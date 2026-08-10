@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>FlyOnTheWall</string>
+	<key>CFBundleDisplayName</key>
+	<string>FlyOnTheWall</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.flyonthewall.fotw</string>
+	<key>CFBundleExecutable</key>
+	<string>fotwd</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.4</string>
+
+	<!-- Menu-bar only. Also set NSApplicationActivationPolicy(Accessory) at
+	     startup: LSUIElement covers the LaunchServices path, the runtime call
+	     covers every other way the binary gets started. -->
+	<key>LSUIElement</key>
+	<true/>
+
+	<!-- Drives the system-audio TCC grant. Not offered in Xcode's dropdown;
+	     it has to be typed. Without it the tap silently captures nothing. -->
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>FlyOnTheWall records meeting audio on this Mac so it can transcribe it with the API key you provide. Audio never leaves your machine except to the transcription service you configure.</string>
+
+	<key>NSMicrophoneUsageDescription</key>
+	<string>FlyOnTheWall records your microphone so your own speech appears in the transcript, labelled separately from everyone else's.</string>
+
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>FlyOnTheWall reads your calendar locally to label recordings with the right meeting and to suggest speaker names. Calendar data never leaves your Mac.</string>
+</dict>
+</plist>

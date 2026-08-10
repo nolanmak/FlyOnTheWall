@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Hardened Runtime resource access for the microphone / AVAudioEngine leg.
+	     NOT what enables the Core Audio tap: Apple's tap documentation lists no
+	     entitlement at all, only the Info.plist key plus the user grant. -->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+
+	<!-- Deliberately NOT sandboxed. Tap behaviour under App Sandbox is
+	     undocumented and reported fragile, and every working implementation
+	     runs non-sandboxed. Developer ID distribution only; the Mac App Store
+	     is an explicit non-goal. See docs/REQUIREMENTS.md section 2. -->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+</dict>
+</plist>
