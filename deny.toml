@@ -1,0 +1,32 @@
+# cargo-deny: the license allowlist is a hard gate.
+# docs/REQUIREMENTS.md 2 -- no GPL/AGPL code enters this tree, and no
+# unlicensed code either. A PR adding one must fail CI, not a review comment.
+
+[licenses]
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "Zlib",
+  "Unlicense",
+  "ISC",
+  "MPL-2.0",
+  "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+# Two incompatible objc2 majors in one binary means Retained/Encode/
+# MainThreadMarker become distinct types across the boundary. See
+# docs/REQUIREMENTS.md 5.5 (the cacao rejection).
+deny = [{ name = "cacao" }]
+
+[advisories]
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
