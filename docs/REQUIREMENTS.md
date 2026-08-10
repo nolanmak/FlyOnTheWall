@@ -88,12 +88,12 @@ Priority: **P0** = v1 does not ship without it. **P1** = fast-follow. **P2** = l
 
 | ID | Requirement | Pri | Eff |
 |---|---|---|---|
-| CAP-01 | Capture system audio via a **Core Audio global exclusive process tap** feeding a **private aggregate device**, excluding our own process. Zoom, Google Meet in a browser, Teams, Slack huddles and Discord all yield non-silent PCM. | P0 | L |
+| CAP-01 | Capture system audio via a **Core Audio global exclusive process tap** feeding a **tap-only private aggregate device** (`uid` + `private` + `tapautostart` + `taps` — *no* main sub-device, *no* sub-device list), excluding our own process. Zoom, Google Meet in a browser, Teams, Slack huddles and Discord all yield non-silent PCM. | P0 | L |
 | CAP-02 | Capture the microphone as a **fully independent second stream** via `AVAudioEngine`. Never merge mic into the system stream at capture time. Two artifacts per meeting: `mic.opus`, `system.opus`. | P0 | M |
 | CAP-03 | **Host-time alignment layer.** Both streams stamped from `mach_absolute_time`-derived nanoseconds; per-stream JSONL index of `{seq, hostTimeNanos, frameOffset, frameCount}`. Merged transcript labels every utterance *You* or *Them* with zero diarization. Acceptance: click-track test reconstructs interleaving within 50 ms. | P0 | M |
 | CAP-04 | **Real-time-safe ring buffer.** The IOProc block does `memcpy` into a preallocated lock-free SPSC ring and bumps an atomic drop counter — no malloc, no locks, no logging, no ARC traffic. ≥ 10 s capacity. CI asserts zero allocations on that path. | P0 | M |
 | CAP-05 | **Zero-buffer watchdog.** Detect bit-exact-zero output for > 8 s while any process reports `kAudioProcessPropertyIsRunningOutput`; recover with the full documented teardown/rebuild. See [§6.4](#64-the-three-runtime-defects-that-actually-matter). | P0 | L |
-| CAP-06 | **Device-change handling.** Property listeners on default output/input device and device list; debounce 300 ms then full rebuild. Target < 300 ms; log a gap marker. Acceptance: three AirPods connect/disconnect cycles in 20 minutes → one continuous file, < 1 s lost per switch. | P0 | L |
+| CAP-06 | **Device-change handling** for the *mic* leg, and ASBD-change rebuilds on both. Reduced in scope: a tap-only aggregate needs no default-output-device tracking or drift compensation. Acceptance: three AirPods connect/disconnect cycles in 20 minutes → one continuous file, < 1 s lost per switch. | P0 | M |
 | CAP-07 | **Format normalization.** Re-read the ASBD on every rebuild — never assume 48 kHz. Convert each stream independently with `AVAudioConverter` to 16 kHz / 1 ch / Int16 LE. No naive decimation. | P0 | M |
 | CAP-08 | **Level normalization before STT.** Taps attenuate in proportion to the target device's stereo-pair count (≈ −12 dB on an 8-output interface). Apply RMS-based slow AGC; log device channel count and measured RMS per session. | P0 | M |
 | CAP-09 | **Prevent idle sleep** while recording (`IOPMAssertPreventUserIdleSystemSleep`); on `willSleep` flush and mark a gap, on `didWake` full rebuild. | P0 | M |
@@ -191,25 +191,38 @@ Priority: **P0** = v1 does not ship without it. **P1** = fast-follow. **P2** = l
 
 ### 5.1 Stack decision
 
-**Chosen: Tauri v2 (Rust core + web UI), single process, macOS system audio captured in-process via Core Audio process taps from Rust.**
+**Chosen: a pure-Rust daemon (`fotwd`) inside a signed, notarized `.app` bundle, with a thin AppKit shell in Rust and the web UI served on `127.0.0.1` to the user's own browser. No Tauri, no Electron, no Swift, no Xcode.**
+
+This was validated by building and running working implementations on macOS 26.3 / arm64 / rustc 1.95.0 — not by reading documentation. Every claim below marked *verified* was executed.
+
+**The shape:**
+
+- `fotwd` — long-running Rust daemon: audio capture, STT, storage, and an `axum` HTTP + WebSocket API serving an embedded SPA on loopback.
+- `fotw` — CLI, a first-class client of that same API (and standalone for `recover` / `transcribe` / `doctor`).
+- A **thin AppKit shell in Rust** owning only the menu-bar item, the recording pill, global hotkeys, and notifications.
+- All of it inside **one signed `.app`** — because that is a TCC requirement, not a UI framework choice.
 
 Why:
 
-1. The hardest constraint is a raw C/Obj-C API. Rust reaches it directly, so there is **no process boundary** and the TCC prompt is attributed to the main app bundle — which matters, because TCC attribution for spawned helpers is the single most common "the permission prompt never appears" failure.
-2. Windows (`wasapi` loopback) and Linux (PipeWire monitor) are also Rust-native, so one language covers all three audio backends behind one trait.
-3. An always-on menu-bar app makes idle RSS a real product cost; Tauri uses the system webview with no Chromium process tree.
-4. Official plugins cover the shell: tray icon, global shortcut, single instance, store, sql, autostart, and a minisign-signed updater served from a static `latest.json` on GitHub Releases — free hosting for an OSS project.
-5. **There is a working precedent.** `anarlog` ships Core Audio process taps + aggregate device from pure Rust via the `cidre` crate (`ca::TapGuard`, `ca::AggregateDevice`) in `crates/audio-actual/src/speaker/macos.rs`, MIT-licensed, with commits landing daily.
+1. The hardest constraint is an Objective-C API, and Rust reaches it. *Verified:* four independent implementations of the full tap flow run correctly — `cidre` 0.20.0, `objc2-core-audio` 0.3.2, hand-rolled 99-line FFI, and `cpal` 0.18.1 loopback. Measured 48 kHz / 2 ch / f32 at **380,928 B/s against a theoretical 384,000 B/s**.
+2. **No process boundary**, so the TCC prompt is attributed to the app bundle — the single most common "the permission prompt never appears" failure.
+3. One language covers all three future audio backends behind one trait (`wasapi` loopback, PipeWire monitor).
+4. The web UI opens in the user's real browser: devtools, zoom, and extensions for free, and **WebKit stays out of our process and off the notarization surface**.
+5. `tray-icon`, `muda`, `global-hotkey`, and `objc2-app-kit` all resolve to the **same** `objc2 0.6.4` as the Core Audio code (*verified* via `Cargo.lock`) — zero runtime duplication.
 
-**Rejected — Electron.** Its two system-audio options are (a) Chromium loopback via undocumented flags, which routes through ScreenCaptureKit and therefore burns the Screen Recording grant, lights the purple indicator, and typically needs an app restart; or (b) spawning the same Swift helper you would write for any stack. Option (b) means Electron contributes *nothing* to the hard problem while adding a Chromium process tree to an app that idles 24/7.
+**Rejected — Tauri v2.** Its value was cross-platform reach plus free shell plugins. Cross-platform is M4, and the plugins cost more than they save here: `tauri-nspanel` cannot produce a working non-activating panel (see §5.5), Tauri neither `lipo`s nor codesigns `externalBin` sidecars for notarization (`tauri#11992`, open since 2024-12, still "needs triage"), and **`tauri dev` runs a bare `target/debug` binary with no bundle structure, so the capture path is untestable in the normal dev loop.**
 
-**Rejected — native SwiftUI only.** Fastest path to correct audio and the only stack with a first-class floating-panel story, but it forfeits Windows/Linux and narrows the contributor pool for a project whose whole pitch is "fork it." **Kept as the escape hatch:** if in-process tap work exceeds three weeks, ship macOS-only SwiftUI rather than ship broken audio.
+**Rejected — Electron.** Its two system-audio options are (a) Chromium loopback via undocumented flags, which routes through ScreenCaptureKit and therefore burns the Screen Recording grant, lights the purple indicator, and typically needs an app restart; or (b) spawning the same native helper you would write for any stack. Option (b) means Electron contributes *nothing* to the hard problem while adding a Chromium process tree to an app that idles 24/7.
+
+**Rejected — native SwiftUI.** Genuinely the lowest-risk path to *correct audio* (every other working tap implementation is Swift, and the ObjC object graph is compile-time checked there rather than runtime-dispatched). It loses on two counts once the Rust path is proven to work: it forfeits M4 cross-platform entirely, and it narrows the contributor pool for a project whose pitch is "fork it." **Kept as the escape hatch:** if tap work exceeds three weeks, ship macOS-only SwiftUI rather than ship broken audio.
 
 **Rejected — ScreenCaptureKit for audio.** Wrong permission class for an audio-only tool, cannot capture audio without running the display pipeline, and the leading Rust binding churned through five major versions between 2026-05-17 and 2026-07-18.
 
-**Rejected — Swift sidecar as the *primary* path.** Tauri neither `lipo`s sidecars into universal binaries nor reliably codesigns them for notarization (`tauri#11992`, open since 2024-12, still "needs triage"). Kept as a compiled-in fallback behind the `AudioSource` trait, selectable by `FOTW_AUDIO_BACKEND=sidecar`. *Correction to earlier analysis: `audiotee#7` — often cited as evidence that sidecar TCC attribution is broken — is **closed**, and the root cause was terminal-emulator TCC responsibility when running the CLI directly, not a defect in prompt attribution for helpers spawned by a signed app bundle. The sidecar path's TCC risk is smaller than it looks; only the lipo/codesign gap is real.*
+**Binding choice: `cidre = "=0.20.0"`, pinned exactly.** It is the only option giving **RAII teardown for free** — `TapGuard::drop` → `AudioHardwareDestroyProcessTap`, `AggregateDevice::drop` → `AudioHardwareDestroyAggregateDevice`, `StartedDevice::drop` → `AudioDeviceStop`, in the correct order. In a daemon that starts and stops capture per meeting, **leaked private aggregate devices are the failure that surfaces in week 6.** A complete production-shaped implementation is **41 significant lines**; the `objc2-core-audio` equivalent was 80 and stopped short of the IOProc, start, and teardown.
 
-**Binding choice.** `objc2-core-audio` 0.3.2 was verified to expose every symbol needed — `AudioHardwareCreateProcessTap`, `CATapDescription`, `AudioHardwareCreateAggregateDevice`, `AudioDeviceCreateIOProcIDWithBlock`, and the `kAudioAggregateDevice*` / `kAudioSubTap*` key constants (typed `&CStr`, requiring runtime conversion to `CFString`). But it has not shipped a release in ~10 months. **Decision:** vendor the ~200 lines of tap FFI we actually use behind our own thin `fotw-audio::sys` module so a binding break is a localized fix, using `objc2-core-audio` for types and `anarlog`'s cidre-based implementation as the working reference to diff PCM output against byte-for-byte.
+Pin with `=`, not `^`: cidre shipped 0.16.1 → 0.17.0 → 0.19.0 → 0.20.0 in five weeks. It is MIT and its `core_audio` module is ~2,500 lines, so vendoring or forking is a real option if the churn becomes intolerable. `objc2-core-audio` remains the escape hatch — migration is mechanical, ~2 days.
+
+**Dead end, confirmed:** `coreaudio-sys` 0.2.18 emits `kAudioAggregateDeviceTapListKey` and `AudioHardwareCreateAggregateDevice` but contains **zero** occurrences of `ProcessTap` or `CATapDescription`. The missing piece is an Objective-C class, which bindgen will not produce.
 
 ### 5.2 Component diagram
 
@@ -217,7 +230,7 @@ Why:
 graph TB
     subgraph OS["macOS"]
         TAP["Core Audio process tap<br/>global exclusive, excl. self"]
-        AGG["Private aggregate device<br/>main sub-device = default output"]
+        AGG["Private aggregate device<br/>TAP-ONLY — no main sub-device"]
         MIC["AVAudioEngine input node"]
         EK["EventKit"]
         KC["Keychain"]
@@ -279,7 +292,7 @@ Two invariants encoded in that diagram, both non-negotiable:
 | `cpal` mic callback | real-time | same discipline, second ring |
 | `audio-pump` | normal | drain rings, align by host time, AEC, downmix, resample 48k→16k, i16 convert, write WAL, `try_send` 20 ms frames |
 | tokio runtime (2 workers) | normal | STT WebSockets, LLM HTTP, SQLite writes on a dedicated writer thread |
-| main | — | Tauri event loop + WKWebView only |
+| main | — | `NSApplication::run()` only. It never returns and must own the main thread, so tokio goes on a spawned thread with a `Handle`; work bounces back via `dispatch2::DispatchQueue::main()`. |
 
 ### 5.4 Crash resilience
 
@@ -297,23 +310,46 @@ sessions/<ulid>/
 
 All appends via `BufWriter` with `flush()` + `sync_data()` at least every 5 s. SQLite is an **index over these files**, not the source of truth. On startup, any session directory lacking `ended_at` surfaces a *Recover meeting from &lt;time&gt;* action. Readers must tolerate a torn final JSONL line and a PCM file truncated mid-frame. Panic hooks and signal handlers flush, but **correctness must not depend on them** — acceptance is `SIGKILL` at a random offset in a 90-minute run, then `fotw recover` yielding audio ≥ (kill_time − 5 s).
 
-### 5.5 UI behavior
+### 5.5 The AppKit shell
 
-- **Menu-bar residency** with `ActivationPolicy::Accessory` + `LSUIElement`, global hotkeys for start/stop and show/hide overlay.
-- **Transcript deltas stream to the webview over a batched channel at 10 Hz** — never one IPC message per word. Virtualize the list (~50 rows in the DOM; a 2-hour meeting is ~20k words). Unmount the transcript view when the window is hidden. Budget: < 3% average CPU on Apple Silicon and < 50 MB RSS growth over a 2-hour soak, asserted by a scripted soak test.
-- **Screen-share behavior must not depend on content protection.** On macOS 15+, `setContentProtected(true)` / `NSWindow.sharingType = .none` is ignored by ScreenCaptureKit — the compositor merges all visible content before capture and there is no known workaround (`tauri#14200`, open, upstream). Therefore: still call it (it works on ≤ 14 and against legacy CoreGraphics capture); ship an instant global hide hotkey; default the overlay to a collapsed pill; add a persistent "hide while presenting" toggle. **Never ship copy claiming the overlay is invisible during screen share.**
+Written in Rust against `objc2-app-kit` 0.3.2. Prototype compiled and run on macOS 26.3.
+
+**The recording pill must be an `NSPanel` created directly, with the style mask passed to the initializer.** `objc2-app-kit` exposes both `NSWindowStyleMask::NonactivatingPanel` (1<<7) and `NSPanel::initWithContentRect_styleMask_backing_defer` as a safe method.
+
+This detail is the whole ballgame: **the mask is only honored if set at init.** AppKit calls the private `-_setPreventsActivation:` — which flips the WindowServer's `kCGSPreventsActivationTagBit` — during panel initialization, and **never from `setStyleMask:`** (FB16484811). That is exactly why `tauri-nspanel` and `tao` are stuck: they create an `NSWindow`, `object_setClass` it to a panel subclass, then call `setStyleMask:`, producing a window that *looks* key but receives no key events. Creating the `NSPanel` ourselves sidesteps the entire class of bug — and retires the strongest argument against the Rust path.
+
+| Capability | Choice |
+|---|---|
+| Status item + menu | `tray-icon 0.24` + `muda 0.19` (same objc2 graph, escape hatches into it) |
+| Recording pill | hand-rolled `NSPanel` subclass, ~70 lines |
+| Global hotkeys | `global-hotkey 0.8` — Carbon `RegisterEventHotKey`, **no Accessibility grant needed** |
+| Notifications | `objc2-user-notifications 0.3` |
+| Accessory policy | `LSUIElement` **and** `setActivationPolicy(Accessory)` |
+| Launch at login | `objc2-service-management`, `SMAppService::mainAppService()` |
+| Single instance | none — `EADDRINUSE` on the loopback bind *is* the mutex |
+
+**Rejected — `cacao`.** Pins `objc2 = "=0.3.0-beta.2"`, so Cargo would resolve **two incompatible objc2 majors** alongside our 0.6.4; `Retained`, `Encode`, and `MainThreadMarker` become distinct types. CI runs `cargo tree -d` and fails on more than one `objc2`.
+
+**Traps that fail silently:** `NSFloatingWindowLevel` (3) is not high enough to sit above another app's full-screen space even with `FullScreenAuxiliary` — the pill works on a normal desktop and **vanishes the moment the user full-screens Zoom**, which is precisely the scenario it exists for and one you never hit in local dev. Use `NSStatusWindowLevel` (25). A borderless window returns NO from `canBecomeKeyWindow`, so buttons swallow the first click. Dropping the `Retained<NSStatusItem>` silently removes the menu-bar icon.
+
+**Screen share.** `panel.setSharingType(NSWindowSharingNone)` does exclude the pill from capture, which partly solves the problem Tauri could not. It is deprecated in favour of ScreenCaptureKit content filters, so it needs an explicit behavior test on our floor — and **no copy may claim the overlay is invisible during screen share** until that test passes.
+
+**Transcript deltas** stream to the browser over the WebSocket batched at 10 Hz — never one message per word. Virtualize the list (~50 rows in the DOM; a 2-hour meeting is ~20k words). Budget: < 3% average CPU on Apple Silicon and < 50 MB RSS growth over a 2-hour soak.
 
 ### 5.6 Repo layout and CI
 
 ```
-apps/desktop/{src,src-tauri}
 crates/
+  fotwd           the daemon binary: axum server, lifecycle, AppKit shell
+  fotw            CLI client
   fotw-audio      AudioTap/AudioPlatform traits + platform/{macos,windows,linux,file}
   fotw-pipeline   rings, resampler, AEC, WAL, muxer, backpressure state machine
   fotw-stt        provider adapters
   fotw-summarize  LlmAdapter, prompts, validators
   fotw-store      SQLCipher schema, migrations, FTS, export/import
   fotw-secrets    keychain; no other crate may depend on a telemetry crate
+ui/               plain SPA, embedded via rust-embed (debug-embed feature ON)
+packaging/        Info.plist, entitlements, justfile targets for bundle/sign/notarize
   fotw-cli        `fotw` headless binary
 packages/ui, packages/ts-bindings
 fixtures/         golden audio + transcripts
@@ -333,6 +369,16 @@ Fork PRs must build without secrets: guard signing/notarization steps on `github
 
 ## 6. Audio capture
 
+### 6.0 What was actually built and measured
+
+Before the design detail: the tap flow was implemented four times on macOS 26.3 / arm64 / rustc 1.95.0 and all four run. Measured format 48000 Hz / 2 ch / `lpcm` f32, throughput **380,928 B/s against a theoretical 384,000 B/s** through a block IOProc on a serial dispatch queue.
+
+**Correction to earlier design: use a tap-only aggregate.** The aggregate device needs only `uid`, `private`, `tapautostart`, and `taps` — **no `kAudioAggregateDeviceMainSubDeviceKey` and no `kAudioAggregateDeviceSubDeviceListKey`.** Both variants were verified working, and both shipping implementations in the wild (`anarlog` via cidre, and `cpal`) use tap-only.
+
+This removes **drift compensation, the default-output-device lookup, and default-output-device-change tracking** from the critical path entirely — a meaningful simplification of what was previously the most failure-prone part of the design.
+
+Two macOS-26 API details worth writing down: `AudioDeviceCreateIOProcIDWithBlock` takes the queue as `Option<&DispatchQueue>` and **passing `None` silently fails to register the block**, so always pass `Some`. And the `kAudioAggregateDevice*` / `kAudioSubTap*` key constants are typed `&CStr` while the dictionary needs CFStrings, so each needs a runtime conversion.
+
 ### 6.1 The mechanism, and what it actually costs the user
 
 Core Audio process taps (`AudioHardwareCreateProcessTap` + `CATapDescription`) are the correct primary path. They need **no Apple-granted entitlement, no kernel extension, no virtual audio device**, and do **not** require the Screen Recording authorization to be granted.
@@ -340,7 +386,7 @@ Core Audio process taps (`AudioHardwareCreateProcessTap` + `CATapDescription`) a
 **But the "one quiet permission that isn't screen recording" positioning is wrong as usually stated, and must be rewritten before launch:**
 
 - The API floor is **macOS 14.2**, not 14.4. Ship **14.4** anyway as conservatism (Apple's own AudioCap sample targets 14.4, and pre-14.4 lands the capability in a different TCC category with divergent prompts).
-- Since macOS 15 the grant is surfaced as **"System Audio Recording Only" inside System Settings → Privacy & Security → Screen & System Audio Recording** — literally the screen-recording pane. Onboarding copy and support docs must send users there. The `tccutil` service name is **`SystemAudioCaptureRequests`**.
+- Since macOS 15 the grant is surfaced as **"System Audio Recording Only" inside System Settings → Privacy & Security → Screen & System Audio Recording** — literally the screen-recording pane. Onboarding copy and support docs must send users there. The `tccutil` service name is **`AudioCapture`** — i.e. `tccutil reset AudioCapture <bundle-id>`. *(Widely-cited 2026 blog posts say `SystemAudioCaptureRequests`; that string does not exist anywhere. Verified: `/usr/bin/tccutil` contains the format `kTCCService%s`, and `kTCCServiceAudioCapture` is present in `tccd` on macOS 26.3.)*
 - **A purple Control Center dot probably does appear.** Apple's own macOS User Guide defines the purple dot as "the system audio is being recorded," not "the screen is being recorded." Assume it appears until proven otherwise.
 - `com.apple.security.device.audio-input` is the hardened-runtime entitlement for the **microphone/AVAudioEngine leg**, not for the tap. Apple's tap documentation lists no entitlement at all. Ship the entitlement anyway — we need the mic leg — but don't claim it's what enables the tap.
 - **"No periodic re-authorization" is unverified, not established.** The documented monthly nag is tied to the screen-capture window picker and persists in Tahoe 26; no primary source says the audio-only grant is exempt, and it now lives in the same pane and subsystem. Treat as an open risk.
@@ -395,9 +441,9 @@ Keep writing to the same output file across the rebuild; record a gap marker. Ac
 
 **2. Undocumented per-device attenuation.** Tap output is attenuated roughly in proportion to the target device's stereo-pair count — about **−12 dB on an 8-output interface**, ~0 dB on built-in speakers and AirPods. Open Apple thread, no reply, no flag to disable. Under-level audio degrades STT accuracy *silently*. Never send raw tap audio to a provider (CAP-08).
 
-**3. Unsigned builds capture silence and never prompt.** TCC keys its record off the code's Designated Requirement; ad-hoc signatures mint a new identity every build. For an open-source project this means **every contributor who runs `cargo build` gets a binary that records nothing, with no error**. Worse: Tauri only produces a real `.app` bundle at `tauri build` — `tauri dev` runs a bare `target/debug` binary with no bundle structure — so **the capture path is untestable in the normal dev loop.**
+**3. Unsigned builds capture silence and never prompt.** TCC keys its record off the code's Designated Requirement; ad-hoc signatures mint a new identity every build. For an open-source project this means **every contributor who runs `cargo build` gets a binary that records nothing, with no error**. Worse still, *verified in testing:* an **unsigned, ad-hoc-signed binary captured real system audio with no prompt at all**, because it inherited the grant from the responsible terminal process. **Your dev machine will lie to you about permissions** — a developer concludes capture works, ships, and users get silence.
 
-*Mitigation:* ship `scripts/dev-sign.sh` that creates or reuses a stable self-signed identity, signs with `--options runtime --entitlements`, and prints the `tccutil reset SystemAudioCaptureRequests <bundle-id>` recovery command. Document this loudly in CONTRIBUTING.md. Consider a signed nightly for contributors — otherwise every self-builder files the same "it records nothing" issue.
+*Mitigation:* ship `scripts/dev-sign.sh` that creates or reuses a stable self-signed identity, signs with `--options runtime --entitlements`, and prints the `tccutil reset AudioCapture <bundle-id>` recovery command. Document this loudly in CONTRIBUTING.md. Consider a signed nightly for contributors — otherwise every self-builder files the same "it records nothing" issue.
 
 ### 6.5 The platform abstraction
 
@@ -718,7 +764,7 @@ Items failing (1) or (2) are **dropped and logged**. Items failing (3) or (4) ha
 
 **SQLCipher-encrypted SQLite, one file per install**, driven from Rust via `rusqlite` 0.40.2 with `bundled-sqlcipher-vendored-openssl`. That feature vendors SQLCipher and OpenSSL and — verified in `libsqlite3-sys/build.rs` — **still compiles `-DSQLITE_ENABLE_FTS5`**, so encryption costs nothing in search capability.
 
-**Do not use `tauri-plugin-sql`.** It is a sqlx wrapper that exposes raw SQL execution to frontend JavaScript (a SQL-injection surface inside our own app, and every schema detail becomes frontend API) and offers no hook for `PRAGMA key`, extension loading, or update hooks.
+*(Not applicable now that Tauri is out, but worth recording as a rejected pattern: never expose raw SQL execution to the front-end. All DB access is behind typed handlers in the daemon; the SPA never sees SQL.)*
 
 Connection bootstrap, in this exact order, on every connection:
 
@@ -737,7 +783,7 @@ PRAGMA temp_store = MEMORY;
 
 ### 9.2 On-disk layout
 
-Root is Tauri's `app_local_data_dir()` — macOS `~/Library/Application Support/com.flyonthewall.app`, Windows `%LOCALAPPDATA%\…` (**deliberately Local, not Roaming — 20 GB of audio in a roaming profile would destroy enterprise profile sync**), Linux `$XDG_DATA_HOME/…`.
+Root is the app-local data dir — macOS `~/Library/Application Support/com.flyonthewall.app`, Windows `%LOCALAPPDATA%\…` (**deliberately Local, not Roaming — 20 GB of audio in a roaming profile would destroy enterprise profile sync**), Linux `$XDG_DATA_HOME/…`.
 
 ```
 <root>/db.sqlite3 (+ -wal, -shm)
@@ -918,6 +964,33 @@ Sync is a non-goal, but these keep the door open at ~2 weeks instead of a rewrit
 
 **Telemetry: none, compiled out — not a disabled flag.** No analytics SDK, no phone-home, no update ping without opt-in. The telemetry crate, if ever added, must not depend on `fotw-secrets` — enforced at the crate boundary. Crash reporting, if offered, is opt-in per install, ships symbolicated stack + OS version only, and scrubs home paths.
 
+### 10.1 Localhost ingress — the risk the daemon architecture introduces
+
+Egress is only half the problem. The daemon holds every transcript and can read keychain-backed keys, and **any web page the user visits can attempt requests to `127.0.0.1`.**
+
+**The browser will not save us.** Chrome 142 gated public→loopback fetch behind a permission prompt and Chrome 147 extended it to WebSockets — but **Safari has taken no position and has not shipped it** (WebKit standards-positions #520 still open; nothing in Safari 26.6), and macOS's own Local Network Privacy **explicitly exempts loopback and exempts WebKit traffic.** On the default browser of our target platform there is zero OS-level and zero browser-level protection. **Do all adversarial testing in Safari** — "it was blocked in Chrome" must never close a security ticket.
+
+**The dominant threat is DNS rebinding, not CSRF.** Rebinding makes the attacker *same-origin*: `Sec-Fetch-Site: same-origin`, no CORS preflight, arbitrary request headers, full response reads. That defeats CORS, `SameSite=Strict`, and `tower_http::csrf::CsrfLayer` alike. It is the class that produced Ollama CVE-2024-28224. Only two things stop it: a raw `Host` allow-list, and a secret the page cannot obtain.
+
+| ID | Control | Prevents |
+|---|---|---|
+| ING-01 | Bind literal `Ipv4Addr::LOCALHOST` (never the string `"localhost:0"` — resolution order varies per machine) + a `ConnectInfo` peer-IP `is_loopback()` tripwire | a future bind-address change silently exposing the LAN |
+| ING-02 | **Raw** `Host`/`:authority` allow-list, exact match | DNS rebinding — browsers forbid scripts setting `Host` |
+| ING-03 | **Never `axum_extra::extract::Host`** — it prefers `Forwarded`, then `X-Forwarded-Host`, then the real header, so under rebinding the attacker chooses the value. Complete bypass; also `#[deprecated]` | a rebinding check that compiles, tests green, and does nothing |
+| ING-04 | `Origin` allow-list when present; absent `Origin` permitted | another local service's page driving our API |
+| ING-05 | 256-bit CSPRNG secret per daemon start, `subtle::ConstantTimeEq` | everything ING-02 misses |
+| ING-06 | **Explicit `Origin` check inside the WS handler before `on_upgrade`** — `axum 0.8.9`'s `ws.rs` contains **zero occurrences of "origin"** | a hostile page reading **live transcript deltas of a meeting in progress**. Same-origin integration tests will not catch this. |
+| ING-07 | Single-use ≤10 s WS ticket from an authenticated POST | browsers cannot set headers on a WS handshake, so this must be designed in, not retrofitted with a cookie |
+| ING-08 | **No cookies, ever.** `sessionStorage` (keyed by full origin *including port*) + `Authorization: Bearer` | cookie port-blindness — RFC 6265 scopes by host, so a cookie from `127.0.0.1:51234` is sent to every other localhost service. Zero ambient credentials makes CSRF structurally impossible. |
+| ING-09 | **Uniform bare 404** for every auth/host/origin failure — no body, no `WWW-Authenticate`, no differential latency | fingerprinting. A `401` with a realm tells a port-scanning page *"FlyOnTheWall is running — this user is in a meeting right now."* |
+| ING-10 | One-time ≤30 s handoff token in the launch URL, burned on redemption, stripped via `history.replaceState`; `Referrer-Policy: no-referrer` | `open::that` execs `/usr/bin/open <url>`, putting the token in the **process argv** and in **synced browser history** |
+| ING-11 | Strict CSP on the SPA shell | transcripts contain attacker-influenced text — a participant can say anything, and a calendar description can carry markup |
+| ING-12 | State file mode 0600 in a 0700 dir, temp-file + `rename(2)` | another *user account* on a shared Mac reading the port and secret |
+
+**Explicit non-goal: same-user local malware is out of scope.** It can read the SQLCipher database directly. Write this down, or the threat model expands forever.
+
+**Lifecycle constraint that is really a TCC constraint:** `fotwd` must be the `.app`'s own `Contents/MacOS` executable started by LaunchServices — **not a LaunchAgent.** launchd-started binaries are their own responsible process, so the grant attaches to the wrong identity and capture silently yields silence. Auto-start via `SMAppService::mainApp.register()`, which registers the containing app and preserves bundle identity.
+
 Acceptance for the whole section: a network capture over a full record → transcribe → summarize cycle shows connections **only** to the user's configured provider hosts.
 
 ---
@@ -1011,15 +1084,17 @@ Estimates are engineer-weeks for one experienced engineer. They assume the macOS
 
 | | Definition of done | Est. |
 |---|---|---|
-| **M0 — Skeleton & seam** | Tauri v2 monorepo builds on macOS; `fotw-audio` traits defined with **zero platform types in the public API**; Windows/Linux stubs compile in CI; SQLCipher schema migration 0001 applies; `fotw doctor` prints environment; `cargo deny` license allowlist green; LICENSE (Apache-2.0), NOTICE, GOVERNANCE.md with the no-open-core commitment. | **2–3** |
+| **M0 — Skeleton & seam** | Cargo workspace builds on macOS; the `.app` bundle + signing + notarization pipeline works end to end and `just dev-sign` gives contributors a stable identity; `fotw-audio` traits defined with **zero platform types in the public API**; Windows/Linux stubs compile in CI; SQLCipher schema migration 0001 applies; loopback ingress controls (§10.1) in place; `fotw doctor` prints environment; `cargo deny` license allowlist green; LICENSE (Apache-2.0), NOTICE, GOVERNANCE.md with the no-open-core commitment. | **4–5** |
 | **M1 — Thin slice that a real person can use daily** | Record a real meeting end to end: system tap + mic as two streams → WAL to disk → Deepgram streaming → live two-color transcript → typed notes with anchors → Opus 5 augment pass with citations → summary on screen → Markdown export. Recording HUD is non-dismissable. Keys in Keychain. Signed, notarized DMG. **Also in M1:** run `count_tokens` against five real transcripts to validate §8.1, and test the purple-dot behavior on a real macOS 26 machine — both are one-hour tests that determine headline claims. | **6–8** |
 | **M2 — Trustworthy** | Zero-buffer watchdog, device-change rebuild, sleep/wake, AEC, level normalization; reconnect with gapless replay; failover chain terminating in the local engine; crash recovery via `fotw recover`; evidence + citation validators; provenance rendering and the source inspector; QA matrix passing on 14.4 / 15 / 26. | **6–8** |
 | **M3 — Complete product** | Calendar integration + conference-URL parser + detection + event matching; jurisdiction engine and full Disclosure Kit; templates; FTS5 search, folders, tags; audio retention engine; bulk export/import round-trip; Obsidian target; chat over meetings; zero-key local path (Apple + whisper.cpp + Ollama); auto-update. | **8–10** |
 | **M4 — Reach** | Windows (endpoint loopback → process loopback), then Linux (PipeWire); plugin interface; Notion/Slack; MCP server; Granola importer; PDF export. | **10–14** |
 
-**Total to M3 (a complete, shippable macOS product): ~22–29 engineer-weeks.** Treat anything under five months for one engineer as optimistic.
+**Total to M3 (a complete, shippable macOS product): ~26–33 engineer-weeks.** Treat anything under six months for one engineer as optimistic.
 
-**Hard time-box on M1:** if in-process Rust taps are not delivering clean PCM within **three weeks**, switch to the AudioTee-style Swift sidecar backend (already stubbed behind `AudioSource`) or fall back to macOS-only SwiftUI. Do not spend a month on bindings.
+That went **up**, not down, after the Rust ground-truthing. The five infrastructure areas alone measured **67 engineer-days (~13.4 weeks)**: Core Audio tap 9d, AppKit shell 12d, bundle/sign/notarize 9d, localhost daemon 16d, real-time audio path 21d. The tap turned out easier than feared; the daemon's security surface and the RT audio chain turned out harder.
+
+**The time-box on the tap is now largely discharged** — four working implementations exist, so M1's tap risk is execution, not feasibility. The escape hatch stands for everything downstream of it: if the *pipeline* (watchdog, AEC framing, device rebuilds) is not stable within three weeks of the tap landing, ship macOS-only rather than ship silent data loss.
 
 ---
 
@@ -1032,15 +1107,15 @@ Estimates are engineer-weeks for one experienced engineer. They assume the macOS
 | 3 | **CIPA exposure follows the product, not the vendor.** § 637.2(a) is $5,000 per violation, per participant. | **High** | §11 in full. Never market invisibility. Keep it a pure BYO-key local tool with no vendor-held corpus to certify a class around. Lawyer review of all public copy. | Any launch-post draft containing the word "invisible" or "won't know." |
 | 4 | **Provider defaults are not privacy-safe.** Deepgram's published rates opt into training; ElevenLabs retains by default. A user assuming "local-first" means "nothing retained" is wrong. | **High** | KEY-03 transport-layer injection with no bypass; integration test asserting 100% flag presence; per-provider retention card with live doc links. | An outbound request captured without `mip_opt_out`. |
 | 5 | **AEC is underestimated** and the product ships double-transcribing remote speech — the visible failure mode in most sub-10-star clones. | **High** | Vendor a real AEC3 implementation rather than a naive spectral subtraction; integration test asserting single-occurrence transcription of a known far-end phrase. | Speaker-mode test transcript containing any duplicated phrase. |
-| 6 | **TCC grants keyed to an unstable signing identity** — every contributor build records silence with no error, and the capture path is untestable in `tauri dev`. | **High** | `scripts/dev-sign.sh` with a stable self-signed identity; signed nightlies for contributors; loud CONTRIBUTING.md. | The first "it records nothing" issue from a self-builder. |
-| 7 | **The overlay cannot be hidden from screen sharing on macOS 15+** and `setContentProtected` is ignored. | **High** | Collapsed-pill default, instant hide hotkey, persistent "presenting" toggle, no invisibility copy. Track `tauri#14200`. | A user screenshot of the overlay in a shared screen. |
+| 6 | **TCC grants keyed to an unstable signing identity** — every contributor build records silence with no error — and worse, a dev machine can *inherit its terminal’s* grant and appear to work. | **High** | `scripts/dev-sign.sh` with a stable self-signed identity; signed nightlies for contributors; loud CONTRIBUTING.md. | The first "it records nothing" issue from a self-builder. |
+| 7 | **The overlay cannot be hidden from screen sharing on macOS 15+** and `setContentProtected` is ignored. | **High** | Collapsed-pill default, instant hide hotkey, persistent "presenting" toggle, no invisibility copy. Partially mitigated by `NSWindowSharingNone` on the panel (deprecated in favour of ScreenCaptureKit content filters, so re-test on our floor). | A user screenshot of the overlay in a shared screen. |
 | 8 | **Feature-surface trap.** Granola exposes ~40 documented surfaces. Chasing parity means never shipping. | **High** | Hold the non-goals list in §2. Parity is capture → notes → enhance → provenance → search → export, plus templates and chat. | Any P0 added after M0 that is not on that list. |
 | 9 | **Deepgram's streaming rate is promotional** and could revert above its batch rate, inverting the default. | Med | Never hardcode prices; dated price table; nightly cost-regression test; failover chain makes the default a config change. | The pricing page losing the "limited-time" label. |
 | 10 | **Discoverability failure.** meetily owns the category on stars and SEO; anarlog owns the GitHub-native audience. | Med | Lead with the three things neither offers (no open-core, BYO cloud STT first-class, consent as a feature); publish a factual comparison table naming each competitor's specific gating; ship the Granola importer early. | 30 days post-launch under 200 stars. |
 | 11 | **Vendored third-party audio code may not be cleanly licensed.** anarlog has one root MIT LICENSE and no per-file SPDX headers. | Med | Run scancode/FOSSology over any vendored subtree before shipping; treat as a release blocker; pin the commit SHA in `vendor/MANIFEST.toml` (MIT grants are irrevocable for already-published versions). | Scanner flagging any WebRTC- or Apple-sample-derived file. |
 | 12 | **ElevenLabs session time limit** is undocumented; a 2-hour meeting will likely hit it and a naive adapter drops the remainder. | Med | Treat `session_time_limit_exceeded` as routine and retryable; test with a 2-hour fixture before shipping ElevenLabs streaming. | Any streaming session ending without our close. |
 | 13 | **Per-device tap attenuation** silently degrades STT for users on multi-channel interfaces. | Med | CAP-08 normalization; WER regression test across built-in-speaker and multi-channel configs. | WER delta > 2 points between device configs. |
-| 14 | **Rust + Tauri narrows the OSS contributor pool**, and the audio core is the least approachable part. | Low | UI stays TypeScript behind generated bindings; audio/STT/storage in small crates with a `FileAudioSource` fake so contributors can run the pipeline without a Mac or a device; `fotw` CLI as a non-GUI entry point. | PRs clustering entirely in `packages/ui`. |
+| 14 | **Rust narrows the OSS contributor pool**, and the audio core is the least approachable part. | Low | UI is a plain SPA served over HTTP with no Rust toolchain needed; audio/STT/storage in small crates with a `FileAudioSource` fake so contributors can run the pipeline without a Mac or a device; `fotw` CLI as a non-GUI entry point. | PRs clustering entirely in `ui/`. |
 
 ---
 
