@@ -13,7 +13,9 @@
 //!    forecloses it is not.
 //! 3. **Deleting means the bytes are gone** (§9.6). [`Db::delete_meeting`] is
 //!    one transaction plus a vacuum and a checkpoint, and its acceptance test
-//!    greps the raw file for the transcript text.
+//!    greps the raw file for the transcript text. Since migration 0002 that
+//!    clause covers the FTS5 indexes too: an external-content index keeps the
+//!    tokens after the source row is deleted unless a trigger retracts them.
 //!
 //! ```no_run
 //! use fotw_store::{Db, DbKey, NewMeeting};
@@ -39,6 +41,7 @@ mod key;
 mod migrations;
 mod models;
 mod repo;
+mod search;
 
 pub use crate::db::Db;
 pub use crate::delete::DeleteOutcome;
@@ -48,3 +51,4 @@ pub use crate::key::DbKey;
 pub use crate::migrations::LATEST_SCHEMA_VERSION;
 pub use crate::models::{Meeting, NewMeeting, NewSegment, NewSummary, NoteAnchor, Summary};
 pub use crate::repo::MeetingRepo;
+pub use crate::search::{FTS_TABLES, SearchHit, SearchQuery, SearchSource, SearchWeights};

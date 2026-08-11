@@ -14,14 +14,20 @@ use crate::key::DbKey;
 ///
 /// Bump this in the same commit that appends to [`migration_set`]; the two
 /// drifting apart is what [`crate::Db::open`]'s refusal is guarding against.
-pub const LATEST_SCHEMA_VERSION: usize = 1;
+pub const LATEST_SCHEMA_VERSION: usize = 2;
 
 /// Every migration, oldest first. Append only — a released migration is
 /// immutable, because editing one changes the schema of databases that already
 /// recorded it as applied.
+///
+/// 0002 is a separate file rather than an edit to 0001 for exactly that reason:
+/// 0001 has shipped, so a released library has to migrate *forward* into the
+/// FTS tables (and backfill them — see the `'rebuild'` statements at the end of
+/// 0002) rather than be rewritten underneath.
 fn migration_set() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(include_str!("schema/0001_initial.sql")).comment("initial schema"),
+        M::up(include_str!("schema/0002_fts.sql")).comment("fts5 search indexes"),
     ])
 }
 

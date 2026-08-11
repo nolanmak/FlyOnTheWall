@@ -2,7 +2,7 @@
 //! before they run, and refused outright when the file is newer than the
 //! binary (docs/REQUIREMENTS.md 9.1).
 
-use fotw_store::{Db, LATEST_SCHEMA_VERSION, StoreError};
+use fotw_store::{Db, LATEST_SCHEMA_VERSION, SearchQuery, StoreError};
 use rusqlite::Connection;
 
 mod common;
@@ -25,7 +25,62 @@ fn a_fresh_database_lands_on_the_latest_version() {
     let (_dir, path) = tmp_db();
     let db = Db::open(&path, &test_key()).unwrap();
     assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
-    assert_eq!(LATEST_SCHEMA_VERSION, 1, "migration 0001 is the only one");
+    assert_eq!(
+        LATEST_SCHEMA_VERSION, 2,
+        "0001 initial schema, 0002 fts5 search indexes"
+    );
+}
+
+/// A library written by the shipped 0001 must migrate *forward* into the search
+/// indexes with its existing content indexed, not be rebuilt from scratch.
+///
+/// This is the case that makes 0002 a separate file rather than an edit to
+/// 0001, and the only test that exercises the `'rebuild'` backfill at the end
+/// of 0002 against rows that pre-date the triggers — the exact situation every
+/// existing install is in.
+#[test]
+fn a_v1_library_migrates_forward_and_its_existing_rows_become_searchable() {
+    let (_dir, path) = tmp_db();
+
+    // Build a v1 library by hand: apply 0001's DDL and stop there.
+    {
+        let conn = raw(&path);
+        conn.execute_batch(include_str!("../src/schema/0001_initial.sql"))
+            .unwrap();
+        conn.execute_batch("PRAGMA user_version = 1;").unwrap();
+        conn.execute(
+            "INSERT INTO meetings (id, title, started_at_ms, tz, state, created_at, updated_at, origin_device_id)
+             VALUES ('m1', 'Kubernetes migration', 0, 'UTC', 'ready', 0, 0, 'd1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transcripts (id, meeting_id, provider, model, created_at, updated_at, origin_device_id)
+             VALUES ('t1', 'm1', 'deepgram', 'nova-3', 0, 0, 'd1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO segments (id, transcript_id, meeting_id, idx, start_ms, end_ms, channel, text)
+             VALUES ('s1', 't1', 'm1', 0, 0, 900, 'mic', 'we should postpone the ingress cutover')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let db = Db::open(&path, &test_key()).unwrap();
+    assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+
+    let hits = db.search(&SearchQuery::new("ingress cutover")).unwrap();
+    assert_eq!(
+        hits.len(),
+        1,
+        "rows written before 0002 must be indexed by its backfill: {hits:?}"
+    );
+    assert_eq!(hits[0].meeting_id, "m1");
+
+    let hits = db.search(&SearchQuery::new("Kubernetes")).unwrap();
+    assert_eq!(hits.len(), 1, "the title backfill is separate: {hits:?}");
 }
 
 /// Reopening is a no-op, not a re-run. If migrations were re-applied the

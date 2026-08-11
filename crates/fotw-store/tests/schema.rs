@@ -8,11 +8,28 @@
 
 use std::collections::BTreeSet;
 
-use fotw_store::Db;
-use rusqlite::Connection;
+use fotw_store::{Db, FTS_TABLES};
+use rusqlite::{Connection, OptionalExtension};
 
 mod common;
 use common::test_key;
+
+/// True for the FTS5 virtual tables from migration 0002 and for the shadow
+/// tables SQLite creates underneath them (`*_data`, `*_idx`, `*_docsize`,
+/// `*_config`).
+///
+/// The house rules below are rules about *our* schema. An FTS5 index is not a
+/// table we wrote — its shape is chosen by SQLite, it cannot be `STRICT`, and
+/// its shadow tables use implicit integer keys that §9.7 invariant 1
+/// specifically permits ("implicit rowids exist only as FTS join keys"). Rather
+/// than weaken each rule with an exception, they are excluded here once, and
+/// `the_fts_indexes_are_external_content_over_the_source_tables` below is what
+/// bounds the exclusion so it cannot become a hiding place.
+fn is_fts_object(name: &str) -> bool {
+    FTS_TABLES
+        .iter()
+        .any(|t| name == *t || name.starts_with(&format!("{t}_")))
+}
 
 /// Every table migration 0001 is required to create.
 const EXPECTED_TABLES: &[&str] = &[
@@ -40,12 +57,21 @@ fn open() -> Db {
     Db::open_in_memory(&test_key()).unwrap()
 }
 
-fn table_names(conn: &Connection) -> BTreeSet<String> {
+/// Every table in the applied schema, FTS objects included.
+fn all_table_names(conn: &Connection) -> BTreeSet<String> {
     let mut stmt = conn
         .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
         .unwrap();
     let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
     rows.map(Result::unwrap).collect()
+}
+
+/// The tables this project wrote by hand — the ones the house rules govern.
+fn table_names(conn: &Connection) -> BTreeSet<String> {
+    all_table_names(conn)
+        .into_iter()
+        .filter(|n| !is_fts_object(n))
+        .collect()
 }
 
 /// `(name, type, notnull, pk)` for every column of `table`.
@@ -80,7 +106,19 @@ fn ddl(conn: &Connection) -> Vec<(String, String)> {
     let rows = stmt
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
         .unwrap();
-    rows.map(Result::unwrap).collect()
+    rows.map(Result::unwrap)
+        .filter(|(name, _): &(String, String)| !is_fts_object(name))
+        .collect()
+}
+
+/// The `CREATE VIRTUAL TABLE` text of one FTS index.
+fn fts_ddl(conn: &Connection, table: &str) -> String {
+    conn.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+        [table],
+        |r| r.get::<_, String>(0),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -92,6 +130,147 @@ fn migration_0001_creates_every_table_the_spec_names() {
         found, expected,
         "the applied schema does not match §9.3's table list"
     );
+}
+
+/// §9.4 names the four things a person searches for. One index each.
+#[test]
+fn migration_0002_creates_the_four_fts_tables() {
+    let db = open();
+    let all = all_table_names(db.conn());
+    for t in FTS_TABLES {
+        assert!(all.contains(t), "missing FTS index `{t}`: {all:?}");
+    }
+    assert_eq!(
+        FTS_TABLES.len(),
+        4,
+        "§9.4 asks for exactly four: segments, notes, summaries, meetings"
+    );
+}
+
+/// The bound on the STRICT/AUTOINCREMENT exemption above.
+///
+/// `content='<table>'` is what makes these indexes cheap: the tokens live in
+/// the index, the columns are read back through the shared rowid, and the text
+/// is stored once. A *contentless-with-content* or default FTS5 table would
+/// instead keep a second full copy of every transcript in a `%_content` shadow
+/// table — doubling §9.5's 250 MB/year of text — and would make the delete
+/// triggers unnecessary, which is precisely the property this schema must not
+/// quietly acquire.
+#[test]
+fn the_fts_indexes_are_external_content_over_the_source_tables() {
+    let db = open();
+    let all = all_table_names(db.conn());
+    for (fts, source) in [
+        ("meetings_fts", "meetings"),
+        ("notes_fts", "notes"),
+        ("summaries_fts", "summaries"),
+        ("segments_fts", "segments"),
+    ] {
+        let sql = fts_ddl(db.conn(), fts);
+        assert!(
+            sql.contains(&format!("content = '{source}'")),
+            "`{fts}` is not external content over `{source}`: {sql}"
+        );
+        assert!(
+            !all.contains(&format!("{fts}_content")),
+            "`{fts}` kept a private copy of the text in {fts}_content"
+        );
+    }
+}
+
+/// §9.4: `unicode61 remove_diacritics 2` everywhere, and NOT `porter`.
+///
+/// The behavioural half of this — that a product name does not match an
+/// unrelated stemmed form — is in `tests/search.rs`. This half is the
+/// configuration itself, because a tokenizer can only be set at
+/// `CREATE VIRTUAL TABLE` time: changing it later means a new migration and a
+/// full reindex, so it is worth failing loudly the moment it drifts.
+#[test]
+fn every_fts_index_uses_unicode61_without_stemming() {
+    let db = open();
+    for fts in FTS_TABLES {
+        let sql = fts_ddl(db.conn(), fts);
+        assert!(
+            sql.contains("unicode61 remove_diacritics 2"),
+            "`{fts}` does not use the §9.4 tokenizer: {sql}"
+        );
+        assert!(
+            !sql.to_lowercase().contains("porter"),
+            "`{fts}` stems; §9.4 forbids it on transcripts: {sql}"
+        );
+    }
+}
+
+/// §9.6, at the level a query can never see.
+///
+/// With `'secure-delete'` off — which is FTS5's default — retracting a row
+/// appends a delete marker carrying the term it retracts, so deleting a
+/// transcript writes a *second* copy of every one of its words into the file
+/// while making the row instantly unfindable. Every behavioural test still
+/// passes. The only two things that catch it are a byte scan (see
+/// `src/delete.rs`) and this: the configuration itself, asserted directly out
+/// of the `%_config` shadow table.
+#[test]
+fn every_fts_index_deletes_securely() {
+    let db = open();
+    for fts in FTS_TABLES {
+        let v: Option<i64> = db
+            .conn()
+            .query_row(
+                &format!("SELECT v FROM {fts}_config WHERE k = 'secure-delete'"),
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(
+            v,
+            Some(1),
+            "`{fts}` retracts rows logically; its delete markers keep the words"
+        );
+    }
+}
+
+/// Nothing in SQLite connects a source table to an external-content index. The
+/// triggers *are* the synchronisation, so their absence is a search result that
+/// silently never appears — and, for the delete trigger, a transcript that
+/// survives §9.6 in the index after its row is gone.
+#[test]
+fn every_fts_index_has_all_three_sync_triggers() {
+    let db = open();
+    let mut stmt = db
+        .conn()
+        .prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'trigger'")
+        .unwrap();
+    let triggers: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+
+    for fts in FTS_TABLES {
+        for (suffix, event) in [("ai", "INSERT"), ("au", "UPDATE"), ("ad", "DELETE")] {
+            let name = format!("{fts}_{suffix}");
+            let (_, sql) = triggers
+                .iter()
+                .find(|(n, _)| *n == name)
+                .unwrap_or_else(|| panic!("missing trigger `{name}`"));
+            assert!(
+                sql.to_uppercase().contains(&format!("AFTER {event}")),
+                "`{name}` is not an AFTER {event} trigger: {sql}"
+            );
+            // The only documented way to retract a row from an
+            // external-content index. An ordinary DELETE against the FTS table
+            // is an error, and simply not retracting leaves the tokens behind.
+            if event != "INSERT" {
+                assert!(
+                    sql.contains(&format!("INSERT INTO {fts}({fts}, rowid,"))
+                        && sql.contains("'delete'"),
+                    "`{name}` does not use the documented 'delete' command form: {sql}"
+                );
+            }
+        }
+    }
 }
 
 /// STRICT is what makes the column types above mean anything. Without it
