@@ -207,23 +207,18 @@ fn fraction_of(value: usize, fraction: f64) -> usize {
 }
 
 /// The user-facing quality/cost presets (spec 8.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Preset {
     /// `claude-opus-5`, effort high.
     Quality,
     /// `claude-opus-5`, effort medium. The default.
+    #[default]
     Balanced,
     /// `claude-sonnet-5`, effort low.
     Cheap,
     /// A user-selected Ollama / LM Studio model, no effort control.
     Local,
-}
-
-impl Default for Preset {
-    fn default() -> Self {
-        Self::Balanced
-    }
 }
 
 /// Model id for the augment/summary call (Call A).

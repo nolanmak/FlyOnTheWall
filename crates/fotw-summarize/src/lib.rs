@@ -10,6 +10,8 @@ pub mod document;
 pub mod error;
 pub mod hash;
 pub mod prompt;
+pub mod schema;
 pub mod testing;
 pub mod tokens;
 pub mod transport;
+pub mod validate;

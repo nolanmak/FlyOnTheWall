@@ -91,12 +91,18 @@ pub fn segment(
 #[must_use]
 pub fn sample_meeting() -> Vec<TranscriptSegment> {
     vec![
+        // "Hi, Alice here" rather than "Alice here": the validator's
+        // proper-noun heuristic deliberately ignores sentence-initial
+        // capitals, so a name in that position is a known false negative and
+        // would make this fixture test the limitation instead of the rule.
+        // `validate::tests::a_name_only_ever_spoken_sentence_initially_is_a_known_false_negative`
+        // covers that case on purpose.
         segment(
             "s0",
             "S0",
             0,
             4_000,
-            "Alice here. Let's start with the migration.",
+            "Hi, Alice here. Let's start with the migration.",
         ),
         segment(
             "s1",
