@@ -936,6 +936,14 @@ Two **mono Opus streams** per meeting at 24 kbps VBR, `OPUS_APPLICATION_VOIP`, 2
 
 **Default retention: delete audio 30 days after the transcript reaches `ready`** → steady state ≈ **1.7 GB**, which is the number that makes the default defensible. Per-meeting override `{default, forever, until_transcribed, days}`. Global budget (default 20 GiB) with oldest-first eviction that skips `forever` meetings and *warns* rather than silently evicting when only `forever` remains. **Transcripts are never subject to retention** — text is kept forever (~250 MB/year including the FTS index).
 
+> **Three corrections (2026-08-11), from implementing it.**
+>
+> **1. Eviction must also skip un-transcribed audio, and this section does not say so.** It only exempts `forever`. But evicting a meeting whose transcript has not reached `ready` destroys **the only copy** — it is the single irreversible action the sweeper can take, and the audio is exactly what would let the user recover. Skip anything not `ready`, with its own warning rather than a silent pass.
+>
+> **2. `days(n)` had no stated anchor.** Meeting start or transcript-ready? Anchor every policy to **transcript-ready**: the default is already phrased that way, and it makes `until_transcribed` exactly `days(0)`. Anchoring to meeting start would let `days(1)` expire before the transcript existed.
+>
+> **3. The 1.7 GB figure is right only for *active* days, and the naive reading is ~45% low.** 30 × 81.2 MB/day is 2.4 GB. The steady state holds only if the yearly total is scaled by 30/365 — 250 working days is about 20.5 days inside any 30-day window. State the derivation, or the number reads as arithmetic that does not check out.
+
 ### 9.6 "Delete this meeting" — exact semantics
 
 One transactional Rust operation, not a UI-level DELETE. It must: cascade-delete all child rows; **fire the FTS delete triggers** (a contentless FTS index still holds the tokens) — *see the correction below, this is necessary and not sufficient*; unlink `media/<yyyy>/<mm>/<meeting_id>/` recursively **including `raw-<provider>.json.zst`, which contains the full transcript and is the most commonly forgotten artifact**; delete cached exports; cancel queued integration runs; insert a tombstone carrying id + kind + timestamp and nothing else; then `PRAGMA incremental_vacuum` and `PRAGMA wal_checkpoint(TRUNCATE)` so freed pages leave the file.
