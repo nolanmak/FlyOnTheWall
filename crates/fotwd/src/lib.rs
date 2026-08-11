@@ -6,6 +6,7 @@
 
 #![warn(missing_docs)]
 
+pub mod persist;
 pub mod session;
 
 pub use session::{SessionOutcome, Transcription};

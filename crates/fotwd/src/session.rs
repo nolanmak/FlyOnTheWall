@@ -44,6 +44,12 @@ const IDLE_POLL: Duration = Duration::from_millis(50);
 pub struct SessionOutcome {
     /// Where the session lives on disk.
     pub dir: PathBuf,
+    /// Wall clock when capture actually began, in epoch milliseconds.
+    ///
+    /// Carried explicitly rather than stamped at persist time: those differ by
+    /// the length of the meeting, and using the later one makes every
+    /// recording show a duration of zero.
+    pub started_at_ms: u64,
     /// Interleaved samples written for the system leg.
     pub system_samples: u64,
     /// Interleaved samples written for the mic leg.
@@ -154,6 +160,7 @@ pub async fn run(
     let wal = SessionWal::create(root, sys_format.sample_rate_hz, sys_format.channels)
         .map_err(|e| format!("could not create the session: {e}"))?;
     let dir = wal.dir().to_path_buf();
+    let started_at_ms = wal.manifest().started_at_ms;
 
     // The STT side, if configured. `write` is non-blocking, so the pump can
     // feed it without ever waiting on the network.
@@ -223,6 +230,7 @@ pub async fn run(
 
     Ok(SessionOutcome {
         dir,
+        started_at_ms,
         system_samples,
         mic_samples,
         silent_buffers: silent.load(Ordering::Relaxed),
