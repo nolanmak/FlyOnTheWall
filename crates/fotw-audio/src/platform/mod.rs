@@ -19,11 +19,24 @@ pub mod linux;
 
 pub use crate::platform::stub::StubPlatform;
 
+#[cfg(target_os = "macos")]
+pub use crate::platform::macos::MacOsPlatform;
+
 /// The backend for the OS this binary was built for.
 ///
-/// Today every OS resolves to [`StubPlatform`], which refuses to open anything
-/// with a typed error. Real capture lands per-platform behind this function,
-/// so callers never gain an `#[cfg]`.
+/// Callers never gain an `#[cfg]`: the type differs per platform but the
+/// trait does not.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn host() -> MacOsPlatform {
+    MacOsPlatform::new()
+}
+
+/// The backend for the OS this binary was built for.
+///
+/// Windows and Linux resolve to [`StubPlatform`], which refuses to open
+/// anything with a typed error rather than recording silence.
+#[cfg(not(target_os = "macos"))]
 #[must_use]
 pub fn host() -> StubPlatform {
     StubPlatform::new()

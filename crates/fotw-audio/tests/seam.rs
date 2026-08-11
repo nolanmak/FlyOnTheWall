@@ -228,11 +228,11 @@ fn default_caps_advertise_nothing() {
     assert!(!caps.needs_consent_for_system);
 }
 
-/// The stub compiled into this build refuses to open anything, with a typed
-/// error, on every OS. (The real macOS tap is a separate issue.)
+/// A platform with no backend refuses to open anything, with a typed error,
+/// rather than pretending to succeed and recording silence.
 #[test]
-fn the_host_platform_stub_is_honest_about_being_a_stub() {
-    let platform = fotw_audio::platform::host();
+fn the_stub_platform_is_honest_about_being_a_stub() {
+    let platform = fotw_audio::platform::StubPlatform::new();
     assert_eq!(platform.caps(), PlatformCaps::default());
     assert!(platform.mics().is_empty());
     assert!(platform.capturable_apps().is_empty());
@@ -249,4 +249,55 @@ fn the_host_platform_stub_is_honest_about_being_a_stub() {
 
     // events() must exist and be well-behaved even on a stub.
     let _rx: std::sync::mpsc::Receiver<PlatformEvent> = platform.events();
+}
+
+/// `host()` returns whatever backend this build actually has, and the caller
+/// never gains a `#[cfg]` — only the capabilities differ.
+#[test]
+fn the_host_platform_advertises_what_this_build_can_do() {
+    let platform = fotw_audio::platform::host();
+    let caps = platform.caps();
+
+    // events() is seam rule 5 and must exist on every backend.
+    let _rx: std::sync::mpsc::Receiver<PlatformEvent> = platform.events();
+
+    #[cfg(target_os = "macos")]
+    {
+        // Core Audio process taps: whole-system mixdown, exclude-based
+        // scoping, and a consent grant that genuinely exists.
+        assert!(caps.system_mix);
+        assert!(caps.exclude_scope);
+        assert!(caps.needs_consent_for_system);
+
+        // The grant cannot be queried — there is no API — and a denial is
+        // delivered as silence. Reporting anything definite here would make
+        // onboarding lie, so the only honest answer is Unobservable, and the
+        // real check is a round-trip capture (`fotw doctor`).
+        assert_eq!(
+            platform.permission(fotw_audio::Permission::SystemAudio),
+            fotw_audio::PermissionState::Unobservable
+        );
+
+        // Per-app scoping is not wired up. Advertising it would make the UI
+        // offer a control that silently captures everything.
+        assert!(!caps.app_scoped);
+        let err = platform
+            .open_system(
+                SystemScope::Apps(vec![fotw_audio::AppRef::Pid(1)]),
+                FormatRequest::any(),
+            )
+            .unwrap_err();
+        assert!(err.is_unsupported());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        assert_eq!(caps, PlatformCaps::default());
+        assert!(
+            platform
+                .open_system(SystemScope::DefaultOutputMix, FormatRequest::any())
+                .unwrap_err()
+                .is_unsupported()
+        );
+    }
 }
