@@ -15,7 +15,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use fotw_audio::{AudioPlatform, DeviceId, FormatRequest, SystemScope, platform};
+use fotw_store::{Db, DbKey};
 use fotw_stt::{DeepgramStreamConfig, Source, deepgram::DeepgramConfig};
+use fotwd::persist;
 use fotwd::session::{self, Transcription};
 
 #[tokio::main]
@@ -27,8 +29,12 @@ async fn main() -> ExitCode {
             let root = args.get(2).map_or_else(default_root, PathBuf::from);
             record(root, secs).await
         }
+        Some("list") => {
+            let root = args.get(1).map_or_else(default_root, PathBuf::from);
+            list(root)
+        }
         _ => {
-            eprintln!("usage: fotwd record [seconds] [dir]");
+            eprintln!("usage: fotwd <record [seconds] [dir] | list [dir]>");
             eprintln!();
             eprintln!("  Set DEEPGRAM_API_KEY to transcribe as well as record.");
             eprintln!("  Without it the meeting is still recorded and can be");
@@ -128,6 +134,17 @@ async fn record(root: PathBuf, seconds: u64) -> ExitCode {
                 println!("  ───────────────────────────────────────────");
             }
 
+            // Persist AFTER the WAL is finalized, never instead of it. The
+            // database is an index over the session directory: if this fails
+            // the meeting is still on disk and can be imported again.
+            match open_db(&root).and_then(|mut db| {
+                persist::persist_session(&mut db, &outcome, &default_title())
+                    .map_err(|e| format!("{e}"))
+            }) {
+                Ok(id) => println!("  meeting    : {id}"),
+                Err(e) => eprintln!("  ! could not add to the library: {e}"),
+            }
+
             println!();
             println!("  ✓ {}", outcome.dir.display());
 
@@ -171,4 +188,52 @@ fn textwrap(s: &str, width: usize) -> Vec<String> {
         out.push("(no speech detected)".into());
     }
     out
+}
+
+/// Open the library beside the sessions.
+///
+/// The key is a placeholder until `fotw-secrets` lands: a real build takes it
+/// from the OS keychain. Recorded here rather than hidden so the gap is
+/// obvious in review.
+fn open_db(root: &std::path::Path) -> Result<Db, String> {
+    let dir = root.parent().unwrap_or(root);
+    let key = DbKey::from_bytes([0u8; 32]);
+    Db::open(dir.join("db.sqlite3"), &key).map_err(|e| format!("{e}"))
+}
+
+fn default_title() -> String {
+    format!(
+        "Untitled recording — {}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    )
+}
+
+fn list(root: PathBuf) -> ExitCode {
+    let mut db = match open_db(&root) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("fotwd: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let meetings = match db.meetings().list(50, 0) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("fotwd: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if meetings.is_empty() {
+        println!("  (no meetings yet)");
+        return ExitCode::SUCCESS;
+    }
+    println!("  {:<38}  {:<9}  {:>7}  title", "id", "state", "secs");
+    for m in &meetings {
+        let secs = m.duration_ms.unwrap_or(0) / 1000;
+        println!("  {:<38}  {:<9}  {secs:>7}  {}", m.id, m.state, m.title);
+    }
+    ExitCode::SUCCESS
 }

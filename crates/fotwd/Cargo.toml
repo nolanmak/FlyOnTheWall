@@ -10,6 +10,7 @@ repository.workspace = true
 fotw-audio = { path = "../fotw-audio" }
 fotw-pipeline = { path = "../fotw-pipeline" }
 fotw-stt = { path = "../fotw-stt" }
+fotw-store = { path = "../fotw-store" }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }
 

@@ -266,6 +266,7 @@ version = "0.1.0"
 dependencies = [
  "fotw-audio",
  "fotw-pipeline",
+ "fotw-store",
  "fotw-stt",
  "serde_json",
  "tokio",
