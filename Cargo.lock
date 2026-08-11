@@ -259,6 +259,12 @@ dependencies = [
 [[package]]
 name = "fotw-summarize"
 version = "0.1.0"
+dependencies = [
+ "fotw-stt",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "fotwd"
