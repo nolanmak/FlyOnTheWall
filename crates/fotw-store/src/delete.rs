@@ -53,6 +53,15 @@ impl Db {
     ///    transcript is still in `db.sqlite3-wal` until a checkpoint. The
     ///    trailing `wal_checkpoint(TRUNCATE)` is what makes the WAL zero-length
     ///    again.
+    /// 5. **The FTS5 indexes.** Since migration 0002 the transcript is also
+    ///    tokenised into `segments_fts`, and an FTS5 retraction is *logical* by
+    ///    default: it appends delete markers, and a delete marker carries the
+    ///    term it retracts, so retracting a transcript writes a second copy of
+    ///    its words rather than removing the first. Migration 0002 turns
+    ///    FTS5's `'secure-delete'` on for all four indexes, which makes the
+    ///    retraction rewrite the affected leaf pages instead. Nothing extra
+    ///    happens here — but the pages it frees are why steps 3 and 4 have to
+    ///    run *after* the delete rather than being a separate maintenance job.
     ///
     /// A tombstone carrying id, kind and timestamp — and nothing else, no
     /// title, no snippet, no path — is written in the same transaction, so a
@@ -117,6 +126,16 @@ pub(crate) fn delete_meeting_in(
 
     let (removed_media, missing_media) = unlink_media(root, meeting_id, &rel_paths)?;
 
+    // The FTS5 indexes need no step of their own here: `'secure-delete'` (set
+    // in migration 0002) means the triggers above already rewrote the affected
+    // leaf pages rather than appending delete markers. `reclaim` is what makes
+    // the pages they freed leave the file, which is why it comes last.
+    //
+    // The alternative — leaving the retraction logical and running
+    // `INSERT INTO t(t) VALUES('optimize')` here — also works and is what an
+    // earlier draft of this did. It was dropped because `optimize` rewrites the
+    // whole index, so deleting one meeting from a 20,000-meeting library would
+    // cost time proportional to the library rather than to the meeting.
     reclaim(conn)?;
 
     Ok(DeleteOutcome {
@@ -260,6 +279,22 @@ mod tests {
 
     const PHRASE: &str = "zarquon-fizzbin-quantum-hedgehog";
 
+    /// A second needle, and the two reasons it looks the way it does.
+    ///
+    /// First, [`PHRASE`] is four tokens to the tokenizer, so it never appears
+    /// as one contiguous byte run inside an FTS5 index; scanning for it says
+    /// nothing about whether the index kept the transcript. This one is a
+    /// single token, so it is stored verbatim in `segments_fts_data` for as
+    /// long as the index holds it.
+    ///
+    /// Second, it deliberately shares no prefix with any other word in the
+    /// fixture. FTS5 stores terms prefix-compressed against their predecessor
+    /// on the page, so `zarquonfizzbinquantumhedgehog` sitting after `zarquon`
+    /// is written as "reuse 7 bytes, then `fizzbin…`" and the full token never
+    /// appears in the file at all — a byte scan for it would then pass against
+    /// an index that had kept every word.
+    const TOKEN: &str = "vorpalsnickersnack";
+
     /// Build an *unencrypted* library, seed it, delete the meeting, and scan
     /// the raw file bytes.
     ///
@@ -312,7 +347,7 @@ mod tests {
                     i,
                     i * 1000,
                     i * 1000 + 900,
-                    format!("segment {i}: {PHRASE} and more words to fill the page"),
+                    format!("segment {i}: {PHRASE} {TOKEN} and more words to fill the page"),
                 ])
                 .unwrap();
             }
@@ -321,15 +356,40 @@ mod tests {
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .unwrap();
 
-        // Sanity: the phrase really is in the file before the delete, so a
+        // Sanity: both needles really are in the file before the delete, so a
         // zero-hit result afterwards means something.
+        for needle in [PHRASE, TOKEN] {
+            assert!(
+                file_contains(&path, needle.as_bytes()),
+                "fixture is broken: `{needle}` should be in the plaintext file before deletion"
+            );
+        }
+        // And specifically that the single token reached the FTS index, which
+        // is the artifact the second assertion in the test below is about.
         assert!(
-            file_contains(&path, PHRASE.as_bytes()),
-            "fixture is broken: the phrase should be in the plaintext file before deletion"
+            fts_data_holds(&db, TOKEN),
+            "fixture is broken: the token should be in segments_fts_data before deletion"
         );
 
         let outcome = db.delete_meeting(&meeting_id).unwrap();
         (path, outcome)
+    }
+
+    /// True while the raw bytes of `needle` are sitting in the FTS index's
+    /// `%_data` shadow blobs.
+    ///
+    /// Deliberately a byte scan of the shadow table rather than a `MATCH`: a
+    /// query stops returning a retracted row immediately, so `MATCH` would go
+    /// quiet long before the words left the file.
+    fn fts_data_holds(db: &Db, needle: &str) -> bool {
+        db.conn()
+            .query_row(
+                "SELECT count(*) FROM segments_fts_data WHERE instr(CAST(block AS TEXT), ?1) > 0",
+                params![needle],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            > 0
     }
 
     fn file_contains(path: &Path, needle: &[u8]) -> bool {
@@ -347,12 +407,50 @@ mod tests {
 
         for suffix in ["", "-wal", "-shm"] {
             let p = PathBuf::from(format!("{}{suffix}", path.display()));
-            assert!(
-                !file_contains(&p, PHRASE.as_bytes()),
-                "transcript text survived deletion in {}",
-                p.display()
-            );
+            for needle in [PHRASE, TOKEN] {
+                assert!(
+                    !file_contains(&p, needle.as_bytes()),
+                    "`{needle}` survived deletion in {}",
+                    p.display()
+                );
+            }
         }
+    }
+
+    /// The half of §9.6 that migration 0002 made non-vacuous.
+    ///
+    /// Before there was an FTS index, "no fragment of the transcript survives"
+    /// was true because there was nowhere for a fragment to survive. There is
+    /// now, and it is a place the source-table scan above cannot see into: an
+    /// FTS5 retraction appends *delete markers*, and a delete marker carries
+    /// the term it retracts — so a delete that fires every trigger correctly
+    /// still leaves two copies of every word in `segments_fts_data` until
+    /// something compacts them.
+    ///
+    /// Split out from the scan above so that a failure names the cause. A
+    /// missing `optimize` and a missing trigger both fail the file scan; only
+    /// this one distinguishes them.
+    #[test]
+    fn deleting_a_meeting_compacts_its_words_out_of_the_fts_shadow_tables() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (path, outcome) = seed_and_delete(dir.path());
+        assert!(outcome.existed);
+
+        // Reopened rather than kept: the point is what is on disk afterwards.
+        let db = Db::open_plaintext(&path).unwrap();
+
+        assert!(
+            !fts_data_holds(&db, TOKEN),
+            "the FTS index still holds the deleted transcript's words; \
+             the delete triggers fired but nothing collapsed the delete markers"
+        );
+        let indexed: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM segments_fts_docsize", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(indexed, 0, "segments_fts still has indexed documents");
     }
 
     #[test]
