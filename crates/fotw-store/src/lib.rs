@@ -1,1 +1,50 @@
-//! `fotw-store` — see docs/REQUIREMENTS.md
+//! `fotw-store` — the SQLCipher-encrypted library every meeting lives in.
+//!
+//! See docs/REQUIREMENTS.md 9. The shape of this crate follows three rules
+//! from that section, each of which is a rule because the alternative fails
+//! quietly rather than loudly:
+//!
+//! 1. **[`Db::open`] is the only way to get a connection.** The bootstrap
+//!    pragmas in §9.1 are all silent-on-omission: a connection that skipped
+//!    `PRAGMA foreign_keys` still works, it just stops cascading deletes.
+//! 2. **Nothing here is mutated in place that two devices could both rewrite**
+//!    (§9.7). Summaries are versioned rows, transcripts accumulate rather than
+//!    replace, and deletes leave tombstones. Sync is a non-goal; a schema that
+//!    forecloses it is not.
+//! 3. **Deleting means the bytes are gone** (§9.6). [`Db::delete_meeting`] is
+//!    one transaction plus a vacuum and a checkpoint, and its acceptance test
+//!    greps the raw file for the transcript text.
+//!
+//! ```no_run
+//! use fotw_store::{Db, DbKey, NewMeeting};
+//!
+//! # fn main() -> Result<(), fotw_store::StoreError> {
+//! let key = DbKey::from_bytes([0u8; 32]); // real ones come from the keychain
+//! let mut db = Db::open("/tmp/fotw/db.sqlite3", &key)?;
+//!
+//! let id = db.meetings().create(NewMeeting::new("device-1", "Europe/Berlin"))?;
+//! let meeting = db.meetings().get(&id)?;
+//! assert_eq!(meeting.state, "recording");
+//! # Ok(())
+//! # }
+//! ```
+
+#![warn(missing_docs)]
+
+mod db;
+mod delete;
+mod error;
+mod ids;
+mod key;
+mod migrations;
+mod models;
+mod repo;
+
+pub use crate::db::Db;
+pub use crate::delete::DeleteOutcome;
+pub use crate::error::{Result, StoreError};
+pub use crate::ids::{new_id, now_ms};
+pub use crate::key::DbKey;
+pub use crate::migrations::LATEST_SCHEMA_VERSION;
+pub use crate::models::{Meeting, NewMeeting, NewSegment, NewSummary, NoteAnchor, Summary};
+pub use crate::repo::MeetingRepo;
