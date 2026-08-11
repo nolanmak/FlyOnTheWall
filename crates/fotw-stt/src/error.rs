@@ -109,11 +109,9 @@ impl SttErrorClass {
             | Self::Network
             | Self::Server
             | Self::SessionLimit => true,
-            Self::Auth
-            | Self::Quota
-            | Self::BadRequest
-            | Self::Unsupported
-            | Self::AudioFormat => false,
+            Self::Auth | Self::Quota | Self::BadRequest | Self::Unsupported | Self::AudioFormat => {
+                false
+            }
         }
     }
 

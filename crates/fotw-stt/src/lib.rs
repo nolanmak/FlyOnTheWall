@@ -16,6 +16,7 @@
 
 pub mod capabilities;
 pub mod clock;
+pub mod deepgram;
 pub mod error;
 pub mod speaker;
 pub mod store;

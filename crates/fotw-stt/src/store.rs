@@ -205,10 +205,12 @@ impl SegmentStore {
     /// that had already been finalized.
     pub fn upsert(&mut self, segment: TranscriptSegment) -> StoreOutcome {
         match self.by_id.get(&segment.id) {
-            Some(existing) if segment.revision <= existing.revision => StoreOutcome::RejectedStale {
-                kept_revision: existing.revision,
-                rejected_revision: segment.revision,
-            },
+            Some(existing) if segment.revision <= existing.revision => {
+                StoreOutcome::RejectedStale {
+                    kept_revision: existing.revision,
+                    rejected_revision: segment.revision,
+                }
+            }
             Some(existing) => {
                 let previous_revision = existing.revision;
                 self.by_id.insert(segment.id.clone(), segment);

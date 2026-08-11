@@ -169,8 +169,17 @@ impl ArrivalEstimator {
         TimeSpan::estimated(start_ms, end_ms)
     }
 
+    /// Move the anchor forward to a known-good session position.
+    ///
+    /// Called whenever the provider *did* supply a timestamp, so that if it
+    /// later stops supplying them the synthesized spans resume from real time
+    /// rather than from the last thing we guessed. Never moves backwards.
+    pub fn advance_to(&mut self, session_ms: u64) {
+        self.last_end_ms = self.last_end_ms.max(session_ms);
+    }
+
     /// Re-anchor after a reconnect so synthesized spans stay continuous.
     pub fn reconnected_at(&mut self, session_ms: u64) {
-        self.last_end_ms = self.last_end_ms.max(session_ms);
+        self.advance_to(session_ms);
     }
 }

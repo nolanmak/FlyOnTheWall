@@ -31,7 +31,13 @@ const ALL_CLASSES: [SttErrorClass; 10] = [
 fn the_taxonomy_is_exactly_the_ten_classes_in_the_spec() {
     let tags: Vec<String> = ALL_CLASSES
         .iter()
-        .map(|class| serde_json::to_value(class).unwrap().as_str().unwrap().to_string())
+        .map(|class| {
+            serde_json::to_value(class)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
         .collect();
 
     assert_eq!(
@@ -181,14 +187,24 @@ fn retryable_is_derived_from_the_class_but_can_be_narrowed_by_an_adapter() {
 
     assert!(!permanent.retryable);
     assert_eq!(permanent.failover_policy(), FailoverPolicy::Backoff);
-    assert_eq!(permanent.detail.as_deref(), Some("the model id no longer exists"));
+    assert_eq!(
+        permanent.detail.as_deref(),
+        Some("the model id no longer exists")
+    );
 }
 
 #[test]
 fn an_error_displays_as_its_user_facing_message() {
-    let error = SttError::new(SttErrorClass::Auth, "deepgram", "Your Deepgram key was rejected.");
+    let error = SttError::new(
+        SttErrorClass::Auth,
+        "deepgram",
+        "Your Deepgram key was rejected.",
+    );
 
-    assert_eq!(error.to_string(), "deepgram: Your Deepgram key was rejected.");
+    assert_eq!(
+        error.to_string(),
+        "deepgram: Your Deepgram key was rejected."
+    );
     // It is a real std::error::Error, so `?` works across the adapter boundary.
     let as_std: &dyn std::error::Error = &error;
     assert!(as_std.to_string().contains("deepgram"));

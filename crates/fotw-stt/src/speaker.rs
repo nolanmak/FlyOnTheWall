@@ -39,10 +39,13 @@ impl SpeakerRegistry {
     /// The normalized `Sn` label for a provider label, assigning one if new.
     pub fn label_for(&mut self, provider_label: &str) -> String {
         let next = self.order.len();
-        let index = *self.index.entry(provider_label.to_string()).or_insert_with(|| {
-            self.order.push(provider_label.to_string());
-            next
-        });
+        let index = *self
+            .index
+            .entry(provider_label.to_string())
+            .or_insert_with(|| {
+                self.order.push(provider_label.to_string());
+                next
+            });
         format!("S{index}")
     }
 

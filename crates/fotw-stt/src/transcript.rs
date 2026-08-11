@@ -19,7 +19,7 @@ thread_local! {
     /// minted in the same millisecond get independent random tails and can come
     /// out in either order. Partials arrive many per second, so that is not a
     /// theoretical case — it would scramble the transcript's ordering key.
-    static ULID_GENERATOR: RefCell<ulid::Generator> = RefCell::new(ulid::Generator::new());
+    static ULID_GENERATOR: RefCell<ulid::Generator> = const { RefCell::new(ulid::Generator::new()) };
 }
 
 /// Mint the next segment ULID, monotonic within this thread.

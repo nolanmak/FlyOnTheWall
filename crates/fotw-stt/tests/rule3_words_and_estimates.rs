@@ -13,7 +13,8 @@ use fotw_stt::{ArrivalEstimator, Source, TimeSpan, TimestampSource, TranscriptSe
 
 #[test]
 fn a_segment_with_no_words_is_legal_and_round_trips() {
-    let mut segment = TranscriptSegment::new("session", Source::System, "openai", "gpt-live-transcribe");
+    let mut segment =
+        TranscriptSegment::new("session", Source::System, "openai", "gpt-live-transcribe");
     segment.text = "so that's the plan for Q3".to_string();
     segment.start_ms = 4_000;
     segment.end_ms = 6_400;

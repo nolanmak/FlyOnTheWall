@@ -8,7 +8,7 @@
 //! dense. Downstream (rename-once-apply-retroactively, the augment prompt, the
 //! export) assumes `S0..Sn`, so the mapping happens here, once.
 
-use fotw_stt::{SpeakerNormalizer, SpeakerRegistry, Source};
+use fotw_stt::{Source, SpeakerNormalizer, SpeakerRegistry};
 
 #[test]
 fn provider_labels_map_to_dense_s_indices_in_first_appearance_order() {
