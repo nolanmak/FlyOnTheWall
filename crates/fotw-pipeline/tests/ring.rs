@@ -103,7 +103,7 @@ fn data_survives_a_producer_consumer_thread_split() {
 
 #[test]
 fn a_dropped_consumer_is_visible_to_the_producer() {
-    let (mut producer, consumer) = AudioRing::with_capacity_frames(512);
+    let (producer, consumer) = AudioRing::with_capacity_frames(512);
     drop(consumer);
     assert!(
         producer.is_abandoned(),
