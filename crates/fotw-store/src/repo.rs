@@ -179,6 +179,26 @@ impl MeetingRepo<'_> {
         Ok(id)
     }
 
+    /// The primary transcript for a meeting, if it has one.
+    ///
+    /// `Ok(None)` means the meeting genuinely has no transcript yet — a normal
+    /// state, since recording without a provider configured is supported. A
+    /// real SQLite failure stays an `Err`: two callers previously hand-rolled
+    /// this query with `.ok()`, which rendered a database error as "no
+    /// transcript" and would have shown an empty meeting instead of a fault.
+    pub fn primary_transcript_id(&self, meeting_id: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        self.db
+            .conn()
+            .query_row(
+                "SELECT id FROM transcripts WHERE meeting_id = ?1 AND is_primary = 1",
+                params![meeting_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Promote a transcript to primary, demoting the incumbent atomically.
     pub fn set_primary_transcript(&mut self, transcript_id: &str) -> Result<()> {
         let now = now_ms();

@@ -157,6 +157,18 @@ dev-sign: (bundle "debug")
     codesign --force --options runtime --timestamp=none \
         --entitlements packaging/entitlements.plist \
         --sign "{{dev_ident}}" "{{app}}"
+    # Also sign the bare CLI binaries. macOS keys a keychain item's ACL to the
+    # calling code's signature, so an ad-hoc-signed CLI presents a NEW identity
+    # on every rebuild and the system raises an approval dialog each time --
+    # which, run from a script, from launchd or over SSH, blocks forever with
+    # no output at all.
+    for bin in target/debug/fotwd target/debug/fotw; do
+        if [ -f "$bin" ]; then
+            codesign --force --options runtime --timestamp=none \
+                --entitlements packaging/entitlements.plist \
+                --sign "{{dev_ident}}" "$bin"
+        fi
+    done
     echo ""
     echo "Designated Requirement (stable across rebuilds if this looks like an identifier, not a cdhash):"
     codesign -d -r- "{{app}}" 2>&1 | sed 's/^/    /'

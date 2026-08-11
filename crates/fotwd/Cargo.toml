@@ -11,6 +11,7 @@ fotw-audio = { path = "../fotw-audio" }
 fotw-pipeline = { path = "../fotw-pipeline" }
 fotw-stt = { path = "../fotw-stt" }
 fotw-summarize = { path = "../fotw-summarize" }
+fotw-web = { path = "../fotw-web" }
 fotw-secrets = { path = "../fotw-secrets" }
 fotw-store = { path = "../fotw-store" }
 serde = { workspace = true }

@@ -34,6 +34,16 @@ pub enum Origin {
     Generated,
 }
 
+/// How long to wait for a keychain read before giving up.
+///
+/// Not a performance guard — a correctness one. macOS keys a keychain item's
+/// ACL to the calling code's signature, so an ad-hoc-signed binary presents a
+/// *new identity on every rebuild* and the system raises a modal approval
+/// dialog. Under launchd, in CI, or over SSH there is nobody to click it, and
+/// the read blocks forever with no output and no error. A daemon that hangs
+/// silently on startup is worse than one that refuses to start.
+pub const KEYCHAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Open the OS keychain, or explain why it is unavailable.
 ///
 /// Never degrades to a plaintext store. On Linux with no Secret Service this
@@ -49,7 +59,7 @@ pub fn keystore() -> Result<OsKeyStore, SecretsError> {
 /// Returns the key and how it was obtained, so the caller can prompt for a
 /// Recovery Key the first time.
 pub fn db_key(store: &dyn KeyStore) -> Result<(DbKey, Origin), SecretsError> {
-    match store.get(SecretKey::DbMasterKey) {
+    match read_with_timeout(store, SecretKey::DbMasterKey) {
         Ok(secret) => {
             let bytes = decode_hex(secret.expose()).ok_or_else(|| {
                 SecretsError::InvalidKeyMaterial(
@@ -75,8 +85,15 @@ pub fn db_key(store: &dyn KeyStore) -> Result<(DbKey, Origin), SecretsError> {
 
 /// The Deepgram API key, from the keychain or the environment.
 pub fn deepgram_key(store: &dyn KeyStore) -> Option<(SecretString, Origin)> {
-    if let Ok(secret) = store.get(SecretKey::ApiKey(Provider::Deepgram)) {
-        return Some((secret, Origin::Keychain));
+    match read_with_timeout(store, SecretKey::ApiKey(Provider::Deepgram)) {
+        Ok(secret) => return Some((secret, Origin::Keychain)),
+        Err(e @ SecretsError::Platform { .. }) => {
+            // Say it out loud rather than falling through to the environment:
+            // silently using a different key source after a keychain stall is
+            // how a user ends up debugging the wrong thing.
+            eprintln!("  ! keychain: {e}");
+        }
+        Err(_) => {}
     }
     match std::env::var("DEEPGRAM_API_KEY") {
         Ok(v) if !v.trim().is_empty() => Some((SecretString::from_pasted(v), Origin::Environment)),
@@ -129,6 +146,40 @@ fn decode_hex(s: &str) -> Option<[u8; 32]> {
         out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
     }
     Some(out)
+}
+
+/// Read one secret with the deadline applied.
+///
+/// The `KeyStore` trait is synchronous by design — keys are read on demand and
+/// dropped — so the deadline lives here rather than in the trait, and only the
+/// OS-backed path can actually stall.
+fn read_with_timeout(store: &dyn KeyStore, key: SecretKey) -> Result<SecretString, SecretsError> {
+    let account = key.account();
+    // The in-memory store used by tests answers instantly; only the OS store
+    // can block, and it is the one this guard exists for.
+    let result = std::thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        scope.spawn(move || {
+            let _ = tx.send(store.get(key));
+        });
+        rx.recv_timeout(KEYCHAIN_TIMEOUT)
+    });
+    match result {
+        Ok(v) => v,
+        Err(_) => Err(SecretsError::Platform {
+            operation: "reading",
+            key: account,
+            detail: format!(
+                "no answer within {}s. This usually means macOS is showing an \
+                 approval dialog you cannot see: an ad-hoc-signed build presents a \
+                 NEW code identity on every rebuild, so the item's ACL is asked \
+                 again each time. Build through `just dev-sign`, which uses a \
+                 stable identity, or approve the dialog once in a foreground \
+                 session.",
+                KEYCHAIN_TIMEOUT.as_secs()
+            ),
+        }),
+    }
 }
 
 #[cfg(test)]
