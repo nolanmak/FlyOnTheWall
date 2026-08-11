@@ -2,7 +2,7 @@
 
 An open-source, local-first meeting recorder. Captures system audio + microphone with **no bot joining the call**, transcribes with **your own API key** (Deepgram, ElevenLabs, OpenAI, or fully on-device), and turns the sparse notes you typed during the call into a grounded, citation-backed document — all stored in an encrypted SQLite database on your own disk.
 
-> **Status: scoping.** No code yet. The full requirements and technical design live in **[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)**.
+> **Status: early build.** The platform seam and the packaging pipeline are in and green; capture, STT and storage are not written yet. Full requirements and technical design in **[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)**; work is tracked in [issues](https://github.com/nolanmak/FlyOnTheWall/issues).
 
 ## The three commitments
 
@@ -21,6 +21,25 @@ Pure Rust. A daemon (`fotwd`) owns capture, STT, and storage and serves a web UI
 ## Scope
 
 macOS 14.4+ first (Core Audio process taps, Developer ID, no Mac App Store). The platform seam for Windows and Linux is built on day one and compiles in CI, but those implementations are M4.
+
+## Building
+
+```sh
+xcode-select --install          # Command Line Tools — Xcode.app is NOT required
+rustup toolchain install 1.95.0 # pinned in rust-toolchain.toml
+just ci                         # fmt + clippy + tests + the platform-seam guard
+```
+
+`just --list` shows the rest. The whole pipeline is testable with **no audio device and no GUI** — `FileAudioSource` replays a WAV fixture through the real seam at a speed multiplier, so a 90-minute meeting runs inside a CI step.
+
+### Running it on macOS
+
+```sh
+just dev-sign   # persisted self-signed identity, stable across rebuilds
+just run        # launches the .app via LaunchServices
+```
+
+**Never run `./target/debug/fotwd` directly.** macOS attributes the TCC grant to the *responsible process*, so a binary launched from a terminal records under Ghostty/iTerm/Terminal's identity, not ours — and an unsigned binary can silently inherit the terminal's existing grant and appear to work while producing nothing for your users. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
