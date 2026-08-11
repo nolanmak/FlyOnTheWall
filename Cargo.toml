@@ -25,6 +25,12 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ulid = "1"
+# Lock-free SPSC ring for the IOProc -> pump handoff. Chosen over ringbuf
+# because its write_chunk_uninit/commit_all API makes the real-time contract
+# explicit at the call site, and over crossbeam because ArrayQueue is MPMC
+# with per-slot atomics and no bulk-memcpy path -- the wrong shape for audio
+# blocks. See docs/REQUIREMENTS.md 5.1.
+rtrb = "0.3"
 
 [profile.release]
 lto = "thin"
