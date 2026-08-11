@@ -31,6 +31,12 @@ ulid = "1"
 # with per-slot atomics and no bulk-memcpy path -- the wrong shape for audio
 # blocks. See docs/REQUIREMENTS.md 5.1.
 rtrb = "0.3"
+# Shared by the STT transport and (soon) the daemon's HTTP/WS server, so the
+# version lives here. tokio-tungstenite stays local to fotw-stt: it is the only
+# crate that opens a socket to a provider, and its TLS choice is load-bearing
+# there for a licensing reason documented at that call site.
+tokio = { version = "1", default-features = false }
+futures-util = { version = "0.3", default-features = false }
 
 [profile.release]
 lto = "thin"
