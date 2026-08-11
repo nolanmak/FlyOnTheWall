@@ -14,12 +14,16 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod capabilities;
 pub mod clock;
+pub mod error;
 pub mod speaker;
 pub mod store;
 pub mod transcript;
 
+pub use capabilities::{CustomVocabulary, FeatureAvailability, RetentionControl, SttCapabilities};
 pub use clock::{ArrivalEstimator, SessionClock, TimeSpan, seconds_to_ms};
+pub use error::{FailoverPolicy, SttError, SttErrorClass};
 pub use speaker::{SpeakerNormalizer, SpeakerRegistry};
 pub use store::{
     CountingIdFactory, SegmentIdFactory, SegmentStore, StoreOutcome, UlidFactory, UtteranceTracker,
