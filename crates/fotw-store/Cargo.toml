@@ -7,3 +7,28 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# SQLCipher, vendored together with OpenSSL, so a build never depends on
+# whatever libsqlite3 the host happens to ship (docs/REQUIREMENTS.md 9.1).
+# The vendored build still defines -DSQLITE_ENABLE_FTS5, so encryption costs
+# us nothing in search capability.
+rusqlite = { version = "0.40.2", features = [
+  "bundled-sqlcipher-vendored-openssl",
+  "backup",
+  "blob",
+  "functions",
+  "hooks",
+  "serde_json",
+  "uuid",
+  "load_extension",
+] }
+rusqlite_migration = "2.6"
+# v7: RFC 9562 time-ordered UUIDs. They index like an autoincrement without
+# being one, which is what keeps the door open for sync (§9.7 invariant 1).
+uuid = { version = "1", features = ["v7"] }
+
+[dev-dependencies]
+tempfile = "3"
