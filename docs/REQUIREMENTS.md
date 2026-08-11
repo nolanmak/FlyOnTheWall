@@ -918,7 +918,11 @@ CREATE TABLE tombstones (
 
 ### 9.4 Search
 
-Four FTS5 external-content tables (`segments`, `notes`, `summaries`, `meetings`) kept in sync by AFTER INSERT/UPDATE/DELETE triggers using the documented `'delete'` command form. Tokenizer `unicode61 remove_diacritics 2` everywhere — **not `porter` on transcripts**, which mangles product names and acronyms. Rank with `bm25()`, preview with `snippet()`, weight titles and notes above transcript body. Ship a `search:rebuild` command: every derived index must be reconstructible from source tables alone.
+Four FTS5 external-content tables (`segments`, `notes`, `summaries`, `meetings`) kept in sync by AFTER INSERT/UPDATE/DELETE triggers using the documented `'delete'` command form. Tokenizer `unicode61 remove_diacritics 2` everywhere — **not `porter` on transcripts**, which mangles product names and acronyms. Rank with `bm25()`, preview with `snippet()`, weight titles and notes above transcript body.
+
+> **Correction (2026-08-11).** The weighting **cannot be expressed as `bm25()` column weights**: each index has one content column, and the four are different corpora with incomparable IDF scales — a term rare among 150,000 segments scores far higher than the same term among 1,250 titles, so the scores were never on a common ruler. Apply a multiplier per index instead, defaulting to 8/4/2/1.
+>
+> Also, **do not render `snippet()` in the ranking statement.** On an external-content table it must re-fetch and re-tokenize the source row, so a single-statement union renders ~10,000 previews to display 50 — measured **p95 371 ms** against a 100 ms budget. Rank from the index alone, then preview only the `LIMIT` survivors: **p95 18 ms** on the same 1,250-meeting corpus. Ship a `search:rebuild` command: every derived index must be reconstructible from source tables alone.
 
 ### 9.5 Audio retention and disk budget
 
@@ -934,11 +938,19 @@ Two **mono Opus streams** per meeting at 24 kbps VBR, `OPUS_APPLICATION_VOIP`, 2
 
 ### 9.6 "Delete this meeting" — exact semantics
 
-One transactional Rust operation, not a UI-level DELETE. It must: cascade-delete all child rows; **fire the FTS delete triggers** (a contentless FTS index still holds the tokens); unlink `media/<yyyy>/<mm>/<meeting_id>/` recursively **including `raw-<provider>.json.zst`, which contains the full transcript and is the most commonly forgotten artifact**; delete cached exports; cancel queued integration runs; insert a tombstone carrying id + kind + timestamp and nothing else; then `PRAGMA incremental_vacuum` and `PRAGMA wal_checkpoint(TRUNCATE)` so freed pages leave the file.
+One transactional Rust operation, not a UI-level DELETE. It must: cascade-delete all child rows; **fire the FTS delete triggers** (a contentless FTS index still holds the tokens) — *see the correction below, this is necessary and not sufficient*; unlink `media/<yyyy>/<mm>/<meeting_id>/` recursively **including `raw-<provider>.json.zst`, which contains the full transcript and is the most commonly forgotten artifact**; delete cached exports; cancel queued integration runs; insert a tombstone carrying id + kind + timestamp and nothing else; then `PRAGMA incremental_vacuum` and `PRAGMA wal_checkpoint(TRUNCATE)` so freed pages leave the file.
 
 The UI must state plainly **what deletion cannot reach**: text already sent to an STT or LLM provider, and anything already pushed to Notion/Slack/Obsidian. Offer an "open the provider's data-deletion page" link rather than implying local deletion is global.
 
 Acceptance: delete a meeting, then grep the DB file and media root for a distinctive phrase from its transcript — zero hits.
+
+> **Correction (2026-08-11) — the step list above is incomplete, and the gap is a data-remanence defect.** Firing the delete triggers does **not** satisfy the byte-scan criterion. By default an FTS5 retraction is *logical*: it appends a delete marker, **and a delete marker carries the term it retracts**. Deleting a transcript therefore writes a *second copy of every one of its words* into the file while making the row instantly unfindable. Queries go quiet immediately, so every behaviour-level assertion passes while the text is still sitting there in plain form.
+>
+> The index must be created with FTS5's **`'secure-delete'`** option, which rewrites the affected leaf pages instead of appending markers; `PRAGMA secure_delete = ON` then zeroes the pages it frees and `PRAGMA incremental_vacuum` returns them. **All three are required and none is observable from a query.** `VALUES('optimize')` also works but rewrites the entire index, making one deletion cost time proportional to the whole library.
+>
+> Two further traps, both found by this same scan. **A byte-scan needle can be vacuous by accident:** FTS5 prefix-compresses each term against its page predecessor, so a needle sharing a prefix with any existing token is never stored contiguously and the scan passes regardless. Pick a needle sharing no prefix with the fixture and assert it *is* present before deleting. And **`VALUES('integrity-check')` is not the check you want** — it verifies only internal well-formedness, so an index emptied with `'delete-all'` passes. The two-argument form `VALUES('integrity-check', 1)` also compares the index against the content table.
+
+
 
 > **Correction (2026-08-11).** That acceptance test as originally written is **vacuous against an encrypted database**. The phrase is never present in the SQLCipher file in plaintext, so the grep passes even against an implementation that deletes nothing at all. Run the byte-scan against a **plaintext** database via a `#[cfg(test)]`-only opener that cannot be compiled into a shipping build, and run the cascade, media-unlink and tombstone assertions against the encrypted one. Two further corrections from implementing it: `PRAGMA secure_delete` alone is insufficient because the vacuum's own writes land in the WAL, so the order must be **checkpoint → incremental_vacuum → checkpoint**; and `Connection::backup` writes **plaintext by default**, so a pre-migration backup destination must be keyed before its first page is written or it leaks the entire library.
 
