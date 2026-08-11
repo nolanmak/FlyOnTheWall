@@ -628,7 +628,9 @@ A conformance suite runs the same 60-second stereo fixture through every registe
 
 ### 7.4 Adapter specifics worth writing down
 
-**Deepgram streaming.** `wss://api.deepgram.com/v1/listen`, header `Authorization: Token <key>`. Params: `model=nova-3&encoding=linear16&sample_rate=16000&channels=1&interim_results=true&punctuate=true&smart_format=true&diarize_model=v1&endpointing=300&utterance_end_ms=1000&vad_events=true&mip_opt_out=true` plus repeated `keyterm=`. Audio as binary frames; **`{"type":"KeepAlive"}` as a TEXT frame every 3–5 s** or the server closes with 1011 / NET-0001 after 10 s of silence. Prefer `punctuated_word`. Note `diarize_model=v2` is batch-only and returns a validation error on streaming.
+**Deepgram streaming.** `wss://api.deepgram.com/v1/listen`, header `Authorization: Token <key>`. Params: `model=nova-3&encoding=linear16&sample_rate=16000&channels=1&interim_results=true&punctuate=true&smart_format=true&diarize=true&diarize_model=v1&endpointing=300&utterance_end_ms=1000&vad_events=true&mip_opt_out=true` plus repeated `keyterm=`.
+
+> **Correction (2026-08-11).** This list originally omitted **`diarize=true`**. `diarize_model=v1` on its own selects a *model* for a feature that is still switched off, so every word comes back with no speaker and the failure is silent — you get a transcript, just an unattributed one. The two must be sent together or not at all. Audio as binary frames; **`{"type":"KeepAlive"}` as a TEXT frame every 3–5 s** or the server closes with 1011 / NET-0001 after 10 s of silence. Prefer `punctuated_word`. Note `diarize_model=v2` is batch-only and returns a validation error on streaming.
 
 **ElevenLabs realtime.** `wss://api.elevenlabs.io/v1/speech-to-text/realtime`, `xi-api-key` header. Client sends **JSON text frames, not binary**: `{"message_type":"input_audio_chunk","audio_base_64":"…","commit":false,"sample_rate":16000}` — base64 inflates bandwidth ~33%, budget for it. **`session_time_limit_exceeded` must trigger a transparent reconnect; assume long meetings will hit it.**
 
