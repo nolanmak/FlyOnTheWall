@@ -673,6 +673,7 @@ dependencies = [
  "fotw-stt",
  "fotw-summarize",
  "reqwest",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",

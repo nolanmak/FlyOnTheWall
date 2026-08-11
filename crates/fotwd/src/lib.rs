@@ -6,6 +6,7 @@
 
 #![warn(missing_docs)]
 
+pub mod consent;
 pub mod persist;
 pub mod secrets;
 pub mod session;
