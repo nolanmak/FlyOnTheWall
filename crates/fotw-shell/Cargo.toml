@@ -6,4 +6,85 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# NOTE (CON-02, docs/REQUIREMENTS.md 11.2): this crate deliberately declares no
+# `[features]` table. The recording indicator must not be suppressible by a
+# build flag, and the cheapest way to guarantee that is to have no build flags
+# at all. `tests/con02_indicator.rs` reads this file and fails if one appears.
+
 [dependencies]
+thiserror = { workspace = true }
+
+# Everything AppKit is target-gated so the crate still compiles on Linux and
+# Windows (CI builds ubuntu + macos) against `platform::stub`. Nothing below
+# may leak into the crate's cross-platform public API.
+#
+# Versions are pinned in this file rather than in the workspace table because
+# they are a single coherent Objective-C runtime graph: objc2 0.6 / objc2-*
+# 0.3. `just tree-dup` (cargo tree -d) fails the build if more than one objc2
+# major resolves -- see docs/REQUIREMENTS.md 5.5 (the `cacao` rejection).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+block2 = "0.6"
+
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "block2",
+  "NSDate",
+  "NSGeometry",
+  "NSString",
+  "NSThread",
+  "NSTimer",
+] }
+
+# `NSPanel` needs `NSResponder` + `NSWindow`; `initWithContentRect:...:` is
+# additionally gated on `NSGraphics` (that is where `NSBackingStoreType`
+# lives), and `NSApplicationActivationPolicy` lives behind
+# `NSRunningApplication`. Getting these wrong is a missing-method compile
+# error, not a silent failure, but the mapping is not guessable.
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "objc2-core-foundation",
+  "objc2-quartz-core",
+  "NSAccessibilityProtocols",
+  "NSApplication",
+  "NSButton",
+  "NSCell",
+  "NSColor",
+  "NSControl",
+  "NSFont",
+  "NSFontDescriptor",
+  "NSGraphics",
+  "NSImage",
+  "NSMenu",
+  "NSPanel",
+  "NSResponder",
+  "NSRunningApplication",
+  "NSScreen",
+  "NSStatusBar",
+  "NSStatusBarButton",
+  "NSStatusItem",
+  "NSText",
+  "NSTextField",
+  "NSView",
+  "NSVisualEffectView",
+  "NSWindow",
+] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "CFCGTypes",
+] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "objc2-core-foundation",
+  "CALayer",
+] }
+
+# Menu-bar item. `TrayIcon::ns_status_item()` hands back the
+# `Retained<NSStatusItem>`, which is the escape hatch 5.5 asks for -- and the
+# reason the objc2-app-kit version here must match tray-icon's.
+tray-icon = { version = "0.24", default-features = false }
+muda = { version = "0.19", default-features = false }
+
+# Carbon `RegisterEventHotKey`. See `platform::macos::hotkeys` for the media-key
+# trap: those take a CGEventTap path that needs the Accessibility grant.
+global-hotkey = "0.8"
