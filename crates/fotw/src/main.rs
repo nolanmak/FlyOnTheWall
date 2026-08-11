@@ -5,6 +5,8 @@
 //! indistinguishable from a quiet room. A round-trip capture is the only
 //! truthful answer available, so that is what this does.
 
+mod record;
+
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -19,13 +21,35 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("doctor") => doctor(),
+        Some("record") => {
+            let secs = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
+            let root = args.get(2).map_or_else(
+                || std::env::temp_dir().join("fotw-sessions"),
+                std::path::PathBuf::from,
+            );
+            if let Err(e) = std::fs::create_dir_all(&root) {
+                eprintln!("fotw: cannot create {}: {e}", root.display());
+                return ExitCode::FAILURE;
+            }
+            println!("FlyOnTheWall record — {secs}s");
+            match record::record(root, secs) {
+                Ok(dir) => {
+                    println!("\n  ✓ session written to {}", dir.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    println!("\n  ✗ {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some(other) => {
             eprintln!("fotw: unknown command `{other}`");
-            eprintln!("usage: fotw doctor");
+            eprintln!("usage: fotw <doctor|record [seconds] [dir]>");
             ExitCode::FAILURE
         }
         None => {
-            eprintln!("usage: fotw doctor");
+            eprintln!("usage: fotw <doctor|record [seconds] [dir]>");
             ExitCode::FAILURE
         }
     }

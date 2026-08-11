@@ -10,6 +10,7 @@
 
 pub mod ring;
 pub mod rt;
+pub mod wal;
 
 // NOTE: deliberately no `#[cfg(test)] #[global_allocator]` here. It would
 // cover this crate's unit tests but NOT its integration tests, which link the
