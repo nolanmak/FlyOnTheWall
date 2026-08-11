@@ -7,3 +7,40 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+thiserror = { workspace = true }
+# The credentials index is a store row (docs/REQUIREMENTS.md 10). It derives
+# Serialize/Deserialize so fotw-store can persist it without redefining the
+# shape -- and so the acceptance test can serialise a record and byte-scan the
+# result for key material.
+serde = { workspace = true }
+
+# SHA-256, for the 16-hex-char fingerprint in the credentials index and for the
+# Redactor's constant-size secret index. Chosen over a heavyweight AEAD crate
+# because this is one hash: sha2 is ~3k lines, MIT OR Apache-2.0 (both on
+# deny.toml's allowlist), no_std-capable, and pulls only `digest`/`typenum`.
+# Hand-rolling SHA-256 was the alternative and is strictly worse: a fingerprint
+# that disagrees with the rest of the world is a fingerprint we cannot verify.
+sha2 = "0.11"
+
+# OS keychain: macOS Keychain Services, Windows Credential Manager, Secret
+# Service on Linux (docs/REQUIREMENTS.md 10). MIT OR Apache-2.0.
+#
+# v4 is a rewrite around `keyring-core` with pluggable stores; the `v1` default
+# feature restores the flat `Entry` API and picks the platform store for us.
+# The reason we take v4 rather than pinning v3 is `Entry::store_status()`,
+# which reports whether the platform credential store initialised *without*
+# attempting a write. That is exactly the probe KEY-05 needs: it lets us refuse
+# to store on a Linux box with no Secret Service instead of discovering the
+# problem halfway through a set() and having to guess whether we left a
+# partial credential behind.
+#
+# Its platform backends are already target-gated in its own manifest, so this
+# is a plain dependency rather than a per-target one -- a Linux build pulls
+# zbus and no Apple frameworks, a macOS build the reverse.
+keyring = "4.1"
+
+[dev-dependencies]
+serde_json = { workspace = true }
+# The KEY-01 acceptance test needs a real directory tree to byte-scan. Already
+# in the lock file via fotw-store's dev-dependencies, so no new supply chain.
+tempfile = "3"
