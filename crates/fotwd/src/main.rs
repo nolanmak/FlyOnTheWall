@@ -32,12 +32,23 @@ async fn main() -> ExitCode {
             record(root, secs).await
         }
         Some("key") => key_command(&args[1..]),
+        Some("summarize") => {
+            let Some(id) = args.get(1).cloned() else {
+                eprintln!("usage: fotwd summarize <meeting-id> [dir]");
+                return ExitCode::FAILURE;
+            };
+            let root = args.get(2).map_or_else(default_root, PathBuf::from);
+            summarize_command(root, id).await
+        }
         Some("list") => {
             let root = args.get(1).map_or_else(default_root, PathBuf::from);
             list(root)
         }
         _ => {
-            eprintln!("usage: fotwd <record [seconds] [dir] | list [dir] | key set <provider>>");
+            eprintln!(
+                "usage: fotwd <record [seconds] [dir] | list [dir] | \
+                 summarize <id> [dir] | key <set <provider>|list>>"
+            );
             eprintln!();
             eprintln!("  Set DEEPGRAM_API_KEY to transcribe as well as record.");
             eprintln!("  Without it the meeting is still recorded and can be");
@@ -328,6 +339,53 @@ fn key_command(args: &[String]) -> ExitCode {
         }
         _ => {
             eprintln!("usage: fotwd key <set <provider> | list>");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `fotwd summarize <meeting-id>` — turn a stored transcript into a document.
+///
+/// Runs entirely off the library. The transcript is immutable and the summary
+/// is a derived, versioned artifact, so this costs zero STT spend and can be
+/// re-run with a different model or template without touching the audio.
+async fn summarize_command(root: PathBuf, meeting_id: String) -> ExitCode {
+    let store = match secrets::keystore() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("fotwd: no OS keychain available: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut db = match open_db(&root) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("fotwd: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match fotwd::summarize::summarize_meeting(&mut db, &store, &meeting_id, "").await {
+        Ok(out) => {
+            println!("  version    : v{}", out.version);
+            println!("  grounding  : {:.0}%", out.coverage * 100.0);
+            println!("  items kept : {}", out.kept_items);
+            if out.dropped_items > 0 {
+                // Surfaced, never silent: the user should know the model
+                // proposed items whose evidence did not check out.
+                println!(
+                    "  dropped    : {} (evidence did not check out)",
+                    out.dropped_items
+                );
+            }
+            println!();
+            for line in out.markdown.lines() {
+                println!("  {line}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("fotwd: {e}");
             ExitCode::FAILURE
         }
     }
