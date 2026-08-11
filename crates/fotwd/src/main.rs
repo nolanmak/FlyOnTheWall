@@ -40,6 +40,25 @@ async fn main() -> ExitCode {
                 .map_or_else(default_root, |s| PathBuf::from(s.as_str()));
             record(root, secs, acknowledged).await
         }
+        Some("serve") => {
+            let root = args
+                .iter()
+                .skip(1)
+                .find(|a| !a.starts_with("--"))
+                .map_or_else(default_root, |s| PathBuf::from(s.as_str()));
+            if let Err(e) = std::fs::create_dir_all(&root) {
+                eprintln!("fotwd: cannot create {}: {e}", root.display());
+                return ExitCode::FAILURE;
+            }
+            let open_browser = !args.iter().any(|a| a == "--no-open");
+            match fotwd::serve::serve(root, open_browser).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("fotwd: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some("disclose") => {
             let kit = DisclosureKit::default();
             println!("── paste into the meeting chat ──");
@@ -67,8 +86,9 @@ async fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: fotwd <record [seconds] [dir] [--i-have-consent] | list [dir] | \
-                 summarize <id> [dir] | disclose | key <set <provider>|list>>"
+                "usage: fotwd <serve [dir] | record [seconds] [dir] [--i-have-consent] | \
+                 list [dir] | summarize <id> [dir] | disclose | \
+                 key <set <provider>|list>>"
             );
             eprintln!();
             eprintln!("  Set DEEPGRAM_API_KEY to transcribe as well as record.");
@@ -255,24 +275,8 @@ fn textwrap(s: &str, width: usize) -> Vec<String> {
 }
 
 /// Open the library beside the sessions, keyed from the OS keychain.
-///
-/// The master key is generated on first run and reused thereafter. It is
-/// never written to disk, never logged, and never passed as an argument.
 fn open_db(root: &std::path::Path) -> Result<Db, String> {
-    let store = secrets::keystore().map_err(|e| {
-        format!(
-            "no OS keychain available: {e}\n  \
-                 FlyOnTheWall will not fall back to storing keys in a file."
-        )
-    })?;
-    let (key, origin) = secrets::db_key(&store).map_err(|e| format!("{e}"))?;
-    if origin == secrets::Origin::Generated {
-        eprintln!("  ! a new library key was generated and stored in your keychain.");
-        eprintln!("    Back it up: losing it without a Recovery Key means the");
-        eprintln!("    library cannot be opened again.");
-    }
-    let dir = root.parent().unwrap_or(root);
-    Db::open(dir.join("db.sqlite3"), &key).map_err(|e| format!("{e}"))
+    fotwd::open_library(root)
 }
 
 fn default_title() -> String {

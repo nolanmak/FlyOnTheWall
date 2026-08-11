@@ -740,6 +740,7 @@ dependencies = [
  "fotw-store",
  "fotw-stt",
  "fotw-summarize",
+ "fotw-web",
  "reqwest",
  "serde",
  "serde_json",

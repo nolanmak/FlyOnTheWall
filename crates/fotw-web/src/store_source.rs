@@ -74,7 +74,11 @@ impl MeetingSource for StoreSource {
             .map_err(map_err)?
             .map(|s| s.body_md);
 
-        let segments = match primary_transcript_id(&db, id) {
+        // Propagates a real database failure instead of folding it into "no
+        // transcript". `MeetingRepo::primary_transcript_id` distinguishes the
+        // two; the previous hand-rolled query used `.ok()` and would have
+        // rendered a broken library as an empty meeting.
+        let segments = match db.meetings().primary_transcript_id(id).map_err(map_err)? {
             Some(transcript_id) => db
                 .meetings()
                 .transcript_text(&transcript_id)
@@ -111,30 +115,6 @@ impl MeetingSource for StoreSource {
             })
             .collect())
     }
-}
-
-/// The primary transcript of a meeting, if it has one.
-///
-/// `MeetingRepo` has no accessor for this — `transcript_text` takes a
-/// transcript id — so the query lives here, spelled the same way `fotwd`'s
-/// `persist::primary_transcript_id` already spells it.
-///
-/// **Known wart, recorded rather than hidden:** `.ok()` folds a genuine SQLite
-/// failure into "this meeting has no transcript", so a broken database renders
-/// as an empty transcript rather than as an error. Naming
-/// `rusqlite::Error::QueryReturnedNoRows` to tell the two apart would make
-/// `fotw-web` depend on `rusqlite` directly, which is exactly the coupling
-/// [`MeetingSource`] exists to prevent. The right fix is a
-/// `MeetingRepo::primary_transcript_id` in `fotw-store`, which would also
-/// delete the duplicate in `fotwd`.
-fn primary_transcript_id(db: &Db, meeting_id: &str) -> Option<String> {
-    db.conn()
-        .query_row(
-            "SELECT id FROM transcripts WHERE meeting_id = ?1 AND is_primary = 1",
-            [meeting_id],
-            |r| r.get::<_, String>(0),
-        )
-        .ok()
 }
 
 fn row(m: fotw_store::Meeting) -> MeetingRow {

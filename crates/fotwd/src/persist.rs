@@ -63,14 +63,15 @@ pub fn persist_session(db: &mut Db, outcome: &SessionOutcome, title: &str) -> St
 }
 
 /// The primary transcript for a meeting, if it has one.
+///
+/// Delegates to the store rather than repeating the query: the hand-rolled
+/// version used `.ok()`, which turned a real SQLite failure into "no
+/// transcript" and would have shown an empty meeting instead of an error.
 pub fn primary_transcript_id(db: &mut Db, meeting_id: &str) -> Option<String> {
-    db.conn()
-        .query_row(
-            "SELECT id FROM transcripts WHERE meeting_id = ?1 AND is_primary = 1",
-            [meeting_id],
-            |r| r.get::<_, String>(0),
-        )
+    db.meetings()
+        .primary_transcript_id(meeting_id)
         .ok()
+        .flatten()
 }
 
 fn to_row(idx: i64, s: &TranscriptSegment) -> NewSegment {
