@@ -33,9 +33,7 @@
 use std::collections::HashSet;
 
 use crate::document::TranscriptDocument;
-use crate::schema::{
-    ActionItem, Confidence, Decision, Extraction, FollowUp, ItemKind, OpenQuestion, Topic,
-};
+use crate::schema::{Confidence, Extraction, ItemKind};
 
 /// Below this segment confidence, an owner is never auto-assigned.
 ///
@@ -421,6 +419,7 @@ fn proper_nouns(text: &str) -> HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::{ActionItem, Decision, FollowUp, OpenQuestion, Topic};
     use crate::testing::{sample_meeting, segment};
 
     fn document() -> TranscriptDocument {

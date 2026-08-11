@@ -5,7 +5,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod adapter;
+pub mod anthropic;
 pub mod capabilities;
+pub mod coverage;
 pub mod document;
 pub mod error;
 pub mod hash;
