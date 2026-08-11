@@ -782,7 +782,9 @@ PRAGMA secure_delete = ON;
 PRAGMA temp_store = MEMORY;
 ```
 
-`PRAGMA auto_vacuum = INCREMENTAL` must be issued in migration 0001 **before the first CREATE TABLE** — it cannot be enabled afterwards without a full VACUUM. One writer connection + N readers.
+`PRAGMA auto_vacuum = INCREMENTAL` must be set **before any table exists** — it cannot be enabled afterwards without a full VACUUM. One writer connection + N readers.
+
+> **Correction (2026-08-11).** It cannot live *in migration 0001*: `rusqlite_migration` wraps the whole run in one transaction, and `auto_vacuum` is a documented no-op inside a transaction. It must also precede `journal_mode = WAL`, which writes the header and closes the window on a fresh file. So it belongs in the connection bootstrap, before migrations run. Assert the *result* (`PRAGMA auto_vacuum == 2`), not the mechanism.
 
 ### 9.2 On-disk layout
 
@@ -930,13 +932,15 @@ The UI must state plainly **what deletion cannot reach**: text already sent to a
 
 Acceptance: delete a meeting, then grep the DB file and media root for a distinctive phrase from its transcript — zero hits.
 
+> **Correction (2026-08-11).** That acceptance test as originally written is **vacuous against an encrypted database**. The phrase is never present in the SQLCipher file in plaintext, so the grep passes even against an implementation that deletes nothing at all. Run the byte-scan against a **plaintext** database via a `#[cfg(test)]`-only opener that cannot be compiled into a shipping build, and run the cascade, media-unlink and tombstone assertions against the encrypted one. Two further corrections from implementing it: `PRAGMA secure_delete` alone is insufficient because the vacuum's own writes land in the WAL, so the order must be **checkpoint → incremental_vacuum → checkpoint**; and `Connection::backup` writes **plaintext by default**, so a pre-migration backup destination must be keyed before its first page is written or it leaks the entire library.
+
 ### 9.7 Sync-safe invariants (enforced by CI lint over migration SQL)
 
 Sync is a non-goal, but these keep the door open at ~2 weeks instead of a rewrite:
 
 1. No `INTEGER PRIMARY KEY AUTOINCREMENT` as externally visible identity — UUIDv7 everywhere. Implicit rowids exist only as FTS join keys and are never exported.
 2. Every mutable row carries `updated_at`, `lamport`, `origin_device_id`. Merge order is `(lamport, origin_device_id)` — **never wall-clock**, because clock skew across a user's two laptops is real.
-3. No column two devices would both rewrite. `notes.body_md` is the one deliberate exception and must therefore be the first thing converted to a CRDT if sync ever ships — so keep it the only text column on that table.
+3. No column two devices would both rewrite. `notes.body_md` is the one deliberate exception and must therefore be the first thing converted to a CRDT if sync ever ships — so keep it the only **user-content** column on that table. (Invariant 2 requires `origin_device_id` there too; "only text column" was too literal.)
 4. Deletes leave tombstones.
 5. No absolute filesystem paths in the DB.
 6. All derived state (FTS5, denormalized durations) rebuildable by one command; never synced.
