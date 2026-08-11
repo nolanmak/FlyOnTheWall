@@ -16,8 +16,12 @@
 
 pub mod clock;
 pub mod speaker;
+pub mod store;
 pub mod transcript;
 
 pub use clock::{ArrivalEstimator, SessionClock, TimeSpan, seconds_to_ms};
 pub use speaker::{SpeakerNormalizer, SpeakerRegistry};
+pub use store::{
+    CountingIdFactory, SegmentIdFactory, SegmentStore, StoreOutcome, UlidFactory, UtteranceTracker,
+};
 pub use transcript::{Source, TimestampSource, TranscriptSegment, Word};
