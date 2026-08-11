@@ -15,9 +15,11 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use fotw_audio::{AudioPlatform, DeviceId, FormatRequest, SystemScope, platform};
-use fotw_store::{Db, DbKey};
+use fotw_secrets::{KeyStore, Provider};
+use fotw_store::Db;
 use fotw_stt::{DeepgramStreamConfig, Source, deepgram::DeepgramConfig};
 use fotwd::persist;
+use fotwd::secrets;
 use fotwd::session::{self, Transcription};
 
 #[tokio::main]
@@ -29,12 +31,13 @@ async fn main() -> ExitCode {
             let root = args.get(2).map_or_else(default_root, PathBuf::from);
             record(root, secs).await
         }
+        Some("key") => key_command(&args[1..]),
         Some("list") => {
             let root = args.get(1).map_or_else(default_root, PathBuf::from);
             list(root)
         }
         _ => {
-            eprintln!("usage: fotwd <record [seconds] [dir] | list [dir]>");
+            eprintln!("usage: fotwd <record [seconds] [dir] | list [dir] | key set <provider>>");
             eprintln!();
             eprintln!("  Set DEEPGRAM_API_KEY to transcribe as well as record.");
             eprintln!("  Without it the meeting is still recorded and can be");
@@ -83,9 +86,20 @@ async fn record(root: PathBuf, seconds: u64) -> ExitCode {
         .open_mic(&DeviceId::new("default"), FormatRequest::any())
         .ok();
 
-    let transcription = match std::env::var("DEEPGRAM_API_KEY") {
-        Ok(key) if !key.trim().is_empty() => {
-            println!("  transcribe : Deepgram nova-3 (streaming)");
+    let key_store = secrets::keystore().ok();
+    let found = key_store
+        .as_ref()
+        .and_then(|s| secrets::deepgram_key(s as &dyn KeyStore));
+    let transcription = match found {
+        Some((secret, origin)) => {
+            match origin {
+                secrets::Origin::Environment => println!(
+                    "  transcribe : Deepgram nova-3 (key from DEEPGRAM_API_KEY — \
+                     readable by any child process; prefer `fotwd key set deepgram`)"
+                ),
+                _ => println!("  transcribe : Deepgram nova-3 (key from keychain)"),
+            }
+            let key = secret.expose().to_owned();
             // Only the system leg is transcribed. The mic leg needs its own
             // connection and doubles the bill; that is the explicit
             // "two cloud streams" decision in spec 7.5, not a default.
@@ -94,8 +108,8 @@ async fn record(root: PathBuf, seconds: u64) -> ExitCode {
                 DeepgramConfig::new(session_id(), Source::System),
             )))
         }
-        _ => {
-            println!("  transcribe : off (set DEEPGRAM_API_KEY to enable)");
+        None => {
+            println!("  transcribe : off (run `fotwd key set deepgram` to enable)");
             Transcription::Disabled
         }
     };
@@ -190,14 +204,24 @@ fn textwrap(s: &str, width: usize) -> Vec<String> {
     out
 }
 
-/// Open the library beside the sessions.
+/// Open the library beside the sessions, keyed from the OS keychain.
 ///
-/// The key is a placeholder until `fotw-secrets` lands: a real build takes it
-/// from the OS keychain. Recorded here rather than hidden so the gap is
-/// obvious in review.
+/// The master key is generated on first run and reused thereafter. It is
+/// never written to disk, never logged, and never passed as an argument.
 fn open_db(root: &std::path::Path) -> Result<Db, String> {
+    let store = secrets::keystore().map_err(|e| {
+        format!(
+            "no OS keychain available: {e}\n  \
+                 FlyOnTheWall will not fall back to storing keys in a file."
+        )
+    })?;
+    let (key, origin) = secrets::db_key(&store).map_err(|e| format!("{e}"))?;
+    if origin == secrets::Origin::Generated {
+        eprintln!("  ! a new library key was generated and stored in your keychain.");
+        eprintln!("    Back it up: losing it without a Recovery Key means the");
+        eprintln!("    library cannot be opened again.");
+    }
     let dir = root.parent().unwrap_or(root);
-    let key = DbKey::from_bytes([0u8; 32]);
     Db::open(dir.join("db.sqlite3"), &key).map_err(|e| format!("{e}"))
 }
 
@@ -236,4 +260,75 @@ fn list(root: PathBuf) -> ExitCode {
         println!("  {:<38}  {:<9}  {secs:>7}  {}", m.id, m.state, m.title);
     }
     ExitCode::SUCCESS
+}
+
+/// `fotwd key set <provider>` — read a key from stdin into the keychain.
+///
+/// Stdin, never an argument: argv is readable by any same-user process, and a
+/// key pasted onto a command line also lands in the shell history file.
+fn key_command(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("set") => {
+            let Some(slug) = args.get(1) else {
+                eprintln!("usage: fotwd key set <deepgram|elevenlabs|openai|anthropic>");
+                return ExitCode::FAILURE;
+            };
+            let Some(provider) = Provider::from_slug(slug) else {
+                eprintln!("fotwd: unknown provider `{slug}`");
+                return ExitCode::FAILURE;
+            };
+            let store = match secrets::keystore() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("fotwd: no OS keychain available: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            eprint!(
+                "paste the {} key (input is not echoed to the log): ",
+                provider.display_name()
+            );
+            use std::io::Write;
+            let _ = std::io::stderr().flush();
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).is_err() {
+                eprintln!("fotwd: could not read the key");
+                return ExitCode::FAILURE;
+            }
+            match secrets::store_key(&store, provider, &line) {
+                Ok(()) => {
+                    println!("stored {} in the keychain", provider.display_name());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("fotwd: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some("list") => {
+            let store = match secrets::keystore() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("fotwd: no OS keychain available: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            for p in Provider::ALL {
+                let present = store
+                    .contains(fotw_secrets::SecretKey::ApiKey(p))
+                    .unwrap_or(false);
+                println!(
+                    "  {:<12} {}",
+                    p.slug(),
+                    if present { "configured" } else { "—" }
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        _ => {
+            eprintln!("usage: fotwd key <set <provider> | list>");
+            ExitCode::FAILURE
+        }
+    }
 }
