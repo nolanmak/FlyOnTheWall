@@ -14,6 +14,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod clock;
+pub mod speaker;
 pub mod transcript;
 
+pub use clock::{ArrivalEstimator, SessionClock, TimeSpan, seconds_to_ms};
+pub use speaker::{SpeakerNormalizer, SpeakerRegistry};
 pub use transcript::{Source, TimestampSource, TranscriptSegment, Word};
