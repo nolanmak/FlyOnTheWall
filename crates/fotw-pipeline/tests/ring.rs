@@ -67,13 +67,18 @@ fn data_survives_a_producer_consumer_thread_split() {
         let mut value = 0.0f32;
         while sent < total {
             let block: Vec<f32> = (0..160).map(|i| value + i as f32).collect();
-            let mut wrote = 0;
-            while wrote == 0 {
-                wrote = producer.push_block(&block);
-                if wrote == 0 {
-                    std::thread::yield_now();
-                }
+            // Wait for room for the WHOLE block before pushing. `push_block`
+            // deliberately takes what fits and drops the rest — that is correct
+            // for the audio thread, which must never retry — so a producer that
+            // wants zero loss has to check capacity first. Treating any
+            // non-zero return as "the block went in" silently skips the
+            // remainder, which is a partial-write bug that only appears when
+            // the consumer falls behind.
+            while producer.slots() < block.len() {
+                std::thread::yield_now();
             }
+            let wrote = producer.push_block(&block);
+            assert_eq!(wrote, block.len(), "capacity was checked first");
             sent += wrote;
             value += 160.0;
         }
