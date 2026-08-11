@@ -297,6 +297,12 @@ fn a_multichannel_session_is_downmixed_to_the_mono_stream_9_5_specifies() {
     );
 
     // Stereo PCM is twice the bytes for the same audio, so the ratio against
-    // a mono Opus track is roughly twice as good.
-    assert!(encoded.system.compression_ratio() > 16.0);
+    // a mono Opus track is roughly twice as good. 48 kHz stereo i16 is the
+    // 11.5 MB/minute per track that §9.5's table opens with.
+    let ratio = encoded.system.compression_ratio();
+    assert!(ratio > 16.0);
+    println!(
+        "48 kHz stereo i16 -> 16 kHz-class mono Opus: {} B -> {} B = {ratio:.1}x",
+        encoded.system.pcm_bytes, encoded.system.opus_bytes
+    );
 }
