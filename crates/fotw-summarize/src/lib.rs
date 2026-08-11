@@ -65,6 +65,7 @@ pub mod document;
 pub mod error;
 pub mod hash;
 pub mod pipeline;
+pub mod pricing;
 pub mod prompt;
 pub mod schema;
 pub mod testing;
@@ -82,6 +83,7 @@ pub use coverage::{Claim, CoverageConfig, CoverageReport, LOW_GROUNDING_THRESHOL
 pub use document::{DocumentSegment, TranscriptDocument};
 pub use error::SummarizeError;
 pub use pipeline::{Pipeline, PipelineConfig, SummaryOutcome, Warning, cache_ttl_for};
+pub use pricing::{Price, cost_usd, price_for};
 pub use prompt::{AUGMENT_PROMPT_VERSION, SystemPrompt, assemble};
 pub use schema::{
     ActionItem, Confidence, Decision, EXTRACTION_SCHEMA, Extraction, FollowUp, ItemKind,
