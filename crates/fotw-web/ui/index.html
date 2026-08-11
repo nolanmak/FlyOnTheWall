@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>FlyOnTheWall</title>
+    <link rel="stylesheet" href="/assets/app.css" />
+  </head>
+  <body>
+    <header>
+      <h1>FlyOnTheWall</h1>
+      <input
+        id="search"
+        type="search"
+        placeholder="Search meetings, notes, transcripts"
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <span id="live" class="live" hidden>live</span>
+    </header>
+    <main>
+      <nav id="list" aria-label="Meetings"></nav>
+      <section id="detail" aria-live="polite"></section>
+    </main>
+    <p id="status" role="status"></p>
+    <script src="/assets/app.js"></script>
+  </body>
+</html>

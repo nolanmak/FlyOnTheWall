@@ -1,0 +1,191 @@
+//! What every handler is given: the policy, the library, the token tables and
+//! the delta hub.
+//!
+//! One `Arc` rather than four in the router's state, so that adding a control
+//! does not mean touching every handler signature — and so that
+//! [`AppState::policy`] is the only way to reach the secret, which keeps the
+//! set of places that can compare it to one.
+
+use std::sync::Arc;
+
+use crate::ingress::IngressPolicy;
+use crate::source::MeetingSource;
+use crate::stream::DeltaHub;
+use crate::tokens::{HANDOFF_TTL, TokenTable, WS_TICKET_TTL};
+
+/// Shared, cheap to clone, immutable except for the token tables and the hub.
+#[derive(Clone, Debug)]
+pub struct AppState {
+    inner: Arc<Inner>,
+}
+
+#[derive(Debug)]
+struct Inner {
+    policy: IngressPolicy,
+    source: Arc<dyn MeetingSource>,
+    tickets: TokenTable,
+    handoff: TokenTable,
+    hub: Arc<DeltaHub>,
+    csp: String,
+}
+
+impl std::fmt::Debug for dyn MeetingSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The library is the thing §10 says must be unreachable from the
+        // logging subsystem. A `{:?}` on the app state prints this.
+        f.write_str("MeetingSource(<redacted>)")
+    }
+}
+
+impl AppState {
+    /// Assemble the state for a server whose policy is already fixed to a
+    /// port.
+    #[must_use]
+    pub fn new(policy: IngressPolicy, source: Arc<dyn MeetingSource>) -> Self {
+        let csp = content_security_policy(policy.origin());
+        Self {
+            inner: Arc::new(Inner {
+                policy,
+                source,
+                tickets: TokenTable::new(WS_TICKET_TTL),
+                handoff: TokenTable::new(HANDOFF_TTL),
+                hub: Arc::new(DeltaHub::new()),
+                csp,
+            }),
+        }
+    }
+
+    /// The ingress allowlists and the per-start secret.
+    #[must_use]
+    pub fn policy(&self) -> &IngressPolicy {
+        &self.inner.policy
+    }
+
+    /// The library, for [`tokio::task::spawn_blocking`].
+    #[must_use]
+    pub fn source(&self) -> Arc<dyn MeetingSource> {
+        Arc::clone(&self.inner.source)
+    }
+
+    /// ING-07's single-use WebSocket tickets.
+    #[must_use]
+    pub fn tickets(&self) -> &TokenTable {
+        &self.inner.tickets
+    }
+
+    /// ING-10's single-use launch handoff tokens.
+    #[must_use]
+    pub fn handoff(&self) -> &TokenTable {
+        &self.inner.handoff
+    }
+
+    /// The 10 Hz transcript fan-out (§5.5).
+    #[must_use]
+    pub fn hub(&self) -> &Arc<DeltaHub> {
+        &self.inner.hub
+    }
+
+    /// The `Content-Security-Policy` served with the SPA shell (ING-11).
+    #[must_use]
+    pub fn csp(&self) -> &str {
+        &self.inner.csp
+    }
+
+    /// Mint a handoff token and return the URL the daemon should open.
+    ///
+    /// ING-10: this URL ends up in `open(1)`'s argv and in the browser's
+    /// synced history, so the only secret in it is worth one redemption inside
+    /// thirty seconds. The bearer token itself never appears here.
+    #[must_use]
+    pub fn launch_url(&self) -> String {
+        let token = self.handoff().mint();
+        format!("{}/?t={token}", self.policy().origin())
+    }
+}
+
+/// ING-11's Content-Security-Policy.
+///
+/// The reason a *local* app needs one: transcripts are attacker-influenced
+/// text. Anyone in the meeting can say "script alert 1", a calendar
+/// description can carry raw markup, and both flow into the same DOM as the
+/// UI. The renderer uses `textContent` throughout, and this header is what
+/// catches the day it does not.
+///
+/// * `default-src 'none'` — deny by default, then name what is allowed.
+/// * `script-src 'self'` with **no** `'unsafe-inline'`: this is why the bearer
+///   token is fetched by the SPA rather than injected into the shell as an
+///   inline `<script>`, which would have forced a nonce or a hash and made the
+///   strongest clause in the policy conditional.
+/// * `connect-src` names the WebSocket origin explicitly. CSP3 says `'self'`
+///   covers a `ws:` URL on the same host and port, but Safari's support for
+///   that clause is exactly the kind of thing §10.1 says not to assume.
+/// * `frame-ancestors 'none'` — a page that frames the UI cannot read it
+///   cross-origin anyway, but it can clickjack it.
+/// * `require-trusted-types-for 'script'` — enforced in Chromium, ignored
+///   elsewhere; it turns "someone reintroduced `innerHTML`" from a
+///   vulnerability into a console error.
+#[must_use]
+pub fn content_security_policy(origin: &str) -> String {
+    let ws_origin = origin.replacen("http://", "ws://", 1);
+    format!(
+        "default-src 'none'; \
+         script-src 'self'; \
+         style-src 'self'; \
+         img-src 'self' data:; \
+         font-src 'self'; \
+         connect-src 'self' {ws_origin}; \
+         base-uri 'none'; \
+         form-action 'none'; \
+         frame-ancestors 'none'; \
+         object-src 'none'; \
+         require-trusted-types-for 'script'"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source::MemorySource;
+
+    fn state() -> AppState {
+        AppState::new(
+            IngressPolicy::for_loopback_port(51234),
+            Arc::new(MemorySource::new()),
+        )
+    }
+
+    #[test]
+    fn the_launch_url_carries_a_one_time_token_and_nothing_else() {
+        let s = state();
+        let url = s.launch_url();
+        assert!(url.starts_with("http://127.0.0.1:51234/?t="));
+        assert!(
+            !url.contains(&s.policy().secret().expose_hex()),
+            "ING-10: the bearer token must never be in a URL — `open(1)` puts \
+             it in argv and in synced browser history"
+        );
+        let token = url.split_once("?t=").unwrap().1.to_owned();
+        assert!(s.handoff().redeem(&token));
+        assert!(!s.handoff().redeem(&token), "burned on redemption");
+    }
+
+    #[test]
+    fn the_csp_denies_by_default_and_allows_no_inline_script() {
+        let csp = state().csp().to_owned();
+        assert!(csp.starts_with("default-src 'none'"));
+        assert!(csp.contains("script-src 'self'"));
+        assert!(!csp.contains("unsafe-inline"));
+        assert!(!csp.contains("unsafe-eval"));
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(csp.contains("object-src 'none'"));
+        assert!(csp.contains("connect-src 'self' ws://127.0.0.1:51234"));
+    }
+
+    #[test]
+    fn debug_on_the_state_prints_neither_the_secret_nor_the_library() {
+        let s = state();
+        let printed = format!("{s:?}");
+        assert!(!printed.contains(&s.policy().secret().expose_hex()));
+        assert!(printed.contains("redacted"));
+    }
+}

@@ -6,4 +6,79 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# The `fotw_store`-backed [`MeetingSource`] adapter. On by default so the
+# workspace build type-checks it, but separable: everything security-critical
+# in this crate is tested against an in-memory fake, and
+# `--no-default-features` gives you a build with no SQLCipher and no vendored
+# OpenSSL in the graph at all.
+default = ["store"]
+store = ["dep:fotw-store"]
+
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+futures-util = { workspace = true, features = ["sink", "std"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+
+# The HTTP/WS server. `ws` is not a default feature; `http2` is deliberately
+# left off -- we serve loopback plaintext to a browser, which speaks HTTP/1.1
+# there, and every additional protocol is another place the `Host` /
+# `:authority` check has to be right (docs/REQUIREMENTS.md 10.1 ING-02).
+axum = { version = "0.8.9", default-features = false, features = [
+  "http1",
+  "json",
+  "query",
+  "tokio",
+  "ws",
+] }
+
+# ING-05: the per-start 256-bit secret is compared with `ConstantTimeEq`, so a
+# byte-by-byte early-return `==` cannot be used to recover it a byte at a time.
+subtle = "2.6"
+# The CSPRNG behind that secret, the handoff token and the WS tickets. Direct
+# rather than through `rand` because the only thing this crate wants is
+# "fill these 32 bytes from the OS", and every layer between that and
+# `getrandom` is a layer that could be a userspace PRNG by accident.
+getrandom = "0.3"
+
+# ING-11 / spec 5.6: the SPA is embedded in the binary. `debug-embed` is not
+# optional -- without it `rust-embed` reads from disk in debug builds, so the
+# dev machine works, every test passes, and the shipped bundle 404s the whole
+# UI on a machine that has no `crates/fotw-web/ui` directory.
+rust-embed = { version = "8", features = ["debug-embed"] }
+
+# For `Layer::layer` alone, so the ingress guard can wrap the *whole* router
+# rather than each route inside it. `Router::layer` applies underneath the
+# method router, which is late enough that `axum` has already attached an
+# `Allow` header to a 405 — see `server::router` and ING-09.
+tower = { version = "0.5", default-features = false }
+
+fotw-store = { path = "../fotw-store", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt",
+  "rt-multi-thread",
+  "sync",
+  # A paused clock, so "10 Hz" is asserted against the interval and not
+  # against how busy the CI runner happens to be.
+  "test-util",
+  "time",
+] }
+# `oneshot` on the router: the only way to compare two rejections byte for byte
+# (ING-09) without hyper's per-connection `Date` header making them differ.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+# A WebSocket client that lets the test choose the `Origin` header, which is
+# exactly what a browser will not let a page do and what ING-06 must refuse.
+# `native-tls` is not enabled: nothing here leaves loopback, and rustls is
+# banned in this tree for the `ring`/`aws-lc-rs` OpenSSL license expression.
+tokio-tungstenite = { version = "0.29", default-features = false, features = [
+  "connect",
+  "handshake",
+] }
