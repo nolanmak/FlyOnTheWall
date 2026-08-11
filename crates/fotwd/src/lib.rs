@@ -9,5 +9,7 @@
 pub mod persist;
 pub mod secrets;
 pub mod session;
+pub mod summarize;
+pub mod transport;
 
 pub use session::{SessionOutcome, Transcription};

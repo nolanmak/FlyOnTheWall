@@ -10,10 +10,13 @@ repository.workspace = true
 fotw-audio = { path = "../fotw-audio" }
 fotw-pipeline = { path = "../fotw-pipeline" }
 fotw-stt = { path = "../fotw-stt" }
+fotw-summarize = { path = "../fotw-summarize" }
 fotw-secrets = { path = "../fotw-secrets" }
 fotw-store = { path = "../fotw-store" }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["http2", "native-tls", "json", "charset"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }
