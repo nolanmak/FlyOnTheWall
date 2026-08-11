@@ -709,6 +709,54 @@ fn rebuilding_a_healthy_index_changes_nothing() {
     db.verify_search_index().unwrap();
 }
 
+/// Compaction is a maintenance operation, so the one thing it must never do is
+/// change an answer.
+#[test]
+fn optimizing_the_index_changes_no_result() {
+    let mut db = db();
+    let ids = filter_corpus(&mut db);
+    db.meetings()
+        .upsert_note(&ids[0], "the flywheel note", &[])
+        .unwrap();
+    // Churn first: an index with a single b-tree has nothing to merge, so
+    // optimizing it would be a no-op and this would prove nothing.
+    for body in ["draft one", "draft two", "the flywheel note again"] {
+        db.meetings().upsert_note(&ids[1], body, &[]).unwrap();
+    }
+
+    let before = db.search(&SearchQuery::new("flywheel")).unwrap();
+    assert_eq!(before.len(), 2);
+
+    db.optimize_search_index().unwrap();
+
+    assert_eq!(db.search(&SearchQuery::new("flywheel")).unwrap(), before);
+    assert!(
+        db.search(&SearchQuery::new("draft")).unwrap().is_empty(),
+        "superseded note drafts must not come back"
+    );
+    db.verify_search_index().unwrap();
+}
+
+/// `verify_search_index` has to be able to *fail*, or every place it is called
+/// as a positive assertion is decoration.
+#[test]
+fn the_integrity_check_notices_an_index_that_disagrees_with_its_content_table() {
+    let mut db = db();
+    filter_corpus(&mut db);
+    db.verify_search_index()
+        .expect("control: a fresh index is consistent");
+
+    db.conn()
+        .execute_batch("INSERT INTO segments_fts(segments_fts) VALUES('delete-all');")
+        .unwrap();
+
+    db.verify_search_index()
+        .expect_err("an emptied index over a populated content table must not verify");
+
+    db.rebuild_search_index().unwrap();
+    db.verify_search_index().unwrap();
+}
+
 // ------------------------------------------------- §9.6, no longer vacuously
 
 /// §9.6, the clause that only became real with migration 0002.

@@ -433,24 +433,32 @@ impl Db {
 
     /// Merge each index into a single b-tree, discarding retracted entries.
     ///
-    /// [`Db::delete_meeting`] already does this, which is where it matters
-    /// (§9.6); it is public so a maintenance pass can compact an index that has
-    /// accumulated churn from edited notes and regenerated summaries. See
-    /// [`optimize_all`] for why a logical delete is not enough on its own.
+    /// A maintenance operation, not part of any hot path and deliberately not
+    /// part of [`Db::delete_meeting`] — see the `optimize_all` docs in this
+    /// module's source for what it costs and what makes it unnecessary there.
     pub fn optimize_search_index(&mut self) -> Result<()> {
         optimize_all(self.conn())
     }
 
     /// FTS5's own `integrity-check`, run against all four indexes.
     ///
-    /// For an external-content table this checks more than the index's internal
-    /// structure: it also verifies that the index agrees with the content
-    /// table. That makes it the direct test for "a trigger did not fire", which
-    /// is the failure this whole design is exposed to.
+    /// The `rank` argument is the whole point of this method and is not
+    /// optional. Without it — `VALUES('integrity-check')` — FTS5 checks only
+    /// that the index is internally well-formed, and an index that has silently
+    /// lost every entry is perfectly well-formed. Passing 1 asks it to also
+    /// verify that the index agrees with the *content table*, which is what
+    /// turns this into a direct test for "a trigger did not fire", the one
+    /// failure an external-content design is really exposed to. Verified by
+    /// `the_integrity_check_notices_an_index_that_disagrees_with_its_content_table`,
+    /// which fails against the argument-less form.
+    ///
+    /// Reports corruption as [`StoreError::Sqlite`] carrying SQLite's
+    /// `database disk image is malformed`. The fix is
+    /// [`Db::rebuild_search_index`], never a restore.
     pub fn verify_search_index(&self) -> Result<()> {
         for table in FTS_TABLES {
             self.conn().execute_batch(&format!(
-                "INSERT INTO {table}({table}) VALUES('integrity-check');"
+                "INSERT INTO {table}({table}, rank) VALUES('integrity-check', 1);"
             ))?;
         }
         Ok(())
@@ -586,27 +594,31 @@ fn hydrate_sql(source: SearchSource) -> &'static str {
     }
 }
 
-/// Merge every b-tree in every FTS index into one, discarding deleted entries.
+/// Merge every b-tree in every FTS index into one, discarding retracted
+/// entries and reclaiming the space they held.
 ///
-/// # Why `delete_meeting` has to call this
+/// # Why this is not what `delete_meeting` uses
 ///
-/// A `'delete'` against an FTS5 index is *logical*. It writes a new index
-/// segment full of delete markers, and a delete marker carries the term it is
-/// retracting — so retracting a transcript does not remove its words from the
-/// file, it writes a **second copy of every one of them**. Queries stop
-/// returning the row immediately, which is what makes this so easy to miss:
-/// every behavioural test passes while the text is still sitting in
-/// `segments_fts_data` in plain form.
+/// By default a `'delete'` against an FTS5 index is *logical*. It appends
+/// delete markers, and a delete marker carries the term it is retracting — so
+/// retracting a transcript does not remove its words from the file, it writes a
+/// **second copy of every one of them**. Queries stop returning the row
+/// immediately, which is what makes this so easy to miss: every behavioural
+/// test passes while the text is still sitting in `segments_fts_data` in plain
+/// form, and only §9.6's byte scan sees it.
 ///
-/// §9.6's acceptance criterion is a byte scan, not a query, and it is the only
-/// thing that catches this. `optimize` is what actually collapses the markers
-/// against the postings they cancel, and it must run *before*
-/// `incremental_vacuum`, or the pages it frees stay in the file.
+/// `optimize` does collapse the markers against the postings they cancel, and
+/// it was how [`Db::delete_meeting`] first satisfied §9.6. It is not how it
+/// does now, because it rewrites the *whole* index: deleting one meeting from a
+/// 20,000-meeting library would cost time proportional to the library. Setting
+/// FTS5's `'secure-delete'` in migration 0002 instead makes the retraction
+/// itself rewrite only the affected leaf pages, which is proportional to the
+/// deletion, and leaves nothing for this to collapse.
 ///
-/// Not cheap: it rewrites the whole index, so it is proportional to the size of
-/// the library rather than to the size of the deletion. That is the right trade
-/// for a rare, explicitly destructive, user-initiated operation, and the wrong
-/// one for anything on the recording path — which is why nothing else calls it.
+/// What remains here is a maintenance operation: an index that has absorbed a
+/// year of edited notes and regenerated summaries is spread across many
+/// b-trees, and merging them speeds up queries. Nothing on the recording path
+/// may call it.
 pub(crate) fn optimize_all(conn: &rusqlite::Connection) -> Result<()> {
     for table in FTS_TABLES {
         conn.execute_batch(&format!("INSERT INTO {table}({table}) VALUES('optimize');"))?;
