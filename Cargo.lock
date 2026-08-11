@@ -619,6 +619,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fotw-shell"
+version = "0.1.0"
+
+[[package]]
 name = "fotw-store"
 version = "0.1.0"
 dependencies = [
@@ -653,6 +657,10 @@ dependencies = [
  "serde_json",
  "thiserror",
 ]
+
+[[package]]
+name = "fotw-web"
+version = "0.1.0"
 
 [[package]]
 name = "fotwd"
