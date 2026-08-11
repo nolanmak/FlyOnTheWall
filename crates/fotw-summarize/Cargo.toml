@@ -7,3 +7,16 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# The transcript is this crate's input and `fotw-stt` owns its canonical shape
+# (spec 7.2). Re-declaring `TranscriptSegment` here would fork the format the
+# moment either side changed a field, so the dependency is deliberate.
+fotw-stt = { path = "../fotw-stt" }
+
+# No HTTP client, no TLS, no async runtime. The provider transport is a trait
+# (`transport::HttpTransport`) that the daemon injects, which is what lets the
+# whole two-call pipeline -- request construction included -- be asserted
+# against a recorded mock with no key, no socket and no secrets in CI
+# (docs/REQUIREMENTS.md 5.6). `testing::block_on` drives the futures.
