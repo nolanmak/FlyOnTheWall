@@ -13,6 +13,7 @@ fotw-stt = { path = "../fotw-stt" }
 fotw-summarize = { path = "../fotw-summarize" }
 fotw-secrets = { path = "../fotw-secrets" }
 fotw-store = { path = "../fotw-store" }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }

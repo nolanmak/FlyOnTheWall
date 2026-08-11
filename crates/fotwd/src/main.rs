@@ -18,6 +18,7 @@ use fotw_audio::{AudioPlatform, DeviceId, FormatRequest, SystemScope, platform};
 use fotw_secrets::{KeyStore, Provider};
 use fotw_store::Db;
 use fotw_stt::{DeepgramStreamConfig, Source, deepgram::DeepgramConfig};
+use fotwd::consent::{DisclosureKit, JurisdictionSignals, Rules};
 use fotwd::persist;
 use fotwd::secrets;
 use fotwd::session::{self, Transcription};
@@ -27,9 +28,29 @@ async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("record") => {
-            let secs: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
-            let root = args.get(2).map_or_else(default_root, PathBuf::from);
-            record(root, secs).await
+            let acknowledged = args.iter().any(|a| a == "--i-have-consent");
+            let positional: Vec<&String> =
+                args[1..].iter().filter(|a| !a.starts_with("--")).collect();
+            let secs: u64 = positional
+                .first()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10);
+            let root = positional
+                .get(1)
+                .map_or_else(default_root, |s| PathBuf::from(s.as_str()));
+            record(root, secs, acknowledged).await
+        }
+        Some("disclose") => {
+            let kit = DisclosureKit::default();
+            println!("── paste into the meeting chat ──");
+            println!("{}", kit.chat_notice());
+            println!();
+            println!("── paste into a calendar invite ──");
+            println!("{}", kit.calendar_blurb());
+            println!();
+            println!("── say out loud ──");
+            println!("{}", kit.verbal_script());
+            ExitCode::SUCCESS
         }
         Some("key") => key_command(&args[1..]),
         Some("summarize") => {
@@ -46,8 +67,8 @@ async fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: fotwd <record [seconds] [dir] | list [dir] | \
-                 summarize <id> [dir] | key <set <provider>|list>>"
+                "usage: fotwd <record [seconds] [dir] [--i-have-consent] | list [dir] | \
+                 summarize <id> [dir] | disclose | key <set <provider>|list>>"
             );
             eprintln!();
             eprintln!("  Set DEEPGRAM_API_KEY to transcribe as well as record.");
@@ -77,11 +98,29 @@ fn default_root() -> PathBuf {
         .unwrap_or_else(|_| std::env::temp_dir().join("fotw-sessions"))
 }
 
-async fn record(root: PathBuf, seconds: u64) -> ExitCode {
+async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
     if let Err(e) = std::fs::create_dir_all(&root) {
         eprintln!("fotwd: cannot create {}: {e}", root.display());
         return ExitCode::FAILURE;
     }
+
+    // CON-05: the consent gate runs BEFORE anything is captured. Detection
+    // arms; the user starts. Recording first and asking afterwards is the
+    // conduct pleaded against Granola.
+    let home = std::env::var("FOTW_JURISDICTION").unwrap_or_else(|_| "US-CA".to_owned());
+    let escalation = Rules::builtin().escalate(&JurisdictionSignals::home(&home));
+    println!("{}", escalation.user_text());
+    if escalation.blocks() && !acknowledged {
+        println!();
+        println!("  Recording is blocked until you confirm every participant has");
+        println!("  consented. Re-run with --i-have-consent, and use the disclosure");
+        println!("  text from `fotwd disclose` to actually tell them.");
+        println!();
+        println!("  (set FOTW_JURISDICTION to your own jurisdiction; it defaults to");
+        println!("   US-CA, the strictest common case, rather than guessing)");
+        return ExitCode::FAILURE;
+    }
+    println!();
 
     let plat = platform::host();
     let system = match plat.open_system(SystemScope::DefaultOutputMix, FormatRequest::any()) {
