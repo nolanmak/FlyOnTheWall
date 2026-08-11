@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use fotw_audio::{
-    AudioPlatform, CaptureTimestamp, FormatRequest, FrameFlags, FrameSink, SystemScope, TapError,
-    platform,
+    AudioPlatform, CaptureTimestamp, DeviceId, FormatRequest, FrameFlags, FrameSink, SystemScope,
+    TapError, platform,
 };
 use fotw_pipeline::ring::{AudioRing, RingProducer};
 use fotw_pipeline::wal::SessionWal;
@@ -74,7 +74,29 @@ pub fn record(root: PathBuf, seconds: u64) -> Result<PathBuf, String> {
         }))
         .map_err(|e| format!("could not start the tap: {e}"))?;
 
-    println!("  format   : {format}");
+    // The mic leg: a separate device, a separate IOProc and a separate ring.
+    // Never fused into one aggregate — see fotw_audio::platform::macos::mic.
+    let (mic_producer, mut mic_consumer) = AudioRing::with_capacity_frames(capacity);
+    let mic_silent = Arc::new(AtomicU64::new(0));
+    let mic_total = Arc::new(AtomicU64::new(0));
+    let mut mic_tap = plat
+        .open_mic(&DeviceId::new("default"), FormatRequest::any())
+        .ok();
+    let mic_format = mic_tap.as_mut().and_then(|t| {
+        t.start(Box::new(RingSink {
+            producer: mic_producer,
+            silent_buffers: Arc::clone(&mic_silent),
+            total_buffers: Arc::clone(&mic_total),
+        }))
+        .map_err(|e| eprintln!("  ! mic unavailable: {e}"))
+        .ok()
+    });
+
+    println!("  system   : {format}");
+    match mic_format {
+        Some(f) => println!("  mic      : {f}"),
+        None => println!("  mic      : (not capturing)"),
+    }
     println!("  session  : {}", root.display());
 
     let mut wal = SessionWal::create(&root, format.sample_rate_hz, format.channels)
@@ -85,16 +107,31 @@ pub fn record(root: PathBuf, seconds: u64) -> Result<PathBuf, String> {
     let pump_stop = Arc::clone(&stop);
 
     // The pump: normal priority, does the I/O, drains on a 100 ms cadence.
-    let pump = std::thread::spawn(move || -> Result<u64, String> {
+    // One pump drains BOTH rings. A thread per leg would double the wakeups
+    // and buy nothing: the writes go to the same session directory anyway.
+    let pump = std::thread::spawn(move || -> Result<(u64, u64), String> {
         let mut scratch = vec![0.0f32; 48_000];
-        let mut written: u64 = 0;
+        let (mut sys_written, mut mic_written) = (0u64, 0u64);
         loop {
+            let mut moved = false;
+
             let n = consumer.pop_into(&mut scratch);
             if n > 0 {
                 wal.write_system(&scratch[..n])
-                    .map_err(|e| format!("write failed: {e}"))?;
-                written += n as u64;
-            } else {
+                    .map_err(|e| format!("system write failed: {e}"))?;
+                sys_written += n as u64;
+                moved = true;
+            }
+
+            let m = mic_consumer.pop_into(&mut scratch);
+            if m > 0 {
+                wal.write_mic(&scratch[..m])
+                    .map_err(|e| format!("mic write failed: {e}"))?;
+                mic_written += m as u64;
+                moved = true;
+            }
+
+            if !moved {
                 if pump_stop.load(Ordering::Acquire) {
                     break;
                 }
@@ -104,7 +141,7 @@ pub fn record(root: PathBuf, seconds: u64) -> Result<PathBuf, String> {
         wal.flush().map_err(|e| format!("flush failed: {e}"))?;
         wal.finalize()
             .map_err(|e| format!("finalize failed: {e}"))?;
-        Ok(written)
+        Ok((sys_written, mic_written))
     });
 
     let began = Instant::now();
@@ -115,8 +152,11 @@ pub fn record(root: PathBuf, seconds: u64) -> Result<PathBuf, String> {
 
     // Stop the tap first, then let the pump drain what is still buffered.
     let _ = tap.stop();
+    if let Some(t) = mic_tap.as_mut() {
+        let _ = t.stop();
+    }
     stop.store(true, Ordering::Release);
-    let written = pump
+    let (written, mic_written) = pump
         .join()
         .map_err(|_| "pump thread panicked".to_string())??;
 
@@ -124,8 +164,17 @@ pub fn record(root: PathBuf, seconds: u64) -> Result<PathBuf, String> {
     let total_b = total.load(Ordering::Relaxed);
     let silent_b = silent.load(Ordering::Relaxed);
 
-    println!("\n  captured : {written} samples ({secs:.2}s of audio)");
-    println!("  buffers  : {total_b} ({silent_b} silent)");
+    println!(
+        "\n  system   : {written} samples ({secs:.2}s), {total_b} buffers ({silent_b} silent)"
+    );
+    if let Some(f) = mic_format {
+        let msecs = mic_written as f64 / f64::from(f.sample_rate_hz) / f64::from(f.channels.max(1));
+        println!(
+            "  mic      : {mic_written} samples ({msecs:.2}s), {} buffers ({} silent)",
+            mic_total.load(Ordering::Relaxed),
+            mic_silent.load(Ordering::Relaxed)
+        );
+    }
 
     if total_b == 0 {
         return Err("the IOProc never fired — the tap was not registered".into());

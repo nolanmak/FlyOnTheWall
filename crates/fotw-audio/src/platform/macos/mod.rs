@@ -31,6 +31,7 @@
 //! We deliberately do **not** ship AudioCap's private-TCC-framework probe: it
 //! is undocumented and its own users report it unreliable.
 
+mod mic;
 mod tap;
 
 use std::sync::mpsc::Receiver;
@@ -42,6 +43,7 @@ use crate::ids::{AppInfo, AppRef, DeviceId, DeviceInfo, TapId};
 use crate::permission::{Permission, PermissionState, PlatformCaps};
 use crate::tap::{AudioPlatform, AudioTap, BoxFuture, SystemScope};
 
+pub use mic::MicTap;
 pub use tap::SystemTap;
 
 /// The macOS backend.
@@ -98,8 +100,13 @@ impl AudioPlatform for MacOsPlatform {
     }
 
     fn mics(&self) -> Vec<DeviceInfo> {
-        // The mic leg is AVAudioEngine, tracked separately (CAP-02).
-        Vec::new()
+        // Only the default input for now. Enumerating every device is a
+        // settings-UI concern and needs no capture code.
+        vec![DeviceInfo::new(
+            DeviceId::new("default"),
+            "Default input",
+            true,
+        )]
     }
 
     fn capturable_apps(&self) -> Vec<AppInfo> {
@@ -111,9 +118,9 @@ impl AudioPlatform for MacOsPlatform {
         _device: &DeviceId,
         _hint: FormatRequest,
     ) -> Result<Box<dyn AudioTap>, TapError> {
-        Err(TapError::unsupported(
-            "microphone capture is not implemented yet (CAP-02)",
-        ))
+        // A separate device and IOProc from the system tap, never a fused
+        // aggregate — see the mic module docs.
+        Ok(Box::new(MicTap::default_input()?))
     }
 
     fn open_system(
