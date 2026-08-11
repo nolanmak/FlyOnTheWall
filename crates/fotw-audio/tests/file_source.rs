@@ -117,9 +117,18 @@ fn delivers_ten_millisecond_buffers() {
 
 /// A 90-minute meeting has to run inside a CI step, so the multiplier has to
 /// actually work rather than merely exist.
+///
+/// The bound is a ratio, not a wall-clock constant, and it is set to separate
+/// correct behaviour from a specific regression with margin on both sides.
+/// Pacing with a `thread::sleep` per 10 ms chunk *looks* right and silently
+/// collapses to about 4x, because a 200 µs sleep rounds up to the scheduler's
+/// millisecond granularity. At 50x a correct implementation finishes in
+/// `seconds/50`; the regression takes roughly `seconds/4`. Asserting
+/// `seconds/10` leaves ~5x headroom either way, so it neither flakes on a
+/// loaded runner nor passes the bug.
 #[test]
 fn speed_multiplier_replays_materially_faster_than_real_time() {
-    let seconds = 2.0;
+    let seconds = 4.0;
     let handle = SinkHandle::new();
     let mut src = FileAudioSource::from_wav(
         TapId::system_default(),
@@ -134,8 +143,10 @@ fn speed_multiplier_replays_materially_faster_than_real_time() {
 
     assert_eq!(handle.samples().len(), (16_000.0 * seconds) as usize);
     assert!(
-        elapsed.as_secs_f32() < seconds / 5.0,
-        "2s of fixture at 50x should finish well under 400ms, took {elapsed:?}"
+        elapsed.as_secs_f32() < seconds / 10.0,
+        "{seconds}s of fixture at 50x must complete at >=10x real time \
+         (expected well under {:.0}ms), took {elapsed:?}",
+        seconds * 100.0
     );
 }
 

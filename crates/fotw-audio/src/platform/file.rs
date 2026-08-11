@@ -40,20 +40,29 @@ pub enum ReplaySpeed {
 }
 
 impl ReplaySpeed {
-    /// How long to wait before delivering a buffer worth `frames` frames.
-    fn delay(self, format: StreamFormat, frames: u64) -> Option<Duration> {
-        let ns = format.frames_to_ns(frames);
+    /// Divisor applied to fixture time, or `None` for no pacing at all.
+    fn divisor(self) -> Option<f64> {
         match self {
-            Self::Realtime => Some(Duration::from_nanos(ns)),
-            Self::Multiplier(m) if m > 0.0 => {
-                Some(Duration::from_nanos((ns as f64 / f64::from(m)) as u64))
-            }
+            Self::Realtime => Some(1.0),
+            Self::Multiplier(m) if m > 0.0 => Some(f64::from(m)),
             // A non-positive multiplier is a caller bug; treat it as unpaced
             // rather than dividing by zero and hanging a test forever.
             Self::Multiplier(_) | Self::Unpaced => None,
         }
     }
 }
+
+/// Don't bother sleeping for less than this.
+///
+/// `thread::sleep` cannot resolve sub-millisecond waits — it rounds up to the
+/// scheduler's granularity, which on a loaded machine is a few milliseconds.
+/// Sleeping per 10 ms chunk therefore makes high multipliers a lie: at 50x the
+/// per-chunk wait is 200 µs, so 200 chunks that should total 40 ms actually
+/// take ~540 ms and the effective speed collapses to about 4x. Pacing against
+/// a running deadline and skipping waits below this threshold keeps the
+/// multiplier honest, which is what lets a 90-minute fixture finish inside a
+/// CI step.
+const MIN_SLEEP: Duration = Duration::from_millis(1);
 
 /// Frames per delivered buffer. 10 ms at the fixture's rate, matching the unit
 /// the rest of the pipeline is driven in (the AEC requires exactly 10 ms).
@@ -160,6 +169,8 @@ impl AudioTap for FileAudioSource {
         let chunk_frames = ((u64::from(format.sample_rate_hz) * CHUNK_MS) / 1_000).max(1) as usize;
         let chunk_samples = chunk_frames * channels;
 
+        let divisor = speed.divisor();
+
         self.worker = Some(thread::spawn(move || {
             let origin = Instant::now();
             let mut device_frames: u64 = 0;
@@ -170,14 +181,26 @@ impl AudioTap for FileAudioSource {
                     break;
                 }
                 let frames = (chunk.len() / channels) as u64;
+                device_frames += frames;
 
-                if let Some(d) = speed.delay(format, frames) {
-                    thread::sleep(d);
+                // Pace against a running deadline derived from total fixture
+                // time, not per-chunk sleeps: rounding error and sleep
+                // granularity would otherwise accumulate across thousands of
+                // chunks and dominate the schedule entirely.
+                if let Some(divisor) = divisor {
+                    let target_ns = format.frames_to_ns(device_frames) as f64 / divisor;
+                    let deadline = Duration::from_nanos(target_ns as u64);
+                    if let Some(wait) = deadline.checked_sub(origin.elapsed())
+                        && wait >= MIN_SLEEP
+                    {
+                        thread::sleep(wait);
+                    }
                 }
 
                 // Stamp at the boundary from the one process-wide clock, as a
-                // real backend must (seam rule 3).
-                let ts = CaptureTimestamp::new(device_frames, clock::ns_since(origin));
+                // real backend must (seam rule 3). `device_frames` counts what
+                // came BEFORE this buffer, hence the subtraction.
+                let ts = CaptureTimestamp::new(device_frames - frames, clock::ns_since(origin));
 
                 // A fixture that is entirely zero is legitimately silent, and
                 // reporting that is how the layer above learns to distinguish
@@ -186,7 +209,6 @@ impl AudioTap for FileAudioSource {
                 flags.set(FrameFlags::SILENT, silent);
 
                 sink.on_frames(chunk, ts, flags);
-                device_frames += frames;
                 delivered.store(device_frames, Ordering::Release);
             }
         }));
