@@ -69,8 +69,13 @@ pub(crate) fn migrate(
         return Ok(());
     }
 
-    if found > 0
-        && let Some(path) = db_path
+    // Back up whenever there is anything to lose. Keying off `found > 0` would
+    // look equivalent and is not: a database can hold objects at
+    // `user_version = 0` — one written before migrations existed, or one
+    // recovered by hand — and those are exactly the files where a migration is
+    // most likely to go wrong and a backup most likely to be needed.
+    if let Some(path) = db_path
+        && has_objects(conn)?
     {
         backup_before_migration(conn, path, found, key)?;
     }
@@ -79,7 +84,20 @@ pub(crate) fn migrate(
     Ok(())
 }
 
-/// Snapshot the database into `<root>/backups/pre-migration-<n>-<ts>.db`.
+/// True when the database contains anything at all.
+fn has_objects(conn: &Connection) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Snapshot the database into `<root>/backups/pre-migration-<n>-<ts>.db`,
+/// where `<n>` is the version the file is being migrated *from* — the version
+/// of the data inside the backup, which is the only reading that helps someone
+/// deciding whether a given file is the one they want to restore.
 ///
 /// Uses SQLite's online-backup API rather than `std::fs::copy`, for two
 /// reasons. First, in WAL mode the main file is not a complete database — a
