@@ -16,6 +16,9 @@ dependencies = [
 [[package]]
 name = "fotw-pipeline"
 version = "0.1.0"
+dependencies = [
+ "rtrb",
+]
 
 [[package]]
 name = "fotw-secrets"
@@ -54,6 +57,12 @@ checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "rtrb"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ade083ccbb4bf536df69d1f6432cc23deb7acccff86b183f3923a6fd56a1153"
 
 [[package]]
 name = "syn"
