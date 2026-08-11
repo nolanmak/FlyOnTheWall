@@ -663,6 +663,8 @@ A diarized, timestamped 1-hour transcript is roughly **18,000–25,000 tokens**;
 **Map-reduce is therefore a local-model-only code path**, engaged only when `transcript_tokens > adapter.usable_context * 0.6`. When it fires: pack whole speaker turns into chunks of `usable_context * 0.35`, never splitting an utterance, with 2 turns of overlap and a running ≤ 800-token "context so far" block. Segment IDs are global across chunks so evidence linkage survives the reduce. **Do not topic-segment for chunking** — topic boundaries are themselves an LLM inference and add a failure mode; turn boundaries are deterministic.
 
 > ⚠️ The 18–25k figure is **derived, not measured** (150 wpm × ~1.33 tokens/word × the documented ~30% Claude 4.7+ tokenizer increase × per-utterance overhead). It is refutable in ten minutes by running `POST /v1/messages/count_tokens` with `model: "claude-opus-5"` against five real transcripts. Do that in M1. If real transcripts run 3–5× the estimate, map-reduce becomes P0 on the default path and the cost model below is understated.
+>
+> **Correction (2026-08-11).** The band is not even reachable from its own stated arithmetic: 9,000 words × 1.33 × 1.30 = **15,561**, below the quoted floor. The unquantified "per-utterance overhead" term is carrying roughly a third of the figure. That is why token estimation is done **per content block** rather than per transcript — the overhead scales with segment count, not word count, and a transcript chopped into many short utterances costs materially more than the same words in few long ones.
 
 ### 8.2 Provider config
 
@@ -720,7 +722,9 @@ Anthropic's Citations API is a **server-enforced** guardrail, not a prompting tr
 
 > **Default to `ttl: "5m"` for the two-call pipeline; upgrade the same prefix to `"1h"` only when a chat session opens.**
 
-Order the prompt as `tools → system (grounding contract + template, both stable) → document block (cached) → user notes → instruction`. **Never interpolate a timestamp, meeting UUID, or `datetime.now()` into the system prompt** — it invalidates the whole prefix. Verify with `usage.cache_read_input_tokens > 0` on Call B; a zero there in CI is a test failure.
+Order the prompt as `tools → system (grounding contract + template, both stable) → document block (cached) → user notes → instruction`. **Never interpolate a timestamp, meeting UUID, or `datetime.now()` into the system prompt** — it invalidates the whole prefix. Verify with `usage.cache_read_input_tokens > 0` on Call B **only where a hit was reachable**.
+
+> **Correction (2026-08-11).** Making a zero an unconditional CI failure is wrong, because two configurations this spec itself mandates cannot produce a hit. Caches are **per-model**, and the `cheap` preset deliberately runs Call B on Haiku while Call A runs on Sonnet — different model, no shared prefix. And `citations.enabled` lives *inside* the document block, so Call A's `true` and Call B's `false` are not byte-identical prefixes to begin with. Assert the hit only when one was actually possible.
 
 ### 8.5 The extraction schema
 
@@ -748,7 +752,9 @@ Order the prompt as `tools → system (grounding contract + template, both stabl
 
 ### 8.6 The validators
 
-**Citation coverage (Call A).** For each substantive claim (> 12 words, not a heading, not a bullet marker), require at least one attached citation. `coverage = cited_claims / total_claims`. Below 0.7, banner: *"This summary has low transcript grounding — review before sharing."* Render uncited paragraphs with a dashed left border. **Do not silently delete them** — deletion loses genuinely-inferred connective tissue. Label it *transcript grounding*, never *accuracy* — a model can cite a real segment while mischaracterizing it, so coverage of 1.0 does not mean zero hallucination.
+**Citation coverage (Call A).** For each substantive claim (> 12 words, not a heading, not a bullet marker), require at least one attached citation.
+
+> **Ambiguity resolved (2026-08-11).** "Not a bullet marker" can mean *skip the marker* or *skip the whole bullet*. The second reading would make coverage measure the prose **around** a set of meeting notes rather than the notes themselves — precisely inverting what the metric is for, since the augmented notes are mostly bullets. Default: strip the marker and judge the content. The literal reading is available behind a config flag. `coverage = cited_claims / total_claims`. Below 0.7, banner: *"This summary has low transcript grounding — review before sharing."* Render uncited paragraphs with a dashed left border. **Do not silently delete them** — deletion loses genuinely-inferred connective tissue. Label it *transcript grounding*, never *accuracy* — a model can cite a real segment while mischaracterizing it, so coverage of 1.0 does not mean zero hallucination.
 
 **Evidence validation (Call B)** — deterministic, provider-independent, and the highest-leverage mechanism in the system:
 
