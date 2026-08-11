@@ -8,6 +8,7 @@
 
 #![warn(missing_docs)]
 
+pub mod resample;
 pub mod ring;
 pub mod rt;
 pub mod wal;
