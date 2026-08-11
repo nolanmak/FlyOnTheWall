@@ -8,3 +8,4 @@ repository.workspace = true
 
 [dependencies]
 fotw-audio = { path = "../fotw-audio" }
+fotw-pipeline = { path = "../fotw-pipeline" }

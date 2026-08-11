@@ -51,6 +51,7 @@ name = "fotw"
 version = "0.1.0"
 dependencies = [
  "fotw-audio",
+ "fotw-pipeline",
 ]
 
 [[package]]
@@ -66,6 +67,8 @@ name = "fotw-pipeline"
 version = "0.1.0"
 dependencies = [
  "rtrb",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
