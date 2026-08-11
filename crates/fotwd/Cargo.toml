@@ -7,3 +7,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+fotw-audio = { path = "../fotw-audio" }
+fotw-pipeline = { path = "../fotw-pipeline" }
+fotw-stt = { path = "../fotw-stt" }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }

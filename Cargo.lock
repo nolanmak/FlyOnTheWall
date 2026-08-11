@@ -263,6 +263,13 @@ version = "0.1.0"
 [[package]]
 name = "fotwd"
 version = "0.1.0"
+dependencies = [
+ "fotw-audio",
+ "fotw-pipeline",
+ "fotw-stt",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "futures-core"
