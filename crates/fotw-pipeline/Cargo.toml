@@ -12,3 +12,5 @@ thiserror = { workspace = true }
 rubato = "5.0.0"
 serde = { workspace = true }
 serde_json = { workspace = true }
+opusic-sys = "0.7"
+ogg = "0.9"

@@ -35,13 +35,25 @@
 //! cadence, so a hard kill costs at most one interval. Nothing here relies on
 //! `Drop`, a panic hook, or a signal handler running: those are best-effort
 //! improvements, not the mechanism.
+//!
+//! # What happens to the PCM afterwards
+//!
+//! Nothing keeps it. Raw PCM is 32 kB/s per leg, so a 45-minute meeting is
+//! 173 MB of it — the crash invariant is worth that *during* the meeting and
+//! nothing like it afterwards. [`SessionWal::finalize_and_encode`] transcodes
+//! both legs to the archival form §9.5 specifies — mono Opus in Ogg, 24 kbps
+//! VBR — and only then unlinks the PCM. The order matters: the PCM is the
+//! source of truth until something else provably is.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+use crate::opus::{OpusError, OpusOggWriter, SUPPORTED_RATES};
+use crate::resample::{Downmixer, Resampler16k, TARGET_RATE};
 
 /// How often buffered data is forced to disk.
 ///
@@ -52,6 +64,18 @@ pub const SYNC_INTERVAL: Duration = Duration::from_secs(2);
 /// Sample width on disk. i16 rather than f32 halves the footprint and is the
 /// format every STT provider wants anyway.
 const BYTES_PER_SAMPLE: u64 = 2;
+
+/// The two legs of a session, as `(pcm file, opus file)`.
+///
+/// The names are the ones §9.2 uses for the archived artifacts, so a session
+/// directory promoted into `media/` needs no renaming.
+pub const LEGS: [(&str, &str); 2] = [("system.pcm", "system.opus"), ("mic.pcm", "mic.opus")];
+
+/// How many PCM samples are read and encoded per iteration during a
+/// post-finalize transcode. 64 Ki samples is 4 seconds at 16 kHz — large
+/// enough that the syscall cost disappears, small enough that a 90-minute
+/// meeting never needs more than a few hundred kilobytes of resident buffer.
+const TRANSCODE_CHUNK_SAMPLES: usize = 65_536;
 
 /// An interval of audio that was not captured.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -95,6 +119,80 @@ pub struct Manifest {
     /// Intervals that were not captured.
     #[serde(default)]
     pub gaps: Vec<Gap>,
+    /// The archival Opus tracks, present once the PCM has been transcoded.
+    ///
+    /// Absent while the session is live, which is what tells a reader that the
+    /// `.pcm` files are still the source of truth. Once this is present the
+    /// `.pcm` files may be gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoded: Option<EncodedSession>,
+}
+
+/// One transcoded leg of a session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EncodedTrack {
+    /// File name within the session directory, e.g. `system.opus`.
+    pub file: String,
+    /// Size of the PCM it came from. Kept after the PCM is unlinked so the
+    /// compression ratio remains reportable.
+    pub pcm_bytes: u64,
+    /// Size of the Ogg file, framing included.
+    pub opus_bytes: u64,
+    /// Duration of the encoded audio.
+    pub duration_ms: u64,
+    /// The rate the Opus stream was encoded at, which is the session rate
+    /// unless it had to be resampled to something libopus accepts.
+    pub sample_rate_hz: u32,
+}
+
+impl EncodedTrack {
+    /// How much smaller the Opus file is than the PCM it replaced.
+    #[must_use]
+    pub fn compression_ratio(&self) -> f64 {
+        if self.opus_bytes == 0 {
+            return 0.0;
+        }
+        self.pcm_bytes as f64 / self.opus_bytes as f64
+    }
+}
+
+/// Both legs of a session, transcoded.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EncodedSession {
+    /// The system-audio leg.
+    pub system: EncodedTrack,
+    /// The microphone leg.
+    pub mic: EncodedTrack,
+}
+
+impl EncodedSession {
+    /// Total Opus bytes.
+    #[must_use]
+    pub const fn opus_bytes(&self) -> u64 {
+        self.system.opus_bytes + self.mic.opus_bytes
+    }
+
+    /// Total PCM bytes replaced.
+    #[must_use]
+    pub const fn pcm_bytes(&self) -> u64 {
+        self.system.pcm_bytes + self.mic.pcm_bytes
+    }
+
+    /// Whole-session compression ratio.
+    #[must_use]
+    pub fn compression_ratio(&self) -> f64 {
+        if self.opus_bytes() == 0 {
+            return 0.0;
+        }
+        self.pcm_bytes() as f64 / self.opus_bytes() as f64
+    }
+
+    /// The two Opus files, resolved against the session directory.
+    #[must_use]
+    pub fn paths(&self, dir: impl AsRef<Path>) -> Vec<PathBuf> {
+        let dir = dir.as_ref();
+        vec![dir.join(&self.system.file), dir.join(&self.mic.file)]
+    }
 }
 
 /// One finalized STT result, as appended to `stt.jsonl`.
@@ -142,9 +240,14 @@ impl SessionWal {
             started_at_ms: now_ms(),
             host_epoch_ns: 0,
             app_version: env!("CARGO_PKG_VERSION").to_string(),
-            schema: 1,
+            // 2 adds `encoded`. The field is `#[serde(default)]`, so a
+            // schema-1 manifest still reads; the bump exists to make the
+            // absence of the field distinguishable from a writer that did not
+            // know about it.
+            schema: 2,
             ended_at_ms: None,
             gaps: Vec::new(),
+            encoded: None,
         };
 
         let wal = Self {
@@ -236,6 +339,21 @@ impl SessionWal {
         Ok(self.dir)
     }
 
+    /// Close the session, transcode both legs to Opus, and unlink the PCM.
+    ///
+    /// This is the production finalize path. [`finalize`](Self::finalize) is
+    /// kept separate because the two failure modes are not the same: a session
+    /// that closes but fails to encode is intact and retryable, while one that
+    /// never closed is a recovery case. Sequencing matters — the PCM is the
+    /// crash invariant right up until the Opus exists, so it is unlinked
+    /// *after* the encode returns and not before.
+    pub fn finalize_and_encode(self) -> Result<(PathBuf, EncodedSession), OpusError> {
+        let dir = self.finalize()?;
+        let encoded = encode_session(&dir)?;
+        discard_pcm(&dir)?;
+        Ok((dir, encoded))
+    }
+
     fn maybe_sync(&mut self) -> std::io::Result<()> {
         if self.last_sync.elapsed() >= SYNC_INTERVAL {
             self.flush()?;
@@ -244,17 +362,7 @@ impl SessionWal {
     }
 
     fn write_manifest(&self) -> std::io::Result<()> {
-        // Temp file plus rename: a manifest half-overwritten by a crash would
-        // make an otherwise-recoverable session unreadable.
-        let tmp = self.dir.join("manifest.json.tmp");
-        let json = serde_json::to_vec_pretty(&self.manifest)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        {
-            let mut f = create(&tmp)?;
-            f.write_all(&json)?;
-            f.sync_all()?;
-        }
-        std::fs::rename(tmp, self.dir.join("manifest.json"))
+        write_manifest_at(&self.dir, &self.manifest)
     }
 }
 
@@ -277,12 +385,7 @@ impl SessionState {
     /// Read a session directory, tolerating a hard kill mid-write.
     pub fn read(dir: impl AsRef<Path>) -> std::io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        let manifest: Manifest = {
-            let mut s = String::new();
-            File::open(dir.join("manifest.json"))?.read_to_string(&mut s)?;
-            serde_json::from_str(&s)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
-        };
+        let manifest = read_manifest(&dir)?;
 
         let frame_bytes = BYTES_PER_SAMPLE * u64::from(manifest.channels.max(1));
         // Integer division deliberately discards a partial trailing frame: a
@@ -336,6 +439,175 @@ pub fn recover(root: impl AsRef<Path>) -> std::io::Result<Vec<SessionState>> {
     }
     out.sort_by_key(|s| s.manifest.started_at_ms);
     Ok(out)
+}
+
+/// Transcode a session's raw PCM legs into the archival Opus tracks of §9.5.
+///
+/// Works on any session directory, finalized or not, which is what lets a
+/// recovered meeting be archived without first being replayed. The `.pcm`
+/// files are left alone — see [`discard_pcm`] — and the manifest is rewritten
+/// with an [`EncodedSession`] so a later reader knows which artifact is
+/// authoritative.
+///
+/// The muxing is incremental (CAP-10): a kill part-way through leaves both
+/// `.opus` files playable up to their last whole Ogg page, and the untouched
+/// `.pcm` still holds everything, so the encode can simply be re-run.
+pub fn encode_session(dir: impl AsRef<Path>) -> Result<EncodedSession, OpusError> {
+    let dir = dir.as_ref();
+    let mut manifest = read_manifest(dir)?;
+
+    let system = encode_track(dir, LEGS[0].0, LEGS[0].1, &manifest)?;
+    let mic = encode_track(dir, LEGS[1].0, LEGS[1].1, &manifest)?;
+    let encoded = EncodedSession { system, mic };
+
+    manifest.encoded = Some(encoded.clone());
+    write_manifest_at(dir, &manifest)?;
+    Ok(encoded)
+}
+
+/// Unlink a session's raw PCM, returning the bytes reclaimed.
+///
+/// Refuses if the manifest does not record an encode, because the PCM is the
+/// only copy of the meeting until something else demonstrably is. That check
+/// is the difference between "reclaim space" and "lose the meeting".
+pub fn discard_pcm(dir: impl AsRef<Path>) -> std::io::Result<u64> {
+    let dir = dir.as_ref();
+    let manifest = read_manifest(dir)?;
+    if manifest.encoded.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to unlink PCM: the manifest records no Opus encode",
+        ));
+    }
+    let mut freed = 0u64;
+    for (pcm, _) in LEGS {
+        let p = dir.join(pcm);
+        let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+        match std::fs::remove_file(&p) {
+            Ok(()) => freed += size,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(freed)
+}
+
+fn read_manifest(dir: &Path) -> std::io::Result<Manifest> {
+    let mut s = String::new();
+    File::open(dir.join("manifest.json"))?.read_to_string(&mut s)?;
+    serde_json::from_str(&s).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+fn write_manifest_at(dir: &Path, manifest: &Manifest) -> std::io::Result<()> {
+    let tmp = dir.join("manifest.json.tmp");
+    let json = serde_json::to_vec_pretty(manifest)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    {
+        let mut f = create(&tmp)?;
+        f.write_all(&json)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(tmp, dir.join("manifest.json"))
+}
+
+/// Encode one leg.
+///
+/// Three shape problems get solved here, in an order that is not arbitrary:
+///
+/// * **Channels.** Opus tracks are mono (§9.5), so a multi-channel session is
+///   averaged down first. Downmixing *before* the resampler halves the work
+///   the filter has to do, which is the same reasoning as
+///   [`crate::resample`]'s.
+/// * **Rate.** libopus accepts only 8/12/16/24/48 kHz. The pipeline's own rate
+///   is 16 kHz so the common path resamples nothing; anything else is put
+///   through [`Resampler16k`] rather than rejected, because a session
+///   recovered from an older or stranger capture must still be archivable.
+///   That path loses up to one 10 ms chunk at the very end — the residue the
+///   resampler is still holding — which is below the resolution of anything
+///   downstream.
+/// * **Framing.** The encoder re-blocks into 20 ms frames itself, so the read
+///   size here is chosen for I/O efficiency alone.
+fn encode_track(
+    dir: &Path,
+    pcm_name: &str,
+    opus_name: &str,
+    manifest: &Manifest,
+) -> Result<EncodedTrack, OpusError> {
+    let pcm_path = dir.join(pcm_name);
+    let opus_path = dir.join(opus_name);
+    let pcm_bytes = std::fs::metadata(&pcm_path).map(|m| m.len()).unwrap_or(0);
+
+    let channels = manifest.channels.max(1);
+    let session_rate = manifest.sample_rate_hz.max(1);
+    let (encode_rate, mut resampler) = if SUPPORTED_RATES.contains(&session_rate) {
+        (session_rate, None)
+    } else {
+        let r = Resampler16k::new(session_rate, 1)
+            .map_err(|e| OpusError::Container(format!("cannot resample {session_rate} Hz: {e}")))?;
+        (TARGET_RATE, Some(r))
+    };
+
+    let mut writer = OpusOggWriter::create(&opus_path, encode_rate)?;
+
+    if pcm_bytes > 0 {
+        let mut rdr = BufReader::new(File::open(&pcm_path)?);
+        let mut bytes = vec![0u8; TRANSCODE_CHUNK_SAMPLES * BYTES_PER_SAMPLE as usize];
+        // Bytes that did not make up a whole frame, carried to the next read.
+        // A hard kill leaves a torn trailing frame; it is dropped at the end,
+        // exactly as `SessionState::read` drops it.
+        let mut carry: Vec<u8> = Vec::new();
+        let frame_bytes = BYTES_PER_SAMPLE as usize * channels as usize;
+        let mut last_sync = Instant::now();
+
+        loop {
+            let n = rdr.read(&mut bytes)?;
+            if n == 0 {
+                break;
+            }
+            carry.extend_from_slice(&bytes[..n]);
+            let usable = carry.len() / frame_bytes * frame_bytes;
+            if usable == 0 {
+                continue;
+            }
+
+            let interleaved: Vec<f32> = carry[..usable]
+                .chunks_exact(BYTES_PER_SAMPLE as usize)
+                .map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32_768.0)
+                .collect();
+            carry.drain(..usable);
+
+            let mono = Downmixer::to_mono(&interleaved, channels);
+            match resampler.as_mut() {
+                Some(r) => {
+                    let out = r
+                        .process_all(&mono)
+                        .map_err(|e| OpusError::Container(e.to_string()))?;
+                    writer.push_f32(&out)?;
+                }
+                None => writer.push_f32(&mono)?,
+            }
+            // Pages already reach the kernel on every page boundary, which is
+            // what defeats `kill -9`. This is the other half — fsync on the
+            // WAL's own cadence, which defeats a power cut — kept on a clock
+            // rather than a chunk count so a fast disk does not turn a
+            // transcode into thousands of fsyncs.
+            if last_sync.elapsed() >= SYNC_INTERVAL {
+                writer.sync()?;
+                last_sync = Instant::now();
+            }
+        }
+    }
+
+    let stats = writer.finish()?;
+    let opus_bytes = std::fs::metadata(&opus_path).map(|m| m.len()).unwrap_or(0);
+
+    Ok(EncodedTrack {
+        file: opus_name.to_string(),
+        pcm_bytes,
+        opus_bytes,
+        duration_ms: stats.duration_ms(),
+        sample_rate_hz: encode_rate,
+    })
 }
 
 fn read_jsonl(path: &Path) -> Vec<SttRecord> {
