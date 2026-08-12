@@ -33,9 +33,11 @@
 
 #![warn(missing_docs)]
 
+mod archive;
 mod db;
 mod delete;
 mod error;
+pub mod export;
 mod ids;
 mod key;
 mod migrations;
@@ -43,9 +45,14 @@ mod models;
 mod repo;
 mod search;
 
+pub use crate::archive::{
+    ArchiveOptions, ArchiveReport, Conflict, ImportReport, LIBRARY_SCHEMA, LibraryManifest,
+    PLAINTEXT_WARNING, Progress, Projection, archived_tables,
+};
 pub use crate::db::Db;
 pub use crate::delete::DeleteOutcome;
 pub use crate::error::{Result, StoreError};
+pub use crate::export::{Blob, Clipboard, MEETING_SCHEMA, MeetingDoc};
 pub use crate::ids::{new_id, now_ms};
 pub use crate::key::DbKey;
 pub use crate::migrations::LATEST_SCHEMA_VERSION;

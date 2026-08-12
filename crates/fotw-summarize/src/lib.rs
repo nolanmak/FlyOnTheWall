@@ -68,6 +68,7 @@ pub mod pipeline;
 pub mod pricing;
 pub mod prompt;
 pub mod schema;
+pub mod template;
 pub mod testing;
 pub mod tokens;
 pub mod transport;
@@ -88,6 +89,9 @@ pub use prompt::{AUGMENT_PROMPT_VERSION, SystemPrompt, assemble};
 pub use schema::{
     ActionItem, Confidence, Decision, EXTRACTION_SCHEMA, Extraction, FollowUp, ItemKind,
     OpenQuestion, Topic,
+};
+pub use template::{
+    ExtractionToggles, Section, Template, TemplateError, TemplateErrorKind, TemplateSet,
 };
 pub use tokens::estimate_tokens;
 pub use transport::{HttpRequest, HttpResponse, HttpTransport};

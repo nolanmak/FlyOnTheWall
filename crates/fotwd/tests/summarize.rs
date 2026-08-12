@@ -11,6 +11,7 @@ use std::sync::Arc;
 use fotw_secrets::{InMemoryKeyStore, KeyStore, Provider, SecretKey, SecretString};
 use fotw_store::{Db, DbKey};
 use fotw_stt::{Source, TimestampSource, TranscriptSegment};
+use fotw_summarize::template::{Template, TemplateSet};
 use fotw_summarize::testing::MockTransport;
 use fotwd::persist;
 use fotwd::session::SessionOutcome;
@@ -25,6 +26,14 @@ fn tmpdir(name: &str) -> std::path::PathBuf {
 
 fn db_at(dir: &std::path::Path) -> Db {
     Db::open(dir.join("db.sqlite3"), &DbKey::from_bytes([0x11; 32])).unwrap()
+}
+
+/// The shipped `general` template (SUM-08). Deliberately a real one rather
+/// than an empty body: the daemon never runs without a template, so a test
+/// that passed an empty string would be exercising a configuration that does
+/// not exist in the product.
+fn general() -> Template {
+    TemplateSet::builtin().get("general").unwrap().clone()
 }
 
 fn keystore_with_anthropic() -> InMemoryKeyStore {
@@ -94,10 +103,15 @@ async fn a_meeting_with_no_transcript_is_a_typed_error_not_a_crash() {
     };
     let id = persist::persist_session(&mut db, &outcome, "No transcript").unwrap();
 
-    let err =
-        summarize::summarize_meeting_with(&mut db, &store, &id, "", Arc::new(MockTransport::new()))
-            .await
-            .unwrap_err();
+    let err = summarize::summarize_meeting_with(
+        &mut db,
+        &store,
+        &id,
+        &general(),
+        Arc::new(MockTransport::new()),
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(err, summarize::SummarizeRunError::NoTranscript(_)));
 }
 
@@ -114,7 +128,7 @@ async fn a_missing_key_is_reported_without_touching_the_transcript() {
         &mut db,
         &empty_store,
         &id,
-        "",
+        &general(),
         Arc::new(MockTransport::new()),
     )
     .await
@@ -142,7 +156,8 @@ async fn the_stored_transcript_reaches_the_provider_as_a_document() {
 
     // The pipeline will reject the extraction shape; what matters here is that
     // the text made it out of SQLite and into a request body at all.
-    let _ = summarize::summarize_meeting_with(&mut db, &store, &id, "", Arc::clone(&mock)).await;
+    let _ = summarize::summarize_meeting_with(&mut db, &store, &id, &general(), Arc::clone(&mock))
+        .await;
 
     assert!(mock.call_count() > 0, "no request was made");
     let body = mock.request(0).body.to_string();
@@ -177,7 +192,8 @@ async fn the_request_never_carries_both_citations_and_a_structured_format() {
         "usage": {"input_tokens": 1, "output_tokens": 1},
         "stop_reason": "end_turn"
     })));
-    let _ = summarize::summarize_meeting_with(&mut db, &store, &id, "", Arc::clone(&mock)).await;
+    let _ = summarize::summarize_meeting_with(&mut db, &store, &id, &general(), Arc::clone(&mock))
+        .await;
 
     // The predicate is `enabled == true`, not the mere presence of the key:
     // Call B sends `citations: {enabled: false}` explicitly, so a substring

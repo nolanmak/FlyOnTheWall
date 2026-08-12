@@ -14,9 +14,35 @@ thiserror = { workspace = true }
 # (spec 7.2). Re-declaring `TranscriptSegment` here would fork the format the
 # moment either side changed a field, so the dependency is deliberate.
 fotw-stt = { path = "../fotw-stt" }
+# YAML frontmatter for the template files (SUM-08).
+#
+# NOT serde_yaml: archived by its author in 2024 and unmaintained.
+# NOT serde_yml either, though it is a maintained fork -- it is a serde front
+# end, so its errors are the deserializer's errors, located at the point the
+# deserializer stopped. saphyr returns a `MarkedYaml` tree in which EVERY node
+# carries its own span, which is what lets `template.rs` say
+# "line 7: unknown key `temperture`, did you mean `temperature`?" -- naming the
+# key's own line and the key the user meant. The located, suggestive error is
+# the feature issue #36 asks for, so the parser that makes it cheap wins.
+#
+# default-features = false drops `encoding` (encoding_rs, ~1 MB of charset
+# tables). Template files are UTF-8; a non-UTF-8 one fails at `read_to_string`
+# with a clearer message than a charset guess would give.
+saphyr = { version = "0.0.11", default-features = false }
+# The event stream underneath saphyr, for one thing the tree cannot express:
+# duplicate keys. saphyr's loader inserts into a LinkedHashMap, so `name:`
+# written twice arrives as one entry with the second value and the first is
+# gone before any caller sees the document -- YAML's own "last wins", which is
+# precisely the silent loss this module refuses. Only the event stream still
+# has both. Same version as `saphyr`, which already depends on it, so this
+# costs nothing in build time or tree size.
+saphyr-parser = "0.0.11"
 
 # No HTTP client, no TLS, no async runtime. The provider transport is a trait
 # (`transport::HttpTransport`) that the daemon injects, which is what lets the
 # whole two-call pipeline -- request construction included -- be asserted
 # against a recorded mock with no key, no socket and no secrets in CI
 # (docs/REQUIREMENTS.md 5.6). `testing::block_on` drives the futures.
+
+[dev-dependencies]
+tempfile = "3"

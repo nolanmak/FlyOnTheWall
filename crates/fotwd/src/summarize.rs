@@ -13,6 +13,7 @@ use fotw_store::{Db, NewSummary};
 use fotw_stt::{Source, TimestampSource, TranscriptSegment};
 use fotw_summarize::document::TranscriptDocument;
 use fotw_summarize::pipeline::{Pipeline, PipelineConfig};
+use fotw_summarize::template::Template;
 use fotw_summarize::{AnthropicAdapter, Preset};
 
 use crate::transport::AllowlistedTransport;
@@ -57,10 +58,10 @@ pub async fn summarize_meeting(
     db: &mut Db,
     store: &dyn KeyStore,
     meeting_id: &str,
-    template_body: &str,
+    template: &Template,
 ) -> Result<SummarizeOutcome, SummarizeRunError> {
     let transport = Arc::new(AllowlistedTransport::new());
-    summarize_meeting_with(db, store, meeting_id, template_body, transport).await
+    summarize_meeting_with(db, store, meeting_id, template, transport).await
 }
 
 /// Summarise a stored meeting over an injected transport.
@@ -73,7 +74,7 @@ pub async fn summarize_meeting_with<T>(
     db: &mut Db,
     store: &dyn KeyStore,
     meeting_id: &str,
-    template_body: &str,
+    template: &Template,
     transport: Arc<T>,
 ) -> Result<SummarizeOutcome, SummarizeRunError>
 where
@@ -111,8 +112,12 @@ where
     let prose = AnthropicAdapter::new(Arc::clone(&transport), prose_model, key.expose());
     let extraction = AnthropicAdapter::new(Arc::clone(&transport), extraction_model, key.expose());
 
+    // The template arrives as a parsed file (SUM-08), and what crosses this
+    // seam is still just its rendered body -- untrusted text that
+    // `prompt::assemble` quarantines. Parsing it earlier bought a located
+    // error message, not trust.
     let pipeline = Pipeline::new(&prose, &extraction).with_config(PipelineConfig {
-        template_body: template_body.to_owned(),
+        template_body: template.prompt_body(),
         ..PipelineConfig::default()
     });
 
