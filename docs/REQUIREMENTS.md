@@ -796,7 +796,7 @@ PRAGMA temp_store = MEMORY;
 
 ### 9.2 On-disk layout
 
-Root is the app-local data dir — macOS `~/Library/Application Support/com.flyonthewall.app`, Windows `%LOCALAPPDATA%\…` (**deliberately Local, not Roaming — 20 GB of audio in a roaming profile would destroy enterprise profile sync**), Linux `$XDG_DATA_HOME/…`.
+Root is the app-local data dir — macOS `~/Library/Application Support/com.flyonthewall.fotw`, Windows `%LOCALAPPDATA%\…` (**deliberately Local, not Roaming — 20 GB of audio in a roaming profile would destroy enterprise profile sync**), Linux `$XDG_DATA_HOME/…`.
 
 ```
 <root>/db.sqlite3 (+ -wal, -shm)
@@ -804,7 +804,14 @@ Root is the app-local data dir — macOS `~/Library/Application Support/com.flyo
 <root>/media/<yyyy>/<mm>/<meeting_id>/{mic.opus.age, system.opus.age, raw-<provider>.json.zst}
 <root>/backups/{auto-<ts>.db, pre-migration-<n>-<ts>.db}
 <root>/plugins/<plugin-id>/
+~/.flyonthewall/templates/<slug>.md   # NOT under <root> — see below
 ```
+
+> **Correction (2026-08-11).** This section said `com.flyonthewall.app`. The shipped bundle identifier is **`com.flyonthewall.fotw`** — `packaging/Info.plist` and the `justfile` have always agreed on it, and on macOS that identifier is load-bearing well beyond a path: TCC grants, keychain item ACLs and the code-signing designated requirement are all keyed to it. Anything built literally from the old text writes to a directory the app never reads.
+>
+> **Templates deliberately sit outside `<root>`**, in `~/.flyonthewall/templates/`. The whole argument for templates-as-files (SUM-08) is that you can `$EDITOR` them, `git init` the directory and share them; `~/Library/Application Support/…` is neither discoverable from a shell nor anywhere anyone keeps a repo. `FOTW_TEMPLATES_DIR` overrides it.
+>
+> §9.6 also requires deleting "cached exports", but this layout gives exports no managed home. That is intentional as implemented — an archive is written wherever the user asks for it, so there is no cache to purge — and §9.6's wording should not be read as implying one.
 
 **All paths stored in the DB are relative to `<root>`** — absolute paths are forbidden by schema lint so the folder can be moved or restored on another machine. On macOS, set `NSURLIsExcludedFromBackupKey` on the media directory by default (user-toggleable) so 20 GB of Opus does not silently fill Time Machine.
 
