@@ -10,7 +10,9 @@ use rusqlite::{OptionalExtension, params};
 use crate::db::Db;
 use crate::error::{Result, StoreError};
 use crate::ids::{new_id, now_ms};
-use crate::models::{Meeting, NewMeeting, NewSegment, NewSummary, NoteAnchor, Summary};
+use crate::models::{
+    Meeting, NewMeeting, NewSegment, NewSummary, NoteAnchor, StoredSegment, Summary,
+};
 
 /// Meeting-scoped reads and writes.
 ///
@@ -296,6 +298,38 @@ impl MeetingRepo<'_> {
         let mut stmt =
             conn.prepare("SELECT idx, text FROM segments WHERE transcript_id = ?1 ORDER BY idx")?;
         let rows = stmt.query_map(params![transcript_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// The transcript with everything a reader needs, not just the words.
+    ///
+    /// [`Self::transcript_text`] exists for the summariser, which wants a flat
+    /// wall of text and nothing else. Rendering a transcript for a *human* is a
+    /// different problem: without a speaker label you cannot tell a question
+    /// from its answer, and without an offset you cannot find the moment
+    /// something was said. Both columns were already being written — we ask
+    /// Deepgram for `diarize=true` and pay for it — and were simply never read
+    /// back, so the UI showed an anonymous monologue.
+    pub fn transcript_segments(&self, transcript_id: &str) -> Result<Vec<StoredSegment>> {
+        let conn = self.db.conn();
+        let mut stmt = conn.prepare(
+            "SELECT idx, start_ms, end_ms, speaker_label, text, confidence
+               FROM segments WHERE transcript_id = ?1 ORDER BY idx",
+        )?;
+        let rows = stmt.query_map(params![transcript_id], |r| {
+            Ok(StoredSegment {
+                idx: r.get(0)?,
+                start_ms: r.get(1)?,
+                end_ms: r.get(2)?,
+                speaker: r.get(3)?,
+                text: r.get(4)?,
+                confidence: r.get(5)?,
+            })
+        })?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);

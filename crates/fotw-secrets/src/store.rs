@@ -106,17 +106,6 @@ impl OsKeyStore {
             StoreAvailability::Unavailable(why) => Err(SecretsError::NoSecretService(why)),
         }
     }
-
-    /// Build the keyring handle for a key.
-    fn entry(
-        &self,
-        operation: &'static str,
-        key: SecretKey,
-    ) -> Result<keyring::Entry, SecretsError> {
-        let account = key.account();
-        keyring::Entry::new(key.service(), &account)
-            .map_err(|err| SecretsError::from_keyring(operation, &account, err))
-    }
 }
 
 /// Ask the platform whether a credential store initialised.
@@ -134,6 +123,87 @@ fn platform_availability() -> StoreAvailability {
     }
 }
 
+/// How long any single keychain call may take before we abandon it.
+///
+/// Not a performance guard — a liveness one. macOS keys a keychain item's ACL
+/// to the calling code's designated requirement. A binary signed ad-hoc, or
+/// signed under a different code identifier than the one that created the
+/// item, is a *different principal*, so the system raises a modal approval
+/// dialog. Under launchd, in CI, over SSH, or from a `cargo run` in a script
+/// there is nobody to click it: the call blocks forever, with no output and no
+/// error. A daemon that hangs silently on startup is worse than one that
+/// refuses to start.
+pub const KEYCHAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run one keychain call, giving up after [`KEYCHAIN_TIMEOUT`].
+///
+/// # Why the thread is detached and never joined
+///
+/// The obvious shape — `std::thread::scope` — is wrong here, and wrong in a
+/// way that *looks* right and passes a green test suite. `scope` joins every
+/// thread it spawned before returning, so `recv_timeout` fires correctly after
+/// five seconds and then the scope blocks forever waiting for the very call we
+/// just gave up on. The timeout becomes decorative. That bug shipped here and
+/// was caught only by sampling a hung process: the main thread sat in
+/// `thread::park` under `thread::scope`, one frame below a timeout that had
+/// already expired.
+///
+/// So the worker is detached. It is stuck inside a system call we cannot
+/// cancel — there is no `SecKeychainFindGenericPasswordWithTimeout` — and the
+/// honest options are to abandon it or to hang. We abandon it: the send half
+/// finds no receiver and the result, including any `SecretString`, is dropped
+/// and zeroed on that thread. The cost is one parked thread for the remaining
+/// life of a process that is, by construction, on its way to reporting an
+/// error.
+fn with_deadline<T, F>(operation: &'static str, account: String, work: F) -> Result<T, SecretsError>
+where
+    F: FnOnce() -> Result<T, SecretsError> + Send + 'static,
+    T: Send + 'static,
+{
+    with_deadline_after(KEYCHAIN_TIMEOUT, operation, account, work)
+}
+
+/// [`with_deadline`] with the deadline named, so a test can use a short one.
+///
+/// Split out only for that: a test that had to wait the real five seconds to
+/// prove the guard works would be a test nobody runs.
+fn with_deadline_after<T, F>(
+    timeout: std::time::Duration,
+    operation: &'static str,
+    account: String,
+    work: F,
+) -> Result<T, SecretsError>
+where
+    F: FnOnce() -> Result<T, SecretsError> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // `send` fails once we have timed out and dropped the receiver. That
+        // is the expected path, not an error, and dropping the value here is
+        // what zeroes it.
+        let _ = tx.send(work());
+    });
+    rx.recv_timeout(timeout).unwrap_or_else(|_| {
+        Err(SecretsError::Platform {
+            operation,
+            key: account,
+            detail: format!(
+                "no answer within {}s. This usually means macOS is showing an \
+                 approval dialog that nothing can display: the keychain item's ACL \
+                 is bound to the code signature that created it, and this binary \
+                 presents a different one. An ad-hoc signature mints a new identity \
+                 on every rebuild, and signing two binaries of the same product \
+                 under different code identifiers makes them different principals \
+                 for the same item. Build through `just dev-sign`, which signs \
+                 every binary under one stable identifier, or approve the dialog \
+                 once in a foreground session.",
+                timeout.as_secs()
+            ),
+        })
+    })
+}
+
 impl KeyStore for OsKeyStore {
     fn set(&self, key: SecretKey, secret: &SecretString) -> Result<(), SecretsError> {
         if secret.is_empty() {
@@ -142,30 +212,49 @@ impl KeyStore for OsKeyStore {
             ));
         }
         let account = key.account();
-        self.entry("writing", key)?
-            .set_password(secret.expose())
-            .map_err(|err| SecretsError::from_keyring("writing", &account, err))
+        // Writes prompt too. Creating a new item does not, but *updating* one
+        // whose ACL names a different principal does, so `set` can hang for
+        // exactly the same reason `get` can.
+        let material = secret.expose().to_owned();
+        let for_thread = account.clone();
+        with_deadline("writing", account, move || {
+            keyring::Entry::new(key.service(), &for_thread)
+                .and_then(|entry| entry.set_password(&material))
+                .map_err(|err| SecretsError::from_keyring("writing", &for_thread, err))
+        })
     }
 
     fn get(&self, key: SecretKey) -> Result<SecretString, SecretsError> {
         let account = key.account();
+        let for_thread = account.clone();
         // `get_password` hands back a bare `String` — a copy of the material
         // outside `SecretString`'s protection. Wrap it in the same expression
         // so it is never bound to a name that could outlive this line, and so
-        // the buffer is zeroed when the `SecretString` drops.
-        keyring::Entry::new(key.service(), &account)
-            .and_then(|entry| entry.get_password())
-            .map(SecretString::new)
-            .map_err(|err| SecretsError::from_keyring("reading", &account, err))
+        // the buffer is zeroed when the `SecretString` drops. That still holds
+        // on the worker thread: if we have already timed out, the `SecretString`
+        // is dropped there and zeroed there.
+        with_deadline("reading", account, move || {
+            keyring::Entry::new(key.service(), &for_thread)
+                .and_then(|entry| entry.get_password())
+                .map(SecretString::new)
+                .map_err(|err| SecretsError::from_keyring("reading", &for_thread, err))
+        })
     }
 
     fn delete(&self, key: SecretKey) -> Result<(), SecretsError> {
         let account = key.account();
-        match self.entry("deleting", key)?.delete_credential() {
-            Ok(()) => Ok(()),
-            Err(keyring::Error::NoEntry) => Ok(()),
-            Err(err) => Err(SecretsError::from_keyring("deleting", &account, err)),
-        }
+        let for_thread = account.clone();
+        with_deadline("deleting", account, move || {
+            let entry = keyring::Entry::new(key.service(), &for_thread)
+                .map_err(|err| SecretsError::from_keyring("deleting", &for_thread, err))?;
+            match entry.delete_credential() {
+                Ok(()) => Ok(()),
+                // Deleting something that is not there is the desired state,
+                // not a failure.
+                Err(keyring::Error::NoEntry) => Ok(()),
+                Err(err) => Err(SecretsError::from_keyring("deleting", &for_thread, err)),
+            }
+        })
     }
 
     fn contains(&self, key: SecretKey) -> Result<bool, SecretsError> {
@@ -426,5 +515,93 @@ mod tests {
 
         store.delete(key).unwrap();
         assert!(!store.contains(key).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    /// The guard must return even when the work never does.
+    ///
+    /// This is the test the original implementation would have failed. It used
+    /// `std::thread::scope`, which joins on exit, so the receive timed out
+    /// correctly and then the scope blocked forever one frame below it — a
+    /// hang that no unit test caught, because no unit test made the keychain
+    /// actually block. If this test hangs, the guard has regressed to that.
+    #[test]
+    fn a_call_that_never_returns_still_times_out() {
+        let started = std::time::Instant::now();
+        let result: Result<u8, SecretsError> = with_deadline_after(
+            std::time::Duration::from_millis(80),
+            "reading",
+            "db:masterkey".to_owned(),
+            || {
+                // Stands in for a keychain call parked on an approval dialog
+                // that nothing can display.
+                std::thread::sleep(std::time::Duration::from_secs(3_600));
+                Ok(0)
+            },
+        );
+
+        let waited = started.elapsed();
+        assert!(
+            matches!(result, Err(SecretsError::Platform { .. })),
+            "expected a Platform error, got {result:?}"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "the guard did not actually give up: waited {waited:?}"
+        );
+    }
+
+    /// The message has to name the cause, or it sends the reader hunting a
+    /// database bug when the problem is a code signature.
+    #[test]
+    fn the_timeout_explains_that_it_is_a_signing_problem() {
+        let result: Result<u8, SecretsError> = with_deadline_after(
+            std::time::Duration::from_millis(20),
+            "reading",
+            "db:masterkey".to_owned(),
+            || {
+                std::thread::sleep(std::time::Duration::from_secs(3_600));
+                Ok(0)
+            },
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("signature"), "unhelpful: {message}");
+        assert!(message.contains("dev-sign"), "no way forward: {message}");
+    }
+
+    /// The happy path must not pay for the guard.
+    #[test]
+    fn work_that_completes_returns_its_value_promptly() {
+        let started = std::time::Instant::now();
+        let result = with_deadline_after(
+            std::time::Duration::from_secs(30),
+            "reading",
+            "db:masterkey".to_owned(),
+            || Ok(7u8),
+        );
+        assert_eq!(result.unwrap(), 7);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// A worker that panics must surface as an error rather than hanging until
+    /// the deadline: the sender is dropped, so the channel disconnects.
+    #[test]
+    fn a_panicking_call_fails_fast_instead_of_waiting_out_the_clock() {
+        let started = std::time::Instant::now();
+        let result: Result<u8, SecretsError> = with_deadline_after(
+            std::time::Duration::from_secs(30),
+            "reading",
+            "db:masterkey".to_owned(),
+            || panic!("the platform library exploded"),
+        );
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a panicking worker should disconnect the channel, not wait"
+        );
     }
 }

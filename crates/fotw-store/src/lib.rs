@@ -49,6 +49,8 @@ pub use crate::error::{Result, StoreError};
 pub use crate::ids::{new_id, now_ms};
 pub use crate::key::DbKey;
 pub use crate::migrations::LATEST_SCHEMA_VERSION;
-pub use crate::models::{Meeting, NewMeeting, NewSegment, NewSummary, NoteAnchor, Summary};
+pub use crate::models::{
+    Meeting, NewMeeting, NewSegment, NewSummary, NoteAnchor, StoredSegment, Summary,
+};
 pub use crate::repo::MeetingRepo;
 pub use crate::search::{FTS_TABLES, SearchHit, SearchQuery, SearchSource, SearchWeights};

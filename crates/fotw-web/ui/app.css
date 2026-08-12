@@ -115,16 +115,58 @@ section {
   padding: 16px 24px;
 }
 
-.summary pre {
-  white-space: pre-wrap;
-  font: inherit;
+.summary-body,
+.note-body {
   background: color-mix(in srgb, var(--fg) 4%, transparent);
-  padding: 12px;
+  padding: 12px 16px;
   border-radius: 8px;
 }
 
+.summary-body > :first-child,
+.note-body > :first-child {
+  margin-top: 0;
+}
+
+.summary-body > :last-child,
+.note-body > :last-child {
+  margin-bottom: 0;
+}
+
+.summary-body h4,
+.note-body h4 {
+  margin: 16px 0 6px;
+  font-size: 0.95rem;
+}
+
+/* Three columns rather than three inline spans: without this the offset, the
+   speaker and the words butt together as "0:00S0The problem is", which is how
+   it first shipped. The time column is fixed-width so the words align down the
+   page instead of stepping in and out as the timestamps change width. */
 .segment {
+  display: grid;
+  grid-template-columns: 3.5rem 2.5rem 1fr;
+  gap: 0 8px;
   margin: 0 0 6px;
+  align-items: baseline;
+}
+
+.segment .at {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.85rem;
+}
+
+.segment .speaker {
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+/* The label is only emitted when the speaker changes, so most rows have no
+   speaker span at all. Without this the words would slide left into the
+   speaker column on every continuation line. */
+.segment .words {
+  grid-column: 3;
 }
 
 .segment.mic {

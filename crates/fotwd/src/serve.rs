@@ -30,8 +30,22 @@ pub fn state_file_path(root: &Path) -> PathBuf {
     root.parent().unwrap_or(root).join("daemon.json")
 }
 
+/// How the page gets its handoff token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Launch {
+    /// Hand the URL straight to the default browser. The token never appears
+    /// anywhere the user can read it, which is the point.
+    OpenBrowser,
+    /// Print it, for a headless box, a remote session, or a browser that is
+    /// not the default. Opt-in only: this puts a live credential into terminal
+    /// scrollback, where it outlives the session that made it.
+    PrintUrl,
+    /// Start the server and say nothing.
+    Nothing,
+}
+
 /// Run the loopback server until the process is stopped.
-pub async fn serve(root: PathBuf, open_browser: bool) -> Result<(), String> {
+pub async fn serve(root: PathBuf, launch: Launch) -> Result<(), String> {
     let db = crate::open_library(&root)?;
     let source = Arc::new(StoreSource::new(db));
 
@@ -60,14 +74,21 @@ pub async fn serve(root: PathBuf, open_browser: bool) -> Result<(), String> {
     println!("  listening  : http://{addr}");
     println!("  state file : {} (0600)", path.display());
 
-    if open_browser {
-        let url = state.launch_url();
-        // Deliberately not printed: it carries the handoff token, and a
-        // terminal scrollback is a place secrets survive.
-        match std::process::Command::new("open").arg(&url).status() {
-            Ok(s) if s.success() => println!("  opened your browser"),
-            _ => println!("  could not open a browser — run `fotwd serve --print-url`"),
+    match launch {
+        Launch::OpenBrowser => {
+            let url = state.launch_url();
+            // Deliberately not printed: it carries the handoff token, and a
+            // terminal scrollback is a place secrets survive.
+            match std::process::Command::new("open").arg(&url).status() {
+                Ok(s) if s.success() => println!("  opened your browser"),
+                _ => println!("  could not open a browser — run `fotwd serve --print-url`"),
+            }
         }
+        Launch::PrintUrl => {
+            println!("  open this once, it expires in 30s:");
+            print_launch_url(&state);
+        }
+        Launch::Nothing => {}
     }
 
     println!();

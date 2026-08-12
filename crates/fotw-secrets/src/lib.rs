@@ -63,5 +63,5 @@ pub use crate::keys::{KEYRING_SERVICE, Provider, SecretKey};
 pub use crate::redact::{REDACTED, RedactingWriter, Redactor, SENSITIVE_HEADERS};
 pub use crate::secret::SecretString;
 pub use crate::store::{
-    InMemoryKeyStore, KeyStore, OsKeyStore, StoreAvailability, os_tests_enabled,
+    InMemoryKeyStore, KEYCHAIN_TIMEOUT, KeyStore, OsKeyStore, StoreAvailability, os_tests_enabled,
 };

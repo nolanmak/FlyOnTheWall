@@ -84,9 +84,68 @@ function when(ms) {
 }
 
 function duration(ms) {
-  if (!ms) return "";
+  if (ms === null || ms === undefined) return "";
+  // Rounding to minutes reported a 40-second meeting as "0 min", which reads
+  // as a bug in the recorder rather than as a short meeting.
+  if (ms < 60000) return Math.max(1, Math.round(ms / 1000)) + "s";
   const mins = Math.round(ms / 60000);
   return mins < 60 ? mins + " min" : Math.floor(mins / 60) + " h " + (mins % 60) + " min";
+}
+
+// mm:ss from the start of the meeting, so a segment can be found in the audio.
+function offset(ms) {
+  const total = Math.floor((ms || 0) / 1000);
+  const mins = Math.floor(total / 60);
+  const secs = total % 60;
+  return mins + ":" + String(secs).padStart(2, "0");
+}
+
+// A meeting still recording has no duration yet, and showing its state is more
+// useful than showing nothing. Previously written as `duration(...) || state`,
+// which silently swapped the two whenever duration formatted to a falsy
+// string -- so an identically-seeded library showed "ready" for one meeting
+// and "0 min" for the next.
+function listMeta(m) {
+  if (m.state && m.state !== "ready") return m.state;
+  return duration(m.duration_ms) || m.state || "";
+}
+
+// ------------------------------------------------------------- markdown
+//
+// A deliberately small subset: headings, bullets, and paragraphs. It builds
+// DOM nodes and assigns textContent, exactly like every other renderer here,
+// so ING-11 still holds -- a summary is model output written over
+// attacker-influenced transcript, and handing that to a markdown library that
+// emits HTML is precisely how a transcript becomes script. Rendering it as
+// preformatted text was safe but showed users literal "## " on every heading.
+//
+// Anything unrecognised falls through as a paragraph, verbatim. That is the
+// right failure: unstyled real text beats swallowed text.
+function renderMarkdown(md, into) {
+  let list = null;
+  for (const raw of String(md).split("\n")) {
+    const line = raw.trimEnd();
+    const bullet = /^\s*[-*+]\s+(.*)$/.exec(line);
+    if (bullet) {
+      if (!list) {
+        list = document.createElement("ul");
+        into.appendChild(list);
+      }
+      list.appendChild(text("li", bullet[1]));
+      continue;
+    }
+    list = null;
+    if (!line.trim()) continue;
+    const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (heading) {
+      // Offset by one: the pane already has an h3, and a document whose
+      // headings outrank their own section is wrong for a screen reader.
+      const level = Math.min(6, heading[1].length + 3);
+      into.appendChild(text("h" + level, heading[2]));
+    } else {
+      into.appendChild(text("p", line));
+    }
+  }
 }
 
 function renderList(meetings) {
@@ -101,7 +160,7 @@ function renderList(meetings) {
     item.type = "button";
     item.appendChild(text("span", m.title || "Untitled meeting", "title"));
     item.appendChild(text("span", when(m.started_at_ms), "meta"));
-    item.appendChild(text("span", duration(m.duration_ms) || m.state, "meta"));
+    item.appendChild(text("span", listMeta(m), "meta"));
     item.addEventListener("click", () => openMeeting(m.id));
     el.list.appendChild(item);
   }
@@ -112,14 +171,28 @@ function renderDetail(detail) {
   el.detail.appendChild(text("h2", detail.meeting.title || "Untitled meeting"));
   el.detail.appendChild(text("p", when(detail.meeting.started_at_ms), "meta"));
 
+  // Notes first, and above the summary, because they are the user's own words
+  // and the summary is a derived artifact. Search has always indexed notes, so
+  // before this they could be matched but never read.
+  if (detail.note_md) {
+    const notes = document.createElement("section");
+    notes.className = "notes";
+    notes.appendChild(text("h3", "Your notes"));
+    const body = document.createElement("div");
+    body.className = "note-body";
+    renderMarkdown(detail.note_md, body);
+    notes.appendChild(body);
+    el.detail.appendChild(notes);
+  }
+
   if (detail.summary_md) {
     const summary = document.createElement("section");
     summary.className = "summary";
     summary.appendChild(text("h3", "Summary"));
-    // Markdown is rendered as preformatted text, not as HTML. A summary is
-    // model output over attacker-influenced transcript, and "just render the
-    // markdown" is how that becomes script.
-    summary.appendChild(text("pre", detail.summary_md));
+    const body = document.createElement("div");
+    body.className = "summary-body";
+    renderMarkdown(detail.summary_md, body);
+    summary.appendChild(body);
     el.detail.appendChild(summary);
   }
 
@@ -128,8 +201,19 @@ function renderDetail(detail) {
   transcript.appendChild(text("h3", "Transcript"));
   const body = document.createElement("div");
   body.id = "segments";
+  let lastSpeaker = null;
   for (const seg of detail.segments) {
-    body.appendChild(text("p", seg.text, "segment"));
+    const line = document.createElement("p");
+    line.className = "segment";
+    line.appendChild(text("span", offset(seg.start_ms), "at"));
+    // Only when it changes. Repeating "S0" on ten consecutive lines is noise
+    // that makes the actual turn-taking harder to see, not easier.
+    if (seg.speaker && seg.speaker !== lastSpeaker) {
+      line.appendChild(text("span", seg.speaker, "speaker"));
+    }
+    lastSpeaker = seg.speaker || lastSpeaker;
+    line.appendChild(text("span", seg.text, "words"));
+    body.appendChild(line);
   }
   transcript.appendChild(body);
   el.detail.appendChild(transcript);

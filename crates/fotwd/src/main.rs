@@ -50,8 +50,14 @@ async fn main() -> ExitCode {
                 eprintln!("fotwd: cannot create {}: {e}", root.display());
                 return ExitCode::FAILURE;
             }
-            let open_browser = !args.iter().any(|a| a == "--no-open");
-            match fotwd::serve::serve(root, open_browser).await {
+            let launch = if args.iter().any(|a| a == "--print-url") {
+                fotwd::serve::Launch::PrintUrl
+            } else if args.iter().any(|a| a == "--no-open") {
+                fotwd::serve::Launch::Nothing
+            } else {
+                fotwd::serve::Launch::OpenBrowser
+            };
+            match fotwd::serve::serve(root, launch).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("fotwd: {e}");

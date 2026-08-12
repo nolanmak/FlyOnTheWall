@@ -223,6 +223,29 @@ impl NewSegment {
     }
 }
 
+/// One transcript segment, as stored.
+///
+/// Distinct from `fotw_stt::TranscriptSegment`, which carries how the text was
+/// *obtained* — provider, model, revision, timestamp source. Those describe a
+/// live streaming session and are meaningless once the row is on disk. This is
+/// what a reader needs.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StoredSegment {
+    /// Position in the transcript.
+    pub idx: i64,
+    /// Milliseconds from the start of the meeting.
+    pub start_ms: i64,
+    /// Milliseconds from the start of the meeting.
+    pub end_ms: i64,
+    /// Diarisation label, e.g. `S0`. `None` when the provider did not
+    /// diarise, which is a normal state and not a fault.
+    pub speaker: Option<String>,
+    /// The words. **Attacker-influenced**: anyone in the meeting chooses this.
+    pub text: String,
+    /// Provider confidence, when reported.
+    pub confidence: Option<f64>,
+}
+
 /// One markdown block of the user's notes, and when they started typing it.
 ///
 /// `typed_at_ms` is relative to the meeting start, not the epoch: the meeting's

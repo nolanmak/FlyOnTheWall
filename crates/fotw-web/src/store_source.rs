@@ -78,13 +78,27 @@ impl MeetingSource for StoreSource {
         // transcript". `MeetingRepo::primary_transcript_id` distinguishes the
         // two; the previous hand-rolled query used `.ok()` and would have
         // rendered a broken library as an empty meeting.
+        // The anchors are dropped here and kept in the store: they exist to
+        // re-anchor a block after an edit, which is the editor's problem, not
+        // the reader's.
+        let note_md = db
+            .meetings()
+            .note(id)
+            .map_err(map_err)?
+            .map(|(body, _)| body);
+
         let segments = match db.meetings().primary_transcript_id(id).map_err(map_err)? {
             Some(transcript_id) => db
                 .meetings()
-                .transcript_text(&transcript_id)
+                .transcript_segments(&transcript_id)
                 .map_err(map_err)?
                 .into_iter()
-                .map(|(idx, text)| Segment { idx, text })
+                .map(|s| Segment {
+                    idx: s.idx,
+                    start_ms: s.start_ms,
+                    speaker: s.speaker,
+                    text: s.text,
+                })
                 .collect(),
             // A meeting with no transcript is normal, not broken: recording
             // without a provider configured is a supported state.
@@ -94,6 +108,7 @@ impl MeetingSource for StoreSource {
         Ok(Some(MeetingDetail {
             meeting: row(meeting),
             summary_md,
+            note_md,
             segments,
         }))
     }

@@ -94,6 +94,12 @@ pub struct MeetingDetail {
     pub meeting: MeetingRow,
     /// The current summary's markdown body, if one has been generated.
     pub summary_md: Option<String>,
+    /// The user's own notes, if they typed any.
+    ///
+    /// Search has always indexed notes, so a user could match their own note,
+    /// land on the meeting, and find it nowhere on the page. In a product whose
+    /// premise is "you write, we augment", the note is not a secondary field.
+    pub note_md: Option<String>,
     /// The primary transcript, in order.
     pub segments: Vec<Segment>,
 }
@@ -103,6 +109,14 @@ pub struct MeetingDetail {
 pub struct Segment {
     /// Position in the transcript.
     pub idx: i64,
+    /// Milliseconds from the start of the meeting.
+    pub start_ms: i64,
+    /// Diarisation label, e.g. `S0`, when the provider diarised.
+    ///
+    /// **Also attacker-influenced**, for a subtler reason than the text: the
+    /// label is a provider string, and once speaker *naming* lands it becomes
+    /// a user string. It goes to the DOM the same way the text does.
+    pub speaker: Option<String>,
     /// The words.
     ///
     /// **Attacker-influenced.** A participant can say anything, so this string

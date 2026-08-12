@@ -162,9 +162,23 @@ dev-sign: (bundle "debug")
     # on every rebuild and the system raises an approval dialog each time --
     # which, run from a script, from launchd or over SSH, blocks forever with
     # no output at all.
-    for bin in target/debug/fotwd target/debug/fotw; do
-        if [ -f "$bin" ]; then
+    # The bare CLI binaries and the examples, all under the SAME code
+    # identifier as the app -- note the explicit `-i`.
+    #
+    # macOS keys a keychain item's ACL to the calling code's designated
+    # requirement, and the DR pins the code IDENTIFIER, which codesign
+    # otherwise derives from the file name. Sign them by default and `fotwd`,
+    # `fotw` and each example become three different principals asking for the
+    # same `db:masterkey` item, so the second one to run gets an approval
+    # dialog -- invisible under launchd, in CI or over SSH, where it blocks
+    # forever with no output. They are one product and share one library key,
+    # so they get one identifier.
+    for bin in target/debug/fotwd target/debug/fotw target/debug/examples/*; do
+        # Skip cargo's hashed duplicates, debug info and dep files.
+        case "$bin" in *.d|*.dSYM|*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) continue ;; esac
+        if [ -f "$bin" ] && [ -x "$bin" ]; then
             codesign --force --options runtime --timestamp=none \
+                -i "{{bundle_id}}" \
                 --entitlements packaging/entitlements.plist \
                 --sign "{{dev_ident}}" "$bin"
         fi

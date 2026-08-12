@@ -36,6 +36,9 @@ pub struct Harness {
 pub const MEETING_ID: &str = "01926f5a-0000-7000-8000-000000000001";
 pub const MEETING_TITLE: &str = "Quarterly planning";
 pub const SEGMENT_TEXT: &str = "we should ship the loopback guard first";
+/// The user's own words. Distinct from the transcript so a test can tell
+/// which of the two a response actually carried.
+pub const NOTE_TEXT: &str = "decide on the rebinding guard before Thursday";
 
 pub async fn start() -> Harness {
     let source = MemorySource::new().with_meeting(MeetingDetail {
@@ -47,8 +50,11 @@ pub async fn start() -> Harness {
             state: "ready".to_owned(),
         },
         summary_md: Some("## Decisions\n- ship the guard".to_owned()),
+        note_md: Some(NOTE_TEXT.to_owned()),
         segments: vec![Segment {
             idx: 0,
+            start_ms: 12_000,
+            speaker: Some("S0".to_owned()),
             text: SEGMENT_TEXT.to_owned(),
         }],
     });
