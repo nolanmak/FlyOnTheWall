@@ -7,13 +7,14 @@ use std::time::Duration;
 
 use fotw_shell::{
     FINISHED_LINGER, Level, MenuAction, Monotonic, Phase, ShellCore, ShellEffect, ShellInput,
-    TrayState, format_elapsed,
+    StartOrigin, TrayState, format_elapsed,
 };
 
 fn started_at(secs: u64) -> ShellCore {
     let mut core = ShellCore::new();
     core.handle(ShellInput::Start {
         at: Monotonic::from_secs(secs),
+        origin: StartOrigin::Menu,
     });
     core
 }
@@ -44,11 +45,18 @@ fn start_commands_capture_and_a_timer_exactly_once() {
     let mut core = ShellCore::new();
     let effects = core.handle(ShellInput::Start {
         at: Monotonic::ZERO,
+        origin: StartOrigin::Menu,
     });
 
     assert_eq!(
         effects,
-        vec![ShellEffect::StartCapture, ShellEffect::StartTicking]
+        vec![
+            // CON-01: the consent record is emitted before the capture it
+            // accounts for, in the same batch.
+            ShellEffect::AuditStart(StartOrigin::Menu),
+            ShellEffect::StartCapture,
+            ShellEffect::StartTicking
+        ]
     );
     assert!(core.capture_is_live());
     assert!(core.is_ticking());
@@ -64,6 +72,7 @@ fn a_second_start_does_not_restart_the_session() {
 
     let effects = core.handle(ShellInput::Start {
         at: Monotonic::from_secs(90),
+        origin: StartOrigin::Menu,
     });
 
     assert!(
@@ -282,7 +291,7 @@ fn toggle_during_teardown_is_dropped_not_queued() {
     core.handle(ShellInput::StopRequested);
     assert!(matches!(core.phase(), Phase::Finishing { .. }));
 
-    let effects = core.toggle(Monotonic::from_secs(1));
+    let effects = core.toggle(Monotonic::from_secs(1), StartOrigin::Menu);
 
     assert!(
         effects.is_empty(),
@@ -301,6 +310,7 @@ fn a_start_arriving_during_teardown_is_refused() {
 
     let effects = core.handle(ShellInput::Start {
         at: Monotonic::from_secs(1),
+        origin: StartOrigin::Menu,
     });
 
     assert!(
@@ -316,11 +326,15 @@ fn a_start_arriving_during_teardown_is_refused() {
 fn toggle_starts_from_idle_and_stops_from_recording() {
     let mut core = ShellCore::new();
     assert_eq!(
-        core.toggle(Monotonic::ZERO),
-        vec![ShellEffect::StartCapture, ShellEffect::StartTicking]
+        core.toggle(Monotonic::ZERO, StartOrigin::Menu),
+        vec![
+            ShellEffect::AuditStart(StartOrigin::Menu),
+            ShellEffect::StartCapture,
+            ShellEffect::StartTicking
+        ]
     );
     assert_eq!(
-        core.toggle(Monotonic::from_secs(5)),
+        core.toggle(Monotonic::from_secs(5), StartOrigin::Menu),
         vec![ShellEffect::StopCapture]
     );
 }
@@ -340,7 +354,7 @@ fn toggle_starts_a_new_session_from_saved_and_from_faulted() {
             });
         }
 
-        let effects = core.toggle(Monotonic::from_secs(2));
+        let effects = core.toggle(Monotonic::from_secs(2), StartOrigin::Menu);
         assert!(effects.contains(&ShellEffect::StartCapture));
         assert!(core.phase().is_recording());
         assert_eq!(
@@ -358,6 +372,7 @@ fn the_record_row_is_disabled_only_while_a_stop_is_in_flight() {
 
     core.handle(ShellInput::Start {
         at: Monotonic::ZERO,
+        origin: StartOrigin::Menu,
     });
     assert_eq!(core.view().menu.record.label, "Stop Recording");
     assert!(core.view().menu.record.enabled);
@@ -438,6 +453,7 @@ fn tray_state_is_distinct_in_every_phase_that_matters() {
 
     core.handle(ShellInput::Start {
         at: Monotonic::ZERO,
+        origin: StartOrigin::Menu,
     });
     assert_eq!(core.view().tray.state, TrayState::Recording);
 

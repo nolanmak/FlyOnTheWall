@@ -6,7 +6,10 @@
 
 #![warn(missing_docs)]
 
+pub mod audit;
 pub mod consent;
+pub mod detect;
+pub mod onboard;
 pub mod persist;
 pub mod secrets;
 pub mod serve;

@@ -851,6 +851,7 @@ dependencies = [
  "fotw-audio",
  "fotw-pipeline",
  "fotw-secrets",
+ "fotw-shell",
  "fotw-store",
  "fotw-stt",
  "fotw-summarize",

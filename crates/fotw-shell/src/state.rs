@@ -29,8 +29,10 @@
 use std::time::Duration;
 
 use crate::clock::{Monotonic, format_elapsed};
+use crate::prompt::{DetectedMeeting, PromptChoice, StartOrigin};
 use crate::view::{
-    Level, MenuAction, MenuButton, MenuModel, PillView, ShellView, Tone, TrayState, TrayView,
+    Level, MenuAction, MenuButton, MenuModel, PillView, PromptView, ShellView, Tone, TrayState,
+    TrayView,
 };
 
 /// How long the pill lingers on `Saved` before the shell returns to idle.
@@ -113,6 +115,9 @@ pub enum ShellInput {
     Start {
         /// Clock reading at the moment of the request.
         at: Monotonic,
+        /// Which human action this was. Written to the audit log; there is no
+        /// variant meaning "nobody asked" (CON-01).
+        origin: StartOrigin,
     },
     /// The clock advanced.
     Tick {
@@ -135,6 +140,32 @@ pub enum ShellInput {
     },
     /// The user acknowledged a finished or failed session.
     Dismiss,
+
+    /// The detector believes a meeting is in progress.
+    ///
+    /// **This arms. It does not record.** The only thing it may do is put a
+    /// prompt on screen; see `tests/con01_detection_arms_only.rs`, which
+    /// exists to make that permanent.
+    MeetingDetected {
+        /// Clock reading when the detector fired.
+        at: Monotonic,
+        /// What was detected, and the evidence for it.
+        meeting: DetectedMeeting,
+    },
+
+    /// The detector's signals went away before the user answered.
+    ///
+    /// The call ended, the app quit, the mic went cold. The prompt comes down
+    /// rather than sitting there offering to record a meeting that is over.
+    DetectionCleared,
+
+    /// The user answered a detection prompt.
+    PromptResponse {
+        /// Clock reading at the click.
+        at: Monotonic,
+        /// What they chose.
+        choice: PromptChoice,
+    },
 }
 
 /// Something the renderer or the host must do.
@@ -142,8 +173,16 @@ pub enum ShellInput {
 /// Everything *visual* is derived from [`ShellCore::view`] instead, so the
 /// renderer cannot drift out of sync with the state by missing an effect.
 /// These are the things that are not visual.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShellEffect {
+    /// Write the user-initiated Start to the local audit log (CON-01, CON-08).
+    ///
+    /// Emitted **immediately before** [`ShellEffect::StartCapture`], in the
+    /// same batch, so the log records the intent even if capture then fails.
+    /// CON-01's acceptance criterion is stated against this log, which is why
+    /// it is an effect the host must handle rather than a line of logging
+    /// inside the capture layer.
+    AuditStart(StartOrigin),
     /// Begin capturing.
     StartCapture,
     /// Tear the capture down.
@@ -162,6 +201,14 @@ pub enum ShellEffect {
     OpenAbout,
     /// Quit the application.
     Quit,
+    /// The user said "not now": stop prompting for a while.
+    ///
+    /// How long is the detector's business, not the shell's. What matters
+    /// here is that "not now" cannot mean "ask again in four seconds", which
+    /// is how a consent surface gets habituated into invisibility.
+    SnoozeDetection,
+    /// The user said "never for this app": persist that, keyed by app.
+    SuppressApp(String),
 }
 
 /// The shell's state machine.
@@ -172,6 +219,14 @@ pub enum ShellEffect {
 pub struct ShellCore {
     phase: Phase,
     level: Level,
+    /// The armed meeting-detection prompt, if one is on screen.
+    ///
+    /// Deliberately *not* a [`Phase`]: arming is not a state of the recorder,
+    /// it is a question being asked of the user while the recorder does
+    /// nothing at all. Modelling it as a phase would put "we are nearly
+    /// recording" into the same type as "we are recording", which is the
+    /// distinction this whole feature exists to keep sharp.
+    prompt: Option<DetectedMeeting>,
     /// Whether [`ShellEffect::StartCapture`] has been emitted without a
     /// matching [`ShellEffect::StopCapture`]. Not derivable from `phase`:
     /// when the capture layer reports its own completion we move out of
@@ -195,6 +250,7 @@ impl ShellCore {
         Self {
             phase: Phase::Idle,
             level: Level::SILENT,
+            prompt: None,
             capture: false,
             ticking: false,
         }
@@ -221,6 +277,12 @@ impl ShellCore {
         self.ticking
     }
 
+    /// What the detector has armed, if anything.
+    #[must_use]
+    pub const fn armed(&self) -> Option<&DetectedMeeting> {
+        self.prompt.as_ref()
+    }
+
     /// Apply an input and report what the host must do.
     pub fn handle(&mut self, input: ShellInput) -> Vec<ShellEffect> {
         // The one input that changes state without changing phase. Kept out
@@ -233,8 +295,69 @@ impl ShellCore {
             }
             return Vec::new();
         }
+
+        // The detection inputs. None of them reaches `next_phase`, which is
+        // the mechanical reason detection cannot start a recording: the only
+        // one that can move the phase is a click on the prompt, and it goes
+        // through the same `Start` path as the menu row.
+        match input {
+            ShellInput::MeetingDetected { meeting, .. } => {
+                // Only from idle. A prompt raised during a live session, or
+                // during the flush that follows one, would either be
+                // meaningless or race the next session's start.
+                if self.phase.is_idle() {
+                    self.prompt = Some(meeting);
+                }
+                return Vec::new();
+            }
+            ShellInput::DetectionCleared => {
+                self.prompt = None;
+                return Vec::new();
+            }
+            ShellInput::PromptResponse { at, choice } => return self.answer_prompt(choice, at),
+            _ => {}
+        }
+
+        let origin = match &input {
+            ShellInput::Start { origin, .. } => Some(*origin),
+            _ => None,
+        };
         let next = self.next_phase(input);
-        self.transition(next)
+        self.transition(next, origin)
+    }
+
+    /// Apply the user's answer to a detection prompt.
+    ///
+    /// Returns nothing at all when there is no prompt on screen. A response
+    /// can arrive for a prompt that was already withdrawn — the call ended,
+    /// the detector cleared, the click was in flight — and honouring it would
+    /// start a recording nobody is looking at.
+    fn answer_prompt(&mut self, choice: PromptChoice, at: Monotonic) -> Vec<ShellEffect> {
+        let Some(meeting) = self.prompt.clone() else {
+            return Vec::new();
+        };
+        match choice {
+            PromptChoice::Start { acknowledged } => {
+                // CON-05: an all-party or contested jurisdiction requires an
+                // explicit acknowledgement. Leaving the prompt up rather than
+                // starting is the whole content of "blocking".
+                if meeting.requires_acknowledgement && !acknowledged {
+                    return Vec::new();
+                }
+                self.prompt = None;
+                let origin = StartOrigin::DetectionPrompt;
+                let next = self.next_phase(ShellInput::Start { at, origin });
+                self.transition(next, Some(origin))
+            }
+            PromptChoice::NotNow => {
+                self.prompt = None;
+                vec![ShellEffect::SnoozeDetection]
+            }
+            PromptChoice::NeverForThisApp => {
+                self.prompt = None;
+                vec![ShellEffect::SuppressApp(meeting.app_key)]
+            }
+        }
     }
 
     /// Translate a menu click.
@@ -246,7 +369,7 @@ impl ShellCore {
             return Vec::new();
         }
         match action {
-            MenuAction::ToggleRecording => self.toggle(now),
+            MenuAction::ToggleRecording => self.toggle(now, StartOrigin::Menu),
             MenuAction::OpenNotes => vec![ShellEffect::OpenNotes],
             MenuAction::DisclosureKit => vec![ShellEffect::OpenDisclosureKit],
             MenuAction::Settings => vec![ShellEffect::OpenSettings],
@@ -260,10 +383,10 @@ impl ShellCore {
     /// A toggle arriving during `Finishing` is **dropped**, not queued: the
     /// previous session is still being flushed, and starting a new capture on
     /// top of that teardown is how you get two taps on one aggregate device.
-    pub fn toggle(&mut self, now: Monotonic) -> Vec<ShellEffect> {
+    pub fn toggle(&mut self, now: Monotonic, origin: StartOrigin) -> Vec<ShellEffect> {
         match self.phase {
             Phase::Idle | Phase::Finished { .. } | Phase::Faulted { .. } => {
-                self.handle(ShellInput::Start { at: now })
+                self.handle(ShellInput::Start { at: now, origin })
             }
             Phase::Recording { .. } => self.handle(ShellInput::StopRequested),
             Phase::Finishing { .. } => Vec::new(),
@@ -278,6 +401,7 @@ impl ShellCore {
             tray: self.tray(),
             menu: self.menu(),
             pill,
+            prompt: self.prompt_view(),
         }
     }
 
@@ -289,7 +413,7 @@ impl ShellCore {
             // not restart the clock the user is watching.
             (
                 Phase::Idle | Phase::Finished { .. } | Phase::Faulted { .. },
-                ShellInput::Start { at },
+                ShellInput::Start { at, .. },
             ) => Phase::Recording {
                 started: at,
                 elapsed: Duration::ZERO,
@@ -354,14 +478,33 @@ impl ShellCore {
         }
     }
 
-    fn transition(&mut self, next: Phase) -> Vec<ShellEffect> {
+    fn transition(&mut self, next: Phase, origin: Option<StartOrigin>) -> Vec<ShellEffect> {
         self.phase = next;
         let mut effects = Vec::new();
+
+        // A prompt is a question about starting a recording. Once anything
+        // else is happening it is stale, so it comes down.
+        if !self.phase.is_idle() {
+            self.prompt = None;
+        }
 
         // Capture edges.
         let want_capture = self.phase.is_recording();
         if want_capture && !self.capture {
             self.capture = true;
+            // CON-01: the audit record is written before the first byte is
+            // captured, and it names the person who asked. Reaching this edge
+            // without an origin would mean some input other than `Start` had
+            // begun a recording, which is the defect this whole file is
+            // arranged to prevent -- `tests/con01_detection_arms_only.rs`
+            // fails on a `StartCapture` with no `AuditStart` in front of it.
+            debug_assert!(
+                origin.is_some(),
+                "capture started with no human origin (CON-01)"
+            );
+            if let Some(origin) = origin {
+                effects.push(ShellEffect::AuditStart(origin));
+            }
             effects.push(ShellEffect::StartCapture);
         } else if !want_capture && self.capture {
             self.capture = false;
@@ -413,6 +556,23 @@ impl ShellCore {
             level: self.level,
             tone,
             stop_enabled,
+        })
+    }
+
+    fn prompt_view(&self) -> Option<PromptView> {
+        let meeting = self.prompt.as_ref()?;
+        Some(PromptView {
+            app_key: meeting.app_key.clone(),
+            headline: meeting.headline(),
+            evidence: meeting.evidence.clone(),
+            consent_notice: meeting.consent_notice.clone(),
+            requires_acknowledgement: meeting.requires_acknowledgement,
+            // "Start recording" rather than "Yes": the button says what it
+            // does, because this is the click that begins recording other
+            // people.
+            start_label: "Start recording",
+            not_now_label: "Not now",
+            never_label: "Never for this app",
         })
     }
 

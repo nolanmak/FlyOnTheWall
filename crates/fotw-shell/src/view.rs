@@ -285,6 +285,38 @@ impl MenuAction {
     }
 }
 
+/// The meeting-detection prompt (CON-01, issue #22).
+///
+/// Present exactly while the detector has armed and nobody has answered yet.
+/// **Its existence is the entire feature**: detection produces this and
+/// nothing else, and only a click on it can start a recording.
+///
+/// It carries its evidence and its consent warning because both are load
+/// bearing. A prompt that says only "meeting detected" is dismissed without
+/// reading, and the all-party jurisdiction warning (CON-05) rides on this same
+/// surface — so habituated dismissal here is a *consent* failure, not a UX
+/// one. That is also why the detector's false-positive rate is treated as a
+/// legal risk in `fotwd::detect`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromptView {
+    /// Stable key of the app that was detected, for "never for this app".
+    pub app_key: String,
+    /// First line, e.g. `Meeting detected — Standup (Zoom). Record?`.
+    pub headline: String,
+    /// Why the detector fired, so the user can judge it.
+    pub evidence: String,
+    /// The jurisdiction warning, or empty.
+    pub consent_notice: String,
+    /// Whether Start requires the explicit all-party acknowledgement.
+    pub requires_acknowledgement: bool,
+    /// Label for the affirmative button.
+    pub start_label: &'static str,
+    /// Label for the dismiss-for-now button.
+    pub not_now_label: &'static str,
+    /// Label for the per-app suppression button.
+    pub never_label: &'static str,
+}
+
 /// Everything on screen, for one moment.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ShellView {
@@ -294,4 +326,9 @@ pub struct ShellView {
     pub tray: TrayView,
     /// The status-item menu.
     pub menu: MenuModel,
+    /// The meeting-detection prompt, or `None` when nothing is armed.
+    ///
+    /// Never `Some` at the same time as a live capture: one surface, one
+    /// decision.
+    pub prompt: Option<PromptView>,
 }

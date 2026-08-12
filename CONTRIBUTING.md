@@ -57,6 +57,14 @@ So:
 - `fotw doctor` runs a real one-second tap and reports whether non-zero samples
   arrived. There is no public API to query this permission, so a round-trip test
   is the only truthful answer available.
+- `fotwd onboard` does the same for both legs *and reads the environment it ran
+  in*: it plays a test tone, counts what came back, and then tells you whether
+  the result means anything. Run from a shell it will say **"THIS RESULT IS NOT
+  EVIDENCE"** even when audio arrived, because the grant it used may be your
+  terminal's. That is the intended output of a development build, not a bug.
+- `fotwd detect [seconds]` prints what meeting detection can see and what it
+  decides. It cannot start a recording — it holds the state machine and asserts
+  that nothing it does produces a `StartCapture`.
 
 ## Tests
 

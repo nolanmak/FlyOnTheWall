@@ -16,9 +16,11 @@ use std::time::Duration;
 
 use fotw_audio::{AudioPlatform, DeviceId, FormatRequest, SystemScope, platform};
 use fotw_secrets::{KeyStore, Provider};
+use fotw_shell::StartOrigin;
 use fotw_store::{ArchiveOptions, Db};
 use fotw_stt::{DeepgramStreamConfig, Source, deepgram::DeepgramConfig};
 use fotw_summarize::template::{TemplateSet, default_templates_dir};
+use fotwd::audit::{AuditKind, AuditLog};
 use fotwd::consent::{DisclosureKit, JurisdictionSignals, Rules};
 use fotwd::persist;
 use fotwd::secrets;
@@ -78,6 +80,14 @@ async fn main() -> ExitCode {
             println!("{}", kit.verbal_script());
             ExitCode::SUCCESS
         }
+        Some("onboard") => onboard(),
+        Some("detect") => {
+            let secs = args
+                .get(1)
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(120);
+            detect(secs)
+        }
         Some("key") => key_command(&args[1..]),
         Some("summarize") => {
             let positional: Vec<&String> =
@@ -104,6 +114,7 @@ async fn main() -> ExitCode {
             eprintln!(
                 "usage: fotwd <serve [dir] | record [seconds] [dir] [--i-have-consent] | \
                  list [dir] | summarize <id> [dir] [--template <slug>] | disclose | \
+                 onboard | detect [seconds] | \
                  key <set <provider>|list> | templates <list|install|show <slug>> | \
                  export <id> [dir] [--format md|txt|json] [--out <file>] | \
                  export-all <dest> [dir] [--audio] [--resume] [--yes-plaintext] | \
@@ -476,6 +487,25 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
     }
     println!();
 
+    // CON-01's acceptance criterion is about the audit log, not the UI: no
+    // audio buffer reaches disk without a user-initiated Start recorded here
+    // first. Written *before* the tap opens, so a crash during capture leaves
+    // the record of who asked and what they were warned about.
+    let audit = AuditLog::at(&root);
+    if let Err(e) = audit.record(AuditKind::SessionStart {
+        origin: StartOrigin::Cli.label().to_owned(),
+        detected_app: None,
+        jurisdiction_warning: escalation.user_text(),
+        acknowledged_all_party: escalation.blocks() && acknowledged,
+    }) {
+        // A recording we cannot account for is not one we should make.
+        eprintln!(
+            "fotwd: could not write the audit log at {}: {e}",
+            audit.path().display()
+        );
+        return ExitCode::FAILURE;
+    }
+
     let plat = platform::host();
     let system = match plat.open_system(SystemScope::DefaultOutputMix, FormatRequest::any()) {
         Ok(t) => t,
@@ -532,6 +562,12 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
     .await
     {
         Ok(outcome) => {
+            if let Err(e) = audit.record(AuditKind::SessionEnd {
+                session: outcome.dir.display().to_string(),
+                duration_ms: seconds * 1_000,
+            }) {
+                eprintln!("  ! could not write the audit log: {e}");
+            }
             println!("  system     : {} samples", outcome.system_samples);
             println!("  mic        : {} samples", outcome.mic_samples);
             println!(
@@ -584,6 +620,198 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `fotwd onboard` — walk the grants, verifying each by using it (issue #31).
+///
+/// Nothing here asks the system for a permission state it cannot honestly
+/// report. The system-audio grant has no query API at all, and a denial
+/// arrives as silence, so the only truthful test is a round trip: start a tap,
+/// play a tone through the default output from another process, count what
+/// came back.
+///
+/// The step that surprises people is the last one. On a developer's machine
+/// this usually *passes* — and it passes for reasons that will not hold for a
+/// user, because an unbundled binary launched from a terminal inherits the
+/// terminal's grant. That case is reported as loudly as a failure.
+fn onboard() -> ExitCode {
+    use fotwd::onboard::{Environment, HostProbe, PROBE_WINDOW, Report, Step, interpret};
+
+    println!("FlyOnTheWall onboarding");
+    println!();
+    println!("  What is about to happen:");
+    println!("    1. a one-second recording of your microphone");
+    println!("    2. a test tone, and a one-second recording of your system audio");
+    println!();
+    println!("  Neither is written to disk. macOS may show a permission prompt;");
+    println!("  the system-audio one appears only when the tap starts, and there");
+    println!("  is no API to ask for it in advance.");
+    println!();
+
+    let env = Environment::detect();
+    println!(
+        "  bundle     : {}",
+        if env.in_app_bundle { "yes" } else { "no" }
+    );
+    println!("  signature  : {:?}", env.signature);
+    println!(
+        "  launched by: {}",
+        env.terminal.as_deref().unwrap_or("not a terminal")
+    );
+    println!();
+
+    // The mic leg is different, and issue #31 says to handle it up front: its
+    // authorization status is a real, queryable API. We still round-trip it
+    // afterwards, because a status of "authorized" and a device that delivers
+    // nothing are different failures.
+    let plat = platform::host();
+    let mic_state = plat.permission(fotw_audio::Permission::Microphone);
+    println!("  microphone authorization: {mic_state:?}");
+    if mic_state.is_blocking() {
+        println!("    → System Settings → Privacy & Security → Microphone");
+    }
+    println!(
+        "  system audio authorization: {:?} (no API exists; probing instead)",
+        plat.permission(fotw_audio::Permission::SystemAudio)
+    );
+    println!();
+
+    let probe = HostProbe;
+    let mut report = Report::default();
+
+    println!("  recording the microphone for {PROBE_WINDOW:?}…");
+    let mic = probe.microphone(PROBE_WINDOW);
+    report.push(Step::Microphone, interpret(Step::Microphone, &mic, &env));
+
+    println!("  playing a tone and recording system audio for {PROBE_WINDOW:?}…");
+    let system = probe.system_audio(PROBE_WINDOW);
+    report.push(
+        Step::SystemAudio,
+        interpret(Step::SystemAudio, &system, &env),
+    );
+
+    println!();
+    print!("{}", report.render());
+
+    if report.ready() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// `fotwd detect` — watch meeting detection decide, and record nothing.
+///
+/// This command **cannot** start a recording, by construction: it holds a
+/// [`Detector`](fotwd::detect::Detector) and prints its output. Arming is all
+/// detection is allowed to do (CON-01), and this is the surface that makes
+/// that visible on a real machine — join a call and watch it arm; leave Zoom
+/// idling in the background and watch it not.
+fn detect(seconds: u64) -> ExitCode {
+    use fotw_audio::activity::ActivityProbe;
+    use fotw_shell::{Monotonic, ShellCore, ShellEffect, ShellInput};
+    use fotwd::detect::{Detection, Detector, DetectorConfig, NoCalendar};
+
+    let plat = platform::host();
+    let mut detector = Detector::new(DetectorConfig::default());
+    // The real shell state machine, so what is printed is what the menu bar
+    // would show -- including the assertion that nothing here ever produces
+    // a StartCapture.
+    let mut shell = ShellCore::new();
+
+    println!("FlyOnTheWall detect — {seconds}s, recording nothing");
+    println!("  conjunction: a known conferencing app AND that app holding the mic");
+    println!("  (or a calendar match, once EventKit lands — MTG-01)");
+    println!();
+
+    let started = std::time::Instant::now();
+    let mut last = String::new();
+    while started.elapsed() < Duration::from_secs(seconds) {
+        let now = Monotonic::from_duration(started.elapsed());
+        let snapshot = plat.snapshot();
+        let reason;
+        let arg = match &snapshot {
+            Ok(s) => Ok(s),
+            Err(e) => {
+                reason = e.to_string();
+                Err(reason.as_str())
+            }
+        };
+
+        let effects = match detector.poll(now, arg, &NoCalendar) {
+            Detection::Arm(meeting) => {
+                println!(
+                    "  [{:>4}s] ARMED — {}",
+                    now.as_duration().as_secs(),
+                    meeting.headline()
+                );
+                println!("          evidence: {}", meeting.evidence);
+                for line in meeting.consent_notice.lines() {
+                    println!("          {line}");
+                }
+                println!("          → the user must now press Start. Nothing is recording.");
+                shell.handle(ShellInput::MeetingDetected { at: now, meeting })
+            }
+            Detection::Clear => {
+                println!("  [{:>4}s] cleared", now.as_duration().as_secs());
+                shell.handle(ShellInput::DetectionCleared)
+            }
+            Detection::Idle | Detection::Hold => Vec::new(),
+        };
+
+        // The invariant, asserted at runtime on a real machine and not only in
+        // the test suite.
+        assert!(
+            !effects.contains(&ShellEffect::StartCapture),
+            "CON-01 violated: detection commanded capture"
+        );
+
+        if let Ok(s) = &snapshot {
+            let line = summarise(s);
+            if line != last {
+                println!("  [{:>4}s] {line}", now.as_duration().as_secs());
+                last = line;
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    let stats = detector.stats();
+    println!();
+    println!(
+        "  armed {} time(s), started {} — conversion {:.0}%",
+        stats.armed,
+        stats.started,
+        stats.conversion() * 100.0
+    );
+    println!("  (local only: these counters are never sent anywhere)");
+    ExitCode::SUCCESS
+}
+
+/// One line describing what the machine is doing, for `fotwd detect`.
+fn summarise(snapshot: &fotw_audio::ActivitySnapshot) -> String {
+    let holders: Vec<String> = snapshot
+        .input_holders()
+        .map(|c| {
+            c.bundle_id
+                .clone()
+                .unwrap_or_else(|| format!("pid {}", c.pid))
+        })
+        .collect();
+    let input = snapshot.default_input.as_ref().map_or_else(
+        || "no input device".to_owned(),
+        |d| {
+            format!(
+                "{} [{:?}] running={}",
+                d.name, d.transport, d.running_somewhere
+            )
+        },
+    );
+    format!(
+        "{} clients · input {input} · mic held by [{}]",
+        snapshot.clients.len(),
+        holders.join(", ")
+    )
 }
 
 /// Minimal greedy wrap. Not worth a dependency.

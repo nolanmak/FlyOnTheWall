@@ -14,6 +14,7 @@ use std::collections::VecDeque;
 
 use crate::clock::Monotonic;
 use crate::hotkey::{Chord, HotkeyMap};
+use crate::prompt::{DetectedMeeting, PromptChoice, StartOrigin};
 use crate::state::{ShellCore, ShellEffect, ShellInput};
 use crate::view::{Level, MenuAction, ShellView};
 
@@ -34,6 +35,16 @@ pub trait ShellHost {
     /// Tear the capture down. Called for the Stop button and for a fault, and
     /// must be safe to call when nothing is running.
     fn stop_capture(&mut self);
+
+    /// Record a user-initiated Start in the local audit log (CON-01, CON-08).
+    ///
+    /// Called immediately before [`ShellHost::start_capture`]. Deliberately
+    /// **not** given a default no-op implementation: CON-01's acceptance
+    /// criterion is that a fresh install never writes an audio buffer without
+    /// a user-initiated Start event *in the audit log*, and a host that
+    /// silently inherited an empty implementation would satisfy the type
+    /// system while failing the requirement.
+    fn audit_start(&mut self, origin: StartOrigin);
 
     /// Quit the application.
     fn quit(&mut self);
@@ -61,6 +72,16 @@ pub trait ShellHost {
 
     /// Open the about box.
     fn open_about(&mut self) {}
+
+    /// The user said "not now" to a detection prompt: back the detector off.
+    ///
+    /// A no-op default is safe here in a way it is not for
+    /// [`ShellHost::audit_start`]: ignoring it costs a repeated prompt, not a
+    /// missing consent record.
+    fn snooze_detection(&mut self) {}
+
+    /// The user said "never for this app": persist that suppression.
+    fn suppress_app(&mut self, _app_key: &str) {}
 }
 
 /// A [`ShellCore`] wired to a [`ShellHost`].
@@ -133,11 +154,46 @@ impl<H: ShellHost> ShellRuntime<H> {
             return false;
         };
         let effects = match action {
-            crate::hotkey::HotkeyAction::ToggleRecording => self.core.toggle(now),
+            crate::hotkey::HotkeyAction::ToggleRecording => {
+                self.core.toggle(now, StartOrigin::Hotkey)
+            }
             crate::hotkey::HotkeyAction::OpenNotes => vec![ShellEffect::OpenNotes],
         };
         self.dispatch(effects);
         true
+    }
+
+    /// The detector believes a meeting is in progress.
+    ///
+    /// **Arms only.** This raises a prompt and returns; nothing here can
+    /// begin a capture, and `tests/con01_detection_arms_only.rs` exists to
+    /// keep it that way (CON-01, issue #22).
+    pub fn meeting_detected(&mut self, at: Monotonic, meeting: DetectedMeeting) {
+        let effects = self
+            .core
+            .handle(ShellInput::MeetingDetected { at, meeting });
+        self.dispatch(effects);
+    }
+
+    /// The detector's signals went away before the user answered.
+    pub fn detection_cleared(&mut self) {
+        let effects = self.core.handle(ShellInput::DetectionCleared);
+        self.dispatch(effects);
+    }
+
+    /// The user answered the detection prompt.
+    pub fn respond_to_prompt(&mut self, choice: PromptChoice, now: Monotonic) {
+        let effects = self
+            .core
+            .handle(ShellInput::PromptResponse { at: now, choice });
+        self.dispatch(effects);
+    }
+
+    /// The user pressed Start somewhere that is not the menu or the hotkey —
+    /// the browser UI on loopback.
+    pub fn request_start(&mut self, origin: StartOrigin, now: Monotonic) {
+        let effects = self.core.handle(ShellInput::Start { at: now, origin });
+        self.dispatch(effects);
     }
 
     /// Handle a menu click.
@@ -186,6 +242,9 @@ impl<H: ShellHost> ShellRuntime<H> {
                 break;
             }
             match effect {
+                ShellEffect::AuditStart(origin) => self.host.audit_start(origin),
+                ShellEffect::SnoozeDetection => self.host.snooze_detection(),
+                ShellEffect::SuppressApp(app_key) => self.host.suppress_app(&app_key),
                 ShellEffect::StartCapture => {
                     if let Err(reason) = self.host.start_capture() {
                         queue.extend(self.core.handle(ShellInput::CaptureFailed { reason }));

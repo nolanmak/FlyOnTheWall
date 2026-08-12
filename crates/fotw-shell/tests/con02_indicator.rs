@@ -16,7 +16,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use fotw_shell::testing::Rng;
-use fotw_shell::{Level, MenuAction, Monotonic, ShellCore, ShellEffect, ShellInput, TrayState};
+use fotw_shell::{
+    DetectedMeeting, Level, MenuAction, Monotonic, PromptChoice, ShellCore, ShellEffect,
+    ShellInput, StartOrigin, TrayState,
+};
 
 /// One of every [`ShellInput`] variant.
 ///
@@ -33,12 +36,18 @@ fn every_input(now: Monotonic) -> Vec<ShellInput> {
             | ShellInput::StopRequested
             | ShellInput::StopCompleted { .. }
             | ShellInput::CaptureFailed { .. }
-            | ShellInput::Dismiss => {}
+            | ShellInput::Dismiss
+            | ShellInput::MeetingDetected { .. }
+            | ShellInput::DetectionCleared
+            | ShellInput::PromptResponse { .. } => {}
         }
     }
 
     let all = vec![
-        ShellInput::Start { at: now },
+        ShellInput::Start {
+            at: now,
+            origin: StartOrigin::Menu,
+        },
         ShellInput::Tick { now },
         ShellInput::Level(Level::new(0.5)),
         ShellInput::StopRequested,
@@ -47,6 +56,23 @@ fn every_input(now: Monotonic) -> Vec<ShellInput> {
             reason: "device disappeared".to_owned(),
         },
         ShellInput::Dismiss,
+        ShellInput::MeetingDetected {
+            at: now,
+            meeting: DetectedMeeting::new("us.zoom.xos", "Zoom", "Zoom is holding the microphone"),
+        },
+        ShellInput::DetectionCleared,
+        ShellInput::PromptResponse {
+            at: now,
+            choice: PromptChoice::Start { acknowledged: true },
+        },
+        ShellInput::PromptResponse {
+            at: now,
+            choice: PromptChoice::NotNow,
+        },
+        ShellInput::PromptResponse {
+            at: now,
+            choice: PromptChoice::NeverForThisApp,
+        },
     ];
     for input in &all {
         assert_exhaustive(input);
@@ -60,6 +86,7 @@ fn no_input_takes_the_indicator_down_while_a_session_is_open() {
         let mut core = ShellCore::new();
         core.handle(ShellInput::Start {
             at: Monotonic::ZERO,
+            origin: StartOrigin::Menu,
         });
         core.handle(ShellInput::Tick {
             now: Monotonic::from_secs(30),
@@ -80,6 +107,7 @@ fn the_indicator_covers_the_whole_capture_window_and_then_some() {
     let mut core = ShellCore::new();
     core.handle(ShellInput::Start {
         at: Monotonic::ZERO,
+        origin: StartOrigin::Menu,
     });
 
     // Live.
@@ -109,6 +137,7 @@ fn the_pill_always_carries_elapsed_time_a_meter_and_a_stop_button() {
     let mut core = ShellCore::new();
     core.handle(ShellInput::Start {
         at: Monotonic::ZERO,
+        origin: StartOrigin::Menu,
     });
     core.handle(ShellInput::Level(Level::new(0.7)));
     core.handle(ShellInput::Tick {
@@ -130,6 +159,7 @@ fn the_menu_bar_item_is_in_a_distinct_state_while_recording() {
     let idle = core.view().tray;
     core.handle(ShellInput::Start {
         at: Monotonic::ZERO,
+        origin: StartOrigin::Menu,
     });
     let recording = core.view().tray;
 
@@ -220,8 +250,11 @@ fn no_source_file_offers_a_way_to_suppress_the_indicator() {
 
 fn random_input(rng: &mut Rng, now: Monotonic) -> ShellInput {
     // Ticks are weighted heavily so linger expiry is actually reached.
-    match rng.below(12) {
-        0 => ShellInput::Start { at: now },
+    match rng.below(16) {
+        0 => ShellInput::Start {
+            at: now,
+            origin: StartOrigin::Menu,
+        },
         1..=4 => ShellInput::Tick { now },
         5 => {
             #[expect(clippy::cast_precision_loss, reason = "value is at most 100")]
@@ -233,7 +266,18 @@ fn random_input(rng: &mut Rng, now: Monotonic) -> ShellInput {
         10 => ShellInput::CaptureFailed {
             reason: "aggregate device vanished".to_owned(),
         },
-        _ => ShellInput::Dismiss,
+        11 => ShellInput::Dismiss,
+        // The detection inputs are swept here too: an armed prompt must not
+        // be able to interfere with the indicator of a live recording.
+        12 | 13 => ShellInput::MeetingDetected {
+            at: now,
+            meeting: DetectedMeeting::new("us.zoom.xos", "Zoom", "Zoom is holding the microphone"),
+        },
+        14 => ShellInput::DetectionCleared,
+        _ => ShellInput::PromptResponse {
+            at: now,
+            choice: PromptChoice::Start { acknowledged: true },
+        },
     }
 }
 

@@ -6,8 +6,8 @@
 
 use fotw_shell::testing::{FakeHost, HostCall};
 use fotw_shell::{
-    Chord, HotkeyAction, HotkeyMap, Key, Level, MenuAction, Modifiers, Monotonic, ShellError,
-    ShellRuntime,
+    Chord, DetectedMeeting, HotkeyAction, HotkeyMap, Key, Level, MenuAction, Modifiers, Monotonic,
+    PromptChoice, ShellError, ShellRuntime, StartOrigin,
 };
 
 fn runtime() -> (ShellRuntime<FakeHost>, FakeHost) {
@@ -57,6 +57,10 @@ fn a_failed_start_faults_and_tears_the_capture_down() {
     assert_eq!(
         host.calls(),
         vec![
+            // The consent record is written for the *request*, not for the
+            // successful capture: the user asked to record, and CON-08's log
+            // is a record of what was asked for as well as what happened.
+            HostCall::AuditStart(StartOrigin::Menu),
             HostCall::StartCaptureFailed,
             HostCall::SetTicking(true),
             HostCall::StopCapture,
@@ -238,4 +242,84 @@ fn the_notes_hotkey_does_not_touch_capture() {
     assert!(rt.on_chord(notes, Monotonic::ZERO));
     assert_eq!(host.calls(), vec![HostCall::OpenNotes]);
     assert!(!rt.core().capture_is_live());
+}
+
+// --- detection arms, the user starts (CON-01) ----------------------------
+
+fn zoom() -> DetectedMeeting {
+    DetectedMeeting::new("us.zoom.xos", "Zoom", "Zoom is holding the microphone")
+        .with_title("Standup")
+}
+
+#[test]
+fn a_detection_reaching_the_host_asks_it_to_do_nothing_at_all() {
+    // The end-to-end version of CON-01: not "the core does not start", but
+    // "the host — the thing that owns the tap — is never told to".
+    let (mut rt, host) = runtime();
+
+    rt.meeting_detected(Monotonic::ZERO, zoom());
+
+    assert!(
+        host.calls().is_empty(),
+        "detection asked the host to do something: {:?}",
+        host.calls()
+    );
+    let prompt = rt.view().prompt.expect("armed");
+    assert!(prompt.headline.contains("Standup"));
+    assert_eq!(prompt.start_label, "Start recording");
+}
+
+#[test]
+fn the_prompt_start_button_reaches_the_host_with_a_consent_record() {
+    let (mut rt, host) = runtime();
+    rt.meeting_detected(Monotonic::ZERO, zoom());
+
+    rt.respond_to_prompt(
+        PromptChoice::Start {
+            acknowledged: false,
+        },
+        Monotonic::from_secs(2),
+    );
+
+    assert_eq!(
+        host.calls(),
+        vec![
+            HostCall::AuditStart(StartOrigin::DetectionPrompt),
+            HostCall::StartCapture,
+            HostCall::SetTicking(true),
+        ]
+    );
+    assert!(rt.view().prompt.is_none());
+}
+
+#[test]
+fn never_for_this_app_reaches_the_host_so_it_can_be_persisted() {
+    let (mut rt, host) = runtime();
+    rt.meeting_detected(Monotonic::ZERO, zoom());
+
+    rt.respond_to_prompt(PromptChoice::NeverForThisApp, Monotonic::from_secs(1));
+
+    assert_eq!(
+        host.calls(),
+        vec![HostCall::SuppressApp("us.zoom.xos".to_owned())],
+        "a suppression the host never hears about is forgotten on quit"
+    );
+    assert!(!rt.core().capture_is_live());
+}
+
+#[test]
+fn not_now_reaches_the_host_and_records_no_consent_event() {
+    let (mut rt, host) = runtime();
+    rt.meeting_detected(Monotonic::ZERO, zoom());
+
+    rt.respond_to_prompt(PromptChoice::NotNow, Monotonic::from_secs(1));
+
+    assert_eq!(host.calls(), vec![HostCall::SnoozeDetection]);
+    assert!(
+        !host
+            .calls()
+            .iter()
+            .any(|c| matches!(c, HostCall::AuditStart(_))),
+        "declining to record is not a start event"
+    );
 }

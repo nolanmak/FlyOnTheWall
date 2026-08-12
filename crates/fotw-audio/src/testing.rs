@@ -10,6 +10,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 
+use crate::activity::{ActivityProbe, ActivitySnapshot};
 use crate::error::TapError;
 use crate::events::{EventBus, PlatformEvent};
 use crate::format::{FormatRequest, StreamFormat};
@@ -468,6 +469,63 @@ impl AudioPlatform for MockPlatform {
 
     fn events(&self) -> Receiver<PlatformEvent> {
         self.bus.subscribe()
+    }
+}
+
+/// An [`ActivityProbe`] that replays a fixed answer.
+///
+/// This is what lets meeting detection be tested with **no conferencing app
+/// installed and no audio device present** — the whole point of putting the
+/// probe behind a trait. A test constructs the machine it wants to reason
+/// about (Zoom holding the mic, AirPods as the default input, a probe that
+/// fails) and the detector never learns it is not on a real Mac.
+#[derive(Debug, Clone)]
+pub struct FixedActivityProbe {
+    snapshot: Arc<Mutex<Result<ActivitySnapshot, String>>>,
+}
+
+impl FixedActivityProbe {
+    /// A probe that always reports `snapshot`.
+    #[must_use]
+    pub fn new(snapshot: ActivitySnapshot) -> Self {
+        Self {
+            snapshot: Arc::new(Mutex::new(Ok(snapshot))),
+        }
+    }
+
+    /// A probe that reports an empty machine: nothing is using audio.
+    #[must_use]
+    pub fn quiet() -> Self {
+        Self::new(ActivitySnapshot::default())
+    }
+
+    /// A probe that always fails.
+    #[must_use]
+    pub fn failing(reason: impl Into<String>) -> Self {
+        Self {
+            snapshot: Arc::new(Mutex::new(Err(reason.into()))),
+        }
+    }
+
+    /// Replace what the probe reports from now on, so one test can walk a
+    /// machine through a whole meeting.
+    pub fn set(&self, snapshot: ActivitySnapshot) {
+        *self.snapshot.lock().unwrap_or_else(PoisonError::into_inner) = Ok(snapshot);
+    }
+
+    /// Make the probe start failing.
+    pub fn fail(&self, reason: impl Into<String>) {
+        *self.snapshot.lock().unwrap_or_else(PoisonError::into_inner) = Err(reason.into());
+    }
+}
+
+impl ActivityProbe for FixedActivityProbe {
+    fn snapshot(&self) -> Result<ActivitySnapshot, TapError> {
+        self.snapshot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .map_err(TapError::platform)
     }
 }
 

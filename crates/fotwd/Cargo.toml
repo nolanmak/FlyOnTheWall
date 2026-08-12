@@ -9,6 +9,11 @@ repository.workspace = true
 [dependencies]
 fotw-audio = { path = "../fotw-audio" }
 fotw-pipeline = { path = "../fotw-pipeline" }
+# The daemon owns the shell's state machine: meeting detection runs here, and
+# CON-01 says detection may only *arm* it. Depending on the crate rather than
+# duplicating `DetectedMeeting` is what makes `tests/detect.rs` able to drive
+# the real state machine and prove that no detection reaches `StartCapture`.
+fotw-shell = { path = "../fotw-shell" }
 fotw-stt = { path = "../fotw-stt" }
 fotw-summarize = { path = "../fotw-summarize" }
 fotw-web = { path = "../fotw-web" }
