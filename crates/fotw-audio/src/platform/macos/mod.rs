@@ -32,18 +32,23 @@
 //! is undocumented and its own users report it unreliable.
 
 mod activity;
+mod listeners;
 mod mic;
 mod tap;
 
+use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
+use crate::device_change::DeviceChangeSignal;
 use crate::error::TapError;
 use crate::events::{EventBus, PlatformEvent};
 use crate::format::FormatRequest;
 use crate::ids::{AppInfo, AppRef, DeviceId, DeviceInfo, TapId};
 use crate::permission::{Permission, PermissionState, PlatformCaps};
-use crate::tap::{AudioPlatform, AudioTap, BoxFuture, SystemScope};
+use crate::tap::{AudioPlatform, AudioTap, BoxFuture, DeviceWatch, SystemScope};
+use crate::watchdog::OutputActivity;
 
+pub use listeners::{DeviceWatcher, debug_output_report, default_output_uid};
 pub use mic::MicTap;
 pub use tap::SystemTap;
 
@@ -63,6 +68,25 @@ impl MacOsPlatform {
     /// Publish a platform event.
     pub fn emit(&self, event: PlatformEvent) {
         self.bus.emit(event);
+    }
+
+    /// Install the Core Audio property listeners for CAP-06, typed.
+    ///
+    /// [`AudioPlatform::watch_devices`] is the same thing behind the seam's
+    /// opaque guard; this returns the concrete [`DeviceWatcher`] for callers
+    /// inside the backend.
+    ///
+    /// Deliberately *not* wired to [`EventBus`]: publishing there takes a
+    /// mutex, clones a `String`-bearing event and pushes into an `mpsc`
+    /// channel that allocates per message, none of which may happen on the
+    /// Core Audio notification thread. The bus stays available for anything
+    /// above the seam that wants to fan the change out after the supervisor
+    /// has taken it.
+    pub fn watch_devices_typed(
+        &self,
+        signal: Arc<DeviceChangeSignal>,
+    ) -> Result<DeviceWatcher, TapError> {
+        listeners::watch(signal)
     }
 }
 
@@ -150,6 +174,17 @@ impl AudioPlatform for MacOsPlatform {
 
     fn events(&self) -> Receiver<PlatformEvent> {
         self.bus.subscribe()
+    }
+
+    fn output_activity(&self) -> OutputActivity {
+        listeners::output_activity()
+    }
+
+    fn watch_devices(
+        &self,
+        signal: Arc<DeviceChangeSignal>,
+    ) -> Result<Box<dyn DeviceWatch>, TapError> {
+        Ok(Box::new(listeners::watch(signal)?))
     }
 }
 

@@ -15,9 +15,36 @@
 //! backend should stamp from `mach_continuous_time` and, at that point, this
 //! module grows a platform-specific body rather than every tap growing its own
 //! clock.
+//!
+//! # Why there is a trait as well as a function
+//!
+//! The stall watchdog's thresholds are 5 and 8 seconds. Testing it against
+//! [`host_ns`] would mean a test suite that sleeps, and a 13-second test is a
+//! test nobody runs. [`Clock`] is the injection point: production passes
+//! [`HostClock`], tests pass `testing::ManualClock`, and the detection logic
+//! itself never reads a clock at all — it takes `now_ns` as an argument.
 
 use std::sync::OnceLock;
 use std::time::Instant;
+
+/// A source of monotonic nanoseconds.
+///
+/// `Send + Sync` because the supervisor holds one behind an `Arc` and is
+/// driven from a different thread than the one that built it.
+pub trait Clock: Send + Sync {
+    /// Nanoseconds on this clock. Must be monotonically non-decreasing.
+    fn now_ns(&self) -> u64;
+}
+
+/// The real clock: the process-wide monotonic host clock of [`host_ns`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HostClock;
+
+impl Clock for HostClock {
+    fn now_ns(&self) -> u64 {
+        host_ns()
+    }
+}
 
 /// The process-wide epoch. Fixed at the first call so every tap in the process
 /// shares one zero point and cross-stream alignment is a subtraction.

@@ -6,14 +6,17 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
+use crate::device_change::DeviceChangeSignal;
 use crate::error::TapError;
 use crate::events::PlatformEvent;
 use crate::format::{FormatRequest, StreamFormat};
 use crate::frames::FrameSink;
 use crate::ids::{AppInfo, AppRef, DeviceId, DeviceInfo, TapId};
 use crate::permission::{Permission, PermissionState, PlatformCaps};
+use crate::watchdog::{OutputActivity, OutputProbe};
 
 /// A boxed future, so [`AudioPlatform`] stays object-safe without pulling an
 /// async runtime into the seam.
@@ -112,4 +115,68 @@ pub trait AudioPlatform: Send + Sync {
 
     /// Subscribe to device-change notifications.
     fn events(&self) -> Receiver<PlatformEvent>;
+
+    /// Install the platform's device-change notifications, raising into
+    /// `signal`.
+    ///
+    /// The real-time-safe sibling of [`AudioPlatform::events`]. macOS delivers
+    /// these on a Core Audio-owned thread that may not block or allocate, and
+    /// publishing onto an `mpsc` channel does both — so the notification path
+    /// is a lock-free bitmask and the fan-out happens on the caller's thread.
+    ///
+    /// The returned guard **must be held** for the length of the session:
+    /// dropping it unregisters the listeners with no diagnostic anywhere.
+    ///
+    /// The default installs nothing and succeeds, because a platform with no
+    /// device notifications is a limitation and not an error — the stall
+    /// watchdog is still the backstop there.
+    fn watch_devices(
+        &self,
+        signal: Arc<DeviceChangeSignal>,
+    ) -> Result<Box<dyn DeviceWatch>, TapError> {
+        let _ = signal;
+        Ok(Box::new(()))
+    }
+
+    /// Whether anything on this machine is currently rendering output audio.
+    ///
+    /// The corroborating evidence for CAP-05's silence rule: bit-exact zero
+    /// buffers mean nothing on their own, because a quiet meeting produces
+    /// exactly that, and only "something *is* playing and we are still getting
+    /// zeros" is a fault (docs/REQUIREMENTS.md 6.4).
+    ///
+    /// The default is [`OutputActivity::Unknown`], which **disables** the
+    /// silence rule rather than deciding it either way — a backend that cannot
+    /// answer must not be able to cause a rebuild by staying silent about it.
+    fn output_activity(&self) -> OutputActivity {
+        OutputActivity::Unknown
+    }
+}
+
+/// Keeps a platform's device-change notifications registered.
+///
+/// Opaque on purpose: what it holds is a Core Audio listener block on one
+/// platform and nothing at all on another, and the caller's only obligation is
+/// the same either way — keep it alive.
+pub trait DeviceWatch: Send {}
+
+/// The no-op guard for platforms with no device notifications.
+impl DeviceWatch for () {}
+
+/// Adapts any [`AudioPlatform`] into the watchdog's [`OutputProbe`].
+///
+/// A named wrapper rather than a blanket `impl OutputProbe for T:
+/// AudioPlatform`, which would collide with every other `OutputProbe`
+/// implementation the moment one is written — including the trivial one on
+/// [`OutputActivity`] that keeps the tests readable.
+#[derive(Debug)]
+pub struct PlatformProbe<'a, P: AudioPlatform + ?Sized>(
+    /// The platform to ask.
+    pub &'a P,
+);
+
+impl<P: AudioPlatform + ?Sized> OutputProbe for PlatformProbe<'_, P> {
+    fn output_activity(&self) -> OutputActivity {
+        AudioPlatform::output_activity(self.0)
+    }
 }
