@@ -38,6 +38,7 @@
 
 #![warn(missing_docs)]
 
+pub mod activity;
 pub mod clock;
 mod error;
 mod events;
@@ -51,6 +52,7 @@ mod tap;
 pub mod testing;
 pub mod wav;
 
+pub use crate::activity::{ActivityProbe, ActivitySnapshot, AudioClient, InputDevice, Transport};
 pub use crate::error::TapError;
 pub use crate::events::{EventBus, PlatformEvent};
 pub use crate::format::{FormatRequest, SampleFormat, StreamFormat};

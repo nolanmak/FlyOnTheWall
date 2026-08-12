@@ -31,6 +31,7 @@
 //! We deliberately do **not** ship AudioCap's private-TCC-framework probe: it
 //! is undocumented and its own users report it unreliable.
 
+mod activity;
 mod mic;
 mod tap;
 
@@ -85,7 +86,10 @@ impl AudioPlatform for MacOsPlatform {
             // See the module docs: there is no API for this, and pretending
             // otherwise would make onboarding lie.
             Permission::SystemAudio => PermissionState::Unobservable,
-            Permission::Microphone => PermissionState::NotDetermined,
+            // The mic leg *is* different: `AVCaptureDevice.authorizationStatus`
+            // is a real, queryable API, so onboarding handles it up front
+            // instead of inferring it from silence (issue #31).
+            Permission::Microphone => mic_authorization(),
             Permission::ScreenRecording => PermissionState::NotApplicable,
         }
     }
@@ -93,7 +97,7 @@ impl AudioPlatform for MacOsPlatform {
     fn request_permission(&self, permission: Permission) -> BoxFuture<'static, PermissionState> {
         let state = match permission {
             Permission::SystemAudio => PermissionState::Unobservable,
-            Permission::Microphone => PermissionState::NotDetermined,
+            Permission::Microphone => mic_authorization(),
             Permission::ScreenRecording => PermissionState::NotApplicable,
         };
         Box::pin(async move { state })
@@ -146,5 +150,30 @@ impl AudioPlatform for MacOsPlatform {
 
     fn events(&self) -> Receiver<PlatformEvent> {
         self.bus.subscribe()
+    }
+}
+
+/// The microphone authorization status, from the API that actually exists.
+///
+/// `AVCaptureDevice.authorizationStatus(for: .audio)` is queryable *and*
+/// requestable, unlike the system-audio grant — which is why onboarding
+/// handles the mic leg up front and the tap leg by round trip (6.3).
+///
+/// A `Restricted` answer is not a `Denied` one: it means MDM or parental
+/// controls, and telling that user to flip a switch they cannot flip is worse
+/// than telling them nothing.
+fn mic_authorization() -> PermissionState {
+    use cidre::av;
+
+    match av::CaptureDevice::authorization_status_for_media_type(av::MediaType::audio()) {
+        Ok(av::AuthorizationStatus::Authorized) => PermissionState::Granted,
+        Ok(av::AuthorizationStatus::Denied) => PermissionState::Denied,
+        Ok(av::AuthorizationStatus::Restricted) => PermissionState::Restricted,
+        Ok(av::AuthorizationStatus::NotDetermined) => PermissionState::NotDetermined,
+        // The call raised an Objective-C exception, which for this selector
+        // means an unsupported media type on this OS. Reporting
+        // "not determined" would send onboarding into a request that also
+        // cannot work; the honest answer is that we cannot see it.
+        Err(_) => PermissionState::Unobservable,
     }
 }

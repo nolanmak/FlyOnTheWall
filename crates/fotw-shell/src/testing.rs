@@ -6,6 +6,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::prompt::StartOrigin;
 use crate::runtime::ShellHost;
 use crate::view::Level;
 
@@ -30,6 +31,12 @@ pub enum HostCall {
     OpenAbout,
     /// [`ShellHost::quit`].
     Quit,
+    /// [`ShellHost::audit_start`] — the CON-01 consent record.
+    AuditStart(StartOrigin),
+    /// [`ShellHost::snooze_detection`].
+    SnoozeDetection,
+    /// [`ShellHost::suppress_app`].
+    SuppressApp(String),
 }
 
 /// A [`ShellHost`] that records what it was asked to do.
@@ -106,6 +113,18 @@ impl ShellHost for FakeHost {
 
     fn stop_capture(&mut self) {
         self.push(HostCall::StopCapture);
+    }
+
+    fn audit_start(&mut self, origin: StartOrigin) {
+        self.push(HostCall::AuditStart(origin));
+    }
+
+    fn snooze_detection(&mut self) {
+        self.push(HostCall::SnoozeDetection);
+    }
+
+    fn suppress_app(&mut self, app_key: &str) {
+        self.push(HostCall::SuppressApp(app_key.to_owned()));
     }
 
     fn quit(&mut self) {

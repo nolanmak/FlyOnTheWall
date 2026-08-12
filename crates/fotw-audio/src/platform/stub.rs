@@ -7,6 +7,7 @@
 
 use std::sync::mpsc::Receiver;
 
+use crate::activity::{ActivityProbe, ActivitySnapshot};
 use crate::error::TapError;
 use crate::events::{EventBus, PlatformEvent};
 use crate::format::FormatRequest;
@@ -76,5 +77,19 @@ impl AudioPlatform for StubPlatform {
 
     fn events(&self) -> Receiver<PlatformEvent> {
         self.bus.subscribe()
+    }
+}
+
+/// An unimplemented platform reports a *failure*, never an empty machine.
+///
+/// Empty means "nothing on this machine is using audio", which the detector
+/// above reads as "no meeting in progress". A stub that answered that way
+/// would turn a missing backend into a detector that is permanently and
+/// silently off — the same class of defect as recording silence.
+impl ActivityProbe for StubPlatform {
+    fn snapshot(&self) -> Result<ActivitySnapshot, TapError> {
+        Err(TapError::unsupported(
+            "no activity probe is compiled in for this platform",
+        ))
     }
 }

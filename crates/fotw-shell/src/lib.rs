@@ -32,13 +32,35 @@
 //! sanctioned. See docs/REQUIREMENTS.md 11.2, and *Chamberlain v. Granola*
 //! for why "no hide-indicator setting" is a legal position and not a taste.
 //!
+//! # CON-01
+//!
+//! Detection arms; a person starts. [`ShellInput::MeetingDetected`] can only
+//! raise a [`PromptView`], every way of starting names a human
+//! ([`StartOrigin`] has no automatic variant), and
+//! `tests/con01_detection_arms_only.rs` is the executable form of both.
+//!
 //! ```
-//! use fotw_shell::{Monotonic, ShellCore, ShellInput};
+//! use fotw_shell::{
+//!     DetectedMeeting, Monotonic, PromptChoice, ShellCore, ShellEffect, ShellInput, StartOrigin,
+//! };
 //!
 //! let mut shell = ShellCore::new();
 //! assert!(shell.view().pill.is_none());
 //!
-//! shell.handle(ShellInput::Start { at: Monotonic::ZERO });
+//! // Detection arms. It does not record.
+//! let effects = shell.handle(ShellInput::MeetingDetected {
+//!     at: Monotonic::ZERO,
+//!     meeting: DetectedMeeting::new("us.zoom.xos", "Zoom", "Zoom is using the microphone"),
+//! });
+//! assert!(!effects.contains(&ShellEffect::StartCapture));
+//! assert!(shell.view().prompt.is_some());
+//! assert!(shell.view().pill.is_none());
+//!
+//! // A person presses the button.
+//! shell.handle(ShellInput::PromptResponse {
+//!     at: Monotonic::ZERO,
+//!     choice: PromptChoice::Start { acknowledged: true },
+//! });
 //! shell.handle(ShellInput::Tick { now: Monotonic::from_secs(754) });
 //!
 //! let pill = shell.view().pill.expect("recording shows an indicator");
@@ -48,6 +70,11 @@
 //! // written to disk.
 //! shell.handle(ShellInput::StopRequested);
 //! assert!(shell.view().pill.is_some());
+//!
+//! // And the same session could have been started from the menu instead.
+//! let mut other = ShellCore::new();
+//! other.handle(ShellInput::Start { at: Monotonic::ZERO, origin: StartOrigin::Menu });
+//! assert!(other.capture_is_live());
 //! ```
 
 #![warn(missing_docs)]
@@ -64,6 +91,7 @@ pub mod hotkey;
 pub mod icon;
 pub mod platform;
 pub mod probe;
+pub mod prompt;
 mod runtime;
 mod state;
 pub mod testing;
@@ -73,10 +101,12 @@ pub use crate::clock::{Monotonic, format_elapsed};
 pub use crate::error::ShellError;
 pub use crate::hotkey::{Chord, HotkeyAction, HotkeyError, HotkeyMap, Key, MediaKey, Modifiers};
 pub use crate::platform::run;
+pub use crate::prompt::{DetectedMeeting, PromptChoice, StartOrigin};
 pub use crate::runtime::{ShellHost, ShellRuntime};
 pub use crate::state::{
     FINISHED_LINGER, METER_SEGMENTS, Phase, ShellCore, ShellEffect, ShellInput,
 };
 pub use crate::view::{
-    Level, MenuAction, MenuButton, MenuModel, PillView, ShellView, Tone, TrayState, TrayView,
+    Level, MenuAction, MenuButton, MenuModel, PillView, PromptView, ShellView, Tone, TrayState,
+    TrayView,
 };

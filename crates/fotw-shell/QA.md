@@ -141,6 +141,27 @@ misses.
 | 6.3 | Start via a `launchd` job at login. | Comes up as an accessory; the menu-bar item appears. | |
 | 6.4 | With the app running, ⌘-Tab. | FlyOnTheWall is absent from the switcher. | |
 
+## 6b. The meeting-detection prompt (CON-01) — **not yet drawn**
+
+`ShellCore` produces a `PromptView` whenever detection arms, and the state
+machine around it is fully covered (`tests/con01_detection_arms_only.rs`). The
+AppKit renderer in `src/platform/macos/mod.rs` **does not draw it yet**: it
+applies `view.tray` and `view.pill` and ignores `view.prompt`. So on a real Mac
+today the prompt exists as data and is observable only through
+`fotwd detect`, which prints it.
+
+This is stated here rather than left implied because the gap is invisible from
+the test suite — every test passes, and no user ever sees a prompt.
+
+| # | Step | Expected | Result |
+|---|---|---|---|
+| 6b.1 | Implement the panel, then join a Zoom call. | The prompt appears once, naming Zoom and the evidence, with Start / Not now / Never for this app. | |
+| 6b.2 | Leave Zoom running and idle for an hour. | **No prompt at any point.** This is the one that decides whether the consent surface keeps its meaning. | |
+| 6b.3 | Dismiss with "Not now", stay in the call. | No second prompt for ten minutes. | |
+| 6b.4 | "Never for this app", then join another call in the same app. | No prompt, ever, until the suppression is cleared in settings. | |
+| 6b.5 | With the home jurisdiction set to an all-party state, press Start without ticking the acknowledgement. | Nothing starts, and the prompt stays up. The state machine enforces this; confirm the panel actually renders the checkbox. | |
+| 6b.6 | Join a call wearing AirPods. | Record what happens. The mic-hot conjunct is expected to be unreliable on Bluetooth (issue #22) and the calendar fallback needs EventKit (MTG-01), so **no prompt is the expected outcome today**. | |
+
 ## 7. Lifecycle and failure
 
 | # | Step | Expected | Result |
@@ -170,7 +191,16 @@ For contrast, so nobody re-tests these by hand or assumes the reverse:
 - **The media-key ban** — `tests/hotkeys.rs` plus a unit test in
   `src/platform/macos/hotkeys.rs` proving no `MediaKey` can map to a
   `global_hotkey::Code`.
-- **The host dispatch path** — `tests/runtime.rs` against a fake host.
+- **CON-01 as a property** — `tests/con01_detection_arms_only.rs`: detection
+  raises a prompt and never a `StartCapture`; an exhaustive `ShellInput` match
+  that fails to compile when a variant is added; every non-human input driven
+  from idle and from armed; a blocking jurisdiction warning that cannot be
+  clicked past; a 200 000-input sweep asserting that the only inputs which can
+  start capture are a human pressing record, that every start is immediately
+  preceded by an `AuditStart` naming a human, and that a prompt is never on
+  screen over a live recording.
+- **The host dispatch path** — `tests/runtime.rs` against a fake host,
+  including that a detection reaching the host asks it to do *nothing*.
 - **Menu-bar icon distinctness** — `tests/tray_icon_raster.rs`, on the
   rasteriser rather than on an asset file.
 - **Four AppKit constants** — `src/platform/macos/pill.rs` unit tests pin the
@@ -179,4 +209,7 @@ For contrast, so nobody re-tests these by hand or assumes the reverse:
   never the behaviour; §1–§3 above are what prove the behaviour.
 
 Mutation testing: 20 seeded defects were introduced one at a time and all 20
-were caught by the suite above.
+were caught by the suite above. The CON-01 work added 7 more (detection starts
+capture, the audit record written late or not at all, the blocking warning
+bypassed, a response to a withdrawn prompt honoured, the prompt left up over a
+live recording, the wrong key suppressed) — all 7 caught.
