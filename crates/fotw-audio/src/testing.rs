@@ -6,10 +6,13 @@
 //! it (docs/REQUIREMENTS.md 5.6).
 
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
+use crate::clock::Clock;
 use crate::error::TapError;
 use crate::events::{EventBus, PlatformEvent};
 use crate::format::{FormatRequest, StreamFormat};
@@ -47,6 +50,107 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 
 /// How many times [`block_on`] polls before giving up.
 pub const BLOCK_ON_POLL_LIMIT: usize = 1_000_000;
+
+/// A [`Clock`] a test moves by hand.
+///
+/// The stall watchdog's thresholds are 5 s and 8 s. Testing it against the
+/// real clock would mean a suite that sleeps for thirteen seconds per case,
+/// which is a suite nobody runs and therefore a watchdog nobody trusts. With
+/// this, a 45-minute meeting is exercised in a few milliseconds.
+///
+/// Interior mutability so it can sit behind the `Arc<dyn Clock>` the
+/// supervisor holds while the test still moves it.
+#[derive(Debug, Default)]
+pub struct ManualClock {
+    ns: AtomicU64,
+}
+
+impl ManualClock {
+    /// A clock at zero, ready to share with whatever is being tested.
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Move forward. Never backwards: the seam's whole timing model assumes a
+    /// monotonic clock, and a test that could violate it would be testing
+    /// something that cannot happen.
+    pub fn advance(&self, by: Duration) {
+        self.ns.fetch_add(by.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// The current reading.
+    #[must_use]
+    pub fn now_ns(&self) -> u64 {
+        self.ns.load(Ordering::Relaxed)
+    }
+}
+
+impl Clock for ManualClock {
+    fn now_ns(&self) -> u64 {
+        Self::now_ns(self)
+    }
+}
+
+/// Something that happened to a [`FakeTap`].
+///
+/// Recovery correctness is an *ordering* property — stop, destroy, only then
+/// create — and ordering is invisible to a counter and to the type system.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TapEvent {
+    /// A tap object was created.
+    Opened(TapId),
+    /// It began delivering, at this format.
+    Started(StreamFormat),
+    /// It was stopped.
+    Stopped,
+    /// It was dropped — on macOS, where the aggregate device and the process
+    /// tap are actually destroyed.
+    Dropped,
+}
+
+/// A shared journal of what happened to a series of [`FakeTap`]s.
+///
+/// Shared and `Arc`-backed so it survives the taps themselves: a supervisor
+/// drops the tap it is replacing, and "was it dropped before the replacement
+/// was created?" is exactly the question worth asking.
+#[derive(Debug, Clone, Default)]
+pub struct TapLog {
+    events: Arc<Mutex<Vec<TapEvent>>>,
+}
+
+impl TapLog {
+    /// An empty journal.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append an event.
+    pub fn record(&self, event: TapEvent) {
+        self.events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(event);
+    }
+
+    /// Everything recorded, oldest first.
+    #[must_use]
+    pub fn events(&self) -> Vec<TapEvent> {
+        self.events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Forget everything, so a test can ignore setup noise.
+    pub fn clear(&self) {
+        self.events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+}
 
 #[derive(Debug, Default)]
 struct SinkState {
@@ -163,6 +267,15 @@ pub struct FakeTap {
     sink: Option<Box<dyn FrameSink>>,
     fail_next_start: Option<TapError>,
     delivered_frames: u64,
+    log: Option<TapLog>,
+}
+
+impl Drop for FakeTap {
+    fn drop(&mut self) {
+        if let Some(log) = &self.log {
+            log.record(TapEvent::Dropped);
+        }
+    }
 }
 
 // Hand-written because `dyn FrameSink` is not `Debug` — and making it so would
@@ -195,7 +308,19 @@ impl FakeTap {
             sink: None,
             fail_next_start: None,
             delivered_frames: 0,
+            log: None,
         }
+    }
+
+    /// Journal this tap's lifecycle into a shared [`TapLog`].
+    ///
+    /// Records [`TapEvent::Opened`] immediately, because for a supervisor
+    /// "when was the replacement created" is half the ordering question.
+    #[must_use]
+    pub fn with_log(mut self, log: TapLog) -> Self {
+        log.record(TapEvent::Opened(self.id.clone()));
+        self.log = Some(log);
+        self
     }
 
     /// Script the format each successive `start()` reports.
@@ -286,12 +411,18 @@ impl AudioTap for FakeTap {
         self.starts += 1;
         self.current = Some(format);
         self.sink = Some(sink);
+        if let Some(log) = &self.log {
+            log.record(TapEvent::Started(format));
+        }
         Ok(format)
     }
 
     fn stop(&mut self) -> Result<(), TapError> {
         self.current = None;
         self.sink = None;
+        if let Some(log) = &self.log {
+            log.record(TapEvent::Stopped);
+        }
         Ok(())
     }
 }

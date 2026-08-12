@@ -21,6 +21,22 @@
 //!    it has to synthesise the gaps itself.
 //! 5. [`AudioPlatform::events`] exists from day one.
 //!
+//! # Surviving a tap that dies without saying so (CAP-05, CAP-06)
+//!
+//! A Core Audio process tap can keep reporting success while delivering
+//! nothing, or nothing but zeros, and a device change mid-meeting is the
+//! commonest way it happens. Three modules answer that, and none of them names
+//! an operating system:
+//!
+//! * [`watchdog`] decides *that* a tap is broken, from counters and an
+//!   injected clock. Read its module docs before changing a threshold — the
+//!   two conditions it distinguishes are not the same condition, and the
+//!   corroboration signal the spec relies on is weaker than the spec assumes.
+//! * [`device_change`] carries a hardware change from a platform notification
+//!   thread that may not allocate to a supervisor thread that may.
+//! * [`supervisor`] does the full teardown and rebuild, and reports what the
+//!   recording lost as a [`CaptureGap`] the writer can act on.
+//!
 //! # Testing without an audio device
 //!
 //! [`FileAudioSource`] is an [`AudioTap`] that replays a WAV fixture — in real
@@ -39,6 +55,7 @@
 #![warn(missing_docs)]
 
 pub mod clock;
+pub mod device_change;
 mod error;
 mod events;
 mod format;
@@ -47,10 +64,13 @@ mod ids;
 mod permission;
 pub mod platform;
 mod session;
+pub mod supervisor;
 mod tap;
 pub mod testing;
+pub mod watchdog;
 pub mod wav;
 
+pub use crate::device_change::{DeviceChangeKind, DeviceChangeSignal, DeviceChanges};
 pub use crate::error::TapError;
 pub use crate::events::{EventBus, PlatformEvent};
 pub use crate::format::{FormatRequest, SampleFormat, StreamFormat};
@@ -59,4 +79,10 @@ pub use crate::ids::{AppInfo, AppRef, DeviceId, DeviceInfo, TapId};
 pub use crate::permission::{Permission, PermissionState, PlatformCaps};
 pub use crate::platform::file::{FileAudioSource, FilePlatform, ReplaySpeed};
 pub use crate::session::TapSession;
-pub use crate::tap::{AudioPlatform, AudioTap, BoxFuture, SystemScope};
+pub use crate::supervisor::{
+    CaptureGap, CaptureSupervisor, GapKind, HealthEvent, SupervisorConfig,
+};
+pub use crate::tap::{AudioPlatform, AudioTap, BoxFuture, DeviceWatch, PlatformProbe, SystemScope};
+pub use crate::watchdog::{
+    ActivityCounters, OutputActivity, TapActivity, Watchdog, WatchdogConfig,
+};

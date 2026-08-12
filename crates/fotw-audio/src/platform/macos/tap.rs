@@ -125,8 +125,16 @@ impl SystemTap {
 
         let mut desc = TapDesc::with_stereo_global_tap_excluding_processes(&exclude);
         desc.set_name(Some(ns::str!(c"FlyOnTheWall system audio")));
-        // Private: visible only to this process, so it never pollutes the
-        // user's Sound settings or Audio MIDI Setup.
+        // Private: keeps the tap out of the user's Sound settings and Audio
+        // MIDI Setup.
+        //
+        // It does NOT keep the aggregate device built around it out of
+        // `kAudioHardwarePropertyDevices` — measured, and it matters: creating
+        // and destroying this aggregate fires the system device-list
+        // notification, so anything listening to that property sees our own
+        // rebuild as a device change. See `crate::device_change`'s
+        // `DeviceChangeKind::DeviceList`, which is why that is not a rebuild
+        // trigger.
         desc.set_private(true);
         // Exclusive means `processes` is an EXCLUDE list. Inverting this
         // silently flips it to an include list and captures nothing.
