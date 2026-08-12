@@ -9,7 +9,21 @@ repository.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# `float_roundtrip` is NOT optional here, and the reason is a defect the export
+# round-trip test caught rather than a preference.
+#
+# By default serde_json parses a float through a fixed-precision fast path that
+# double-rounds: it writes `0.9999999999999999` faithfully (ryu is exact) and
+# reads it back as `1.0`. `segments.confidence` and `summaries.coverage` are
+# REAL columns, so with the default feature set every export is silently lossy
+# in the last bit -- and nothing short of comparing `f64::to_bits` notices.
+# `float_roundtrip` uses enough precision on the way in to make the pair exact,
+# at roughly 2x float-parsing cost, which is invisible next to the SQLite work
+# either side of it.
+#
+# Adding a feature to a workspace dependency from a member manifest is
+# additive; the root Cargo.toml is unchanged.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 
 # SQLCipher, vendored together with OpenSSL, so a build never depends on
 # whatever libsqlite3 the host happens to ship (docs/REQUIREMENTS.md 9.1).
@@ -29,6 +43,7 @@ rusqlite_migration = "2.6"
 # v7: RFC 9562 time-ordered UUIDs. They index like an autoincrement without
 # being one, which is what keeps the door open for sync (§9.7 invariant 1).
 uuid = { version = "1", features = ["v7"] }
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"
