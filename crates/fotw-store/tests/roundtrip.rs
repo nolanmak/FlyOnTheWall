@@ -698,6 +698,33 @@ fn a_title_that_would_break_the_frontmatter_is_quoted() {
 }
 
 #[test]
+fn the_markdown_transcript_does_not_collapse_into_one_paragraph() {
+    // CommonMark joins consecutive lines. A transcript written as bare lines
+    // renders in Obsidian as a wall of text with the timestamps buried
+    // mid-sentence — technically present, practically unreadable.
+    let (_f, db) = fixture();
+    let md = db.export_meeting("mtg-1").unwrap().to_markdown();
+    let body = &md[md.find("## Transcript").expect("transcript section")..];
+
+    let lines: Vec<&str> = body
+        .lines()
+        .filter(|l| l.contains("] ") && l.contains(':'))
+        .collect();
+    assert!(lines.len() >= 5, "{body}");
+    for l in &lines {
+        assert!(
+            l.starts_with("- ["),
+            "transcript line is not a list item: {l:?}"
+        );
+    }
+    // A segment whose own text has a newline must not break out of its item.
+    assert!(
+        body.contains("line one line"),
+        "an embedded newline split a transcript line: {body}"
+    );
+}
+
+#[test]
 fn the_plain_text_export_timestamps_every_line() {
     let (_f, db) = fixture();
     let txt = db.export_meeting("mtg-1").unwrap().to_plain_text();

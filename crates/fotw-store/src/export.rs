@@ -853,7 +853,7 @@ impl MeetingDoc {
 
         if !self.segments.is_empty() {
             out.push_str("## Transcript\n\n");
-            out.push_str(&self.transcript_lines());
+            out.push_str(&self.transcript_lines("- "));
             out.push('\n');
         }
         out
@@ -873,11 +873,18 @@ impl MeetingDoc {
             },
             iso_date(m.started_at_ms)
         ));
-        out.push_str(&self.transcript_lines());
+        out.push_str(&self.transcript_lines(""));
         out
     }
 
-    fn transcript_lines(&self) -> String {
+    /// `[00:12:34] Alice: …`, one segment per line.
+    ///
+    /// `prefix` is `"- "` for Markdown and empty for plain text, and that is
+    /// not cosmetic: CommonMark joins consecutive lines into one paragraph, so
+    /// a Markdown transcript written as bare lines renders in Obsidian as a
+    /// single wall of text with the timestamps buried mid-sentence. List items
+    /// are the only form that survives every renderer.
+    fn transcript_lines(&self, prefix: &str) -> String {
         // Only the primary transcript is rendered for humans -- the others are
         // alternative takes on the same audio and interleaving them would read
         // as the meeting having happened twice. Every one of them is still in
@@ -902,7 +909,11 @@ impl MeetingDoc {
                 .as_deref()
                 .filter(|l| !l.is_empty())
                 .unwrap_or("Speaker");
-            lines.push_str(&format!("[{}] {who}: {}\n", hms(s.start_ms), s.text));
+            // A segment's text can itself contain a newline (STT providers
+            // emit them), which would break out of the list item. One line in,
+            // one line out.
+            let text = s.text.replace(['\n', '\r'], " ");
+            lines.push_str(&format!("{prefix}[{}] {who}: {text}\n", hms(s.start_ms)));
         }
         lines
     }

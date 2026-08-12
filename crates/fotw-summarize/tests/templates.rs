@@ -389,6 +389,19 @@ fn the_prompt_body_carries_the_body_and_every_section() {
     // Required and optional must read differently, or the flag does nothing.
     assert!(body.contains("always include"));
     assert!(body.contains("omit if"));
+
+    // The sections are introduced as an ordered structure, not appended as a
+    // bare list. Without that sentence the model is handed a bullet list with
+    // no statement of what it is for, and the `sections:` key silently becomes
+    // decorative — a mutation that survived the first version of this test.
+    let intro = body
+        .find("Structure the document with these sections, in this order:")
+        .expect("sections are not introduced as an output shape");
+    assert!(intro < body.find("Per person").unwrap());
+    assert!(intro > body.find("Keep it short.").unwrap());
+
+    // Order is the template's order, not alphabetical or anything else.
+    assert!(body.find("Per person").unwrap() < body.find("Blockers").unwrap());
 }
 
 #[test]
