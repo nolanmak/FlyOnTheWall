@@ -27,3 +27,9 @@ reqwest = { version = "0.13.4", default-features = false, features = ["http2", "
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }
+# The recovery round trip creates several throwaway libraries per test and has
+# to leave nothing behind when one fails mid-way -- the older
+# `std::env::temp_dir()` pattern in this crate's other tests cleans up only on
+# the happy path. Already in the lock file via fotw-store and fotw-secrets, so
+# no new supply chain.
+tempfile = "3"
