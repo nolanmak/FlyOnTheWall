@@ -133,6 +133,25 @@ Run `fotwd disclose` for copy you can paste into all three places.
 
 ## 4. What the app builds in, and what is still missing
 
+### macOS shows a recording indicator, and this is measured
+
+Worth knowing before writing any marketing copy, because it is the fact that
+makes the *"they won't know it's there"* framing false as well as unwise.
+
+With a Core Audio process tap running and the microphone closed, macOS 26.3
+puts a **purple dot (`#6361e9`)** at the right end of the menu bar for the
+entire capture, and removes it the instant capture stops. With the microphone
+also open, the same pixel turns **orange (`#f2a33c`)** — mic supersedes system
+audio. Both appear even with the menu bar auto-hidden under a full-screen
+window. Nothing capturing, nothing shown.
+
+So the operating system already tells the user's own machine that something is
+recording. That is not the same as telling the *other participants*, which is
+what the law is about — and it is a floor, not a substitute for disclosure.
+
+It also does not make our own indicator redundant: the OS dot does not name
+the app, show elapsed time, or offer a Stop.
+
 Built and verified:
 
 - **64 jurisdictions with statutes and citations**, plus escalation from your
@@ -145,7 +164,15 @@ Built and verified:
   pre-filled consent email.
 - **Local-only by construction**, with an exact-host egress allowlist.
 
-**The gap, stated plainly.** The `meetings.disclosed` column exists, is
+**A second gap, and the more urgent one.** The all-party jurisdiction warning
+blocks Start **only on the detection-prompt path**. `ShellCore::toggle()` —
+which both the menu item and the global hotkey call — never consults
+jurisdiction at all, so ⇧⌘R starts recording in California with no warning
+shown. A gate covering one of three start paths is not a gate, and the hotkey
+is the path a regular user actually reaches for because it is the fast one.
+Tracked as #57.
+
+**The first gap, stated plainly.** The `meetings.disclosed` column exists, is
 exported, and has a builder — and **nothing in the codebase ever sets it to
 true.** The app hands you the words and then does not record that you said
 them. That is CON-04, and it is the difference between a tool that helps you
