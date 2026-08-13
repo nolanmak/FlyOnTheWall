@@ -27,6 +27,16 @@
 //!    `SecretString`. Neither has a filesystem fallback, which is what makes
 //!    KEY-05 (below) enforceable rather than aspirational.
 //!
+//! # The one file this crate does write
+//!
+//! [`recovery`] writes `db.sqlite3.recovery`: the database master key **sealed
+//! under a Recovery Key the user wrote down**. That is not a hole in rule 4, it
+//! is the deliberate complement to it — a wrapped key on disk is what makes the
+//! keychain survivable, and rule 4 is about *material*, which that file never
+//! contains. The argument is set out in full in [`recovery`]'s module docs; the
+//! short version is that a recovery path stored in the keychain is lost with
+//! the keychain, which is the only failure it exists for.
+//!
 //! # KEY-05: no silent plaintext fallback
 //!
 //! On Linux with no Secret Service, [`OsKeyStore::new`] returns
@@ -51,6 +61,7 @@ mod error;
 mod fingerprint;
 mod index;
 mod keys;
+pub mod recovery;
 mod redact;
 mod secret;
 mod store;

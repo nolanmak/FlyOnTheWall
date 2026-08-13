@@ -5,13 +5,19 @@
 //! and neither is ever written to disk, passed as an argument, or held in a
 //! global (§10).
 //!
-//! # The master key is generated once and never shown
+//! # The master key is generated once, and only behind the ceremony
 //!
 //! On first run a 32-byte key is drawn from the OS CSPRNG and stored in the
 //! keychain. Losing it without the Recovery Key means permanent data loss,
-//! which is why §10 makes the recovery-key dialog unskippable — that dialog
-//! belongs to the UI and is not built yet, so this module deliberately fails
-//! loudly rather than silently minting a key a user cannot back up.
+//! which is why §10 makes the recovery-key dialog unskippable.
+//!
+//! This module deliberately **does not** generate-and-store in one call any
+//! more. It offers [`generate_master_key`] and [`store_master_key`] separately,
+//! so the first-run ceremony in [`crate::recovery`] sits between them: a key is
+//! only ever committed to the keychain after the user has been shown a Recovery
+//! Key for it and typed part of it back. A single `db_key()` that minted and
+//! stored in one step made that ordering impossible to enforce, and the
+//! warning it printed named a backup the user had no way to take.
 //!
 //! # Why an environment variable is still accepted for the provider key
 //!
@@ -20,18 +26,23 @@
 //! variable is readable by every child process and shows up in a crash dump.
 //! The keychain is tried first and the fallback says so out loud.
 
+use fotw_secrets::recovery::MasterKeyBytes;
 use fotw_secrets::{KeyStore, OsKeyStore, Provider, SecretKey, SecretString, SecretsError};
 use fotw_store::DbKey;
 
-/// How the daemon resolved a secret, so the UI can tell the user.
+/// How the daemon resolved a *provider* secret, so the UI can tell the user.
+///
+/// There used to be a `Generated` variant here, for the master key minted on
+/// first run. It is gone with `db_key()`: the master key's provenance is now a
+/// decision [`crate::open_library_with`] makes from three explicit states, and
+/// a variant that nothing can ever produce is a variant that misleads the next
+/// person to read this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
     /// Read from the OS keychain — the supported path.
     Keychain,
     /// Read from the environment. Works, but readable by any child process.
     Environment,
-    /// Generated fresh and stored.
-    Generated,
 }
 
 /// Re-exported so callers and tests name one deadline.
@@ -51,11 +62,20 @@ pub fn keystore() -> Result<OsKeyStore, SecretsError> {
     OsKeyStore::new()
 }
 
-/// The database master key, generated on first run.
+/// The stored database master key, or `None` if this machine has never had one.
 ///
-/// Returns the key and how it was obtained, so the caller can prompt for a
-/// Recovery Key the first time.
-pub fn db_key(store: &dyn KeyStore) -> Result<(DbKey, Origin), SecretsError> {
+/// `None` is a *state*, not an error: on a first run there is no key yet, and
+/// on a machine that has lost its keychain there is no key any more. Those two
+/// need completely different handling — one runs the first-run ceremony, the
+/// other must refuse to touch the library and point at `fotwd recover` — and
+/// the caller can only tell them apart if this returns without deciding.
+///
+/// # Errors
+///
+/// Anything other than "not stored": a locked keychain, an ACL mismatch, a
+/// stalled call. Those must not be mistaken for "no key", because mistaking
+/// them means minting a second key over a perfectly good library.
+pub fn load_master_key(store: &dyn KeyStore) -> Result<Option<MasterKeyBytes>, SecretsError> {
     match store.get(SecretKey::DbMasterKey) {
         Ok(secret) => {
             let bytes = decode_hex(secret.expose()).ok_or_else(|| {
@@ -66,18 +86,47 @@ pub fn db_key(store: &dyn KeyStore) -> Result<(DbKey, Origin), SecretsError> {
                         .to_owned(),
                 )
             })?;
-            Ok((DbKey::from_bytes(bytes), Origin::Keychain))
+            Ok(Some(MasterKeyBytes::new(bytes)))
         }
-        Err(SecretsError::NotFound { .. }) => {
-            let bytes = random_32();
-            store.set(
-                SecretKey::DbMasterKey,
-                &SecretString::new(encode_hex(&bytes)),
-            )?;
-            Ok((DbKey::from_bytes(bytes), Origin::Generated))
-        }
+        Err(SecretsError::NotFound { .. }) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// A fresh 32-byte master key, **not** stored anywhere.
+///
+/// Split from [`store_master_key`] so the recovery-key ceremony can run between
+/// the two. Nothing is committed until the user has a Recovery Key in hand.
+///
+/// # Errors
+///
+/// Propagates a CSPRNG failure rather than falling back to a weaker source.
+pub fn generate_master_key() -> Result<MasterKeyBytes, SecretsError> {
+    MasterKeyBytes::generate()
+        .map_err(|e| SecretsError::InvalidKeyMaterial(format!("could not generate a key: {e}")))
+}
+
+/// Commit a master key to the keychain.
+///
+/// # Errors
+///
+/// Whatever the platform credential store says. There is no file fallback.
+pub fn store_master_key(store: &dyn KeyStore, key: &MasterKeyBytes) -> Result<(), SecretsError> {
+    store.set(
+        SecretKey::DbMasterKey,
+        &SecretString::new(encode_hex(key.expose())),
+    )
+}
+
+/// The `PRAGMA key` form of a master key.
+///
+/// # Errors
+///
+/// [`SecretsError::InvalidKeyMaterial`] if the material is not 32 bytes —
+/// SQLCipher would silently zero-pad it into a weaker database that still
+/// opens.
+pub fn db_key_of(key: &MasterKeyBytes) -> Result<DbKey, SecretsError> {
+    DbKey::from_slice(key.expose()).map_err(|e| SecretsError::InvalidKeyMaterial(format!("{e}")))
 }
 
 /// The Deepgram API key, from the keychain or the environment.
@@ -111,22 +160,6 @@ pub fn store_key(
         ));
     }
     store.set(SecretKey::ApiKey(provider), &secret)
-}
-
-/// 32 bytes from the OS CSPRNG.
-///
-/// Read straight from `/dev/urandom` rather than taking a dependency: this is
-/// the one place a weak source would be catastrophic and unnoticeable, and
-/// the fewer layers between the OS and the key the better.
-fn random_32() -> [u8; 32] {
-    use std::io::Read;
-    let mut buf = [0u8; 32];
-    // A failure here means the OS has no entropy source, which is not a
-    // condition to paper over with a fallback.
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .expect("the operating system must provide /dev/urandom");
-    buf
 }
 
 fn encode_hex(bytes: &[u8; 32]) -> String {
@@ -165,30 +198,42 @@ mod tests {
         store
             .set(SecretKey::DbMasterKey, &SecretString::new("not-hex"))
             .unwrap();
-        assert!(db_key(&store).is_err());
+        assert!(load_master_key(&store).is_err());
+    }
+
+    /// The distinction the whole recovery path rests on: "there is no key"
+    /// must not be reported the same way as "the keychain would not answer".
+    /// The first runs onboarding; the second must never mint a second key over
+    /// a library that already has one.
+    #[test]
+    fn an_absent_key_is_none_and_not_an_error() {
+        let store = InMemoryKeyStore::new();
+        assert!(load_master_key(&store).unwrap().is_none());
     }
 
     #[test]
-    fn the_master_key_is_generated_once_and_then_reused() {
+    fn a_stored_key_round_trips_through_the_keychain() {
         let store = InMemoryKeyStore::new();
-        let (first, origin) = db_key(&store).unwrap();
-        assert_eq!(origin, Origin::Generated);
+        let key = generate_master_key().unwrap();
+        store_master_key(&store, &key).unwrap();
 
-        let (second, origin) = db_key(&store).unwrap();
-        assert_eq!(origin, Origin::Keychain);
-        assert_eq!(
-            first.pragma_literal(),
-            second.pragma_literal(),
+        let back = load_master_key(&store).unwrap().expect("key vanished");
+        assert!(
+            key.ct_eq(&back),
             "a second run must reuse the key, or every restart orphans the library"
+        );
+        assert_eq!(
+            db_key_of(&key).unwrap().pragma_literal(),
+            db_key_of(&back).unwrap().pragma_literal()
         );
     }
 
     #[test]
     fn generated_keys_are_not_all_the_same() {
-        let a = random_32();
-        let b = random_32();
-        assert_ne!(a, b, "the CSPRNG returned the same 32 bytes twice");
-        assert!(a.iter().any(|b| *b != 0), "key is all zeroes");
+        let a = generate_master_key().unwrap();
+        let b = generate_master_key().unwrap();
+        assert!(!a.ct_eq(&b), "the CSPRNG returned the same 32 bytes twice");
+        assert!(a.expose().iter().any(|b| *b != 0), "key is all zeroes");
     }
 
     #[test]

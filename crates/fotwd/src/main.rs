@@ -89,6 +89,11 @@ async fn main() -> ExitCode {
             detect(secs)
         }
         Some("key") => key_command(&args[1..]),
+        Some("recover") => {
+            let pos = positionals(&args[1..], &[]);
+            let root = pos.first().map_or_else(default_root, PathBuf::from);
+            recover_command(data_root_of(&root), args.iter().any(|a| a == "--check"))
+        }
         Some("summarize") => {
             let positional: Vec<&String> =
                 args[1..].iter().filter(|a| !a.starts_with("--")).collect();
@@ -115,7 +120,8 @@ async fn main() -> ExitCode {
                 "usage: fotwd <serve [dir] | record [seconds] [dir] [--i-have-consent] | \
                  list [dir] | summarize <id> [dir] [--template <slug>] | disclose | \
                  onboard | detect [seconds] | \
-                 key <set <provider>|list> | templates <list|install|show <slug>> | \
+                 key <set <provider>|list> | recover [dir] [--check] | \
+                 templates <list|install|show <slug>> | \
                  export <id> [dir] [--format md|txt|json] [--out <file>] | \
                  export-all <dest> [dir] [--audio] [--resume] [--yes-plaintext] | \
                  import <dest> [dir]>"
@@ -944,6 +950,93 @@ fn key_command(args: &[String]) -> ExitCode {
         }
         _ => {
             eprintln!("usage: fotwd key <set <provider> | list>");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `fotwd recover [dir] [--check]` — open a library with the Recovery Key.
+///
+/// The command for the day the keychain is gone. It reads the key from
+/// **stdin**, never from `argv`: an argument is readable by any same-user
+/// process through `ps`, and a Recovery Key typed onto a command line also
+/// lands in the shell history file — where it would outlive the emergency it
+/// was typed for. Same reasoning as `fotwd key set`.
+///
+/// `--check` verifies a written-down key and changes nothing: no keychain
+/// write, no rewrite of the sealed file. It is what a careful user runs a month
+/// later to find out whether the card in the drawer is still good, and it has
+/// to be safe to run at any time or nobody will run it.
+fn recover_command(data_root: PathBuf, check_only: bool) -> ExitCode {
+    use fotwd::recovery;
+
+    let store = if check_only {
+        None
+    } else {
+        match secrets::keystore() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("fotwd: no OS keychain available: {e}");
+                eprintln!("  The library can still be checked with --check.");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
+    println!("  library    : {}", data_root.join("db.sqlite3").display());
+    println!();
+    eprint!("  Recovery Key (fotw1-…): ");
+    use std::io::Write;
+    let _ = std::io::stderr().flush();
+    let mut typed = String::new();
+    if std::io::stdin().read_line(&mut typed).is_err() || typed.trim().is_empty() {
+        eprintln!("fotwd: no Recovery Key was entered");
+        return ExitCode::FAILURE;
+    }
+
+    if check_only {
+        return match recovery::check(&data_root, &typed) {
+            Ok(()) => {
+                println!();
+                println!("  ✓ that Recovery Key opens this library.");
+                println!("    Nothing was changed: the keychain and the recovery file are");
+                println!("    exactly as they were.");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!();
+                eprintln!("fotwd: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    let store = store.expect("checked above");
+    match recovery::recover(&data_root, &store, &typed) {
+        Ok(mut outcome) => {
+            let count = outcome
+                .db
+                .meetings()
+                .list(1, 0)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            println!();
+            println!("  ✓ the library is open.");
+            if count == 0 {
+                println!("    (it contains no meetings yet)");
+            }
+            if outcome.key_restored_to_keychain {
+                println!("    The master key has been put back in your keychain, so the next");
+                println!("    run is an ordinary one and will not ask for anything.");
+            }
+            println!();
+            println!("  Keep the Recovery Key. It is still the only backup, and this");
+            println!("  keychain can be lost again.");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!();
+            eprintln!("fotwd: {e}");
             ExitCode::FAILURE
         }
     }
