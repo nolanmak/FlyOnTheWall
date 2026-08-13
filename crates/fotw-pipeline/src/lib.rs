@@ -9,6 +9,7 @@
 #![warn(missing_docs)]
 
 pub mod opus;
+pub mod promote;
 pub mod resample;
 pub mod retention;
 pub mod ring;

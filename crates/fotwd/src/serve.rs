@@ -21,8 +21,19 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use fotw_web::{DaemonState, StoreSource, WebServer, write_state_file};
+
+use crate::retention::{self, Schedule, SweepMode, Tick};
+
+/// How often the sweeper thread wakes to ask whether it may run.
+///
+/// Much finer than the hourly cadence itself, because the *other* question it
+/// asks — "is a recording in flight" — changes on a human timescale. A sweep
+/// deferred by a meeting should start shortly after the meeting ends, not at
+/// the top of the next hour.
+const SWEEP_POLL: Duration = Duration::from_secs(60);
 
 /// Where the CLI looks for a running daemon.
 #[must_use]
@@ -64,6 +75,18 @@ pub async fn serve(root: PathBuf, launch: Launch) -> Result<(), String> {
     let hub = state.hub();
     let _flusher = hub.spawn_flusher();
 
+    // §9.5's sweeper, and issue #41's "on app start and hourly". Started
+    // before the URL is printed so a daemon that is killed a second later
+    // still finished whatever promotion the last run interrupted.
+    //
+    // Non-fatal on purpose: a sweeper that cannot start is a disk that fills
+    // slowly, which is a far smaller problem than a UI that will not open at
+    // all. It is said out loud rather than swallowed.
+    if let Err(e) = spawn_sweeper(&root) {
+        eprintln!("  ! retention is not running: {e}");
+        eprintln!("    Audio will accumulate. `fotwd retention` shows what is on disk.");
+    }
+
     let daemon = DaemonState {
         port: addr.port(),
         token: state.policy().secret().expose_hex(),
@@ -94,6 +117,77 @@ pub async fn serve(root: PathBuf, launch: Launch) -> Result<(), String> {
     println!();
     println!("  Ctrl-C to stop.");
     server.serve().await.map_err(|e| format!("server: {e}"))
+}
+
+/// Start the retention sweeper on its own thread.
+///
+/// # Why a thread and not a tokio task
+///
+/// Everything the sweeper does is blocking: SQLite queries, `stat`, `unlink`.
+/// On a runtime worker that would stall the UI's request handling for the
+/// length of a sweep. `spawn_blocking` would work too, but the sweeper is a
+/// long-lived loop rather than a unit of work, and parking a blocking-pool
+/// slot forever is a worse shape than one dedicated thread.
+///
+/// # Why a second connection
+///
+/// The UI's [`Db`](fotw_store::Db) is sealed inside `StoreSource`'s mutex with
+/// no accessor. SQLite in WAL mode serialises writers and `Db::open` sets
+/// `busy_timeout = 5000` (§9.1), so a second writer that touches a handful of
+/// rows once an hour is exactly the case that setting exists for.
+fn spawn_sweeper(root: &Path) -> Result<(), String> {
+    let sessions = root.to_path_buf();
+    let data_root = sessions.parent().unwrap_or(&sessions).to_path_buf();
+    let mut db = crate::open_library(root)?;
+
+    std::thread::Builder::new()
+        .name("fotw-sweeper".into())
+        .spawn(move || {
+            let mut schedule = Schedule::hourly();
+            loop {
+                let now = fotw_store::now_ms().max(0) as u64;
+                // The veto, checked every time and never overridden by how
+                // long it has been. Competing for disk I/O with a live capture
+                // is how buffers get dropped.
+                let recording = retention::recording_in_flight(&sessions, now);
+                if schedule.poll(now, recording) == Tick::Run {
+                    sweep_once(&mut db, &data_root);
+                }
+                std::thread::sleep(SWEEP_POLL);
+            }
+        })
+        .map_err(|e| format!("could not start the retention sweeper: {e}"))?;
+    Ok(())
+}
+
+/// One pass: finish interrupted promotions, then apply the retention policy.
+///
+/// Loud about everything irreversible and quiet about everything else. A sweep
+/// that deletes nothing — the overwhelmingly common case — prints nothing, so
+/// the lines that do appear are all deletions.
+fn sweep_once(db: &mut fotw_store::Db, data_root: &Path) {
+    for outcome in retention::resume_promotions(db, data_root) {
+        match outcome {
+            Ok(p) => println!("  archived   : {} ({} bytes)", p.rel_dir, p.bytes()),
+            Err(e) => eprintln!("  ! could not archive a pending session: {e}"),
+        }
+    }
+
+    let now = fotw_store::now_ms().max(0) as u64;
+    // `Apply`, because the policy the user configured is the consent. Every
+    // protection that makes that safe — `forever`, un-transcribed audio, the
+    // transcripts themselves — lives in `plan_sweep` and is tested there.
+    match retention::sweep(db, data_root, now, SweepMode::Apply) {
+        Ok(report) => {
+            if !report.plan.evictions.is_empty()
+                || !report.plan.warnings.is_empty()
+                || !report.errors.is_empty()
+            {
+                print!("{}", report.render());
+            }
+        }
+        Err(e) => eprintln!("  ! retention sweep failed: {e}"),
+    }
 }
 
 /// Print the launch URL instead of opening a browser.

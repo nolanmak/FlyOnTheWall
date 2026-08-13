@@ -42,6 +42,16 @@
 //! source before anything derived from it existed — the one irreversible
 //! mistake available here — so they are skipped too, with their own warning.
 //! See [`SweepWarning`].
+//!
+//! There is a second, sharper edge on the same rule, and it is not in §9.5
+//! either: **`state == ready` does not mean a transcript exists.** `fotwd`
+//! marks a session `ready` when it finishes regardless of whether a provider
+//! was configured, because recording without transcription is a supported
+//! mode. Keying the protection off `state` alone therefore left exactly the
+//! users who record without a provider exposed — every one of their meetings
+//! looked like a transcribed meeting whose audio was a redundant backup, and
+//! the first budget sweep would have deleted the lot. The protection keys off
+//! [`MeetingAudio::is_transcribed`] instead.
 
 use std::path::{Path, PathBuf};
 
@@ -227,13 +237,29 @@ impl MeetingAudio {
         Some(ready.saturating_add(days.saturating_mul(MS_PER_DAY)))
     }
 
+    /// Whether a transcript of this meeting actually exists.
+    ///
+    /// **Not the same question as `state == ready`, and the difference is a
+    /// data-loss bug.** `fotwd` marks a meeting `ready` when its session
+    /// finishes whether or not a provider was configured — recording without
+    /// transcription is a supported mode, and the meeting is genuinely
+    /// finished. So a `ready` meeting can have no transcript at all, and for
+    /// that meeting the audio is not a backup of anything: it is the entire
+    /// record.
+    ///
+    /// Every protection in this module keys off this rather than off `state`.
+    #[must_use]
+    pub const fn is_transcribed(&self) -> bool {
+        self.state.is_ready() && self.transcript_ready_at_ms.is_some()
+    }
+
     /// Whether budget eviction is allowed to consider this meeting.
     ///
     /// `forever` is excluded by §9.5. Un-transcribed audio is excluded because
     /// it is the only copy of the meeting — see the module note on deviations.
     #[must_use]
     pub const fn is_evictable(&self) -> bool {
-        !self.policy.is_forever() && self.state.is_ready() && self.audio_bytes > 0
+        !self.policy.is_forever() && self.is_transcribed() && self.audio_bytes > 0
     }
 }
 
@@ -465,7 +491,7 @@ pub fn plan_sweep(
         for m in survivors {
             if m.policy.is_forever() {
                 forever_bytes += m.audio_bytes;
-            } else if !m.state.is_ready() {
+            } else if !m.is_transcribed() {
                 untranscribed_bytes += m.audio_bytes;
             }
         }
@@ -533,7 +559,7 @@ pub fn usage(meetings: &[MeetingAudio]) -> DiskUsage {
         if m.policy.is_forever() {
             u.forever_bytes += m.audio_bytes;
         }
-        if !m.state.is_ready() {
+        if !m.is_transcribed() {
             u.untranscribed_bytes += m.audio_bytes;
         }
     }
