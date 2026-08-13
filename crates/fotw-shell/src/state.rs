@@ -166,6 +166,19 @@ pub enum ShellInput {
         /// What they chose.
         choice: PromptChoice,
     },
+
+    /// The user ticked or cleared the prompt's all-party acknowledgement
+    /// (CON-05).
+    ///
+    /// **This starts nothing.** It is the checkbox, not the button: all it
+    /// can do is make [`PromptView::start_enabled`] true, and a person still
+    /// has to press Start afterwards. Ignored when no prompt is on screen, so
+    /// a click that raced a withdrawal cannot leave a tick waiting to
+    /// pre-authorise the next meeting.
+    PromptAcknowledged {
+        /// Whether the box is now ticked.
+        acknowledged: bool,
+    },
 }
 
 /// Something the renderer or the host must do.
@@ -227,6 +240,15 @@ pub struct ShellCore {
     /// recording" into the same type as "we are recording", which is the
     /// distinction this whole feature exists to keep sharp.
     prompt: Option<DetectedMeeting>,
+    /// Whether the all-party acknowledgement on that prompt is ticked
+    /// (CON-05).
+    ///
+    /// Lives here rather than in the checkbox on screen so that clearing it is
+    /// a state transition with a test, not an `NSButton` somebody has to
+    /// remember to reset. Every path that changes which meeting is being asked
+    /// about clears it: an acknowledgement is about *this* call and the people
+    /// on it.
+    acknowledged: bool,
     /// Whether [`ShellEffect::StartCapture`] has been emitted without a
     /// matching [`ShellEffect::StopCapture`]. Not derivable from `phase`:
     /// when the capture layer reports its own completion we move out of
@@ -251,6 +273,7 @@ impl ShellCore {
             phase: Phase::Idle,
             level: Level::SILENT,
             prompt: None,
+            acknowledged: false,
             capture: false,
             ticking: false,
         }
@@ -306,15 +329,34 @@ impl ShellCore {
                 // during the flush that follows one, would either be
                 // meaningless or race the next session's start.
                 if self.phase.is_idle() {
+                    // A *different* meeting is a different consent question,
+                    // so the tick goes. An identical one is the same question
+                    // asked twice -- the detector holds rather than re-arming,
+                    // but a core that cleared the tick on every repeat would
+                    // let a chatty detector make the box impossible to keep
+                    // ticked, and Start impossible to reach.
+                    if self.prompt.as_ref() != Some(&meeting) {
+                        self.acknowledged = false;
+                    }
                     self.prompt = Some(meeting);
                 }
                 return Vec::new();
             }
             ShellInput::DetectionCleared => {
-                self.prompt = None;
+                self.withdraw_prompt();
                 return Vec::new();
             }
             ShellInput::PromptResponse { at, choice } => return self.answer_prompt(choice, at),
+            ShellInput::PromptAcknowledged { acknowledged } => {
+                // Only while something is being asked. A tick that arrives
+                // after the prompt came down would otherwise sit there and
+                // pre-acknowledge the next meeting, which is an
+                // acknowledgement nobody gave.
+                if self.prompt.is_some() {
+                    self.acknowledged = acknowledged;
+                }
+                return Vec::new();
+            }
             _ => {}
         }
 
@@ -341,23 +383,39 @@ impl ShellCore {
                 // CON-05: an all-party or contested jurisdiction requires an
                 // explicit acknowledgement. Leaving the prompt up rather than
                 // starting is the whole content of "blocking".
-                if meeting.requires_acknowledgement && !acknowledged {
+                //
+                // Either source counts: the checkbox this core is tracking, or
+                // a caller that asserts it directly (the web UI, which draws
+                // its own). Neither can be inferred -- a missing answer is a
+                // "no", which is why this is `||` over two explicit `true`s
+                // and not a default.
+                if meeting.requires_acknowledgement && !(acknowledged || self.acknowledged) {
                     return Vec::new();
                 }
-                self.prompt = None;
+                self.withdraw_prompt();
                 let origin = StartOrigin::DetectionPrompt;
                 let next = self.next_phase(ShellInput::Start { at, origin });
                 self.transition(next, Some(origin))
             }
             PromptChoice::NotNow => {
-                self.prompt = None;
+                self.withdraw_prompt();
                 vec![ShellEffect::SnoozeDetection]
             }
             PromptChoice::NeverForThisApp => {
-                self.prompt = None;
+                self.withdraw_prompt();
                 vec![ShellEffect::SuppressApp(meeting.app_key)]
             }
         }
+    }
+
+    /// Take the prompt down, and the acknowledgement with it.
+    ///
+    /// One function rather than two assignments at six call sites: the pair
+    /// must move together, and the failure mode of forgetting the second one
+    /// is a tick that silently authorises the *next* meeting.
+    fn withdraw_prompt(&mut self) {
+        self.prompt = None;
+        self.acknowledged = false;
     }
 
     /// Translate a menu click.
@@ -485,7 +543,7 @@ impl ShellCore {
         // A prompt is a question about starting a recording. Once anything
         // else is happening it is stale, so it comes down.
         if !self.phase.is_idle() {
-            self.prompt = None;
+            self.withdraw_prompt();
         }
 
         // Capture edges.
@@ -567,12 +625,19 @@ impl ShellCore {
             evidence: meeting.evidence.clone(),
             consent_notice: meeting.consent_notice.clone(),
             requires_acknowledgement: meeting.requires_acknowledgement,
+            acknowledged: self.acknowledged,
+            // The one rule the renderer must not restate. A panel that
+            // computed this itself could disagree with `answer_prompt` above,
+            // and the disagreement is invisible: a Start button that looks
+            // live and does nothing, or one that looks live and records.
+            start_enabled: !meeting.requires_acknowledgement || self.acknowledged,
             // "Start recording" rather than "Yes": the button says what it
             // does, because this is the click that begins recording other
             // people.
             start_label: "Start recording",
             not_now_label: "Not now",
             never_label: "Never for this app",
+            acknowledge_label: "Everyone on this call has agreed to be recorded",
         })
     }
 

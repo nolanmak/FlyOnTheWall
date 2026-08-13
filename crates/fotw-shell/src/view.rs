@@ -309,12 +309,50 @@ pub struct PromptView {
     pub consent_notice: String,
     /// Whether Start requires the explicit all-party acknowledgement.
     pub requires_acknowledgement: bool,
+    /// Whether the user has ticked that acknowledgement.
+    ///
+    /// Held by [`ShellCore`](crate::ShellCore) rather than by the checkbox on
+    /// screen, for the same reason every other decision is: a tick that lives
+    /// only in an `NSButton` cannot be tested, and cannot be *reset* by
+    /// anything the state machine does. A stale tick carried into the next
+    /// meeting is an acknowledgement the user never gave.
+    pub acknowledged: bool,
+    /// Whether the Start button accepts a click.
+    ///
+    /// False exactly while a blocking jurisdiction warning is unacknowledged.
+    /// The renderer draws its Start button from this and nothing else;
+    /// `tests/prompt_surface.rs` pins it to what the state machine will
+    /// actually do, so the two cannot drift apart.
+    pub start_enabled: bool,
     /// Label for the affirmative button.
     pub start_label: &'static str,
     /// Label for the dismiss-for-now button.
     pub not_now_label: &'static str,
     /// Label for the per-app suppression button.
     pub never_label: &'static str,
+    /// Label for the all-party acknowledgement checkbox (CON-05).
+    ///
+    /// Phrased as a statement of fact the user is asserting, not as
+    /// permission being granted to the app: they are the one who knows
+    /// whether the room agreed.
+    pub acknowledge_label: &'static str,
+}
+
+impl PromptView {
+    /// The whole prompt as one string, for VoiceOver.
+    ///
+    /// Includes the jurisdiction warning. A user who cannot see the panel
+    /// still has to hear why this recording might be a criminal matter where
+    /// they live (CON-05).
+    #[must_use]
+    pub fn accessibility_label(&self) -> String {
+        let mut out = format!("{} {}", self.headline, self.evidence);
+        if !self.consent_notice.is_empty() {
+            out.push(' ');
+            out.push_str(&self.consent_notice);
+        }
+        out
+    }
 }
 
 /// Everything on screen, for one moment.

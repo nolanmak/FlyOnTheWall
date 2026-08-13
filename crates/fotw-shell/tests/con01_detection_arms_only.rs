@@ -47,7 +47,11 @@ fn every_input(now: Monotonic) -> Vec<ShellInput> {
             | ShellInput::Dismiss
             | ShellInput::MeetingDetected { .. }
             | ShellInput::DetectionCleared
-            | ShellInput::PromptResponse { .. } => {}
+            | ShellInput::PromptResponse { .. }
+            // The checkbox. It can make Start reachable; it can never be
+            // Start, which is why it is on this list and not on the one in
+            // `is_a_human_pressing_record`.
+            | ShellInput::PromptAcknowledged { .. } => {}
         }
     }
 
@@ -82,6 +86,10 @@ fn every_input(now: Monotonic) -> Vec<ShellInput> {
         ShellInput::PromptResponse {
             at: now,
             choice: PromptChoice::NeverForThisApp,
+        },
+        ShellInput::PromptAcknowledged { acknowledged: true },
+        ShellInput::PromptAcknowledged {
+            acknowledged: false,
         },
     ];
     for input in &all {
@@ -396,7 +404,7 @@ fn every_start_is_immediately_preceded_by_an_audit_record() {
 // --- the sweep -----------------------------------------------------------
 
 fn random_input(rng: &mut Rng, now: Monotonic) -> ShellInput {
-    match rng.below(16) {
+    match rng.below(18) {
         0 => ShellInput::Start {
             at: now,
             origin: StartOrigin::Menu,
@@ -428,9 +436,16 @@ fn random_input(rng: &mut Rng, now: Monotonic) -> ShellInput {
             at: now,
             choice: PromptChoice::NotNow,
         },
-        _ => ShellInput::PromptResponse {
+        15 => ShellInput::PromptResponse {
             at: now,
             choice: PromptChoice::NeverForThisApp,
+        },
+        // The checkbox, ticked and un-ticked at random. Swept because the
+        // interesting bug is not "the tick does nothing", it is "the tick
+        // survives the prompt it was given for".
+        16 => ShellInput::PromptAcknowledged { acknowledged: true },
+        _ => ShellInput::PromptAcknowledged {
+            acknowledged: false,
         },
     }
 }
@@ -474,7 +489,10 @@ fn capture_never_begins_without_a_human_over_two_hundred_thousand_random_inputs(
                     _ => unreachable!(),
                 }
 
-                // A blocking consent warning is never started past.
+                // A blocking consent warning is never started past. The
+                // acknowledgement may come from the click itself or from the
+                // checkbox that was already ticked on the prompt as drawn --
+                // and nowhere else.
                 if let ShellInput::PromptResponse {
                     choice: PromptChoice::Start { acknowledged },
                     ..
@@ -484,8 +502,15 @@ fn capture_never_begins_without_a_human_over_two_hundred_thousand_random_inputs(
                         .as_ref()
                         .unwrap_or_else(|| panic!("{where_}: started from no prompt"));
                     assert!(
-                        *acknowledged || !prompt.requires_acknowledgement,
+                        *acknowledged || prompt.acknowledged || !prompt.requires_acknowledgement,
                         "{where_}: clicked past a blocking jurisdiction warning"
+                    );
+                    // And whatever the answer was, the panel agreed it was
+                    // clickable -- unless the caller asserted the
+                    // acknowledgement itself, which is the web UI's path.
+                    assert!(
+                        prompt.start_enabled || *acknowledged,
+                        "{where_}: a Start drawn as disabled started a recording"
                     );
                 }
             }

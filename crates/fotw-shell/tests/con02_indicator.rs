@@ -39,7 +39,8 @@ fn every_input(now: Monotonic) -> Vec<ShellInput> {
             | ShellInput::Dismiss
             | ShellInput::MeetingDetected { .. }
             | ShellInput::DetectionCleared
-            | ShellInput::PromptResponse { .. } => {}
+            | ShellInput::PromptResponse { .. }
+            | ShellInput::PromptAcknowledged { .. } => {}
         }
     }
 
@@ -73,6 +74,7 @@ fn every_input(now: Monotonic) -> Vec<ShellInput> {
             at: now,
             choice: PromptChoice::NeverForThisApp,
         },
+        ShellInput::PromptAcknowledged { acknowledged: true },
     ];
     for input in &all {
         assert_exhaustive(input);
@@ -274,6 +276,9 @@ fn random_input(rng: &mut Rng, now: Monotonic) -> ShellInput {
             meeting: DetectedMeeting::new("us.zoom.xos", "Zoom", "Zoom is holding the microphone"),
         },
         14 => ShellInput::DetectionCleared,
+        15 => ShellInput::PromptAcknowledged {
+            acknowledged: rng.below(2) == 0,
+        },
         _ => ShellInput::PromptResponse {
             at: now,
             choice: PromptChoice::Start { acknowledged: true },

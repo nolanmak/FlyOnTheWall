@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 
 use crate::clock::Monotonic;
 use crate::hotkey::{Chord, HotkeyMap};
-use crate::prompt::{DetectedMeeting, PromptChoice, StartOrigin};
+use crate::prompt::{DetectedMeeting, DetectionUpdate, PromptChoice, StartOrigin};
 use crate::state::{ShellCore, ShellEffect, ShellInput};
 use crate::view::{Level, MenuAction, ShellView};
 
@@ -82,6 +82,21 @@ pub trait ShellHost {
 
     /// The user said "never for this app": persist that suppression.
     fn suppress_app(&mut self, _app_key: &str) {}
+
+    /// Anything the host's meeting detector has to say, polled once per tick.
+    ///
+    /// The default is `None`: a host with no detector never arms anything,
+    /// which is the correct behaviour and not a degraded one.
+    ///
+    /// **This is the only way a detection reaches the screen.** It is
+    /// deliberately a poll rather than a channel of arbitrary
+    /// [`ShellInput`]s: the host may say "a meeting appears to be happening"
+    /// and "it stopped", and nothing else. A host that could push a
+    /// [`ShellInput::Start`] would be a host that could record without a
+    /// person, which is the whole of CON-01.
+    fn poll_detection(&mut self) -> Option<DetectionUpdate> {
+        None
+    }
 }
 
 /// A [`ShellCore`] wired to a [`ShellHost`].
@@ -138,7 +153,16 @@ impl<H: ShellHost> ShellRuntime<H> {
 
     /// Advance the clock. Samples the host's level first so the meter and the
     /// elapsed label describe the same instant.
+    ///
+    /// Also drains the host's detector, which is what puts a prompt on screen
+    /// in a running shell (CON-01, issue #52).
     pub fn tick(&mut self, now: Monotonic) {
+        match self.host.poll_detection() {
+            Some(DetectionUpdate::Armed(meeting)) => self.meeting_detected(now, meeting),
+            Some(DetectionUpdate::Cleared) => self.detection_cleared(),
+            None => {}
+        }
+
         if self.core.phase().is_recording() {
             let level = self.host.level();
             let effects = self.core.handle(ShellInput::Level(level));
@@ -178,6 +202,18 @@ impl<H: ShellHost> ShellRuntime<H> {
     /// The detector's signals went away before the user answered.
     pub fn detection_cleared(&mut self) {
         let effects = self.core.handle(ShellInput::DetectionCleared);
+        self.dispatch(effects);
+    }
+
+    /// The user ticked or cleared the prompt's all-party acknowledgement.
+    ///
+    /// Produces no effects and reaches no host method: it is a checkbox. The
+    /// only observable consequence is
+    /// [`PromptView::start_enabled`](crate::PromptView::start_enabled).
+    pub fn acknowledge_prompt(&mut self, acknowledged: bool) {
+        let effects = self
+            .core
+            .handle(ShellInput::PromptAcknowledged { acknowledged });
         self.dispatch(effects);
     }
 

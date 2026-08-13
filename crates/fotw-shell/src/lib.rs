@@ -39,6 +39,12 @@
 //! ([`StartOrigin`] has no automatic variant), and
 //! `tests/con01_detection_arms_only.rs` is the executable form of both.
 //!
+//! That prompt is drawn by `platform::macos::prompt` and reaches the screen
+//! through [`ShellHost::poll_detection`] — the only channel a detector has
+//! into a running shell, and one that can say "a meeting seems to be
+//! happening" and nothing else. `cargo run -p fotw-shell --example
+//! prompt_preview` puts it on screen without a meeting.
+//!
 //! ```
 //! use fotw_shell::{
 //!     DetectedMeeting, Monotonic, PromptChoice, ShellCore, ShellEffect, ShellInput, StartOrigin,
@@ -101,7 +107,7 @@ pub use crate::clock::{Monotonic, format_elapsed};
 pub use crate::error::ShellError;
 pub use crate::hotkey::{Chord, HotkeyAction, HotkeyError, HotkeyMap, Key, MediaKey, Modifiers};
 pub use crate::platform::run;
-pub use crate::prompt::{DetectedMeeting, PromptChoice, StartOrigin};
+pub use crate::prompt::{DetectedMeeting, DetectionUpdate, PromptChoice, StartOrigin};
 pub use crate::runtime::{ShellHost, ShellRuntime};
 pub use crate::state::{
     FINISHED_LINGER, METER_SEGMENTS, Phase, ShellCore, ShellEffect, ShellInput,

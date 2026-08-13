@@ -4,9 +4,10 @@
 //! matching `fotw_audio::testing`.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::rc::Rc;
 
-use crate::prompt::StartOrigin;
+use crate::prompt::{DetectionUpdate, StartOrigin};
 use crate::runtime::ShellHost;
 use crate::view::Level;
 
@@ -49,6 +50,7 @@ pub struct FakeHost {
     calls: Rc<RefCell<Vec<HostCall>>>,
     level: Rc<RefCell<Level>>,
     fail_start_with: Rc<RefCell<Option<String>>>,
+    detections: Rc<RefCell<VecDeque<DetectionUpdate>>>,
 }
 
 impl FakeHost {
@@ -94,6 +96,15 @@ impl FakeHost {
     /// Set the level the host reports on the next tick.
     pub fn set_level(&self, level: Level) {
         *self.level.borrow_mut() = level;
+    }
+
+    /// Queue something for the detector to report on the next tick.
+    ///
+    /// Deliberately **not** recorded in the call log: the pump polls this
+    /// twenty times a second, and a log full of "nothing happened" would make
+    /// every other assertion in `tests/runtime.rs` unreadable.
+    pub fn report_detection(&self, update: DetectionUpdate) {
+        self.detections.borrow_mut().push_back(update);
     }
 
     fn push(&self, call: HostCall) {
@@ -153,6 +164,10 @@ impl ShellHost for FakeHost {
 
     fn open_about(&mut self) {
         self.push(HostCall::OpenAbout);
+    }
+
+    fn poll_detection(&mut self) -> Option<DetectionUpdate> {
+        self.detections.borrow_mut().pop_front()
     }
 }
 
