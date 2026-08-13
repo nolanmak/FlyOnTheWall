@@ -106,6 +106,11 @@ async fn main() -> ExitCode {
             let root = args.get(1).map_or_else(default_root, PathBuf::from);
             list(root)
         }
+        Some("retention") => {
+            let pos = positionals(&args[1..], &["--days", "--budget-gib"]);
+            let root = pos.first().map_or_else(default_root, PathBuf::from);
+            retention_command(root, &args[1..])
+        }
         Some("templates") => templates_command(&args[1..]),
         Some("export") => export_command(&args[1..]),
         Some("export-all") => export_all_command(&args[1..]),
@@ -115,6 +120,7 @@ async fn main() -> ExitCode {
                 "usage: fotwd <serve [dir] | record [seconds] [dir] [--i-have-consent] | \
                  list [dir] | summarize <id> [dir] [--template <slug>] | disclose | \
                  onboard | detect [seconds] | \
+                 retention [dir] [--apply] [--days <n>] [--budget-gib <n>] | \
                  key <set <provider>|list> | templates <list|install|show <slug>> | \
                  export <id> [dir] [--format md|txt|json] [--out <file>] | \
                  export-all <dest> [dir] [--audio] [--resume] [--yes-plaintext] | \
@@ -591,16 +597,56 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
             // Persist AFTER the WAL is finalized, never instead of it. The
             // database is an index over the session directory: if this fails
             // the meeting is still on disk and can be imported again.
-            match open_db(&root).and_then(|mut db| {
-                persist::persist_session(&mut db, &outcome, &default_title())
-                    .map_err(|e| format!("{e}"))
-            }) {
-                Ok(id) => println!("  meeting    : {id}"),
-                Err(e) => eprintln!("  ! could not add to the library: {e}"),
+            //
+            // Then promote: §9.2 gives the session directory a *scratch*
+            // lifetime and `media/<yyyy>/<mm>/<id>/` a durable one. Skipping
+            // that step is what left every recording sitting in `sessions/`
+            // forever with the retention engine unable to see any of it.
+            let data_root = data_root_of(&root);
+            let mut archived = None;
+            match open_db(&root) {
+                Err(e) => eprintln!("  ! could not open the library: {e}"),
+                Ok(mut db) => match persist::persist_session(&mut db, &outcome, &default_title()) {
+                    Err(e) => eprintln!("  ! could not add to the library: {e}"),
+                    Ok(id) => {
+                        println!("  meeting    : {id}");
+                        match fotwd::retention::promote_session(
+                            &mut db,
+                            &data_root,
+                            &outcome.dir,
+                            &id,
+                            outcome.started_at_ms,
+                        ) {
+                            Ok(p) => {
+                                println!(
+                                    "  archived   : {} ({:.1} MiB Opus)",
+                                    p.rel_dir,
+                                    p.bytes() as f64 / 1_048_576.0
+                                );
+                                archived = Some(p.rel_dir);
+                            }
+                            // Never fatal, and never silent. The session
+                            // directory survives every promotion failure, so
+                            // the meeting is intact and the next daemon start
+                            // finishes the job.
+                            Err(e) => {
+                                eprintln!("  ! could not archive the audio: {e}");
+                                eprintln!(
+                                    "    The recording is still at {} and will be",
+                                    outcome.dir.display()
+                                );
+                                eprintln!("    archived the next time the daemon starts.");
+                            }
+                        }
+                    }
+                },
             }
 
             println!();
-            println!("  ✓ {}", outcome.dir.display());
+            match &archived {
+                Some(rel) => println!("  ✓ {}", data_root.join(rel).display()),
+                None => println!("  ✓ {}", outcome.dir.display()),
+            }
 
             if !outcome.captured_audio() {
                 println!();
@@ -834,6 +880,103 @@ fn textwrap(s: &str, width: usize) -> Vec<String> {
         out.push("(no speech detected)".into());
     }
     out
+}
+
+/// `fotwd retention [dir] [--apply] [--days <n>] [--budget-gib <n>]`.
+///
+/// **Dry run unless `--apply` is passed**, and that default is not a
+/// convenience. Deleting a user's meeting audio is the one irreversible thing
+/// this program does, so the answer to "what is about to happen" has to be
+/// obtainable without it happening. The background sweeper carries out the
+/// policy the user configured; this command is how they see what that policy
+/// means before trusting it.
+fn retention_command(root: PathBuf, args: &[String]) -> ExitCode {
+    use fotwd::retention::{self, SweepMode};
+
+    let data_root = data_root_of(&root);
+    let mut db = match open_db(&root) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("fotwd: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Settings changes land before the plan is computed, so `--budget-gib 5
+    // --apply` shows and carries out the *new* budget rather than the old one.
+    let mut settings = retention::settings(&db);
+    let mut changed = false;
+    if let Some(v) = flag_value(args, "--days") {
+        match v.parse::<u32>() {
+            Ok(d) => {
+                settings.default_days = d;
+                changed = true;
+            }
+            Err(_) => {
+                eprintln!("fotwd: --days takes a whole number of days");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    if let Some(v) = flag_value(args, "--budget-gib") {
+        match v.parse::<f64>() {
+            Ok(g) if g >= 0.0 => {
+                settings.budget_bytes = (g * 1_073_741_824.0) as u64;
+                changed = true;
+            }
+            _ => {
+                eprintln!("fotwd: --budget-gib takes a non-negative number");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    if changed && let Err(e) = retention::set_settings(&mut db, &settings) {
+        eprintln!("fotwd: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    // Finish any promotion an earlier run left half-done first, or the
+    // accounting below is missing whatever is still sitting in `sessions/`.
+    for outcome in retention::resume_promotions(&mut db, &data_root) {
+        match outcome {
+            Ok(p) => println!(
+                "  archived   : {} (deferred from an earlier run)",
+                p.rel_dir
+            ),
+            Err(e) => eprintln!("  ! could not archive a pending session: {e}"),
+        }
+    }
+
+    let apply = args.iter().any(|a| a == "--apply");
+    let now = fotw_store::now_ms().max(0) as u64;
+    if apply && retention::recording_in_flight(&root, now) {
+        // Same rule the background sweeper follows, for the same reason:
+        // competing for disk I/O with a live capture is how buffers get
+        // dropped.
+        eprintln!("fotwd: a recording is in progress — refusing to sweep.");
+        eprintln!("  Retention can always wait; the meeting cannot.");
+        return ExitCode::FAILURE;
+    }
+
+    let mode = if apply {
+        SweepMode::Apply
+    } else {
+        SweepMode::DryRun
+    };
+    match retention::sweep(&mut db, &data_root, now, mode) {
+        Ok(report) => {
+            print!("{}", report.render());
+            if report.errors.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(e) => {
+            eprintln!("fotwd: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Open the library beside the sessions, keyed from the OS keychain.

@@ -104,6 +104,78 @@ fn audio_with_no_transcript_is_never_deleted_by_an_age_rule() {
     );
 }
 
+/// The single irreversible mistake the sweeper can make, and the one §9.5 as
+/// written would have made.
+///
+/// §9.5 exempts only `forever` from budget eviction. It says nothing about a
+/// meeting whose transcript does not exist, and there is a shape — produced by
+/// the shipping code, not by a contrived fixture — where that omission
+/// destroys the only copy of a meeting: `fotwd` marks a session `ready` when
+/// it finishes **whether or not a provider was configured**, because recording
+/// without transcription is a supported mode (see `persist_session`). So
+/// `state = ready` does not mean "there is a transcript".
+///
+/// Age rules were already safe, because they key off `transcript_ready_at_ms`
+/// and that is `None` here. Budget eviction was not: it keyed off `state`
+/// alone, so the first time a user with transcription switched off crossed
+/// their 20 GiB budget, the sweeper would have deleted meetings that had never
+/// been transcribed — audio that is not a backup of anything, with no text
+/// left behind to say what was lost.
+#[test]
+fn eviction_never_deletes_audio_for_a_meeting_with_no_transcript() {
+    let settings = RetentionSettings {
+        default_days: 30,
+        budget_bytes: GIB,
+    };
+
+    // Recorded with no provider configured: finished, marked ready, no
+    // transcript row, no segments, and ten times over budget.
+    let mut untranscribed = meeting("no-transcript", 90);
+    untranscribed.state = TranscriptState::Ready;
+    untranscribed.transcript_ready_at_ms = None;
+    untranscribed.transcript_bytes = 0;
+    untranscribed.audio_bytes = 10 * GIB;
+
+    let plan = plan_sweep(NOW, &[untranscribed.clone()], &settings);
+
+    assert!(
+        plan.evictions.is_empty(),
+        "the sweeper deleted the only copy of an untranscribed meeting: {:?}",
+        evicted(&plan)
+    );
+    assert!(!plan.within_budget(), "it should still report being over");
+    assert!(
+        plan.warnings
+            .contains(&SweepWarning::OnlyUntranscribedRemains {
+                over_by_bytes: 9 * GIB,
+                untranscribed_bytes: 10 * GIB,
+            }),
+        "over budget and unable to act, it must say so rather than pass \
+         silently; warnings were {:?}",
+        plan.warnings
+    );
+
+    // And it is not simply that nothing was evictable: a sibling that *does*
+    // have a transcript goes, so the protection is specific rather than the
+    // sweeper being inert.
+    let transcribed = meeting("has-transcript", 91);
+    let plan = plan_sweep(NOW, &[untranscribed, transcribed], &settings);
+    assert_eq!(evicted(&plan), ["has-transcript"]);
+}
+
+/// The accounting has to agree with the protection, or the settings screen
+/// tells the user 10 GB is reclaimable when none of it is.
+#[test]
+fn a_ready_meeting_with_no_transcript_counts_as_untranscribed_in_the_usage_split() {
+    let mut m = meeting("ready-but-empty", 1);
+    m.state = TranscriptState::Ready;
+    m.transcript_ready_at_ms = None;
+    m.audio_bytes = 4 * GIB;
+
+    let u = usage(&[m]);
+    assert_eq!(u.untranscribed_bytes, 4 * GIB);
+}
+
 #[test]
 fn the_four_per_meeting_overrides_each_do_what_they_say() {
     let s = RetentionSettings::default();

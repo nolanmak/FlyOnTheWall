@@ -126,6 +126,22 @@ pub struct Manifest {
     /// `.pcm` files may be gone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoded: Option<EncodedSession>,
+    /// Which meeting this session became, and where its audio is going
+    /// (§9.2). Written by [`crate::promote::claim`] once the meeting row
+    /// exists.
+    ///
+    /// Its presence is what makes promotion resumable without a database: a
+    /// session directory found after a crash still knows its own destination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<crate::promote::Claim>,
+    /// The tracks already published into `media/`, and their exact sizes.
+    ///
+    /// The commit point of [`crate::promote`]. Its presence means the media
+    /// tree *should* hold this meeting; the sizes are what
+    /// [`crate::promote::retire`] re-checks before it removes the only other
+    /// copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted: Option<crate::promote::Promotion>,
 }
 
 /// One transcoded leg of a session.
@@ -240,14 +256,16 @@ impl SessionWal {
             started_at_ms: now_ms(),
             host_epoch_ns: 0,
             app_version: env!("CARGO_PKG_VERSION").to_string(),
-            // 2 adds `encoded`. The field is `#[serde(default)]`, so a
-            // schema-1 manifest still reads; the bump exists to make the
-            // absence of the field distinguishable from a writer that did not
-            // know about it.
-            schema: 2,
+            // 2 adds `encoded`; 3 adds `claim` and `promoted`. Every one of
+            // those fields is `#[serde(default)]`, so an older manifest still
+            // reads; the bump exists to make the absence of a field
+            // distinguishable from a writer that did not know about it.
+            schema: 3,
             ended_at_ms: None,
             gaps: Vec::new(),
             encoded: None,
+            claim: None,
+            promoted: None,
         };
 
         let wal = Self {
@@ -492,13 +510,22 @@ pub fn discard_pcm(dir: impl AsRef<Path>) -> std::io::Result<u64> {
     Ok(freed)
 }
 
-fn read_manifest(dir: &Path) -> std::io::Result<Manifest> {
+/// Read a session's manifest.
+///
+/// `pub(crate)` rather than private because [`crate::promote`] is the other
+/// half of this file's life cycle and has to read and rewrite the same
+/// document; duplicating the reader there would be two definitions of what a
+/// session directory is.
+pub(crate) fn read_manifest(dir: &Path) -> std::io::Result<Manifest> {
     let mut s = String::new();
     File::open(dir.join("manifest.json"))?.read_to_string(&mut s)?;
     serde_json::from_str(&s).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
-fn write_manifest_at(dir: &Path, manifest: &Manifest) -> std::io::Result<()> {
+/// Replace a session's manifest atomically: write a sibling, `fsync` it, then
+/// `rename` it into place, so a crash can never leave a half-written manifest
+/// — the one file that says what everything else in the directory means.
+pub(crate) fn write_manifest_at(dir: &Path, manifest: &Manifest) -> std::io::Result<()> {
     let tmp = dir.join("manifest.json.tmp");
     let json = serde_json::to_vec_pretty(manifest)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;

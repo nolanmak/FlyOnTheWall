@@ -11,6 +11,7 @@ pub mod consent;
 pub mod detect;
 pub mod onboard;
 pub mod persist;
+pub mod retention;
 pub mod secrets;
 pub mod serve;
 pub mod session;

@@ -40,6 +40,7 @@ mod error;
 pub mod export;
 mod ids;
 mod key;
+mod media;
 mod migrations;
 mod models;
 mod repo;
@@ -55,6 +56,7 @@ pub use crate::error::{Result, StoreError};
 pub use crate::export::{Blob, Clipboard, MEETING_SCHEMA, MeetingDoc};
 pub use crate::ids::{new_id, now_ms};
 pub use crate::key::DbKey;
+pub use crate::media::{AudioFile, AudioRow, NewRecording};
 pub use crate::migrations::LATEST_SCHEMA_VERSION;
 pub use crate::models::{
     Meeting, NewMeeting, NewSegment, NewSummary, NoteAnchor, StoredSegment, Summary,
