@@ -36,8 +36,33 @@ panel_can_become_main     false (must be false)
 panel_level               25 (25 = NSStatusWindowLevel)
 panel_sharing_type        0 (0 = NSWindowSharingNone)
 panel_collection_behavior 0x0151
+
+prompt_style_mask         0x8080
+prompt_is_nonactivating   true   <-- the prompt fires mid-call
+prompt_can_become_key     true (must be true)
+prompt_can_become_main    false (must be false)
+prompt_level              25 (25 = NSStatusWindowLevel)
+prompt_sharing_type       0 (0 = NSWindowSharingNone)
+prompt_collection_behav.  0x0151
+prompt_start_disabled     true (CON-05: all-party, box unticked)
+prompt_start_after_tick   true (and reachable once ticked)
+prompt_content_fits       true (the warning is not clipped)
+prompt_is_on_a_screen     true (ordered front onto a real display)
+prompt_blocked_click      true (a real click on the disabled Start does nothing)
+prompt_checkbox_click     true (target/action reaches the panel)
+prompt_start_click        true (and carries the acknowledgement)
+prompt_dismissal_clicks   true (Not now / Never dispatch as themselves)
+
 healthy: true
 ```
+
+The `prompt_*_click` lines are `performClick:` through AppKit's real
+target/action dispatch, against a **blocking** California prompt — the case a
+fresh install draws, since `DetectorConfig::home_jurisdiction` defaults to
+`US-CA`. They are the only check anywhere that the CON-05 gate is applied by
+the thing the user's finger lands on: a mistyped selector, or a renderer that
+receives `start_enabled` and forgets to apply it, is invisible to every test
+in this repository and shows up here as `false`.
 
 It cannot be a `cargo test`: `libtest` runs every test on a spawned thread and
 all three surfaces are main-thread-only. (That guard *is* tested — see
@@ -67,6 +92,19 @@ only a real desktop proves they have the effect they are configured for.
 | 1.4 | ⌘-Tab through applications while recording. | FlyOnTheWall does not appear in the switcher. | |
 
 ## 2. CON-02 — the indicator is present and legible **(release blockers)**
+
+**macOS shows one of its own too** — measured, not assumed (issue #4, macOS
+26.3, 2026-08-13). With a Core Audio process tap running and **no microphone
+open**, a **purple dot** (`#6361e9`) appears at the right-hand end of the menu
+bar; it is gone the moment the tap stops. Open the microphone as well and the
+dot is **orange** (`#f2a33c`) instead — the microphone indicator supersedes it.
+Both appear over a full-screen space with the menu bar auto-hidden.
+
+That does **not** make our pill redundant. The system dot says *something on
+this Mac is capturing*; it does not name the application, show elapsed time,
+offer a Stop button, or survive a screenshot into a meeting where someone asks
+what it is. It does mean no copy anywhere may describe the capture as
+invisible or unnoticeable.
 
 | # | Step | Expected | Result |
 |---|---|---|---|
@@ -141,26 +179,65 @@ misses.
 | 6.3 | Start via a `launchd` job at login. | Comes up as an accessory; the menu-bar item appears. | |
 | 6.4 | With the app running, ⌘-Tab. | FlyOnTheWall is absent from the switcher. | |
 
-## 6b. The meeting-detection prompt (CON-01) — **not yet drawn**
+### What the launch path does to TCC (issue #51, measured 2026-08-13, macOS 26.3)
 
-`ShellCore` produces a `PromptView` whenever detection arms, and the state
-machine around it is fully covered (`tests/con01_detection_arms_only.rs`). The
-AppKit renderer in `src/platform/macos/mod.rs` **does not draw it yet**: it
-applies `view.tray` and `view.pill` and ignores `view.prompt`. So on a real Mac
-today the prompt exists as data and is observable only through
-`fotwd detect`, which prints it.
+`responsibility_get_pid_responsible_for_pid`, against the dev-signed bundle:
 
-This is stated here rather than left implied because the gap is invisible from
-the test suite — every test passes, and no user ever sees a prompt.
+- **`open -a FlyOnTheWall.app`** (what `just run` does): the responsible process
+  is **the app itself**, and `tccd`'s `AUTHREQ_ATTRIBUTION` line carries no
+  `responsible=` entry at all — only `accessing={com.flyonthewall.fotw}`.
+- **`Contents/MacOS/fotwd` from a shell**: responsible is
+  **`/Applications/Ghostty.app`**, and the attribution reads
+  `responsible={com.mitchellh.ghostty}, accessing={com.flyonthewall.fotw}`.
+
+So the trap is real and visible. What it did **not** do here is break capture:
+the grant row is keyed to `com.flyonthewall.fotw` (`kTCCServiceAudioCapture`,
+`auth_reason` 2 = user consent), and with that row present **both** launch
+paths captured non-silent audio — `tccd` checks "access for accessor
+com.flyonthewall.fotw" in both. That is with a *properly identified* binary
+inside a bundle; an ad-hoc or unbundled binary has no stable identity to key a
+row to, which is the case the `fotwd onboard` copy warns about. Still launch
+through LaunchServices: the responsible process is what decides who gets
+prompted, and that is the one thing this could not be tested for twice.
+
+## 6b. The meeting-detection prompt (CON-01)
+
+`src/platform/macos/prompt.rs` draws it, and `MacShell::render` applies
+`view.prompt` (issue #52). Look at it without a meeting:
+
+```sh
+cargo run -p fotw-shell --example prompt_preview
+```
+
+That runs the real shell against a fake detector that arms three seconds after
+launch, with the blocking California notice a fresh install actually produces.
+It is the only way to review this panel without a conferencing app, a TCC grant
+and twenty seconds of dwell — which is how it came to not exist at all while
+the whole suite stayed green.
+
+**A screenshot will not show it.** `sharingType: NSWindowSharingNone` works:
+measured on macOS 26.3, `screencapture` of the region the panel occupies
+returns the desktop behind it. To photograph the panel for a bug report, flip
+`PROMPT_SHARING` to `ReadOnly` locally — and put it back.
 
 | # | Step | Expected | Result |
 |---|---|---|---|
-| 6b.1 | Implement the panel, then join a Zoom call. | The prompt appears once, naming Zoom and the evidence, with Start / Not now / Never for this app. | |
+| 6b.0 | Run `prompt_preview`. | The panel appears top right: headline, evidence, the jurisdiction warning in orange, an unticked checkbox, and Start **greyed out**. | |
+| 6b.1 | Join a Zoom call. | The prompt appears once, naming Zoom and the evidence, with Start / Not now / Never for this app. | |
 | 6b.2 | Leave Zoom running and idle for an hour. | **No prompt at any point.** This is the one that decides whether the consent surface keeps its meaning. | |
 | 6b.3 | Dismiss with "Not now", stay in the call. | No second prompt for ten minutes. | |
 | 6b.4 | "Never for this app", then join another call in the same app. | No prompt, ever, until the suppression is cleared in settings. | |
-| 6b.5 | With the home jurisdiction set to an all-party state, press Start without ticking the acknowledgement. | Nothing starts, and the prompt stays up. The state machine enforces this; confirm the panel actually renders the checkbox. | |
+| 6b.5 | With the home jurisdiction set to an all-party state, press Start without ticking the acknowledgement. | Nothing starts, and the prompt stays up. The state machine enforces it, the panel greys the button out, and §0 checks both — confirm by eye that the checkbox and the warning are legible. | |
 | 6b.6 | Join a call wearing AirPods. | Record what happens. The mic-hot conjunct is expected to be unreliable on Bluetooth (issue #22) and the calendar fallback needs EventKit (MTG-01), so **no prompt is the expected outcome today**. | |
+| 6b.7 | While the prompt is up, type into the meeting app. | Keystrokes keep landing there. Click the prompt's background, then type again — still there. The panel is non-activating and every label is non-selectable, both of which have to hold for this. | |
+| 6b.8 | Arm the prompt with the meeting window full-screened. | The prompt is on top of it (`NSStatusWindowLevel`). | |
+| 6b.9 | Tick the box, then let the call end so the detector clears the prompt. Re-join. | The new prompt's box is **unticked**. An acknowledgement is about one call and the people on it. | |
+
+**Nothing launches this shell yet.** `fotw_shell::run` has no caller in the
+product: `fotwd` has no `shell` subcommand, so the panel is reachable today
+only through `prompt_preview`. Wiring the daemon's `Detector` into
+`ShellHost::poll_detection` is what turns 6b.1–6b.9 into things a user can
+reach.
 
 ## 7. Lifecycle and failure
 
@@ -207,9 +284,27 @@ For contrast, so nobody re-tests these by hand or assumes the reverse:
   non-activating bit, `NSStatusWindowLevel` (not floating), the four collection
   behaviour bits, and `NSWindowSharingType::None`. These prove the *values*,
   never the behaviour; §1–§3 above are what prove the behaviour.
+- **The prompt as a drawable surface** — `tests/prompt_surface.rs`: everything
+  the panel needs is in the view; the acknowledgement is core state with a
+  lifetime, not an `NSButton`; and `start_enabled` is pinned to what the state
+  machine will actually do, so the drawn gate and the enforced gate cannot
+  drift apart.
+- **The prompt panel's own arithmetic** — unit tests in
+  `src/platform/macos/prompt.rs`: the panel grows with its consent notice
+  without a ceiling, an undrawn row costs no space, and the button row widens
+  the panel rather than being clipped.
 
 Mutation testing: 20 seeded defects were introduced one at a time and all 20
 were caught by the suite above. The CON-01 work added 7 more (detection starts
 capture, the audit record written late or not at all, the blocking warning
 bypassed, a response to a withdrawn prompt honoured, the prompt left up over a
-live recording, the wrong key suppressed) — all 7 caught.
+live recording, the wrong key suppressed) — all 7 caught. The prompt-panel work
+(issue #52) added 16: 14 caught, 4 of them **only by the probe** (a renderer
+that ignores `start_enabled`, a guessed notice height, a button wired to the
+wrong selector, a checkbox that never reports). The 2 survivors are equivalent
+mutants — dropping the acknowledgement reset in `withdraw_prompt`, or the
+"only while a prompt is up" guard on `PromptAcknowledged`. Neither is
+observable, because `acknowledged` is only ever *read* while a prompt exists
+and every transition into "a prompt exists" resets it; they are kept as
+defence in depth for the day someone edits that third mechanism, which *is*
+covered.

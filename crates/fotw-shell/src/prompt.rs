@@ -148,6 +148,30 @@ impl DetectedMeeting {
     }
 }
 
+/// What the host's meeting detector has to say, polled once per tick.
+///
+/// This is how a detection reaches the screen at all: `platform::run` owns the
+/// [`ShellRuntime`](crate::ShellRuntime) behind `NSApplication::run()`, so a
+/// detector living in the daemon has no other way in.
+///
+/// **Neither variant can start a recording.** They become
+/// [`ShellInput::MeetingDetected`](crate::ShellInput::MeetingDetected) and
+/// [`ShellInput::DetectionCleared`](crate::ShellInput::DetectionCleared), both
+/// of which `tests/con01_detection_arms_only.rs` drives from every reachable
+/// phase and proves inert. There is deliberately no variant that carries a
+/// [`PromptChoice`]: a host must not be able to answer its own prompt on the
+/// user's behalf.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DetectionUpdate {
+    /// Raise a prompt for this meeting, or keep the one already up.
+    ///
+    /// Safe to repeat at the pump rate: an identical meeting leaves the
+    /// acknowledgement checkbox exactly as the user left it.
+    Armed(DetectedMeeting),
+    /// Take the prompt down — the signals went away before anybody answered.
+    Cleared,
+}
+
 /// What the person did with the prompt.
 ///
 /// Three answers, matching issue #22: *Start* / *Not now* / *Never for this

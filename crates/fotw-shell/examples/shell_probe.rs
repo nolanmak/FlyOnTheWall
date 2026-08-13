@@ -45,6 +45,67 @@ fn main() {
                 "panel_collection_behavior 0x{:04x}",
                 probe.panel_collection_behavior
             );
+            println!();
+            println!(
+                "prompt_style_mask         0x{:04x}",
+                probe.prompt_style_mask
+            );
+            println!(
+                "prompt_is_nonactivating   {}   <-- the prompt fires mid-call",
+                probe.prompt_is_nonactivating
+            );
+            println!(
+                "prompt_can_become_key     {} (must be true)",
+                probe.prompt_can_become_key
+            );
+            println!(
+                "prompt_can_become_main    {} (must be false)",
+                probe.prompt_can_become_main
+            );
+            println!(
+                "prompt_level              {} (25 = NSStatusWindowLevel)",
+                probe.prompt_level
+            );
+            println!(
+                "prompt_sharing_type       {} (0 = NSWindowSharingNone)",
+                probe.prompt_sharing_type
+            );
+            println!(
+                "prompt_collection_behav.  0x{:04x}",
+                probe.prompt_collection_behavior
+            );
+            println!(
+                "prompt_start_disabled     {} (CON-05: all-party, box unticked)",
+                probe.prompt_blocking_start_disabled
+            );
+            println!(
+                "prompt_start_after_tick   {} (and reachable once ticked)",
+                probe.prompt_acknowledged_start_enabled
+            );
+            println!(
+                "prompt_content_fits       {} (the warning is not clipped)",
+                probe.prompt_content_fits
+            );
+            println!(
+                "prompt_is_on_a_screen     {} (ordered front onto a real display)",
+                probe.prompt_is_on_a_screen
+            );
+            println!(
+                "prompt_blocked_click      {} (a real click on the disabled Start does nothing)",
+                probe.prompt_disabled_start_swallows_the_click
+            );
+            println!(
+                "prompt_checkbox_click     {} (target/action reaches the panel)",
+                probe.prompt_checkbox_dispatches
+            );
+            println!(
+                "prompt_start_click        {} (and carries the acknowledgement)",
+                probe.prompt_start_click_dispatches
+            );
+            println!(
+                "prompt_dismissal_clicks   {} (Not now / Never dispatch as themselves)",
+                probe.prompt_dismissals_dispatch
+            );
             println!("\nhealthy: {}", probe.is_healthy());
             if !probe.is_healthy() {
                 std::process::exit(1);

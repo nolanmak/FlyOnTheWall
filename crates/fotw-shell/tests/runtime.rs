@@ -6,8 +6,8 @@
 
 use fotw_shell::testing::{FakeHost, HostCall};
 use fotw_shell::{
-    Chord, DetectedMeeting, HotkeyAction, HotkeyMap, Key, Level, MenuAction, Modifiers, Monotonic,
-    PromptChoice, ShellError, ShellRuntime, StartOrigin,
+    Chord, DetectedMeeting, DetectionUpdate, HotkeyAction, HotkeyMap, Key, Level, MenuAction,
+    Modifiers, Monotonic, PromptChoice, ShellError, ShellRuntime, StartOrigin,
 };
 
 fn runtime() -> (ShellRuntime<FakeHost>, FakeHost) {
@@ -267,6 +267,66 @@ fn a_detection_reaching_the_host_asks_it_to_do_nothing_at_all() {
     let prompt = rt.view().prompt.expect("armed");
     assert!(prompt.headline.contains("Standup"));
     assert_eq!(prompt.start_label, "Start recording");
+}
+
+#[test]
+fn a_host_that_reports_a_meeting_gets_a_prompt_and_nothing_else() {
+    // The seam the daemon's detector arrives through, and the reason the
+    // prompt panel can appear at all: `run()` owns the runtime, so a detector
+    // living in the host has no other way to reach the screen (issue #52).
+    let (mut rt, host) = runtime();
+    host.report_detection(DetectionUpdate::Armed(zoom()));
+
+    rt.tick(Monotonic::from_secs(1));
+
+    let prompt = rt
+        .view()
+        .prompt
+        .expect("the host's detection armed nothing");
+    assert!(prompt.headline.contains("Standup"));
+    assert!(
+        host.calls().is_empty(),
+        "a detection asked the host to do something: {:?}",
+        host.calls()
+    );
+    assert!(!rt.core().capture_is_live());
+}
+
+#[test]
+fn a_host_that_withdraws_a_meeting_takes_the_prompt_down() {
+    let (mut rt, host) = runtime();
+    host.report_detection(DetectionUpdate::Armed(zoom()));
+    rt.tick(Monotonic::from_secs(1));
+    assert!(rt.view().prompt.is_some());
+
+    host.report_detection(DetectionUpdate::Cleared);
+    rt.tick(Monotonic::from_secs(2));
+
+    assert!(
+        rt.view().prompt.is_none(),
+        "the call ended and the prompt is still offering to record it"
+    );
+}
+
+#[test]
+fn a_host_repeating_the_same_detection_does_not_reset_the_acknowledgement() {
+    // The pump polls at 20 Hz. A core that cleared the tick on every repeat
+    // would make an all-party prompt impossible to start at all.
+    let (mut rt, host) = runtime();
+    let california = zoom().with_consent_notice("California — Cal. Penal Code § 632", true);
+    for second in 0..5 {
+        host.report_detection(DetectionUpdate::Armed(california.clone()));
+        rt.tick(Monotonic::from_secs(second));
+    }
+    rt.acknowledge_prompt(true);
+    for second in 5..10 {
+        host.report_detection(DetectionUpdate::Armed(california.clone()));
+        rt.tick(Monotonic::from_secs(second));
+    }
+
+    let prompt = rt.view().prompt.expect("armed");
+    assert!(prompt.acknowledged, "the repeat un-ticked the box");
+    assert!(prompt.start_enabled);
 }
 
 #[test]
