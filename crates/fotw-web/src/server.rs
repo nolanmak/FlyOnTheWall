@@ -45,6 +45,24 @@ impl WebServer {
     /// The bind failed, or — see the module docs — it succeeded on something
     /// that is not loopback.
     pub async fn bind(port: u16, source: Arc<dyn MeetingSource>) -> io::Result<Self> {
+        Self::bind_with_recorder(port, source, None).await
+    }
+
+    /// [`WebServer::bind`], with a recorder the UI may drive.
+    ///
+    /// Separate rather than a wider `bind` because `bind` has call sites with
+    /// nothing to record — the tests and the `ui_preview` example — and none
+    /// of them should grow a `None`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever binding the loopback listener failed with, or if the bound
+    /// address is somehow not loopback.
+    pub async fn bind_with_recorder(
+        port: u16,
+        source: Arc<dyn MeetingSource>,
+        recorder: Option<Arc<dyn crate::recorder::RecorderControl>>,
+    ) -> io::Result<Self> {
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await?;
         let addr = listener.local_addr()?;
         if !addr.ip().is_loopback() {
@@ -52,7 +70,8 @@ impl WebServer {
                 "refusing to serve: bound {addr}, which is not loopback"
             )));
         }
-        let state = AppState::new(IngressPolicy::for_loopback_port(addr.port()), source);
+        let state =
+            AppState::with_recorder(IngressPolicy::for_loopback_port(addr.port()), source, recorder);
         Ok(Self {
             listener,
             addr,
@@ -131,6 +150,9 @@ fn routes(state: AppState) -> Router {
         .route("/api/ws-ticket", post(api::ws_ticket))
         .route("/api/handoff", post(api::handoff))
         .route("/api/stream", get(stream::stream))
+        .route("/api/recording/status", get(api::recording_status))
+        .route("/api/recording/start", post(api::recording_start))
+        .route("/api/recording/stop", post(api::recording_stop))
         // Both of these are ING-09. The fallback is the same bare 404 the
         // guard returns, so "wrong token" and "no such path" are one response.
         // The method fallback replaces axum's `405 Method Not Allowed` with an

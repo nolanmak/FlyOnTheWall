@@ -135,6 +135,96 @@ fn platform_availability() -> StoreAvailability {
 /// refuses to start.
 pub const KEYCHAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Whether anyone could actually answer an approval dialog right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answerable {
+    /// A person at this machine, with a window server that can draw a dialog.
+    Person,
+    /// launchd, CI, or SSH. The dialog either cannot be drawn or cannot be
+    /// seen, so waiting only converts a fast error into a silent hang.
+    Nobody,
+}
+
+/// How long to wait for the credential store, given who could answer.
+///
+/// The old single five-second deadline was right for [`Answerable::Nobody`]
+/// and wrong for everyone else: nobody finds an approval window, reads it and
+/// clicks the correct button inside five seconds. Because a timed-out request
+/// is abandoned rather than cancelled, the user's eventual click then landed
+/// on a request nothing was waiting for — they clicked Allow and the command
+/// had already failed.
+///
+/// Still bounded in both cases. "Wait forever" is the hang this exists to
+/// prevent, and an interactive session can still be one where the dialog
+/// never draws.
+#[must_use]
+pub fn keychain_timeout(who: Answerable) -> std::time::Duration {
+    match who {
+        Answerable::Person => std::time::Duration::from_secs(60),
+        Answerable::Nobody => KEYCHAIN_TIMEOUT,
+    }
+}
+
+/// Decide from environment markers and whether a GUI session exists.
+///
+/// Split from the lookup so it is testable: a test cannot remove the window
+/// server, and setting process-wide environment variables from one test races
+/// every other test in the binary.
+#[must_use]
+pub fn answerable_from(env: &[(&str, &str)], has_window_server: bool) -> Answerable {
+    let marked = |name: &str| {
+        env.iter()
+            .any(|(k, v)| *k == name && !v.trim().is_empty())
+    };
+
+    // CI first: a hosted macOS runner has a window server and still nobody to
+    // click. SSH next: a person, but not one who can see the far end's screen.
+    if marked("CI") || marked("SSH_CONNECTION") || marked("SSH_TTY") {
+        return Answerable::Nobody;
+    }
+    if has_window_server {
+        Answerable::Person
+    } else {
+        Answerable::Nobody
+    }
+}
+
+/// [`answerable_from`], reading this process's actual environment.
+#[must_use]
+pub fn answerable() -> Answerable {
+    let env: Vec<(String, String)> = ["CI", "SSH_CONNECTION", "SSH_TTY"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| ((*k).to_owned(), v)))
+        .collect();
+    let borrowed: Vec<(&str, &str)> = env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    answerable_from(&borrowed, has_window_server())
+}
+
+/// Whether this process is in a GUI session that could draw a dialog.
+///
+/// `SecurityAgent` runs in the Aqua session, so a process outside one cannot
+/// be shown anything. Detected from the session's bootstrap namespace rather
+/// than from a TTY, because the app bundle is launched by LaunchServices and
+/// has no TTY at all while very much having a screen.
+fn has_window_server() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // Set for every process in a GUI login session and absent in the
+        // system context that launchd daemons run in.
+        std::env::var_os("XPC_SERVICE_NAME").is_some()
+            || std::env::var_os("__CFBundleIdentifier").is_some()
+            || std::env::var_os("TERM_SESSION_ID").is_some()
+            || std::env::var_os("SECURITYSESSIONID").is_some()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// Run one keychain call, giving up after [`KEYCHAIN_TIMEOUT`].
 ///
 /// # Why the thread is detached and never joined
@@ -160,7 +250,7 @@ where
     F: FnOnce() -> Result<T, SecretsError> + Send + 'static,
     T: Send + 'static,
 {
-    with_deadline_after(KEYCHAIN_TIMEOUT, operation, account, work)
+    with_deadline_after(keychain_timeout(answerable()), operation, account, work)
 }
 
 /// [`with_deadline`] with the deadline named, so a test can use a short one.

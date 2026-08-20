@@ -11,6 +11,7 @@ use std::sync::Arc;
 use crate::ingress::IngressPolicy;
 use crate::source::MeetingSource;
 use crate::stream::DeltaHub;
+use crate::recorder::RecorderControl;
 use crate::tokens::{HANDOFF_TTL, TokenTable, WS_TICKET_TTL};
 
 /// Shared, cheap to clone, immutable except for the token tables and the hub.
@@ -27,6 +28,15 @@ struct Inner {
     handoff: TokenTable,
     hub: Arc<DeltaHub>,
     csp: String,
+    recorder: Option<Arc<dyn RecorderControl>>,
+}
+
+impl std::fmt::Debug for dyn RecorderControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Same reason as the library below: a `{:?}` on the app state must not
+        // reach anything that knows what is being recorded.
+        f.write_str("RecorderControl(<redacted>)")
+    }
 }
 
 impl std::fmt::Debug for dyn MeetingSource {
@@ -42,11 +52,27 @@ impl AppState {
     /// port.
     #[must_use]
     pub fn new(policy: IngressPolicy, source: Arc<dyn MeetingSource>) -> Self {
+        Self::with_recorder(policy, source, None)
+    }
+
+    /// [`AppState::new`], with a recorder the UI may drive.
+    ///
+    /// Separate constructor rather than a wider `new` because `new` has call
+    /// sites that have no recorder and should not grow a `None` — the
+    /// read-only preview server among them. `AppState` wraps an `Arc`, so this
+    /// cannot be a post-construction builder without unwrapping it.
+    #[must_use]
+    pub fn with_recorder(
+        policy: IngressPolicy,
+        source: Arc<dyn MeetingSource>,
+        recorder: Option<Arc<dyn RecorderControl>>,
+    ) -> Self {
         let csp = content_security_policy(policy.origin());
         Self {
             inner: Arc::new(Inner {
                 policy,
                 source,
+                recorder,
                 tickets: TokenTable::new(WS_TICKET_TTL),
                 handoff: TokenTable::new(HANDOFF_TTL),
                 hub: Arc::new(DeltaHub::new()),
@@ -59,6 +85,16 @@ impl AppState {
     #[must_use]
     pub fn policy(&self) -> &IngressPolicy {
         &self.inner.policy
+    }
+
+    /// The recorder, if this daemon has one.
+    ///
+    /// `None` on a read-only server. The handlers answer a bare 404 in that
+    /// case, so a daemon that cannot record is indistinguishable from one that
+    /// has never heard of the route.
+    #[must_use]
+    pub fn recorder(&self) -> Option<Arc<dyn RecorderControl>> {
+        self.inner.recorder.clone()
     }
 
     /// The library, for [`tokio::task::spawn_blocking`].

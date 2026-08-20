@@ -122,17 +122,221 @@ impl std::fmt::Debug for Transcription {
     }
 }
 
+/// A latch an external caller can use to end a running session.
+///
+/// The CLI never needs one — `fotwd record 3600` ends on its stopwatch — but a
+/// Start/Stop button does: nobody knows how long a meeting is when it begins.
+///
+/// # Why a `Notify` and not a bare `AtomicBool`
+///
+/// The pump already polls its own latch every [`IDLE_POLL`], because it is a
+/// blocking thread with nowhere to await. The async side has somewhere to
+/// await, and a second poller would be a wake-up ten times a second for a flag
+/// that changes exactly once. `Notify` lets the session sleep until either the
+/// duration expires or someone asks it to stop.
+#[derive(Clone, Debug, Default)]
+pub struct StopSignal(Arc<StopInner>);
+
+#[derive(Debug, Default)]
+struct StopInner {
+    requested: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl StopSignal {
+    /// A signal nobody has tripped yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask the session to end. Idempotent; a second call is a no-op.
+    pub fn stop(&self) {
+        self.0.requested.store(true, Ordering::Release);
+        self.0.notify.notify_waiters();
+    }
+
+    /// Whether [`stop`](Self::stop) has been called.
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.0.requested.load(Ordering::Acquire)
+    }
+
+    /// Resolve once the signal is tripped, now or later.
+    ///
+    /// The `notified()` future is constructed *before* the flag is read, and
+    /// that order is the whole correctness argument: `notify_waiters` wakes
+    /// only those already waiting and leaves no permit behind, so a `stop()`
+    /// landing between a read and an await would be lost forever. Registering
+    /// first turns that race into a redundant wake-up.
+    async fn wait(&self) {
+        loop {
+            let notified = self.0.notify.notified();
+            if self.is_stopped() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// A latch the session trips once capture is genuinely live.
+///
+/// The counterpart to [`StopSignal`], and the answer to a specific bug: the
+/// taps are started *inside* the session, so a caller that spawned it and
+/// returned would report "recording" while a Core Audio device sat blocked in
+/// `start()`. That produced a red badge, a ticking clock and an empty disk —
+/// the one failure mode this project exists to avoid.
+///
+/// # Why a `Condvar` and not a `Notify`
+///
+/// The waiter is not async. `RecorderControl::start` is called on a blocking
+/// pool thread and has to answer before it returns, so it needs a blocking
+/// wait with a deadline; the signaller is on the runtime and only sets a flag.
+#[derive(Clone, Debug, Default)]
+pub struct ReadySignal(Arc<ReadyInner>);
+
+#[derive(Debug, Default)]
+struct ReadyInner {
+    ready: std::sync::Mutex<bool>,
+    woke: std::sync::Condvar,
+}
+
+impl ReadySignal {
+    /// A signal nobody has tripped yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Announce that capture is live. Idempotent.
+    pub fn signal(&self) {
+        let mut ready = self.0.ready.lock().unwrap_or_else(|e| e.into_inner());
+        *ready = true;
+        // `notify_all`, not `notify_one`: the flag is level-triggered and more
+        // than one thread may be waiting on a slow start.
+        self.0.woke.notify_all();
+    }
+
+    /// Whether capture has been announced.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        *self.0.ready.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Block until capture is live, or `timeout` elapses.
+    ///
+    /// Returns whether it became ready. Loops on the predicate rather than
+    /// trusting a single wake, because a `Condvar` may wake spuriously.
+    #[must_use]
+    pub fn wait_timeout(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut ready = self.0.ready.lock().unwrap_or_else(|e| e.into_inner());
+        while !*ready {
+            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return false;
+            };
+            let (guard, _) = self
+                .0
+                .woke
+                .wait_timeout(ready, left)
+                .unwrap_or_else(|e| e.into_inner());
+            ready = guard;
+        }
+        true
+    }
+}
+
+/// The two latches a caller outside the session holds.
+#[derive(Clone, Debug, Default)]
+pub struct SessionControl {
+    /// Trip to end the session early.
+    pub stop: StopSignal,
+    /// Tripped by the session once capture is live.
+    pub ready: ReadySignal,
+}
+
+impl SessionControl {
+    /// A fresh pair.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// Run a meeting session to completion.
 ///
 /// `system` is required; `mic` is optional so a machine with no input device
 /// still records the far end rather than refusing to start.
 pub async fn run(
     root: &Path,
+    system: Box<dyn AudioTap>,
+    mic: Option<Box<dyn AudioTap>>,
+    transcription: Transcription,
+    duration: Duration,
+) -> Result<SessionOutcome, String> {
+    run_with_stop(
+        root,
+        system,
+        mic,
+        transcription,
+        duration,
+        StopSignal::new(),
+    )
+    .await
+}
+
+/// [`run`], with the stop latch named.
+///
+/// The seam that lets a caller who did not start a stopwatch still end the
+/// session — mirroring `open_library` / `open_library_with` and
+/// `AuditLog::record` / `record_at` elsewhere in this crate.
+///
+/// `duration` remains a ceiling rather than becoming optional. An unbounded
+/// session is a real failure mode: it runs until the disk fills, and
+/// [`crate::retention::recording_in_flight`] vetoes the sweeper for as long as
+/// it is alive, so a forgotten recording disables retention too. Whichever
+/// arrives first wins.
+///
+/// # Errors
+///
+/// Whatever [`run`] fails with.
+pub async fn run_with_stop(
+    root: &Path,
+    system: Box<dyn AudioTap>,
+    mic: Option<Box<dyn AudioTap>>,
+    transcription: Transcription,
+    duration: Duration,
+    stop: StopSignal,
+) -> Result<SessionOutcome, String> {
+    run_with_control(
+        root,
+        system,
+        mic,
+        transcription,
+        duration,
+        SessionControl {
+            stop,
+            ready: ReadySignal::new(),
+        },
+    )
+    .await
+}
+
+/// [`run_with_stop`], and the caller also learns when capture went live.
+///
+/// # Errors
+///
+/// Whatever [`run`] fails with.
+pub async fn run_with_control(
+    root: &Path,
     mut system: Box<dyn AudioTap>,
     mut mic: Option<Box<dyn AudioTap>>,
     transcription: Transcription,
     duration: Duration,
+    control: SessionControl,
 ) -> Result<SessionOutcome, String> {
+    let stop_signal = control.stop;
     let silent = Arc::new(AtomicU64::new(0));
     let total = Arc::new(AtomicU64::new(0));
 
@@ -203,7 +407,19 @@ pub async fn run(
         })
     });
 
-    tokio::time::sleep(duration).await;
+    // Capture is genuinely live now: both taps returned from `start`, the WAL
+    // exists and the pump is draining. Announced here rather than at the top
+    // of the function because a tap that blocks in `start` never reaches this
+    // line — which is the whole point.
+    control.ready.signal();
+
+    // Whichever comes first. `select!` drops the loser, and both branches are
+    // cancel-safe: a dropped `sleep` is a dropped timer, and a dropped
+    // `wait()` is a dropped `Notified` registration.
+    tokio::select! {
+        () = tokio::time::sleep(duration) => {}
+        () = stop_signal.wait() => {}
+    }
 
     // Stop capture first, then let the pump drain what is already buffered.
     let _ = system.stop();

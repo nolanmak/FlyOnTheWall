@@ -26,6 +26,10 @@ const el = {
   detail: document.getElementById("detail"),
   status: document.getElementById("status"),
   live: document.getElementById("live"),
+  consent: document.getElementById("consent"),
+  consentLabel: document.getElementById("consent-label"),
+  record: document.getElementById("record"),
+  recording: document.getElementById("recording"),
 };
 
 // --------------------------------------------------------------- ING-10
@@ -330,6 +334,79 @@ function appendDeltas(deltas) {
   }
 }
 
+// -------------------------------------------------- CON-01, recording state
+
+// How often to re-read the recorder while the tab is open.
+//
+// Polled rather than pushed: /api/stream is one-directional by design and its
+// hub coalesces transcript deltas, dropping a flush when the buffer is empty,
+// so a state change has nothing to ride on. Five seconds is slow enough to be
+// invisible on the wire and fast enough that a recording started from the
+// menu bar shows up here before anyone wonders.
+const RECORDING_POLL_MS = 5000;
+
+let recordingNow = false;
+
+// A daemon with no recorder answers 404 on these paths, which is
+// indistinguishable from a server that never had them. Once we learn that,
+// stop asking and leave the controls hidden.
+let recorderPresent = true;
+
+async function pollRecording() {
+  if (!recorderPresent) return;
+  try {
+    renderRecording(await api("/api/recording/status"));
+  } catch (e) {
+    // Not "the request failed" — this build has no recorder at all.
+    recorderPresent = false;
+    showRecordingControls(false);
+  }
+}
+
+function showRecordingControls(visible) {
+  el.record.hidden = !visible;
+  el.consentLabel.hidden = !visible;
+  if (!visible) el.recording.hidden = true;
+}
+
+function renderRecording(body) {
+  recordingNow = body.state === "recording";
+  showRecordingControls(true);
+
+  el.recording.hidden = !recordingNow;
+  el.record.textContent = recordingNow ? "Stop" : "Start";
+
+  // The tick box is the control CON-01 asks for, so it is only meaningful
+  // before a recording exists. While one is running, Stop must never be
+  // gated on it — a user who cannot stop a recording is the worse failure.
+  el.consentLabel.hidden = recordingNow;
+  el.record.disabled = !recordingNow && !el.consent.checked;
+}
+
+async function onRecord() {
+  const path = recordingNow
+    ? "/api/recording/stop"
+    : "/api/recording/start?ack=all-party";
+  el.record.disabled = true;
+  try {
+    const body = await api(path, { method: "POST" });
+    renderRecording(body);
+    if (body.error === "consent_required") {
+      say("Tick the box first: everyone on the call has to have consented.");
+    } else if (body.error) {
+      say("The recorder said: " + body.error);
+    } else if (body.state === "recording") {
+      say("Recording. Tell the other participants.");
+    } else {
+      say("Stopped. The meeting is being written to your library.");
+      await loadMeetings();
+    }
+  } catch (e) {
+    say("Could not reach the recorder.");
+    el.record.disabled = false;
+  }
+}
+
 // ------------------------------------------------------------------ start
 
 async function main() {
@@ -339,7 +416,14 @@ async function main() {
     return;
   }
   el.search.addEventListener("input", onSearch);
+  el.record.addEventListener("click", onRecord);
+  // Re-evaluates the disabled state; the box gates Start and nothing else.
+  el.consent.addEventListener("change", function () {
+    el.record.disabled = !recordingNow && !el.consent.checked;
+  });
   await loadMeetings();
+  await pollRecording();
+  setInterval(pollRecording, RECORDING_POLL_MS);
   connectStream();
 }
 

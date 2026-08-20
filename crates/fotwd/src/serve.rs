@@ -41,6 +41,55 @@ pub fn state_file_path(root: &Path) -> PathBuf {
     root.parent().unwrap_or(root).join("daemon.json")
 }
 
+/// The port `serve` should bind, taken from the command line.
+///
+/// Defaults to 0 — the OS picks — because a fixed port is guessable by a page
+/// scanning localhost. That is not itself a security control (ING-01 through
+/// ING-05 are), but it is one more thing an attacker has to find, so trading
+/// it away stays an explicit choice.
+///
+/// The reason to offer the trade at all: the redeemed bearer lives in
+/// `sessionStorage` (ING-08), which is keyed by origin, and the port is part
+/// of an origin. An ephemeral port therefore throws the credential away on
+/// every restart, and the user meets a 30-second handoff window instead of a
+/// bookmark that works.
+///
+/// # Errors
+///
+/// If `--port` is present but its value is missing, not a number, above
+/// 65535, or privileged.
+pub fn parse_port(args: &[String]) -> Result<u16, String> {
+    let Some(at) = args.iter().position(|a| a == "--port") else {
+        return Ok(0);
+    };
+
+    // A following `--flag` is treated as absent rather than as the value:
+    // `--port --print-url` must not bind whatever that parsed to.
+    let raw = args
+        .get(at + 1)
+        .filter(|v| !v.starts_with("--"))
+        .ok_or_else(|| "--port needs a number, as in `--port 8765`".to_owned())?;
+
+    // Parsed as u32 rather than u16 so that 65536 reports the boundary
+    // instead of the same "not a number" a typo produces.
+    let port: u32 = raw
+        .parse()
+        .map_err(|_| format!("--port: `{raw}` is not a port number"))?;
+
+    if port > u32::from(u16::MAX) {
+        return Err(format!("--port: {port} is above the maximum of 65535"));
+    }
+    if port != 0 && port < 1024 {
+        return Err(format!(
+            "--port: {port} is privileged — ports below 1024 need root, and the \
+             error the OS returns for that is a bare `Permission denied` that \
+             never mentions the port. Pick one above 1024."
+        ));
+    }
+
+    u16::try_from(port).map_err(|e| format!("--port: {e}"))
+}
+
 /// How the page gets its handoff token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Launch {
@@ -56,16 +105,31 @@ pub enum Launch {
 }
 
 /// Run the loopback server until the process is stopped.
-pub async fn serve(root: PathBuf, launch: Launch) -> Result<(), String> {
+pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), String> {
     let db = crate::open_library(&root)?;
     let source = Arc::new(StoreSource::new(db));
 
-    // Port 0: the OS picks. A fixed port would be trivially guessable by a
+    // 0 — the default — means the OS picks. A fixed port is guessable by a
     // page scanning localhost, and the ephemeral port is one more thing an
-    // attacker has to find even though it is not itself a security control.
-    let server = WebServer::bind(0, source)
-        .await
-        .map_err(|e| format!("could not bind 127.0.0.1: {e}"))?;
+    // attacker has to find even though it is not itself a security control;
+    // `--port` trades that away for an origin the browser can remember. See
+    // `parse_port`.
+    // The recorder is what turns the read-only library viewer into something
+    // that can start a meeting. It needs the runtime handle because `start()`
+    // is called from a blocking pool thread and has to spawn the session task
+    // back onto the runtime.
+    let recorder = Arc::new(crate::recording::DaemonRecorder::new(
+        root.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+
+    let server = WebServer::bind_with_recorder(
+        port,
+        source,
+        Some(Arc::clone(&recorder) as Arc<dyn fotw_web::RecorderControl>),
+    )
+    .await
+    .map_err(|e| format!("could not bind 127.0.0.1: {e}"))?;
 
     let addr = server.addr();
     let state = server.state().clone();
@@ -93,6 +157,16 @@ pub async fn serve(root: PathBuf, launch: Launch) -> Result<(), String> {
     };
     let path = state_file_path(&root);
     write_state_file(&path, &daemon).map_err(|e| format!("writing {}: {e}", path.display()))?;
+
+    // macOS attributes a system-audio grant to the responsible process, which
+    // for a daemon started from a shell is the terminal. Saying so here is the
+    // difference between a user seeing a warning and a user getting a silent
+    // recording they only discover afterwards.
+    if !crate::recording::DaemonRecorder::launched_as_app() {
+        println!("  ! Start will record through this terminal's audio grant, not");
+        println!("    FlyOnTheWall's. For a real meeting, launch the bundle:");
+        println!("      open -a FlyOnTheWall.app --args serve --port <n>");
+    }
 
     println!("  listening  : http://{addr}");
     println!("  state file : {} (0600)", path.display());

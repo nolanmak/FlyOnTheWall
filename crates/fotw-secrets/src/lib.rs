@@ -61,12 +61,14 @@ mod error;
 mod fingerprint;
 mod index;
 mod keys;
+pub mod cache;
 pub mod recovery;
 mod redact;
 mod secret;
 mod store;
 pub mod validate;
 
+pub use crate::cache::CachedKeyStore;
 pub use crate::error::SecretsError;
 pub use crate::fingerprint::Fingerprint;
 pub use crate::index::CredentialRecord;
@@ -74,5 +76,7 @@ pub use crate::keys::{KEYRING_SERVICE, Provider, SecretKey};
 pub use crate::redact::{REDACTED, RedactingWriter, Redactor, SENSITIVE_HEADERS};
 pub use crate::secret::SecretString;
 pub use crate::store::{
+    Answerable, answerable, answerable_from, keychain_timeout,
+
     InMemoryKeyStore, KEYCHAIN_TIMEOUT, KeyStore, OsKeyStore, StoreAvailability, os_tests_enabled,
 };

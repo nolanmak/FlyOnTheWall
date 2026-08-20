@@ -11,6 +11,7 @@ pub mod consent;
 pub mod detect;
 pub mod onboard;
 pub mod persist;
+pub mod recording;
 pub mod recovery;
 pub mod retention;
 pub mod secrets;
@@ -50,7 +51,7 @@ pub fn open_library(root: &Path) -> Result<Db, String> {
     })?;
     let data_root = root.parent().unwrap_or(root);
     let mut ceremony = TtyCeremony::new();
-    open_library_with(data_root, &store, &mut ceremony, KdfParams::default())
+    open_library_with(data_root, store, &mut ceremony, KdfParams::default())
 }
 
 /// [`open_library`] with every dependency named.

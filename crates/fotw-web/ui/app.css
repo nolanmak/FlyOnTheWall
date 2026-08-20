@@ -64,6 +64,50 @@ h1 {
   letter-spacing: 0.08em;
 }
 
+/* Deliberately not `.live`: that one means "the socket is connected", and a
+   page with a socket open is not a page that is recording. Two facts, two
+   indicators. */
+.recording {
+  color: #d2453d;
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+}
+
+/* CON-02: the indicator must not be suppressible. It is never given a
+   transition or an opacity, so nothing can fade it out and leave a recording
+   running behind a dimmed badge. */
+.recording::before {
+  content: "\25CF";
+  margin-right: 4px;
+}
+
+.consent {
+  color: var(--muted);
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+#record {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+#record:disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
 main {
   display: grid;
   grid-template-columns: minmax(220px, 320px) 1fr;

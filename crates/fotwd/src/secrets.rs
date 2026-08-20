@@ -26,8 +26,10 @@
 //! variable is readable by every child process and shows up in a crash dump.
 //! The keychain is tried first and the fallback says so out loud.
 
+use std::sync::OnceLock;
+
 use fotw_secrets::recovery::MasterKeyBytes;
-use fotw_secrets::{KeyStore, OsKeyStore, Provider, SecretKey, SecretString, SecretsError};
+use fotw_secrets::{CachedKeyStore, KeyStore, OsKeyStore, Provider, SecretKey, SecretString, SecretsError};
 use fotw_store::DbKey;
 
 /// How the daemon resolved a *provider* secret, so the UI can tell the user.
@@ -58,8 +60,32 @@ pub use fotw_secrets::KEYCHAIN_TIMEOUT;
 /// is a hard failure by design: silently writing keys to a file would be a
 /// headline-grade defect for a project whose pitch is that your keys stay
 /// yours.
-pub fn keystore() -> Result<OsKeyStore, SecretsError> {
-    OsKeyStore::new()
+/// # Why one store for the whole process
+///
+/// The returned store caches what the keychain already told it, and that is
+/// only worth anything if every caller shares one. `open_library` reads
+/// `db:masterkey` on every call — `list`, `serve`, `summarize`, persist,
+/// retention, import and export all go through it — and on macOS each read of
+/// an item whose ACL does not list this exact binary is a separate approval
+/// dialog. Handing out a fresh store per call would mean a fresh empty cache
+/// per call, which is where six dialogs in a row came from.
+///
+/// This is the shape Chromium uses for the `<App> Safe Storage` item every
+/// Electron app keeps in the keychain: read once, hold for the process.
+pub fn keystore() -> Result<&'static CachedKeyStore<OsKeyStore>, SecretsError> {
+    static STORE: OnceLock<Result<CachedKeyStore<OsKeyStore>, String>> = OnceLock::new();
+
+    // The error is kept as a string because `SecretsError` is not `Clone` and
+    // a `OnceLock` hands out shared references. The text is what the caller
+    // prints anyway.
+    match STORE.get_or_init(|| {
+        OsKeyStore::new()
+            .map(CachedKeyStore::new)
+            .map_err(|e| e.to_string())
+    }) {
+        Ok(store) => Ok(store),
+        Err(why) => Err(SecretsError::NoSecretService(why.clone())),
+    }
 }
 
 /// The stored database master key, or `None` if this machine has never had one.
