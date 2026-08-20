@@ -122,16 +122,108 @@ impl std::fmt::Debug for Transcription {
     }
 }
 
+/// A latch an external caller can use to end a running session.
+///
+/// The CLI never needs one — `fotwd record 3600` ends on its stopwatch — but a
+/// Start/Stop button does: nobody knows how long a meeting is when it begins.
+///
+/// # Why a `Notify` and not a bare `AtomicBool`
+///
+/// The pump already polls its own latch every [`IDLE_POLL`], because it is a
+/// blocking thread with nowhere to await. The async side has somewhere to
+/// await, and a second poller would be a wake-up ten times a second for a flag
+/// that changes exactly once. `Notify` lets the session sleep until either the
+/// duration expires or someone asks it to stop.
+#[derive(Clone, Debug, Default)]
+pub struct StopSignal(Arc<StopInner>);
+
+#[derive(Debug, Default)]
+struct StopInner {
+    requested: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl StopSignal {
+    /// A signal nobody has tripped yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask the session to end. Idempotent; a second call is a no-op.
+    pub fn stop(&self) {
+        self.0.requested.store(true, Ordering::Release);
+        self.0.notify.notify_waiters();
+    }
+
+    /// Whether [`stop`](Self::stop) has been called.
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.0.requested.load(Ordering::Acquire)
+    }
+
+    /// Resolve once the signal is tripped, now or later.
+    ///
+    /// The `notified()` future is constructed *before* the flag is read, and
+    /// that order is the whole correctness argument: `notify_waiters` wakes
+    /// only those already waiting and leaves no permit behind, so a `stop()`
+    /// landing between a read and an await would be lost forever. Registering
+    /// first turns that race into a redundant wake-up.
+    async fn wait(&self) {
+        loop {
+            let notified = self.0.notify.notified();
+            if self.is_stopped() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 /// Run a meeting session to completion.
 ///
 /// `system` is required; `mic` is optional so a machine with no input device
 /// still records the far end rather than refusing to start.
 pub async fn run(
     root: &Path,
+    system: Box<dyn AudioTap>,
+    mic: Option<Box<dyn AudioTap>>,
+    transcription: Transcription,
+    duration: Duration,
+) -> Result<SessionOutcome, String> {
+    run_with_stop(
+        root,
+        system,
+        mic,
+        transcription,
+        duration,
+        StopSignal::new(),
+    )
+    .await
+}
+
+/// [`run`], with the stop latch named.
+///
+/// The seam that lets a caller who did not start a stopwatch still end the
+/// session — mirroring `open_library` / `open_library_with` and
+/// `AuditLog::record` / `record_at` elsewhere in this crate.
+///
+/// `duration` remains a ceiling rather than becoming optional. An unbounded
+/// session is a real failure mode: it runs until the disk fills, and
+/// [`crate::retention::recording_in_flight`] vetoes the sweeper for as long as
+/// it is alive, so a forgotten recording disables retention too. Whichever
+/// arrives first wins.
+///
+/// # Errors
+///
+/// Whatever [`run`] fails with.
+pub async fn run_with_stop(
+    root: &Path,
     mut system: Box<dyn AudioTap>,
     mut mic: Option<Box<dyn AudioTap>>,
     transcription: Transcription,
     duration: Duration,
+    stop_signal: StopSignal,
 ) -> Result<SessionOutcome, String> {
     let silent = Arc::new(AtomicU64::new(0));
     let total = Arc::new(AtomicU64::new(0));
@@ -203,7 +295,13 @@ pub async fn run(
         })
     });
 
-    tokio::time::sleep(duration).await;
+    // Whichever comes first. `select!` drops the loser, and both branches are
+    // cancel-safe: a dropped `sleep` is a dropped timer, and a dropped
+    // `wait()` is a dropped `Notified` registration.
+    tokio::select! {
+        () = tokio::time::sleep(duration) => {}
+        () = stop_signal.wait() => {}
+    }
 
     // Stop capture first, then let the pump drain what is already buffered.
     let _ = system.stop();
