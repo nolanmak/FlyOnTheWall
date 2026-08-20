@@ -2,8 +2,9 @@
 //!
 //! `fotw-web` cannot start a recording and must not learn how. Core Audio
 //! lives in `fotw-audio`, session lifecycle in `fotwd`, and `just seam` fails
-//! the build if a `AudioDeviceID` or an `AudioBufferList` appears outside
-//! `fotw-audio/src/platform/macos/`. So the web layer takes a trait, exactly
+//! the build if any of the platform device or buffer types appears outside
+//! `fotw-audio/src/platform/macos/` — this comment does not spell them for
+//! exactly that reason. So the web layer takes a trait, exactly
 //! as it takes [`MeetingSource`](crate::source::MeetingSource) for the
 //! library, and `fotwd` supplies the implementation that knows about devices.
 //!

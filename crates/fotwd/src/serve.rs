@@ -114,9 +114,22 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
     // attacker has to find even though it is not itself a security control;
     // `--port` trades that away for an origin the browser can remember. See
     // `parse_port`.
-    let server = WebServer::bind(port, source)
-        .await
-        .map_err(|e| format!("could not bind 127.0.0.1: {e}"))?;
+    // The recorder is what turns the read-only library viewer into something
+    // that can start a meeting. It needs the runtime handle because `start()`
+    // is called from a blocking pool thread and has to spawn the session task
+    // back onto the runtime.
+    let recorder = Arc::new(crate::recording::DaemonRecorder::new(
+        root.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+
+    let server = WebServer::bind_with_recorder(
+        port,
+        source,
+        Some(Arc::clone(&recorder) as Arc<dyn fotw_web::RecorderControl>),
+    )
+    .await
+    .map_err(|e| format!("could not bind 127.0.0.1: {e}"))?;
 
     let addr = server.addr();
     let state = server.state().clone();
@@ -144,6 +157,16 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
     };
     let path = state_file_path(&root);
     write_state_file(&path, &daemon).map_err(|e| format!("writing {}: {e}", path.display()))?;
+
+    // macOS attributes a system-audio grant to the responsible process, which
+    // for a daemon started from a shell is the terminal. Saying so here is the
+    // difference between a user seeing a warning and a user getting a silent
+    // recording they only discover afterwards.
+    if !crate::recording::DaemonRecorder::launched_as_app() {
+        println!("  ! Start will record through this terminal's audio grant, not");
+        println!("    FlyOnTheWall's. For a real meeting, launch the bundle:");
+        println!("      open -a FlyOnTheWall.app --args serve --port <n>");
+    }
 
     println!("  listening  : http://{addr}");
     println!("  state file : {} (0600)", path.display());
