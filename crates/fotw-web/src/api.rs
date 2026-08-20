@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::assets::apply_security_headers;
 use crate::ingress::not_found;
 use crate::query::query_param;
+use crate::recorder::{RecorderError, RecordingStatus};
 use crate::source::{Hit, MeetingDetail, MeetingRow, SourceError};
 use crate::state::AppState;
 use crate::tokens::WS_TICKET_TTL;
@@ -76,6 +77,116 @@ pub struct HandoffResponse {
     /// Goes in `Authorization: Bearer`, and into `sessionStorage` — never a
     /// cookie (ING-08).
     pub token: String,
+}
+
+/// `GET /api/recording/status`, `POST /api/recording/{start,stop}`.
+///
+/// The status is flattened in rather than nested so the UI reads
+/// `body.state` for every one of the three endpoints and never has to know
+/// which it called.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RecordingResponse {
+    /// What the recorder is doing.
+    #[serde(flatten)]
+    pub status: RecordingStatus,
+    /// Why the request did not do what was asked, when it did not.
+    ///
+    /// Carried beside a 200 rather than as a status code: see the module note
+    /// on `recorder.rs` about ING-09 and presence oracles.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The value `?ack=` must carry for a start to be honoured.
+///
+/// Spelled out rather than a bare boolean so that a stray `?ack=1`, an empty
+/// `?ack=`, or a form default cannot start a recording by accident. It is the
+/// UI's tick box, and CON-01's "no silent auto-record", on the wire.
+const CONSENT_ACK: &str = "all-party";
+
+/// `GET /api/recording/status`
+pub async fn recording_status(State(state): State<AppState>) -> Response {
+    let Some(recorder) = state.recorder() else {
+        return not_found();
+    };
+    let status = recorder.status();
+    json(
+        &state,
+        &RecordingResponse {
+            status,
+            error: None,
+        },
+    )
+}
+
+/// `POST /api/recording/start`
+///
+/// Requires `?ack=all-party`. The acknowledgement is read with
+/// [`query_param`] rather than from a JSON body on purpose: an extractor that
+/// can reject produces a rejection body, and a rejection body that differs
+/// from a 404 is the oracle ING-09 forbids. `ws_ticket` takes no body for the
+/// same reason.
+pub async fn recording_start(State(state): State<AppState>, uri: Uri) -> Response {
+    let Some(recorder) = state.recorder() else {
+        return not_found();
+    };
+
+    if query_param(uri.query().unwrap_or_default(), "ack").as_deref() != Some(CONSENT_ACK) {
+        return json(
+            &state,
+            &RecordingResponse {
+                status: recorder.status(),
+                error: Some("consent_required".to_owned()),
+            },
+        );
+    }
+
+    // Opening a tap blocks. On a runtime worker that would stall the live
+    // delta stream of the meeting being started, which is the one thing the
+    // user is watching at that moment.
+    let result = tokio::task::spawn_blocking(move || {
+        let outcome = recorder.start();
+        (outcome, recorder.status())
+    })
+    .await;
+
+    let Ok((outcome, status)) = result else {
+        return server_error();
+    };
+
+    let error = match outcome {
+        Ok(_) => None,
+        // Not surfaced as a failure: a double-clicked button produces it, and
+        // the honest answer is the state, which is already "recording".
+        Err(RecorderError::AlreadyRecording) => Some("already_recording".to_owned()),
+        Err(e) => Some(e.to_string()),
+    };
+    json(&state, &RecordingResponse { status, error })
+}
+
+/// `POST /api/recording/stop`
+pub async fn recording_stop(State(state): State<AppState>) -> Response {
+    let Some(recorder) = state.recorder() else {
+        return not_found();
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        let outcome = recorder.stop();
+        (outcome, recorder.status())
+    })
+    .await;
+
+    let Ok((outcome, status)) = result else {
+        return server_error();
+    };
+
+    let error = match outcome {
+        // Stopping something already stopped is what a reloaded tab does. The
+        // state it asked for is the state it got.
+        Ok(_) | Err(RecorderError::NotRecording) => None,
+        Err(e) => Some(e.to_string()),
+    };
+    json(&state, &RecordingResponse { status, error })
 }
 
 /// `GET /api/meetings`

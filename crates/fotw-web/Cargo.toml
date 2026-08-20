@@ -58,6 +58,9 @@ tower = { version = "0.5", default-features = false }
 fotw-store = { path = "../fotw-store", optional = true }
 
 [dev-dependencies]
+# The integration tests parse response bodies; a normal dependency is not
+# in scope for a `tests/` target.
+serde_json = { workspace = true }
 tokio = { workspace = true, features = [
   "io-util",
   "macros",

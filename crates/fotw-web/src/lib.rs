@@ -73,6 +73,7 @@ pub mod api;
 pub mod assets;
 pub mod ingress;
 pub mod query;
+pub mod recorder;
 pub mod secret;
 pub mod server;
 pub mod source;
@@ -85,6 +86,7 @@ pub mod tokens;
 pub mod store_source;
 
 pub use crate::ingress::{Deny, IngressPolicy, not_found};
+pub use crate::recorder::{RecorderControl, RecorderError, RecordingState, RecordingStatus};
 pub use crate::secret::Secret;
 pub use crate::server::{WebServer, router};
 pub use crate::source::{
