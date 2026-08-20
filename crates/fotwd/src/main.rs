@@ -542,7 +542,7 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
     let key_store = secrets::keystore().ok();
     let found = key_store
         .as_ref()
-        .and_then(|s| secrets::deepgram_key(s as &dyn KeyStore));
+        .and_then(|s| secrets::deepgram_key(*s as &dyn KeyStore));
     let transcription = match found {
         Some((secret, origin)) => {
             match origin {
@@ -1067,7 +1067,7 @@ fn key_command(args: &[String]) -> ExitCode {
                 eprintln!("fotwd: could not read the key");
                 return ExitCode::FAILURE;
             }
-            match secrets::store_key(&store, provider, &line) {
+            match secrets::store_key(store, provider, &line) {
                 Ok(()) => {
                     println!("stored {} in the keychain", provider.display_name());
                     ExitCode::SUCCESS
@@ -1162,7 +1162,7 @@ fn recover_command(data_root: PathBuf, check_only: bool) -> ExitCode {
     }
 
     let store = store.expect("checked above");
-    match recovery::recover(&data_root, &store, &typed) {
+    match recovery::recover(&data_root, store, &typed) {
         Ok(mut outcome) => {
             let count = outcome
                 .db
@@ -1259,7 +1259,7 @@ async fn summarize_command(root: PathBuf, meeting_id: String, slug: Option<Strin
     };
     println!("  template   : {} ({})", template.name, template.slug);
 
-    match fotwd::summarize::summarize_meeting(&mut db, &store, &meeting_id, &template).await {
+    match fotwd::summarize::summarize_meeting(&mut db, store, &meeting_id, &template).await {
         Ok(out) => {
             println!("  version    : v{}", out.version);
             println!("  grounding  : {:.0}%", out.coverage * 100.0);

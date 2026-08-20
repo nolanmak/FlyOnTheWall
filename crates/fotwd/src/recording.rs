@@ -188,7 +188,7 @@ fn keychain_transcription() -> Transcription {
     let store = secrets::keystore().ok();
     match store
         .as_ref()
-        .and_then(|s| secrets::deepgram_key(s as &dyn KeyStore))
+        .and_then(|s| secrets::deepgram_key(*s as &dyn KeyStore))
     {
         Some((secret, _)) => Transcription::Deepgram(Box::new(DeepgramStreamConfig::new(
             secret.expose().to_owned(),
