@@ -44,11 +44,11 @@ async fn main() -> ExitCode {
             record(root, secs, acknowledged).await
         }
         Some("serve") => {
-            let root = args
-                .iter()
-                .skip(1)
-                .find(|a| !a.starts_with("--"))
-                .map_or_else(default_root, |s| PathBuf::from(s.as_str()));
+            // `positionals` so that the number after `--port` is not mistaken
+            // for the sessions directory.
+            let root = positionals(&args[1..], &["--port"])
+                .first()
+                .map_or_else(default_root, PathBuf::from);
             if let Err(e) = std::fs::create_dir_all(&root) {
                 eprintln!("fotwd: cannot create {}: {e}", root.display());
                 return ExitCode::FAILURE;
@@ -60,7 +60,14 @@ async fn main() -> ExitCode {
             } else {
                 fotwd::serve::Launch::OpenBrowser
             };
-            match fotwd::serve::serve(root, launch).await {
+            let port = match fotwd::serve::parse_port(&args) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("fotwd: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match fotwd::serve::serve(root, launch, port).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("fotwd: {e}");
@@ -122,7 +129,7 @@ async fn main() -> ExitCode {
         Some("import") => import_command(&args[1..]),
         _ => {
             eprintln!(
-                "usage: fotwd <serve [dir] | record [seconds] [dir] [--i-have-consent] | \
+                "usage: fotwd <serve [dir] [--port <n>] | record [seconds] [dir] [--i-have-consent] | \
                  list [dir] | summarize <id> [dir] [--template <slug>] | disclose | \
                  onboard | detect [seconds] | \
                  retention [dir] [--apply] [--days <n>] [--budget-gib <n>] | \
