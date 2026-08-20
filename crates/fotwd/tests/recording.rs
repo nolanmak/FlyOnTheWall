@@ -70,6 +70,9 @@ fn recorder(root: &std::path::Path, finished: Arc<AtomicU64>) -> DaemonRecorder 
             finished.fetch_add(1, Ordering::Relaxed);
         }),
         Duration::from_secs(5),
+        // Generous: these taps start instantly, and a deadline that raced the
+        // scheduler would make the suite flaky rather than strict.
+        Duration::from_secs(10),
     )
 }
 

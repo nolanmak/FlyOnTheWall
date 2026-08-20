@@ -43,7 +43,7 @@ use fotw_web::{RecorderControl, RecorderError, RecordingStatus};
 use crate::audit::{AuditKind, AuditLog};
 use crate::consent::{JurisdictionSignals, Rules};
 use crate::secrets;
-use crate::session::{self, SessionOutcome, StopSignal, Transcription};
+use crate::session::{self, SessionControl, SessionOutcome, StopSignal, Transcription};
 
 /// How a session acquires its taps.
 ///
@@ -79,6 +79,7 @@ pub struct DaemonRecorder {
     transcription: TranscriptionFactory,
     finish: Arc<Finisher>,
     ceiling: Duration,
+    ready_deadline: Duration,
     live: Arc<Mutex<Option<Live>>>,
 }
 
@@ -96,6 +97,17 @@ impl std::fmt::Debug for DaemonRecorder {
 /// retention indefinitely as well as fill the disk. Eight hours is longer than
 /// any meeting and shorter than a weekend.
 pub const UI_CEILING: Duration = Duration::from_secs(8 * 60 * 60);
+
+/// How long `start()` waits for capture to actually begin before calling it a
+/// failure.
+///
+/// Generous, because opening a real device is not instant, but finite: a Core
+/// Audio device whose HAL still believes a dead client holds it blocks in
+/// `start()` forever rather than returning an error, and nothing inside this
+/// process can cancel the syscall it is stuck in. Fifteen seconds is longer
+/// than any healthy start and short enough that a user learns the truth while
+/// they are still looking at the button.
+pub const READY_DEADLINE: Duration = Duration::from_secs(15);
 
 impl DaemonRecorder {
     /// A recorder that opens the host's real devices.
@@ -119,6 +131,7 @@ impl DaemonRecorder {
             Box::new(keychain_transcription),
             Box::new(persist_and_promote),
             UI_CEILING,
+            READY_DEADLINE,
         )
     }
 
@@ -131,6 +144,7 @@ impl DaemonRecorder {
         transcription: TranscriptionFactory,
         finish: Finisher,
         ceiling: Duration,
+        ready_deadline: Duration,
     ) -> Self {
         Self {
             root,
@@ -139,6 +153,7 @@ impl DaemonRecorder {
             transcription,
             finish: Arc::new(finish),
             ceiling,
+            ready_deadline,
             live: Arc::new(Mutex::new(None)),
         }
     }
@@ -260,7 +275,9 @@ impl RecorderControl for DaemonRecorder {
 
         let transcription = (self.transcription)();
 
-        let stop = StopSignal::new();
+        let control = SessionControl::new();
+        let stop = control.stop.clone();
+        let ready = control.ready.clone();
         let started_at_ms = now_ms();
         *slot = Some(Live {
             stop: stop.clone(),
@@ -281,11 +298,26 @@ impl RecorderControl for DaemonRecorder {
             mic,
             transcription,
             ceiling,
-            stop,
+            control,
             started_at_ms,
-            live,
+            Arc::clone(&live),
             finish,
         ));
+
+        // Do not answer until capture is real. Answering on spawn is what let
+        // a wedged device show a RECORDING badge over an empty disk.
+        if !ready.wait_timeout(self.ready_deadline) {
+            stop.stop();
+            *live.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            return Err(RecorderError::Failed(
+                "the audio device did not start. This is usually a Core Audio \
+                 HAL that still believes a dead client holds the device; it \
+                 blocks rather than failing, and nothing in this process can \
+                 cancel it. Restart the audio daemon with `sudo killall \
+                 coreaudiod` (this briefly interrupts all audio) and try again."
+                    .to_owned(),
+            ));
+        }
 
         Ok(RecordingStatus::recording(started_at_ms, 0))
     }
@@ -323,13 +355,13 @@ async fn spawn_session(
     mic: Option<Box<dyn AudioTap>>,
     transcription: Transcription,
     ceiling: Duration,
-    stop: StopSignal,
+    control: SessionControl,
     started_at_ms: u64,
     live: Arc<Mutex<Option<Live>>>,
     finish: Arc<Finisher>,
 ) {
     let outcome =
-        session::run_with_stop(&root, system, mic, transcription, ceiling, stop).await;
+        session::run_with_control(&root, system, mic, transcription, ceiling, control).await;
 
     match outcome {
         Ok(outcome) => {

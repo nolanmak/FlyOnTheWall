@@ -180,6 +180,90 @@ impl StopSignal {
     }
 }
 
+/// A latch the session trips once capture is genuinely live.
+///
+/// The counterpart to [`StopSignal`], and the answer to a specific bug: the
+/// taps are started *inside* the session, so a caller that spawned it and
+/// returned would report "recording" while a Core Audio device sat blocked in
+/// `start()`. That produced a red badge, a ticking clock and an empty disk —
+/// the one failure mode this project exists to avoid.
+///
+/// # Why a `Condvar` and not a `Notify`
+///
+/// The waiter is not async. `RecorderControl::start` is called on a blocking
+/// pool thread and has to answer before it returns, so it needs a blocking
+/// wait with a deadline; the signaller is on the runtime and only sets a flag.
+#[derive(Clone, Debug, Default)]
+pub struct ReadySignal(Arc<ReadyInner>);
+
+#[derive(Debug, Default)]
+struct ReadyInner {
+    ready: std::sync::Mutex<bool>,
+    woke: std::sync::Condvar,
+}
+
+impl ReadySignal {
+    /// A signal nobody has tripped yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Announce that capture is live. Idempotent.
+    pub fn signal(&self) {
+        let mut ready = self.0.ready.lock().unwrap_or_else(|e| e.into_inner());
+        *ready = true;
+        // `notify_all`, not `notify_one`: the flag is level-triggered and more
+        // than one thread may be waiting on a slow start.
+        self.0.woke.notify_all();
+    }
+
+    /// Whether capture has been announced.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        *self.0.ready.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Block until capture is live, or `timeout` elapses.
+    ///
+    /// Returns whether it became ready. Loops on the predicate rather than
+    /// trusting a single wake, because a `Condvar` may wake spuriously.
+    #[must_use]
+    pub fn wait_timeout(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut ready = self.0.ready.lock().unwrap_or_else(|e| e.into_inner());
+        while !*ready {
+            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return false;
+            };
+            let (guard, _) = self
+                .0
+                .woke
+                .wait_timeout(ready, left)
+                .unwrap_or_else(|e| e.into_inner());
+            ready = guard;
+        }
+        true
+    }
+}
+
+/// The two latches a caller outside the session holds.
+#[derive(Clone, Debug, Default)]
+pub struct SessionControl {
+    /// Trip to end the session early.
+    pub stop: StopSignal,
+    /// Tripped by the session once capture is live.
+    pub ready: ReadySignal,
+}
+
+impl SessionControl {
+    /// A fresh pair.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// Run a meeting session to completion.
 ///
 /// `system` is required; `mic` is optional so a machine with no input device
@@ -219,12 +303,40 @@ pub async fn run(
 /// Whatever [`run`] fails with.
 pub async fn run_with_stop(
     root: &Path,
+    system: Box<dyn AudioTap>,
+    mic: Option<Box<dyn AudioTap>>,
+    transcription: Transcription,
+    duration: Duration,
+    stop: StopSignal,
+) -> Result<SessionOutcome, String> {
+    run_with_control(
+        root,
+        system,
+        mic,
+        transcription,
+        duration,
+        SessionControl {
+            stop,
+            ready: ReadySignal::new(),
+        },
+    )
+    .await
+}
+
+/// [`run_with_stop`], and the caller also learns when capture went live.
+///
+/// # Errors
+///
+/// Whatever [`run`] fails with.
+pub async fn run_with_control(
+    root: &Path,
     mut system: Box<dyn AudioTap>,
     mut mic: Option<Box<dyn AudioTap>>,
     transcription: Transcription,
     duration: Duration,
-    stop_signal: StopSignal,
+    control: SessionControl,
 ) -> Result<SessionOutcome, String> {
+    let stop_signal = control.stop;
     let silent = Arc::new(AtomicU64::new(0));
     let total = Arc::new(AtomicU64::new(0));
 
@@ -294,6 +406,12 @@ pub async fn run_with_stop(
             }
         })
     });
+
+    // Capture is genuinely live now: both taps returned from `start`, the WAL
+    // exists and the pump is draining. Announced here rather than at the top
+    // of the function because a tap that blocks in `start` never reaches this
+    // line — which is the whole point.
+    control.ready.signal();
 
     // Whichever comes first. `select!` drops the loser, and both branches are
     // cancel-safe: a dropped `sleep` is a dropped timer, and a dropped
