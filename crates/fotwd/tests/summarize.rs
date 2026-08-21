@@ -87,6 +87,7 @@ fn seeded_meeting(db: &mut Db, dir: &std::path::Path) -> String {
                 1_000,
             ),
         ],
+        stt_errors: Vec::new(),
     };
     persist::persist_session(db, &outcome, "Weekly sync").unwrap()
 }

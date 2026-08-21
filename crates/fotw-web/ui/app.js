@@ -381,6 +381,14 @@ function renderRecording(body) {
   // gated on it — a user who cannot stop a recording is the worse failure.
   el.consentLabel.hidden = recordingNow;
   el.record.disabled = !recordingNow && !el.consent.checked;
+
+  // Said out loud while the meeting is still running. Two Deepgram bugs each
+  // killed the stream on connect and reported nothing anywhere, so hours of
+  // audio were captured beside an empty transcript that looked exactly like a
+  // quiet meeting. Finding out afterwards is finding out too late.
+  if (body.transcription_error) {
+    say("Recording, but transcription is failing: " + body.transcription_error);
+  }
 }
 
 async function onRecord() {

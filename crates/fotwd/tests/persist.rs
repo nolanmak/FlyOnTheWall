@@ -65,6 +65,7 @@ fn outcome(dir: &std::path::Path, segments: Vec<TranscriptSegment>) -> SessionOu
         total_buffers: 400,
         dropped_samples: 0,
         segments,
+        stt_errors: Vec::new(),
     }
 }
 
