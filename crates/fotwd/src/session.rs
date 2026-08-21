@@ -54,6 +54,12 @@ pub struct SessionOutcome {
     pub system_samples: u64,
     /// Interleaved samples written for the mic leg.
     pub mic_samples: u64,
+    /// What the transcription provider failed with, if anything.
+    ///
+    /// Empty is not the same as "transcription worked": a session with
+    /// [`Transcription::Disabled`] also has none. The two are distinguished by
+    /// what the caller configured, not by this field.
+    pub stt_errors: Vec<String>,
     /// Buffers the tap delivered that were digitally silent.
     pub silent_buffers: u64,
     /// Total buffers the tap delivered.
@@ -247,6 +253,59 @@ impl ReadySignal {
     }
 }
 
+/// What the transcription provider said went wrong, as it happens.
+///
+/// # Why this type exists at all
+///
+/// `run` used to consume `StreamEvent::Final` and drop `StreamEvent::Error`.
+/// Two separate bugs each killed the Deepgram stream on connect — a handshake
+/// the provider rejected, and a frame shape the reader could not parse — and
+/// neither produced a single line of output anywhere. An empty `stt.jsonl`
+/// beside hours of good audio is indistinguishable from a meeting where nobody
+/// spoke, so both survived until someone went looking with a packet-level
+/// probe. A failure nobody can see is a failure nobody fixes.
+#[derive(Clone, Debug, Default)]
+pub struct SttErrors(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl SttErrors {
+    /// An empty record.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Note that the provider failed.
+    pub fn record(&self, message: impl Into<String>) {
+        self.lock().push(message.into());
+    }
+
+    /// The most recent failure, if any.
+    ///
+    /// The latest rather than the first: a stream that reconnects and fails
+    /// again should surface why it is failing *now*, not the reason it first
+    /// tripped an hour ago.
+    #[must_use]
+    pub fn latest(&self) -> Option<String> {
+        self.lock().last().cloned()
+    }
+
+    /// How many failures have been seen.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// Take everything recorded so far.
+    #[must_use]
+    pub fn drain(&self) -> Vec<String> {
+        std::mem::take(&mut *self.lock())
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// The two latches a caller outside the session holds.
 #[derive(Clone, Debug, Default)]
 pub struct SessionControl {
@@ -254,6 +313,8 @@ pub struct SessionControl {
     pub stop: StopSignal,
     /// Tripped by the session once capture is live.
     pub ready: ReadySignal,
+    /// Filled in by the session when the transcription provider fails.
+    pub errors: SttErrors,
 }
 
 impl SessionControl {
@@ -318,6 +379,7 @@ pub async fn run_with_stop(
         SessionControl {
             stop,
             ready: ReadySignal::new(),
+            errors: SttErrors::new(),
         },
     )
     .await
@@ -397,11 +459,21 @@ pub async fn run_with_control(
     // not accumulate an unbounded queue.
     let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&collected);
+    let error_sink = control.errors.clone();
     let collector = events.take().map(|mut rx| {
         tokio::spawn(async move {
             while let Some(ev) = rx.recv().await {
-                if let StreamEvent::Final(seg) = ev {
-                    sink.lock().unwrap_or_else(|e| e.into_inner()).push(seg);
+                match ev {
+                    StreamEvent::Final(seg) => {
+                        sink.lock().unwrap_or_else(|e| e.into_inner()).push(seg);
+                    }
+                    // Recorded rather than dropped. This is the line whose
+                    // absence hid two fatal bugs for the life of the project.
+                    StreamEvent::Error(e) => {
+                        eprintln!("  ! transcription: {e}");
+                        error_sink.record(e.to_string());
+                    }
+                    _ => {}
                 }
             }
         })
@@ -453,6 +525,9 @@ pub async fn run_with_control(
         total_buffers: total.load(Ordering::Relaxed),
         dropped_samples,
         segments,
+        // Drained after the collector has finished, so a failure that arrived
+        // during the provider's final flush is still carried out.
+        stt_errors: control.errors.drain(),
     })
 }
 

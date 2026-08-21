@@ -44,6 +44,15 @@ pub struct RecordingStatus {
     pub started_at_ms: Option<u64>,
     /// Milliseconds since capture began; `null` while idle.
     pub elapsed_ms: Option<u64>,
+    /// What the transcription provider last failed with, or `null`.
+    ///
+    /// Surfaced live rather than only at the end. Two Deepgram bugs each
+    /// killed the stream on connect and produced nothing anywhere, so hours of
+    /// audio were recorded beside an empty transcript that looked exactly like
+    /// a quiet meeting. `null` means nothing has gone wrong; it is never an
+    /// empty string, which the UI would render as a blank warning.
+    #[serde(default)]
+    pub transcription_error: Option<String>,
 }
 
 impl RecordingStatus {
@@ -54,6 +63,7 @@ impl RecordingStatus {
             state: RecordingState::Idle,
             started_at_ms: None,
             elapsed_ms: None,
+            transcription_error: None,
         }
     }
 
@@ -64,7 +74,15 @@ impl RecordingStatus {
             state: RecordingState::Recording,
             started_at_ms: Some(started_at_ms),
             elapsed_ms: Some(elapsed_ms),
+            transcription_error: None,
         }
+    }
+
+    /// Attach the provider's last failure, if there is one.
+    #[must_use]
+    pub fn with_transcription_error(mut self, error: Option<String>) -> Self {
+        self.transcription_error = error.filter(|e| !e.trim().is_empty());
+        self
     }
 
     /// Whether capture is in flight.

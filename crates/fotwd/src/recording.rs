@@ -43,7 +43,7 @@ use fotw_web::{RecorderControl, RecorderError, RecordingStatus};
 use crate::audit::{AuditKind, AuditLog};
 use crate::consent::{JurisdictionSignals, Rules};
 use crate::secrets;
-use crate::session::{self, SessionControl, SessionOutcome, StopSignal, Transcription};
+use crate::session::{self, SessionControl, SessionOutcome, StopSignal, SttErrors, Transcription};
 
 /// How a session acquires its taps.
 ///
@@ -69,6 +69,9 @@ pub type TranscriptionFactory = Box<dyn Fn() -> Transcription + Send + Sync>;
 struct Live {
     stop: StopSignal,
     started_at_ms: u64,
+    /// So `status()` can report a provider failure while the meeting is still
+    /// running, rather than leaving it to be discovered in an empty file.
+    errors: SttErrors,
 }
 
 /// Starts and stops real recordings on the UI's behalf.
@@ -282,6 +285,7 @@ impl RecorderControl for DaemonRecorder {
         *slot = Some(Live {
             stop: stop.clone(),
             started_at_ms,
+            errors: control.errors.clone(),
         });
         drop(slot);
 
@@ -330,10 +334,13 @@ impl RecorderControl for DaemonRecorder {
         // Trip and return. The task clears the slot once the meeting is on
         // disk; until then status honestly still reads `recording`.
         live.stop.stop();
-        Ok(RecordingStatus::recording(
-            live.started_at_ms,
-            now_ms().saturating_sub(live.started_at_ms),
-        ))
+        Ok(
+            RecordingStatus::recording(
+                live.started_at_ms,
+                now_ms().saturating_sub(live.started_at_ms),
+            )
+            .with_transcription_error(live.errors.latest()),
+        )
     }
 
     fn status(&self) -> RecordingStatus {
@@ -343,6 +350,7 @@ impl RecorderControl for DaemonRecorder {
                 live.started_at_ms,
                 now_ms().saturating_sub(live.started_at_ms),
             )
+            .with_transcription_error(live.errors.latest())
         })
     }
 }
@@ -365,6 +373,9 @@ async fn spawn_session(
 
     match outcome {
         Ok(outcome) => {
+            for e in &outcome.stt_errors {
+                eprintln!("  ! transcription failed during this meeting: {e}");
+            }
             let audit = AuditLog::at(&root);
             if let Err(e) = audit.record(AuditKind::SessionEnd {
                 session: outcome.dir.display().to_string(),

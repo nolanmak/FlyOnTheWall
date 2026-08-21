@@ -345,3 +345,33 @@ fn an_idle_status_carries_no_timestamps() {
     assert!(v["started_at_ms"].is_null());
     assert!(v["elapsed_ms"].is_null());
 }
+
+// ------------------------------------------------- transcription failures
+
+/// A recording whose transcription provider is failing must say so *while it
+/// is running*. Discovering it afterwards is how two fatal Deepgram bugs
+/// survived the life of the project: an empty transcript beside good audio is
+/// indistinguishable from a meeting where nobody spoke.
+#[tokio::test]
+async fn a_transcription_failure_is_visible_in_the_status() {
+    let status = RecordingStatus::recording(1_787_000_000_000, 5_000)
+        .with_transcription_error(Some("deepgram handshake returned HTTP 400".to_owned()));
+
+    let v = serde_json::to_value(&status).unwrap();
+    assert_eq!(v["state"], "recording");
+    assert_eq!(
+        v["transcription_error"].as_str(),
+        Some("deepgram handshake returned HTTP 400")
+    );
+}
+
+/// Silence in this field means "nothing has gone wrong", so it must be null
+/// rather than an empty string the UI would render as a blank warning.
+#[tokio::test]
+async fn a_healthy_recording_reports_no_transcription_error() {
+    let v = serde_json::to_value(RecordingStatus::recording(1, 2)).unwrap();
+    assert!(v["transcription_error"].is_null());
+
+    let idle = serde_json::to_value(RecordingStatus::idle()).unwrap();
+    assert!(idle["transcription_error"].is_null());
+}
