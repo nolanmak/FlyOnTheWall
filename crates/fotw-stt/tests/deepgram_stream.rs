@@ -184,7 +184,7 @@ async fn the_request_carries_the_spec_url_and_the_token_header() {
         "interim_results=true",
         "punctuate=true",
         "smart_format=true",
-        "diarize_model=v1",
+        "diarize=true",
         "endpointing=300",
         "utterance_end_ms=1000",
         "vad_events=true",
@@ -192,7 +192,15 @@ async fn the_request_carries_the_spec_url_and_the_token_header() {
     ] {
         assert!(query.contains(expected), "{expected} missing from {query}");
     }
-    assert!(!query.contains("diarize_model=v2"));
+    // Deepgram refuses the handshake outright when both are present:
+    // "diarize_model cannot be used together with diarize or diarize_version."
+    // It is an HTTP 400 on connect, so nothing is ever transcribed — and
+    // because `session::run` consumes only `StreamEvent::Final`, the failure
+    // is invisible and reads as "nobody spoke".
+    assert!(
+        !query.contains("diarize_model"),
+        "diarize_model must not be sent alongside diarize: {query}"
+    );
 
     stream.close().await.expect("close succeeds");
     drain(&mut events).await;

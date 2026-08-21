@@ -75,15 +75,28 @@ fn mip_opt_out_is_present_on_every_variation_of_the_request() {
     }
 }
 
+/// Deepgram refuses the handshake when `diarize_model` accompanies `diarize`:
+/// "diarize_model cannot be used together with diarize or diarize_version."
+/// It is an HTTP 400 on connect, so nothing is transcribed at all — and since
+/// `session::run` consumes only `StreamEvent::Final`, an empty transcript was
+/// indistinguishable from a meeting where nobody spoke. Every recording this
+/// project ever made came back with zero segments because of this pair.
 #[test]
-fn streaming_sends_diarize_model_v1_and_never_v2() {
+fn streaming_sends_diarize_alone_and_never_the_model_alongside_it() {
     let query = DeepgramStreamParams::spec().to_query();
     assert!(query.contains("diarize=true"));
-    assert!(query.contains(&format!("diarize_model={STREAMING_DIARIZE_MODEL}")));
     assert!(
-        !query.contains(BATCH_ONLY_DIARIZE_MODEL),
-        "diarize_model=v2 is pre-recorded only and fails validation on a stream"
+        !query.contains("diarize_model"),
+        "diarize_model alongside diarize is a 400 on connect: {query}"
     );
+    assert!(!query.contains(BATCH_ONLY_DIARIZE_MODEL));
+}
+
+/// The setter still exists and still guards the batch-only model, because a
+/// caller who reaches for it deserves the error rather than silence.
+#[test]
+fn the_streaming_diarize_model_is_still_the_supported_one() {
+    assert_eq!(DeepgramStreamParams::spec().diarize_model(), STREAMING_DIARIZE_MODEL);
 }
 
 #[test]
@@ -612,4 +625,54 @@ fn an_uncoded_error_frame_falls_back_to_server() {
     let error = frame.to_stt_error();
     assert_eq!(error.class, SttErrorClass::Server);
     assert!(error.retryable, "a 5xx-shaped failure is worth retrying");
+}
+
+// ---------------------------------------------------- frame shape, per type
+
+/// `channel` is not one shape. On a `Results` frame it is the object holding
+/// `alternatives`; on a `SpeechStarted` frame it is an array of channel
+/// indices, `[0,1]`.
+///
+/// Typing it as the object alone meant serde read `[0,1]` as the struct,
+/// mapped element `0` onto `alternatives`, and failed with "invalid type:
+/// integer `0`, expected a sequence". Because `vad_events=true` is in the spec
+/// parameter set, `SpeechStarted` is the FIRST frame Deepgram sends — so the
+/// stream died before a single word was transcribed, on every meeting.
+#[test]
+fn a_speech_started_frame_does_not_break_the_reader() {
+    let raw = r#"{"type":"SpeechStarted","channel":[0,1],"timestamp":0.05}"#;
+    let parsed: fotw_stt::deepgram::DeepgramResult =
+        serde_json::from_str(raw).expect("SpeechStarted must parse");
+
+    assert_eq!(parsed.message_type.as_deref(), Some("SpeechStarted"));
+    assert!(
+        parsed.channel.is_none(),
+        "an array channel carries no alternatives and must read as absent"
+    );
+}
+
+#[test]
+fn an_utterance_end_frame_parses_too() {
+    let raw = r#"{"type":"UtteranceEnd","channel":[0,1],"last_word_end":2.5}"#;
+    let parsed: fotw_stt::deepgram::DeepgramResult =
+        serde_json::from_str(raw).expect("UtteranceEnd must parse");
+    assert_eq!(parsed.message_type.as_deref(), Some("UtteranceEnd"));
+}
+
+/// The object form must still be read, or the fix would trade one silent
+/// failure for another.
+#[test]
+fn a_results_frame_still_yields_its_alternatives() {
+    let raw = r#"{"type":"Results","channel_index":[0,1],"duration":1.0,"start":0.0,
+        "is_final":true,"speech_final":true,
+        "channel":{"alternatives":[{"transcript":"hello there","confidence":0.99,"words":[]}]}}"#;
+    let parsed: fotw_stt::deepgram::DeepgramResult =
+        serde_json::from_str(raw).expect("Results must parse");
+
+    let channel = parsed.channel.expect("Results carries a channel object");
+    assert_eq!(
+        channel.alternatives.first().map(|a| a.transcript.as_str()),
+        Some("hello there")
+    );
+    assert!(parsed.is_final);
 }

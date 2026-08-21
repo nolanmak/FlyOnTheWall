@@ -257,12 +257,24 @@ impl DeepgramStreamParams {
             ("smart_format".into(), bool_param(self.smart_format)),
         ];
 
-        // The spec's parameter list names `diarize_model` but not `diarize`.
-        // Deepgram needs both: `diarize_model` alone selects a model for a
-        // feature that is still off, and every word comes back with no speaker.
+        // `diarize` alone, never with `diarize_model`.
+        //
+        // Deepgram refuses the handshake when both are present —
+        // "diarize_model cannot be used together with diarize or
+        // diarize_version" — as an HTTP 400 on connect, before a single word
+        // is transcribed. Sending both was a silent, total loss of
+        // transcription: `session::run` consumes only `StreamEvent::Final`, so
+        // the error went nowhere and an empty `stt.jsonl` read as a meeting
+        // where nobody spoke.
+        //
+        // The earlier comment here reasoned that `diarize_model` alone would
+        // select a model for a feature that is still off. That is true, and
+        // the conclusion drawn from it — send both — is what broke it. The
+        // parameter is kept on the struct because `with_diarize_model` still
+        // guards the batch-only `v2`, and a caller that sets it explicitly
+        // should still be told no.
         if self.diarize {
             pairs.push(("diarize".into(), "true".into()));
-            pairs.push(("diarize_model".into(), self.diarize_model.clone()));
         }
 
         pairs.push(("endpointing".into(), self.endpointing_ms.to_string()));
