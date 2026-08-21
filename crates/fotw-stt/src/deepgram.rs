@@ -51,9 +51,50 @@ pub struct DeepgramResult {
     /// Chunk duration in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration: Option<f64>,
-    /// Absent on non-`Results` frames.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The `Results` channel object, or `None` on any other frame.
+    ///
+    /// Read through [`channel_object_only`] because `channel` is not one
+    /// shape: `Results` sends the object holding `alternatives`, while
+    /// `SpeechStarted` and `UtteranceEnd` send an array of channel indices,
+    /// `[0,1]`.
+    #[serde(
+        default,
+        deserialize_with = "channel_object_only",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub channel: Option<DeepgramChannel>,
+}
+
+/// Accept the object form of `channel` and ignore every other shape.
+///
+/// # The bug this exists to prevent
+///
+/// Typed as `Option<DeepgramChannel>` alone, serde read `SpeechStarted`'s
+/// `"channel":[0,1]` as the struct — arrays deserialise into structs
+/// positionally — mapped element `0` onto `alternatives`, and failed with
+/// "invalid type: integer `0`, expected a sequence".
+///
+/// That was fatal rather than cosmetic. `vad_events=true` is in the spec
+/// parameter set, so `SpeechStarted` is the *first* frame Deepgram sends: the
+/// reader errored before any `Results` frame arrived, the driver closed the
+/// stream, and `session::run` — which consumes only `StreamEvent::Final` —
+/// reported nothing at all. Every recording came back with an empty
+/// transcript that was indistinguishable from a meeting where nobody spoke.
+fn channel_object_only<'de, D>(deserializer: D) -> Result<Option<DeepgramChannel>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if value.is_object() {
+        serde_json::from_value(value)
+            .map(Some)
+            .map_err(serde::de::Error::custom)
+    } else {
+        // An array of channel indices, or null. Neither carries alternatives,
+        // and neither is a reason to drop the connection.
+        Ok(None)
+    }
 }
 
 /// The `channel` object of a `Results` frame.
