@@ -125,6 +125,7 @@ async fn a_foreign_origin_is_refused_on_every_endpoint() {
         "/api/meetings",
         &format!("/api/meetings/{MEETING_ID}"),
         "/api/search?q=loopback",
+        "/api/settings/github",
     ] {
         let mut headers = h.authorised();
         headers[1] = ("Origin".into(), "http://evil.test".into());
@@ -162,6 +163,7 @@ async fn no_token_no_data() {
         "/api/meetings",
         &format!("/api/meetings/{MEETING_ID}"),
         "/api/search?q=loopback",
+        "/api/settings/github",
     ] {
         let res = h.get(path, &h.anonymous()).await;
         assert_eq!(res.status, 404, "{path} must require the bearer token");
@@ -169,6 +171,22 @@ async fn no_token_no_data() {
     }
     assert_eq!(
         h.post("/api/ws-ticket", &h.anonymous(), None).await.status,
+        404
+    );
+    assert_eq!(
+        h.post("/api/settings/github", &h.anonymous(), None)
+            .await
+            .status,
+        404
+    );
+    assert_eq!(
+        h.post(
+            &format!("/api/meetings/{MEETING_ID}/github-push"),
+            &h.anonymous(),
+            None
+        )
+        .await
+        .status,
         404
     );
 }
@@ -206,6 +224,7 @@ async fn nothing_this_server_returns_ever_sets_a_cookie() {
         )
         .await,
         h.get("/api/meetings", &h.anonymous()).await,
+        h.get("/api/settings/github", &h.authorised()).await,
     ];
     for res in responses {
         assert!(

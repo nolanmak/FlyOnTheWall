@@ -63,6 +63,22 @@ impl WebServer {
         source: Arc<dyn MeetingSource>,
         recorder: Option<Arc<dyn crate::recorder::RecorderControl>>,
     ) -> io::Result<Self> {
+        Self::bind_with_controls(port, source, recorder, None).await
+    }
+
+    /// [`WebServer::bind_with_recorder`], with the GitHub export control as
+    /// well (issue #63).
+    ///
+    /// # Errors
+    ///
+    /// Whatever binding the loopback listener failed with, or if the bound
+    /// address is somehow not loopback.
+    pub async fn bind_with_controls(
+        port: u16,
+        source: Arc<dyn MeetingSource>,
+        recorder: Option<Arc<dyn crate::recorder::RecorderControl>>,
+        github: Option<Arc<dyn crate::github::GithubExport>>,
+    ) -> io::Result<Self> {
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await?;
         let addr = listener.local_addr()?;
         if !addr.ip().is_loopback() {
@@ -70,8 +86,12 @@ impl WebServer {
                 "refusing to serve: bound {addr}, which is not loopback"
             )));
         }
-        let state =
-            AppState::with_recorder(IngressPolicy::for_loopback_port(addr.port()), source, recorder);
+        let state = AppState::with_controls(
+            IngressPolicy::for_loopback_port(addr.port()),
+            source,
+            recorder,
+            github,
+        );
         Ok(Self {
             listener,
             addr,
@@ -153,6 +173,11 @@ fn routes(state: AppState) -> Router {
         .route("/api/recording/status", get(api::recording_status))
         .route("/api/recording/start", post(api::recording_start))
         .route("/api/recording/stop", post(api::recording_stop))
+        .route(
+            "/api/settings/github",
+            get(api::github_settings).post(api::github_set_settings),
+        )
+        .route("/api/meetings/{id}/github-push", post(api::github_push))
         // Both of these are ING-09. The fallback is the same bare 404 the
         // guard returns, so "wrong token" and "no such path" are one response.
         // The method fallback replaces axum's `405 Method Not Allowed` with an

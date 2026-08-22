@@ -31,7 +31,8 @@ use fotw_audio::{AudioTap, CaptureTimestamp, FrameFlags, FrameSink, StreamFormat
 use fotw_pipeline::resample::{Downmixer, Resampler16k};
 use fotw_pipeline::ring::{AudioRing, RingConsumer, RingProducer};
 use fotw_pipeline::wal::{SessionWal, SttRecord};
-use fotw_stt::{DeepgramStream, DeepgramStreamConfig, StreamEvent, TranscriptSegment};
+use fotw_stt::deepgram::DeepgramConfig;
+use fotw_stt::{DeepgramStream, DeepgramStreamConfig, Source, StreamEvent, TranscriptSegment};
 
 /// Ring capacity per leg, in samples. Ten seconds at 48 kHz stereo.
 const RING_SAMPLES: usize = 48_000 * 2 * 10;
@@ -111,12 +112,80 @@ impl FrameSink for RingSink {
     fn on_error(&mut self, _e: TapError) {}
 }
 
+/// One Deepgram connection per capture leg.
+///
+/// Spec 7.5 called two cloud streams an explicit decision because the second
+/// one doubles the bill. The decision, made in issue #60: the mic leg is **on
+/// by default** — a meeting-notes tool that omits the note-taker's half of
+/// every conversation fails at its one job — and declined explicitly with
+/// `FOTW_MIC_STT=off`, because a bill must be declinable.
+pub struct DeepgramLegs {
+    /// The far end: everybody else on the call. Always transcribed.
+    pub system: Box<DeepgramStreamConfig>,
+    /// The near end: the user. `None` on a machine with no input device, or
+    /// when the opt-out is set. The session also refuses to open this stream
+    /// if the mic tap did not actually start — a paid connection fed nothing
+    /// would be pure cost.
+    pub mic: Option<Box<DeepgramStreamConfig>>,
+}
+
+impl DeepgramLegs {
+    /// The legs for one session, from the one key both connections share.
+    ///
+    /// Diarization asymmetry is inherited from [`DeepgramConfig::new`]: the
+    /// system leg is diarized (`S0`, `S1`, …), the mic leg is not — it is one
+    /// known person, and the normalizer labels it `me`.
+    #[must_use]
+    pub fn for_session(
+        api_key: &str,
+        session_id: &str,
+        mic_present: bool,
+        mic_enabled: bool,
+    ) -> Self {
+        let system = Box::new(DeepgramStreamConfig::new(
+            api_key.to_owned(),
+            DeepgramConfig::new(session_id.to_owned(), Source::System),
+        ));
+        let mic = (mic_present && mic_enabled).then(|| {
+            Box::new(DeepgramStreamConfig::new(
+                api_key.to_owned(),
+                DeepgramConfig::new(session_id.to_owned(), Source::Mic),
+            ))
+        });
+        Self { system, mic }
+    }
+}
+
+/// Whether the mic leg should be transcribed, from `FOTW_MIC_STT`.
+///
+/// Unset means on. Only the documented `off` and the spellings muscle memory
+/// produces (`0`, `false`, any casing) mean off — a typo must fail toward the
+/// documented default, and `FOTW_MIC_STT=on` set by a script must not read as
+/// an opt-out.
+#[must_use]
+pub fn mic_stt_enabled(value: Option<&str>) -> bool {
+    !value.is_some_and(|v| {
+        let v = v.trim();
+        v.eq_ignore_ascii_case("off") || v == "0" || v.eq_ignore_ascii_case("false")
+    })
+}
+
+/// Put segments from both legs into spoken order.
+///
+/// Two streams finalize independently, so segments arrive interleaved by
+/// network luck rather than by when the words were said; unmerged, a
+/// two-person exchange reads as two monologues. Stable, so equal start times
+/// keep arrival order and the same meeting always renders byte-identically.
+pub fn order_segments(segments: &mut [TranscriptSegment]) {
+    segments.sort_by_key(|s| s.start_ms);
+}
+
 /// How to transcribe, if at all.
 pub enum Transcription {
     /// Record only. Still fully useful — the audio can be transcribed later.
     Disabled,
-    /// Stream to Deepgram as the meeting runs.
-    Deepgram(Box<DeepgramStreamConfig>),
+    /// Stream to Deepgram as the meeting runs, one connection per leg.
+    Deepgram(DeepgramLegs),
 }
 
 impl std::fmt::Debug for Transcription {
@@ -306,6 +375,50 @@ impl SttErrors {
     }
 }
 
+/// The closure shape a [`SegmentTap`] holds.
+type SegmentFn = dyn Fn(&TranscriptSegment) + Send + Sync;
+
+/// A callback the collector hands every finalized segment, as it arrives.
+///
+/// This is the live-transcript producer seam (#61): the hub, its flusher and
+/// the WebSocket all existed with nothing feeding them, so a transcript was
+/// only ever visible after the meeting finalized. The default is silence —
+/// every caller that does not name the feature keeps its old behavior.
+///
+/// A wrapper rather than a bare `Option<Arc<dyn Fn>>` so `SessionControl`
+/// keeps deriving `Clone` and `Default`, and so `Debug` can redact: segments
+/// are meeting content, and §10's never-log rule does not stop at log files.
+#[derive(Clone, Default)]
+pub struct SegmentTap(Option<Arc<SegmentFn>>);
+
+impl std::fmt::Debug for SegmentTap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "SegmentTap(<set>)"
+        } else {
+            "SegmentTap(<none>)"
+        })
+    }
+}
+
+impl SegmentTap {
+    /// A tap that hands each segment to `f`.
+    ///
+    /// `f` runs on the collector task while the meeting is live, so it must
+    /// not block: the hub's `publish` is a buffered push by design.
+    #[must_use]
+    pub fn new(f: impl Fn(&TranscriptSegment) + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(f)))
+    }
+
+    /// Hand one segment over, or do nothing when no tap was set.
+    pub fn emit(&self, segment: &TranscriptSegment) {
+        if let Some(f) = &self.0 {
+            f(segment);
+        }
+    }
+}
+
 /// The two latches a caller outside the session holds.
 #[derive(Clone, Debug, Default)]
 pub struct SessionControl {
@@ -315,6 +428,8 @@ pub struct SessionControl {
     pub ready: ReadySignal,
     /// Filled in by the session when the transcription provider fails.
     pub errors: SttErrors,
+    /// Handed every finalized segment as it arrives, for the live transcript.
+    pub on_segment: SegmentTap,
 }
 
 impl SessionControl {
@@ -380,6 +495,7 @@ pub async fn run_with_stop(
             stop,
             ready: ReadySignal::new(),
             errors: SttErrors::new(),
+            on_segment: SegmentTap::default(),
         },
     )
     .await
@@ -430,17 +546,30 @@ pub async fn run_with_control(
 
     // The STT side, if configured. `write` is non-blocking, so the pump can
     // feed it without ever waiting on the network.
-    let (stt, mut events) = match transcription {
-        Transcription::Disabled => (None, None),
-        Transcription::Deepgram(cfg) => {
-            let (s, rx) = DeepgramStream::open(*cfg);
-            (Some(Arc::new(s)), Some(rx))
+    // One stream per leg. The mic stream is additionally gated on the mic tap
+    // having actually started: a paid connection for a device that is not
+    // there would be fed nothing and still billed for the socket.
+    let (sys_stt, sys_events, mic_stt, mic_events) = match transcription {
+        Transcription::Disabled => (None, None, None, None),
+        Transcription::Deepgram(legs) => {
+            let (s, s_rx) = DeepgramStream::open(*legs.system);
+            let (m, m_rx) = match legs.mic {
+                Some(cfg) if mic_format.is_some() => {
+                    let (m, rx) = DeepgramStream::open(*cfg);
+                    (Some(Arc::new(m)), Some(rx))
+                }
+                _ => (None, None),
+            };
+            (Some(Arc::new(s)), Some(s_rx), m, m_rx)
         }
     };
 
     let stop = Arc::new(AtomicBool::new(false));
     let pump_stop = Arc::clone(&stop);
-    let stt_for_pump = stt.clone();
+    let feeds = SttFeeds {
+        system: sys_stt.clone(),
+        mic: mic_stt.clone(),
+    };
 
     // The pump owns the WAL and does every blocking thing.
     let pump = std::thread::spawn(move || -> Result<(u64, u64, u64), String> {
@@ -450,33 +579,32 @@ pub async fn run_with_control(
             mic_cons,
             sys_format,
             mic_format,
-            stt_for_pump,
+            feeds,
             &pump_stop,
         )
     });
 
     // Drain transcript events while the meeting runs, so a long meeting does
-    // not accumulate an unbounded queue.
+    // not accumulate an unbounded queue. One collector per leg, into one
+    // shared sink — the merge is a sort at the end, not a select here.
     let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = Arc::clone(&collected);
-    let error_sink = control.errors.clone();
-    let collector = events.take().map(|mut rx| {
-        tokio::spawn(async move {
-            while let Some(ev) = rx.recv().await {
-                match ev {
-                    StreamEvent::Final(seg) => {
-                        sink.lock().unwrap_or_else(|e| e.into_inner()).push(seg);
-                    }
-                    // Recorded rather than dropped. This is the line whose
-                    // absence hid two fatal bugs for the life of the project.
-                    StreamEvent::Error(e) => {
-                        eprintln!("  ! transcription: {e}");
-                        error_sink.record(e.to_string());
-                    }
-                    _ => {}
-                }
-            }
-        })
+    let sys_collector = sys_events.map(|rx| {
+        spawn_leg_collector(
+            "system",
+            rx,
+            Arc::clone(&collected),
+            control.errors.clone(),
+            control.on_segment.clone(),
+        )
+    });
+    let mic_collector = mic_events.map(|rx| {
+        spawn_leg_collector(
+            "mic",
+            rx,
+            Arc::clone(&collected),
+            control.errors.clone(),
+            control.on_segment.clone(),
+        )
     });
 
     // Capture is genuinely live now: both taps returned from `start`, the WAL
@@ -502,19 +630,22 @@ pub async fn run_with_control(
     let (system_samples, mic_samples, dropped_samples) =
         pump.join().map_err(|_| "pump panicked".to_string())??;
 
-    if let Some(s) = stt {
-        let _ = s.flush().await;
-        let _ = s.close().await;
+    for stream in [sys_stt, mic_stt].into_iter().flatten() {
+        let _ = stream.flush().await;
+        let _ = stream.close().await;
     }
-    if let Some(c) = collector {
+    for collector in [sys_collector, mic_collector].into_iter().flatten() {
         // The stream is closed, so the channel ends and this finishes.
-        let _ = tokio::time::timeout(Duration::from_secs(10), c).await;
+        let _ = tokio::time::timeout(Duration::from_secs(10), collector).await;
     }
 
-    let segments = collected
+    let mut segments = collected
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .split_off(0);
+    // Both legs finalized independently; put the conversation back in spoken
+    // order before anything downstream renders or stores it.
+    order_segments(&mut segments);
 
     Ok(SessionOutcome {
         dir,
@@ -531,6 +662,47 @@ pub async fn run_with_control(
     })
 }
 
+/// Drain one leg's transcript events into the shared sink.
+///
+/// The error arm is named per leg — a dead mic stream must not read as a dead
+/// system stream, or the user turns the wrong knob. Recording rather than
+/// dropping these is the line whose absence hid two fatal bugs for the life
+/// of the project.
+fn spawn_leg_collector(
+    leg: &'static str,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<StreamEvent>,
+    sink: Arc<std::sync::Mutex<Vec<TranscriptSegment>>>,
+    errors: SttErrors,
+    tap: SegmentTap,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                StreamEvent::Final(seg) => {
+                    // Live first, then the buffer: a viewer watching the
+                    // meeting should not be behind the file on disk.
+                    tap.emit(&seg);
+                    sink.lock().unwrap_or_else(|e| e.into_inner()).push(seg);
+                }
+                StreamEvent::Error(e) => {
+                    eprintln!("  ! transcription ({leg}): {e}");
+                    errors.record(format!("{leg}: {e}"));
+                }
+                _ => {}
+            }
+        }
+    })
+}
+
+/// The provider connections the pump feeds, one per leg.
+///
+/// A struct rather than two more parameters: the pump's argument list was at
+/// clippy's limit, and these two travel together or not at all.
+struct SttFeeds {
+    system: Option<Arc<DeepgramStream>>,
+    mic: Option<Arc<DeepgramStream>>,
+}
+
 /// Drain both rings until stopped, writing raw audio and feeding the provider.
 fn pump_loop(
     mut wal: SessionWal,
@@ -538,18 +710,27 @@ fn pump_loop(
     mut mic: RingConsumer,
     sys_format: StreamFormat,
     mic_format: Option<StreamFormat>,
-    stt: Option<Arc<DeepgramStream>>,
+    stt: SttFeeds,
     stop: &AtomicBool,
 ) -> Result<(u64, u64, u64), String> {
     let mut scratch = vec![0.0f32; 48_000];
     let (mut sys_written, mut mic_written) = (0u64, 0u64);
 
-    // Only the system leg is transcribed for now. The mic leg needs its own
-    // connection (and doubles the bill), which is the "two cloud streams"
-    // decision in spec 7.5 — not something to switch on implicitly.
     let mut resampler = Resampler16k::new(sys_format.sample_rate_hz, sys_format.channels)
         .map_err(|e| format!("resampler: {e}"))?;
-    let _ = mic_format;
+
+    // The mic gets its own resampler because its format is its own: the
+    // system tap is 48k stereo, a USB headset mic is whatever it is, and
+    // reusing the system resampler was never an option — which is exactly why
+    // the old single-stream code had a `let _ = mic_format;` here.
+    let mut mic_resampler = match (&stt.mic, mic_format) {
+        (Some(_), Some(f)) => Some((
+            Resampler16k::new(f.sample_rate_hz, f.channels)
+                .map_err(|e| format!("mic resampler: {e}"))?,
+            f.channels,
+        )),
+        _ => None,
+    };
 
     let mut seq = 0u64;
 
@@ -564,7 +745,7 @@ fn pump_loop(
             sys_written += n as u64;
             moved = true;
 
-            if let Some(h) = stt.as_ref() {
+            if let Some(h) = stt.system.as_ref() {
                 let resampled = resampler
                     .process_all(&scratch[..n])
                     .map_err(|e| format!("resample failed: {e}"))?;
@@ -577,10 +758,21 @@ fn pump_loop(
 
         let m = mic.pop_into(&mut scratch);
         if m > 0 {
+            // Raw first here too, for the same reason as the system leg.
             wal.write_mic(&scratch[..m])
                 .map_err(|e| format!("mic write failed: {e}"))?;
             mic_written += m as u64;
             moved = true;
+
+            if let (Some(h), Some((r, channels))) = (stt.mic.as_ref(), mic_resampler.as_mut()) {
+                let resampled = r
+                    .process_all(&scratch[..m])
+                    .map_err(|e| format!("mic resample failed: {e}"))?;
+                if !resampled.is_empty() {
+                    let mono = Downmixer::to_mono(&resampled, *channels);
+                    h.write(&Downmixer::to_i16(&mono));
+                }
+            }
         }
 
         if !moved {

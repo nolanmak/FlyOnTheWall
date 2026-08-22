@@ -71,6 +71,7 @@
 
 pub mod api;
 pub mod assets;
+pub mod github;
 pub mod ingress;
 pub mod query;
 pub mod recorder;
@@ -85,6 +86,7 @@ pub mod tokens;
 #[cfg(feature = "store")]
 pub mod store_source;
 
+pub use crate::github::{GithubError, GithubExport, GithubMode, GithubReceipt, GithubSettings};
 pub use crate::ingress::{Deny, IngressPolicy, not_found};
 pub use crate::recorder::{RecorderControl, RecorderError, RecordingState, RecordingStatus};
 pub use crate::secret::Secret;

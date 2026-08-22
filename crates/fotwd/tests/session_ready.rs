@@ -205,6 +205,7 @@ fn recorder(
     DaemonRecorder::with_parts(
         root.to_path_buf(),
         tokio::runtime::Handle::current(),
+        fotwd::session::SegmentTap::default(),
         taps,
         Box::new(|| Transcription::Disabled),
         Box::new(|_root, _outcome| {}),
