@@ -100,6 +100,34 @@ impl MeetingRepo<'_> {
 
     /// Move a meeting through the `recording -> transcribing -> ready` states,
     /// bumping `updated_at` and `lamport` the way every mutation must.
+    /// Replace the meeting's title.
+    ///
+    /// Exists for #67: every meeting is created under a timestamp fallback,
+    /// and the real title arrives only after an engine has read the
+    /// transcript. Touches nothing but the one column.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when there is no such meeting — a silent
+    /// no-op here would let an enrichment step believe it renamed something.
+    pub fn set_title(&mut self, meeting_id: &str, title: &str) -> Result<()> {
+        // The same updated_at/lamport discipline as set_state: a rename is an
+        // edit, and an edit that does not bump the clock is invisible to sync.
+        let n = self.db.conn().execute(
+            "UPDATE meetings SET title = ?2, updated_at = ?3, lamport = lamport + 1
+             WHERE id = ?1",
+            params![meeting_id, title, now_ms()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound {
+                kind: "meeting",
+                id: meeting_id.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Move the meeting to a new lifecycle state.
     pub fn set_state(&mut self, meeting_id: &str, state: &str) -> Result<()> {
         let n = self.db.conn().execute(
             "UPDATE meetings SET state = ?2, updated_at = ?3, lamport = lamport + 1

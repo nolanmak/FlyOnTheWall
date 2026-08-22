@@ -60,6 +60,7 @@ pub mod adapter;
 pub mod anthropic;
 pub mod capabilities;
 pub mod chunk;
+pub mod claude_cli;
 pub mod coverage;
 pub mod document;
 pub mod error;

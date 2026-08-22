@@ -57,7 +57,11 @@ pub type TapOpener =
     Box<dyn Fn() -> Result<(Box<dyn AudioTap>, Option<Box<dyn AudioTap>>), String> + Send + Sync>;
 
 /// What to do with a finished session. Injectable for the same reason.
-pub type Finisher = Box<dyn Fn(&Path, &SessionOutcome) + Send + Sync>;
+///
+/// Returns the persisted meeting id when there is one, so the caller can run
+/// enrichment (#67/#68) against it — titles and summaries need a row to hang
+/// off, and only the finisher knows whether persist succeeded.
+pub type Finisher = Box<dyn Fn(&Path, &SessionOutcome) -> Option<String> + Send + Sync>;
 
 /// How a session decides whether, and how, to transcribe.
 ///
@@ -223,7 +227,7 @@ fn keychain_transcription() -> Transcription {
 /// out of the scratch `sessions/` lifetime into the durable one — skipping
 /// that is what left every recording sitting in `sessions/` with the retention
 /// engine unable to see any of it.
-fn persist_and_promote(root: &Path, outcome: &SessionOutcome) {
+fn persist_and_promote(root: &Path, outcome: &SessionOutcome) -> Option<String> {
     if !outcome.segments.is_empty()
         && let Err(e) = session::append_segments(&outcome.dir, &outcome.segments)
     {
@@ -239,9 +243,15 @@ fn persist_and_promote(root: &Path, outcome: &SessionOutcome) {
     );
 
     match crate::open_library(root) {
-        Err(e) => eprintln!("  ! could not open the library: {e}"),
+        Err(e) => {
+            eprintln!("  ! could not open the library: {e}");
+            None
+        }
         Ok(mut db) => match crate::persist::persist_session(&mut db, outcome, &title) {
-            Err(e) => eprintln!("  ! could not add to the library: {e}"),
+            Err(e) => {
+                eprintln!("  ! could not add to the library: {e}");
+                None
+            }
             Ok(id) => {
                 if let Err(e) = crate::retention::promote_session(
                     &mut db,
@@ -252,6 +262,7 @@ fn persist_and_promote(root: &Path, outcome: &SessionOutcome) {
                 ) {
                     eprintln!("  ! could not archive the session: {e}");
                 }
+                Some(id)
             }
         },
     }

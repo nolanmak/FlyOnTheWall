@@ -410,3 +410,21 @@ fn stored_segments_carry_their_channel_back_out() {
     assert_eq!(rows[0].channel, "mic", "NewSegment::new defaults to mic");
     assert_eq!(rows[1].channel, "system");
 }
+
+/// Titles start as timestamp fallbacks and get replaced once an engine has
+/// read the transcript (#67). The update must not touch anything else.
+#[test]
+fn a_meeting_title_can_be_set_after_the_fact() {
+    let mut db = db();
+    let meeting = db
+        .meetings()
+        .create(NewMeeting::new("dev-1", "UTC"))
+        .unwrap();
+
+    db.meetings()
+        .set_title(&meeting, "Interconnect bandwidth planning")
+        .unwrap();
+
+    let row = db.meetings().get(&meeting).unwrap();
+    assert_eq!(row.title, "Interconnect bandwidth planning");
+}

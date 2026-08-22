@@ -69,6 +69,7 @@ fn recorder(root: &std::path::Path, finished: Arc<AtomicU64>) -> DaemonRecorder 
         Box::new(|| fotwd::session::Transcription::Disabled),
         Box::new(move |_root, _outcome| {
             finished.fetch_add(1, Ordering::Relaxed);
+            None
         }),
         Duration::from_secs(5),
         // Generous: these taps start instantly, and a deadline that raced the
