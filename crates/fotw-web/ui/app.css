@@ -220,8 +220,19 @@ section {
   grid-column: 3;
 }
 
+/* The user's own lines (#64). A tinted band rather than bold text: bolding
+   alone disappears in a long transcript, and the band reads at a glance
+   without shouting. Derived from --accent so both themes get it for free. */
 .segment.mic {
-  font-weight: 600;
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 6px 6px 0;
+  padding: 2px 8px 2px 5px;
+  margin-left: -8px;
+}
+
+.segment.mic .speaker {
+  color: var(--accent);
 }
 
 .empty,
@@ -291,4 +302,50 @@ section {
 .gh-push:disabled {
   color: var(--muted);
   cursor: not-allowed;
+}
+
+/* ------------------------------------------------------------- small screens
+   One breakpoint (#66). Below it the two columns stack: the meeting list
+   becomes a bounded strip that scrolls on its own above the detail pane, and
+   the header wraps instead of pushing the record controls off-screen. The
+   desktop layout above this line is untouched. */
+@media (max-width: 700px) {
+  header {
+    flex-wrap: wrap;
+    row-gap: 8px;
+  }
+
+  #search {
+    /* Full width on its own row, so the controls after it wrap as a group
+       rather than one at a time. */
+    flex-basis: 100%;
+    order: 1;
+  }
+
+  main {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(0, 35%) 1fr;
+  }
+
+  nav {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  section {
+    padding: 12px 14px;
+  }
+
+  .segment {
+    /* The fixed time column earns its keep on a desktop; at phone widths it
+       taxes every line. `block` rather than a one-column grid: grid items
+       are blockified, so the spans would stack three-high — as blocks they
+       flow inline and the words wrap under the offset naturally. */
+    display: block;
+  }
+
+  .segment .at,
+  .segment .speaker {
+    margin-right: 8px;
+  }
 }

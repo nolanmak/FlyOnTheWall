@@ -54,6 +54,7 @@ pub async fn start() -> Harness {
         segments: vec![Segment {
             idx: 0,
             start_ms: 12_000,
+            channel: "system".to_owned(),
             speaker: Some("S0".to_owned()),
             text: SEGMENT_TEXT.to_owned(),
         }],

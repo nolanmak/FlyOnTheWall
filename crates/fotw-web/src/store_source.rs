@@ -96,6 +96,7 @@ impl MeetingSource for StoreSource {
                 .map(|s| Segment {
                     idx: s.idx,
                     start_ms: s.start_ms,
+                    channel: s.channel,
                     speaker: s.speaker,
                     text: s.text,
                 })

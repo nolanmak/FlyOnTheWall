@@ -317,7 +317,7 @@ impl MeetingRepo<'_> {
     pub fn transcript_segments(&self, transcript_id: &str) -> Result<Vec<StoredSegment>> {
         let conn = self.db.conn();
         let mut stmt = conn.prepare(
-            "SELECT idx, start_ms, end_ms, speaker_label, text, confidence
+            "SELECT idx, start_ms, end_ms, speaker_label, text, confidence, channel
                FROM segments WHERE transcript_id = ?1 ORDER BY idx",
         )?;
         let rows = stmt.query_map(params![transcript_id], |r| {
@@ -328,6 +328,7 @@ impl MeetingRepo<'_> {
                 speaker: r.get(3)?,
                 text: r.get(4)?,
                 confidence: r.get(5)?,
+                channel: r.get(6)?,
             })
         })?;
         let mut out = Vec::new();
