@@ -50,7 +50,10 @@ fn zero_is_a_legal_way_to_ask_for_ephemeral() {
 #[test]
 fn a_non_numeric_port_is_refused() {
     let e = parse_port(&args(&["serve", "--port", "http"])).unwrap_err();
-    assert!(e.contains("http"), "the bad value should be quoted back: {e}");
+    assert!(
+        e.contains("http"),
+        "the bad value should be quoted back: {e}"
+    );
 }
 
 /// `--port` with nothing after it must not silently mean "ephemeral". Taking

@@ -77,6 +77,20 @@ pub enum AuditKind {
         /// `not_now` or `never_for_this_app`.
         answer: String,
     },
+    /// A meeting transcript was committed to the user's configured GitHub
+    /// repository (issue #63). CON-08's "providers contacted", for an
+    /// integration: the fact of the egress, never the content — deletion
+    /// honesty (§9.6) needs to be able to say exactly what left and where.
+    TranscriptPushed {
+        /// The meeting whose transcript left the machine.
+        meeting: String,
+        /// `owner/name` it went to.
+        repo: String,
+        /// The path inside the repository.
+        path: String,
+        /// The commit GitHub answered with.
+        commit: String,
+    },
 }
 
 /// An append-only audit log.

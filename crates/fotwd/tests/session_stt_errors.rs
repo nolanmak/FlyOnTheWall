@@ -114,7 +114,10 @@ async fn transcription_disabled_reports_no_error() {
     .await
     .expect("session runs");
 
-    assert!(errors.latest().is_none(), "no provider, so no provider error");
+    assert!(
+        errors.latest().is_none(),
+        "no provider, so no provider error"
+    );
     assert!(outcome.stt_errors.is_empty());
 }
 

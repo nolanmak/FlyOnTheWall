@@ -29,6 +29,53 @@
       <nav id="list" aria-label="Meetings"></nav>
       <section id="detail" aria-live="polite"></section>
     </main>
+    <details id="gh-settings" class="gh-settings" hidden>
+      <summary>GitHub export</summary>
+      <p class="gh-note">
+        Commits a finished meeting's Markdown export to a repository of yours,
+        using your own <code>gh</code> login. Nothing is sent until this is
+        enabled.
+      </p>
+      <label class="gh-field">
+        repository
+        <input
+          id="gh-repo"
+          type="text"
+          placeholder="owner/name"
+          autocomplete="off"
+          spellcheck="false"
+        />
+      </label>
+      <label class="gh-field">
+        branch
+        <input
+          id="gh-branch"
+          type="text"
+          placeholder="default branch"
+          autocomplete="off"
+          spellcheck="false"
+        />
+      </label>
+      <label class="gh-field">
+        folder
+        <input
+          id="gh-prefix"
+          type="text"
+          placeholder="meetings/"
+          autocomplete="off"
+          spellcheck="false"
+        />
+      </label>
+      <label class="gh-check">
+        <input id="gh-auto" type="checkbox" />
+        push automatically when a meeting finishes
+      </label>
+      <label class="gh-check">
+        <input id="gh-enabled" type="checkbox" />
+        enabled
+      </label>
+      <button id="gh-save" type="button">Save</button>
+    </details>
     <p id="status" role="status"></p>
     <script src="/assets/app.js"></script>
   </body>

@@ -96,7 +96,11 @@ impl GithubSettings {
         }
 
         self.branch = self.branch.trim().to_owned();
-        if self.branch.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        if self
+            .branch
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+        {
             return Err("the branch name has whitespace in it".to_owned());
         }
 
@@ -232,7 +236,10 @@ mod tests {
         assert!(enabled("octocat/notes", "m/").normalized().is_ok());
         assert!(enabled("octocat", "m/").normalized().is_err());
         assert!(enabled("a/b/c", "m/").normalized().is_err());
-        assert!(enabled("", "m/").normalized().is_err(), "enabled needs a repo");
+        assert!(
+            enabled("", "m/").normalized().is_err(),
+            "enabled needs a repo"
+        );
         assert!(enabled("owner/has space", "m/").normalized().is_err());
     }
 

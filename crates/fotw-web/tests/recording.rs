@@ -18,8 +18,8 @@
 mod common;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fotw_web::{
     MemorySource, RecorderControl, RecorderError, RecordingState, RecordingStatus, WebServer,
@@ -115,7 +115,10 @@ async fn every_recording_route_needs_the_bearer() {
             "GET" => r.h.get(path, &anon).await,
             _ => r.h.post(path, &anon, None).await,
         };
-        assert_eq!(res.status, 404, "{method} {path} leaked to an anonymous caller");
+        assert_eq!(
+            res.status, 404,
+            "{method} {path} leaked to an anonymous caller"
+        );
     }
 
     assert_eq!(
@@ -172,10 +175,9 @@ async fn an_acknowledged_start_records_and_status_agrees() {
     let r = rig().await;
     let auth = r.h.authorised();
 
-    let started = r
-        .h
-        .post("/api/recording/start?ack=all-party", &auth, None)
-        .await;
+    let started =
+        r.h.post("/api/recording/start?ack=all-party", &auth, None)
+            .await;
     assert_eq!(started.status, 200);
     assert_eq!(state_of(&started.body), "recording");
 
@@ -195,7 +197,9 @@ async fn an_acknowledged_start_records_and_status_agrees() {
 #[tokio::test]
 async fn a_start_without_the_acknowledgement_is_refused() {
     let r = rig().await;
-    let res = r.h.post("/api/recording/start", &r.h.authorised(), None).await;
+    let res =
+        r.h.post("/api/recording/start", &r.h.authorised(), None)
+            .await;
 
     assert_eq!(res.status, 200, "the refusal is data, not a status code");
     assert_eq!(state_of(&res.body), "idle");
@@ -217,10 +221,9 @@ async fn a_wrong_acknowledgement_value_is_refused() {
     let auth = r.h.authorised();
 
     for q in ["?ack=", "?ack=no", "?ack=true", "?acknowledged=all-party"] {
-        let res = r
-            .h
-            .post(&format!("/api/recording/start{q}"), &auth, None)
-            .await;
+        let res =
+            r.h.post(&format!("/api/recording/start{q}"), &auth, None)
+                .await;
         assert_eq!(state_of(&res.body), "idle", "{q} was accepted");
     }
     assert_eq!(r.recorder.starts.load(Ordering::Relaxed), 0);
@@ -248,10 +251,9 @@ async fn starting_twice_does_not_start_twice() {
 
     r.h.post("/api/recording/start?ack=all-party", &auth, None)
         .await;
-    let again = r
-        .h
-        .post("/api/recording/start?ack=all-party", &auth, None)
-        .await;
+    let again =
+        r.h.post("/api/recording/start?ack=all-party", &auth, None)
+            .await;
 
     assert_eq!(again.status, 200);
     assert_eq!(
@@ -269,7 +271,9 @@ async fn starting_twice_does_not_start_twice() {
 #[tokio::test]
 async fn stopping_when_idle_is_not_an_error_the_ui_must_handle() {
     let r = rig().await;
-    let res = r.h.post("/api/recording/stop", &r.h.authorised(), None).await;
+    let res =
+        r.h.post("/api/recording/stop", &r.h.authorised(), None)
+            .await;
 
     assert_eq!(res.status, 200);
     assert_eq!(state_of(&res.body), "idle");
@@ -294,7 +298,10 @@ async fn a_server_without_a_recorder_hides_the_routes_entirely() {
             "GET" => h.get(path, &auth).await,
             _ => h.post(path, &auth, None).await,
         };
-        assert_eq!(res.status, 404, "{method} {path} answered without a recorder");
+        assert_eq!(
+            res.status, 404,
+            "{method} {path} answered without a recorder"
+        );
 
         let unknown = h.get("/no-such-path", &auth).await;
         assert_eq!(

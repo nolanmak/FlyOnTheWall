@@ -172,10 +172,7 @@ pub fn keychain_timeout(who: Answerable) -> std::time::Duration {
 /// every other test in the binary.
 #[must_use]
 pub fn answerable_from(env: &[(&str, &str)], has_window_server: bool) -> Answerable {
-    let marked = |name: &str| {
-        env.iter()
-            .any(|(k, v)| *k == name && !v.trim().is_empty())
-    };
+    let marked = |name: &str| env.iter().any(|(k, v)| *k == name && !v.trim().is_empty());
 
     // CI first: a hosted macOS runner has a window server and still nobody to
     // click. SSH next: a person, but not one who can see the far end's screen.
@@ -196,10 +193,7 @@ pub fn answerable() -> Answerable {
         .iter()
         .filter_map(|k| std::env::var(k).ok().map(|v| ((*k).to_owned(), v)))
         .collect();
-    let borrowed: Vec<(&str, &str)> = env
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
+    let borrowed: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     answerable_from(&borrowed, has_window_server())
 }
 

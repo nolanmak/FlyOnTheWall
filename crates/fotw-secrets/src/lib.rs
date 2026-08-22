@@ -57,11 +57,11 @@
 
 #![warn(missing_docs)]
 
+pub mod cache;
 mod error;
 mod fingerprint;
 mod index;
 mod keys;
-pub mod cache;
 pub mod recovery;
 mod redact;
 mod secret;
@@ -76,7 +76,6 @@ pub use crate::keys::{KEYRING_SERVICE, Provider, SecretKey};
 pub use crate::redact::{REDACTED, RedactingWriter, Redactor, SENSITIVE_HEADERS};
 pub use crate::secret::SecretString;
 pub use crate::store::{
-    Answerable, answerable, answerable_from, keychain_timeout,
-
-    InMemoryKeyStore, KEYCHAIN_TIMEOUT, KeyStore, OsKeyStore, StoreAvailability, os_tests_enabled,
+    Answerable, InMemoryKeyStore, KEYCHAIN_TIMEOUT, KeyStore, OsKeyStore, StoreAvailability,
+    answerable, answerable_from, keychain_timeout, os_tests_enabled,
 };
