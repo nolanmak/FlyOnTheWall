@@ -42,18 +42,70 @@ fn serve(state: &AppState, path: &str) -> Response {
     if path.contains("..") {
         return not_found();
     }
+    // A developer override, when one is active, replaces where a known asset
+    // comes from — never what the server exposes. See `dev_override`.
+    if let Some(bytes) = dev_override(path) {
+        return asset_response(state, path, bytes);
+    }
     let Some(file) = Ui::get(path) else {
         return not_found();
     };
-    let body = Body::from(file.data.into_owned());
+    asset_response(state, path, file.data.into_owned())
+}
+
+/// The one way an asset body becomes a response.
+///
+/// Shared by the embedded and the override paths so their headers cannot
+/// drift: `tests/ingress.rs` compares responses byte for byte, and a header
+/// that existed only on one path would make the two distinguishable.
+fn asset_response(state: &AppState, path: &str, bytes: Vec<u8>) -> Response {
     let mut response = Response::builder()
         .status(StatusCode::OK)
-        .body(body)
+        .body(Body::from(bytes))
         .expect("a static asset response is always constructible");
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, content_type(path));
     apply_security_headers(headers, state.csp());
     response
+}
+
+/// `FOTW_UI_DIR` — read a known asset from disk instead of the embedded copy.
+///
+/// The embed is forced on even in debug (`debug-embed`) because silently
+/// reading from disk in dev is how a shipped bundle 404s its whole UI on a
+/// machine with no `ui/` directory. That hazard was about *silence*: an env
+/// var someone typed is not silent, so the escape is explicit — and it is
+/// compiled out of release entirely, so the original failure mode cannot
+/// return no matter what is in the environment.
+///
+/// Without it, the UI iteration loop is edit → `cargo build` → `just
+/// dev-sign` → a new binary identity → a keychain approval dialog → relaunch,
+/// for a one-character CSS change.
+#[cfg(debug_assertions)]
+fn dev_override(name: &str) -> Option<Vec<u8>> {
+    let dir = std::env::var_os("FOTW_UI_DIR")?;
+    dev_override_from(std::path::Path::new(&dir), name)
+}
+
+/// A release binary ignores the variable unconditionally.
+#[cfg(not(debug_assertions))]
+fn dev_override(_name: &str) -> Option<Vec<u8>> {
+    None
+}
+
+/// [`dev_override`] with the directory named, so a test needs no env var —
+/// the environment is process-global and tests run in parallel.
+#[cfg(debug_assertions)]
+fn dev_override_from(dir: &std::path::Path, name: &str) -> Option<Vec<u8>> {
+    // The allowlist is the embedded bundle itself: only a name that ships can
+    // be overridden, so the join below cannot be steered anywhere new and the
+    // override cannot widen what the server exposes. A miss — unknown name or
+    // missing file — falls back to the embedded copy, because half a
+    // directory is a normal state while editing.
+    if !Ui::iter().any(|f| f == name) {
+        return None;
+    }
+    std::fs::read(dir.join(name)).ok()
 }
 
 /// The headers every non-404 response carries.
@@ -153,5 +205,54 @@ mod tests {
         assert_eq!(content_type("x.bin"), "application/octet-stream");
         assert_eq!(content_type("x"), "application/octet-stream");
         assert_eq!(content_type("app.js"), "text/javascript; charset=utf-8");
+    }
+
+    // ------------------------------------------------- FOTW_UI_DIR (#62)
+
+    fn override_dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("fotw-uidir-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The point of the feature: an allowlisted asset is read from the
+    /// directory, so a UI edit needs no rebuild, no re-sign and no keychain
+    /// prompt.
+    #[test]
+    fn an_embedded_name_is_read_from_the_override_directory() {
+        let dir = override_dir("hit");
+        std::fs::write(dir.join("app.js"), b"console.log(1);").unwrap();
+
+        let got = dev_override_from(&dir, "app.js").expect("app.js is embedded");
+        assert_eq!(got, b"console.log(1);");
+    }
+
+    /// The allowlist is the embedded bundle itself. A file that merely exists
+    /// in the directory is not served — the override changes *where* known
+    /// assets come from, never *what* the server exposes.
+    #[test]
+    fn a_name_the_bundle_does_not_contain_is_refused_even_if_the_file_exists() {
+        let dir = override_dir("stranger");
+        std::fs::write(dir.join("secrets.txt"), b"nope").unwrap();
+
+        assert!(dev_override_from(&dir, "secrets.txt").is_none());
+    }
+
+    /// A traversal-shaped name is not in the embedded set, so it never reaches
+    /// the filesystem — the join below the allowlist cannot be steered.
+    #[test]
+    fn a_traversal_name_never_reaches_the_filesystem() {
+        let dir = override_dir("traverse");
+        assert!(dev_override_from(&dir, "../Cargo.toml").is_none());
+        assert!(dev_override_from(&dir, "..").is_none());
+    }
+
+    /// A missing file falls back to the embedded copy rather than 404ing the
+    /// asset: half a directory is a normal state while editing.
+    #[test]
+    fn a_missing_file_means_the_embedded_copy_serves() {
+        let dir = override_dir("fallback");
+        assert!(dev_override_from(&dir, "app.js").is_none());
     }
 }
