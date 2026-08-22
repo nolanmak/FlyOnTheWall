@@ -75,8 +75,9 @@ pub struct HandoffRequest {
 /// session.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HandoffResponse {
-    /// Goes in `Authorization: Bearer`, and into `sessionStorage` — never a
-    /// cookie (ING-08).
+    /// Goes in `Authorization: Bearer`, and into `localStorage` — never a
+    /// cookie (ING-08): origin-keyed, attached only by the app's own code,
+    /// zero ambient credentials.
     pub token: String,
 }
 
@@ -199,6 +200,13 @@ pub struct GithubSettingsResponse {
     /// on ING-09 and presence oracles.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// `POST /api/launch-url`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LaunchUrlResponse {
+    /// A fresh one-time login URL, `http://127.0.0.1:{port}/?t={handoff}`.
+    pub url: String,
 }
 
 /// `GET /api/settings/github/repos`.
@@ -406,6 +414,24 @@ pub async fn ws_ticket(State(state): State<AppState>) -> Response {
         &TicketResponse {
             ticket,
             expires_in_ms: u64::try_from(WS_TICKET_TTL.as_millis()).unwrap_or(u64::MAX),
+        },
+    )
+}
+
+/// `POST /api/launch-url`
+///
+/// The re-entry path: the launch URL the daemon opened at startup is worth
+/// one redemption, so a closed tab used to mean restarting the daemon. A
+/// caller holding the bearer — the CLI reading the 0600 state file, or an
+/// authorized tab — can mint another. The reply carries a handoff token,
+/// never the bearer itself, so the URL is still safe in `open(1)`'s argv and
+/// browser history, and same-user local processes are outside the threat
+/// model anyway (§10.1).
+pub async fn launch_url(State(state): State<AppState>) -> Response {
+    json(
+        &state,
+        &LaunchUrlResponse {
+            url: state.launch_url(),
         },
     )
 }

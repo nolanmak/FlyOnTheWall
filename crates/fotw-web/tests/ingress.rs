@@ -182,6 +182,10 @@ async fn no_token_no_data() {
         404
     );
     assert_eq!(
+        h.post("/api/launch-url", &h.anonymous(), None).await.status,
+        404
+    );
+    assert_eq!(
         h.post(
             &format!("/api/meetings/{MEETING_ID}/github-push"),
             &h.anonymous(),
@@ -318,6 +322,38 @@ async fn a_wrong_method_does_not_confirm_that_a_path_exists() {
 }
 
 // ------------------------------------------------------------------- ING-10
+
+#[tokio::test]
+async fn a_fresh_launch_url_can_be_minted_with_the_bearer_and_not_without() {
+    let h = common::start().await;
+
+    // Anonymous: the same bare 404 as every other refusal — this endpoint
+    // hands out a login link, so it must itself require being logged in.
+    let anon = h.post("/api/launch-url", &h.anonymous(), None).await;
+    assert_eq!(anon.status, 404);
+    assert!(anon.body.is_empty());
+
+    // With the bearer: a fresh one-time URL whose token redeems exactly once.
+    let res = h.post("/api/launch-url", &h.authorised(), None).await;
+    assert_eq!(res.status, 200);
+    let v: serde_json::Value = serde_json::from_str(&res.body).expect("json body");
+    let url = v["url"].as_str().expect("a url");
+    assert!(url.starts_with(&format!("{}/?t=", h.origin)));
+    assert!(
+        !url.contains(&h.token),
+        "the session secret must never be in a URL"
+    );
+
+    let handoff = url.split_once("?t=").unwrap().1.to_owned();
+    let body = format!("{{\"token\":\"{handoff}\"}}");
+    let first = h.post("/api/handoff", &h.anonymous(), Some(&body)).await;
+    assert_eq!(
+        first.status, 200,
+        "the minted link must actually log a tab in"
+    );
+    let replay = h.post("/api/handoff", &h.anonymous(), Some(&body)).await;
+    assert_eq!(replay.status, 404, "burned on redemption, like any handoff");
+}
 
 #[tokio::test]
 async fn the_launch_token_buys_the_bearer_exactly_once() {

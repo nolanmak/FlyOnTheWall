@@ -1,32 +1,22 @@
-//! `fotwd serve --port` — the flag that makes the UI's origin stable.
+//! `fotwd serve --port` — the port is the origin, and the origin is the login.
 //!
-//! # Why this flag has to exist
-//!
-//! The redeemed bearer lives in `sessionStorage` (ING-08), which is keyed by
-//! *origin* — scheme, host and **port**. Binding an ephemeral port therefore
-//! mints a new origin on every launch, and the tab's credential is not merely
-//! stale but unreachable: a bookmark cannot carry it and a reload cannot find
-//! it. Every restart forces a fresh one-time handoff inside its 30-second
-//! window, which is exactly the failure a user reports as "the link never
-//! works".
-//!
-//! # Why it is nonetheless opt-in
-//!
-//! `serve` still defaults to port 0. A fixed port is guessable by a page
-//! scanning localhost, and while the port is not itself a security control —
-//! ING-01 through ING-05 are — it is one more thing an attacker has to find.
-//! Trading that away is the user's call to make explicitly, not ours to make
-//! for them.
+//! The bearer is stored keyed by *origin* — scheme, host and **port** — so a
+//! stable port is what makes `http://127.0.0.1:8737` a bookmark that works
+//! and lets every tab share one login. The default is therefore the fixed
+//! [`DEFAULT_PORT`]; `--port 0` buys back the old ephemeral behavior, where
+//! every restart minted a fresh origin and forced a new 30-second handoff.
+//! The port was never a security control — ING-01 through ING-05 are.
 
-use fotwd::serve::parse_port;
+use fotwd::serve::{DEFAULT_PORT, parse_port};
 
 fn args(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| (*s).to_owned()).collect()
 }
 
 #[test]
-fn no_flag_leaves_the_choice_to_the_os() {
-    assert_eq!(parse_port(&args(&["serve"])), Ok(0));
+fn no_flag_means_the_stable_default_port() {
+    assert_eq!(parse_port(&args(&["serve"])), Ok(DEFAULT_PORT));
+    assert_ne!(DEFAULT_PORT, 0, "the default origin must survive a restart");
 }
 
 #[test]
