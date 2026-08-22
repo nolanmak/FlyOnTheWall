@@ -947,6 +947,7 @@ dependencies = [
 name = "fotwd"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "fotw-audio",
  "fotw-pipeline",
  "fotw-secrets",

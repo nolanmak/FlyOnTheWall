@@ -223,3 +223,65 @@ section {
   padding: 12px 16px;
   margin: 0;
 }
+
+.gh-settings {
+  border-top: 1px solid var(--line);
+  padding: 8px 16px;
+  font-size: 12px;
+}
+
+.gh-settings summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.gh-note {
+  color: var(--muted);
+  max-width: 60ch;
+}
+
+.gh-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+  color: var(--muted);
+}
+
+.gh-field input {
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  width: 24ch;
+}
+
+.gh-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0;
+  color: var(--muted);
+}
+
+#gh-save,
+.gh-push {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  margin-top: 4px;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+#gh-save:disabled,
+.gh-push:disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+}

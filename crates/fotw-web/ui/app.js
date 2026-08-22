@@ -30,6 +30,13 @@ const el = {
   consentLabel: document.getElementById("consent-label"),
   record: document.getElementById("record"),
   recording: document.getElementById("recording"),
+  ghSettings: document.getElementById("gh-settings"),
+  ghRepo: document.getElementById("gh-repo"),
+  ghBranch: document.getElementById("gh-branch"),
+  ghPrefix: document.getElementById("gh-prefix"),
+  ghAuto: document.getElementById("gh-auto"),
+  ghEnabled: document.getElementById("gh-enabled"),
+  ghSave: document.getElementById("gh-save"),
 };
 
 // --------------------------------------------------------------- ING-10
@@ -174,6 +181,9 @@ function renderDetail(detail) {
   clear(el.detail);
   el.detail.appendChild(text("h2", detail.meeting.title || "Untitled meeting"));
   el.detail.appendChild(text("p", when(detail.meeting.started_at_ms), "meta"));
+
+  const actions = githubActions(detail.meeting.id);
+  if (actions) el.detail.appendChild(actions);
 
   // Notes first, and above the summary, because they are the user's own words
   // and the summary is a derived artifact. Search has always indexed notes, so
@@ -436,6 +446,114 @@ async function onRecord() {
   }
 }
 
+// ------------------------------------------- issue #63, GitHub export
+
+// The same "404 means the feature is absent" convention the recorder uses: a
+// read-only build hides the section entirely rather than showing dead knobs.
+let githubPresent = true;
+let githubSettings = null;
+
+// The stable machine codes from the API, spelled for a person. Anything not
+// listed renders verbatim — GitHub's own error text beats a shrug.
+const GH_ERRORS = {
+  gh_missing: "The gh CLI is not installed. brew install gh, then try again.",
+  gh_not_authenticated: "gh has no login. Run gh auth login in a terminal, then try again.",
+  repo_not_found: "That repository is not reachable with your gh login. Check the name and your access.",
+  github_export_disabled: "GitHub export is switched off. Enable it in the GitHub export section first.",
+};
+
+function ghExplain(code) {
+  return GH_ERRORS[code] || code;
+}
+
+function renderGithubForm(s) {
+  githubSettings = s;
+  el.ghRepo.value = s.repo || "";
+  el.ghBranch.value = s.branch || "";
+  el.ghPrefix.value = s.path_prefix || "";
+  el.ghAuto.checked = s.mode === "auto";
+  el.ghEnabled.checked = Boolean(s.enabled);
+  el.ghSettings.hidden = false;
+}
+
+async function loadGithub() {
+  if (!githubPresent) return;
+  try {
+    const body = await api("/api/settings/github");
+    renderGithubForm(body.settings);
+  } catch (e) {
+    // Not "the request failed" — this build has no GitHub export at all.
+    githubPresent = false;
+    el.ghSettings.hidden = true;
+  }
+}
+
+async function onGithubSave() {
+  el.ghSave.disabled = true;
+  try {
+    const body = await api("/api/settings/github", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        enabled: el.ghEnabled.checked,
+        repo: el.ghRepo.value,
+        branch: el.ghBranch.value,
+        path_prefix: el.ghPrefix.value,
+        mode: el.ghAuto.checked ? "auto" : "manual",
+      }),
+    });
+    // Always re-render from the reply: a refused save answers with what is
+    // still stored, and an accepted one with the normalized spelling.
+    renderGithubForm(body.settings);
+    if (body.error) {
+      say("Not saved. " + body.error.replace("invalid_settings: ", ""));
+    } else if (body.settings.enabled && body.settings.mode === "auto") {
+      say("Saved. New meetings will be pushed to " + body.settings.repo + " when they finish.");
+    } else if (body.settings.enabled) {
+      say("Saved. Use the button on a meeting to push it to " + body.settings.repo + ".");
+    } else {
+      say("Saved. GitHub export is off.");
+    }
+  } catch (e) {
+    say("Could not save the GitHub settings.");
+  }
+  el.ghSave.disabled = false;
+}
+
+async function onGithubPush(meetingId, button) {
+  button.disabled = true;
+  say("Pushing to " + (githubSettings ? githubSettings.repo : "GitHub") + "…");
+  try {
+    const body = await api(
+      "/api/meetings/" + encodeURIComponent(meetingId) + "/github-push",
+      { method: "POST" },
+    );
+    if (body.error) {
+      say(ghExplain(body.error));
+    } else {
+      say("Pushed: " + body.receipt.repo + "/" + body.receipt.path);
+    }
+  } catch (e) {
+    say("Could not push that meeting.");
+  }
+  button.disabled = false;
+}
+
+// The per-meeting button, appended into the detail pane when the feature is
+// present and switched on.
+function githubActions(meetingId) {
+  if (!githubPresent || !githubSettings || !githubSettings.enabled) return null;
+  const row = document.createElement("p");
+  row.className = "gh-actions";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "gh-push";
+  button.textContent = "Push to GitHub";
+  button.addEventListener("click", () => onGithubPush(meetingId, button));
+  row.appendChild(button);
+  return row;
+}
+
 // ------------------------------------------------------------------ start
 
 async function main() {
@@ -450,7 +568,9 @@ async function main() {
   el.consent.addEventListener("change", function () {
     el.record.disabled = !recordingNow && !el.consent.checked;
   });
+  el.ghSave.addEventListener("click", onGithubSave);
   await loadMeetings();
+  await loadGithub();
   await pollRecording();
   setInterval(pollRecording, RECORDING_POLL_MS);
   connectStream();

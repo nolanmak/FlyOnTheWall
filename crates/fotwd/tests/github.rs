@@ -52,11 +52,14 @@ fn store_settings(db: &mut Db, json: &str) {
 
 const MANUAL: &str = r#"{"enabled":true,"repo":"octocat/notes","branch":"","path_prefix":"meetings/","mode":"manual"}"#;
 
+/// One recorded invocation: the argv, and what rode in on stdin.
+type GhCall = (Vec<String>, Option<Vec<u8>>);
+
 /// A `gh` that answers from a script and remembers what it was asked.
 #[derive(Debug, Default)]
 struct ScriptedGh {
     script: Mutex<VecDeque<Result<GhOutput, String>>>,
-    calls: Mutex<Vec<(Vec<String>, Option<Vec<u8>>)>>,
+    calls: Mutex<Vec<GhCall>>,
 }
 
 impl ScriptedGh {
@@ -67,7 +70,7 @@ impl ScriptedGh {
         })
     }
 
-    fn calls(&self) -> Vec<(Vec<String>, Option<Vec<u8>>)> {
+    fn calls(&self) -> Vec<GhCall> {
         self.calls.lock().unwrap().clone()
     }
 }
@@ -106,7 +109,12 @@ const PUT_OK: &str = r#"{"content":{"path":"x"},"commit":{"sha":"abc123def"}}"#;
 
 /// auth ok → repo ok → no existing file → PUT lands.
 fn create_script() -> Vec<Result<GhOutput, String>> {
-    vec![ok(""), ok(r#"{"default_branch":"main"}"#), http_err(404), ok(PUT_OK)]
+    vec![
+        ok(""),
+        ok(r#"{"default_branch":"main"}"#),
+        http_err(404),
+        ok(PUT_OK),
+    ]
 }
 
 struct Rig {
@@ -168,7 +176,9 @@ fn switching_auto_on_stamps_the_moment_and_switching_off_clears_it() {
         ..GithubSettings::default()
     };
     let stored = r.exporter.set_settings(auto.clone()).unwrap();
-    let stamp = stored.auto_since_ms.expect("turning auto on stamps the moment");
+    let stamp = stored
+        .auto_since_ms
+        .expect("turning auto on stamps the moment");
     assert!(stamp > 0);
 
     // Saving again while already auto keeps the original stamp: re-saving the
@@ -192,11 +202,16 @@ fn switching_auto_on_stamps_the_moment_and_switching_off_clears_it() {
 fn a_push_commits_the_markdown_and_saves_the_receipt() {
     let r = rig(MANUAL, create_script());
 
-    let receipt = r.exporter.push(&r.meeting).expect("the scripted push lands");
+    let receipt = r
+        .exporter
+        .push(&r.meeting)
+        .expect("the scripted push lands");
     assert_eq!(receipt.repo, "octocat/notes");
     assert_eq!(receipt.commit, "abc123def");
     assert!(
-        receipt.path.starts_with("meetings/2025-08-21-weekly-standup-"),
+        receipt
+            .path
+            .starts_with("meetings/2025-08-21-weekly-standup-"),
         "the path is prefix + date + slug + id fragment, got {}",
         receipt.path
     );
@@ -228,10 +243,12 @@ fn a_push_commits_the_markdown_and_saves_the_receipt() {
     );
 
     // What actually crosses the wire: base64 of the EXP-01 Markdown document.
-    let body: serde_json::Value =
-        serde_json::from_slice(calls[3].1.as_deref().unwrap()).unwrap();
+    let body: serde_json::Value = serde_json::from_slice(calls[3].1.as_deref().unwrap()).unwrap();
     assert!(
-        body["message"].as_str().unwrap_or_default().contains("Weekly Standup"),
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Weekly Standup"),
         "the commit message names the meeting"
     );
     let content = B64.decode(body["content"].as_str().unwrap()).unwrap();
@@ -277,9 +294,11 @@ fn a_repush_reuses_the_path_and_sends_the_sha() {
     );
 
     let calls = r.gh.calls();
-    let body: serde_json::Value =
-        serde_json::from_slice(calls[7].1.as_deref().unwrap()).unwrap();
-    assert_eq!(body["sha"], "oldsha42", "an update names the blob it replaces");
+    let body: serde_json::Value = serde_json::from_slice(calls[7].1.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        body["sha"], "oldsha42",
+        "an update names the blob it replaces"
+    );
 }
 
 #[test]
@@ -294,8 +313,7 @@ fn a_configured_branch_rides_on_the_probe_and_the_put() {
         "the probe must look at the branch it will write to, got {:?}",
         calls[2].0
     );
-    let body: serde_json::Value =
-        serde_json::from_slice(calls[3].1.as_deref().unwrap()).unwrap();
+    let body: serde_json::Value = serde_json::from_slice(calls[3].1.as_deref().unwrap()).unwrap();
     assert_eq!(body["branch"], "transcripts");
 }
 
@@ -306,12 +324,18 @@ fn each_failure_maps_to_its_own_error() {
     assert_eq!(r.exporter.push(&r.meeting), Err(GithubError::GhMissing));
 
     // gh present, nobody logged in.
-    let r = rig(MANUAL, vec![Ok(GhOutput {
-        status: 1,
-        stdout: String::new(),
-        stderr: "You are not logged into any GitHub hosts.".to_owned(),
-    })]);
-    assert_eq!(r.exporter.push(&r.meeting), Err(GithubError::NotAuthenticated));
+    let r = rig(
+        MANUAL,
+        vec![Ok(GhOutput {
+            status: 1,
+            stdout: String::new(),
+            stderr: "You are not logged into any GitHub hosts.".to_owned(),
+        })],
+    );
+    assert_eq!(
+        r.exporter.push(&r.meeting),
+        Err(GithubError::NotAuthenticated)
+    );
 
     // Logged in, repo gone (or private to someone else — GitHub answers 404
     // for both, deliberately, and so do we).
@@ -326,8 +350,7 @@ fn each_failure_maps_to_its_own_error() {
     );
 
     // Disabled: nothing is contacted at all.
-    let disabled =
-        r#"{"enabled":false,"repo":"octocat/notes","branch":"","path_prefix":"meetings/","mode":"manual"}"#;
+    let disabled = r#"{"enabled":false,"repo":"octocat/notes","branch":"","path_prefix":"meetings/","mode":"manual"}"#;
     let r = rig(disabled, create_script());
     assert_eq!(r.exporter.push(&r.meeting), Err(GithubError::Disabled));
     assert!(r.gh.calls().is_empty(), "disabled must not spawn a process");
@@ -353,7 +376,11 @@ fn auto_push_pushes_a_ready_meeting_exactly_once() {
 
     // Nothing new: the receipt is the memory.
     assert_eq!(r.exporter.auto_push_pending(), 0);
-    assert_eq!(r.gh.calls().len(), 4, "an already-pushed meeting stays pushed");
+    assert_eq!(
+        r.gh.calls().len(),
+        4,
+        "an already-pushed meeting stays pushed"
+    );
 }
 
 #[test]

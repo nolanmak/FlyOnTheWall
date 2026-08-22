@@ -22,6 +22,9 @@ fotw-store = { path = "../fotw-store" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# The Contents API wants file content base64-encoded. Same version fotw-store
+# already pins for BLOB columns in exports, so no new supply chain.
+base64 = "0.22"
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["http2", "native-tls", "json", "charset"] }
 

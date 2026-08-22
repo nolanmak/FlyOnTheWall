@@ -23,8 +23,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use fotw_web::{DaemonState, StoreSource, WebServer, write_state_file};
+use fotw_web::{DaemonState, GithubExport, StoreSource, WebServer, write_state_file};
 
+use crate::github::{GithubExporter, SystemGh};
 use crate::retention::{self, Schedule, SweepMode, Tick};
 
 /// How often the sweeper thread wakes to ask whether it may run.
@@ -34,6 +35,15 @@ use crate::retention::{self, Schedule, SweepMode, Tick};
 /// deferred by a meeting should start shortly after the meeting ends, not at
 /// the top of the next hour.
 const SWEEP_POLL: Duration = Duration::from_secs(60);
+
+/// How often auto mode asks whether a finished meeting is waiting to be
+/// pushed to GitHub (issue #63).
+///
+/// A poll rather than a hook on the finish path: the finish path is shared
+/// with the CLI and must never wait on the network, and a poll also catches
+/// the meeting that finished while the daemon was down. One minute is
+/// invisible next to "the meeting just ended".
+const GITHUB_POLL: Duration = Duration::from_secs(60);
 
 /// Where the CLI looks for a running daemon.
 #[must_use]
@@ -152,10 +162,31 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
         on_segment,
     ));
 
-    let server = WebServer::bind_with_recorder(
+    // The GitHub export target (issue #63). Its own library connection, as
+    // the sweeper has one, so a push never holds the UI's mutex through a
+    // subprocess. Non-fatal on purpose: a UI without the export section
+    // beats a UI that will not open — and the second open failing right
+    // after the first succeeded is a story worth printing.
+    let github = match crate::open_library(&root) {
+        Ok(db) => Some(Arc::new(GithubExporter::new(
+            db,
+            root.clone(),
+            Arc::new(SystemGh),
+        ))),
+        Err(e) => {
+            eprintln!("  ! GitHub export is not available: {e}");
+            None
+        }
+    };
+    if let Some(exporter) = &github {
+        spawn_github_pusher(Arc::clone(exporter));
+    }
+
+    let server = WebServer::bind_with_controls(
         port,
         source,
         Some(Arc::clone(&recorder) as Arc<dyn fotw_web::RecorderControl>),
+        github.map(|g| g as Arc<dyn GithubExport>),
     )
     .await
     .map_err(|e| format!("could not bind 127.0.0.1: {e}"))?;
@@ -223,6 +254,27 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
     println!();
     println!("  Ctrl-C to stop.");
     server.serve().await.map_err(|e| format!("server: {e}"))
+}
+
+/// Start the auto-push worker on its own thread.
+///
+/// The same shape as the sweeper below, for the same reasons: everything it
+/// does is blocking — SQLite, then a subprocess — and it is a long-lived
+/// loop, not a unit of work. When manual mode or a disabled target makes
+/// `auto_push_pending` a no-op, the loop is one settings read a minute.
+fn spawn_github_pusher(exporter: Arc<GithubExporter>) {
+    if let Err(e) = std::thread::Builder::new()
+        .name("fotw-github".into())
+        .spawn(move || {
+            loop {
+                exporter.auto_push_pending();
+                std::thread::sleep(GITHUB_POLL);
+            }
+        })
+    {
+        // Worth a line, not a refusal: manual pushes still work.
+        eprintln!("  ! automatic GitHub pushes are not running: {e}");
+    }
 }
 
 /// Start the retention sweeper on its own thread.
