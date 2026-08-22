@@ -111,6 +111,12 @@ pub struct Segment {
     pub idx: i64,
     /// Milliseconds from the start of the meeting.
     pub start_ms: i64,
+    /// `mic` or `system` — which capture leg produced these words.
+    ///
+    /// The user's own voice versus everybody else's. It survives capture,
+    /// transcription and storage; dropping it here is what made a stored
+    /// transcript render both legs identically (#64).
+    pub channel: String,
     /// Diarisation label, e.g. `S0`, when the provider diarised.
     ///
     /// **Also attacker-influenced**, for a subtler reason than the text: the

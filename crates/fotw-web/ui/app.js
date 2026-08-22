@@ -218,17 +218,8 @@ function renderDetail(detail) {
   body.id = "segments";
   let lastSpeaker = null;
   for (const seg of detail.segments) {
-    const line = document.createElement("p");
-    line.className = "segment";
-    line.appendChild(text("span", offset(seg.start_ms), "at"));
-    // Only when it changes. Repeating "S0" on ten consecutive lines is noise
-    // that makes the actual turn-taking harder to see, not easier.
-    if (seg.speaker && seg.speaker !== lastSpeaker) {
-      line.appendChild(text("span", seg.speaker, "speaker"));
-    }
+    body.appendChild(segmentRow(seg.channel, seg.start_ms, seg.speaker, seg.text, lastSpeaker));
     lastSpeaker = seg.speaker || lastSpeaker;
-    line.appendChild(text("span", seg.text, "words"));
-    body.appendChild(line);
   }
   transcript.appendChild(body);
   el.detail.appendChild(transcript);
@@ -254,6 +245,27 @@ function renderHits(hits) {
 
 function say(message) {
   el.status.textContent = message;
+}
+
+// One transcript row, identical for a stored segment and a live delta.
+//
+// The channel class is what tells the user's own lines from the far end's
+// (#64) — capture keeps the legs on separate devices precisely so this is
+// free, and the styling in app.css is where it becomes visible. The words
+// live in a `.words` span because `.segment` is a three-column grid: a bare
+// text node lands in the 3.5rem time column, which is how the live view
+// shipped rendering two characters per line (#65).
+function segmentRow(channel, startMs, speaker, words, lastSpeaker) {
+  const line = document.createElement("p");
+  line.className = "segment " + (channel || "");
+  line.appendChild(text("span", offset(startMs), "at"));
+  // Only when it changes. Repeating "S0" on ten consecutive lines is noise
+  // that makes the actual turn-taking harder to see, not easier.
+  if (speaker && speaker !== lastSpeaker) {
+    line.appendChild(text("span", speaker, "speaker"));
+  }
+  line.appendChild(text("span", words, "words"));
+  return line;
 }
 
 // ------------------------------------------------------------------ data
@@ -344,7 +356,11 @@ function appendDeltas(deltas) {
   const body = document.getElementById("segments");
   if (!body) return;
   for (const d of deltas) {
-    body.appendChild(text("p", d.text, "segment " + d.channel));
+    // Deltas carry no diarisation label; the channel is the truth here, and
+    // "me" is what the mic leg means (§7.5). The far end's labels arrive
+    // with the stored transcript after Stop.
+    const speaker = d.channel === "mic" ? "me" : null;
+    body.appendChild(segmentRow(d.channel, d.start_ms, speaker, d.text, null));
   }
   while (body.childElementCount > MAX_ROWS) {
     body.removeChild(body.firstChild);

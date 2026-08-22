@@ -381,3 +381,32 @@ fn a_meeting_with_no_summary_has_none() {
     assert!(db.meetings().current_summary(&meeting).unwrap().is_none());
     assert!(db.meetings().summary_versions(&meeting).unwrap().is_empty());
 }
+
+/// The channel is written on the way in (§7.5's "me vs them") and must come
+/// back out: `transcript_segments` fed a UI that could not tell the user's
+/// own lines from the far end's because the SELECT never fetched the column.
+#[test]
+fn stored_segments_carry_their_channel_back_out() {
+    let mut db = db();
+    let meeting = db
+        .meetings()
+        .create(NewMeeting::new("dev-1", "UTC"))
+        .unwrap();
+    let transcript = db
+        .meetings()
+        .create_transcript(&meeting, "deepgram", "nova-3", true)
+        .unwrap();
+    db.meetings()
+        .append_segments(
+            &transcript,
+            &[
+                NewSegment::new(0, 0, 900, "wait, before you start"),
+                NewSegment::new(1, 1_000, 2_400, "let me share my screen").channel("system"),
+            ],
+        )
+        .unwrap();
+
+    let rows = db.meetings().transcript_segments(&transcript).unwrap();
+    assert_eq!(rows[0].channel, "mic", "NewSegment::new defaults to mic");
+    assert_eq!(rows[1].channel, "system");
+}

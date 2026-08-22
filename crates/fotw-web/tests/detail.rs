@@ -18,6 +18,24 @@ fn detail_json(body: &str) -> serde_json::Value {
     serde_json::from_str(body).expect("detail response is JSON")
 }
 
+/// The channel is the difference between the user's own words and everybody
+/// else's. It survives capture, transcription and storage — and was then
+/// dropped by this API, so the transcript rendered both legs identically.
+#[tokio::test]
+async fn a_segment_says_which_leg_it_came_from() {
+    let h = common::start().await;
+    let res = h
+        .get(&format!("/api/meetings/{MEETING_ID}"), &h.authorised())
+        .await;
+    assert_eq!(res.status, 200);
+
+    let body = detail_json(&res.body);
+    assert_eq!(
+        body["segments"][0]["channel"], "system",
+        "the fixture's one segment is far-end speech"
+    );
+}
+
 #[tokio::test]
 async fn a_segment_carries_its_speaker_and_its_offset() {
     let h = common::start().await;

@@ -231,6 +231,8 @@ impl NewSegment {
 /// what a reader needs.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoredSegment {
+    /// `mic` or `system` — which capture leg produced these words (#64).
+    pub channel: String,
     /// Position in the transcript.
     pub idx: i64,
     /// Milliseconds from the start of the meeting.
