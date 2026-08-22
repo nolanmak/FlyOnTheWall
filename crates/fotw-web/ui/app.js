@@ -266,9 +266,15 @@ async function loadMeetings() {
   }
 }
 
+// The detail pane's current content, so a GitHub-settings change can redraw
+// the per-meeting actions row without refetching. Cleared when the live view
+// replaces the pane.
+let currentDetail = null;
+
 async function openMeeting(id) {
   try {
     const detail = await api("/api/meetings/" + encodeURIComponent(id));
+    currentDetail = detail;
     renderDetail(detail);
   } catch (e) {
     say("Could not open that meeting.");
@@ -408,6 +414,7 @@ function renderRecording(body) {
 // pane is acceptable as the direct result of an action, and rude as a side
 // effect of a timer while someone is reading an old meeting.
 function showLive() {
+  currentDetail = null;
   clear(el.detail);
   el.detail.appendChild(text("h2", "Recording"));
   el.detail.appendChild(
@@ -502,12 +509,19 @@ async function onGithubSave() {
         mode: el.ghAuto.checked ? "auto" : "manual",
       }),
     });
-    // Always re-render from the reply: a refused save answers with what is
-    // still stored, and an accepted one with the normalized spelling.
-    renderGithubForm(body.settings);
     if (body.error) {
+      // The form keeps what the user typed — wiping it back to the stored
+      // values would make them re-enter everything to fix one field.
       say("Not saved. " + body.error.replace("invalid_settings: ", ""));
-    } else if (body.settings.enabled && body.settings.mode === "auto") {
+      el.ghSave.disabled = false;
+      return;
+    }
+    // Accepted: re-render from the reply (the normalized spelling), and
+    // redraw the open meeting so its push button appears or disappears with
+    // the setting it depends on.
+    renderGithubForm(body.settings);
+    if (currentDetail) renderDetail(currentDetail);
+    if (body.settings.enabled && body.settings.mode === "auto") {
       say("Saved. New meetings will be pushed to " + body.settings.repo + " when they finish.");
     } else if (body.settings.enabled) {
       say("Saved. Use the button on a meeting to push it to " + body.settings.repo + ".");

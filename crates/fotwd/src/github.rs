@@ -137,11 +137,19 @@ pub struct GithubExporter {
     /// The sessions root, which is where the audit log lives beside.
     root: PathBuf,
     runner: Arc<dyn GhRunner>,
-    /// Meetings whose auto-push failed. Not retried until the daemon
-    /// restarts: retrying a hard failure once a minute is how a laptop on
-    /// hotel wifi makes a rate limiter's acquaintance. A manual push always
-    /// tries afresh.
+    /// Meetings whose push failed for a reason of their own. Not retried by
+    /// the worker until the daemon restarts: retrying a hard failure once a
+    /// minute is how a laptop on hotel wifi makes a rate limiter's
+    /// acquaintance. Environment-wide failures — no gh, no login, no repo —
+    /// never land here, so fixing the environment drains the backlog on the
+    /// next poll. A manual push always tries afresh.
     failed_auto: Mutex<HashSet<String>>,
+    /// Meetings with a push in progress right now. The Db lock is released
+    /// for the whole gh sequence, so without this the worker and the UI
+    /// button could push one meeting concurrently: both probe 404, both PUT
+    /// without a sha, and the loser gets a spurious 422 for a transcript
+    /// that in fact landed.
+    in_flight: Mutex<HashSet<String>>,
 }
 
 impl std::fmt::Debug for GithubExporter {
@@ -160,6 +168,7 @@ impl GithubExporter {
             root: sessions_root,
             runner,
             failed_auto: Mutex::new(HashSet::new()),
+            in_flight: Mutex::new(HashSet::new()),
         }
     }
 
@@ -198,24 +207,52 @@ impl GithubExporter {
                 .failed_auto
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            db.meetings()
-                .list(200, 0)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|m| m.state == "ready")
-                .filter(|m| u64::try_from(m.started_at_ms).unwrap_or(0) >= since)
-                .filter(|m| !receipts.contains_key(&m.id))
-                .filter(|m| !skip.contains(&m.id))
-                .map(|m| m.id)
-                .collect()
+            // Paged, newest first, stopping at the first meeting older than
+            // the stamp: one page of 200 would silently strand an owed
+            // meeting the moment a busy library outgrew it.
+            let mut owed = Vec::new();
+            let mut offset = 0;
+            'pages: loop {
+                let page = db.meetings().list(200, offset).unwrap_or_default();
+                let full = page.len() == 200;
+                for m in page {
+                    if u64::try_from(m.started_at_ms).unwrap_or(0) < since {
+                        break 'pages;
+                    }
+                    if m.state == "ready" && !receipts.contains_key(&m.id) && !skip.contains(&m.id)
+                    {
+                        owed.push(m.id);
+                    }
+                }
+                if !full {
+                    break;
+                }
+                offset += 200;
+            }
+            owed
         };
 
         let mut pushed = 0;
         for id in candidates {
             match GithubExport::push(self, &id) {
                 Ok(receipt) => {
-                    println!("  pushed     : {} -> {}/{}", id, receipt.repo, receipt.path);
+                    // The id and the repo, never the path: the path carries a
+                    // slug of the meeting title, and titles are on §10's
+                    // never-log list.
+                    println!("  pushed     : {} -> {}", id, receipt.repo);
                     pushed += 1;
+                }
+                // The environment's fault, not this meeting's. Nothing is
+                // parked, and the round ends: the same broken gh would answer
+                // identically for every remaining meeting, once a minute.
+                Err(
+                    e @ (GithubError::GhMissing
+                    | GithubError::NotAuthenticated
+                    | GithubError::RepoNotFound
+                    | GithubError::Disabled),
+                ) => {
+                    eprintln!("  ! GitHub pushes are stalled: {e}");
+                    break;
                 }
                 Err(e) => {
                     eprintln!("  ! could not push meeting {id} to GitHub: {e}");
@@ -289,13 +326,16 @@ impl GithubExport for GithubExporter {
             if !settings.enabled {
                 return Err(GithubError::Disabled);
             }
+            // The store's own error text can quote the row it choked on, and
+            // this string reaches the UI and the daemon log — the same
+            // reasoning that keeps api.rs's server_error() a bare 500.
             let meeting = db.meetings().get(meeting_id).map_err(|e| match e {
                 StoreError::NotFound { .. } => GithubError::NoSuchMeeting,
-                other => GithubError::Failed(format!("could not read the meeting: {other}")),
+                _ => GithubError::Failed("the library refused to read the meeting".to_owned()),
             })?;
-            let doc = db
-                .export_meeting(meeting_id)
-                .map_err(|e| GithubError::Failed(format!("could not export the meeting: {e}")))?;
+            let doc = db.export_meeting(meeting_id).map_err(|_| {
+                GithubError::Failed("the library refused to export the meeting".to_owned())
+            })?;
             let existing = read_receipts(&db).remove(meeting_id);
             let path = existing.as_ref().map_or_else(
                 || {
@@ -308,9 +348,44 @@ impl GithubExport for GithubExporter {
                 },
                 |r| r.path.clone(),
             );
+            // Claimed before the Db lock is released: from here to the
+            // receipt write the meeting belongs to this call, and a second
+            // push — the worker and the button racing — answers immediately
+            // instead of double-committing.
+            let mut in_flight = self
+                .in_flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !in_flight.insert(meeting_id.to_owned()) {
+                return Err(GithubError::Failed(
+                    "a push for this meeting is already running".to_owned(),
+                ));
+            }
+            drop(in_flight);
             (settings, doc.to_markdown(), path, meeting.title, existing)
         };
+        // Everything below must release the claim on every exit.
+        let result = self.push_claimed(meeting_id, &settings, &markdown, &path, &title, existing);
+        self.in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(meeting_id);
+        result
+    }
+}
 
+impl GithubExporter {
+    /// The gh sequence and the bookkeeping, with the in-flight claim held.
+    #[allow(clippy::too_many_lines)]
+    fn push_claimed(
+        &self,
+        meeting_id: &str,
+        settings: &GithubSettings,
+        markdown: &str,
+        path: &str,
+        title: &str,
+        existing: Option<GithubReceipt>,
+    ) -> Result<GithubReceipt, GithubError> {
         let run = |args: &[&str], stdin: Option<&[u8]>| {
             let owned: Vec<String> = args.iter().map(ToString::to_string).collect();
             self.runner
@@ -388,7 +463,7 @@ impl GithubExport for GithubExporter {
 
         let receipt = GithubReceipt {
             repo: settings.repo.clone(),
-            path,
+            path: path.to_owned(),
             commit,
             pushed_at_ms: u64::try_from(fotw_store::now_ms()).unwrap_or(0),
         };
@@ -406,6 +481,14 @@ impl GithubExport for GithubExporter {
                 Ok(json) => {
                     if let Err(e) = db.put_setting(RECEIPTS_KEY, &json) {
                         eprintln!("  ! pushed, but could not save the receipt: {e}");
+                        // Without the receipt, the worker would see this
+                        // meeting as owed again next minute and commit it
+                        // again, forever. Parking it caps the damage at one
+                        // push; a restart (or a manual push) tries afresh.
+                        self.failed_auto
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(meeting_id.to_owned());
                     }
                 }
                 Err(e) => eprintln!("  ! pushed, but could not encode the receipt: {e}"),

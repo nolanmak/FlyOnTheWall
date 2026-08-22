@@ -397,19 +397,138 @@ fn auto_push_skips_meetings_from_before_the_stamp() {
 }
 
 #[test]
-fn a_failed_auto_push_is_not_retried_until_restart() {
-    // Everything fails at the repo check, on every attempt.
-    let r = rig(AUTO_SINCE_EPOCH, vec![ok(""), http_err(404)]);
+fn a_meeting_that_fails_on_its_own_is_parked_until_restart() {
+    // The PUT itself is refused — something about *this* meeting.
+    let r = rig(
+        AUTO_SINCE_EPOCH,
+        vec![
+            ok(""),
+            ok(r#"{"default_branch":"main"}"#),
+            http_err(404),
+            http_err(422),
+        ],
+    );
     assert_eq!(r.exporter.auto_push_pending(), 0);
     let after_first = r.gh.calls().len();
-    assert!(after_first > 0);
+    assert_eq!(after_first, 4);
 
     assert_eq!(r.exporter.auto_push_pending(), 0);
     assert_eq!(
         r.gh.calls().len(),
         after_first,
-        "a failing meeting must not hammer gh once a minute"
+        "a meeting that keeps failing must not hammer gh once a minute"
     );
+}
+
+/// gh missing, nobody logged in, repo unreachable — none of these are the
+/// meeting's fault. Fixing the environment must drain the backlog without a
+/// daemon restart, which is the promise `SystemGh` re-resolving per call
+/// already makes.
+#[test]
+fn an_environment_failure_is_retried_and_stops_the_round() {
+    let mut db = library();
+    let first = ready_meeting(&mut db, "First", 1_755_734_400_000);
+    let second = ready_meeting(&mut db, "Second", 1_755_734_500_000);
+    store_settings(&mut db, AUTO_SINCE_EPOCH);
+    let gh = ScriptedGh::scripted(vec![Ok(GhOutput {
+        status: 1,
+        stdout: String::new(),
+        stderr: "You are not logged into any GitHub hosts.".to_owned(),
+    })]);
+    let dir = tempfile::TempDir::new().unwrap();
+    let exporter = GithubExporter::new(
+        db,
+        dir.path().join("sessions"),
+        Arc::clone(&gh) as Arc<dyn GhRunner>,
+    );
+
+    assert_eq!(exporter.auto_push_pending(), 0);
+    assert_eq!(
+        gh.calls().len(),
+        1,
+        "one failed login answers for every meeting — the round must stop, \
+         not repeat the same refusal per meeting"
+    );
+
+    // The environment is fixed; the next poll owes both meetings.
+    gh.script.lock().unwrap().extend(create_script());
+    gh.script.lock().unwrap().extend(create_script());
+    assert_eq!(
+        exporter.auto_push_pending(),
+        2,
+        "meetings {first} and {second} must not be parked by an environment failure"
+    );
+}
+
+/// Auto with no stamp would mean "everything, ever". The guard refusing that
+/// is the only thing between a hand-edited settings row and a full-archive
+/// export.
+#[test]
+fn auto_mode_with_no_stamp_pushes_nothing() {
+    let stampless = r#"{"enabled":true,"repo":"octocat/notes","branch":"","path_prefix":"meetings/","mode":"auto"}"#;
+    let r = rig(stampless, create_script());
+    assert_eq!(r.exporter.auto_push_pending(), 0);
+    assert!(r.gh.calls().is_empty());
+}
+
+/// The park list gates the *worker*, never the person: a manual push is a
+/// human saying "try again now", and it must actually try.
+#[test]
+fn a_manual_push_retries_a_parked_meeting() {
+    let r = rig(
+        AUTO_SINCE_EPOCH,
+        vec![
+            ok(""),
+            ok(r#"{"default_branch":"main"}"#),
+            http_err(404),
+            http_err(422),
+        ],
+    );
+    assert_eq!(r.exporter.auto_push_pending(), 0, "parked");
+
+    r.gh.script.lock().unwrap().extend(create_script());
+    let receipt = r
+        .exporter
+        .push(&r.meeting)
+        .expect("a manual push ignores the park list");
+    assert_eq!(receipt.repo, "octocat/notes");
+}
+
+/// A `gh` that answers the create sequence forever, for tests whose point is
+/// volume rather than the exact exchange.
+#[derive(Debug, Default)]
+struct TirelessGh {
+    calls: Mutex<usize>,
+}
+
+impl GhRunner for TirelessGh {
+    fn run(&self, _args: &[String], _stdin: Option<&[u8]>) -> Result<GhOutput, String> {
+        let mut n = self.calls.lock().unwrap();
+        *n += 1;
+        match (*n - 1) % 4 {
+            2 => http_err(404),
+            _ => ok(PUT_OK),
+        }
+    }
+}
+
+/// One `list` page is 200 meetings. A backlog deeper than that must still
+/// drain — the busiest imaginable library must not silently strand its
+/// oldest owed meeting.
+#[test]
+fn auto_push_reaches_meetings_beyond_the_first_page() {
+    let mut db = library();
+    for i in 0..201 {
+        ready_meeting(&mut db, &format!("m{i}"), 1_755_734_400_000 + i);
+    }
+    store_settings(&mut db, AUTO_SINCE_EPOCH);
+    let dir = tempfile::TempDir::new().unwrap();
+    let exporter = GithubExporter::new(
+        db,
+        dir.path().join("sessions"),
+        Arc::new(TirelessGh::default()) as Arc<dyn GhRunner>,
+    );
+    assert_eq!(exporter.auto_push_pending(), 201);
 }
 
 #[test]
