@@ -37,13 +37,16 @@ use std::time::Duration;
 use fotw_audio::{AudioPlatform, AudioTap, DeviceId, FormatRequest, SystemScope, platform};
 use fotw_secrets::KeyStore;
 use fotw_shell::StartOrigin;
-use fotw_stt::{DeepgramStreamConfig, Source, deepgram::DeepgramConfig};
+
 use fotw_web::{RecorderControl, RecorderError, RecordingStatus};
 
 use crate::audit::{AuditKind, AuditLog};
 use crate::consent::{JurisdictionSignals, Rules};
 use crate::secrets;
-use crate::session::{self, SessionControl, SessionOutcome, StopSignal, SttErrors, Transcription};
+use crate::session::{
+    self, DeepgramLegs, SegmentTap, SessionControl, SessionOutcome, StopSignal, SttErrors,
+    Transcription,
+};
 
 /// How a session acquires its taps.
 ///
@@ -83,6 +86,8 @@ pub struct DaemonRecorder {
     finish: Arc<Finisher>,
     ceiling: Duration,
     ready_deadline: Duration,
+    /// Handed to every session for the live transcript (#61).
+    on_segment: SegmentTap,
     live: Arc<Mutex<Option<Live>>>,
 }
 
@@ -115,10 +120,11 @@ pub const READY_DEADLINE: Duration = Duration::from_secs(15);
 impl DaemonRecorder {
     /// A recorder that opens the host's real devices.
     #[must_use]
-    pub fn new(root: PathBuf, handle: tokio::runtime::Handle) -> Self {
+    pub fn new(root: PathBuf, handle: tokio::runtime::Handle, on_segment: SegmentTap) -> Self {
         Self::with_parts(
             root,
             handle,
+            on_segment,
             Box::new(|| {
                 let plat = platform::host();
                 let system = plat
@@ -140,9 +146,11 @@ impl DaemonRecorder {
 
     /// [`DaemonRecorder::new`] with every dependency named, for tests.
     #[must_use]
+    #[allow(clippy::too_many_arguments)] // every dependency named, as the tests require
     pub fn with_parts(
         root: PathBuf,
         handle: tokio::runtime::Handle,
+        on_segment: SegmentTap,
         open_taps: TapOpener,
         transcription: TranscriptionFactory,
         finish: Finisher,
@@ -157,6 +165,7 @@ impl DaemonRecorder {
             finish: Arc::new(finish),
             ceiling,
             ready_deadline,
+            on_segment,
             live: Arc::new(Mutex::new(None)),
         }
     }
@@ -193,10 +202,15 @@ fn keychain_transcription() -> Transcription {
         .as_ref()
         .and_then(|s| secrets::deepgram_key(*s as &dyn KeyStore))
     {
-        Some((secret, _)) => Transcription::Deepgram(Box::new(DeepgramStreamConfig::new(
-            secret.expose().to_owned(),
-            DeepgramConfig::new(format!("fotw-web-{}", now_ms()), Source::System),
-        ))),
+        Some((secret, _)) => Transcription::Deepgram(DeepgramLegs::for_session(
+            secret.expose(),
+            &format!("fotw-web-{}", now_ms()),
+            // Whether a mic actually started is the session's call, not ours:
+            // it gates the paid mic stream on the tap coming up, so claiming
+            // one here costs nothing when the device is absent.
+            true,
+            session::mic_stt_enabled(std::env::var("FOTW_MIC_STT").ok().as_deref()),
+        )),
         None => Transcription::Disabled,
     }
 }
@@ -278,7 +292,8 @@ impl RecorderControl for DaemonRecorder {
 
         let transcription = (self.transcription)();
 
-        let control = SessionControl::new();
+        let mut control = SessionControl::new();
+        control.on_segment = self.on_segment.clone();
         let stop = control.stop.clone();
         let ready = control.ready.clone();
         let started_at_ms = now_ms();

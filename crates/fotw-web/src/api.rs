@@ -23,6 +23,7 @@ use axum::response::Response;
 use serde::{Deserialize, Serialize};
 
 use crate::assets::apply_security_headers;
+use crate::github::{GithubError, GithubReceipt, GithubSettings};
 use crate::ingress::not_found;
 use crate::query::query_param;
 use crate::recorder::{RecorderError, RecordingStatus};
@@ -187,6 +188,126 @@ pub async fn recording_stop(State(state): State<AppState>) -> Response {
         Err(e) => Some(e.to_string()),
     };
     json(&state, &RecordingResponse { status, error })
+}
+
+/// `GET /api/settings/github`, `POST /api/settings/github`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GithubSettingsResponse {
+    /// What is stored — after a refused save, what is *still* stored.
+    pub settings: GithubSettings,
+    /// Why a save was refused, when it was. Beside a 200: see `recorder.rs`
+    /// on ING-09 and presence oracles.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `POST /api/meetings/{id}/github-push`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GithubPushResponse {
+    /// Where the transcript landed, when it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<GithubReceipt>,
+    /// Why it did not, when it did not — the stable codes in
+    /// [`GithubError`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `GET /api/settings/github`
+pub async fn github_settings(State(state): State<AppState>) -> Response {
+    let Some(github) = state.github() else {
+        return not_found();
+    };
+    // Reading the settings is a library read; rusqlite blocks.
+    let result = tokio::task::spawn_blocking(move || github.settings()).await;
+    let Ok(settings) = result else {
+        return server_error();
+    };
+    json(
+        &state,
+        &GithubSettingsResponse {
+            settings,
+            error: None,
+        },
+    )
+}
+
+/// `POST /api/settings/github`
+///
+/// The body is the settings document. Validation runs here, once, so the
+/// control behind the trait only ever stores what
+/// [`GithubSettings::normalized`] accepted.
+pub async fn github_set_settings(
+    State(state): State<AppState>,
+    body: Result<axum::Json<GithubSettings>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Some(github) = state.github() else {
+        return not_found();
+    };
+    // A malformed body is refused exactly as a wrong token is — axum's own
+    // rejection text describes the endpoint to whoever is probing it.
+    let Ok(axum::Json(submitted)) = body else {
+        return not_found();
+    };
+
+    let result = tokio::task::spawn_blocking(move || match submitted.normalized() {
+        Ok(valid) => match github.set_settings(valid) {
+            Ok(stored) => (stored, None),
+            Err(e) => (github.settings(), Some(e.to_string())),
+        },
+        // The refusal answers with what is still stored, so the UI never has
+        // to guess whether a rejected save changed anything.
+        Err(why) => (
+            github.settings(),
+            Some(GithubError::Invalid(why).to_string()),
+        ),
+    })
+    .await;
+
+    let Ok((settings, error)) = result else {
+        return server_error();
+    };
+    json(&state, &GithubSettingsResponse { settings, error })
+}
+
+/// `POST /api/meetings/{id}/github-push`
+pub async fn github_push(
+    State(state): State<AppState>,
+    id: Result<Path<String>, PathErr>,
+) -> Response {
+    let Some(github) = state.github() else {
+        return not_found();
+    };
+    let Ok(Path(id)) = id else {
+        return not_found();
+    };
+
+    // A push is a subprocess making network calls; minutes of transcript are
+    // read from the library first. Neither belongs on a runtime worker.
+    let result = tokio::task::spawn_blocking(move || github.push(&id)).await;
+    let Ok(outcome) = result else {
+        return server_error();
+    };
+
+    match outcome {
+        Ok(receipt) => json(
+            &state,
+            &GithubPushResponse {
+                receipt: Some(receipt),
+                error: None,
+            },
+        ),
+        // The same bare 404 `GET /api/meetings/{id}` answers: a guessed id
+        // must not be confirmable through this route either.
+        Err(GithubError::NoSuchMeeting) => not_found(),
+        Err(e) => json(
+            &state,
+            &GithubPushResponse {
+                receipt: None,
+                error: Some(e.to_string()),
+            },
+        ),
+    }
 }
 
 /// `GET /api/meetings`

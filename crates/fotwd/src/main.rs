@@ -18,7 +18,6 @@ use fotw_audio::{AudioPlatform, DeviceId, FormatRequest, SystemScope, platform};
 use fotw_secrets::{KeyStore, Provider};
 use fotw_shell::StartOrigin;
 use fotw_store::{ArchiveOptions, Db};
-use fotw_stt::{DeepgramStreamConfig, Source, deepgram::DeepgramConfig};
 use fotw_summarize::template::{TemplateSet, default_templates_dir};
 use fotwd::audit::{AuditKind, AuditLog};
 use fotwd::consent::{DisclosureKit, JurisdictionSignals, Rules};
@@ -552,14 +551,23 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
                 ),
                 _ => println!("  transcribe : Deepgram nova-3 (key from keychain)"),
             }
-            let key = secret.expose().to_owned();
-            // Only the system leg is transcribed. The mic leg needs its own
-            // connection and doubles the bill; that is the explicit
-            // "two cloud streams" decision in spec 7.5, not a default.
-            Transcription::Deepgram(Box::new(DeepgramStreamConfig::new(
-                key,
-                DeepgramConfig::new(session_id(), Source::System),
-            )))
+            // Both legs by default (#60): a transcript missing the user's
+            // half of every conversation fails at the product's one job. The
+            // second stream doubles the Deepgram bill, so it is declinable —
+            // and the line below says which legs are live, so the bill is
+            // never a surprise.
+            let mic_stt = session::mic_stt_enabled(std::env::var("FOTW_MIC_STT").ok().as_deref());
+            match (mic.is_some(), mic_stt) {
+                (true, true) => println!("  streams    : system + mic (FOTW_MIC_STT=off for one)"),
+                (true, false) => println!("  streams    : system only (FOTW_MIC_STT=off)"),
+                (false, _) => println!("  streams    : system only (no input device)"),
+            }
+            Transcription::Deepgram(session::DeepgramLegs::for_session(
+                secret.expose(),
+                &session_id(),
+                mic.is_some(),
+                mic_stt,
+            ))
         }
         None => {
             println!("  transcribe : off (run `fotwd key set deepgram` to enable)");

@@ -114,6 +114,34 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
     // attacker has to find even though it is not itself a security control;
     // `--port` trades that away for an origin the browser can remember. See
     // `parse_port`.
+    // The live-transcript producer (#61). The hub, its flusher and the
+    // WebSocket have existed since the UI shipped; this closure is the first
+    // thing in production to feed them. Deltas carry the session id — persist
+    // mints the library id only at the end, and the renderer does not read
+    // the id anyway; the post-stop refresh shows the persisted meeting.
+    //
+    // Late-bound because the hub lives inside the state that `bind` creates,
+    // and the recorder must exist before `bind` is called. Until the slot is
+    // filled the tap drops segments — which is a window nothing can occupy: a
+    // recording can only be started over HTTP, and HTTP is not served yet.
+    let hub_slot: Arc<std::sync::OnceLock<Arc<fotw_web::DeltaHub>>> =
+        Arc::new(std::sync::OnceLock::new());
+    let hub_for_tap = Arc::clone(&hub_slot);
+    // `Delta.idx` is documented as the index within *the* transcript, so the
+    // counter resets when the session changes — a daemon-lifetime counter
+    // would leak how many segments earlier meetings produced.
+    let tap_state = Arc::new(std::sync::Mutex::new((String::new(), 0i64)));
+    let on_segment = crate::session::SegmentTap::new(move |seg| {
+        let Some(hub) = hub_for_tap.get() else { return };
+        let mut guard = tap_state.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.0 != seg.session_id {
+            *guard = (seg.session_id.clone(), 0);
+        }
+        let idx = guard.1;
+        guard.1 += 1;
+        hub.publish(delta_from(idx, seg));
+    });
+
     // The recorder is what turns the read-only library viewer into something
     // that can start a meeting. It needs the runtime handle because `start()`
     // is called from a blocking pool thread and has to spawn the session task
@@ -121,6 +149,7 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
     let recorder = Arc::new(crate::recording::DaemonRecorder::new(
         root.clone(),
         tokio::runtime::Handle::current(),
+        on_segment,
     ));
 
     let server = WebServer::bind_with_recorder(
@@ -138,6 +167,9 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
     // is ~20k words, and one message each would swamp the socket and the DOM.
     let hub = state.hub();
     let _flusher = hub.spawn_flusher();
+
+    // The live-transcript tap can publish from here on.
+    let _ = hub_slot.set(Arc::clone(hub));
 
     // §9.5's sweeper, and issue #41's "on app start and hourly". Started
     // before the URL is printed so a daemon that is killed a second later
@@ -261,6 +293,31 @@ fn sweep_once(db: &mut fotw_store::Db, data_root: &Path) {
             }
         }
         Err(e) => eprintln!("  ! retention sweep failed: {e}"),
+    }
+}
+
+/// One finalized segment, as the wire sees it.
+///
+/// `meeting_id` is the **session** id: a live recording has no library id —
+/// persist mints one only when the meeting ends — and the UI's renderer
+/// appends deltas without reading the id at all. Only finals reach the
+/// collector that feeds this, so `is_final` is unconditionally true.
+#[must_use]
+pub fn delta_from(idx: i64, seg: &fotw_stt::TranscriptSegment) -> fotw_web::Delta {
+    fotw_web::Delta {
+        meeting_id: seg.session_id.clone(),
+        idx,
+        start_ms: i64::try_from(seg.start_ms).unwrap_or(i64::MAX),
+        end_ms: i64::try_from(seg.end_ms).unwrap_or(i64::MAX),
+        // §7.5's "me vs them", kept on the wire: the channel is what the UI
+        // styles by, and losing it here would turn it back into a
+        // diarisation problem.
+        channel: match seg.source {
+            fotw_stt::Source::Mic => "mic".to_owned(),
+            fotw_stt::Source::System => "system".to_owned(),
+        },
+        text: seg.text.clone(),
+        is_final: true,
     }
 }
 

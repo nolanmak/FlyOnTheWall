@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use crate::github::GithubExport;
 use crate::ingress::IngressPolicy;
 use crate::source::MeetingSource;
 use crate::stream::DeltaHub;
@@ -29,6 +30,7 @@ struct Inner {
     hub: Arc<DeltaHub>,
     csp: String,
     recorder: Option<Arc<dyn RecorderControl>>,
+    github: Option<Arc<dyn GithubExport>>,
 }
 
 impl std::fmt::Debug for dyn RecorderControl {
@@ -36,6 +38,13 @@ impl std::fmt::Debug for dyn RecorderControl {
         // Same reason as the library below: a `{:?}` on the app state must not
         // reach anything that knows what is being recorded.
         f.write_str("RecorderControl(<redacted>)")
+    }
+}
+
+impl std::fmt::Debug for dyn GithubExport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // It holds the library handle the pusher exports transcripts from.
+        f.write_str("GithubExport(<redacted>)")
     }
 }
 
@@ -67,12 +76,27 @@ impl AppState {
         source: Arc<dyn MeetingSource>,
         recorder: Option<Arc<dyn RecorderControl>>,
     ) -> Self {
+        Self::with_controls(policy, source, recorder, None)
+    }
+
+    /// [`AppState::with_recorder`], with the GitHub export control as well.
+    ///
+    /// Grown the same way `with_recorder` grew out of `new`: existing call
+    /// sites keep the arity that says what they actually have.
+    #[must_use]
+    pub fn with_controls(
+        policy: IngressPolicy,
+        source: Arc<dyn MeetingSource>,
+        recorder: Option<Arc<dyn RecorderControl>>,
+        github: Option<Arc<dyn GithubExport>>,
+    ) -> Self {
         let csp = content_security_policy(policy.origin());
         Self {
             inner: Arc::new(Inner {
                 policy,
                 source,
                 recorder,
+                github,
                 tickets: TokenTable::new(WS_TICKET_TTL),
                 handoff: TokenTable::new(HANDOFF_TTL),
                 hub: Arc::new(DeltaHub::new()),
@@ -95,6 +119,16 @@ impl AppState {
     #[must_use]
     pub fn recorder(&self) -> Option<Arc<dyn RecorderControl>> {
         self.inner.recorder.clone()
+    }
+
+    /// The GitHub export control, if this daemon has one.
+    ///
+    /// `None` on a read-only server, and the handlers answer a bare 404 —
+    /// a build that cannot push is indistinguishable from one that has never
+    /// heard of the route.
+    #[must_use]
+    pub fn github(&self) -> Option<Arc<dyn GithubExport>> {
+        self.inner.github.clone()
     }
 
     /// The library, for [`tokio::task::spawn_blocking`].

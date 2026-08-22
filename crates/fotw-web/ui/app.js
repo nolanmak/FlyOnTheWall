@@ -391,6 +391,26 @@ function renderRecording(body) {
   }
 }
 
+// Give the live transcript somewhere to land. `appendDeltas` targets
+// `#segments`, which until now existed only inside an opened meeting's detail
+// view — so live words had a working socket and no element to render into.
+// Only called from the Start click, never from the poll: replacing the detail
+// pane is acceptable as the direct result of an action, and rude as a side
+// effect of a timer while someone is reading an old meeting.
+function showLive() {
+  clear(el.detail);
+  el.detail.appendChild(text("h2", "Recording"));
+  el.detail.appendChild(
+    text("p", "Words appear here as the provider finalizes them.", "meta"),
+  );
+  const transcript = document.createElement("section");
+  transcript.className = "transcript";
+  const body = document.createElement("div");
+  body.id = "segments";
+  transcript.appendChild(body);
+  el.detail.appendChild(transcript);
+}
+
 async function onRecord() {
   const path = recordingNow
     ? "/api/recording/stop"
@@ -405,6 +425,7 @@ async function onRecord() {
       say("The recorder said: " + body.error);
     } else if (body.state === "recording") {
       say("Recording. Tell the other participants.");
+      showLive();
     } else {
       say("Stopped. The meeting is being written to your library.");
       await loadMeetings();

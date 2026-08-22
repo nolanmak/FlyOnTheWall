@@ -53,6 +53,7 @@ fn recorder(root: &std::path::Path, finished: Arc<AtomicU64>) -> DaemonRecorder 
     DaemonRecorder::with_parts(
         root.to_path_buf(),
         tokio::runtime::Handle::current(),
+        fotwd::session::SegmentTap::default(),
         Box::new(|| {
             Ok((
                 Box::new(FileAudioSource::from_wav(
