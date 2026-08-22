@@ -3,13 +3,18 @@
 // Two rules, both from docs/REQUIREMENTS.md 10.1, and both of which the Rust
 // side has a test for:
 //
-//   ING-08  The bearer token lives in sessionStorage and nowhere else. Never a
+//   ING-08  The bearer token lives in localStorage and nowhere else. Never a
 //           cookie: RFC 6265 scopes cookies by *host*, so a cookie set by
-//           127.0.0.1:51234 would be sent to every other service on every
+//           127.0.0.1:8737 would be sent to every other service on every
 //           other port of 127.0.0.1 -- every local dev server, every other
-//           app's helper process. sessionStorage is keyed by the full origin
+//           app's helper process. localStorage is keyed by the full origin
 //           including the port, and it is not ambient: nothing attaches it to
-//           a request unless this file does.
+//           a request unless this file does. localStorage rather than
+//           sessionStorage so that, paired with the daemon's stable default
+//           port, every tab at this origin shares one login and a bookmark
+//           works -- a rebound page is a different origin and reads nothing,
+//           and a daemon restart rotates the bearer, so a stale copy here is
+//           worth exactly one 404.
 //
 //   ING-11  Transcript text is attacker-influenced. Anyone in the meeting can
 //           say anything, and a calendar description can carry markup. Every
@@ -60,11 +65,11 @@ async function redeemHandoff() {
   });
   if (!res.ok) return;
   const body = await res.json();
-  sessionStorage.setItem(TOKEN_KEY, body.token);
+  localStorage.setItem(TOKEN_KEY, body.token);
 }
 
 function token() {
-  return sessionStorage.getItem(TOKEN_KEY);
+  return localStorage.getItem(TOKEN_KEY);
 }
 
 async function api(path, options) {
@@ -616,7 +621,7 @@ function githubActions(meetingId) {
 async function main() {
   await redeemHandoff();
   if (!token()) {
-    say("This tab is not authorised. Reopen FlyOnTheWall from the menu bar.");
+    say("This tab is not authorised. Click the FlyOnTheWall app icon to open a fresh one.");
     return;
   }
   el.search.addEventListener("input", onSearch);

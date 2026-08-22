@@ -197,7 +197,7 @@ dev-sign: (bundle "debug")
 # launching Contents/MacOS/fotwd from a shell makes the TERMINAL the responsible
 # process, so the grant attaches to Ghostty/iTerm/Terminal instead of us.
 run: dev-sign
-    open -a "$(pwd)/{{app}}"
+    open -a "$(pwd)/{{app}}" --args serve
 
 # ---------------------------------------------------------------- release
 

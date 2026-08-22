@@ -169,6 +169,7 @@ fn routes(state: AppState) -> Router {
         .route("/api/search", get(api::search))
         .route("/api/ws-ticket", post(api::ws_ticket))
         .route("/api/handoff", post(api::handoff))
+        .route("/api/launch-url", post(api::launch_url))
         .route("/api/stream", get(stream::stream))
         .route("/api/recording/status", get(api::recording_status))
         .route("/api/recording/start", post(api::recording_start))

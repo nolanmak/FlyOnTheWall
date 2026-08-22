@@ -51,18 +51,20 @@ pub fn state_file_path(root: &Path) -> PathBuf {
     root.parent().unwrap_or(root).join("daemon.json")
 }
 
+/// The port `serve` binds when `--port` does not say otherwise.
+///
+/// Fixed, because the login is keyed by origin and the port is part of an
+/// origin: a stable port is what makes `http://127.0.0.1:8737` a bookmark
+/// that works and lets every tab share one login. A fixed port is guessable
+/// by a page scanning localhost, but the port was never a security control —
+/// ING-01 through ING-05 are, and a scanner that finds the port still meets
+/// the bearer. `--port 0` keeps the old harder-to-find ephemeral behavior
+/// for anyone who wants the trade back.
+pub const DEFAULT_PORT: u16 = 8737;
+
 /// The port `serve` should bind, taken from the command line.
 ///
-/// Defaults to 0 — the OS picks — because a fixed port is guessable by a page
-/// scanning localhost. That is not itself a security control (ING-01 through
-/// ING-05 are), but it is one more thing an attacker has to find, so trading
-/// it away stays an explicit choice.
-///
-/// The reason to offer the trade at all: the redeemed bearer lives in
-/// `sessionStorage` (ING-08), which is keyed by origin, and the port is part
-/// of an origin. An ephemeral port therefore throws the credential away on
-/// every restart, and the user meets a 30-second handoff window instead of a
-/// bookmark that works.
+/// Defaults to [`DEFAULT_PORT`]; `--port 0` asks for an ephemeral one.
 ///
 /// # Errors
 ///
@@ -70,7 +72,7 @@ pub fn state_file_path(root: &Path) -> PathBuf {
 /// 65535, or privileged.
 pub fn parse_port(args: &[String]) -> Result<u16, String> {
     let Some(at) = args.iter().position(|a| a == "--port") else {
-        return Ok(0);
+        return Ok(DEFAULT_PORT);
     };
 
     // A following `--flag` is treated as absent rather than as the value:
@@ -114,8 +116,69 @@ pub enum Launch {
     Nothing,
 }
 
+/// Ask an already-running daemon for a fresh one-time login URL.
+///
+/// The caller proves it may ask by presenting the bearer from the 0600 state
+/// file — the same file the CLI has always read. Any failure — nothing
+/// listening, a foreign service on a reused port, a stale token — is an
+/// `Err`, and the caller starts a daemon of its own instead.
+///
+/// # Errors
+///
+/// The daemon did not answer 200 with a loopback `?t=` URL.
+pub async fn fetch_fresh_launch_url(port: u16, token: &str) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/api/launch-url"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if response.status().as_u16() != 200 {
+        return Err(format!("not our daemon: status {}", response.status()));
+    }
+    let body: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
+    let url = body["url"].as_str().unwrap_or_default();
+    if url.starts_with(&format!("http://127.0.0.1:{port}/?t=")) {
+        Ok(url.to_owned())
+    } else {
+        Err("the answer did not look like a launch URL".to_owned())
+    }
+}
+
+/// If a daemon is already serving this library, hand back a fresh login URL
+/// from it. `None` means nobody real answered and a fresh start is in order.
+async fn reopen_running_ui(root: &Path) -> Option<String> {
+    let state = fotw_web::read_state_file(&state_file_path(root)).ok()?;
+    fetch_fresh_launch_url(state.port, &state.token).await.ok()
+}
+
 /// Run the loopback server until the process is stopped.
 pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), String> {
+    // Second click, not second daemon: if one is already serving, every tab
+    // problem is solved by a fresh one-time link from it — no keychain read,
+    // no bind, no new process. This is also what makes the app icon behave
+    // like an app: launching it again brings the UI back.
+    if let Some(url) = reopen_running_ui(&root).await {
+        match launch {
+            Launch::OpenBrowser => match std::process::Command::new("open").arg(&url).status() {
+                Ok(s) if s.success() => {
+                    println!("  already running — opened a new authorized tab");
+                }
+                _ => println!("  already running — run `fotwd serve --print-url` for a link"),
+            },
+            Launch::PrintUrl => {
+                println!("  already running — open this once, it expires in 30s:");
+                println!("{url}");
+            }
+            Launch::Nothing => println!("  already running"),
+        }
+        return Ok(());
+    }
+
     let db = crate::open_library(&root)?;
     let source = Arc::new(StoreSource::new(db));
 
