@@ -103,6 +103,16 @@ impl GithubSettings {
         {
             return Err("the branch name has whitespace in it".to_owned());
         }
+        // The branch rides in a URL the gh CLI hands to Go's URL parser,
+        // which treats '#' as a fragment, '?' as a query, '%' as an escape
+        // and '&' as a separator — all legal in a git refname, all silently
+        // changing which file gets written. Verified against the real
+        // parser: `repos/o/r/contents/x#y` fetches `x`.
+        if self.branch.chars().any(url_metacharacter) {
+            return Err(
+                "the branch name has a character (#, ?, %, &) that a URL would misread".to_owned(),
+            );
+        }
 
         self.path_prefix = normalize_prefix(self.path_prefix.trim())?;
         Ok(self)
@@ -118,14 +128,26 @@ fn validate_repo(repo: &str) -> Result<(), String> {
     if owner.is_empty() || name.is_empty() {
         return Err(format!("`{repo}` is not owner/name"));
     }
-    let ok = |s: &str| {
-        s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    };
-    if !ok(owner) || !ok(name) {
+    // Owners (users and orgs) are alphanumeric plus '-' and '_'; only repo
+    // names may carry dots. "." and ".." are how `repos/../gists` walks out
+    // of the /repos/ namespace entirely — GitHub's server normalizes dot
+    // segments — so a name of only dots is refused outright.
+    let owner_ok = owner
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+    let name_ok = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !name.chars().all(|c| c == '.');
+    if !owner_ok || !name_ok {
         return Err(format!("`{repo}` has characters GitHub would refuse"));
     }
     Ok(())
+}
+
+/// A character Go's URL parser would reinterpret before GitHub ever sees it.
+fn url_metacharacter(c: char) -> bool {
+    matches!(c, '#' | '?' | '%' | '&')
 }
 
 /// No leading slash, a trailing one unless empty, and no way out of the repo.
@@ -143,6 +165,14 @@ fn normalize_prefix(prefix: &str) -> Result<String, String> {
         }
         if segment == "." || segment == ".." {
             return Err("the path prefix must stay inside the repository".to_owned());
+        }
+        // Same reason as the branch: '#' truncates the URL at the parser,
+        // so a prefix of "q#a/" would commit every transcript to a root
+        // file named "q", each push overwriting the last.
+        if segment.chars().any(url_metacharacter) {
+            return Err(
+                "the path prefix has a character (#, ?, %, &) that a URL would misread".to_owned(),
+            );
         }
     }
     Ok(format!("{trimmed}/"))
@@ -241,6 +271,45 @@ mod tests {
             "enabled needs a repo"
         );
         assert!(enabled("owner/has space", "m/").normalized().is_err());
+    }
+
+    #[test]
+    fn url_metacharacters_are_refused_everywhere_they_could_reroute_a_push() {
+        // Verified against gh: '#' makes Go's URL parser drop the rest of
+        // the path, so these are not pedantry — each one silently writes to
+        // a file the user never named.
+        for bad in ["q#a/", "q?a/", "q%2fa/", "q&a/"] {
+            assert!(
+                enabled("o/n", bad).normalized().is_err(),
+                "prefix {bad:?} must be refused"
+            );
+        }
+        for bad in ["feat#1", "feat?x", "feat%31", "a&b"] {
+            let s = GithubSettings {
+                branch: bad.to_owned(),
+                ..enabled("o/n", "m/")
+            };
+            assert!(s.normalized().is_err(), "branch {bad:?} must be refused");
+        }
+        // The characters GitHub itself uses stay legal.
+        assert!(enabled("o/n", "notes/meetings/").normalized().is_ok());
+        let fine = GithubSettings {
+            branch: "feat/x-1.2_ok".to_owned(),
+            ..enabled("o/n", "m/")
+        };
+        assert!(fine.normalized().is_ok());
+    }
+
+    #[test]
+    fn dot_segments_cannot_walk_out_of_the_repos_namespace() {
+        // `repos/../gists` is a real, reachable endpoint after the server
+        // normalizes the dots. An owner never contains a dot at all.
+        assert!(enabled("../gists", "m/").normalized().is_err());
+        assert!(enabled("./x", "m/").normalized().is_err());
+        assert!(enabled("o/..", "m/").normalized().is_err());
+        assert!(enabled("o/.", "m/").normalized().is_err());
+        assert!(enabled("dotted.owner/x", "m/").normalized().is_err());
+        assert!(enabled("o/repo.name", "m/").normalized().is_ok());
     }
 
     #[test]

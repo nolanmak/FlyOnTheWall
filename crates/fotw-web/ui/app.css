@@ -27,6 +27,9 @@
 
 body {
   margin: 0;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
   background: var(--bg);
   color: var(--fg);
   font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
@@ -108,10 +111,14 @@ h1 {
   cursor: not-allowed;
 }
 
+/* The column heights come from flex on the body, not from a hardcoded
+   calc(): the GitHub-export bar made the old 90px a lie, which pushed the
+   status line below the fold exactly when it had something to say. */
 main {
   display: grid;
   grid-template-columns: minmax(220px, 320px) 1fr;
-  height: calc(100vh - 90px);
+  flex: 1;
+  min-height: 0;
 }
 
 nav {
