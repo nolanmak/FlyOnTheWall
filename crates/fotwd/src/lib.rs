@@ -9,6 +9,8 @@
 pub mod audit;
 pub mod consent;
 pub mod detect;
+pub mod engine;
+pub mod enrich;
 pub mod github;
 pub mod onboard;
 pub mod persist;

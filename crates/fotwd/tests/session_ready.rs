@@ -208,7 +208,7 @@ fn recorder(
         fotwd::session::SegmentTap::default(),
         taps,
         Box::new(|| Transcription::Disabled),
-        Box::new(|_root, _outcome| {}),
+        Box::new(|_root, _outcome| None),
         Duration::from_secs(5),
         deadline,
     )

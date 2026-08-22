@@ -15,7 +15,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use fotw_audio::{AudioPlatform, DeviceId, FormatRequest, SystemScope, platform};
-use fotw_secrets::{KeyStore, Provider};
+use fotw_secrets::{KeyStore, Provider, SecretKey};
 use fotw_shell::StartOrigin;
 use fotw_store::{ArchiveOptions, Db};
 use fotw_summarize::template::{TemplateSet, default_templates_dir};
@@ -94,6 +94,7 @@ async fn main() -> ExitCode {
                 .unwrap_or(120);
             detect(secs)
         }
+        Some("engine") => engine_command(&args[1..]),
         Some("key") => key_command(&args[1..]),
         Some("recover") => {
             let pos = positionals(&args[1..], &[]);
@@ -132,7 +133,8 @@ async fn main() -> ExitCode {
                  list [dir] | summarize <id> [dir] [--template <slug>] | disclose | \
                  onboard | detect [seconds] | \
                  retention [dir] [--apply] [--days <n>] [--budget-gib <n>] | \
-                 key <set <provider>|list> | recover [dir] [--check] | \
+                 key <set <provider>|list> | engine [claude-cli|off] | \
+                 recover [dir] [--check] | \
                  templates <list|install|show <slug>> | \
                  export <id> [dir] [--format md|txt|json] [--out <file>] | \
                  export-all <dest> [dir] [--audio] [--resume] [--yes-plaintext] | \
@@ -625,12 +627,14 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
             // forever with the retention engine unable to see any of it.
             let data_root = data_root_of(&root);
             let mut archived = None;
+            let mut persisted_id = None;
             match open_db(&root) {
                 Err(e) => eprintln!("  ! could not open the library: {e}"),
                 Ok(mut db) => match persist::persist_session(&mut db, &outcome, &default_title()) {
                     Err(e) => eprintln!("  ! could not add to the library: {e}"),
                     Ok(id) => {
                         println!("  meeting    : {id}");
+                        persisted_id = Some(id.clone());
                         match fotwd::retention::promote_session(
                             &mut db,
                             &data_root,
@@ -661,6 +665,22 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
                         }
                     }
                 },
+            }
+
+            // Enrichment (#67/#68): title, summary, action items — derived
+            // work over a meeting already safe on disk, so problems print
+            // and nothing here can fail the recording.
+            if let Some(id) = &persisted_id {
+                let report = fotwd::enrich::enrich_meeting(&root, id).await;
+                if let Some(title) = &report.title {
+                    println!("  title      : {title}");
+                }
+                if let Some(version) = report.summary_version {
+                    println!("  summary    : v{version} (with action items)");
+                }
+                for problem in &report.problems {
+                    eprintln!("  ! enrichment: {problem}");
+                }
             }
 
             println!();
@@ -1046,6 +1066,96 @@ fn list(root: PathBuf) -> ExitCode {
 ///
 /// Stdin, never an argument: argv is readable by any same-user process, and a
 /// key pasted onto a command line also lands in the shell history file.
+/// `fotwd engine [claude-cli --i-acknowledge-egress [--binary <path>] | off]`.
+///
+/// The CLI engine is opt-in with a recorded acknowledgement, because a
+/// `claude` binary on PATH is not consent: the transcript leaves the machine
+/// through it exactly as it would through an API key (KEY-04), and the
+/// resolver refuses the CLI until the user has said they know that.
+fn engine_command(args: &[String]) -> ExitCode {
+    use fotwd::engine::{SETTINGS_KEY, SummarizeSettings};
+
+    let root = default_root();
+    let mut db = match open_db(&root) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("fotwd: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let write = |db: &mut Db, settings: &SummarizeSettings| -> Result<(), String> {
+        let json = serde_json::to_string(settings).map_err(|e| e.to_string())?;
+        db.put_setting(SETTINGS_KEY, &json)
+            .map_err(|e| e.to_string())
+    };
+
+    match args.first().map(String::as_str) {
+        None => {
+            let settings = SummarizeSettings::read(&db);
+            let has_key = secrets::keystore().ok().is_some_and(|s| {
+                s.contains(SecretKey::ApiKey(Provider::Anthropic))
+                    .unwrap_or(false)
+            });
+            if has_key {
+                println!("  engine     : anthropic API (key in keychain — always wins)");
+            } else if settings.cli_enabled && settings.acknowledged_egress {
+                println!("  engine     : claude CLI (`{}`)", settings.binary);
+            } else {
+                println!("  engine     : none — meetings get a local fallback title only");
+                println!("    `fotwd key set anthropic`                         for the API");
+                println!("    `fotwd engine claude-cli --i-acknowledge-egress`  for your CLI");
+            }
+            ExitCode::SUCCESS
+        }
+        Some("off") => match write(&mut db, &SummarizeSettings::default()) {
+            Ok(()) => {
+                println!("  engine     : off");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("fotwd: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("claude-cli") => {
+            // The disclosure is the point, not a speed bump: KEY-04's duty,
+            // for a path with no key to hang it on.
+            if !args.iter().any(|a| a == "--i-acknowledge-egress") {
+                eprintln!("  Enabling the CLI engine sends each finished meeting's transcript");
+                eprintln!("  to Anthropic through your local `claude` login — the same words");
+                eprintln!("  that would travel under an API key, on your subscription's terms.");
+                eprintln!();
+                eprintln!("  Re-run with --i-acknowledge-egress to confirm.");
+                return ExitCode::FAILURE;
+            }
+            let settings = SummarizeSettings {
+                cli_enabled: true,
+                acknowledged_egress: true,
+                binary: flag_value(args, "--binary").unwrap_or_else(|| "claude".to_owned()),
+            };
+            match write(&mut db, &settings) {
+                Ok(()) => {
+                    println!("  engine     : claude CLI (`{}`)", settings.binary);
+                    println!("  Finished meetings now get a title, a summary and action items.");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("fotwd: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some(other) => {
+            eprintln!(
+                "usage: fotwd engine [claude-cli --i-acknowledge-egress [--binary <path>] | off]"
+            );
+            eprintln!("fotwd: unknown engine `{other}`");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn key_command(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("set") => {

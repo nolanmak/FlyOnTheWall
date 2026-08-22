@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use fotw_secrets::{KeyStore, Provider, SecretKey};
+use fotw_secrets::KeyStore;
 use fotw_store::{Db, NewSummary};
 use fotw_stt::{Source, TimestampSource, TranscriptSegment};
 use fotw_summarize::document::TranscriptDocument;
@@ -17,6 +17,11 @@ use fotw_summarize::template::Template;
 use fotw_summarize::{AnthropicAdapter, Preset};
 
 use crate::transport::AllowlistedTransport;
+
+/// How long one CLI call may take. Generous — a long meeting is a long
+/// prompt — and finite, because a hung CLI must not become a meeting whose
+/// enrichment never finishes.
+const CLI_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// What a summarisation run produced.
 #[derive(Debug)]
@@ -39,10 +44,12 @@ pub enum SummarizeRunError {
     /// The meeting has no transcript to summarise.
     #[error("meeting {0} has no transcript yet")]
     NoTranscript(String),
-    /// No Anthropic key is configured.
+    /// No engine is configured — neither an API key nor an enabled CLI.
     #[error(
-        "no Anthropic key configured — run `fotwd key set anthropic`. \
-         The transcript is unchanged and can be summarised later."
+        "no summarize engine configured — run `fotwd key set anthropic` (API), \
+         or `fotwd engine claude-cli --i-acknowledge-egress` (your Claude \
+         subscription's CLI). The transcript is unchanged and can be \
+         summarised later."
     )]
     NoKey,
     /// The store failed.
@@ -51,6 +58,22 @@ pub enum SummarizeRunError {
     /// The provider or the pipeline failed.
     #[error("summarize: {0}")]
     Pipeline(#[from] fotw_summarize::SummarizeError),
+}
+
+/// The stored transcript for a meeting, reconstructed for the summariser.
+///
+/// # Errors
+///
+/// [`SummarizeRunError::NoTranscript`] when the meeting has none, or whatever
+/// the store failed with.
+pub(crate) fn stored_segments(
+    db: &mut Db,
+    meeting_id: &str,
+) -> Result<Vec<TranscriptSegment>, SummarizeRunError> {
+    let Some(transcript_id) = crate::persist::primary_transcript_id(db, meeting_id) else {
+        return Err(SummarizeRunError::NoTranscript(meeting_id.to_owned()));
+    };
+    Ok(load_segments(db, &transcript_id)?)
 }
 
 /// Summarise a stored meeting using the daemon's real, allowlisted transport.
@@ -89,9 +112,7 @@ where
         return Err(SummarizeRunError::NoTranscript(meeting_id.to_owned()));
     }
 
-    let key = store
-        .get(SecretKey::ApiKey(Provider::Anthropic))
-        .map_err(|_| SummarizeRunError::NoKey)?;
+    let engine = crate::engine::resolve_engine(store, db).ok_or(SummarizeRunError::NoKey)?;
 
     // The user's typed notes, if any. They are a *saliency signal*, not just
     // another input: the prompt contract treats each line as a pointer to
@@ -103,20 +124,58 @@ where
         .unwrap_or_default();
 
     let document = TranscriptDocument::from_segments(&segments);
-    // Two adapters, two models. Extraction is a low-difficulty task, so it
-    // runs on the cheap tier while the prose call gets the better model —
-    // spec 8.4's split, and the reason the pipeline takes two adapters rather
-    // than one.
+    // Two adapters. On the API they are two models — extraction is a
+    // low-difficulty task, so it runs on the cheap tier while the prose call
+    // gets the better model (spec 8.4's split). On the CLI both use the
+    // subscription's own configured default: the plan's model choice belongs
+    // to the user, and hardcoding a tier here would fight their settings.
     let prose_model = Preset::Balanced.prose_model().unwrap_or("claude-opus-5");
     let extraction_model = Preset::Cheap.prose_model().unwrap_or("claude-haiku-4-5");
-    let prose = AnthropicAdapter::new(Arc::clone(&transport), prose_model, key.expose());
-    let extraction = AnthropicAdapter::new(Arc::clone(&transport), extraction_model, key.expose());
+    let (prose, extraction, provider_name, recorded_model): (
+        Box<dyn fotw_summarize::adapter::LlmAdapter>,
+        Box<dyn fotw_summarize::adapter::LlmAdapter>,
+        &str,
+        String,
+    ) = match &engine {
+        crate::engine::Engine::Anthropic { key } => (
+            Box::new(AnthropicAdapter::new(
+                Arc::clone(&transport),
+                prose_model,
+                key.expose(),
+            )),
+            Box::new(AnthropicAdapter::new(
+                Arc::clone(&transport),
+                extraction_model,
+                key.expose(),
+            )),
+            "anthropic",
+            prose_model.to_owned(),
+        ),
+        crate::engine::Engine::ClaudeCli { binary } => {
+            let runner = Arc::new(crate::engine::TokioCliRunner::new(
+                binary.clone(),
+                CLI_DEADLINE,
+            ));
+            (
+                Box::new(fotw_summarize::claude_cli::ClaudeCliAdapter::new(
+                    Arc::clone(&runner),
+                    None,
+                )),
+                Box::new(fotw_summarize::claude_cli::ClaudeCliAdapter::new(
+                    runner, None,
+                )),
+                "claude-cli",
+                "claude-cli".to_owned(),
+            )
+        }
+    };
+    let (prose, extraction) = (&*prose, &*extraction);
 
     // The template arrives as a parsed file (SUM-08), and what crosses this
     // seam is still just its rendered body -- untrusted text that
     // `prompt::assemble` quarantines. Parsing it earlier bought a located
     // error message, not trust.
-    let pipeline = Pipeline::new(&prose, &extraction).with_config(PipelineConfig {
+    let pipeline = Pipeline::new(prose, extraction).with_config(PipelineConfig {
         template_body: template.prompt_body(),
         ..PipelineConfig::default()
     });
@@ -136,8 +195,8 @@ where
         meeting_id,
         NewSummary {
             transcript_id: Some(transcript_id),
-            provider: "anthropic".to_owned(),
-            model: prose_model.to_owned(),
+            provider: provider_name.to_owned(),
+            model: recorded_model.clone(),
             prompt_hash: outcome.prompt_hash.clone(),
             body_md: markdown.clone(),
             coverage: Some(coverage),
@@ -168,7 +227,7 @@ where
 /// the summariser wants (`session_id`, `revision`, `timestamp_source`) are
 /// reconstructed rather than persisted, because they describe how the text was
 /// obtained rather than what it says.
-fn load_segments(
+pub(crate) fn load_segments(
     db: &Db,
     transcript_id: &str,
 ) -> Result<Vec<TranscriptSegment>, fotw_store::StoreError> {
