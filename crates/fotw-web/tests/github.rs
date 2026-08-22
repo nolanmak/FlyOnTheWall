@@ -16,9 +16,9 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 use fotw_web::{
     GithubError, GithubExport, GithubMode, GithubReceipt, GithubSettings, MemorySource, WebServer,
@@ -114,7 +114,10 @@ async fn every_github_route_needs_the_bearer() {
         r.h.post("/api/meetings/m1/github-push", &anon, None).await,
     ];
     for res in responses {
-        assert_eq!(res.status, 404, "a github route leaked to an anonymous caller");
+        assert_eq!(
+            res.status, 404,
+            "a github route leaked to an anonymous caller"
+        );
         assert!(res.body.is_empty());
     }
     assert_eq!(
@@ -153,15 +156,19 @@ async fn a_server_without_the_control_answers_the_same_404_as_an_unknown_path() 
 #[tokio::test]
 async fn the_wrong_method_is_a_bare_404_with_no_allow_header() {
     let r = rig().await;
-    let res = r
-        .h
-        .post("/api/meetings/m1/github-push", &r.h.authorised(), None)
-        .await;
+    let res =
+        r.h.post("/api/meetings/m1/github-push", &r.h.authorised(), None)
+            .await;
     assert_eq!(res.status, 200, "sanity: the right method works");
 
-    let wrong = r.h.get("/api/meetings/m1/github-push", &r.h.authorised()).await;
+    let wrong =
+        r.h.get("/api/meetings/m1/github-push", &r.h.authorised())
+            .await;
     assert_eq!(wrong.status, 404);
-    assert!(wrong.header("allow").is_none(), "an Allow header names the method");
+    assert!(
+        wrong.header("allow").is_none(),
+        "an Allow header names the method"
+    );
 }
 
 // ----------------------------------------------------------------- settings
@@ -170,9 +177,12 @@ async fn the_wrong_method_is_a_bare_404_with_no_allow_header() {
 async fn settings_round_trip_through_the_api() {
     let r = rig().await;
 
-    let saved = r
-        .h
-        .post("/api/settings/github", &r.h.authorised(), Some(&good_settings()))
+    let saved =
+        r.h.post(
+            "/api/settings/github",
+            &r.h.authorised(),
+            Some(&good_settings()),
+        )
         .await;
     assert_eq!(saved.status, 200);
     let saved = body_json(&saved.body);
@@ -193,10 +203,9 @@ async fn settings_round_trip_through_the_api() {
 async fn a_path_prefix_is_normalized_before_it_is_stored() {
     let r = rig().await;
     let body = r#"{"enabled":true,"repo":"octocat/notes","branch":"main","path_prefix":"/notes/meetings","mode":"auto"}"#;
-    let res = r
-        .h
-        .post("/api/settings/github", &r.h.authorised(), Some(body))
-        .await;
+    let res =
+        r.h.post("/api/settings/github", &r.h.authorised(), Some(body))
+            .await;
     let v = body_json(&res.body);
     assert!(v["error"].is_null());
     assert_eq!(
@@ -218,10 +227,9 @@ async fn invalid_settings_are_refused_in_the_body_not_the_status() {
         // A prefix that escapes the repo.
         r#"{"enabled":true,"repo":"octocat/notes","branch":"","path_prefix":"../secrets/","mode":"manual"}"#,
     ] {
-        let res = r
-            .h
-            .post("/api/settings/github", &r.h.authorised(), Some(bad))
-            .await;
+        let res =
+            r.h.post("/api/settings/github", &r.h.authorised(), Some(bad))
+                .await;
         assert_eq!(res.status, 200, "a refusal is not a status code (ING-09)");
         let v = body_json(&res.body);
         let error = v["error"].as_str().unwrap_or_default().to_owned();
@@ -244,10 +252,9 @@ async fn invalid_settings_are_refused_in_the_body_not_the_status() {
 #[tokio::test]
 async fn a_malformed_settings_body_is_a_bare_404() {
     let r = rig().await;
-    let res = r
-        .h
-        .post("/api/settings/github", &r.h.authorised(), Some("not json"))
-        .await;
+    let res =
+        r.h.post("/api/settings/github", &r.h.authorised(), Some("not json"))
+            .await;
     assert_eq!(res.status, 404);
     assert!(res.body.is_empty());
 }
@@ -257,10 +264,9 @@ async fn a_malformed_settings_body_is_a_bare_404() {
 #[tokio::test]
 async fn a_push_returns_the_receipt() {
     let r = rig().await;
-    let res = r
-        .h
-        .post("/api/meetings/m1/github-push", &r.h.authorised(), None)
-        .await;
+    let res =
+        r.h.post("/api/meetings/m1/github-push", &r.h.authorised(), None)
+            .await;
     assert_eq!(res.status, 200);
     let v = body_json(&res.body);
     assert!(v["error"].is_null());
@@ -275,10 +281,9 @@ async fn a_push_returns_the_receipt() {
 async fn a_push_for_a_meeting_that_does_not_exist_is_a_bare_404() {
     let r = rig().await;
     *r.github.outcome.lock().unwrap() = Some(GithubError::NoSuchMeeting);
-    let res = r
-        .h
-        .post("/api/meetings/gone/github-push", &r.h.authorised(), None)
-        .await;
+    let res =
+        r.h.post("/api/meetings/gone/github-push", &r.h.authorised(), None)
+            .await;
     assert_eq!(res.status, 404);
     assert!(res.body.is_empty());
 }
@@ -296,10 +301,9 @@ async fn a_push_failure_rides_in_the_body() {
         (GithubError::Failed("HTTP 409".to_owned()), "HTTP 409"),
     ] {
         *r.github.outcome.lock().unwrap() = Some(err);
-        let res = r
-            .h
-            .post("/api/meetings/m1/github-push", &r.h.authorised(), None)
-            .await;
+        let res =
+            r.h.post("/api/meetings/m1/github-push", &r.h.authorised(), None)
+                .await;
         assert_eq!(res.status, 200);
         let v = body_json(&res.body);
         assert_eq!(v["error"].as_str().unwrap_or_default(), code);
@@ -313,8 +317,14 @@ async fn a_push_failure_rides_in_the_body() {
 /// state is.
 #[test]
 fn the_mode_spelling_is_pinned() {
-    assert_eq!(serde_json::to_string(&GithubMode::Manual).unwrap(), r#""manual""#);
-    assert_eq!(serde_json::to_string(&GithubMode::Auto).unwrap(), r#""auto""#);
+    assert_eq!(
+        serde_json::to_string(&GithubMode::Manual).unwrap(),
+        r#""manual""#
+    );
+    assert_eq!(
+        serde_json::to_string(&GithubMode::Auto).unwrap(),
+        r#""auto""#
+    );
 }
 
 /// Defaults are what a fresh library gets: disabled, `meetings/`, manual.

@@ -112,9 +112,18 @@ fn repeated_reads_do_not_reach_the_store_again() {
 fn a_missing_secret_is_remembered_as_missing() {
     let cached = CachedKeyStore::new(Counting::default());
 
-    assert!(matches!(cached.get(MASTER), Err(SecretsError::NotFound { .. })));
-    assert!(matches!(cached.get(MASTER), Err(SecretsError::NotFound { .. })));
-    assert!(matches!(cached.get(MASTER), Err(SecretsError::NotFound { .. })));
+    assert!(matches!(
+        cached.get(MASTER),
+        Err(SecretsError::NotFound { .. })
+    ));
+    assert!(matches!(
+        cached.get(MASTER),
+        Err(SecretsError::NotFound { .. })
+    ));
+    assert!(matches!(
+        cached.get(MASTER),
+        Err(SecretsError::NotFound { .. })
+    ));
 
     assert_eq!(cached.inner().reads(), 1);
 }
@@ -239,7 +248,10 @@ fn a_transient_failure_is_not_remembered() {
     });
     assert!(cached.get(MASTER).is_err(), "first call should fail");
     assert_eq!(
-        cached.get(MASTER).expect("retry must reach the store").expose(),
+        cached
+            .get(MASTER)
+            .expect("retry must reach the store")
+            .expose(),
         "arrived-late",
         "a transient platform error was cached as if it were an answer"
     );

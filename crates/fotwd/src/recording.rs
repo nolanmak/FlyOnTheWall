@@ -349,13 +349,11 @@ impl RecorderControl for DaemonRecorder {
         // Trip and return. The task clears the slot once the meeting is on
         // disk; until then status honestly still reads `recording`.
         live.stop.stop();
-        Ok(
-            RecordingStatus::recording(
-                live.started_at_ms,
-                now_ms().saturating_sub(live.started_at_ms),
-            )
-            .with_transcription_error(live.errors.latest()),
+        Ok(RecordingStatus::recording(
+            live.started_at_ms,
+            now_ms().saturating_sub(live.started_at_ms),
         )
+        .with_transcription_error(live.errors.latest()))
     }
 
     fn status(&self) -> RecordingStatus {
@@ -400,8 +398,7 @@ async fn spawn_session(
             }
             // Blocking work — Opus encoding and SQLite — off the runtime.
             let root2 = root.clone();
-            let _ =
-                tokio::task::spawn_blocking(move || (finish)(&root2, &outcome)).await;
+            let _ = tokio::task::spawn_blocking(move || (finish)(&root2, &outcome)).await;
         }
         Err(e) => eprintln!("  ! the recording failed: {e}"),
     }

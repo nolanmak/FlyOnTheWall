@@ -117,9 +117,7 @@ impl<S: KeyStore> KeyStore for CachedKeyStore<S> {
         if let Some(known) = self.lock().get(&key) {
             return match known {
                 Known::Present(material) => Ok(SecretString::new(material.clone())),
-                Known::Absent => Err(SecretsError::NotFound {
-                    key: key.account(),
-                }),
+                Known::Absent => Err(SecretsError::NotFound { key: key.account() }),
             };
         }
 

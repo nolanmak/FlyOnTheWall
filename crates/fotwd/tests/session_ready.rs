@@ -250,7 +250,9 @@ async fn a_wedged_device_fails_the_start_instead_of_lying() {
     );
 
     let began = Instant::now();
-    let err = rec.start().expect_err("a wedged device must not report success");
+    let err = rec
+        .start()
+        .expect_err("a wedged device must not report success");
 
     assert!(
         began.elapsed() < Duration::from_secs(10),
@@ -286,7 +288,9 @@ async fn a_start_that_cannot_open_a_device_leaves_the_recorder_idle() {
         Duration::from_millis(500),
     );
 
-    let err = rec.start().expect_err("a missing device must not report success");
+    let err = rec
+        .start()
+        .expect_err("a missing device must not report success");
     assert!(matches!(err, RecorderError::Failed(_)));
     assert!(!rec.status().is_recording());
 

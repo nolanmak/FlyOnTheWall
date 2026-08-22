@@ -96,7 +96,10 @@ fn streaming_sends_diarize_alone_and_never_the_model_alongside_it() {
 /// caller who reaches for it deserves the error rather than silence.
 #[test]
 fn the_streaming_diarize_model_is_still_the_supported_one() {
-    assert_eq!(DeepgramStreamParams::spec().diarize_model(), STREAMING_DIARIZE_MODEL);
+    assert_eq!(
+        DeepgramStreamParams::spec().diarize_model(),
+        STREAMING_DIARIZE_MODEL
+    );
 }
 
 #[test]

@@ -75,7 +75,10 @@ fn ssh_is_nobody() {
         answerable_from(&[("SSH_CONNECTION", "10.0.0.1 22 10.0.0.2 22")], true),
         Answerable::Nobody
     );
-    assert_eq!(answerable_from(&[("SSH_TTY", "/dev/ttys004")], true), Answerable::Nobody);
+    assert_eq!(
+        answerable_from(&[("SSH_TTY", "/dev/ttys004")], true),
+        Answerable::Nobody
+    );
 }
 
 /// No GUI session at all — a launchd daemon in the system context.

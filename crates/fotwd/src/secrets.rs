@@ -29,7 +29,9 @@
 use std::sync::OnceLock;
 
 use fotw_secrets::recovery::MasterKeyBytes;
-use fotw_secrets::{CachedKeyStore, KeyStore, OsKeyStore, Provider, SecretKey, SecretString, SecretsError};
+use fotw_secrets::{
+    CachedKeyStore, KeyStore, OsKeyStore, Provider, SecretKey, SecretString, SecretsError,
+};
 use fotw_store::DbKey;
 
 /// How the daemon resolved a *provider* secret, so the UI can tell the user.

@@ -574,13 +574,7 @@ pub async fn run_with_control(
     // The pump owns the WAL and does every blocking thing.
     let pump = std::thread::spawn(move || -> Result<(u64, u64, u64), String> {
         pump_loop(
-            wal,
-            sys_cons,
-            mic_cons,
-            sys_format,
-            mic_format,
-            feeds,
-            &pump_stop,
+            wal, sys_cons, mic_cons, sys_format, mic_format, feeds, &pump_stop,
         )
     });
 

@@ -10,10 +10,10 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
-use tokio_tungstenite::tungstenite::Message;
 
 use fotw_stt::deepgram_wire::DeepgramStreamParams;
 
