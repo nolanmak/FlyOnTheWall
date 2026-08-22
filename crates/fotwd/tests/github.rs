@@ -537,3 +537,39 @@ fn manual_mode_never_pushes_on_its_own() {
     assert_eq!(r.exporter.auto_push_pending(), 0);
     assert!(r.gh.calls().is_empty());
 }
+
+// -------------------------------------------------------------------- repos
+
+/// The settings form's picker: one `gh api` call, only repos this login can
+/// push to, most recently active first — the order GitHub already answers in.
+#[test]
+fn the_repo_picker_asks_gh_for_pushable_repos() {
+    let r = rig(MANUAL, vec![ok(r#"["octocat/notes","work-org/minutes"]"#)]);
+    let repos = r.exporter.repos().expect("the scripted listing answers");
+    assert_eq!(repos, ["octocat/notes", "work-org/minutes"]);
+
+    let calls = r.gh.calls();
+    assert_eq!(calls.len(), 1, "one subprocess, no preflight ceremony");
+    assert_eq!(
+        calls[0].0,
+        [
+            "api",
+            "user/repos?per_page=100&sort=pushed",
+            "--jq",
+            "[.[] | select(.permissions.push) | .full_name]"
+        ]
+    );
+}
+
+#[test]
+fn the_repo_picker_maps_failures_like_a_push_does() {
+    let r = rig(MANUAL, vec![Err("No such file or directory".to_owned())]);
+    assert_eq!(r.exporter.repos(), Err(GithubError::GhMissing));
+
+    let r = rig(MANUAL, vec![http_err(401)]);
+    assert_eq!(r.exporter.repos(), Err(GithubError::NotAuthenticated));
+
+    // Garbage stdout is a Failed, never a panic and never an empty success.
+    let r = rig(MANUAL, vec![ok("not json")]);
+    assert!(matches!(r.exporter.repos(), Err(GithubError::Failed(_))));
+}

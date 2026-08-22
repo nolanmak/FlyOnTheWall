@@ -37,6 +37,7 @@ const el = {
   ghAuto: document.getElementById("gh-auto"),
   ghEnabled: document.getElementById("gh-enabled"),
   ghSave: document.getElementById("gh-save"),
+  ghRepoList: document.getElementById("gh-repo-list"),
 };
 
 // --------------------------------------------------------------- ING-10
@@ -495,6 +496,32 @@ async function loadGithub() {
   }
 }
 
+// Fetched once, when the section is first opened: listing repos runs the gh
+// CLI on the daemon side, and page load should not pay for a picker nobody
+// opened. A failure is said out loud and retried on the next open — the
+// field itself keeps working as free text either way.
+let ghReposLoaded = false;
+
+async function loadGithubRepos() {
+  if (ghReposLoaded) return;
+  try {
+    const body = await api("/api/settings/github/repos");
+    if (body.error) {
+      say(ghExplain(body.error));
+      return;
+    }
+    clear(el.ghRepoList);
+    for (const name of body.repos) {
+      const option = document.createElement("option");
+      option.value = name;
+      el.ghRepoList.appendChild(option);
+    }
+    ghReposLoaded = true;
+  } catch (e) {
+    // The control is absent or the request failed; the field stays free text.
+  }
+}
+
 async function onGithubSave() {
   el.ghSave.disabled = true;
   try {
@@ -583,6 +610,9 @@ async function main() {
     el.record.disabled = !recordingNow && !el.consent.checked;
   });
   el.ghSave.addEventListener("click", onGithubSave);
+  el.ghSettings.addEventListener("toggle", function () {
+    if (el.ghSettings.open) loadGithubRepos();
+  });
   await loadMeetings();
   await loadGithub();
   await pollRecording();

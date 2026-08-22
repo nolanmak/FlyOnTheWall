@@ -291,6 +291,34 @@ impl GithubExport for GithubExporter {
         read_settings(&self.lock_db())
     }
 
+    fn repos(&self) -> Result<Vec<String>, GithubError> {
+        // One call, no preflight: the call's own failure modes already say
+        // "no gh" and "no login", which is everything the picker needs to
+        // know. Pushable repos only — offering a repo the token cannot write
+        // to sets the user up for a push that fails later — and one page of
+        // the 100 most recently pushed: a picker wants the repos someone
+        // actually uses, and the field still accepts anything typed.
+        let args: Vec<String> = [
+            "api",
+            "user/repos?per_page=100&sort=pushed",
+            "--jq",
+            "[.[] | select(.permissions.push) | .full_name]",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let out = self
+            .runner
+            .run(&args, None)
+            .map_err(|_| GithubError::GhMissing)?;
+        if out.status != 0 {
+            return Err(classify(&out));
+        }
+        serde_json::from_str(&out.stdout).map_err(|_| {
+            GithubError::Failed("gh answered something that is not a repo list".to_owned())
+        })
+    }
+
     fn set_settings(&self, settings: GithubSettings) -> Result<GithubSettings, GithubError> {
         let mut db = self.lock_db();
         let previous = read_settings(&db);

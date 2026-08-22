@@ -31,6 +31,8 @@ struct FakeGithub {
     pushes: AtomicU64,
     /// The error the next push should fail with, if any.
     outcome: Mutex<Option<GithubError>>,
+    /// The error the next repo listing should fail with, if any.
+    repos_outcome: Mutex<Option<GithubError>>,
 }
 
 impl GithubExport for FakeGithub {
@@ -41,6 +43,16 @@ impl GithubExport for FakeGithub {
     fn set_settings(&self, s: GithubSettings) -> Result<GithubSettings, GithubError> {
         *self.settings.lock().unwrap() = s.clone();
         Ok(s)
+    }
+
+    fn repos(&self) -> Result<Vec<String>, GithubError> {
+        if let Some(err) = self.repos_outcome.lock().unwrap().take() {
+            return Err(err);
+        }
+        Ok(vec![
+            "octocat/notes".to_owned(),
+            "octocat/journal".to_owned(),
+        ])
     }
 
     fn push(&self, meeting_id: &str) -> Result<GithubReceipt, GithubError> {
@@ -257,6 +269,56 @@ async fn a_malformed_settings_body_is_a_bare_404() {
             .await;
     assert_eq!(res.status, 404);
     assert!(res.body.is_empty());
+}
+
+// -------------------------------------------------------------------- repos
+
+/// The picker behind the settings form: the daemon asks gh which repos this
+/// login can push to, so the user picks instead of typing.
+#[tokio::test]
+async fn the_repo_listing_answers_names_and_needs_the_bearer() {
+    let r = rig().await;
+
+    let anon =
+        r.h.get("/api/settings/github/repos", &r.h.anonymous())
+            .await;
+    assert_eq!(
+        anon.status, 404,
+        "the listing leaked to an anonymous caller"
+    );
+    assert!(anon.body.is_empty());
+
+    let res =
+        r.h.get("/api/settings/github/repos", &r.h.authorised())
+            .await;
+    assert_eq!(res.status, 200);
+    let v = body_json(&res.body);
+    assert!(v["error"].is_null());
+    assert_eq!(v["repos"][0], "octocat/notes");
+    assert_eq!(v["repos"][1], "octocat/journal");
+}
+
+/// "gh is missing" is data for the UI here exactly as it is for a push.
+#[tokio::test]
+async fn a_repo_listing_failure_rides_in_the_body() {
+    let r = rig().await;
+    *r.github.repos_outcome.lock().unwrap() = Some(GithubError::GhMissing);
+    let res =
+        r.h.get("/api/settings/github/repos", &r.h.authorised())
+            .await;
+    assert_eq!(res.status, 200);
+    let v = body_json(&res.body);
+    assert_eq!(v["error"], "gh_missing");
+    assert_eq!(v["repos"].as_array().map(Vec::len), Some(0));
+}
+
+/// A server without the control answers the same bare 404 here too.
+#[tokio::test]
+async fn the_repo_listing_is_invisible_without_the_control() {
+    let h = common::start().await;
+    let absent = h.get("/api/settings/github/repos", &h.authorised()).await;
+    let unknown = h.get("/api/no-such-path", &h.authorised()).await;
+    assert_eq!(absent.bytes_without_date(), unknown.bytes_without_date());
 }
 
 // -------------------------------------------------------------------- push

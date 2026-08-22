@@ -177,6 +177,7 @@ fn routes(state: AppState) -> Router {
             "/api/settings/github",
             get(api::github_settings).post(api::github_set_settings),
         )
+        .route("/api/settings/github/repos", get(api::github_repos))
         .route("/api/meetings/{id}/github-push", post(api::github_push))
         // Both of these are ING-09. The fallback is the same bare 404 the
         // guard returns, so "wrong token" and "no such path" are one response.

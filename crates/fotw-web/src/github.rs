@@ -239,6 +239,16 @@ pub trait GithubExport: Send + Sync + 'static {
     /// [`GithubError::Failed`] if the store refused the write.
     fn set_settings(&self, settings: GithubSettings) -> Result<GithubSettings, GithubError>;
 
+    /// The repositories this login may push to, `owner/name`, most recently
+    /// active first — what the settings form offers instead of a blank field.
+    ///
+    /// # Errors
+    ///
+    /// [`GithubError::GhMissing`], [`GithubError::NotAuthenticated`], or
+    /// [`GithubError::Failed`] — the same states a push would have hit, found
+    /// before anything was configured.
+    fn repos(&self) -> Result<Vec<String>, GithubError>;
+
     /// Commit one meeting's Markdown export to the configured repository.
     ///
     /// # Errors

@@ -201,6 +201,17 @@ pub struct GithubSettingsResponse {
     pub error: Option<String>,
 }
 
+/// `GET /api/settings/github/repos`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GithubReposResponse {
+    /// `owner/name`, most recently active first. Empty when `error` says why.
+    pub repos: Vec<String>,
+    /// Why the listing failed, when it did — the same stable codes a push
+    /// answers with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// `POST /api/meetings/{id}/github-push`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GithubPushResponse {
@@ -230,6 +241,25 @@ pub async fn github_settings(State(state): State<AppState>) -> Response {
             error: None,
         },
     )
+}
+
+/// `GET /api/settings/github/repos`
+///
+/// The picker behind the settings form. A subprocess call, so it runs on the
+/// blocking pool like a push does.
+pub async fn github_repos(State(state): State<AppState>) -> Response {
+    let Some(github) = state.github() else {
+        return not_found();
+    };
+    let result = tokio::task::spawn_blocking(move || github.repos()).await;
+    let Ok(outcome) = result else {
+        return server_error();
+    };
+    let (repos, error) = match outcome {
+        Ok(repos) => (repos, None),
+        Err(e) => (Vec::new(), Some(e.to_string())),
+    };
+    json(&state, &GithubReposResponse { repos, error })
 }
 
 /// `POST /api/settings/github`
