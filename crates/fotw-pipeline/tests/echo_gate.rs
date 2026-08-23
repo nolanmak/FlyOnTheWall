@@ -44,14 +44,36 @@ fn speech_like(seed: u32, n: usize, offset: usize) -> Vec<f32> {
     for _ in 0..(n + offset) {
         noise.push(noise_at());
     }
-    let (rate_a, rate_b) = (1.9 + (seed % 5) as f32 * 0.7, 3.3 + (seed % 3) as f32 * 1.1);
+    // The envelope must be APERIODIC too. A periodic envelope (sines) lets
+    // adjacent windows of the same signal correlate with themselves, which
+    // faked out an earlier version of the negative-lag test below. Real
+    // syllables do not repeat on a schedule; a smoothed noise walk models
+    // that honestly. Separate generator, so the envelope stream is
+    // independent of the carrier stream.
+    let mut env_state = seed.wrapping_mul(747_796_405).wrapping_add(1);
+    let mut env_noise = move || {
+        env_state ^= env_state << 13;
+        env_state ^= env_state >> 17;
+        env_state ^= env_state << 5;
+        env_state as f32 / u32::MAX as f32
+    };
+    let mut envelope = Vec::with_capacity(n + offset);
+    let mut level = 0.5f32;
+    let mut target = 0.5f32;
+    for i in 0..(n + offset) {
+        // Step-and-glide: a new random loudness target every ~150 ms, with a
+        // ~30 ms glide toward it. Deep, aperiodic, syllable-paced swings —
+        // a plain one-pole walk over noise was measured near-constant
+        // (std ≈ 0.01), which is a fixture with no syllables in it.
+        if i % 2_400 == 0 {
+            target = env_noise();
+        }
+        level += 0.002 * (target - level);
+        let swung = (level.clamp(0.0, 1.0)).powi(2);
+        envelope.push(0.03 + 0.97 * swung);
+    }
     (0..n)
-        .map(|i| {
-            let t = (i + offset) as f32 / RATE as f32;
-            let wobble = (0.15 + 0.85 * (0.5 + 0.5 * (t * rate_a * std::f32::consts::TAU).sin()))
-                * (0.4 + 0.6 * (0.5 + 0.5 * (t * rate_b * std::f32::consts::TAU).sin()));
-            wobble * 0.3 * noise[i + offset]
-        })
+        .map(|i| envelope[i + offset] * 0.3 * noise[i + offset])
         .collect()
 }
 
@@ -284,11 +306,13 @@ fn echo_and_independent_speech_are_separated_by_a_wide_margin() {
         echo_suppressed >= 6,
         "echo suppressed only {echo_suppressed}/8 post-warmup chunks"
     );
-    // And the raw score itself must clear the threshold with margin, so the
-    // constant is not sitting on the echo population's edge.
+    // The discrimination burden lives on the stability ratio now — the raw
+    // floor only needs honest headroom over the coupling floor so echo never
+    // fails to qualify. (Raw scores CANNOT separate the populations at this
+    // search width; the suppressed-counts above are the real margin.)
     let threshold = EchoGate::correlation_threshold();
     assert!(
-        echo_floor > threshold * 1.3,
+        echo_floor > threshold * 1.15,
         "echo floor {echo_floor:.3} sits too close to the threshold {threshold:.3}"
     );
 }
@@ -361,4 +385,43 @@ fn the_gate_counts_what_it_did() {
     // what this test pins is that the counters describe what happened.
     assert!(suppressed >= 3, "only {suppressed}/10 suppressed");
     assert!(suppressed < assessed);
+}
+
+/// The live failure, reproduced: the system feed ran SECONDS behind the mic
+/// feed — the echo reached the gate before its own reference did. A search
+/// that only looks backward in reference history can never match that; the
+/// alignment must be bidirectional and cover multi-second skew.
+#[test]
+fn a_reference_that_arrives_seconds_late_is_still_matched() {
+    let mut g = gate();
+    let system = speech_like(3, CHUNK * 24, 0);
+    let acoustic = 40 * RATE as usize / 1_000;
+    // The system feed delivers audio two whole chunks (200 ms scaled up:
+    // here two 100 ms chunks) behind the mic's timeline — and to make it
+    // brutal, push it four chunks behind: 400 ms of negative lag.
+    let behind = 4;
+
+    let mut flagged = 0;
+    let mut assessed = 0u32;
+    for chunk in 0..24 {
+        let off = chunk * CHUNK;
+        if chunk >= behind {
+            let sys_off = (chunk - behind) * CHUNK;
+            g.push_system(&system[sys_off..sys_off + CHUNK]);
+        }
+        let mic = echoed(&system, acoustic, 0.3, CHUNK, off);
+        let verdict = g.assess(&mic);
+        // Warmup: both histories must cover the window plus the skew, and
+        // engagement costs three stable windows on top.
+        if chunk >= 12 {
+            assessed += 1;
+            if verdict == GateVerdict::Suppress {
+                flagged += 1;
+            }
+        }
+    }
+    assert!(
+        flagged >= assessed - 1,
+        "late-reference echo flagged only {flagged}/{assessed}"
+    );
 }
