@@ -31,6 +31,44 @@ pub const SETTINGS_KEY: &str = "summarize";
 /// How long a fallback title may be, in bytes of UTF-8.
 const TITLE_BUDGET: usize = 64;
 
+/// Which local CLI serves as the engine.
+///
+/// The wire spelling is `snake_case` and defaults to [`CliKind::Claude`] so a
+/// settings row written before codex existed reads back as the claude engine
+/// it was, never as an error.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CliKind {
+    /// The `claude` CLI, backed by a Claude subscription.
+    #[default]
+    Claude,
+    /// The `codex` CLI, backed by a ChatGPT/Codex subscription.
+    Codex,
+}
+
+impl CliKind {
+    /// The binary a bare enablement defaults to when the user names none.
+    #[must_use]
+    pub fn default_binary(self) -> String {
+        match self {
+            Self::Claude => "claude".to_owned(),
+            // codex ships as an app bundle and is usually reached through a
+            // shell alias, which a daemon that spawns without a shell cannot
+            // see. Prefer the app's real binary when it is where the
+            // installer puts it, and fall back to the bare name for a PATH
+            // install.
+            Self::Codex => {
+                const APP: &str = "/Applications/Codex.app/Contents/Resources/codex";
+                if std::path::Path::new(APP).is_file() {
+                    APP.to_owned()
+                } else {
+                    "codex".to_owned()
+                }
+            }
+        }
+    }
+}
+
 /// The persisted CLI-engine choice.
 ///
 /// Missing or unparseable reads as default — a fresh library, never an error
@@ -43,6 +81,8 @@ pub struct SummarizeSettings {
     /// The user was shown, and accepted, that transcripts leave the machine
     /// through the CLI. Enablement without this is not enablement.
     pub acknowledged_egress: bool,
+    /// Which CLI. Defaults to claude for rows written before codex existed.
+    pub cli_kind: CliKind,
     /// The binary to run. A bare name resolves on PATH; a path is used as-is.
     pub binary: String,
 }
@@ -71,6 +111,11 @@ pub enum Engine {
         /// The resolved binary.
         binary: PathBuf,
     },
+    /// The local `codex` CLI, BYO ChatGPT/Codex subscription.
+    Codex {
+        /// The resolved binary.
+        binary: PathBuf,
+    },
 }
 
 impl std::fmt::Debug for Engine {
@@ -79,11 +124,17 @@ impl std::fmt::Debug for Engine {
         match self {
             Self::Anthropic { .. } => f.write_str("Engine::Anthropic(<redacted>)"),
             Self::ClaudeCli { binary } => f.debug_tuple("Engine::ClaudeCli").field(binary).finish(),
+            Self::Codex { binary } => f.debug_tuple("Engine::Codex").field(binary).finish(),
         }
     }
 }
 
 /// Pick the engine for this machine, or `None` when summaries stay local.
+///
+/// An Anthropic API key always wins — it is explicit configuration and keeps
+/// the pre-CLI behavior byte-for-byte. With no key, the enabled-and-
+/// acknowledged CLI serves, `cli_kind` deciding which. With neither,
+/// enrichment stays local and nothing leaves the device.
 #[must_use]
 pub fn resolve_engine(store: &dyn KeyStore, db: &Db) -> Option<Engine> {
     if let Ok(key) = store.get(SecretKey::ApiKey(Provider::Anthropic)) {
@@ -98,11 +149,18 @@ pub fn resolve_engine(store: &dyn KeyStore, db: &Db) -> Option<Engine> {
     // visible state the caller can report, where a spawn failure hours later
     // inside a finished meeting's enrichment is a surprise in a log.
     let binary = resolve_binary(&settings.binary)?;
-    Some(Engine::ClaudeCli { binary })
+    Some(match settings.cli_kind {
+        CliKind::Claude => Engine::ClaudeCli { binary },
+        CliKind::Codex => Engine::Codex { binary },
+    })
 }
 
 /// A bare name searched on PATH; anything with a separator taken literally.
-fn resolve_binary(configured: &str) -> Option<PathBuf> {
+///
+/// Public so `fotwd engine` can warn at configuration time when the binary it
+/// just stored will not resolve — a spawn failure hours later inside a
+/// finished meeting's enrichment is a far worse place to learn it.
+pub fn resolve_binary(configured: &str) -> Option<PathBuf> {
     let direct = PathBuf::from(configured);
     if configured.contains(std::path::MAIN_SEPARATOR) {
         return is_executable(&direct).then_some(direct);
@@ -191,8 +249,12 @@ impl fotw_summarize::claude_cli::CliTransport for TokioCliRunner {
                 // The transcript is the child's stdin, not its environment;
                 // a wiped environment also keeps DEEPGRAM_API_KEY and
                 // friends out of a process that has no business seeing them.
+                // OPENAI_API_KEY specifically: codex prefers it over the
+                // subscription login when present, which would silently bill
+                // the per-token API the CLI engine exists to avoid.
                 .env_remove("DEEPGRAM_API_KEY")
                 .env_remove("ANTHROPIC_API_KEY")
+                .env_remove("OPENAI_API_KEY")
                 .kill_on_drop(true)
                 .spawn()
                 .map_err(|e| {
@@ -232,5 +294,102 @@ impl fotw_summarize::claude_cli::CliTransport for TokioCliRunner {
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fotw_secrets::{InMemoryKeyStore, Provider, SecretString};
+    use fotw_store::{Db, DbKey};
+
+    fn db() -> Db {
+        Db::open_in_memory(&DbKey::from_bytes([0x01; 32])).unwrap()
+    }
+
+    fn enable(db: &mut Db, kind: CliKind, binary: &str) {
+        let settings = SummarizeSettings {
+            cli_enabled: true,
+            acknowledged_egress: true,
+            cli_kind: kind,
+            binary: binary.to_owned(),
+        };
+        db.put_setting(SETTINGS_KEY, &serde_json::to_string(&settings).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn an_anthropic_key_always_wins_over_a_configured_cli() {
+        let store = InMemoryKeyStore::new();
+        store
+            .set(
+                SecretKey::ApiKey(Provider::Anthropic),
+                &SecretString::new("sk-ant-xxx"),
+            )
+            .unwrap();
+        let mut db = db();
+        enable(&mut db, CliKind::Codex, "/bin/sh"); // an executable that exists
+        assert!(
+            matches!(resolve_engine(&store, &db), Some(Engine::Anthropic { .. })),
+            "an explicit key is explicit configuration and must win"
+        );
+    }
+
+    #[test]
+    fn codex_is_chosen_when_it_is_the_configured_kind() {
+        let store = InMemoryKeyStore::new();
+        let mut db = db();
+        // `/bin/sh` stands in for a real, resolvable binary on every unix CI.
+        enable(&mut db, CliKind::Codex, "/bin/sh");
+        assert!(matches!(
+            resolve_engine(&store, &db),
+            Some(Engine::Codex { .. })
+        ));
+    }
+
+    #[test]
+    fn the_claude_kind_still_resolves_to_the_claude_engine() {
+        let store = InMemoryKeyStore::new();
+        let mut db = db();
+        enable(&mut db, CliKind::Claude, "/bin/sh");
+        assert!(matches!(
+            resolve_engine(&store, &db),
+            Some(Engine::ClaudeCli { .. })
+        ));
+    }
+
+    #[test]
+    fn a_settings_row_from_before_codex_reads_back_as_claude() {
+        // No `cli_kind` field at all — the shape written by the pre-codex
+        // build. It must not fail to parse, and must mean claude.
+        let mut db = db();
+        db.put_setting(
+            SETTINGS_KEY,
+            r#"{"cli_enabled":true,"acknowledged_egress":true,"binary":"/bin/sh"}"#,
+        )
+        .unwrap();
+        assert_eq!(SummarizeSettings::read(&db).cli_kind, CliKind::Claude);
+        assert!(matches!(
+            resolve_engine(&InMemoryKeyStore::new(), &db),
+            Some(Engine::ClaudeCli { .. })
+        ));
+    }
+
+    #[test]
+    fn the_cli_is_refused_without_the_egress_acknowledgement() {
+        let store = InMemoryKeyStore::new();
+        let mut db = db();
+        let settings = SummarizeSettings {
+            cli_enabled: true,
+            acknowledged_egress: false, // enabled, but not acknowledged
+            cli_kind: CliKind::Codex,
+            binary: "/bin/sh".to_owned(),
+        };
+        db.put_setting(SETTINGS_KEY, &serde_json::to_string(&settings).unwrap())
+            .unwrap();
+        assert!(
+            resolve_engine(&store, &db).is_none(),
+            "enablement without the acknowledgement is not enablement"
+        );
     }
 }

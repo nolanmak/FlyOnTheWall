@@ -43,6 +43,7 @@ fn cli_settings(binary: &str, acknowledged: bool) -> SummarizeSettings {
         cli_enabled: true,
         acknowledged_egress: acknowledged,
         binary: binary.to_owned(),
+        ..Default::default()
     }
 }
 

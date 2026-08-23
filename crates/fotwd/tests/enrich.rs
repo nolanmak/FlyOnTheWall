@@ -46,6 +46,7 @@ fn cli_settings(db: &mut Db, binary: &str) {
         cli_enabled: true,
         acknowledged_egress: true,
         binary: binary.to_owned(),
+        ..Default::default()
     };
     db.put_setting("summarize", &serde_json::to_string(&settings).unwrap())
         .unwrap();
