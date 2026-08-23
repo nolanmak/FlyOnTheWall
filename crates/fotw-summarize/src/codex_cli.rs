@@ -25,6 +25,19 @@
 //!
 //! Everything else — the stdin block order, the transport seam, the capability
 //! honesty — is shared with the `claude` adapter verbatim.
+//!
+//! # The residual risk this adapter cannot close alone
+//!
+//! `codex exec` is agentic: it runs model-generated shell on its own, and the
+//! transcript it reads is untrusted (ING-11 — a participant can say anything).
+//! `--sandbox read-only` stops writes and network, so codex cannot exfiltrate
+//! directly; but a prompt injection could still make it *read* a local file
+//! and reflect the bytes into the summary. The daemon's runner answers that by
+//! giving the child an empty `$HOME` (see `fotwd`'s `TokioCliRunner::shielded`)
+//! so `~`-relative secrets resolve to nothing. That is defence-in-depth, not a
+//! proof: the honest posture is that `claude -p` is non-agentic and strictly
+//! safer over untrusted input, which the `fotwd engine` disclosure says out
+//! loud.
 
 use std::sync::Arc;
 

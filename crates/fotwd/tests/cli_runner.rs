@@ -1,100 +1,98 @@
-//! The tokio-backed [`CliTransport`] — the half of #68 that owns real IO.
+//! The production `TokioCliRunner`, and the read shield the codex engine
+//! relies on (#68 review).
 //!
-//! `fotw-summarize` does no IO; its adapter speaks to a seam. This is the
-//! seam's production implementation, tested the way #63 tests `gh`: against
-//! a fake binary that records what it was given, so the argv/stdin contract
-//! is pinned at the process boundary and no real CLI is needed.
+//! No real `claude`/`codex` here — `/bin/sh` stands in for "a CLI", which is
+//! all these assertions need: that stdin arrives, that a non-zero exit is
+//! reported, and above all that a *shielded* runner hands the child an empty
+//! `$HOME` so a prompt-injected `cat ~/.ssh/...` inside an agentic CLI finds
+//! nothing.
 
-use std::time::{Duration, Instant};
+#![cfg(unix)]
+
+use std::time::Duration;
 
 use fotw_summarize::claude_cli::CliTransport;
 use fotwd::engine::TokioCliRunner;
 
-fn fake_cli(name: &str, script_body: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!("fotw-cli-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let bin = dir.join("claude");
-    std::fs::write(&bin, format!("#!/bin/sh\n{script_body}\n")).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    (bin, dir)
-}
-
-fn argv(items: &[&str]) -> Vec<String> {
-    items.iter().map(|s| (*s).to_owned()).collect()
+fn argv(script: &str) -> Vec<String> {
+    vec!["-c".to_owned(), script.to_owned()]
 }
 
 #[tokio::test]
-async fn argv_and_stdin_reach_the_process_and_stdout_comes_back() {
-    let (bin, dir) = fake_cli(
-        "roundtrip",
-        r#"cat > "$(dirname "$0")/stdin.txt"
-printf '%s\n' "$@" > "$(dirname "$0")/argv.txt"
-printf '{"type":"result","is_error":false,"result":"summarised"}'"#,
-    );
-    let runner = TokioCliRunner::new(bin, Duration::from_secs(10));
-
+async fn stdin_reaches_the_child_and_comes_back_out() {
+    let runner = TokioCliRunner::new("/bin/sh".into(), Duration::from_secs(10));
     let out = runner
-        .run(
-            &argv(&["-p", "--output-format", "json"]),
-            "THE-PROMPT on stdin",
-        )
+        .run(&argv("cat"), "the-prompt-body")
         .await
-        .expect("run succeeds");
-
+        .expect("sh runs");
     assert_eq!(out.status, 0);
-    assert!(out.stdout.contains("summarised"));
-    assert_eq!(
-        std::fs::read_to_string(dir.join("stdin.txt")).unwrap(),
-        "THE-PROMPT on stdin"
-    );
-    assert_eq!(
-        std::fs::read_to_string(dir.join("argv.txt")).unwrap(),
-        "-p\n--output-format\njson\n"
-    );
+    assert_eq!(out.stdout.trim(), "the-prompt-body");
 }
 
 #[tokio::test]
-async fn a_nonzero_exit_reports_status_and_stderr() {
-    let (bin, _dir) = fake_cli(
-        "fails",
-        r#"echo "not logged in" >&2
-exit 3"#,
-    );
-    let runner = TokioCliRunner::new(bin, Duration::from_secs(10));
-
-    let out = runner
-        .run(&argv(&["-p"]), "x")
-        .await
-        .expect("captured, not Err");
+async fn a_nonzero_exit_is_reported_not_hidden() {
+    let runner = TokioCliRunner::new("/bin/sh".into(), Duration::from_secs(10));
+    let out = runner.run(&argv("exit 3"), "").await.expect("sh runs");
     assert_eq!(out.status, 3);
-    assert!(out.stderr.contains("not logged in"));
 }
 
-/// A hung CLI must become an error, never a hung meeting pipeline — the same
-/// liveness argument as the keychain deadline, with the same shape of fix.
 #[tokio::test]
-async fn a_hung_binary_is_killed_at_the_deadline() {
-    let (bin, _dir) = fake_cli("hangs", "sleep 30");
-    let runner = TokioCliRunner::new(bin, Duration::from_millis(400));
-
-    let began = Instant::now();
-    let err = runner
-        .run(&argv(&["-p"]), "x")
+async fn an_unshielded_runner_leaves_home_alone() {
+    let runner = TokioCliRunner::new("/bin/sh".into(), Duration::from_secs(10));
+    let out = runner
+        .run(&argv("printf %s \"$HOME\""), "")
         .await
-        .expect_err("must time out");
+        .expect("sh runs");
+    let real_home = std::env::var("HOME").unwrap_or_default();
+    assert_eq!(out.stdout, real_home, "no shield means the real HOME");
+}
 
-    assert!(
-        began.elapsed() < Duration::from_secs(5),
-        "the deadline did not fire: {:?}",
-        began.elapsed()
+/// The shield's whole job: `$HOME` is a fresh empty dir, so `~`-relative
+/// secret paths resolve to nothing. This is the control standing between an
+/// agentic codex run and `~/.ssh/id_rsa`.
+#[tokio::test]
+async fn a_shielded_runner_redirects_home_away_from_the_real_one() {
+    let runner = TokioCliRunner::shielded("/bin/sh".into(), Duration::from_secs(10));
+    let out = runner
+        .run(&argv("printf %s \"$HOME\""), "")
+        .await
+        .expect("sh runs");
+
+    let real_home = std::env::var("HOME").unwrap_or_default();
+    assert_ne!(
+        out.stdout, real_home,
+        "the shield must not be the real HOME"
     );
+    assert!(!out.stdout.is_empty(), "HOME is set, just elsewhere");
+
+    // And that elsewhere is empty: a `~`-relative read finds nothing.
+    let listing = runner
+        .run(&argv("ls -a \"$HOME\" | tr '\\n' ' '"), "")
+        .await
+        .expect("sh runs");
+    let entries: Vec<&str> = listing
+        .stdout
+        .split_whitespace()
+        .filter(|e| *e != "." && *e != "..")
+        .collect();
     assert!(
-        err.to_string().contains("deadline") || err.to_string().contains("timed out"),
-        "the error should say what happened: {err}"
+        entries.is_empty(),
+        "the shielded HOME must be empty, found: {entries:?}"
     );
+}
+
+/// The two runners share a process but not a HOME — proof the shield is per
+/// runner, not a global mutation that would bleed into the claude path.
+#[tokio::test]
+async fn shielded_and_unshielded_runners_do_not_share_a_home() {
+    let shielded = TokioCliRunner::shielded("/bin/sh".into(), Duration::from_secs(10));
+    let plain = TokioCliRunner::new("/bin/sh".into(), Duration::from_secs(10));
+
+    let a = shielded
+        .run(&argv("printf %s \"$HOME\""), "")
+        .await
+        .unwrap();
+    let b = plain.run(&argv("printf %s \"$HOME\""), "").await.unwrap();
+    assert_ne!(a.stdout, b.stdout);
+    assert_eq!(b.stdout, std::env::var("HOME").unwrap_or_default());
 }

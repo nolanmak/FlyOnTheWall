@@ -1129,7 +1129,25 @@ fn engine_command(args: &[String]) -> ExitCode {
                     CliKind::Claude => "claude",
                     CliKind::Codex => "codex",
                 };
-                println!("  engine     : {name} CLI (`{}`)", settings.binary);
+                // Report what enrichment will actually do, not just what was
+                // configured: `resolve_engine` returns None — a fallback title
+                // only — if the binary no longer resolves, and codex is
+                // usually a shell alias the daemon cannot see. Re-run the same
+                // check here so status and behavior cannot disagree.
+                if fotwd::engine::resolve_binary(&settings.binary).is_some() {
+                    println!("  engine     : {name} CLI (`{}`)", settings.binary);
+                } else {
+                    println!(
+                        "  engine     : none — {name} CLI configured (`{}`), but that binary",
+                        settings.binary
+                    );
+                    println!(
+                        "               does not resolve, so meetings get a fallback title only."
+                    );
+                    println!(
+                        "    fix: `fotwd engine {name}-cli --i-acknowledge-egress --binary <path>`"
+                    );
+                }
             } else {
                 println!("  engine     : none — meetings get a local fallback title only");
                 println!("    `fotwd key set anthropic`                         for the API");
@@ -1151,17 +1169,45 @@ fn engine_command(args: &[String]) -> ExitCode {
             }
         },
         Some(sub @ ("claude-cli" | "codex-cli")) => {
-            let (kind, cli, vendor, login) = if sub == "claude-cli" {
-                (CliKind::Claude, "claude", "Anthropic", "`claude` login")
+            // KEY-04: name the host, what leaves the device, and the provider's
+            // retention/training default with a live doc link. The two CLIs
+            // differ on the last point in the way that matters most — the
+            // Anthropic API is no-training-by-default, while a consumer ChatGPT
+            // subscription trains on conversations by default — so the codex
+            // disclosure says so rather than implying "same as an API key".
+            let (kind, cli, disclosure): (CliKind, &str, &[&str]) = if sub == "claude-cli" {
+                (
+                    CliKind::Claude,
+                    "claude",
+                    &[
+                        "  Enabling this sends each finished meeting's transcript to Anthropic",
+                        "  (api.anthropic.com) through your local `claude` login. On a Claude",
+                        "  subscription, conversations are not used for training by default;",
+                        "  confirm current terms: https://www.anthropic.com/legal/privacy",
+                    ],
+                )
             } else {
-                (CliKind::Codex, "codex", "OpenAI", "`codex` login")
+                (
+                    CliKind::Codex,
+                    "codex",
+                    &[
+                        "  Enabling this sends each finished meeting's transcript to OpenAI",
+                        "  (chatgpt.com / api.openai.com) through your local `codex` login.",
+                        "  NOTE: a consumer ChatGPT subscription MAY be used to train OpenAI's",
+                        "  models by default — unlike a no-training API key. Review and opt out:",
+                        "  https://help.openai.com/en/articles/7730893-data-controls-faq",
+                        "  codex is also an agentic CLI: it can run shell over the transcript,",
+                        "  so FlyOnTheWall runs it read-only with an empty HOME to shield your",
+                        "  files. Prefer claude-cli if you want a non-agentic engine.",
+                    ],
+                )
             };
             // The disclosure is the point, not a speed bump: KEY-04's duty,
             // for a path with no key to hang it on.
             if !args.iter().any(|a| a == "--i-acknowledge-egress") {
-                eprintln!("  Enabling the CLI engine sends each finished meeting's transcript");
-                eprintln!("  to {vendor} through your local {login} — the same words that would");
-                eprintln!("  travel under an API key, on your subscription's terms.");
+                for line in disclosure {
+                    eprintln!("{line}");
+                }
                 eprintln!();
                 eprintln!("  Re-run with --i-acknowledge-egress to confirm.");
                 return ExitCode::FAILURE;
@@ -1174,17 +1220,25 @@ fn engine_command(args: &[String]) -> ExitCode {
             };
             match write(&mut db, &settings) {
                 Ok(()) => {
-                    println!("  engine     : {cli} CLI (`{}`)", settings.binary);
-                    if fotwd::engine::resolve_binary(&settings.binary).is_none() {
+                    if fotwd::engine::resolve_binary(&settings.binary).is_some() {
+                        println!("  engine     : {cli} CLI (`{}`)", settings.binary);
                         println!(
-                            "  ! `{}` is not on PATH or is not executable — enrichment will",
+                            "  Finished meetings now get a title, a summary and action items."
+                        );
+                    } else {
+                        // Saved, but it will not run: say that plainly rather
+                        // than promising summaries the daemon cannot produce.
+                        println!(
+                            "  saved, but `{}` does not resolve — enrichment will",
                             settings.binary
                         );
                         println!(
-                            "    report 'no engine' until it is. Pass --binary <path> to fix."
+                            "  report 'no engine' until it does. Pass --binary <path> to fix, e.g."
+                        );
+                        println!(
+                            "    fotwd engine {sub} --i-acknowledge-egress --binary /full/path/to/{cli}"
                         );
                     }
-                    println!("  Finished meetings now get a title, a summary and action items.");
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
