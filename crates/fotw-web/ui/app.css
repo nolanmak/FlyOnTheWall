@@ -304,6 +304,21 @@ section {
   cursor: not-allowed;
 }
 
+/* A still-revising utterance in the live view. Muted rather than faded by
+   opacity so the words stay readable; the final replaces this row. */
+.segment.pending .words {
+  color: var(--muted);
+}
+
+/* The session clock. Tabular numerals so it ticks in place instead of the
+   header breathing every second. */
+.elapsed {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 /* ------------------------------------------------------------- small screens
    One breakpoint (#66). Below it the two columns stack: the meeting list
    becomes a bounded strip that scrolls on its own above the detail pane, and

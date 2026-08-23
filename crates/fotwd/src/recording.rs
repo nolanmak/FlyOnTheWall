@@ -409,7 +409,28 @@ async fn spawn_session(
             }
             // Blocking work — Opus encoding and SQLite — off the runtime.
             let root2 = root.clone();
-            let _ = tokio::task::spawn_blocking(move || (finish)(&root2, &outcome)).await;
+            let persisted = tokio::task::spawn_blocking(move || (finish)(&root2, &outcome)).await;
+
+            // Enrichment (#67/#68): title, summary, action items — derived
+            // work over a meeting already safe on disk, so problems print
+            // and nothing here can fail the recording.
+            //
+            // This call went missing once already — a patch matched stale
+            // text, replaced nothing, and asserted nothing — and every
+            // dashboard meeting kept its epoch title while the CLI path
+            // worked. There is no unit pin: enrichment opens the real
+            // library and keychain, which no test may touch. If this block
+            // disappears again, the symptom is epoch titles on dashboard
+            // meetings while `fotwd record` titles fine.
+            if let Ok(Some(meeting_id)) = persisted {
+                let report = crate::enrich::enrich_meeting(&root, &meeting_id).await;
+                if let Some(title) = &report.title {
+                    eprintln!("  meeting titled: {title}");
+                }
+                for problem in &report.problems {
+                    eprintln!("  ! enrichment: {problem}");
+                }
+            }
         }
         Err(e) => eprintln!("  ! the recording failed: {e}"),
     }

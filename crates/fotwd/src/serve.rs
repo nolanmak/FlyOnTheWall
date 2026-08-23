@@ -230,15 +230,23 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
     // counter resets when the session changes — a daemon-lifetime counter
     // would leak how many segments earlier meetings produced.
     let tap_state = Arc::new(std::sync::Mutex::new((String::new(), 0i64)));
-    let on_segment = crate::session::SegmentTap::new(move |seg| {
+    let on_segment = crate::session::SegmentTap::new(move |seg, kind| {
         let Some(hub) = hub_for_tap.get() else { return };
-        let mut guard = tap_state.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.0 != seg.session_id {
-            *guard = (seg.session_id.clone(), 0);
+        match kind {
+            crate::session::TapKind::Final => {
+                let mut guard = tap_state.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.0 != seg.session_id {
+                    *guard = (seg.session_id.clone(), 0);
+                }
+                let idx = guard.1;
+                guard.1 += 1;
+                hub.publish(delta_from(idx, seg));
+            }
+            // Partials take no index — they are revisions, not rows. The
+            // renderer keeps one in-progress line per channel and replaces
+            // it on every revision; the final then lands as a real row.
+            crate::session::TapKind::Partial => hub.publish(delta_partial(seg)),
         }
-        let idx = guard.1;
-        guard.1 += 1;
-        hub.publish(delta_from(idx, seg));
     });
 
     // The recorder is what turns the read-only library viewer into something
@@ -459,6 +467,21 @@ pub fn delta_from(idx: i64, seg: &fotw_stt::TranscriptSegment) -> fotw_web::Delt
         },
         text: seg.text.clone(),
         is_final: true,
+    }
+}
+
+/// A still-revising utterance, as the wire sees it.
+///
+/// `idx` is `-1` and `is_final` false: a partial is a *revision*, not a row —
+/// the next one with the same channel replaces it, and only the final gets a
+/// real index. Publishing these is what makes the live view move while the
+/// speaker is mid-sentence instead of at utterance boundaries.
+#[must_use]
+pub fn delta_partial(seg: &fotw_stt::TranscriptSegment) -> fotw_web::Delta {
+    fotw_web::Delta {
+        idx: -1,
+        is_final: false,
+        ..delta_from(-1, seg)
     }
 }
 
