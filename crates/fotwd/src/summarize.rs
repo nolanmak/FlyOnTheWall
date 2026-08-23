@@ -47,8 +47,9 @@ pub enum SummarizeRunError {
     /// No engine is configured — neither an API key nor an enabled CLI.
     #[error(
         "no summarize engine configured — run `fotwd key set anthropic` (API), \
-         or `fotwd engine claude-cli --i-acknowledge-egress` (your Claude \
-         subscription's CLI). The transcript is unchanged and can be \
+         or `fotwd engine claude-cli --i-acknowledge-egress` (Claude \
+         subscription) or `fotwd engine codex-cli --i-acknowledge-egress` \
+         (ChatGPT/Codex subscription). The transcript is unchanged and can be \
          summarised later."
     )]
     NoKey,
@@ -171,8 +172,10 @@ where
         crate::engine::Engine::Codex { binary } => {
             // Same shape as the claude arm: both calls share one runner, and
             // the model choice is the subscription's own default (None), never
-            // ours to hardcode into their plan.
-            let runner = Arc::new(crate::engine::TokioCliRunner::new(
+            // ours to hardcode into their plan. `shielded` because codex is
+            // agentic — it runs shell over the untrusted transcript — so the
+            // child gets an empty $HOME (see TokioCliRunner's docs).
+            let runner = Arc::new(crate::engine::TokioCliRunner::shielded(
                 binary.clone(),
                 CLI_DEADLINE,
             ));

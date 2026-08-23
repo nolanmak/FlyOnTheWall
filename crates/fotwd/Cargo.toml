@@ -25,6 +25,11 @@ thiserror = { workspace = true }
 # The Contents API wants file content base64-encoded. Same version fotw-store
 # already pins for BLOB columns in exports, so no new supply chain.
 base64 = "0.22"
+# The codex-CLI engine runs an *agentic* CLI over untrusted transcript text
+# (#68 review): the read-shield gives it an empty $HOME so a prompt-injected
+# `cat ~/.ssh/...` finds nothing. Already in the lock via fotw-store and the
+# dev-deps, so no new supply chain.
+tempfile = "3"
 tokio = { workspace = true, features = [
   "macros",
   "rt",

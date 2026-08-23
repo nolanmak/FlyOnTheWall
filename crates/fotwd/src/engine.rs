@@ -216,17 +216,57 @@ pub fn fallback_title(segments: &[TranscriptSegment]) -> Option<String> {
 /// hangs — waiting on a login prompt nobody can see, or a network that went
 /// away — must become an error the pipeline can report, never a meeting
 /// enrichment that silently never finishes. On timeout the child is killed,
-/// not abandoned: an orphaned `claude` process holds a subscription slot.
+/// not abandoned: an orphaned CLI process holds a subscription slot.
+///
+/// # The read shield, and why only codex needs it
+///
+/// `codex exec` is an *agentic* CLI: it runs model-generated shell commands on
+/// its own, and its read-only sandbox bounds those to reads (no writes, no
+/// network). A prompt injection inside the untrusted transcript (ING-11 — a
+/// participant can say anything) could therefore make it `cat ~/.ssh/id_rsa`
+/// and reflect the bytes into the summary. When [`TokioCliRunner::shielded`]
+/// built this runner, the child gets an **empty `$HOME`** (a fresh temp dir)
+/// so every `~`-relative secret path resolves to nothing, while `CODEX_HOME`
+/// is pinned to the real `~/.codex` so the subscription login still works. The
+/// `claude -p` path is not agentic and does not need this.
 pub struct TokioCliRunner {
     binary: PathBuf,
     deadline: std::time::Duration,
+    /// When present, the child's `$HOME` and working directory. Owned so it
+    /// lives exactly as long as the runner — both pipeline calls share it and
+    /// it is removed when the runner drops.
+    shield: Option<tempfile::TempDir>,
 }
 
 impl TokioCliRunner {
     /// A runner for `binary`, giving each invocation `deadline` to finish.
     #[must_use]
     pub fn new(binary: PathBuf, deadline: std::time::Duration) -> Self {
-        Self { binary, deadline }
+        Self {
+            binary,
+            deadline,
+            shield: None,
+        }
+    }
+
+    /// [`TokioCliRunner::new`] with the read shield (see the type docs).
+    ///
+    /// Falls back to an unshielded runner — loudly — if the temp dir cannot be
+    /// created: the read-only sandbox still blocks the child from sending
+    /// anything out, so this is a narrower read radius, not the only control.
+    #[must_use]
+    pub fn shielded(binary: PathBuf, deadline: std::time::Duration) -> Self {
+        match tempfile::TempDir::new() {
+            Ok(shield) => Self {
+                binary,
+                deadline,
+                shield: Some(shield),
+            },
+            Err(e) => {
+                eprintln!("  ! could not create the codex read shield ({e}); running without it");
+                Self::new(binary, deadline)
+            }
+        }
     }
 }
 
@@ -241,7 +281,8 @@ impl fotw_summarize::claude_cli::CliTransport for TokioCliRunner {
     > {
         use fotw_summarize::error::SummarizeError;
         Box::pin(async move {
-            let mut child = tokio::process::Command::new(&self.binary)
+            let mut command = tokio::process::Command::new(&self.binary);
+            command
                 .args(argv)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
@@ -255,14 +296,24 @@ impl fotw_summarize::claude_cli::CliTransport for TokioCliRunner {
                 .env_remove("DEEPGRAM_API_KEY")
                 .env_remove("ANTHROPIC_API_KEY")
                 .env_remove("OPENAI_API_KEY")
-                .kill_on_drop(true)
-                .spawn()
-                .map_err(|e| {
-                    SummarizeError::Transport(format!(
-                        "could not start {}: {e}",
-                        self.binary.display()
-                    ))
-                })?;
+                .kill_on_drop(true);
+
+            // The read shield: an empty $HOME so a prompt-injected
+            // `cat ~/.ssh/...` inside an agentic CLI finds nothing, with
+            // CODEX_HOME pinned to the real config dir so auth survives.
+            if let Some(shield) = &self.shield {
+                if let (None, Some(home)) =
+                    (std::env::var_os("CODEX_HOME"), std::env::var_os("HOME"))
+                {
+                    command.env("CODEX_HOME", std::path::Path::new(&home).join(".codex"));
+                }
+                command.env("HOME", shield.path());
+                command.current_dir(shield.path());
+            }
+
+            let mut child = command.spawn().map_err(|e| {
+                SummarizeError::Transport(format!("could not start {}: {e}", self.binary.display()))
+            })?;
 
             // Write-then-close, so a CLI that reads to EOF gets its EOF.
             if let Some(mut handle) = child.stdin.take() {
@@ -282,7 +333,8 @@ impl fotw_summarize::claude_cli::CliTransport for TokioCliRunner {
                     // kill_on_drop reaps the child when `child` fell into
                     // wait_with_output; nothing left to kill by hand here.
                     return Err(SummarizeError::Transport(format!(
-                        "claude CLI hit its {}s deadline and was killed",
+                        "{} hit its {}s deadline and was killed",
+                        self.binary.display(),
                         self.deadline.as_secs_f64()
                     )));
                 }
