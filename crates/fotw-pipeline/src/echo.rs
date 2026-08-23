@@ -61,6 +61,13 @@ pub enum GateVerdict {
 ///
 /// Derived by the margin test, which requires this to sit between the
 /// independent-speech ceiling and the echo floor with room to spare.
+/// Checked against LIVE capture (FOTW_ECHO_DEBUG), not the fixture alone:
+/// real-room echo locks near 0.9 when speech dominates the speakers and the
+/// gate suppresses sustainedly; overlapping simultaneous sources hover in
+/// the 0.6s and deliberately leak — lowering the bar into that band lets
+/// fixture coincidences through, and mixed audio is #72's subtraction
+/// problem, not this detector's. Detection buys the common case; AEC buys
+/// the rest.
 const CORRELATION_THRESHOLD: f32 = 0.7;
 
 /// How close to the round's peak the previous round's lag must still score
@@ -73,7 +80,7 @@ const CORRELATION_THRESHOLD: f32 = 0.7;
 /// STAYING at one lag: echo keeps its old lag within a couple of percent of
 /// the maximum round after round, while a coincidence's old lag decays as
 /// the peak teleports. This ratio is the boundary between those behaviors.
-const STABILITY_RATIO: f32 = 0.92;
+const STABILITY_RATIO: f32 = 0.95;
 
 /// How much the best lag may wander between consecutive coupled verdicts,
 /// in frames. A room's delay is a property of furniture — it holds still.
@@ -186,6 +193,11 @@ pub struct EchoGate {
     reference: EnvelopeTracker,
     mic: EnvelopeTracker,
     coupled_streak: u32,
+    /// Whether suppression is currently engaged — a Schmitt trigger: engage
+    /// at [`ENGAGE_STREAK`], hold while any streak remains, release at zero.
+    /// Without the hysteresis, a streak hovering at the engagement edge
+    /// strobes suppression on and off through sustained playback.
+    engaged: bool,
     /// The best signed lag of the previous coupled-looking window, for the
     /// stability check.
     last_lag: Option<i64>,
@@ -204,6 +216,7 @@ impl EchoGate {
             reference: EnvelopeTracker::new(frame_len, capacity),
             mic: EnvelopeTracker::new(frame_len, capacity),
             coupled_streak: 0,
+            engaged: false,
             last_lag: None,
             assessed: 0,
             suppressed: 0,
@@ -308,25 +321,50 @@ impl EchoGate {
 
         // Coupled means the pattern matches; stable means the old delay is
         // still essentially THE peak — not merely acceptable. Rooms hold
-        // still; coincidences teleport.
-        let stable = scored.at_previous >= CORRELATION_THRESHOLD
-            && scored.at_previous >= scored.best * STABILITY_RATIO;
+        // still (live capture measures at_prev/best ≈ 1.00 round after
+        // round); coincidences teleport. The very first coupled round has
+        // no history and seeds the streak by definition — once, ever:
+        // re-seeding on every unstable match let coincidences churn the
+        // streak upward.
+        let stable = (scored.at_previous >= CORRELATION_THRESHOLD
+            && scored.at_previous >= scored.best * STABILITY_RATIO)
+            || self.last_lag.is_none();
         let coupled = scored.best >= CORRELATION_THRESHOLD;
-        self.last_lag = scored.best_lag;
+        self.last_lag = scored.best_lag.or(self.last_lag);
 
-        if coupled && (stable || self.coupled_streak == 0) {
+        if coupled && stable {
             self.coupled_streak = self.coupled_streak.saturating_add(1);
+        } else if coupled {
+            // Still matching, momentarily not at the old lag: a broad
+            // correlation ridge at short lags wobbles its peak past the
+            // stability ratio without the coupling ever ending. Decay
+            // gently — engagement still requires consecutive STABLE rounds,
+            // so this grants nothing to coincidences.
+            self.coupled_streak = self.coupled_streak.saturating_sub(1);
         } else {
-            // Halve rather than reset: real echo dips under the threshold
-            // on quiet syllables, and a hard reset made suppression strobe
-            // through sustained playback — but a long streak must not take a
-            // long time to release once headphones go on. Halving releases
-            // any streak within two clean chunks, which the release test
-            // pins, while a single mid-echo dip only dents the streak.
-            self.coupled_streak /= 2;
+            // No match at all: release fast — down two levels per clean
+            // chunk, so any streak reaches zero within two chunks once
+            // headphones go on, which the release test pins.
+            self.coupled_streak = (self.coupled_streak / 2).saturating_sub(1);
+        }
+
+        // Ground-truth instrumentation, opt-in: real rooms have repeatedly
+        // embarrassed synthetic fixtures in this module, and the fastest way
+        // out of a guessing loop is to see the live numbers.
+        if std::env::var_os("FOTW_ECHO_DEBUG").is_some() {
+            eprintln!(
+                "echo-gate: best {:.3} at lag {:?}  at_prev {:.3}  streak {}",
+                scored.best, scored.best_lag, scored.at_previous, self.coupled_streak
+            );
         }
 
         if self.coupled_streak >= ENGAGE_STREAK {
+            self.engaged = true;
+        } else if self.coupled_streak == 0 {
+            self.engaged = false;
+        }
+
+        if self.engaged {
             self.suppressed += 1;
             GateVerdict::Suppress
         } else {
