@@ -61,7 +61,19 @@ pub enum GateVerdict {
 ///
 /// Derived by the margin test, which requires this to sit between the
 /// independent-speech ceiling and the echo floor with room to spare.
-const CORRELATION_THRESHOLD: f32 = 0.55;
+const CORRELATION_THRESHOLD: f32 = 0.7;
+
+/// How close to the round's peak the previous round's lag must still score
+/// for the coupling to count as stable.
+///
+/// Population measurements on the room fixture show why a floor alone
+/// cannot work: with a ±3 s signed search, independent speech finds a peak
+/// above any workable floor in most windows — a wide search has a high
+/// extreme-value baseline for anything. What it cannot fake is the peak
+/// STAYING at one lag: echo keeps its old lag within a couple of percent of
+/// the maximum round after round, while a coincidence's old lag decays as
+/// the peak teleports. This ratio is the boundary between those behaviors.
+const STABILITY_RATIO: f32 = 0.92;
 
 /// How much the best lag may wander between consecutive coupled verdicts,
 /// in frames. A room's delay is a property of furniture — it holds still.
@@ -82,10 +94,16 @@ const FRAME_MS: usize = 10;
 /// after the coupling ends happens within a couple of chunks.
 const WINDOW_FRAMES: usize = 40;
 
-/// Maximum envelope lag searched, in frames (600 ms). Covers the acoustic
-/// path, device latency, and — the part the first version missed — the
-/// pump's skew between when each leg's audio reaches this gate.
-const MAX_LAG_FRAMES: usize = 60;
+/// Maximum envelope lag searched, in frames each direction (3 s signed).
+///
+/// The acoustic path itself is tens of milliseconds; the reason for a range
+/// two orders larger — and *signed* — is the feed clocks. Live capture
+/// showed the system leg delivering the same words seconds after the mic
+/// heard them through the speakers: the reference arrived AFTER the echo.
+/// A search that only looks backward in reference history can never match
+/// that, so the gate slides both ways — mic-now against reference history,
+/// and reference-now against mic history.
+const MAX_LAG_FRAMES: usize = 300;
 
 /// Frames of mic history required before any verdict. Below this the gate
 /// abstains — an unwarmed detector must fail open, never closed.
@@ -103,13 +121,15 @@ const ENGAGE_STREAK: u32 = 3;
 /// Floor added inside the log so silence has a defined loudness.
 const LOG_FLOOR: f32 = 1e-6;
 
-/// One scoring pass over the lag search.
+/// One scoring pass over the signed lag search.
 #[derive(Debug, Default)]
 struct Scored {
     /// The peak correlation anywhere in the search.
     best: f32,
-    /// Where the peak was.
-    best_lag: Option<usize>,
+    /// Where the peak was. Positive: the reference is older than the mic
+    /// (the normal direction). Negative: the mic heard it first — the
+    /// reference feed is running behind.
+    best_lag: Option<i64>,
     /// The best correlation in the neighbourhood of the previous round's
     /// lag — the number the stability check actually wants.
     at_previous: f32,
@@ -166,9 +186,9 @@ pub struct EchoGate {
     reference: EnvelopeTracker,
     mic: EnvelopeTracker,
     coupled_streak: u32,
-    /// The best lag of the previous coupled-looking window, for the
+    /// The best signed lag of the previous coupled-looking window, for the
     /// stability check.
-    last_lag: Option<usize>,
+    last_lag: Option<i64>,
     assessed: u64,
     suppressed: u64,
 }
@@ -179,6 +199,7 @@ impl EchoGate {
     pub fn new(sample_rate: u32) -> Self {
         let frame_len = FRAME_MS * sample_rate as usize / 1_000;
         let capacity = MAX_LAG_FRAMES + WINDOW_FRAMES * 2;
+        debug_assert!(capacity >= MAX_LAG_FRAMES + WINDOW_FRAMES);
         Self {
             reference: EnvelopeTracker::new(frame_len, capacity),
             mic: EnvelopeTracker::new(frame_len, capacity),
@@ -229,28 +250,51 @@ impl EchoGate {
             return Scored::default();
         }
 
-        let max_lag = MAX_LAG_FRAMES.min(ref_frames.len() - window);
         let mut out = Scored::default();
-        for lag in 0..=max_lag {
+        let consider = |c: f32, lag: i64, out: &mut Scored, last: Option<i64>| {
+            if c > out.best {
+                out.best = c;
+                out.best_lag = Some(lag);
+            }
+            // How yesterday's delay is doing today. The peak's exact
+            // position jitters between near-equal neighbours; the question
+            // that identifies a room is whether the OLD lag still scores,
+            // not whether the argmax held still.
+            if let Some(prev) = last
+                && prev.abs_diff(lag) <= LAG_JITTER_FRAMES as u64
+                && c > out.at_previous
+            {
+                out.at_previous = c;
+            }
+        };
+
+        // Positive lags: mic-now against reference history.
+        let max_pos = MAX_LAG_FRAMES.min(ref_frames.len() - window);
+        for lag in 0..=max_pos {
             let end = ref_frames.len() - lag;
             let reference = &ref_frames[end - window..end];
             if rms_of_window(reference) < ACTIVITY_FLOOR {
                 continue;
             }
             let c = pearson(&mic_diff, &onset_pattern(reference));
-            if c > out.best {
-                out.best = c;
-                out.best_lag = Some(lag);
-            }
-            // How yesterday's delay is doing today. The peak's exact position
-            // jitters between near-equal neighbours; the question that
-            // identifies a room is whether the OLD lag still scores, not
-            // whether the argmax held still.
-            if let Some(prev) = self.last_lag
-                && prev.abs_diff(lag) <= LAG_JITTER_FRAMES
-                && c > out.at_previous
-            {
-                out.at_previous = c;
+            consider(c, lag as i64, &mut out, self.last_lag);
+        }
+
+        // Negative lags: reference-now against mic history — the live
+        // failure's direction, where the reference feed runs behind the mic
+        // and the match has not "arrived" in reference history yet.
+        let ref_tail = &ref_frames[ref_frames.len() - window..];
+        if rms_of_window(ref_tail) >= ACTIVITY_FLOOR {
+            let ref_diff = onset_pattern(ref_tail);
+            let max_neg = MAX_LAG_FRAMES.min(self.mic.frames.len() - window);
+            for back in 1..=max_neg {
+                let end = self.mic.frames.len() - back;
+                let mic_window = &self.mic.frames[end - window..end];
+                if rms_of_window(mic_window) < ACTIVITY_FLOOR {
+                    continue;
+                }
+                let c = pearson(&onset_pattern(mic_window), &ref_diff);
+                consider(c, -(back as i64), &mut out, self.last_lag);
             }
         }
         out
@@ -262,12 +306,11 @@ impl EchoGate {
         self.assessed += 1;
         let scored = self.scored(mic);
 
-        // Coupled means the pattern matches; stable means the delay it
-        // matched at last time still matches now. Rooms hold still, so real
-        // echo keeps scoring at its old lag even while the argmax jitters
-        // between near-equal neighbours; a coincidence between independent
-        // speakers scores somewhere new each time.
-        let stable = scored.at_previous >= CORRELATION_THRESHOLD;
+        // Coupled means the pattern matches; stable means the old delay is
+        // still essentially THE peak — not merely acceptable. Rooms hold
+        // still; coincidences teleport.
+        let stable = scored.at_previous >= CORRELATION_THRESHOLD
+            && scored.at_previous >= scored.best * STABILITY_RATIO;
         let coupled = scored.best >= CORRELATION_THRESHOLD;
         self.last_lag = scored.best_lag;
 
@@ -323,14 +366,26 @@ fn pearson(a: &[f32], b: &[f32]) -> f32 {
     (dot / denom).max(0.0)
 }
 
-/// The frame-to-frame change in log energy: the onset train.
+/// The syllable pattern: log energy with its own local trend removed.
 ///
-/// Differencing whitens the slow loudness curve that makes two unrelated
-/// speakers look alike over a short window — what remains is *when* energy
-/// arrives, which is the fingerprint a room cannot fake and a copy cannot
-/// hide.
+/// A band-pass, in effect. Frame-to-frame differencing was tried first and
+/// amplified exactly the wrong thing — the carrier's per-frame statistical
+/// jitter — while the identity of speech lives in the 3–8 Hz syllable band.
+/// Subtracting a short moving average keeps that band: slow trends (overall
+/// loudness, the thing that makes unrelated speakers look alike) vanish,
+/// syllable onsets survive, and frame jitter averages itself away inside
+/// the window.
 fn onset_pattern(log_frames: &[f32]) -> Vec<f32> {
-    log_frames.windows(2).map(|w| w[1] - w[0]).collect()
+    const TREND: usize = 15; // 150 ms: below the syllable band's period.
+    let n = log_frames.len();
+    (0..n)
+        .map(|i| {
+            let from = i.saturating_sub(TREND / 2);
+            let to = (i + TREND / 2 + 1).min(n);
+            let local: f32 = log_frames[from..to].iter().sum::<f32>() / (to - from) as f32;
+            log_frames[i] - local
+        })
+        .collect()
 }
 
 /// Linear RMS of a log-energy window.
