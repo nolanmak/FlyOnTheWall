@@ -76,3 +76,23 @@ fn a_privileged_port_is_refused_with_a_reason() {
         "the message should say where the boundary is: {e}"
     );
 }
+
+// ------------------------------------------------------- the double-click
+
+use fotwd::serve::{BareLaunch, bare_launch};
+
+/// Finder launches `CFBundleExecutable` with no arguments and no terminal.
+/// Printing usage to a stdout nobody can see and exiting is indistinguishable
+/// from "the app doesn't open" — which is precisely how it was reported. A
+/// bare launch with no terminal is the doorway: serve.
+#[test]
+fn a_finder_launch_is_the_doorway() {
+    assert_eq!(bare_launch(false), BareLaunch::Serve);
+}
+
+/// A person typing `fotwd` in a terminal is asking what it does. Usage is
+/// the correct answer there, exactly as before.
+#[test]
+fn a_bare_terminal_invocation_still_prints_usage() {
+    assert_eq!(bare_launch(true), BareLaunch::Usage);
+}

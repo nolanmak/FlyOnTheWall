@@ -127,6 +127,31 @@ async fn main() -> ExitCode {
         Some("export") => export_command(&args[1..]),
         Some("export-all") => export_all_command(&args[1..]),
         Some("import") => import_command(&args[1..]),
+        // The double-click. Finder runs the bundle executable with no
+        // arguments and no terminal; usage printed to a stdout nobody can
+        // see reads as "the app doesn't open". See `serve::bare_launch`.
+        None if fotwd::serve::bare_launch(std::io::IsTerminal::is_terminal(&std::io::stdin()))
+            == fotwd::serve::BareLaunch::Serve =>
+        {
+            let root = default_root();
+            if let Err(e) = std::fs::create_dir_all(&root) {
+                eprintln!("fotwd: cannot create {}: {e}", root.display());
+                return ExitCode::FAILURE;
+            }
+            match fotwd::serve::serve(
+                root,
+                fotwd::serve::Launch::OpenBrowser,
+                fotwd::serve::DEFAULT_PORT,
+            )
+            .await
+            {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("fotwd: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         _ => {
             eprintln!(
                 "usage: fotwd <serve [dir] [--port <n>] | record [seconds] [dir] [--i-have-consent] | \
