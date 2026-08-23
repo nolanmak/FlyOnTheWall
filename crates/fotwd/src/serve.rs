@@ -102,6 +102,32 @@ pub fn parse_port(args: &[String]) -> Result<u16, String> {
     u16::try_from(port).map_err(|e| format!("--port: {e}"))
 }
 
+/// What a bare, argument-less invocation should do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BareLaunch {
+    /// Print usage: a person in a terminal asking what this does.
+    Usage,
+    /// Start (or re-enter) the daemon and open the dashboard.
+    Serve,
+}
+
+/// Decide what `fotwd` with no arguments means.
+///
+/// Finder launches `CFBundleExecutable` with no arguments and no terminal.
+/// Printing usage to a stdout nobody can see and exiting is indistinguishable
+/// from "the app doesn't open" — which is exactly how it was reported. So a
+/// bare launch is the doorway when there is no terminal to read usage in, and
+/// usage when there is: the same stdin test the Recovery Key ceremony uses to
+/// tell a human apart from LaunchServices.
+#[must_use]
+pub fn bare_launch(stdin_is_terminal: bool) -> BareLaunch {
+    if stdin_is_terminal {
+        BareLaunch::Usage
+    } else {
+        BareLaunch::Serve
+    }
+}
+
 /// How the page gets its handoff token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Launch {
