@@ -170,6 +170,16 @@ pub fn mic_stt_enabled(value: Option<&str>) -> bool {
     })
 }
 
+/// Whether the speaker-echo gate guards the mic's transcription feed.
+///
+/// From `FOTW_ECHO_GATE`; unset means on. Off is for A/B against the gate —
+/// CAP-11's acceptance metric needs a control group — and the same spellings
+/// as `FOTW_MIC_STT` mean off, for the same muscle-memory reasons.
+#[must_use]
+pub fn echo_gate_enabled(value: Option<&str>) -> bool {
+    mic_stt_enabled(value)
+}
+
 /// Put segments from both legs into spoken order.
 ///
 /// Two streams finalize independently, so segments arrive interleaved by
@@ -579,6 +589,10 @@ pub async fn run_with_control(
     let feeds = SttFeeds {
         system: sys_stt.clone(),
         mic: mic_stt.clone(),
+        echo_gate: (sys_stt.is_some()
+            && mic_stt.is_some()
+            && echo_gate_enabled(std::env::var("FOTW_ECHO_GATE").ok().as_deref()))
+        .then(|| fotw_pipeline::echo::EchoGate::new(16_000)),
     };
 
     // The pump owns the WAL and does every blocking thing.
@@ -711,6 +725,10 @@ fn spawn_leg_collector(
 struct SttFeeds {
     system: Option<Arc<DeepgramStream>>,
     mic: Option<Arc<DeepgramStream>>,
+    /// CAP-11 v1 (#71): withholds echo-dominated mic chunks from the mic
+    /// feed when the mic is judged to be hearing the speakers. Present only
+    /// when both feeds are live — with one leg there is nothing to couple.
+    echo_gate: Option<fotw_pipeline::echo::EchoGate>,
 }
 
 /// Drain both rings until stopped, writing raw audio and feeding the provider.
@@ -720,7 +738,7 @@ fn pump_loop(
     mut mic: RingConsumer,
     sys_format: StreamFormat,
     mic_format: Option<StreamFormat>,
-    stt: SttFeeds,
+    mut stt: SttFeeds,
     stop: &AtomicBool,
 ) -> Result<(u64, u64, u64), String> {
     let mut scratch = vec![0.0f32; 48_000];
@@ -761,6 +779,11 @@ fn pump_loop(
                     .map_err(|e| format!("resample failed: {e}"))?;
                 if !resampled.is_empty() {
                     let mono = Downmixer::to_mono(&resampled, sys_format.channels);
+                    // The gate's reference: what the speakers are playing is
+                    // exactly what the system feed carries.
+                    if let Some(gate) = stt.echo_gate.as_mut() {
+                        gate.push_system(&mono);
+                    }
                     h.write(&Downmixer::to_i16(&mono));
                 }
             }
@@ -780,7 +803,19 @@ fn pump_loop(
                     .map_err(|e| format!("mic resample failed: {e}"))?;
                 if !resampled.is_empty() {
                     let mono = Downmixer::to_mono(&resampled, *channels);
-                    h.write(&Downmixer::to_i16(&mono));
+                    // CAP-11 v1: on speakers the mic is mostly a copy of the
+                    // system leg — transcribing it again costs money and
+                    // attributes the far end's words to the user. Withheld
+                    // from the FEED only; the WAL above already has the raw
+                    // audio, so this is revertible in principle (the same
+                    // text-not-audio stance Descript documents for its
+                    // mic-bleed fix).
+                    let suppress = stt.echo_gate.as_mut().is_some_and(|g| {
+                        g.assess(&mono) == fotw_pipeline::echo::GateVerdict::Suppress
+                    });
+                    if !suppress {
+                        h.write(&Downmixer::to_i16(&mono));
+                    }
                 }
             }
         }
@@ -794,6 +829,18 @@ fn pump_loop(
         seq = seq.wrapping_add(1);
     }
     let _ = seq;
+
+    if let Some(gate) = &stt.echo_gate {
+        let (assessed, suppressed) = gate.stats();
+        if suppressed > 0 {
+            // Once, at the end — CAP-11's metric, and the honest nudge: the
+            // gate working hard means the user is on speakers.
+            eprintln!(
+                "  echo gate  : withheld {suppressed}/{assessed} mic chunks from \
+                 transcription (speakers detected — headphones transcribe better)"
+            );
+        }
+    }
 
     wal.flush().map_err(|e| format!("flush failed: {e}"))?;
     // Finalize stamps `ended_at_ms`. Without it every cleanly-ended meeting
