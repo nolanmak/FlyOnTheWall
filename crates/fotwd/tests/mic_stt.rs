@@ -155,3 +155,16 @@ fn a_tie_does_not_reshuffle() {
     assert_eq!(segments[0].text, "first arrival");
     assert_eq!(segments[1].text, "second arrival");
 }
+
+// ------------------------------------------------------------- echo gate
+
+use fotwd::session::echo_gate_enabled;
+
+/// CAP-11 v1 is on unless declined — the duplicated-transcript default is
+/// the bug, not the feature.
+#[test]
+fn the_echo_gate_defaults_on_and_declines_like_mic_stt() {
+    assert!(echo_gate_enabled(None));
+    assert!(!echo_gate_enabled(Some("off")));
+    assert!(echo_gate_enabled(Some("on")));
+}
