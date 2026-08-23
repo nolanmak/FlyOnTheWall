@@ -12,6 +12,11 @@
 	<string>fotwd</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
+
+	<!-- Contents/Resources/AppIcon.icns, named without the extension per the
+	     LaunchServices convention. The `bundle` recipe copies it in. -->
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleShortVersionString</key>
 	<string>0.1.0</string>
 	<key>CFBundleVersion</key>

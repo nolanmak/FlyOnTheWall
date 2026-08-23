@@ -61,6 +61,7 @@ bundle profile="release":
     mkdir -p "{{app}}/Contents/MacOS" "{{app}}/Contents/Resources"
     cp "target/{{profile}}/fotwd" "{{app}}/Contents/MacOS/fotwd"
     cp packaging/Info.plist "{{app}}/Contents/Info.plist"
+    cp packaging/AppIcon.icns "{{app}}/Contents/Resources/AppIcon.icns"
     printf 'APPL????' > "{{app}}/Contents/PkgInfo"
     plutil -lint "{{app}}/Contents/Info.plist"
     echo "✓ assembled {{app}}"

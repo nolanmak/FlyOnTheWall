@@ -54,6 +54,26 @@ async fn the_spa_and_the_api_work_for_the_real_client() {
     assert!(ticket.body.contains("\"ticket\""));
 }
 
+/// The favicon is a bundled asset like the script and the stylesheet: served
+/// same-origin (`img-src 'self'`, so no CSP relaxation is needed), with the
+/// SVG content type, and reachable without the bearer as the rest of the
+/// shell is. A tab with no icon reads as a broken page.
+#[tokio::test]
+async fn the_favicon_is_served_as_an_svg() {
+    let h = common::start().await;
+
+    let shell = h.get("/", &h.anonymous()).await;
+    assert!(
+        shell.body.contains("/assets/favicon.svg"),
+        "the shell must reference the favicon so the browser fetches it"
+    );
+
+    let icon = h.get("/assets/favicon.svg", &h.anonymous()).await;
+    assert_eq!(icon.status, 200);
+    assert_eq!(icon.header("content-type"), Some("image/svg+xml"));
+    assert!(icon.body.contains("<svg"), "the body is the icon itself");
+}
+
 // ------------------------------------------------------------------- ING-02
 //
 // The rebinding attack itself. The TCP connection really is to 127.0.0.1 —
