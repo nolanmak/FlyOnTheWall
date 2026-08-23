@@ -376,7 +376,7 @@ impl SttErrors {
 }
 
 /// The closure shape a [`SegmentTap`] holds.
-type SegmentFn = dyn Fn(&TranscriptSegment) + Send + Sync;
+type SegmentFn = dyn Fn(&TranscriptSegment, TapKind) + Send + Sync;
 
 /// A callback the collector hands every finalized segment, as it arrives.
 ///
@@ -390,6 +390,16 @@ type SegmentFn = dyn Fn(&TranscriptSegment) + Send + Sync;
 /// are meeting content, and §10's never-log rule does not stop at log files.
 #[derive(Clone, Default)]
 pub struct SegmentTap(Option<Arc<SegmentFn>>);
+
+/// Whether a tapped segment is settled or still being revised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TapKind {
+    /// A revision of an utterance in progress. The next partial with the
+    /// same utterance replaces it; only the final is stored.
+    Partial,
+    /// Settled text. This is what the sink buffers and persist writes.
+    Final,
+}
 
 impl std::fmt::Debug for SegmentTap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -407,14 +417,14 @@ impl SegmentTap {
     /// `f` runs on the collector task while the meeting is live, so it must
     /// not block: the hub's `publish` is a buffered push by design.
     #[must_use]
-    pub fn new(f: impl Fn(&TranscriptSegment) + Send + Sync + 'static) -> Self {
+    pub fn new(f: impl Fn(&TranscriptSegment, TapKind) + Send + Sync + 'static) -> Self {
         Self(Some(Arc::new(f)))
     }
 
     /// Hand one segment over, or do nothing when no tap was set.
-    pub fn emit(&self, segment: &TranscriptSegment) {
+    pub fn emit(&self, segment: &TranscriptSegment, kind: TapKind) {
         if let Some(f) = &self.0 {
-            f(segment);
+            f(segment, kind);
         }
     }
 }
@@ -675,9 +685,15 @@ fn spawn_leg_collector(
                 StreamEvent::Final(seg) => {
                     // Live first, then the buffer: a viewer watching the
                     // meeting should not be behind the file on disk.
-                    tap.emit(&seg);
+                    tap.emit(&seg, TapKind::Final);
                     sink.lock().unwrap_or_else(|e| e.into_inner()).push(seg);
                 }
+                // Partials feed the live view and nothing else: the next
+                // revision replaces them, only finals are stored, and
+                // dropping them here is why the "live" transcript only
+                // moved at utterance boundaries — one to three seconds
+                // after the speaker paused, which reads as "not realtime".
+                StreamEvent::Partial(seg) => tap.emit(&seg, TapKind::Partial),
                 StreamEvent::Error(e) => {
                     eprintln!("  ! transcription ({leg}): {e}");
                     errors.record(format!("{leg}: {e}"));

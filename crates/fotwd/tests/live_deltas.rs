@@ -21,8 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use fotw_stt::Source;
 use fotw_stt::transcript::{TimestampSource, TranscriptSegment};
-use fotwd::serve::delta_from;
-use fotwd::session::SegmentTap;
+use fotwd::serve::{delta_from, delta_partial};
+use fotwd::session::{SegmentTap, TapKind};
 
 fn seg(source: Source, start_ms: u64, text: &str) -> TranscriptSegment {
     TranscriptSegment {
@@ -50,19 +50,19 @@ fn seg(source: Source, start_ms: u64, text: &str) -> TranscriptSegment {
 /// test — keeps exactly its old behavior without naming the feature.
 #[test]
 fn the_default_tap_swallows_segments_without_complaint() {
-    SegmentTap::default().emit(&seg(Source::System, 0, "unheard"));
+    SegmentTap::default().emit(&seg(Source::System, 0, "unheard"), TapKind::Final);
 }
 
 #[test]
 fn a_tap_sees_every_segment_it_is_given() {
     let count = Arc::new(AtomicU64::new(0));
     let seen = Arc::clone(&count);
-    let tap = SegmentTap::new(move |_s| {
+    let tap = SegmentTap::new(move |_s, _k| {
         seen.fetch_add(1, Ordering::Relaxed);
     });
 
-    tap.emit(&seg(Source::System, 0, "one"));
-    tap.emit(&seg(Source::Mic, 500, "two"));
+    tap.emit(&seg(Source::System, 0, "one"), TapKind::Final);
+    tap.emit(&seg(Source::Mic, 500, "two"), TapKind::Partial);
 
     assert_eq!(count.load(Ordering::Relaxed), 2);
 }
@@ -73,12 +73,12 @@ fn a_tap_sees_every_segment_it_is_given() {
 fn a_cloned_tap_reaches_the_same_closure() {
     let count = Arc::new(AtomicU64::new(0));
     let seen = Arc::clone(&count);
-    let tap = SegmentTap::new(move |_s| {
+    let tap = SegmentTap::new(move |_s, _k| {
         seen.fetch_add(1, Ordering::Relaxed);
     });
 
     let held = tap.clone();
-    held.emit(&seg(Source::System, 0, "via the clone"));
+    held.emit(&seg(Source::System, 0, "via the clone"), TapKind::Final);
 
     assert_eq!(count.load(Ordering::Relaxed), 1);
 }
@@ -89,11 +89,11 @@ fn a_cloned_tap_reaches_the_same_closure() {
 fn the_tap_is_handed_the_real_segment() {
     let heard = Arc::new(std::sync::Mutex::new(String::new()));
     let sink = Arc::clone(&heard);
-    let tap = SegmentTap::new(move |s| {
+    let tap = SegmentTap::new(move |s, _k| {
         *sink.lock().unwrap() = s.text.clone();
     });
 
-    tap.emit(&seg(Source::Mic, 100, "the exact words"));
+    tap.emit(&seg(Source::Mic, 100, "the exact words"), TapKind::Final);
     assert_eq!(*heard.lock().unwrap(), "the exact words");
 }
 
@@ -118,4 +118,15 @@ fn a_system_segment_becomes_a_system_delta() {
 fn a_mic_segment_becomes_a_mic_delta() {
     let d = delta_from(0, &seg(Source::Mic, 1_000, "wait, before you start"));
     assert_eq!(d.channel, "mic");
+}
+
+/// A revision, not a row: no index, not final — the renderer's replace
+/// contract, pinned on the wire shape.
+#[test]
+fn a_partial_delta_has_no_index_and_is_not_final() {
+    let d = delta_partial(&seg(Source::System, 2_000, "and that is wh"));
+    assert_eq!(d.idx, -1);
+    assert!(!d.is_final);
+    assert_eq!(d.channel, "system");
+    assert_eq!(d.text, "and that is wh");
 }

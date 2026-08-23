@@ -31,6 +31,7 @@ const el = {
   detail: document.getElementById("detail"),
   status: document.getElementById("status"),
   live: document.getElementById("live"),
+  elapsed: document.getElementById("elapsed"),
   consent: document.getElementById("consent"),
   consentLabel: document.getElementById("consent-label"),
   record: document.getElementById("record"),
@@ -365,6 +366,21 @@ function appendDeltas(deltas) {
     // "me" is what the mic leg means (§7.5). The far end's labels arrive
     // with the stored transcript after Stop.
     const speaker = d.channel === "mic" ? "me" : null;
+    if (d.is_final === false) {
+      // A revision, not a row: one in-progress line per channel, replaced on
+      // every partial. This is what makes the view move while the speaker is
+      // mid-sentence instead of at utterance boundaries.
+      const id = "pending-" + d.channel;
+      const fresh = segmentRow(d.channel, d.start_ms, speaker, d.text, null);
+      fresh.id = id;
+      fresh.classList.add("pending");
+      const old = document.getElementById(id);
+      if (old) old.replaceWith(fresh);
+      else body.appendChild(fresh);
+      continue;
+    }
+    const pending = document.getElementById("pending-" + d.channel);
+    if (pending) pending.remove();
     body.appendChild(segmentRow(d.channel, d.start_ms, speaker, d.text, null));
   }
   while (body.childElementCount > MAX_ROWS) {
@@ -384,6 +400,20 @@ function appendDeltas(deltas) {
 const RECORDING_POLL_MS = 5000;
 
 let recordingNow = false;
+let recordingSince = null;
+let clockTimer = null;
+
+// Ticks locally every second from the last started_at_ms the poll reported.
+// The poll corrects drift; the local tick is what makes it a clock rather
+// than a number that jumps every five seconds.
+function paintClock() {
+  if (!recordingSince) return;
+  const s = Math.max(0, Math.floor((Date.now() - recordingSince) / 1000));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = String(s % 60).padStart(2, "0");
+  el.elapsed.textContent = h > 0 ? h + ":" + String(m).padStart(2, "0") + ":" + sec : m + ":" + sec;
+}
 
 // A daemon with no recorder answers 404 on these paths, which is
 // indistinguishable from a server that never had them. Once we learn that,
@@ -413,6 +443,22 @@ function renderRecording(body) {
 
   el.recording.hidden = !recordingNow;
   el.record.textContent = recordingNow ? "Stop" : "Start";
+
+  // The session clock (#66 follow-up): a recording with no visible duration
+  // is how a 37-minute accident happens.
+  if (recordingNow && body.started_at_ms) {
+    recordingSince = body.started_at_ms;
+    el.elapsed.hidden = false;
+    paintClock();
+    if (!clockTimer) clockTimer = setInterval(paintClock, 1000);
+  } else if (!recordingNow) {
+    recordingSince = null;
+    el.elapsed.hidden = true;
+    if (clockTimer) {
+      clearInterval(clockTimer);
+      clockTimer = null;
+    }
+  }
 
   // The tick box is the control CON-01 asks for, so it is only meaningful
   // before a recording exists. While one is running, Stop must never be
