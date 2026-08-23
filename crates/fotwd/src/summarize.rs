@@ -168,6 +168,26 @@ where
                 "claude-cli".to_owned(),
             )
         }
+        crate::engine::Engine::Codex { binary } => {
+            // Same shape as the claude arm: both calls share one runner, and
+            // the model choice is the subscription's own default (None), never
+            // ours to hardcode into their plan.
+            let runner = Arc::new(crate::engine::TokioCliRunner::new(
+                binary.clone(),
+                CLI_DEADLINE,
+            ));
+            (
+                Box::new(fotw_summarize::codex_cli::CodexCliAdapter::new(
+                    Arc::clone(&runner),
+                    None,
+                )),
+                Box::new(fotw_summarize::codex_cli::CodexCliAdapter::new(
+                    runner, None,
+                )),
+                "codex-cli",
+                "codex-cli".to_owned(),
+            )
+        }
     };
     let (prose, extraction) = (&*prose, &*extraction);
 

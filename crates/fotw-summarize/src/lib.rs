@@ -61,6 +61,7 @@ pub mod anthropic;
 pub mod capabilities;
 pub mod chunk;
 pub mod claude_cli;
+pub mod codex_cli;
 pub mod coverage;
 pub mod document;
 pub mod error;
@@ -81,6 +82,8 @@ pub use adapter::{
 pub use anthropic::AnthropicAdapter;
 pub use capabilities::{CacheTtl, Capabilities, Effort, Preset, PromptCache};
 pub use chunk::{Chunk, Plan, SpeakerTurn};
+pub use claude_cli::{ClaudeCliAdapter, CliOutput, CliTransport};
+pub use codex_cli::CodexCliAdapter;
 pub use coverage::{Claim, CoverageConfig, CoverageReport, LOW_GROUNDING_THRESHOLD, METRIC_LABEL};
 pub use document::{DocumentSegment, TranscriptDocument};
 pub use error::SummarizeError;

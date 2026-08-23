@@ -106,7 +106,11 @@ impl<T: CliTransport> ClaudeCliAdapter<T> {
 /// order — system, document, notes, instruction — survives the flattening
 /// because the quarantine reasoning behind it is about order, not transport:
 /// the instruction stays last so nothing inside the transcript can pose as it.
-fn assemble_stdin(request: &LlmRequest) -> String {
+///
+/// `pub(crate)` because every CLI adapter feeds its subprocess the same one
+/// stdin document — [`crate::codex_cli`] reuses this verbatim rather than
+/// growing a second copy that could drift out of block order.
+pub(crate) fn assemble_stdin(request: &LlmRequest) -> String {
     let mut out = String::with_capacity(4_096);
     out.push_str(&request.system);
     out.push_str("\n\n");

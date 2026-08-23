@@ -158,7 +158,7 @@ async fn main() -> ExitCode {
                  list [dir] | summarize <id> [dir] [--template <slug>] | disclose | \
                  onboard | detect [seconds] | \
                  retention [dir] [--apply] [--days <n>] [--budget-gib <n>] | \
-                 key <set <provider>|list> | engine [claude-cli|off] | \
+                 key <set <provider>|list> | engine [claude-cli|codex-cli|off] | \
                  recover [dir] [--check] | \
                  templates <list|install|show <slug>> | \
                  export <id> [dir] [--format md|txt|json] [--out <file>] | \
@@ -1098,7 +1098,7 @@ fn list(root: PathBuf) -> ExitCode {
 /// through it exactly as it would through an API key (KEY-04), and the
 /// resolver refuses the CLI until the user has said they know that.
 fn engine_command(args: &[String]) -> ExitCode {
-    use fotwd::engine::{SETTINGS_KEY, SummarizeSettings};
+    use fotwd::engine::{CliKind, SETTINGS_KEY, SummarizeSettings};
 
     let root = default_root();
     let mut db = match open_db(&root) {
@@ -1125,11 +1125,18 @@ fn engine_command(args: &[String]) -> ExitCode {
             if has_key {
                 println!("  engine     : anthropic API (key in keychain — always wins)");
             } else if settings.cli_enabled && settings.acknowledged_egress {
-                println!("  engine     : claude CLI (`{}`)", settings.binary);
+                let name = match settings.cli_kind {
+                    CliKind::Claude => "claude",
+                    CliKind::Codex => "codex",
+                };
+                println!("  engine     : {name} CLI (`{}`)", settings.binary);
             } else {
                 println!("  engine     : none — meetings get a local fallback title only");
                 println!("    `fotwd key set anthropic`                         for the API");
-                println!("    `fotwd engine claude-cli --i-acknowledge-egress`  for your CLI");
+                println!(
+                    "    `fotwd engine claude-cli --i-acknowledge-egress`  for the Claude CLI"
+                );
+                println!("    `fotwd engine codex-cli --i-acknowledge-egress`   for the Codex CLI");
             }
             ExitCode::SUCCESS
         }
@@ -1143,13 +1150,18 @@ fn engine_command(args: &[String]) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Some("claude-cli") => {
+        Some(sub @ ("claude-cli" | "codex-cli")) => {
+            let (kind, cli, vendor, login) = if sub == "claude-cli" {
+                (CliKind::Claude, "claude", "Anthropic", "`claude` login")
+            } else {
+                (CliKind::Codex, "codex", "OpenAI", "`codex` login")
+            };
             // The disclosure is the point, not a speed bump: KEY-04's duty,
             // for a path with no key to hang it on.
             if !args.iter().any(|a| a == "--i-acknowledge-egress") {
                 eprintln!("  Enabling the CLI engine sends each finished meeting's transcript");
-                eprintln!("  to Anthropic through your local `claude` login — the same words");
-                eprintln!("  that would travel under an API key, on your subscription's terms.");
+                eprintln!("  to {vendor} through your local {login} — the same words that would");
+                eprintln!("  travel under an API key, on your subscription's terms.");
                 eprintln!();
                 eprintln!("  Re-run with --i-acknowledge-egress to confirm.");
                 return ExitCode::FAILURE;
@@ -1157,11 +1169,21 @@ fn engine_command(args: &[String]) -> ExitCode {
             let settings = SummarizeSettings {
                 cli_enabled: true,
                 acknowledged_egress: true,
-                binary: flag_value(args, "--binary").unwrap_or_else(|| "claude".to_owned()),
+                cli_kind: kind,
+                binary: flag_value(args, "--binary").unwrap_or_else(|| kind.default_binary()),
             };
             match write(&mut db, &settings) {
                 Ok(()) => {
-                    println!("  engine     : claude CLI (`{}`)", settings.binary);
+                    println!("  engine     : {cli} CLI (`{}`)", settings.binary);
+                    if fotwd::engine::resolve_binary(&settings.binary).is_none() {
+                        println!(
+                            "  ! `{}` is not on PATH or is not executable — enrichment will",
+                            settings.binary
+                        );
+                        println!(
+                            "    report 'no engine' until it is. Pass --binary <path> to fix."
+                        );
+                    }
                     println!("  Finished meetings now get a title, a summary and action items.");
                     ExitCode::SUCCESS
                 }
@@ -1173,7 +1195,8 @@ fn engine_command(args: &[String]) -> ExitCode {
         }
         Some(other) => {
             eprintln!(
-                "usage: fotwd engine [claude-cli --i-acknowledge-egress [--binary <path>] | off]"
+                "usage: fotwd engine [claude-cli|codex-cli --i-acknowledge-egress \
+                 [--binary <path>] | off]"
             );
             eprintln!("fotwd: unknown engine `{other}`");
             ExitCode::FAILURE
