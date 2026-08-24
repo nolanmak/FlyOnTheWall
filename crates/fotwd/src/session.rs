@@ -180,6 +180,271 @@ pub fn echo_gate_enabled(value: Option<&str>) -> bool {
     mic_stt_enabled(value)
 }
 
+/// Whether the cross-leg transcript dedupe runs at persist time.
+///
+/// From `FOTW_TEXT_DEDUPE`; unset means on. Off is the field escape hatch,
+/// and the A/B control that keeps the audio gate's CAP-11 acceptance metric
+/// measurable — unconditional text dedupe would erase transcript-level
+/// duplicates in both arms of that experiment.
+#[must_use]
+pub fn text_dedupe_enabled(value: Option<&str>) -> bool {
+    mic_stt_enabled(value)
+}
+
+/// Cross-leg transcript dedupe: drop mic-leg segments that duplicate the
+/// system leg. Returns how many were dropped.
+///
+/// On speakers the mic re-transcribes the system audio, so the same passage
+/// lands twice — once diarized on the system leg, once labeled `me` — with
+/// ASR wording drift between the copies and multi-second skew between the
+/// legs. The audio gate (CAP-11 v1) removes what it can before transcription;
+/// this pass removes what leaks, because in the text domain the duplication
+/// is trivially visible no matter what the room did to the waveform.
+/// Precedent: Descript's "mic bleed" fix — text-only removal, audio
+/// untouched. The system copy always wins: it is the clean, diarized feed.
+///
+/// # How a mic segment is judged
+///
+/// Tokens come from [`fotw_stt::normalize_tokens`], then — here only, never
+/// in `normalize_tokens` itself, whose one-unit-one-token contract STT-09's
+/// replay trimming depends on — digits and number words collapse to one
+/// class token, because the two legs routinely disagree on "29" versus
+/// "twenty nine" while transcribing the same audio.
+///
+/// * **Containment** (four tokens or more): the segment's tokens against the
+///   concatenated multiset of every system segment overlapping its span
+///   padded by [`DEDUPE_WINDOW_MS`]. Concatenated, not element-wise max — a
+///   phrase played twice was transcribed twice and may match twice.
+/// * **Short fragments** (under four tokens — the audio gate's warmup
+///   residue): a contiguous-subsequence match inside a *single* system
+///   segment overlapping within [`DEDUPE_SHORT_WINDOW_MS`]. Tight on
+///   purpose: an echo overlaps its source, a spoken confirmation follows it.
+///
+/// # The corroboration guard
+///
+/// Echo is never a one-off: a session where exactly one mic utterance
+/// matches moderately is a human repeating something, not a room. A
+/// candidate is dropped only if it is near-verbatim on its own
+/// ([`DEDUPE_VERBATIM`]), or clears [`DEDUPE_THRESHOLD`] while at least one
+/// *other* mic segment in the session also clears it. Short fragments always
+/// need that corroboration — a two-word interjection can be a contiguous
+/// coincidence, and eating the user's real voice is the one unforgivable
+/// failure here exactly as it is in the audio gate.
+pub fn dedupe_cross_leg(segments: &mut Vec<TranscriptSegment>) -> usize {
+    let system: Vec<(u64, u64, Vec<String>)> = segments
+        .iter()
+        .filter(|s| s.source == Source::System)
+        .map(|s| (s.start_ms, s.end_ms, classed_tokens(&s.text)))
+        .collect();
+    if system.is_empty() {
+        return 0;
+    }
+
+    /// What pass one learned about one mic segment.
+    struct Candidate {
+        index: usize,
+        containment: f32,
+        short: bool,
+    }
+
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut clearers = 0usize;
+    for (index, seg) in segments.iter().enumerate() {
+        if seg.source != Source::Mic {
+            continue;
+        }
+        let tokens = classed_tokens(&seg.text);
+        if tokens.is_empty() {
+            continue;
+        }
+
+        if tokens.len() >= DEDUPE_MIN_MATCHED {
+            let from = seg.start_ms.saturating_sub(DEDUPE_WINDOW_MS);
+            let to = seg.end_ms + DEDUPE_WINDOW_MS;
+            let mut window: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for (start, end, sys_tokens) in &system {
+                if *start <= to && *end >= from {
+                    for t in sys_tokens {
+                        *window.entry(t.as_str()).or_insert(0) += 1;
+                    }
+                }
+            }
+            let mut counts: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for t in &tokens {
+                *counts.entry(t.as_str()).or_insert(0) += 1;
+            }
+            let matched: usize = counts
+                .iter()
+                .map(|(t, n)| (*n).min(window.get(t).copied().unwrap_or(0)))
+                .sum();
+            let containment = matched as f32 / tokens.len() as f32;
+            if containment >= DEDUPE_THRESHOLD && matched >= DEDUPE_MIN_MATCHED {
+                clearers += 1;
+                candidates.push(Candidate {
+                    index,
+                    containment,
+                    short: false,
+                });
+            }
+        } else {
+            let from = seg.start_ms.saturating_sub(DEDUPE_SHORT_WINDOW_MS);
+            let to = seg.end_ms + DEDUPE_SHORT_WINDOW_MS;
+            let echoed = system.iter().any(|(start, end, sys_tokens)| {
+                *start <= to
+                    && *end >= from
+                    && sys_tokens
+                        .windows(tokens.len())
+                        .any(|w| w == tokens.as_slice())
+            });
+            if echoed {
+                candidates.push(Candidate {
+                    index,
+                    containment: 1.0,
+                    short: true,
+                });
+            }
+        }
+    }
+
+    let mut drop: Vec<usize> = Vec::new();
+    for candidate in &candidates {
+        let corroborated = clearers >= if candidate.short { 1 } else { 2 };
+        let alone_is_enough = !candidate.short && candidate.containment >= DEDUPE_VERBATIM;
+        if alone_is_enough || corroborated {
+            drop.push(candidate.index);
+        }
+    }
+    let dropped = drop.len();
+    let mut keep_index = 0usize;
+    segments.retain(|_| {
+        let keep = !drop.contains(&keep_index);
+        keep_index += 1;
+        keep
+    });
+    dropped
+}
+
+/// Containment above which a long mic segment reads as an echo copy.
+///
+/// Derived from live pairs in `tests/cross_leg_dedupe.rs` — real podcast
+/// echo lands 0.83–1.0 with number-classing, independent speech under 0.4.
+const DEDUPE_THRESHOLD: f32 = 0.65;
+
+/// Containment at which a lone long match is echo even without
+/// corroboration: near-verbatim duplication does not happen by accident.
+const DEDUPE_VERBATIM: f32 = 0.85;
+
+/// Minimum matched tokens for the containment path, and the boundary below
+/// which the short-fragment rule applies instead. Four: any three common
+/// words appear somewhere in twenty seconds of speech.
+const DEDUPE_MIN_MATCHED: usize = 4;
+
+/// Span padding for the containment window, covering the observed
+/// multi-second skew between the legs' clocks.
+const DEDUPE_WINDOW_MS: u64 = 10_000;
+
+/// Span padding for the short-fragment rule — tight, bounded by the audio
+/// gate's own search horizon: an echo overlaps its source, a spoken
+/// confirmation follows it.
+const DEDUPE_SHORT_WINDOW_MS: u64 = 3_500;
+
+/// Whether `text` reads as an echo of any of the recent system token sets —
+/// the live half of the cross-leg dedupe, sharing the persist pass's rules:
+/// containment for four-plus tokens, contiguous subsequence for fragments.
+/// No corroboration guard here — the live view is cosmetic and corrected at
+/// persist either way, and a guard would need session history a streaming
+/// callback does not hold.
+pub fn echoes_recent<'a>(text: &str, recent_system: impl Iterator<Item = &'a [String]>) -> bool {
+    let tokens = classed_tokens(text);
+    if tokens.is_empty() {
+        return false;
+    }
+    let recent: Vec<&[String]> = recent_system.collect();
+    if recent.is_empty() {
+        return false;
+    }
+    if tokens.len() >= DEDUPE_MIN_MATCHED {
+        let mut window: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for set in &recent {
+            for t in set.iter() {
+                *window.entry(t.as_str()).or_insert(0) += 1;
+            }
+        }
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for t in &tokens {
+            *counts.entry(t.as_str()).or_insert(0) += 1;
+        }
+        let matched: usize = counts
+            .iter()
+            .map(|(t, n)| (*n).min(window.get(t).copied().unwrap_or(0)))
+            .sum();
+        matched >= DEDUPE_MIN_MATCHED && matched as f32 / tokens.len() as f32 >= DEDUPE_THRESHOLD
+    } else {
+        recent
+            .iter()
+            .any(|set| set.windows(tokens.len()).any(|w| w == tokens.as_slice()))
+    }
+}
+
+/// The dedupe's token view of a text, for callers holding their own window.
+#[must_use]
+pub fn dedupe_tokens(text: &str) -> Vec<String> {
+    classed_tokens(text)
+}
+
+/// [`fotw_stt::normalize_tokens`], with digits and number words collapsed to
+/// one class token. Local to the dedupe on purpose — see the fn doc.
+fn classed_tokens(text: &str) -> Vec<String> {
+    const NUMBER_WORDS: &[&str] = &[
+        "zero",
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+        "eleven",
+        "twelve",
+        "thirteen",
+        "fourteen",
+        "fifteen",
+        "sixteen",
+        "seventeen",
+        "eighteen",
+        "nineteen",
+        "twenty",
+        "thirty",
+        "forty",
+        "fifty",
+        "sixty",
+        "seventy",
+        "eighty",
+        "ninety",
+        "hundred",
+        "thousand",
+        "million",
+        "billion",
+        "oh",
+        "o",
+    ];
+    fotw_stt::normalize_tokens(text)
+        .into_iter()
+        .map(|t| {
+            if t.chars().all(|c| c.is_ascii_digit()) || NUMBER_WORDS.contains(&t.as_str()) {
+                "<num>".to_owned()
+            } else {
+                t
+            }
+        })
+        .collect()
+}
+
 /// Put segments from both legs into spoken order.
 ///
 /// Two streams finalize independently, so segments arrive interleaved by

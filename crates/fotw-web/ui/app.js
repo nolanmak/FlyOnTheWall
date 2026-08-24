@@ -368,9 +368,16 @@ function appendDeltas(deltas) {
     const speaker = d.channel === "mic" ? "me" : null;
     if (d.is_final === false) {
       // A revision, not a row: one in-progress line per channel, replaced on
-      // every partial. This is what makes the view move while the speaker is
-      // mid-sentence instead of at utterance boundaries.
+      // every partial. An EMPTY partial is the server retracting the line —
+      // sent when a mic final was suppressed as speaker echo, so the last
+      // echo partial does not sit on screen as "me" for the rest of the
+      // meeting.
       const id = "pending-" + d.channel;
+      if (!d.text) {
+        const old = document.getElementById(id);
+        if (old) old.remove();
+        continue;
+      }
       const fresh = segmentRow(d.channel, d.start_ms, speaker, d.text, null);
       fresh.id = id;
       fresh.classList.add("pending");

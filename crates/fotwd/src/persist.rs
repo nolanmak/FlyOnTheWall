@@ -25,6 +25,29 @@ use crate::session::SessionOutcome;
 /// transcribed later. Dropping it here would make the library quietly lossy
 /// in exactly the case where the user most needs to find the recording.
 pub fn persist_session(db: &mut Db, outcome: &SessionOutcome, title: &str) -> StoreResult<String> {
+    // Cross-leg dedupe happens HERE, not at session end: `stt.jsonl` is the
+    // crash-recovery record and stays raw, so a matcher misfire is always
+    // recoverable from the session directory. The database — and everything
+    // that reads it: export, titles, the detail API — gets the deduped view.
+    let deduped;
+    let outcome =
+        if crate::session::text_dedupe_enabled(std::env::var("FOTW_TEXT_DEDUPE").ok().as_deref()) {
+            let mut segments = outcome.segments.clone();
+            let dropped = crate::session::dedupe_cross_leg(&mut segments);
+            if dropped > 0 {
+                eprintln!(
+                    "  dedupe     : dropped {dropped} mic segment(s) that duplicated the \
+                 system leg (speaker echo)"
+                );
+            }
+            deduped = SessionOutcome {
+                segments,
+                ..outcome_shallow(outcome)
+            };
+            &deduped
+        } else {
+            outcome
+        };
     let mut m = NewMeeting::new(device_id(), timezone());
     m.title = title.to_owned();
     // The real capture start, not now: they differ by the length of the
@@ -72,6 +95,94 @@ pub fn primary_transcript_id(db: &mut Db, meeting_id: &str) -> Option<String> {
         .primary_transcript_id(meeting_id)
         .ok()
         .flatten()
+}
+
+/// What one retroactive dedupe pass did.
+#[derive(Debug)]
+pub struct DedupeReport {
+    /// Segments before the pass.
+    pub before: usize,
+    /// Mic segments dropped as speaker echo.
+    pub dropped: usize,
+    /// The new primary transcript id, when one was written.
+    pub new_transcript: Option<String>,
+}
+
+/// Re-run the cross-leg dedupe over a stored meeting (#71 follow-through).
+///
+/// The library already holds meetings persisted before this pass existed —
+/// their transcripts carry every speaker-echo duplicate. This rewrites them
+/// the way the store already versions derived artifacts: a NEW transcript
+/// becomes primary and the old one is retained untouched, so
+/// `set_primary_transcript(&old)` is a full revert. Idempotent: a clean
+/// transcript writes nothing.
+///
+/// # Errors
+///
+/// Whatever the store failed with.
+pub fn dedupe_meeting(db: &mut Db, meeting_id: &str) -> StoreResult<DedupeReport> {
+    let Some(old_transcript) = primary_transcript_id(db, meeting_id) else {
+        return Ok(DedupeReport {
+            before: 0,
+            dropped: 0,
+            new_transcript: None,
+        });
+    };
+    let mut segments = crate::summarize::load_segments(db, &old_transcript)?;
+    crate::session::order_segments(&mut segments);
+    let before = segments.len();
+    let dropped = crate::session::dedupe_cross_leg(&mut segments);
+    if dropped == 0 {
+        return Ok(DedupeReport {
+            before,
+            dropped: 0,
+            new_transcript: None,
+        });
+    }
+
+    // Provider and model belong to the transcript row, not the segments;
+    // the export view is the one existing reader that surfaces them.
+    let (provider, model) = db
+        .export_meeting(meeting_id)?
+        .transcripts
+        .iter()
+        .find(|t| t.id == old_transcript)
+        .map(|t| (t.provider.clone(), t.model.clone()))
+        .unwrap_or_else(|| ("deepgram".to_owned(), "unknown".to_owned()));
+
+    // `make_primary: true` demotes the old primary in the same transaction;
+    // the old rows stay for revert. Dense re-index, as persist writes.
+    let new_transcript = db
+        .meetings()
+        .create_transcript(meeting_id, &provider, &model, true)?;
+    let rows: Vec<NewSegment> = segments
+        .iter()
+        .enumerate()
+        .map(|(i, s)| to_row(i as i64, s))
+        .collect();
+    db.meetings().append_segments(&new_transcript, &rows)?;
+
+    Ok(DedupeReport {
+        before,
+        dropped,
+        new_transcript: Some(new_transcript),
+    })
+}
+
+/// A field-for-field copy of the outcome minus its segments, so the deduped
+/// view above can borrow the same shape without mutating the caller's.
+fn outcome_shallow(o: &SessionOutcome) -> SessionOutcome {
+    SessionOutcome {
+        dir: o.dir.clone(),
+        started_at_ms: o.started_at_ms,
+        system_samples: o.system_samples,
+        mic_samples: o.mic_samples,
+        stt_errors: o.stt_errors.clone(),
+        silent_buffers: o.silent_buffers,
+        total_buffers: o.total_buffers,
+        dropped_samples: o.dropped_samples,
+        segments: Vec::new(),
+    }
 }
 
 fn to_row(idx: i64, s: &TranscriptSegment) -> NewSegment {

@@ -229,17 +229,72 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
     // `Delta.idx` is documented as the index within *the* transcript, so the
     // counter resets when the session changes — a daemon-lifetime counter
     // would leak how many segments earlier meetings produced.
-    let tap_state = Arc::new(std::sync::Mutex::new((String::new(), 0i64)));
+    // Session-keyed live state: the delta index, and a short window of
+    // recent SYSTEM finals for the live half of the cross-leg dedupe. The
+    // persist-time pass is authoritative; this one keeps speaker echo off
+    // the screen while the meeting runs. A mic final that arrives BEFORE
+    // its system counterpart (the observed skew direction) leaks here and
+    // is cleaned at persist — the documented post-stop-refresh contract.
+    struct LiveTap {
+        session: String,
+        next_idx: i64,
+        /// `(end_ms, classed tokens)` of recent system finals.
+        recent_system: std::collections::VecDeque<(u64, Vec<String>)>,
+    }
+    let tap_state = Arc::new(std::sync::Mutex::new(LiveTap {
+        session: String::new(),
+        next_idx: 0,
+        recent_system: std::collections::VecDeque::new(),
+    }));
     let on_segment = crate::session::SegmentTap::new(move |seg, kind| {
         let Some(hub) = hub_for_tap.get() else { return };
         match kind {
             crate::session::TapKind::Final => {
                 let mut guard = tap_state.lock().unwrap_or_else(|e| e.into_inner());
-                if guard.0 != seg.session_id {
-                    *guard = (seg.session_id.clone(), 0);
+                if guard.session != seg.session_id {
+                    guard.session = seg.session_id.clone();
+                    guard.next_idx = 0;
+                    guard.recent_system.clear();
                 }
-                let idx = guard.1;
-                guard.1 += 1;
+                match seg.source {
+                    fotw_stt::Source::System => {
+                        guard
+                            .recent_system
+                            .push_back((seg.end_ms, crate::session::dedupe_tokens(&seg.text)));
+                        // Bounded both ways: count and age.
+                        while guard.recent_system.len() > 8 {
+                            guard.recent_system.pop_front();
+                        }
+                        let horizon = seg.end_ms.saturating_sub(20_000);
+                        while guard
+                            .recent_system
+                            .front()
+                            .is_some_and(|(end, _)| *end < horizon)
+                        {
+                            guard.recent_system.pop_front();
+                        }
+                    }
+                    fotw_stt::Source::Mic => {
+                        if crate::session::echoes_recent(
+                            &seg.text,
+                            guard.recent_system.iter().map(|(_, t)| t.as_slice()),
+                        ) {
+                            // Suppressed: skip the publish AND the index — a
+                            // hole in `Delta.idx` would break its documented
+                            // "index within the transcript" meaning. The
+                            // renderer's pending mic row would otherwise
+                            // strand the last echo partial on screen, so an
+                            // empty partial clears it.
+                            hub.publish(fotw_web::Delta {
+                                text: String::new(),
+                                ..delta_partial(seg)
+                            });
+                            return;
+                        }
+                    }
+                }
+                let idx = guard.next_idx;
+                guard.next_idx += 1;
                 hub.publish(delta_from(idx, seg));
             }
             // Partials take no index — they are revisions, not rows. The
