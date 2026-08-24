@@ -348,7 +348,7 @@ impl GithubExport for GithubExporter {
     fn push(&self, meeting_id: &str) -> Result<GithubReceipt, GithubError> {
         // Snapshot under the lock, then let it go: the gh calls below take
         // seconds, and the auto worker shares this exporter with the UI.
-        let (settings, markdown, path, title, existing) = {
+        let (settings, markdown, path, title, started_at_ms, existing) = {
             let mut db = self.lock_db();
             let settings = read_settings(&db);
             if !settings.enabled {
@@ -390,53 +390,175 @@ impl GithubExport for GithubExporter {
                 ));
             }
             drop(in_flight);
-            (settings, doc.to_markdown(), path, meeting.title, existing)
+            let started = u64::try_from(meeting.started_at_ms).unwrap_or(0);
+            (
+                settings,
+                doc.to_markdown(),
+                path,
+                meeting.title,
+                started,
+                existing,
+            )
         };
         // Everything below must release the claim on every exit.
-        let result = self.push_claimed(meeting_id, &settings, &markdown, &path, &title, existing);
+        let result = self.push_claimed(
+            meeting_id,
+            &settings,
+            &markdown,
+            &path,
+            &title,
+            started_at_ms,
+            existing,
+        );
         self.in_flight
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(meeting_id);
         result
     }
+
+    fn sync_bundle(&self) -> Result<(), GithubError> {
+        let (settings, receipts) = {
+            let db = self.lock_db();
+            (read_settings(&db), read_receipts(&db))
+        };
+        if !settings.enabled {
+            return Err(GithubError::Disabled);
+        }
+        // Only what was pushed to the *currently* configured repo belongs in
+        // this bundle — a receipt from an old repo names a file that is not
+        // here.
+        let mut mine: Vec<GithubReceipt> = receipts
+            .into_values()
+            .filter(|r| r.repo == settings.repo)
+            .collect();
+        if mine.is_empty() {
+            return Ok(());
+        }
+        // Newest first, deterministically: a tie on start time falls back to
+        // the path so the listing does not reshuffle between runs.
+        mine.sort_by(|a, b| {
+            b.started_at_ms
+                .cmp(&a.started_at_ms)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+
+        self.preflight(&settings)?;
+        let prefix = &settings.path_prefix;
+        self.put_file(
+            &settings,
+            &format!("{prefix}index.md"),
+            &render_index(&mine),
+            "OKF index",
+        )?;
+        self.put_file(
+            &settings,
+            &format!("{prefix}log.md"),
+            &render_log(&mine),
+            "OKF change log",
+        )?;
+        Ok(())
+    }
+}
+
+/// The bundle's `index.md`: an OKF progressive-disclosure listing, newest
+/// first, linking each transcript relatively so the graph survives a move.
+///
+/// Per the OKF spec, `index.md` frontmatter carries only `okf_version`.
+fn render_index(receipts: &[GithubReceipt]) -> String {
+    let mut out = String::from("---\nokf_version: \"0.2\"\n---\n\n# Meeting transcripts\n\n");
+    for r in receipts {
+        let title = if r.title.trim().is_empty() {
+            "Untitled meeting"
+        } else {
+            r.title.trim()
+        };
+        out.push_str(&format!(
+            "- [{title}](./{}) — {}\n",
+            basename(&r.path),
+            iso_date_of(r.started_at_ms)
+        ));
+    }
+    out
+}
+
+/// The bundle's `log.md`: OKF change history under ISO-8601 date headings,
+/// most recent day first, one entry per meeting at its last push.
+fn render_log(receipts: &[GithubReceipt]) -> String {
+    // Group by push day, newest day first. `receipts` is already sorted by
+    // meeting start; re-sort by push time for the log's own ordering.
+    let mut by_push: Vec<&GithubReceipt> = receipts.iter().collect();
+    by_push.sort_by_key(|r| std::cmp::Reverse(r.pushed_at_ms));
+
+    let mut out = String::from("# Change log\n\n");
+    let mut current_day = String::new();
+    for r in by_push {
+        let day = iso_date_of(r.pushed_at_ms);
+        if day != current_day {
+            out.push_str(&format!("## {day}\n\n"));
+            current_day = day;
+        }
+        let title = if r.title.trim().is_empty() {
+            "Untitled meeting"
+        } else {
+            r.title.trim()
+        };
+        out.push_str(&format!("- Added [{title}](./{})\n", basename(&r.path)));
+    }
+    out
+}
+
+/// The file name inside the bundle directory — everything after the last `/`.
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// `YYYY-MM-DD` (UTC) from epoch milliseconds, for OKF's date fields.
+fn iso_date_of(epoch_ms: u64) -> String {
+    let (y, m, d) = ymd_utc(i64::try_from(epoch_ms).unwrap_or(0));
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 impl GithubExporter {
-    /// The gh sequence and the bookkeeping, with the in-flight claim held.
-    #[allow(clippy::too_many_lines)]
-    fn push_claimed(
-        &self,
-        meeting_id: &str,
-        settings: &GithubSettings,
-        markdown: &str,
-        path: &str,
-        title: &str,
-        existing: Option<GithubReceipt>,
-    ) -> Result<GithubReceipt, GithubError> {
-        let run = |args: &[&str], stdin: Option<&[u8]>| {
-            let owned: Vec<String> = args.iter().map(ToString::to_string).collect();
-            self.runner
-                .run(&owned, stdin)
-                .map_err(|_| GithubError::GhMissing)
-        };
+    /// Run `gh`, mapping "could not even start it" to [`GithubError::GhMissing`].
+    fn run_gh(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<GhOutput, GithubError> {
+        let owned: Vec<String> = args.iter().map(ToString::to_string).collect();
+        self.runner
+            .run(&owned, stdin)
+            .map_err(|_| GithubError::GhMissing)
+    }
 
-        // Three questions before the write, each with its own honest answer:
-        // is there a gh, is anyone logged in, does the repo exist for them.
-        let auth = run(&["auth", "status", "--hostname", "github.com"], None)?;
+    /// The two preflight questions every write shares: is anyone logged in,
+    /// and does the repo exist for them. Kept separate so a bundle sync and a
+    /// meeting push ask them the same way.
+    fn preflight(&self, settings: &GithubSettings) -> Result<(), GithubError> {
+        let auth = self.run_gh(&["auth", "status", "--hostname", "github.com"], None)?;
         if auth.status != 0 {
             return Err(GithubError::NotAuthenticated);
         }
-
         let repo_url = format!("repos/{}", settings.repo);
-        let repo = run(&["api", &repo_url], None)?;
+        let repo = self.run_gh(&["api", &repo_url], None)?;
         if repo.status != 0 {
             if mentions_http(&repo.stderr, 404) {
                 return Err(GithubError::RepoNotFound);
             }
             return Err(classify(&repo));
         }
+        Ok(())
+    }
 
+    /// Commit one file — create or update — and return the commit sha.
+    ///
+    /// `subject` is prefixed with `Add`/`Update` from whether the file already
+    /// exists, so the commit log reads naturally for every file the bundle
+    /// carries. Assumes [`GithubExporter::preflight`] already passed.
+    fn put_file(
+        &self,
+        settings: &GithubSettings,
+        path: &str,
+        content: &str,
+        subject: &str,
+    ) -> Result<String, GithubError> {
         // Create or update? The Contents API wants the old blob's sha for an
         // update and refuses one for a create, so ask first.
         let probe_url = if settings.branch.is_empty() {
@@ -447,7 +569,7 @@ impl GithubExporter {
                 settings.repo, path, settings.branch
             )
         };
-        let probe = run(&["api", &probe_url, "--jq", ".sha"], None)?;
+        let probe = self.run_gh(&["api", &probe_url, "--jq", ".sha"], None)?;
         let sha = if probe.status == 0 {
             Some(probe.stdout.trim().to_owned()).filter(|s| !s.is_empty())
         } else if mentions_http(&probe.stderr, 404) {
@@ -456,17 +578,9 @@ impl GithubExporter {
             return Err(classify(&probe));
         };
 
-        let display_title = if title.trim().is_empty() {
-            "Untitled meeting"
-        } else {
-            title.trim()
-        };
         let mut body = serde_json::json!({
-            "message": format!(
-                "{} meeting transcript: {display_title}",
-                if sha.is_some() { "Update" } else { "Add" }
-            ),
-            "content": B64.encode(markdown.as_bytes()),
+            "message": format!("{} {subject}", if sha.is_some() { "Update" } else { "Add" }),
+            "content": B64.encode(content.as_bytes()),
         });
         if !settings.branch.is_empty() {
             body["branch"] = settings.branch.clone().into();
@@ -476,24 +590,52 @@ impl GithubExporter {
         }
 
         let put_url = format!("repos/{}/contents/{}", settings.repo, path);
-        let put = run(
+        let put = self.run_gh(
             &["api", "-X", "PUT", &put_url, "--input", "-"],
             Some(body.to_string().as_bytes()),
         )?;
         if put.status != 0 {
             return Err(classify(&put));
         }
-
-        let commit = serde_json::from_str::<serde_json::Value>(&put.stdout)
+        Ok(serde_json::from_str::<serde_json::Value>(&put.stdout)
             .ok()
             .and_then(|v| v["commit"]["sha"].as_str().map(ToOwned::to_owned))
-            .unwrap_or_else(|| "unknown".to_owned());
+            .unwrap_or_else(|| "unknown".to_owned()))
+    }
+
+    /// The gh sequence and the bookkeeping, with the in-flight claim held.
+    #[allow(clippy::too_many_arguments)]
+    fn push_claimed(
+        &self,
+        meeting_id: &str,
+        settings: &GithubSettings,
+        markdown: &str,
+        path: &str,
+        title: &str,
+        started_at_ms: u64,
+        existing: Option<GithubReceipt>,
+    ) -> Result<GithubReceipt, GithubError> {
+        self.preflight(settings)?;
+
+        let display_title = if title.trim().is_empty() {
+            "Untitled meeting"
+        } else {
+            title.trim()
+        };
+        let commit = self.put_file(
+            settings,
+            path,
+            markdown,
+            &format!("meeting transcript: {display_title}"),
+        )?;
 
         let receipt = GithubReceipt {
             repo: settings.repo.clone(),
             path: path.to_owned(),
             commit,
             pushed_at_ms: u64::try_from(fotw_store::now_ms()).unwrap_or(0),
+            title: title.to_owned(),
+            started_at_ms,
         };
 
         // The content is on GitHub now; what remains is remembering that
@@ -658,5 +800,79 @@ mod tests {
             transcript_path("", 0, "", "abc"),
             "1970-01-01-meeting-abc.md"
         );
+    }
+
+    fn receipt(path: &str, title: &str, started: u64, pushed: u64) -> GithubReceipt {
+        GithubReceipt {
+            repo: "o/n".to_owned(),
+            path: path.to_owned(),
+            commit: "sha".to_owned(),
+            pushed_at_ms: pushed,
+            title: title.to_owned(),
+            started_at_ms: started,
+        }
+    }
+
+    #[test]
+    fn the_index_is_an_okf_listing_newest_first_with_relative_links() {
+        // Two meetings; render receives them already sorted newest-first, the
+        // order sync_bundle guarantees.
+        let receipts = vec![
+            receipt(
+                "meetings/2025-08-21-standup-a.md",
+                "Standup",
+                1_755_734_400_000,
+                10,
+            ),
+            receipt(
+                "meetings/2025-08-20-planning-b.md",
+                "Planning",
+                1_755_648_000_000,
+                20,
+            ),
+        ];
+        let md = render_index(&receipts);
+
+        // OKF: index.md frontmatter carries only okf_version.
+        assert!(
+            md.starts_with("---\nokf_version:"),
+            "OKF version frontmatter\n{md}"
+        );
+        assert_eq!(
+            md.matches("---").count(),
+            2,
+            "exactly one frontmatter block"
+        );
+        // Relative links by basename (survive a move), with the date.
+        assert!(md.contains("- [Standup](./2025-08-21-standup-a.md) — 2025-08-21"));
+        assert!(md.contains("- [Planning](./2025-08-20-planning-b.md) — 2025-08-20"));
+        // Newest first: Standup's line precedes Planning's.
+        assert!(md.find("Standup").unwrap() < md.find("Planning").unwrap());
+    }
+
+    #[test]
+    fn the_log_groups_entries_under_iso_date_headings_newest_day_first() {
+        // Pushed on two different days; the log orders by push time.
+        let day_a = 1_755_734_400_000; // 2025-08-21
+        let day_b = 1_755_648_000_000; // 2025-08-20
+        let receipts = vec![
+            receipt("meetings/m-old.md", "Old", 1, day_b),
+            receipt("meetings/m-new.md", "New", 2, day_a),
+        ];
+        let md = render_log(&receipts);
+
+        assert!(md.contains("## 2025-08-21"), "ISO date heading\n{md}");
+        assert!(md.contains("## 2025-08-20"));
+        assert!(md.contains("- Added [New](./m-new.md)"));
+        assert!(md.contains("- Added [Old](./m-old.md)"));
+        // Newest day heading first.
+        assert!(md.find("2025-08-21").unwrap() < md.find("2025-08-20").unwrap());
+    }
+
+    #[test]
+    fn a_blank_title_never_produces_an_empty_link_label() {
+        let receipts = vec![receipt("meetings/x.md", "   ", 1, 1)];
+        assert!(render_index(&receipts).contains("[Untitled meeting]"));
+        assert!(render_log(&receipts).contains("[Untitled meeting]"));
     }
 }

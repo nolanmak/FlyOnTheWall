@@ -82,4 +82,10 @@ fn a_real_push_lands_and_a_repush_updates_the_same_file() {
     );
     assert_eq!(second.path, first.path, "same meeting, same file");
     assert_ne!(second.commit, first.commit, "an update is a new commit");
+
+    // The OKF bundle: index.md and log.md, committed for real.
+    exporter
+        .sync_bundle()
+        .expect("the live bundle sync lands");
+    eprintln!("synced fotw-qa/index.md and fotw-qa/log.md");
 }

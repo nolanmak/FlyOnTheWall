@@ -180,7 +180,8 @@ fn normalize_prefix(prefix: &str) -> Result<String, String> {
 
 /// Proof one transcript landed: enough to find the commit again, and the
 /// stable path a re-push updates rather than duplicating.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GithubReceipt {
     /// `owner/name` it went to.
     pub repo: String,
@@ -190,6 +191,13 @@ pub struct GithubReceipt {
     pub commit: String,
     /// When, epoch milliseconds.
     pub pushed_at_ms: u64,
+    /// The meeting's title at push time, so the bundle's `index.md`/`log.md`
+    /// can label the link without re-reading the library. Defaults empty for
+    /// receipts written before the OKF bundle existed.
+    pub title: String,
+    /// The meeting's start, epoch milliseconds, so the listing can date and
+    /// order entries. Defaults 0 for pre-bundle receipts.
+    pub started_at_ms: u64,
 }
 
 /// Why a push or a save did not do what was asked.
@@ -256,6 +264,18 @@ pub trait GithubExport: Send + Sync + 'static {
     /// The full taxonomy in [`GithubError`]; each variant renders differently
     /// in the UI.
     fn push(&self, meeting_id: &str) -> Result<GithubReceipt, GithubError>;
+
+    /// Regenerate the OKF bundle's `index.md` and `log.md` from what has been
+    /// pushed and commit them, so the repo is a navigable bundle rather than a
+    /// flat pile of files. Called after a push, not inside it: a manual push
+    /// syncs once, and the auto worker syncs once per batch rather than once
+    /// per meeting.
+    ///
+    /// # Errors
+    ///
+    /// The same taxonomy as [`GithubExport::push`]. Callers treat it as
+    /// best-effort — the meeting files already landed.
+    fn sync_bundle(&self) -> Result<(), GithubError>;
 }
 
 #[cfg(test)]
