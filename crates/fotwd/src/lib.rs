@@ -12,6 +12,7 @@ pub mod detect;
 pub mod engine;
 pub mod enrich;
 pub mod github;
+pub mod okf;
 pub mod onboard;
 pub mod persist;
 pub mod recording;
