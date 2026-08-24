@@ -778,13 +778,51 @@ impl MeetingDoc {
             .or_else(|| self.summaries.iter().max_by_key(|s| s.version))
     }
 
+    /// A one-line description for OKF frontmatter.
+    ///
+    /// The first substantive line of the summary — skipping headings and
+    /// blank lines — bounded so the frontmatter stays a scalar; the title
+    /// when there is no summary yet; a constant when there is neither.
+    fn okf_description(&self) -> String {
+        const BUDGET: usize = 200;
+        let from_summary = self.current_summary().and_then(|s| {
+            s.body_md
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(ToOwned::to_owned)
+        });
+        let text = from_summary
+            .filter(|s| !s.is_empty())
+            .or_else(|| Some(self.meeting.title.clone()).filter(|t| !t.is_empty()))
+            .unwrap_or_else(|| "Meeting transcript".to_owned());
+        if text.chars().count() <= BUDGET {
+            return text;
+        }
+        let cut: String = text.chars().take(BUDGET - 1).collect();
+        let cut = cut.rfind(' ').map_or(cut.as_str(), |i| &cut[..i]);
+        format!("{cut}…")
+    }
+
     /// Markdown with YAML frontmatter — a valid Obsidian note (EXP-01).
     #[must_use]
     pub fn to_markdown(&self) -> String {
         let m = &self.meeting;
         let mut out = String::from("---\n");
+        // `type` is the one field OKF (Google's Open Knowledge Format) requires
+        // on every concept, so a repo of these files is an agent-consumable
+        // bundle rather than a pile of notes. It is additive YAML that Obsidian
+        // ignores, so the same file is still a valid note (EXP-01).
+        out.push_str("type: meeting-transcript\n");
         out.push_str(&format!("id: {}\n", yaml_scalar(&m.id)));
         out.push_str(&format!("title: {}\n", yaml_scalar(&m.title)));
+        // OKF's recommended one-line summary — the first real line of the
+        // generated summary, or the title, so a listing can show what the
+        // meeting was about without opening it.
+        out.push_str(&format!(
+            "description: {}\n",
+            yaml_scalar(&self.okf_description())
+        ));
         out.push_str(&format!(
             "date: {}\n",
             yaml_scalar(&iso_date(m.started_at_ms))
@@ -813,6 +851,19 @@ impl MeetingDoc {
         // §11: whether participants were told is part of the record, so it
         // travels with the note rather than living only in the app.
         out.push_str(&format!("disclosed: {}\n", m.disclosed != 0));
+        // OKF provenance: who produced the derived content and when. Only when
+        // a summary exists — a transcript-only export was not model-generated,
+        // and claiming otherwise would be the dishonest kind of metadata.
+        if let Some(s) = self.current_summary() {
+            let by = if s.model.trim().is_empty() {
+                s.provider.clone()
+            } else {
+                format!("{} {}", s.provider, s.model)
+            };
+            out.push_str("generated:\n");
+            out.push_str(&format!("  by: {}\n", yaml_scalar(&by)));
+            out.push_str(&format!("  at: {}\n", yaml_scalar(&iso_date(s.created_at))));
+        }
         out.push_str("---\n\n");
 
         out.push_str(&format!(

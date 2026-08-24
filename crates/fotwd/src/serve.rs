@@ -419,7 +419,14 @@ fn spawn_github_pusher(exporter: Arc<GithubExporter>) {
         .name("fotw-github".into())
         .spawn(move || {
             loop {
-                exporter.auto_push_pending();
+                // Sync the OKF bundle (index.md/log.md) once per batch, not
+                // once per meeting: a backlog of 200 pushes should rewrite the
+                // index once, not 200 times.
+                if exporter.auto_push_pending() > 0
+                    && let Err(e) = fotw_web::GithubExport::sync_bundle(exporter.as_ref())
+                {
+                    eprintln!("  ! pushed meetings, but could not sync the bundle index: {e}");
+                }
                 std::thread::sleep(GITHUB_POLL);
             }
         })

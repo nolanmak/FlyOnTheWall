@@ -573,3 +573,88 @@ fn the_repo_picker_maps_failures_like_a_push_does() {
     let r = rig(MANUAL, vec![ok("not json")]);
     assert!(matches!(r.exporter.repos(), Err(GithubError::Failed(_))));
 }
+
+// -------------------------------------------------------------- OKF bundle
+
+/// The six-call sync sequence: preflight (auth, repo) then create index.md and
+/// log.md (each a probe + PUT).
+fn sync_script() -> Vec<Result<GhOutput, String>> {
+    vec![
+        ok(""),
+        ok(r#"{"default_branch":"main"}"#),
+        http_err(404),
+        ok(PUT_OK),
+        http_err(404),
+        ok(PUT_OK),
+    ]
+}
+
+#[test]
+fn sync_bundle_commits_an_okf_index_and_log() {
+    let r = rig(MANUAL, create_script());
+    // A push first, so there is a receipt to index.
+    r.exporter.push(&r.meeting).unwrap();
+    let after_push = r.gh.calls().len();
+
+    r.gh.script.lock().unwrap().extend(sync_script());
+    GithubExport::sync_bundle(&r.exporter).expect("the scripted sync lands");
+
+    let calls = r.gh.calls();
+    assert_eq!(calls.len(), after_push + 6, "auth+repo, then index and log");
+
+    // index.md — OKF listing with a relative, dated link to the meeting.
+    let index_put = &calls[after_push + 3];
+    assert_eq!(
+        index_put.0,
+        [
+            "api",
+            "-X",
+            "PUT",
+            "repos/octocat/notes/contents/meetings/index.md",
+            "--input",
+            "-"
+        ]
+    );
+    let body: serde_json::Value = serde_json::from_slice(index_put.1.as_deref().unwrap()).unwrap();
+    let index_md =
+        String::from_utf8(B64.decode(body["content"].as_str().unwrap()).unwrap()).unwrap();
+    assert!(
+        index_md.contains("okf_version"),
+        "OKF frontmatter: {index_md}"
+    );
+    assert!(
+        index_md.contains("[Weekly Standup](./2025-08-21-weekly-standup-"),
+        "relative dated link missing: {index_md}"
+    );
+
+    // log.md — a change-history entry under an ISO date heading.
+    let log_put = &calls[after_push + 5];
+    assert_eq!(log_put.0[3], "repos/octocat/notes/contents/meetings/log.md");
+    let lbody: serde_json::Value = serde_json::from_slice(log_put.1.as_deref().unwrap()).unwrap();
+    let log_md =
+        String::from_utf8(B64.decode(lbody["content"].as_str().unwrap()).unwrap()).unwrap();
+    assert!(log_md.contains("# Change log"));
+    assert!(log_md.contains("- Added [Weekly Standup](./2025-08-21-weekly-standup-"));
+}
+
+#[test]
+fn sync_bundle_with_nothing_pushed_contacts_no_gh() {
+    // Enabled, but no receipts yet: there is no bundle to write.
+    let r = rig(MANUAL, sync_script());
+    GithubExport::sync_bundle(&r.exporter).expect("a no-op is not a failure");
+    assert!(
+        r.gh.calls().is_empty(),
+        "nothing to index, nothing to spawn"
+    );
+}
+
+#[test]
+fn sync_bundle_is_refused_when_export_is_disabled() {
+    let disabled = r#"{"enabled":false,"repo":"octocat/notes","branch":"","path_prefix":"meetings/","mode":"manual"}"#;
+    let r = rig(disabled, sync_script());
+    assert_eq!(
+        GithubExport::sync_bundle(&r.exporter),
+        Err(GithubError::Disabled)
+    );
+    assert!(r.gh.calls().is_empty());
+}

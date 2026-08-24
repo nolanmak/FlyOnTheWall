@@ -29,6 +29,8 @@ use fotw_web::{
 struct FakeGithub {
     settings: Mutex<GithubSettings>,
     pushes: AtomicU64,
+    /// How many times the bundle sync was requested.
+    syncs: AtomicU64,
     /// The error the next push should fail with, if any.
     outcome: Mutex<Option<GithubError>>,
     /// The error the next repo listing should fail with, if any.
@@ -65,7 +67,14 @@ impl GithubExport for FakeGithub {
             path: format!("meetings/2026-08-21-standup-{meeting_id}.md"),
             commit: "f00dcafe".to_owned(),
             pushed_at_ms: 1_787_000_000_000,
+            title: "Standup".to_owned(),
+            started_at_ms: 1_755_734_400_000,
         })
+    }
+
+    fn sync_bundle(&self) -> Result<(), GithubError> {
+        self.syncs.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 }
 

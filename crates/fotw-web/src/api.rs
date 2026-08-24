@@ -321,8 +321,17 @@ pub async fn github_push(
     };
 
     // A push is a subprocess making network calls; minutes of transcript are
-    // read from the library first. Neither belongs on a runtime worker.
-    let result = tokio::task::spawn_blocking(move || github.push(&id)).await;
+    // read from the library first. Neither belongs on a runtime worker. The
+    // bundle sync rides in the same blocking task: best-effort, because the
+    // meeting file has already landed and the index is derived from it.
+    let result = tokio::task::spawn_blocking(move || {
+        let outcome = github.push(&id);
+        if outcome.is_ok() {
+            let _ = github.sync_bundle();
+        }
+        outcome
+    })
+    .await;
     let Ok(outcome) = result else {
         return server_error();
     };

@@ -671,6 +671,33 @@ fn the_markdown_export_is_a_valid_obsidian_note() {
 }
 
 #[test]
+fn the_frontmatter_carries_okf_type_and_provenance() {
+    // OKF (Google's Open Knowledge Format): `type` is the one required field,
+    // and `generated` is the provenance that makes the derived summary
+    // trustworthy to an agent consuming the repo.
+    let (_f, db) = fixture();
+    let md = db.export_meeting("mtg-1").unwrap().to_markdown();
+    let end = md[4..].find("\n---\n").expect("frontmatter is not closed") + 4;
+    let front = &md[4..end];
+
+    assert!(
+        front.contains("type: meeting-transcript"),
+        "OKF requires a `type`\n{front}"
+    );
+    assert!(front.contains("description:"), "OKF description missing");
+    // The fixture has a current summary, so provenance must be present and
+    // name the provider that produced it.
+    assert!(
+        front.contains("generated:"),
+        "a summarised meeting must carry `generated` provenance\n{front}"
+    );
+    assert!(
+        front.contains("  by:") && front.contains("  at:"),
+        "generated must name who and when\n{front}"
+    );
+}
+
+#[test]
 fn a_title_that_would_break_the_frontmatter_is_quoted() {
     // A colon in a title is ordinary and turns unquoted YAML into either a
     // parse error or a different document. Obsidian silently shows the raw
