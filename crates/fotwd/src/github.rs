@@ -443,80 +443,37 @@ impl GithubExport for GithubExporter {
                 .then_with(|| a.path.cmp(&b.path))
         });
 
+        let entries: Vec<crate::okf::BundleEntry> = mine
+            .iter()
+            .map(|r| crate::okf::BundleEntry {
+                filename: basename(&r.path).to_owned(),
+                title: r.title.clone(),
+                started_at_ms: r.started_at_ms,
+                logged_at_ms: r.pushed_at_ms,
+            })
+            .collect();
+
         self.preflight(&settings)?;
         let prefix = &settings.path_prefix;
         self.put_file(
             &settings,
             &format!("{prefix}index.md"),
-            &render_index(&mine),
+            &crate::okf::render_index(&entries),
             "OKF index",
         )?;
         self.put_file(
             &settings,
             &format!("{prefix}log.md"),
-            &render_log(&mine),
+            &crate::okf::render_log(&entries),
             "OKF change log",
         )?;
         Ok(())
     }
 }
 
-/// The bundle's `index.md`: an OKF progressive-disclosure listing, newest
-/// first, linking each transcript relatively so the graph survives a move.
-///
-/// Per the OKF spec, `index.md` frontmatter carries only `okf_version`.
-fn render_index(receipts: &[GithubReceipt]) -> String {
-    let mut out = String::from("---\nokf_version: \"0.2\"\n---\n\n# Meeting transcripts\n\n");
-    for r in receipts {
-        let title = if r.title.trim().is_empty() {
-            "Untitled meeting"
-        } else {
-            r.title.trim()
-        };
-        out.push_str(&format!(
-            "- [{title}](./{}) — {}\n",
-            basename(&r.path),
-            iso_date_of(r.started_at_ms)
-        ));
-    }
-    out
-}
-
-/// The bundle's `log.md`: OKF change history under ISO-8601 date headings,
-/// most recent day first, one entry per meeting at its last push.
-fn render_log(receipts: &[GithubReceipt]) -> String {
-    // Group by push day, newest day first. `receipts` is already sorted by
-    // meeting start; re-sort by push time for the log's own ordering.
-    let mut by_push: Vec<&GithubReceipt> = receipts.iter().collect();
-    by_push.sort_by_key(|r| std::cmp::Reverse(r.pushed_at_ms));
-
-    let mut out = String::from("# Change log\n\n");
-    let mut current_day = String::new();
-    for r in by_push {
-        let day = iso_date_of(r.pushed_at_ms);
-        if day != current_day {
-            out.push_str(&format!("## {day}\n\n"));
-            current_day = day;
-        }
-        let title = if r.title.trim().is_empty() {
-            "Untitled meeting"
-        } else {
-            r.title.trim()
-        };
-        out.push_str(&format!("- Added [{title}](./{})\n", basename(&r.path)));
-    }
-    out
-}
-
 /// The file name inside the bundle directory — everything after the last `/`.
 fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
-}
-
-/// `YYYY-MM-DD` (UTC) from epoch milliseconds, for OKF's date fields.
-fn iso_date_of(epoch_ms: u64) -> String {
-    let (y, m, d) = ymd_utc(i64::try_from(epoch_ms).unwrap_or(0));
-    format!("{y:04}-{m:02}-{d:02}")
 }
 
 impl GithubExporter {
@@ -699,180 +656,12 @@ fn classify(out: &GhOutput) -> GithubError {
     GithubError::Failed(short)
 }
 
-/// `prefix/YYYY-MM-DD-title-slug-idfragment.md`.
-///
-/// Deterministic from fields that exist at push time, with the id fragment
-/// carrying uniqueness — two "Standup" meetings on the same day must not
-/// fight over one filename.
+/// `prefix/YYYY-MM-DD-title-slug-idfragment.md` — the prefix plus the shared
+/// [`crate::okf::transcript_filename`], so the GitHub path and a local OKF
+/// export name the same meeting the same file.
 fn transcript_path(prefix: &str, started_at_ms: i64, title: &str, meeting_id: &str) -> String {
-    let (y, m, d) = ymd_utc(started_at_ms);
-    let id8: String = meeting_id
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .take(8)
-        .collect::<String>()
-        .to_ascii_lowercase();
-    format!("{prefix}{y:04}-{m:02}-{d:02}-{}-{id8}.md", slug(title))
-}
-
-/// Lowercased, everything unsafe collapsed to `-`, bounded, never empty.
-fn slug(title: &str) -> String {
-    let mut out = String::new();
-    for c in title.chars().flat_map(char::to_lowercase) {
-        if c.is_alphanumeric() {
-            out.push(c);
-        } else if !out.is_empty() && !out.ends_with('-') {
-            out.push('-');
-        }
-        if out.chars().count() >= 48 {
-            break;
-        }
-    }
-    let trimmed = out.trim_matches('-');
-    if trimmed.is_empty() {
-        "meeting".to_owned()
-    } else {
-        trimmed.to_owned()
-    }
-}
-
-/// Civil date from epoch milliseconds, UTC. Hinnant's `civil_from_days`,
-/// which is exact over the whole proleptic Gregorian calendar — no leap-year
-/// table to get wrong.
-fn ymd_utc(epoch_ms: i64) -> (i64, u32, u32) {
-    let days = epoch_ms.div_euclid(86_400_000);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (
-        if m <= 2 { y + 1 } else { y },
-        u32::try_from(m).unwrap_or(1),
-        u32::try_from(d).unwrap_or(1),
+    format!(
+        "{prefix}{}",
+        crate::okf::transcript_filename(started_at_ms, title, meeting_id)
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_civil_date_math_is_right_where_it_matters() {
-        assert_eq!(ymd_utc(0), (1970, 1, 1));
-        assert_eq!(ymd_utc(1_755_734_400_000), (2025, 8, 21));
-        // A leap day, and the millisecond before it.
-        assert_eq!(ymd_utc(1_709_164_800_000), (2024, 2, 29));
-        assert_eq!(ymd_utc(1_709_164_800_000 - 1), (2024, 2, 28));
-        // Before the epoch: div_euclid, not integer division toward zero.
-        assert_eq!(ymd_utc(-1), (1969, 12, 31));
-    }
-
-    #[test]
-    fn a_slug_survives_hostile_titles() {
-        assert_eq!(slug("Weekly Standup"), "weekly-standup");
-        assert_eq!(slug("Q3 // planning: part 2!"), "q3-planning-part-2");
-        assert_eq!(slug(""), "meeting");
-        assert_eq!(slug("---"), "meeting");
-        assert_eq!(
-            slug("Café müde"),
-            "café-müde",
-            "unicode letters are letters"
-        );
-        assert!(slug(&"x".repeat(500)).chars().count() <= 48);
-    }
-
-    #[test]
-    fn the_path_is_prefix_date_slug_and_id_fragment() {
-        let p = transcript_path(
-            "meetings/",
-            1_755_734_400_000,
-            "Weekly Standup",
-            "01890c2a-ffff-7000-8000-000000000000",
-        );
-        assert_eq!(p, "meetings/2025-08-21-weekly-standup-01890c2a.md");
-        // An empty prefix lands in the repository root, without a leading /.
-        assert_eq!(
-            transcript_path("", 0, "", "abc"),
-            "1970-01-01-meeting-abc.md"
-        );
-    }
-
-    fn receipt(path: &str, title: &str, started: u64, pushed: u64) -> GithubReceipt {
-        GithubReceipt {
-            repo: "o/n".to_owned(),
-            path: path.to_owned(),
-            commit: "sha".to_owned(),
-            pushed_at_ms: pushed,
-            title: title.to_owned(),
-            started_at_ms: started,
-        }
-    }
-
-    #[test]
-    fn the_index_is_an_okf_listing_newest_first_with_relative_links() {
-        // Two meetings; render receives them already sorted newest-first, the
-        // order sync_bundle guarantees.
-        let receipts = vec![
-            receipt(
-                "meetings/2025-08-21-standup-a.md",
-                "Standup",
-                1_755_734_400_000,
-                10,
-            ),
-            receipt(
-                "meetings/2025-08-20-planning-b.md",
-                "Planning",
-                1_755_648_000_000,
-                20,
-            ),
-        ];
-        let md = render_index(&receipts);
-
-        // OKF: index.md frontmatter carries only okf_version.
-        assert!(
-            md.starts_with("---\nokf_version:"),
-            "OKF version frontmatter\n{md}"
-        );
-        assert_eq!(
-            md.matches("---").count(),
-            2,
-            "exactly one frontmatter block"
-        );
-        // Relative links by basename (survive a move), with the date.
-        assert!(md.contains("- [Standup](./2025-08-21-standup-a.md) — 2025-08-21"));
-        assert!(md.contains("- [Planning](./2025-08-20-planning-b.md) — 2025-08-20"));
-        // Newest first: Standup's line precedes Planning's.
-        assert!(md.find("Standup").unwrap() < md.find("Planning").unwrap());
-    }
-
-    #[test]
-    fn the_log_groups_entries_under_iso_date_headings_newest_day_first() {
-        // Pushed on two different days; the log orders by push time.
-        let day_a = 1_755_734_400_000; // 2025-08-21
-        let day_b = 1_755_648_000_000; // 2025-08-20
-        let receipts = vec![
-            receipt("meetings/m-old.md", "Old", 1, day_b),
-            receipt("meetings/m-new.md", "New", 2, day_a),
-        ];
-        let md = render_log(&receipts);
-
-        assert!(md.contains("## 2025-08-21"), "ISO date heading\n{md}");
-        assert!(md.contains("## 2025-08-20"));
-        assert!(md.contains("- Added [New](./m-new.md)"));
-        assert!(md.contains("- Added [Old](./m-old.md)"));
-        // Newest day heading first.
-        assert!(md.find("2025-08-21").unwrap() < md.find("2025-08-20").unwrap());
-    }
-
-    #[test]
-    fn a_blank_title_never_produces_an_empty_link_label() {
-        let receipts = vec![receipt("meetings/x.md", "   ", 1, 1)];
-        assert!(render_index(&receipts).contains("[Untitled meeting]"));
-        assert!(render_log(&receipts).contains("[Untitled meeting]"));
-    }
 }

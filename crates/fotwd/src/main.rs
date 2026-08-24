@@ -127,6 +127,7 @@ async fn main() -> ExitCode {
         Some("templates") => templates_command(&args[1..]),
         Some("export") => export_command(&args[1..]),
         Some("export-all") => export_all_command(&args[1..]),
+        Some("export-okf") => export_okf_command(&args[1..]),
         Some("import") => import_command(&args[1..]),
         // The double-click. Finder runs the bundle executable with no
         // arguments and no terminal; usage printed to a stdout nobody can
@@ -165,6 +166,7 @@ async fn main() -> ExitCode {
                  templates <list|install|show <slug>> | \
                  export <id> [dir] [--format md|txt|json] [--out <file>] | \
                  export-all <dest> [dir] [--audio] [--resume] [--yes-plaintext] | \
+                 export-okf <dest> [dir] | \
                  import <dest> [dir]>"
             );
             eprintln!();
@@ -292,6 +294,45 @@ fn templates_command(args: &[String]) -> ExitCode {
 }
 
 /// `fotwd export <meeting-id> [dir] [--format md|txt|json] [--out <file>]`.
+/// `fotwd export-okf <dest> [dir]` — write the whole library as a local OKF
+/// bundle: one markdown file per meeting plus `index.md` and `log.md`.
+///
+/// The point is an agent can index the folder directly — a Filesystem MCP
+/// server (OpenClaw) or `qmd` (Hermes) over `<dest>` gives the agent context
+/// of the user's meetings, no GitHub round trip. The files are PLAIN TEXT, so
+/// this says so, once, the way every unencrypted export does.
+fn export_okf_command(args: &[String]) -> ExitCode {
+    let pos = positionals(args, &[]);
+    let Some(dest) = pos.first().map(PathBuf::from) else {
+        eprintln!("usage: fotwd export-okf <dest> [dir]");
+        return ExitCode::FAILURE;
+    };
+    let root = pos.get(1).map_or_else(default_root, PathBuf::from);
+
+    let mut db = match open_db(&root) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("fotwd: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match fotwd::okf::export_bundle(&mut db, &dest) {
+        Ok(count) => {
+            println!(
+                "  wrote {count} meetings + index.md + log.md to {}",
+                dest.display()
+            );
+            println!("  PLAIN TEXT — not encrypted. Point a Filesystem MCP server or qmd at it.");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("fotwd: could not write the OKF bundle: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn export_command(args: &[String]) -> ExitCode {
     let pos = positionals(args, &["--format", "--out"]);
     let Some(id) = pos.first() else {
