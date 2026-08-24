@@ -128,6 +128,7 @@ async fn main() -> ExitCode {
         Some("export") => export_command(&args[1..]),
         Some("export-all") => export_all_command(&args[1..]),
         Some("export-okf") => export_okf_command(&args[1..]),
+        Some("mcp") => mcp_command(&args[1..]),
         Some("import") => import_command(&args[1..]),
         // The double-click. Finder runs the bundle executable with no
         // arguments and no terminal; usage printed to a stdout nobody can
@@ -167,6 +168,7 @@ async fn main() -> ExitCode {
                  export <id> [dir] [--format md|txt|json] [--out <file>] | \
                  export-all <dest> [dir] [--audio] [--resume] [--yes-plaintext] | \
                  export-okf <dest> [dir] | \
+                 mcp [dir] | \
                  import <dest> [dir]>"
             );
             eprintln!();
@@ -294,6 +296,33 @@ fn templates_command(args: &[String]) -> ExitCode {
 }
 
 /// `fotwd export <meeting-id> [dir] [--format md|txt|json] [--out <file>]`.
+/// `fotwd mcp [dir]` — serve the meeting library over MCP on stdio (MTG-11).
+///
+/// The agent (Claude Desktop, Cursor, Hermes, OpenClaw) spawns this and speaks
+/// newline-delimited JSON-RPC down the pipe. Only JSON-RPC may reach stdout;
+/// the library-open banner and any error go to stderr so they cannot corrupt
+/// the stream.
+fn mcp_command(args: &[String]) -> ExitCode {
+    let root = positionals(args, &[])
+        .first()
+        .map_or_else(default_root, PathBuf::from);
+    let db = match open_db(&root) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("fotwd: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("fotwd mcp: serving the meeting library over stdio");
+    match fotwd::mcp::Server::new(db).serve_stdio() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("fotwd: mcp server: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// `fotwd export-okf <dest> [dir]` — write the whole library as a local OKF
 /// bundle: one markdown file per meeting plus `index.md` and `log.md`.
 ///
