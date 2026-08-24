@@ -94,6 +94,7 @@ async fn main() -> ExitCode {
                 .unwrap_or(120);
             detect(secs)
         }
+        Some("dedupe") => dedupe_command(&args[1..]),
         Some("engine") => engine_command(&args[1..]),
         Some("key") => key_command(&args[1..]),
         Some("recover") => {
@@ -159,6 +160,7 @@ async fn main() -> ExitCode {
                  onboard | detect [seconds] | \
                  retention [dir] [--apply] [--days <n>] [--budget-gib <n>] | \
                  key <set <provider>|list> | engine [claude-cli|codex-cli|off] | \
+                 dedupe <id|--all> [dir] [--revert <transcript-id>] | \
                  recover [dir] [--check] | \
                  templates <list|install|show <slug>> | \
                  export <id> [dir] [--format md|txt|json] [--out <file>] | \
@@ -1091,6 +1093,85 @@ fn list(root: PathBuf) -> ExitCode {
 ///
 /// Stdin, never an argument: argv is readable by any same-user process, and a
 /// key pasted onto a command line also lands in the shell history file.
+/// `fotwd dedupe <meeting-id|--all> [dir] [--revert <transcript-id>]`.
+///
+/// Retroactive cross-leg dedupe over stored meetings: the library holds
+/// transcripts persisted before the echo pass existed. Rewrites are
+/// versioned — the old transcript is retained and `--revert` restores it.
+fn dedupe_command(args: &[String]) -> ExitCode {
+    let pos = positionals(args, &["--revert"]);
+    let root = pos.get(1).map_or_else(default_root, PathBuf::from);
+    let mut db = match open_db(&root) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("fotwd: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if let Some(transcript) = flag_value(args, "--revert") {
+        let Some(meeting) = pos.first() else {
+            eprintln!("usage: fotwd dedupe <meeting-id> --revert <transcript-id>");
+            return ExitCode::FAILURE;
+        };
+        return match db.meetings().set_primary_transcript(&transcript) {
+            Ok(()) => {
+                println!("  reverted   : {meeting} back to transcript {transcript}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("fotwd: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    let targets: Vec<String> = if args.iter().any(|a| a == "--all") {
+        match db.meetings().list(10_000, 0) {
+            Ok(list) => list.into_iter().map(|m| m.id).collect(),
+            Err(e) => {
+                eprintln!("fotwd: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if let Some(id) = pos.first() {
+        vec![(*id).to_owned()]
+    } else {
+        eprintln!("usage: fotwd dedupe <meeting-id|--all> [dir] [--revert <transcript-id>]");
+        return ExitCode::FAILURE;
+    };
+
+    let mut rewritten = 0usize;
+    for meeting in &targets {
+        match persist::dedupe_meeting(&mut db, meeting) {
+            Ok(report) if report.dropped > 0 => {
+                rewritten += 1;
+                println!(
+                    "  {meeting} : dropped {}/{} segments (new transcript {})",
+                    report.dropped,
+                    report.before,
+                    report.new_transcript.as_deref().unwrap_or("?")
+                );
+            }
+            Ok(_) => {
+                if targets.len() == 1 {
+                    println!("  {meeting} : clean, nothing to do");
+                }
+            }
+            Err(e) => eprintln!("  ! {meeting}: {e}"),
+        }
+    }
+    if targets.len() > 1 {
+        println!("  {rewritten}/{} meetings rewritten", targets.len());
+    }
+    if rewritten > 0 {
+        println!("  Old transcripts are retained; `fotwd dedupe <id> --revert <transcript-id>`");
+        println!("  restores one. Summaries reference the old text until `fotwd summarize <id>`");
+        println!("  is re-run, and GitHub copies update on the next manual push.");
+    }
+    ExitCode::SUCCESS
+}
+
 /// `fotwd engine [claude-cli --i-acknowledge-egress [--binary <path>] | off]`.
 ///
 /// The CLI engine is opt-in with a recorded acknowledgement, because a
