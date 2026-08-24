@@ -48,24 +48,38 @@ pub enum CliKind {
 
 impl CliKind {
     /// The binary a bare enablement defaults to when the user names none.
+    ///
+    /// Resolved to an **absolute path** when one can be found, because the
+    /// daemon runs as a LaunchServices-launched `.app` whose PATH is minimal
+    /// (`/usr/bin:/bin:/usr/sbin:/sbin`) — it does not include `~/.local/bin`
+    /// or Homebrew, where both CLIs actually install. A bare name stored here
+    /// resolves fine from the user's shell (where `fotwd engine` runs) and
+    /// then fails to resolve inside the daemon, which is precisely the silent
+    /// "configured but no summaries" trap. Probing the real install spots at
+    /// configure time turns that into a path that works from both.
     #[must_use]
     pub fn default_binary(self) -> String {
-        match self {
-            Self::Claude => "claude".to_owned(),
-            // codex ships as an app bundle and is usually reached through a
-            // shell alias, which a daemon that spawns without a shell cannot
-            // see. Prefer the app's real binary when it is where the
-            // installer puts it, and fall back to the bare name for a PATH
-            // install.
-            Self::Codex => {
-                const APP: &str = "/Applications/Codex.app/Contents/Resources/codex";
-                if std::path::Path::new(APP).is_file() {
-                    APP.to_owned()
-                } else {
-                    "codex".to_owned()
-                }
-            }
+        let bare = match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        };
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        // codex also ships as an app bundle; prefer it when present.
+        if self == Self::Codex {
+            candidates.push(PathBuf::from(
+                "/Applications/Codex.app/Contents/Resources/codex",
+            ));
         }
+        if let Some(home) = std::env::var_os("HOME") {
+            candidates.push(PathBuf::from(&home).join(".local/bin").join(bare));
+        }
+        candidates.push(PathBuf::from("/opt/homebrew/bin").join(bare));
+        candidates.push(PathBuf::from("/usr/local/bin").join(bare));
+
+        candidates
+            .into_iter()
+            .find(|p| p.is_file())
+            .map_or_else(|| bare.to_owned(), |p| p.to_string_lossy().into_owned())
     }
 }
 
