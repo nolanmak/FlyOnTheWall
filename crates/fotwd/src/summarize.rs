@@ -11,6 +11,7 @@ use std::sync::Arc;
 use fotw_secrets::KeyStore;
 use fotw_store::{Db, NewSummary};
 use fotw_stt::{Source, TimestampSource, TranscriptSegment};
+use fotw_summarize::coverage::{LOW_GROUNDING_BANNER, LOW_GROUNDING_THRESHOLD};
 use fotw_summarize::document::TranscriptDocument;
 use fotw_summarize::pipeline::{Pipeline, PipelineConfig, SummaryOutcome, Warning};
 use fotw_summarize::template::Template;
@@ -172,15 +173,34 @@ where
     let outcome = pipeline.run(&document, &notes).await?;
     let warnings = user_warnings(&outcome);
 
-    // The admonition rides in *our* rendered markdown, never in
+    // The admonitions ride in *our* rendered markdown, never in
     // `SummaryOutcome::blocks`: spec 8.6 keeps Call A's blocks unmodified, and
-    // this is a note about the run rather than something the model wrote. It
+    // these are notes about the run rather than something the model wrote. It
     // needs no schema change — `body_md` already reaches the web view, the
     // export and FTS, so the note becomes searchable, which is fine.
-    let mut markdown = outcome.markdown();
-    for warning in &warnings {
-        markdown.push_str(&format!("\n\n> [!WARNING]\n> {warning}\n"));
+    //
+    // `body_md` is also what gets *shared*: it is the text the OKF and GitHub
+    // exports carry out of the library. A grounding caveat that lived only in
+    // the dashboard's chrome would be stripped by precisely the act spec 8.6's
+    // banner asks the user to think twice about, which is why it goes in here
+    // and above the prose rather than beside it in the UI.
+    let mut markdown = String::new();
+    for warning in warnings
+        .iter()
+        .filter(|w| w.placement == Placement::Leading)
+    {
+        markdown.push_str(&format!("> [!WARNING]\n> {}\n\n", warning.text));
     }
+    markdown.push_str(&outcome.markdown());
+    for warning in warnings
+        .iter()
+        .filter(|w| w.placement == Placement::Trailing)
+    {
+        markdown.push_str(&format!("\n\n> [!WARNING]\n> {}\n", warning.text));
+    }
+    // Flattened only now: the CLI's `warning :` lines and the enrich report's
+    // problems are lists, and neither has an above or a below.
+    let warnings: Vec<String> = warnings.into_iter().map(|w| w.text).collect();
 
     let coverage = if outcome.coverage.total_claims == 0 {
         1.0
@@ -369,15 +389,42 @@ where
     title::clean_title(&response.text()).ok_or(SummarizeRunError::NotATitle)
 }
 
+/// Where a warning belongs relative to the summary it is about.
+///
+/// Not decoration. A caveat about the document *as a whole* that sits under two
+/// thousand words of it is not a caveat anyone reads, and spec 8.6 calls the
+/// grounding notice a **banner** for that reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// Above the prose. For something true of the whole summary.
+    Leading,
+    /// Below it. For something missing from one part of it.
+    Trailing,
+}
+
+/// One pipeline warning, worded for a human and placed.
+#[derive(Debug)]
+struct UserWarning {
+    /// The sentence the user reads.
+    text: String,
+    /// Where it goes in the rendered markdown.
+    placement: Placement,
+}
+
 /// The pipeline warnings worth putting in front of a user, worded for one.
 ///
-/// A deliberately chosen subset rather than every [`Warning`]. Rendering the
-/// list verbatim would print a cache miss on every CLI run:
-/// `Pipeline::expects_cache_hit` never looks at `prompt_cache`, and both CLI
-/// adapters declare `PromptCache::None`, so a miss that could not have been a
-/// hit fires every time. A warning that is always wrong teaches people to
-/// ignore the ones that are not.
-fn user_warnings(outcome: &SummaryOutcome) -> Vec<String> {
+/// A deliberately chosen subset rather than every [`Warning`], and the match is
+/// **exhaustive on purpose**: a [`Warning`] is a fact about a pipeline run, and
+/// only some facts about a run are things to say to the person reading the
+/// summary. Adding a variant should force that decision here rather than
+/// defaulting it either way.
+///
+/// This is the daemon's only channel for saying something about a run, and it
+/// reaches all three surfaces: the admonition in `body_md` (web pane, exports,
+/// MCP, search), a `warning :` line in `fotwd summarize`, and an
+/// `EnrichReport` problem in `fotwd record`. That is why the copy is written
+/// for a human here rather than at any one of them.
+fn user_warnings(outcome: &SummaryOutcome) -> Vec<UserWarning> {
     // Under map-reduce the chunks that answered well keep their items, so the
     // honest wording depends on whether anything survived (#75).
     let salvaged = outcome.validation.extraction.item_count() > 0;
@@ -385,16 +432,55 @@ fn user_warnings(outcome: &SummaryOutcome) -> Vec<String> {
         .warnings
         .iter()
         .filter_map(|warning| match warning {
-            Warning::ExtractionFailed { detail } => Some(format!(
-                "Extraction failed ({detail}) — {}. The notes above came from a separate call \
-                 and are unaffected.",
-                if salvaged {
-                    "some structured items may be missing"
-                } else {
-                    "no action items were extracted from this meeting"
-                }
-            )),
-            _ => None,
+            // Spec 8.6's own banner, plus the number behind it. The threshold
+            // is a verdict; the measured percentage is what lets someone weigh
+            // it against how much they already trust the meeting. The string
+            // comes from the coverage module so it cannot drift into
+            // "accuracy" three layers up, which that module's docs forbid.
+            Warning::LowGrounding { coverage } => Some(UserWarning {
+                text: format!(
+                    "{LOW_GROUNDING_BANNER} {:.0}% of its substantive claims cite the \
+                     transcript, against a {:.0}% threshold.",
+                    coverage * 100.0,
+                    LOW_GROUNDING_THRESHOLD * 100.0
+                ),
+                placement: Placement::Leading,
+            }),
+            Warning::ExtractionFailed { detail } => Some(UserWarning {
+                text: format!(
+                    "Extraction failed ({detail}) — {}. The notes above came from a separate \
+                     call and are unaffected.",
+                    if salvaged {
+                        "some structured items may be missing"
+                    } else {
+                        "no action items were extracted from this meeting"
+                    }
+                ),
+                placement: Placement::Trailing,
+            }),
+            // **Provenance, not a warning** (#84). Under `Preset::Local`
+            // map-reduce is the *normal* path — a 32K context puts spec 8.1's
+            // single-shot budget below an hour of meeting — so an alarm here
+            // would fire on every run of a configuration this crate supports,
+            // which is exactly the failure the cache miss it shipped alongside
+            // was. It is also nothing the user can act on: they cannot make
+            // the meeting shorter after the fact. The fact itself is already
+            // carried as provenance on `SummaryOutcome::map_reduced`, beside
+            // the prompt hash, where a statement about *how* a summary was
+            // made belongs.
+            Warning::MapReduced { .. } => None,
+            // A cost diagnostic. It says Call B paid full input price for a
+            // prefix Call A had already cached — money, not meaning, and
+            // nothing the reader of a summary can do about it. #84 made it
+            // truthful (it used to fire on every CLI run, because
+            // `expects_cache_hit` never looked at `prompt_cache`); truthful
+            // still does not make it user copy.
+            Warning::CachePrefixMissed => None,
+            // Already surfaced, and better: `fotwd summarize` prints a
+            // `dropped :` line of its own from `validation.dropped`, and spec
+            // 8.6's wording for it lives on `ValidationReport::drop_notice`.
+            // Rendering it here too would say it twice in one screen.
+            Warning::ItemsDropped { .. } => None,
         })
         .collect()
 }
@@ -442,4 +528,83 @@ pub(crate) fn load_segments(
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fotw_summarize::coverage::CoverageReport;
+    use fotw_summarize::validate::ValidationReport;
+
+    /// A `SummaryOutcome` carrying exactly `warnings` and nothing else of note.
+    ///
+    /// Built by hand rather than by running the pipeline: what is under test is
+    /// the wording and the placement *this* crate chooses, and reaching a
+    /// map-reduce warning through a real run would mean a 20k-token fixture for
+    /// a decision that is three lines of match arm.
+    fn outcome_with(warnings: Vec<Warning>) -> SummaryOutcome {
+        SummaryOutcome {
+            blocks: Vec::new(),
+            coverage: CoverageReport {
+                claims: Vec::new(),
+                cited_claims: 0,
+                total_claims: 0,
+            },
+            validation: ValidationReport {
+                extraction: fotw_summarize::Extraction::default(),
+                dropped: Vec::new(),
+                adjusted: Vec::new(),
+            },
+            warnings,
+            prompt_hash: String::new(),
+            prompt_version: "test",
+            usage_a: fotw_summarize::Usage::default(),
+            usage_b: fotw_summarize::Usage::default(),
+            map_reduced: false,
+        }
+    }
+
+    #[test]
+    fn a_weakly_grounded_summary_is_worded_for_the_user() {
+        let warnings = user_warnings(&outcome_with(vec![Warning::LowGrounding { coverage: 0.4 }]));
+        let [warning] = warnings.as_slice() else {
+            panic!("spec 8.6's threshold was measured and then dropped: {warnings:?}");
+        };
+        // Spec 8.6 owns the wording, and owns it in one place -- the metric is
+        // "transcript grounding" and never "accuracy" (see the coverage module).
+        assert!(
+            warning.text.contains("low transcript grounding"),
+            "{warning:?}"
+        );
+        assert!(
+            !warning.text.to_lowercase().contains("accuracy"),
+            "{warning:?}"
+        );
+        // The number, not just the verdict: "low" is a threshold, 40% is a
+        // fact the user can weigh against how much they trust the meeting.
+        assert!(warning.text.contains("40%"), "{warning:?}");
+        // A banner is above the thing it is about.
+        assert_eq!(warning.placement, Placement::Leading);
+    }
+
+    #[test]
+    fn map_reduce_is_provenance_and_never_alarms_the_user() {
+        // #84: under `Preset::Local` map-reduce is the *normal* path -- a 32K
+        // context puts spec 8.1's single-shot budget below an hour of meeting
+        // -- so an alarm here would fire on every run of a supported
+        // configuration, which is the same failure as the cache miss it
+        // shipped alongside. The fact is already carried as provenance on
+        // `SummaryOutcome::map_reduced`.
+        let warnings = user_warnings(&outcome_with(vec![Warning::MapReduced { chunks: 4 }]));
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_cache_miss_is_a_cost_diagnostic_and_never_reaches_the_user() {
+        // Truthful since #84, and still not user copy: it says Call B paid
+        // full input price for a prefix Call A had cached, which belongs in a
+        // cost report rather than next to a summary.
+        let warnings = user_warnings(&outcome_with(vec![Warning::CachePrefixMissed]));
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
 }

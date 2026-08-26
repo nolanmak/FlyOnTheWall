@@ -36,7 +36,7 @@
 use crate::adapter::{
     AnnotatedBlock, Citation, DocumentPayload, LlmAdapter, LlmRequest, LlmResponse, Usage,
 };
-use crate::capabilities::{CacheTtl, Preset};
+use crate::capabilities::{CacheTtl, Preset, PromptCache};
 use crate::chunk::{self, Chunk};
 use crate::coverage::{self, CoverageConfig, CoverageReport};
 use crate::document::TranscriptDocument;
@@ -210,8 +210,8 @@ impl<'a> Pipeline<'a> {
     ///
     /// **This is where the spec's own guidance does not survive contact with
     /// the API.** Spec 8.4 says to verify `cache_read_input_tokens > 0` on Call
-    /// B and to treat a zero as a CI failure. Two facts make a hit impossible
-    /// in cases the spec also mandates:
+    /// B and to treat a zero as a CI failure. Three facts make a hit impossible
+    /// in cases the spec and this crate also mandate:
     ///
     /// * **The cache is per model.** The `cheap` preset runs Call A on Sonnet 5
     ///   and Call B on Haiku 4.5 (spec 8.4), so B cannot read A's cache — there
@@ -219,14 +219,23 @@ impl<'a> Pipeline<'a> {
     /// * **`citations.enabled` is part of the document block.** Call A sends
     ///   `true` and Call B sends `false` (spec 8.4 requires exactly that), so
     ///   the two prefixes are not byte-identical even on one model.
+    /// * **The provider may not cache at all.** Both CLI adapters report
+    ///   [`PromptCache::None`], which [`Capabilities::clamp_ttl`] turns into
+    ///   [`CacheTtl::None`] before the request is built — so nothing was
+    ///   written for Call B to read back, and the zero is arithmetic rather
+    ///   than a fault. Missing this was #84: the other two conditions are both
+    ///   satisfied by a CLI engine, so the warning fired on every CLI run.
     ///
     /// The warning therefore fires only when a hit was actually reachable,
     /// rather than failing every run of a configuration the spec itself
     /// prescribes.
+    ///
+    /// [`Capabilities::clamp_ttl`]: crate::capabilities::Capabilities::clamp_ttl
     #[must_use]
     pub fn expects_cache_hit(&self) -> bool {
         self.prose.model_id() == self.extraction.model_id()
             && !self.prose.capabilities().native_citations
+            && self.prose.capabilities().prompt_cache != PromptCache::None
             && self.config.cache_ttl() != CacheTtl::None
     }
 
@@ -1046,17 +1055,26 @@ mod tests {
     fn a_zero_cache_read_on_call_b_is_reported_when_a_hit_was_possible() {
         // Spec 8.4 says a zero here is a test failure. It can only be
         // diagnostic when the two calls could have shared a prefix at all --
-        // see Pipeline::expects_cache_hit for the two cases where they cannot.
+        // see Pipeline::expects_cache_hit for the three cases where they
+        // cannot.
         let transport = MockTransport::new()
             .with_json(prose_response(false))
             .with_json(extraction_response(good_extraction(), 0));
-        // Same model on both calls, and no native citations, so the document
-        // block bytes are identical and a hit was genuinely reachable.
+        // Same model on both calls, no native citations, and a provider that
+        // actually caches, so the document block bytes are identical and a hit
+        // was genuinely reachable.
         let adapter =
             AnthropicAdapter::new(transport, "local-model", "k").with_capabilities(Capabilities {
                 native_citations: false,
                 ..Capabilities::anthropic_frontier()
             });
+        // Spelled out because #84 added the third condition: without a cache
+        // on the provider this fixture would pin nothing.
+        assert_ne!(
+            adapter.capabilities().prompt_cache,
+            PromptCache::None,
+            "the fixture must cache, or a hit was never reachable here either"
+        );
         let pipeline = Pipeline::new(&adapter, &adapter);
         assert!(pipeline.expects_cache_hit());
 
@@ -1083,6 +1101,34 @@ mod tests {
         assert!(!pipeline.expects_cache_hit());
         let outcome = block_on(pipeline.run(&document(), "")).expect("runs");
         assert!(!outcome.warnings.contains(&Warning::CachePrefixMissed));
+
+        // And the third case (#84), unrepresented until now: an engine with no
+        // prompt cache at all. Both CLI adapters report `PromptCache::None`
+        // while sharing one model id and reporting no native citations, so
+        // every other condition above was satisfied and the miss fired on
+        // every single CLI-engine run.
+        let transport = MockTransport::new()
+            .with_json(prose_response(false))
+            .with_json(extraction_response(good_extraction(), 0));
+        let uncached =
+            AnthropicAdapter::new(transport, "cli-engine", "k").with_capabilities(Capabilities {
+                native_citations: false,
+                prompt_cache: PromptCache::None,
+                ..Capabilities::anthropic_frontier()
+            });
+        let pipeline = Pipeline::new(&uncached, &uncached);
+
+        assert!(
+            !pipeline.expects_cache_hit(),
+            "the TTL is clamped away before the request is built, so nothing \
+             was written for Call B to read back"
+        );
+        let outcome = block_on(pipeline.run(&document(), "")).expect("runs");
+        assert!(
+            !outcome.warnings.contains(&Warning::CachePrefixMissed),
+            "a miss that could never have been a hit was reported: {:?}",
+            outcome.warnings
+        );
     }
 
     #[test]

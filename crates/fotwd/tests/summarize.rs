@@ -281,3 +281,79 @@ async fn an_unparseable_extraction_still_stores_a_summary_with_a_warning() {
         outcome.warnings
     );
 }
+
+/// #84: spec 8.6 sets a 0.7 citation-coverage threshold and `coverage::measure`
+/// computes it on every run. Before this the number reached `SummaryOutcome`
+/// and stopped there, so a summary citing none of its claims looked — in the
+/// web pane, in the export, in `fotwd summarize`'s output — exactly like one
+/// citing all of them.
+#[tokio::test]
+async fn a_weakly_grounded_summary_says_so_above_the_summary_itself() {
+    let dir = tmpdir("lowgrounding");
+    let mut db = db_at(&dir);
+    let id = seeded_meeting(&mut db, &dir);
+    let store = keystore_with_anthropic();
+
+    // A substantive claim (spec 8.6: over 12 words) carrying no citation, so
+    // coverage measures 0 of 1 and the threshold is missed by the whole range.
+    let mock = Arc::new(
+        MockTransport::new()
+            .with_json(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": "The quarterly numbers came in above target and the infra \
+                             migration is scheduled to finish before the beta ships.",
+                    "citations": []
+                }],
+                "usage": {"input_tokens": 100, "output_tokens": 20},
+                "stop_reason": "end_turn"
+            }))
+            .with_json(serde_json::json!({
+                "content": [{"type": "text", "text": "{\"action_items\":[],\"decisions\":[],\
+                    \"open_questions\":[],\"follow_ups\":[],\"topics\":[]}"}],
+                "usage": {"input_tokens": 100, "output_tokens": 8},
+                "stop_reason": "end_turn"
+            })),
+    );
+
+    let outcome =
+        summarize::summarize_meeting_with(&mut db, &store, &id, &general(), Arc::clone(&mock))
+            .await
+            .expect("a weakly grounded summary is still a summary");
+
+    assert!(
+        outcome.coverage < 0.7,
+        "the fixture did not produce a weakly grounded summary: {}",
+        outcome.coverage
+    );
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|w| w.to_lowercase().contains("grounding")),
+        "the measured coverage never became words: {:?}",
+        outcome.warnings
+    );
+
+    let stored = db
+        .meetings()
+        .current_summary(&id)
+        .unwrap()
+        .expect("the summary row was not written");
+    let banner = stored
+        .body_md
+        .find("low transcript grounding")
+        .expect("spec 8.6's banner is nowhere the user reads the summary");
+    let prose = stored
+        .body_md
+        .find("quarterly numbers")
+        .expect("Call A's prose did not reach the store");
+    // A banner is above the thing it is about. It also has to survive being
+    // *shared*, which is what the banner asks the user to think twice about --
+    // and what gets shared is `body_md`, not the pane it renders in.
+    assert!(
+        banner < prose,
+        "the grounding caveat sits below the summary it qualifies: {}",
+        stored.body_md
+    );
+}
