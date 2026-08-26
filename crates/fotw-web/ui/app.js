@@ -300,6 +300,27 @@ async function openMeeting(id) {
   }
 }
 
+// The library changed under us: refetch the list, and redraw the detail pane
+// when the meeting that changed is the one being read (#78).
+//
+// The list refresh is guarded on an empty search box, and that guard is not
+// optional: `renderList` and `renderHits` both open with `clear(el.list)`, so
+// an unconditional refetch would silently replace search results someone is
+// in the middle of reading. `onSearch` branches on the same condition.
+//
+// `meetingId` is omitted by the callers that know *something* changed but not
+// what — a `resync` after backlog overflow, and the recording→idle poll edge.
+// Those redraw whatever pane is open rather than nothing, because the frame
+// they are standing in for would have named a meeting.
+function refreshLibrary(meetingId) {
+  if (el.search.value.trim() === "") loadMeetings();
+  if (currentDetail && (!meetingId || currentDetail.meeting.id === meetingId)) {
+    // Not `renderDetail(currentDetail)`: the point is the title and summary
+    // that landed on the server since this pane was drawn.
+    openMeeting(currentDetail.meeting.id);
+  }
+}
+
 let searchTimer = null;
 function onSearch() {
   clearTimeout(searchTimer);
@@ -343,7 +364,18 @@ async function connectStream() {
   socket.addEventListener("message", (event) => {
     const frame = JSON.parse(event.data);
     if (frame.kind === "resync") {
-      loadMeetings();
+      // Lag, not a library event: the client fell more than BACKLOG frames
+      // behind and everything it missed is already in the store. A
+      // meeting_ready lost in that overflow is recovered here, so the pane
+      // gets the same redraw it would have got from the frame itself.
+      refreshLibrary();
+      return;
+    }
+    // #78: a meeting reached the library, or its title and summary landed.
+    // Both mean the same thing on this side — what is on screen is older
+    // than what the daemon has.
+    if (frame.kind === "meeting_ready") {
+      refreshLibrary(frame.meeting_id);
       return;
     }
     appendDeltas(frame.deltas || []);
@@ -546,12 +578,19 @@ function renderRecording(body) {
   el.consentLabel.hidden = recState !== "idle";
   paintRecordButton();
 
-  // finishing → idle is the moment the meeting reached the library, which is
-  // the only moment the list is worth refetching. #78 replaces this poll with
-  // a pushed frame; the transition it fires on is this one.
+  // finishing → idle is the moment the meeting reached the library, and the
+  // moment to say so.
   if (was === "finishing" && recState === "idle") {
     say(lastFinalMs === null ? "Saved to your library." : "Saved — " + formatElapsed(lastFinalMs) + ".");
-    loadMeetings();
+  }
+  // Belt and braces for #78. The `meeting_ready` frame is what normally
+  // refreshes the library; this recovers a tab that never received it — one
+  // whose socket was between reconnects, or whose frame was lost to backlog
+  // overflow with no `resync` reaching it either. The edge is leaving *any*
+  // live state for idle rather than finishing→idle alone, because a poll can
+  // straddle a whole finish and only ever observe recording→idle.
+  if (was !== "idle" && recState === "idle") {
+    refreshLibrary();
   }
   if (recState === "finishing") startFinishingPoll();
   else stopFinishingPoll();

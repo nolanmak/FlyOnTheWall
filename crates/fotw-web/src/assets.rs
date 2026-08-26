@@ -215,6 +215,22 @@ mod tests {
         );
     }
 
+    /// The same weak-but-not-nothing pin for #78. The server half of
+    /// `meeting_ready` has real tests either side of the socket; the client
+    /// half has only this, and a handler that never learned the frame's name
+    /// is a library that goes stale until the tab is reloaded — which is the
+    /// entire bug.
+    #[test]
+    fn the_spa_acts_on_the_meeting_ready_frame() {
+        let js = Ui::get("app.js").unwrap();
+        let js = String::from_utf8(js.data.into_owned()).unwrap();
+        assert!(
+            js.contains("\"meeting_ready\""),
+            "the SPA must handle the meeting_ready frame, or a finished \
+             meeting appears in the library only after a reload"
+        );
+    }
+
     #[test]
     fn an_unknown_extension_is_not_served_as_html() {
         assert_eq!(content_type("x.bin"), "application/octet-stream");

@@ -55,6 +55,9 @@ fn recorder_with(root: &Path, finish: Finisher) -> DaemonRecorder {
         root.to_path_buf(),
         tokio::runtime::Handle::current(),
         fotwd::session::SegmentTap::default(),
+        // No hub behind a unit test, and the finisher here is the caller's
+        // rather than `persist_and_promote`, so there is nothing to announce.
+        fotwd::recording::ReadyTap::default(),
         Box::new(|| {
             Ok((
                 Box::new(FileAudioSource::from_wav(

@@ -243,3 +243,62 @@ fn timezone() -> String {
         })
         .unwrap_or_else(|| "UTC".to_owned())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fotw_store::DbKey;
+
+    /// The premise the `meeting_ready` announcement rests on (#78).
+    ///
+    /// The daemon announces `persisted` the instant [`persist_session`]
+    /// returns an id — before promotion, because the Opus encode can take
+    /// minutes and the meeting is already in the library. That is only
+    /// correct if the row is queryable *at that point*, in the state the list
+    /// view expects. It is `set_state` at the tail here that makes it so, and
+    /// `finish` alone would not: a row stuck in `recording` lists as a meeting
+    /// still in progress, which is what an announced-but-unfinished meeting
+    /// would look like in the UI.
+    ///
+    /// A `Db::open` over a temp directory rather than `open_library`: that
+    /// reads the OS keychain, and a test that touches the user's keychain
+    /// raises an approval dialog on every rebuild.
+    #[test]
+    fn a_persisted_session_is_immediately_listable_as_ready() {
+        let dir = std::env::temp_dir().join(format!(
+            "fotwd-persist-unit-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut db = Db::open(dir.join("db.sqlite3"), &DbKey::from_bytes([0x78; 32])).unwrap();
+
+        let outcome = SessionOutcome {
+            dir: dir.clone(),
+            started_at_ms: 1_754_900_000_000,
+            system_samples: 480_000,
+            mic_samples: 0,
+            stt_errors: Vec::new(),
+            silent_buffers: 0,
+            total_buffers: 100,
+            dropped_samples: 0,
+            segments: Vec::new(),
+        };
+        let id = persist_session(&mut db, &outcome, "Untitled recording — 1754900000").unwrap();
+
+        let rows = db.meetings().list(50, 0).unwrap();
+        let found = rows
+            .iter()
+            .find(|m| m.id == id)
+            .expect("the id the daemon announces must already be in the list");
+        assert_eq!(
+            found.state, "ready",
+            "announcing a meeting that still lists as `recording` would put a \
+             finished meeting on the dashboard as one in progress"
+        );
+        assert_eq!(found.started_at_ms, 1_754_900_000_000);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

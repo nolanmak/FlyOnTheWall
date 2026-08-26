@@ -14,7 +14,7 @@ mod common;
 
 use std::time::Duration;
 
-use fotw_web::Delta;
+use fotw_web::{Delta, MeetingReadyReason};
 use futures_util::StreamExt as _;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -203,6 +203,66 @@ async fn deltas_arrive_batched_not_one_message_per_word() {
             .is_err(),
         "a second frame would mean the batch was split"
     );
+}
+
+// --------------------------------------------------------------------- #78
+
+/// The frame that stops the library going stale, over a real socket.
+///
+/// The first non-delta frame this suite has ever asserted: `resync` has
+/// travelled the same `broadcast::Sender<Arc<str>>` since the UI shipped with
+/// no test covering it, which is how #67 came to claim `resync` already told
+/// an open tab to refetch. It does not — it fires on lag and nothing else.
+/// This one fires when a meeting lands.
+#[tokio::test]
+async fn a_meeting_ready_frame_reaches_an_open_socket() {
+    let h = common::start().await;
+    let t = ticket(&h).await;
+    let mut socket = connect(&h, &t, None, Some(&h.origin))
+        .await
+        .expect("the real page must be able to connect");
+    await_subscriber(&h).await;
+
+    h.state
+        .hub()
+        .announce_meeting_ready(common::MEETING_ID, MeetingReadyReason::Persisted);
+
+    let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("the announcement must arrive without waiting for a tick")
+        .expect("the socket must stay open")
+        .expect("a well-formed frame");
+    let Message::Text(json) = message else {
+        panic!("expected a text frame, got {message:?}");
+    };
+    let frame: fotw_web::MeetingReady = serde_json::from_str(&json).unwrap();
+    assert_eq!(frame.kind, "meeting_ready");
+    assert_eq!(frame.meeting_id, common::MEETING_ID);
+    assert_eq!(frame.reason, MeetingReadyReason::Persisted);
+
+    // The socket is still live afterwards: a library event must not disturb
+    // the transcript stream it shares a channel with.
+    h.state.hub().publish(Delta {
+        meeting_id: common::MEETING_ID.to_owned(),
+        idx: 0,
+        start_ms: 0,
+        end_ms: 100,
+        channel: "system".to_owned(),
+        text: "still here".to_owned(),
+        is_final: true,
+    });
+    assert_eq!(h.state.hub().flush(), 1);
+    let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("deltas must still flow")
+        .expect("the socket must stay open")
+        .expect("a well-formed frame");
+    let Message::Text(json) = message else {
+        panic!("expected a text frame, got {message:?}");
+    };
+    let frame: fotw_web::Frame = serde_json::from_str(&json).unwrap();
+    assert_eq!(frame.kind, "deltas");
+    assert_eq!(frame.deltas[0].text, "still here");
 }
 
 #[tokio::test]

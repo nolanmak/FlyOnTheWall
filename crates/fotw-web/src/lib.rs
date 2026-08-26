@@ -96,7 +96,7 @@ pub use crate::source::{
 };
 pub use crate::state::AppState;
 pub use crate::state_file::{DaemonState, read_state_file, write_state_file};
-pub use crate::stream::{Delta, DeltaHub, FLUSH_INTERVAL, Frame};
+pub use crate::stream::{Delta, DeltaHub, FLUSH_INTERVAL, Frame, MeetingReady, MeetingReadyReason};
 pub use crate::tokens::{HANDOFF_TTL, TokenTable, WS_TICKET_TTL};
 
 #[cfg(feature = "store")]
