@@ -33,7 +33,7 @@ use std::sync::Arc;
 use fotw_store::{Db, DbKey, NewSummary};
 use fotw_stt::{Source, TimestampSource, TranscriptSegment};
 use fotwd::persist;
-use fotwd::session::SessionOutcome;
+use fotwd::session::{LegBuffers, SessionOutcome};
 
 fn seg(idx: u64, speaker: &str, text: &str, start: u64, end: u64) -> TranscriptSegment {
     TranscriptSegment {
@@ -153,8 +153,11 @@ async fn main() -> Result<(), String> {
             started_at_ms,
             system_samples: t * 48,
             mic_samples: 0,
-            silent_buffers: 0,
-            total_buffers: (t / 10).max(1),
+            system_buffers: LegBuffers {
+                silent: 0,
+                total: (t / 10).max(1),
+            },
+            mic_buffers: None,
             dropped_samples: 0,
             segments,
             stt_errors: Vec::new(),

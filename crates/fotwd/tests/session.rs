@@ -10,7 +10,7 @@ use fotw_audio::platform::file::{FileAudioSource, ReplaySpeed};
 use fotw_audio::wav::WavData;
 use fotw_audio::{AudioTap, SampleFormat, StreamFormat, TapId};
 use fotw_pipeline::wal::{SessionState, TrackFormat, recover};
-use fotwd::session::{self, Transcription};
+use fotwd::session::{self, LegAudio, Transcription};
 
 fn tmpdir(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("fotwd-{name}-{}", std::process::id()));
@@ -64,10 +64,17 @@ async fn a_session_captures_audio_to_a_finalized_wal() {
     .await
     .unwrap();
 
-    assert!(outcome.total_buffers > 0, "the tap delivered nothing");
-    assert!(
-        outcome.captured_audio(),
-        "a 440 Hz tone must not read as silence"
+    assert_eq!(
+        outcome.system_buffers.audio(),
+        LegAudio::Audible,
+        "a 440 Hz tone must not read as silence: {:?}",
+        outcome.system_buffers
+    );
+    assert!(outcome.captured_audio());
+    assert_eq!(
+        outcome.mic_buffers, None,
+        "no mic tap was passed, so there is no mic leg to report on — which \
+         is not the same as one that reported nothing"
     );
 
     // Roughly a second of 48 kHz stereo. Generous bounds: this is a
@@ -129,14 +136,126 @@ async fn a_silent_source_is_reported_as_silent_rather_than_as_success() {
     .await
     .unwrap();
 
-    assert!(outcome.total_buffers > 0, "buffers still arrived");
+    assert!(outcome.system_buffers.total > 0, "buffers still arrived");
     assert!(
         !outcome.captured_audio(),
         "every buffer was digitally silent and the outcome must say so — \
          this is what distinguishes 'quiet room' from 'permission denied', \
          which macOS reports identically"
     );
-    assert_eq!(outcome.silent_buffers, outcome.total_buffers);
+    assert_eq!(outcome.system_buffers.audio(), LegAudio::Silent);
+    assert_eq!(outcome.system_buffers.silent, outcome.system_buffers.total);
+
+    // And it says so where a human reads it. There is no mic leg here to
+    // rescue the recording, so this is a fully silent meeting — but the line
+    // still names the leg, because with a mic attached the same silence would
+    // be a system-audio grant and nothing else (#79's channel, #81's leg).
+    assert!(
+        outcome
+            .stt_errors
+            .iter()
+            .any(|e| e.starts_with("capture (system):")),
+        "a leg that captured nothing audible must reach the degradation \
+         channel: {:?}",
+        outcome.stt_errors
+    );
+}
+
+/// A dead microphone beside a working system tap (#81).
+///
+/// The mic sink used to be built with counters constructed inline, held by
+/// nobody, so an hour of muted hardware — or a denied grant, which macOS
+/// answers with silence rather than an error — was indistinguishable from an
+/// hour of a working microphone. The two legs are reported separately here,
+/// and this is the case where they disagree.
+#[tokio::test]
+async fn a_dead_mic_is_reported_separately_from_a_working_system_leg() {
+    let root = tmpdir("deadmic");
+    let outcome = session::run(
+        &root,
+        source(tone(2.0)),
+        Some(source(silence(2.0))),
+        Transcription::Disabled,
+        Duration::from_millis(900),
+    )
+    .await
+    .unwrap();
+
+    let mic = outcome
+        .mic_buffers
+        .expect("the mic tap started, so it reports");
+    assert!(mic.total > 0, "the mic tap delivered nothing at all");
+    assert_eq!(
+        (outcome.system_buffers.audio(), mic.audio()),
+        (LegAudio::Audible, LegAudio::Silent),
+        "the legs must disagree here: system {:?}, mic {:?}",
+        outcome.system_buffers,
+        mic
+    );
+
+    // The recording is still worth keeping — the far end is on disk — so the
+    // one derived answer stays true. What changed is that "the far end was
+    // captured" no longer doubles as a claim about the microphone.
+    assert!(
+        outcome.captured_audio(),
+        "the system leg was live, so audio was captured"
+    );
+    assert!(
+        outcome
+            .stt_errors
+            .iter()
+            .any(|e| e.starts_with("capture (mic):")),
+        "a dead mic is a degraded meeting and someone should know: {:?}",
+        outcome.stt_errors
+    );
+}
+
+/// The other direction: a note to self, with nothing playing.
+///
+/// A silent system leg is normal here — there is no far end — and the rule
+/// this outcome derives must not call that a failed recording. Before #81 it
+/// did: the single pair of counters *was* the system leg, so `captured_audio()`
+/// was false and the CLI answered a perfectly good recording with the
+/// screen-recording permission speech.
+#[tokio::test]
+async fn a_note_to_self_with_nothing_playing_is_not_a_capture_failure() {
+    let root = tmpdir("notetoself");
+    let outcome = session::run(
+        &root,
+        source(silence(2.0)),
+        Some(source(tone(2.0))),
+        Transcription::Disabled,
+        Duration::from_millis(900),
+    )
+    .await
+    .unwrap();
+
+    let mic = outcome
+        .mic_buffers
+        .expect("the mic tap started, so it reports");
+    assert_eq!(
+        (outcome.system_buffers.audio(), mic.audio()),
+        (LegAudio::Silent, LegAudio::Audible),
+        "system {:?}, mic {:?}",
+        outcome.system_buffers,
+        mic
+    );
+    assert!(
+        outcome.captured_audio(),
+        "the user's own voice is audio, and this recording is worth keeping"
+    );
+
+    // Not a failure is not the same as unremarkable: the quiet leg is still
+    // named, because the same shape is what a denied system-audio grant looks
+    // like and only the user knows which of the two this was.
+    assert!(
+        outcome
+            .stt_errors
+            .iter()
+            .any(|e| e.starts_with("capture (system):")),
+        "{:?}",
+        outcome.stt_errors
+    );
 }
 
 #[tokio::test]

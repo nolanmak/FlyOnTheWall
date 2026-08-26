@@ -7,7 +7,7 @@
 use fotw_store::{Db, DbKey};
 use fotw_stt::{Source, TimestampSource, TranscriptSegment, Word};
 use fotwd::persist;
-use fotwd::session::SessionOutcome;
+use fotwd::session::{LegBuffers, SessionOutcome};
 
 fn tmpdir(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("fotwd-persist-{name}-{}", std::process::id()));
@@ -61,8 +61,14 @@ fn outcome(dir: &std::path::Path, segments: Vec<TranscriptSegment>) -> SessionOu
         started_at_ms: 0,
         system_samples: 480_000,
         mic_samples: 240_000,
-        silent_buffers: 2,
-        total_buffers: 400,
+        system_buffers: LegBuffers {
+            silent: 2,
+            total: 400,
+        },
+        mic_buffers: Some(LegBuffers {
+            silent: 0,
+            total: 400,
+        }),
         dropped_samples: 0,
         segments,
         stt_errors: Vec::new(),

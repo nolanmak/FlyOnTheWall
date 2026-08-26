@@ -178,8 +178,8 @@ fn outcome_shallow(o: &SessionOutcome) -> SessionOutcome {
         system_samples: o.system_samples,
         mic_samples: o.mic_samples,
         stt_errors: o.stt_errors.clone(),
-        silent_buffers: o.silent_buffers,
-        total_buffers: o.total_buffers,
+        system_buffers: o.system_buffers,
+        mic_buffers: o.mic_buffers,
         dropped_samples: o.dropped_samples,
         segments: Vec::new(),
     }
@@ -247,6 +247,7 @@ fn timezone() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::LegBuffers;
     use fotw_store::DbKey;
 
     /// The premise the `meeting_ready` announcement rests on (#78).
@@ -280,8 +281,11 @@ mod tests {
             system_samples: 480_000,
             mic_samples: 0,
             stt_errors: Vec::new(),
-            silent_buffers: 0,
-            total_buffers: 100,
+            system_buffers: LegBuffers {
+                silent: 0,
+                total: 100,
+            },
+            mic_buffers: None,
             dropped_samples: 0,
             segments: Vec::new(),
         };

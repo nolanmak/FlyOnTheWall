@@ -14,7 +14,7 @@ use fotw_stt::{Source, TimestampSource, TranscriptSegment};
 use fotw_summarize::template::{Template, TemplateSet};
 use fotw_summarize::testing::MockTransport;
 use fotwd::persist;
-use fotwd::session::SessionOutcome;
+use fotwd::session::{LegBuffers, SessionOutcome};
 use fotwd::summarize;
 
 fn tmpdir(name: &str) -> std::path::PathBuf {
@@ -72,8 +72,11 @@ fn seeded_meeting(db: &mut Db, dir: &std::path::Path) -> String {
         started_at_ms: 0,
         system_samples: 1_000,
         mic_samples: 0,
-        silent_buffers: 0,
-        total_buffers: 10,
+        system_buffers: LegBuffers {
+            silent: 0,
+            total: 10,
+        },
+        mic_buffers: None,
         dropped_samples: 0,
         segments: vec![
             seg(

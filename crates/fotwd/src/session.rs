@@ -66,10 +66,15 @@ pub struct SessionOutcome {
     /// joined it in #79 rather than getting a channel of their own: this is the
     /// only degradation channel with a reader on the other end.
     pub stt_errors: Vec<String>,
-    /// Buffers the tap delivered that were digitally silent.
-    pub silent_buffers: u64,
-    /// Total buffers the tap delivered.
-    pub total_buffers: u64,
+    /// What the system tap delivered. Required, so always present: a session
+    /// whose system tap refuses to start never gets this far.
+    pub system_buffers: LegBuffers,
+    /// What the mic tap delivered, or `None` when there was no mic leg at all
+    /// — no input device, or a tap that refused to start. Distinct from
+    /// `Some(LegBuffers::default())`, which is a mic tap that started and then
+    /// never fired: the first is a machine without a microphone, the second is
+    /// a microphone that is not working.
+    pub mic_buffers: Option<LegBuffers>,
     /// Samples the ring dropped because the pump fell behind.
     pub dropped_samples: u64,
     /// Finalized transcript segments.
@@ -78,9 +83,29 @@ pub struct SessionOutcome {
 
 impl SessionOutcome {
     /// Whether any audible audio was captured at all.
+    ///
+    /// # Why either leg is enough
+    ///
+    /// This is the one question with a single answer, and the only honest one
+    /// is *did anything reach the disk*. Neither leg's silence proves a
+    /// failure on its own, because which leg is legitimately quiet is a fact
+    /// about the meeting, not about the machine: a note to self has no far end
+    /// to capture, and a meeting where the user only listened has a quiet mic.
+    /// A rule that failed on either leg would call both of those a broken
+    /// recording. Only *both* legs silent means nothing was captured — which
+    /// is the case the CLI's permission guidance exists for.
+    ///
+    /// The sharper question — *which* leg was quiet, and was that expected —
+    /// needs the per-leg counts, which is why [`system_buffers`] and
+    /// [`mic_buffers`] are reported rather than summed (#81). Summing them
+    /// destroys exactly the disagreement worth reading.
+    ///
+    /// [`system_buffers`]: Self::system_buffers
+    /// [`mic_buffers`]: Self::mic_buffers
     #[must_use]
     pub const fn captured_audio(&self) -> bool {
-        self.total_buffers > 0 && self.silent_buffers < self.total_buffers
+        matches!(self.system_buffers.audio(), LegAudio::Audible)
+            || matches!(self.mic_buffers, Some(b) if matches!(b.audio(), LegAudio::Audible))
     }
 
     /// The transcript as plain text.
@@ -95,18 +120,102 @@ impl SessionOutcome {
     }
 }
 
-/// A sink that copies into a ring and returns. Nothing else may happen here.
-struct RingSink {
-    producer: RingProducer,
+/// What one capture leg's tap delivered, counted on the audio thread.
+///
+/// Per leg rather than summed, because "the system leg was live" and "the mic
+/// leg was live" are different questions and the interesting answer is the one
+/// where they disagree — a dead microphone beside a working system tap is
+/// invisible in a total (#81).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LegBuffers {
+    /// How many of those buffers were bit-exact digital silence.
+    pub silent: u64,
+    /// Buffers the tap delivered to its sink.
+    pub total: u64,
+}
+
+impl LegBuffers {
+    /// What these counts say about the leg.
+    #[must_use]
+    pub const fn audio(&self) -> LegAudio {
+        if self.total == 0 {
+            LegAudio::Nothing
+        } else if self.silent >= self.total {
+            LegAudio::Silent
+        } else {
+            LegAudio::Audible
+        }
+    }
+}
+
+/// What a capture leg's buffers said about it.
+///
+/// Three states, not a bool: "the tap never fired" and "the tap fired and
+/// every buffer was silence" are different faults with different causes, and
+/// collapsing them is how a dead device reads as a quiet room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegAudio {
+    /// The tap started and then delivered no buffer at all. A stalled IOProc,
+    /// not a quiet one.
+    Nothing,
+    /// Every buffer it delivered was bit-exact digital silence — a muted or
+    /// dead device, a denied permission (macOS answers a denial with silence
+    /// rather than an error), or genuinely nothing to hear.
+    Silent,
+    /// At least one buffer carried audio. This leg was live.
+    Audible,
+}
+
+/// The counters one leg's [`RingSink`] bumps on the audio thread, and the
+/// session's own handle on them.
+///
+/// A type rather than two loose `Arc`s at the construction site, because #81
+/// was precisely that: the system leg's sink was handed clones of the pair the
+/// session read, and the mic leg's was handed a pair constructed inline that
+/// nobody else held. Building the sink *from* the counters leaves nowhere to
+/// spell the orphaned version.
+#[derive(Clone, Debug, Default)]
+struct LegCounters {
     silent: Arc<AtomicU64>,
     total: Arc<AtomicU64>,
 }
 
+impl LegCounters {
+    /// A sink for `producer` that reports to these counters.
+    fn sink(&self, producer: RingProducer) -> Box<dyn FrameSink> {
+        Box::new(RingSink {
+            producer,
+            counters: self.clone(),
+        })
+    }
+
+    /// Read both counters. Not atomic *together*, which costs at most one
+    /// buffer of skew and only ever while the tap is still running — the
+    /// session reads this after `stop()`, so its snapshot is settled.
+    fn snapshot(&self) -> LegBuffers {
+        LegBuffers {
+            silent: self.silent.load(Ordering::Relaxed),
+            total: self.total.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A sink that copies into a ring and returns. Nothing else may happen here.
+struct RingSink {
+    producer: RingProducer,
+    counters: LegCounters,
+}
+
 impl FrameSink for RingSink {
     fn on_frames(&mut self, pcm: &[f32], _ts: CaptureTimestamp, flags: FrameFlags) {
-        self.total.fetch_add(1, Ordering::Relaxed);
+        // Counted here, at the tap, and nowhere downstream: this is what the
+        // *device* delivered. The echo gate's suppression (#79) rewrites what
+        // the mic's STT feed is handed, far below this line, so a mic that
+        // spends a meeting being suppressed still counts every buffer it heard
+        // as audible — which is the whole point of counting here.
+        self.counters.total.fetch_add(1, Ordering::Relaxed);
         if flags.contains(FrameFlags::SILENT) {
-            self.silent.fetch_add(1, Ordering::Relaxed);
+            self.counters.silent.fetch_add(1, Ordering::Relaxed);
         }
         // The return value is deliberately ignored: a short write means the
         // pump is behind, and retrying on a real-time thread is blocking by
@@ -805,29 +914,22 @@ pub async fn run_with_control(
     control: SessionControl,
 ) -> Result<SessionOutcome, String> {
     let stop_signal = control.stop;
-    let silent = Arc::new(AtomicU64::new(0));
-    let total = Arc::new(AtomicU64::new(0));
+    // One pair per leg, both held here. The mic's used to be constructed
+    // inline inside its sink, so its liveness was unobservable (#81).
+    let sys_counters = LegCounters::default();
+    let mic_counters = LegCounters::default();
 
     // Every allocation happens here, before anything real-time is running.
     let (sys_prod, sys_cons) = AudioRing::with_capacity_frames(RING_SAMPLES);
     let (mic_prod, mic_cons) = AudioRing::with_capacity_frames(RING_SAMPLES);
 
     let sys_format = system
-        .start(Box::new(RingSink {
-            producer: sys_prod,
-            silent: Arc::clone(&silent),
-            total: Arc::clone(&total),
-        }))
+        .start(sys_counters.sink(sys_prod))
         .map_err(|e| format!("could not start the system tap: {e}"))?;
 
-    let mic_format = mic.as_mut().and_then(|t| {
-        t.start(Box::new(RingSink {
-            producer: mic_prod,
-            silent: Arc::new(AtomicU64::new(0)),
-            total: Arc::new(AtomicU64::new(0)),
-        }))
-        .ok()
-    });
+    let mic_format = mic
+        .as_mut()
+        .and_then(|t| t.start(mic_counters.sink(mic_prod)).ok());
 
     // A format per leg, because the two taps are two devices: the system tap
     // is 48 kHz stereo and the mic is usually mono. Recording the system's
@@ -926,6 +1028,42 @@ pub async fn run_with_control(
     let (system_samples, mic_samples, dropped_samples) =
         pump.join().map_err(|_| "pump panicked".to_string())??;
 
+    // Read after the taps are stopped, so these are final counts rather than a
+    // snapshot taken mid-meeting.
+    let system_buffers = sys_counters.snapshot();
+    let mic_buffers = mic_format.is_some().then(|| mic_counters.snapshot());
+
+    // A leg that captured nothing audible is a degraded meeting, so it goes
+    // where degradation goes: the one channel with a reader on the other end
+    // (#79). Per leg and named, because the remedies are different — a silent
+    // system leg is a screen-recording grant, a silent mic leg is a muted or
+    // dead microphone — and because `captured_audio()` deliberately no longer
+    // fails on one silent leg. Without these lines a denied system grant on a
+    // machine with a working mic would pass in complete silence, which is the
+    // failure this project exists to make impossible.
+    for (leg, buffers) in [("system", Some(system_buffers)), ("mic", mic_buffers)] {
+        let Some(buffers) = buffers else { continue };
+        match buffers.audio() {
+            LegAudio::Audible => {}
+            LegAudio::Nothing => control.errors.record(format!(
+                "capture ({leg}): the tap started and then delivered no audio \
+                 at all — the device stalled rather than went quiet"
+            )),
+            LegAudio::Silent => control.errors.record(format!(
+                "capture ({leg}): every one of {} buffers was digitally silent \
+                 — {}",
+                buffers.total,
+                if leg == "mic" {
+                    "a muted, denied or dead microphone, so this meeting has \
+                     none of the near end"
+                } else {
+                    "either nothing was playing, or system-audio capture was \
+                     denied (macOS answers a denial with silence, not an error)"
+                }
+            )),
+        }
+    }
+
     // Audio the pump was too slow to collect is audio that exists nowhere: the
     // ring sits upstream of the WAL, so a drop is not a degraded transcript,
     // it is a hole in the recording. It rides the same channel as a provider
@@ -960,8 +1098,8 @@ pub async fn run_with_control(
         started_at_ms,
         system_samples,
         mic_samples,
-        silent_buffers: silent.load(Ordering::Relaxed),
-        total_buffers: total.load(Ordering::Relaxed),
+        system_buffers,
+        mic_buffers,
         dropped_samples,
         segments,
         // Drained after the collector has finished, so a failure that arrived
@@ -1314,12 +1452,14 @@ mod pump_clock_tests {
         mono.iter().flat_map(|s| [*s, *s]).collect()
     }
 
-    /// What each leg's socket was handed, once the pump had drained both rings.
+    /// What each leg's socket was handed, once the pump had drained both
+    /// rings — and, separately, what each leg's *tap* delivered.
     struct FedClocks {
         system_samples: u64,
         mic_samples: u64,
         mic_writes: u64,
         mic_silent_writes: u64,
+        mic_buffers: LegBuffers,
     }
 
     /// A root nobody else in this binary will touch. The counter matters:
@@ -1351,14 +1491,25 @@ mod pump_clock_tests {
         let system = interleave(&mono);
         let mic = interleave(&echoed(&mono, 40 * CAPTURE_RATE as usize / 1_000));
 
-        let (mut sys_prod, sys_cons) = AudioRing::with_capacity_frames(RING_SAMPLES);
-        let (mut mic_prod, mic_cons) = AudioRing::with_capacity_frames(RING_SAMPLES);
+        let (sys_prod, sys_cons) = AudioRing::with_capacity_frames(RING_SAMPLES);
+        let (mic_prod, mic_cons) = AudioRing::with_capacity_frames(RING_SAMPLES);
+
+        // Through the real sinks, in tap-sized buffers, rather than one bulk
+        // `push_block`: the liveness counters live on that callback, and
+        // routing the fixture past them is what lets a test downstream of the
+        // gate say anything about them (#81).
+        let sys_counters = LegCounters::default();
+        let mic_counters = LegCounters::default();
+        deliver(&mut *sys_counters.sink(sys_prod), &system);
+        deliver(&mut *mic_counters.sink(mic_prod), &mic);
+        // The sink swallows a short write by design, so the fit has to be
+        // checked from the other end. Without this the fixture could silently
+        // shrink and these tests would measure ring drops instead.
         assert_eq!(
-            sys_prod.push_block(&system),
-            system.len(),
+            (sys_cons.dropped_frames(), mic_cons.dropped_frames()),
+            (0, 0),
             "the fixture has to fit the ring or the test measures drops instead"
         );
-        assert_eq!(mic_prod.push_block(&mic), mic.len());
 
         let sys_feed = Arc::new(CountingFeed::default());
         let mic_feed = Arc::new(CountingFeed::default());
@@ -1386,6 +1537,25 @@ mod pump_clock_tests {
             mic_samples: mic_feed.samples.load(Ordering::Relaxed),
             mic_writes: mic_feed.writes.load(Ordering::Relaxed),
             mic_silent_writes: mic_feed.silent_writes.load(Ordering::Relaxed),
+            mic_buffers: mic_counters.snapshot(),
+        }
+    }
+
+    /// Hand `pcm` to a sink the way a tap does: fixed-size buffers, a clock
+    /// that advances, and a `SILENT` flag set from what is actually in the
+    /// buffer — which is where the flag comes from on the real path too.
+    fn deliver(sink: &mut dyn FrameSink, pcm: &[f32]) {
+        /// 5 ms of 48 kHz stereo, near the low end of a real IOProc's block.
+        const BUFFER: usize = 480 * CHANNELS as usize;
+        for (i, chunk) in pcm.chunks(BUFFER).enumerate() {
+            let frames = (i * BUFFER / CHANNELS as usize) as u64;
+            let mut flags = FrameFlags::empty();
+            flags.set(FrameFlags::SILENT, chunk.iter().all(|s| *s == 0.0));
+            sink.on_frames(
+                chunk,
+                CaptureTimestamp::new(frames, frames * 1_000_000_000 / u64::from(CAPTURE_RATE)),
+                flags,
+            );
         }
     }
 
@@ -1445,6 +1615,42 @@ mod pump_clock_tests {
         assert_eq!(
             open.mic_silent_writes, 0,
             "ungated mic audio must not arrive as silence"
+        );
+    }
+
+    /// #79 meets #81: a suppressed mic leg is not a silent mic leg.
+    ///
+    /// The gate's suppression writes zeros into the mic's *STT feed*, and this
+    /// fixture is the coupled case where it does that to most of the meeting.
+    /// If the liveness counters lived anywhere downstream of that — in the
+    /// pump, or off what the feed was handed — a user on speakers would come
+    /// out of a working meeting with a microphone reported dead, which is the
+    /// exact false positive #81's counters exist to avoid. They are read here
+    /// *after* a fully gated run, so nothing between the tap and the socket
+    /// gets to rewrite what the device delivered.
+    #[test]
+    fn suppression_cannot_make_a_working_microphone_look_silent() {
+        let fed = drive_both_legs(true);
+
+        let suppressed = 100.0 * fed.mic_silent_writes as f64 / fed.mic_writes as f64;
+        assert!(
+            suppressed > 50.0,
+            "the gate withheld only {suppressed:.0}% of the mic feed, so this \
+             proves nothing"
+        );
+
+        // The tap's own view, unmoved. The handful of silent buffers that do
+        // land are the fixture's: `echoed` opens with `lag` of true zeros
+        // before the delayed copy starts, which is a few dozen milliseconds
+        // against a suppressed majority.
+        assert_eq!(fed.mic_buffers.audio(), LegAudio::Audible);
+        let silent = 100.0 * fed.mic_buffers.silent as f64 / fed.mic_buffers.total as f64;
+        assert!(
+            silent < 5.0,
+            "the gate withheld {suppressed:.0}% of the mic feed and the leg's \
+             own counters moved with it: {silent:.0}% of {} buffers read as \
+             digital silence",
+            fed.mic_buffers.total
         );
     }
 

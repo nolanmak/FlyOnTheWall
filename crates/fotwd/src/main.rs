@@ -696,10 +696,27 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
             }
             println!("  system     : {} samples", outcome.system_samples);
             println!("  mic        : {} samples", outcome.mic_samples);
+            // Per leg, because a total cannot tell a working microphone from a
+            // dead one beside a live system tap (#81). The mic line is omitted
+            // rather than printed as zeros when there was no mic leg: "no
+            // microphone" and "a microphone that heard nothing" are the two
+            // states this line exists to separate.
             println!(
-                "  buffers    : {} ({} silent)",
-                outcome.total_buffers, outcome.silent_buffers
+                "  buffers    : system {} ({} silent)",
+                outcome.system_buffers.total, outcome.system_buffers.silent
             );
+            if let Some(mic) = outcome.mic_buffers {
+                println!(
+                    "               mic    {} ({} silent)",
+                    mic.total, mic.silent
+                );
+            }
+            // The daemon path prints these (`recording.rs`); the CLI never
+            // did, so a degraded leg — or a dropped ring, since #79 — reached
+            // a human only when it happened to fail the whole recording too.
+            for e in &outcome.stt_errors {
+                eprintln!("  ! this meeting was degraded: {e}");
+            }
 
             if !outcome.segments.is_empty() {
                 if let Err(e) = session::append_segments(&outcome.dir, &outcome.segments) {
@@ -786,9 +803,13 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
                 None => println!("  ✓ {}", outcome.dir.display()),
             }
 
+            // Only when *no* leg was audible: one quiet leg is a fact about
+            // the meeting, not a fault (#81), and it has already printed its
+            // own degradation line above. Nothing at all from either device is
+            // still the failure this guidance was written for.
             if !outcome.captured_audio() {
                 println!();
-                println!("  ! every buffer was digitally silent.");
+                println!("  ! every buffer from every leg was digitally silent.");
                 println!("    Either nothing was playing, or the system-audio");
                 println!("    permission was denied — macOS reports a denial as");
                 println!("    silence, not as an error. Grant it under System");
