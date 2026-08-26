@@ -45,6 +45,18 @@ pub const SETTINGS_KEY: &str = "github_export";
 /// meeting id → [`GithubReceipt`].
 pub const RECEIPTS_KEY: &str = "github_export_receipts";
 
+/// How long the auto pusher waits for enrichment before pushing anyway (#76).
+///
+/// The never-held-back-forever valve. Enrichment can die anywhere before it
+/// writes its stamp — a keychain that will not open, a library that will not,
+/// a daemon killed mid-pass — and a meeting waiting on a stamp nobody will
+/// ever write is a meeting that is never exported.
+///
+/// Generous, because the worst case it has to outlast is a title call plus
+/// Call A plus one Call B per chunk of a three-hour meeting; bounded, because
+/// the whole point is that the wait ends.
+const ENRICH_GRACE_MS: u64 = 30 * 60 * 1_000;
+
 /// What one `gh` invocation came back with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GhOutput {
@@ -190,6 +202,10 @@ impl GithubExporter {
     /// Returns how many landed. Failures are said out loud, remembered, and
     /// not retried until restart; a meeting from before the auto stamp is
     /// not owed at all — enabling auto must never export the archive.
+    ///
+    /// **`ready` alone does not make a meeting owed** — see [`export_ready`].
+    /// `persist.rs` sets that state before enrichment runs, and this worker is
+    /// an independent thread polling for it every sixty seconds.
     pub fn auto_push_pending(&self) -> usize {
         let settings = read_settings(&self.lock_db());
         if !settings.enabled || settings.mode != GithubMode::Auto {
@@ -203,6 +219,10 @@ impl GithubExporter {
         let candidates: Vec<String> = {
             let mut db = self.lock_db();
             let receipts = read_receipts(&db);
+            // Read once per round, beside the push receipts and for the same
+            // reason: it is one settings row answering for every meeting.
+            let enriched = crate::enrich::read_receipts(&db);
+            let now = u64::try_from(fotw_store::now_ms()).unwrap_or(0);
             let skip = self
                 .failed_auto
                 .lock()
@@ -219,7 +239,10 @@ impl GithubExporter {
                     if u64::try_from(m.started_at_ms).unwrap_or(0) < since {
                         break 'pages;
                     }
-                    if m.state == "ready" && !receipts.contains_key(&m.id) && !skip.contains(&m.id)
+                    if m.state == "ready"
+                        && !receipts.contains_key(&m.id)
+                        && !skip.contains(&m.id)
+                        && export_ready(enriched.get(&m.id), m.updated_at, now)
                     {
                         owed.push(m.id);
                     }
@@ -264,6 +287,38 @@ impl GithubExporter {
             }
         }
         pushed
+    }
+}
+
+/// Whether a finished meeting has stopped changing enough to export (#76).
+///
+/// The gate is on **full enrichment**, not on the title looking human: the
+/// exported Markdown embeds the current summary (`export.rs`), so a push
+/// landing between the title and the summary would permanently ship a
+/// summary-less file under a path the receipt then pins.
+///
+/// Three ways through, in the order they occur:
+///
+/// * a finished stamp — the ordinary path, seconds to minutes after persist;
+/// * a pass that started long enough ago that it is not coming back. Anchored
+///   at the start of enrichment rather than at `updated_at`, because a long
+///   meeting spends a title call plus a Call B per chunk inside the window and
+///   one measured from persist can expire mid-run — re-creating the exact race
+///   the stamp closes;
+/// * no stamp at all on a meeting nothing has touched in a while, which is
+///   every meeting of a library recorded before any of this existed. That arm
+///   is what stops the gate stranding an archive, and it also covers the
+///   passes that die before the started stamp — a keychain or library that
+///   would not open (`enrich.rs`'s wrapper).
+fn export_ready(receipt: Option<&crate::enrich::EnrichReceipt>, updated_at: i64, now: u64) -> bool {
+    let long_enough_ago = |then: u64| now.saturating_sub(then) > ENRICH_GRACE_MS;
+    match receipt {
+        Some(r) if r.finished_at_ms > 0 => true,
+        // A stamp with no clocks at all reads as an ancient one rather than as
+        // a pass in flight: the map is parsed tolerantly, and a field that did
+        // not decode must not be able to hold a meeting back forever.
+        Some(r) => long_enough_ago(r.started_at_ms),
+        None => long_enough_ago(u64::try_from(updated_at).unwrap_or(0)),
     }
 }
 

@@ -179,7 +179,11 @@ fn slug(title: &str) -> String {
 /// Civil date from epoch milliseconds, UTC. Hinnant's `civil_from_days`,
 /// exact over the whole proleptic Gregorian calendar — no leap-year table to
 /// get wrong.
-fn ymd_utc(epoch_ms: i64) -> (i64, u32, u32) {
+///
+/// Shared with [`crate::enrich::dated_fallback_title`] rather than copied: it
+/// is the only civil-calendar arithmetic in this workspace, and a second copy
+/// is a second chance to get a century boundary wrong.
+pub(crate) fn ymd_utc(epoch_ms: i64) -> (i64, u32, u32) {
     let days = epoch_ms.div_euclid(86_400_000);
     let z = days + 719_468;
     let era = z.div_euclid(146_097);

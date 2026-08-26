@@ -23,6 +23,59 @@ fn library() -> Db {
     Db::open_in_memory(&DbKey::from_bytes([0x01; 32])).unwrap()
 }
 
+/// A finished meeting that enrichment has also run to completion on.
+///
+/// What the auto pusher owes, after #76. `ready` alone is no longer enough:
+/// `persist.rs` sets that state *before* enrichment runs, so a meeting in it
+/// may still be waiting for the title and summary the exported Markdown
+/// embeds. Every test whose point is "this meeting gets pushed" goes through
+/// here; the ones whose point is the gate itself use [`ready_meeting`] raw.
+fn enriched_meeting(db: &mut Db, title: &str, started_at_ms: i64) -> String {
+    let id = ready_meeting(db, title, started_at_ms);
+    mark_enriched(db, &[&id]);
+    id
+}
+
+/// Stamp meetings as fully enriched, as `enrich_meeting_with` does when a pass
+/// reaches its end.
+fn mark_enriched(db: &mut Db, meetings: &[&str]) {
+    let now = u64::try_from(fotw_store::now_ms()).unwrap_or(0);
+    let entries: Vec<(&str, u64, u64)> = meetings.iter().map(|id| (*id, now, now)).collect();
+    stamp_receipts(db, &entries);
+}
+
+/// Write the enrichment receipt map as **raw JSON**, on `MANUAL`'s precedent.
+///
+/// Two modules agree on these three field names and neither owns the type, so
+/// a rename has to break something loudly. `tests/enrich.rs` pins the same
+/// shape from the writing side; this is the reading side.
+fn stamp_receipts(db: &mut Db, entries: &[(&str, u64, u64)]) {
+    let body: Vec<String> = entries
+        .iter()
+        .map(|(id, started, finished)| {
+            format!(
+                r#""{id}":{{"started_at_ms":{started},"finished_at_ms":{finished},"minted_title":""}}"#
+            )
+        })
+        .collect();
+    db.put_setting(
+        fotwd::enrich::RECEIPTS_KEY,
+        &format!("{{{}}}", body.join(",")),
+    )
+    .unwrap();
+}
+
+/// Push a meeting's `updated_at` into the past, the way a library recorded
+/// before any of this existed already is.
+fn backdate(db: &Db, meeting: &str, updated_at_ms: i64) {
+    db.conn()
+        .execute(
+            &format!("UPDATE meetings SET updated_at = {updated_at_ms} WHERE id = '{meeting}'"),
+            [],
+        )
+        .unwrap();
+}
+
 /// A finished meeting with a primary transcript of one segment.
 fn ready_meeting(db: &mut Db, title: &str, started_at_ms: i64) -> String {
     let id = db
@@ -127,7 +180,7 @@ struct Rig {
 
 fn rig(settings_json: &str, script: Vec<Result<GhOutput, String>>) -> Rig {
     let mut db = library();
-    let meeting = ready_meeting(&mut db, "Weekly Standup", 1_755_734_400_000); // 2025-08-21 UTC
+    let meeting = enriched_meeting(&mut db, "Weekly Standup", 1_755_734_400_000); // 2025-08-21 UTC
     store_settings(&mut db, settings_json);
     let gh = ScriptedGh::scripted(script);
     let dir = tempfile::TempDir::new().unwrap();
@@ -383,6 +436,123 @@ fn auto_push_pushes_a_ready_meeting_exactly_once() {
     );
 }
 
+// -------------------------------------------- waiting for enrichment (#76)
+
+/// The race #76 exists to close, from the exporter's side.
+///
+/// `persist.rs` sets `state = "ready"` six seconds before enrichment even
+/// opens the keychain, and the pusher polls that state every sixty seconds. It
+/// won a real meeting on 2026-08-25: the file landed in the repo under
+/// `untitled-recording-1787677095` while the library row was still being
+/// titled, and the receipt pinned that path forever.
+///
+/// Not fixed by re-sequencing `set_state`: that strands a meeting whose
+/// enrichment dies before touching the library, delays the retention clocks
+/// that key on `ready`, and mutates a state enum the UI and MCP both read.
+#[test]
+fn a_meeting_whose_enrichment_has_not_finished_is_not_exported_yet() {
+    let mut db = library();
+    // Ready, and *not* stamped — the six-second window, exactly.
+    ready_meeting(
+        &mut db,
+        "Untitled recording — 2026-08-25 14:05 UTC",
+        1_755_734_400_000,
+    );
+    store_settings(&mut db, AUTO_SINCE_EPOCH);
+    let gh = ScriptedGh::scripted(create_script());
+    let dir = tempfile::TempDir::new().unwrap();
+    let exporter = GithubExporter::new(
+        db,
+        dir.path().join("sessions"),
+        Arc::clone(&gh) as Arc<dyn GhRunner>,
+    );
+
+    assert_eq!(exporter.auto_push_pending(), 0);
+    assert!(
+        gh.calls().is_empty(),
+        "a meeting still being enriched must not reach a process at all"
+    );
+}
+
+/// And the other side of it: once enrichment has finished, the file lands
+/// under the title enrichment gave it, which is what #67 asked for.
+#[test]
+fn an_enriched_meeting_exports_under_the_title_enrichment_gave_it() {
+    let r = rig(AUTO_SINCE_EPOCH, create_script());
+    assert_eq!(r.exporter.auto_push_pending(), 1);
+    let receipt = r.exporter.receipt_for(&r.meeting).expect("it pushed");
+    assert!(
+        receipt.path.contains("weekly-standup"),
+        "the path must carry the real title's slug, not `untitled-recording`: {}",
+        receipt.path
+    );
+}
+
+/// The valve. Enrichment that never finishes — the daemon was killed mid-pass,
+/// or the keychain refused before a stamp could be written — must not hold a
+/// meeting back forever. The window is measured from the moment enrichment
+/// *began*, because a long meeting spends a title call plus a Call B per chunk
+/// inside it and a window anchored at persist time expires mid-run.
+#[test]
+fn an_enrichment_that_never_finished_exports_once_the_grace_expires() {
+    let mut db = library();
+    let meeting = ready_meeting(&mut db, "Weekly Standup", 1_755_734_400_000);
+    let long_ago = u64::try_from(fotw_store::now_ms()).unwrap_or(0) - 3_600_000;
+    stamp_receipts(&mut db, &[(&meeting, long_ago, 0)]); // started, never finished
+    store_settings(&mut db, AUTO_SINCE_EPOCH);
+    let dir = tempfile::TempDir::new().unwrap();
+    let exporter = GithubExporter::new(
+        db,
+        dir.path().join("sessions"),
+        ScriptedGh::scripted(create_script()) as Arc<dyn GhRunner>,
+    );
+
+    assert_eq!(
+        exporter.auto_push_pending(),
+        1,
+        "an hour past the start of a pass that never ended, the meeting is owed"
+    );
+}
+
+/// A library recorded before any stamp existed has no receipts at all, and
+/// every one of its meetings is long finished. It must export immediately
+/// rather than wait out a grace window for a pass that will never run.
+#[test]
+fn a_library_from_before_the_stamp_existed_still_exports() {
+    let mut db = library();
+    let meeting = ready_meeting(&mut db, "Weekly Standup", 1_755_734_400_000);
+    backdate(&db, &meeting, fotw_store::now_ms() - 86_400_000);
+    store_settings(&mut db, AUTO_SINCE_EPOCH);
+    let dir = tempfile::TempDir::new().unwrap();
+    let exporter = GithubExporter::new(
+        db,
+        dir.path().join("sessions"),
+        ScriptedGh::scripted(create_script()) as Arc<dyn GhRunner>,
+    );
+
+    assert_eq!(exporter.auto_push_pending(), 1);
+}
+
+/// The gate is on the *worker*, never on the person. A manual push is a human
+/// saying "export this now", and it has never had a state check at all.
+#[test]
+fn a_manual_push_is_never_held_back_by_the_gate() {
+    let mut db = library();
+    let meeting = ready_meeting(&mut db, "Weekly Standup", 1_755_734_400_000);
+    store_settings(&mut db, MANUAL);
+    let dir = tempfile::TempDir::new().unwrap();
+    let exporter = GithubExporter::new(
+        db,
+        dir.path().join("sessions"),
+        ScriptedGh::scripted(create_script()) as Arc<dyn GhRunner>,
+    );
+
+    assert!(
+        exporter.push(&meeting).is_ok(),
+        "an unenriched meeting is still the user's to export by hand"
+    );
+}
+
 #[test]
 fn auto_push_skips_meetings_from_before_the_stamp() {
     // The stamp is far in the future of the fixture meeting.
@@ -429,6 +599,7 @@ fn an_environment_failure_is_retried_and_stops_the_round() {
     let mut db = library();
     let first = ready_meeting(&mut db, "First", 1_755_734_400_000);
     let second = ready_meeting(&mut db, "Second", 1_755_734_500_000);
+    mark_enriched(&mut db, &[&first, &second]);
     store_settings(&mut db, AUTO_SINCE_EPOCH);
     let gh = ScriptedGh::scripted(vec![Ok(GhOutput {
         status: 1,
@@ -518,9 +689,12 @@ impl GhRunner for TirelessGh {
 #[test]
 fn auto_push_reaches_meetings_beyond_the_first_page() {
     let mut db = library();
-    for i in 0..201 {
-        ready_meeting(&mut db, &format!("m{i}"), 1_755_734_400_000 + i);
-    }
+    let ids: Vec<String> = (0..201)
+        .map(|i| ready_meeting(&mut db, &format!("m{i}"), 1_755_734_400_000 + i))
+        .collect();
+    // One write for all 201: the map is a single settings row, and stamping it
+    // per meeting would be 201 read-modify-writes of a growing JSON object.
+    mark_enriched(&mut db, &ids.iter().map(String::as_str).collect::<Vec<_>>());
     store_settings(&mut db, AUTO_SINCE_EPOCH);
     let dir = tempfile::TempDir::new().unwrap();
     let exporter = GithubExporter::new(

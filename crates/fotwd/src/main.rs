@@ -1122,14 +1122,13 @@ fn open_db(root: &std::path::Path) -> Result<Db, String> {
     fotwd::open_library(root)
 }
 
+/// The placeholder a meeting is persisted under, before enrichment names it.
+///
+/// The same mint as the daemon's (`recording::persist_and_promote`) and
+/// deliberately so: two spellings of "untitled" would be two guards to keep in
+/// step with [`fotwd::enrich`]'s replaceability test.
 fn default_title() -> String {
-    format!(
-        "Untitled recording — {}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    )
+    fotwd::enrich::dated_fallback_title(fotw_store::now_ms())
 }
 
 fn list(root: PathBuf) -> ExitCode {
