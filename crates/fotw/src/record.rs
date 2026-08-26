@@ -31,10 +31,13 @@
 //! writes into the same ring, feeding the same WAL, and everything already on
 //! disk is untouched.
 //!
-//! **An unwritten gap is padded with real silence.** The manifest's gap list
-//! records that those samples are synthetic, but the samples themselves have
-//! to exist, or the byte offset of everything after the gap no longer equals
-//! its session time and every later timestamp is wrong.
+//! **An unwritten gap is padded with real silence, in that leg's own shape.**
+//! The manifest's gap list records that those samples are synthetic, but the
+//! samples themselves have to exist, or the byte offset of everything after
+//! the gap no longer equals its session time and every later timestamp is
+//! wrong. A second of a mono mic is half as many samples as a second of the
+//! stereo system tap, so the two legs are padded from their own formats and
+//! never from one session-wide count (#82).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,7 +54,7 @@ use fotw_audio::{
     StreamFormat, SystemScope, TapError, TapId, platform,
 };
 use fotw_pipeline::ring::{AudioRing, RingConsumer, RingProducer};
-use fotw_pipeline::wal::{SessionWal, TrackFormat};
+use fotw_pipeline::wal::{SessionFormats, SessionWal, TrackFormat};
 
 /// Ring capacity. Ten seconds is generous — the pump drains every 100 ms —
 /// but the cost is 1.3 MB and the benefit is surviving a stalled disk.
@@ -149,7 +152,13 @@ struct Leg {
     supervisor: CaptureSupervisor,
     counters: Arc<ActivityCounters>,
     consumer: RingConsumer,
+    /// What the tap is delivering right now. Re-read after every rebuild.
     format: StreamFormat,
+    /// The shape **this leg's** PCM is being written in, which is fixed for
+    /// the session and is not necessarily the other leg's — a mono mic
+    /// alongside a stereo system tap is the ordinary case. Padding a gap from
+    /// the wrong one fills it with the wrong amount of silence (#82).
+    wal_format: TrackFormat,
 }
 
 /// Where a leg's samples go in the WAL.
@@ -260,13 +269,7 @@ pub fn record(root: PathBuf, seconds: u64) -> Result<PathBuf, String> {
     )
     .map_err(|e| format!("could not create the session: {e}"))?;
     let dir = wal.dir().to_path_buf();
-    // The system leg's shape, which is what the manifest's pre-schema-4
-    // fields carry.
-    let wal_format = StreamFormat::new(
-        wal.manifest().sample_rate_hz,
-        wal.manifest().channels,
-        sys_format.sample,
-    );
+    let formats = wal_formats(&wal);
 
     let stop = Arc::new(AtomicBool::new(false));
     let pump_stop = Arc::clone(&stop);
@@ -280,6 +283,7 @@ pub fn record(root: PathBuf, seconds: u64) -> Result<PathBuf, String> {
             counters: Arc::clone(&sys_counters),
             consumer: sys_consumer,
             format: sys_format,
+            wal_format: formats.system,
         },
     )];
     if let Some(format) = mic_format {
@@ -291,6 +295,7 @@ pub fn record(root: PathBuf, seconds: u64) -> Result<PathBuf, String> {
                 counters: Arc::clone(&mic_counters),
                 consumer: mic_consumer,
                 format,
+                wal_format: formats.mic,
             },
         ));
     }
@@ -336,7 +341,6 @@ pub fn record(root: PathBuf, seconds: u64) -> Result<PathBuf, String> {
                         *channel,
                         leg,
                         &*pump_plat,
-                        wal_format,
                         session_epoch_ns,
                         &mut scratch,
                     )?;
@@ -415,6 +419,20 @@ pub fn record(root: PathBuf, seconds: u64) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// The shape each of the session's two PCM legs is written in.
+///
+/// Resolved through [`fotw_pipeline::wal::Manifest::track_formats`] rather
+/// than read off the manifest's top-level `sample_rate_hz`/`channels`, which
+/// are the *system* tap's (#80). There has to be exactly one answer to "what
+/// shape is this leg", and this is the one the encoder, `SessionState` and
+/// every other reader already use. A session being recorded is one this
+/// process just wrote, so the resolver's pre-schema-4 inference never fires
+/// here — the point is that the padder and the encoder cannot disagree, not
+/// that this call site needs the legacy path.
+fn wal_formats(wal: &SessionWal) -> SessionFormats {
+    wal.manifest().track_formats(wal.dir())
+}
+
 /// Poll one leg's supervisor and apply whatever it decided to the WAL.
 ///
 /// Runs on the pump thread, between drains, which is the only place a gap's
@@ -424,7 +442,6 @@ fn supervise(
     channel: Channel,
     leg: &mut Leg,
     plat: &(impl AudioPlatform + ?Sized),
-    wal_format: StreamFormat,
     epoch_ns: u64,
     scratch: &mut [f32],
 ) -> Result<(), String> {
@@ -455,9 +472,9 @@ fn supervise(
             // better than writing 16 kHz samples into a 48 kHz file quietly.
             println!(
                 "  ! [{}] format changed across the rebuild: {} -> {format}. \
-                 The session manifest still says {wal_format}; this leg's \
+                 The manifest still records this leg as {} Hz / {} ch; its \
                  timing will be wrong until resampling is wired in.",
-                leg.label, leg.format
+                leg.label, leg.format, leg.wal_format.sample_rate_hz, leg.wal_format.channels
             );
             leg.format = format;
         }
@@ -477,7 +494,15 @@ fn supervise(
         }
 
         for gap in gaps {
-            apply_gap(wal, channel, leg.label, &gap, wal_format, epoch_ns, scratch)?;
+            apply_gap(
+                wal,
+                channel,
+                leg.label,
+                &gap,
+                leg.wal_format,
+                epoch_ns,
+                scratch,
+            )?;
         }
     }
     Ok(())
@@ -490,7 +515,7 @@ fn apply_gap(
     channel: Channel,
     label: &str,
     gap: &CaptureGap,
-    wal_format: StreamFormat,
+    format: TrackFormat,
     epoch_ns: u64,
     scratch: &mut [f32],
 ) -> Result<(), String> {
@@ -506,7 +531,14 @@ fn apply_gap(
         return Ok(());
     }
 
-    let mut remaining = gap.samples_to_pad(wal_format) as usize;
+    // Counted in *this* leg's interleaved samples. The gap's duration is the
+    // same on both legs, but the samples that duration is worth are not: a
+    // mono mic needs half what the stereo system tap does, and padding it with
+    // the system tap's count doubles the silence and shifts everything after
+    // it in that leg (#82).
+    let mut remaining = gap
+        .frames_to_pad(format.sample_rate_hz)
+        .saturating_mul(u64::from(format.channels)) as usize;
     let chunk = PAD_CHUNK_SAMPLES.min(scratch.len());
     scratch[..chunk].fill(0.0);
     while remaining > 0 {
@@ -522,7 +554,9 @@ fn apply_gap(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fotw_audio::AudioTap;
     use fotw_audio::supervisor::GapReason;
+    use fotw_audio::testing::{FakeTap, ManualClock, MockPlatform};
     use fotw_pipeline::wal::SessionState;
 
     fn scratch_dir(name: &str) -> PathBuf {
@@ -533,8 +567,134 @@ mod tests {
         dir
     }
 
-    fn f48() -> StreamFormat {
-        StreamFormat::new(48_000, 2, fotw_audio::SampleFormat::F32)
+    /// The shape a stereo system leg's PCM is written in.
+    fn stereo48() -> TrackFormat {
+        TrackFormat::new(48_000, 2)
+    }
+
+    /// One supervised leg over a scriptable tap, wired the way [`record`]
+    /// wires a real one: its own ring, its own counters, its own supervisor —
+    /// on a clock the test moves by hand, so a five-second stall costs no
+    /// wall-clock time.
+    fn fake_leg(
+        label: &'static str,
+        id: TapId,
+        wal_format: TrackFormat,
+        clock: &Arc<ManualClock>,
+    ) -> Leg {
+        let channels = wal_format.channels;
+        let format = StreamFormat::new(
+            wal_format.sample_rate_hz,
+            channels,
+            fotw_audio::SampleFormat::F32,
+        );
+        let (producer, consumer) = AudioRing::with_capacity_frames(48_000);
+        let slot = ProducerSlot::holding(producer);
+        let counters = Arc::new(ActivityCounters::new());
+        let open_id = id.clone();
+        let sink_slot = slot.clone();
+        let sink_counters = Arc::clone(&counters);
+        let mut supervisor = CaptureSupervisor::new(
+            SupervisorConfig {
+                id,
+                ..SupervisorConfig::default()
+            },
+            Arc::clone(clock) as Arc<dyn Clock>,
+            move || Ok(Box::new(FakeTap::new(open_id.clone(), format)) as Box<dyn AudioTap>),
+            move || sink_slot.sink(Arc::clone(&sink_counters), channels),
+        );
+        supervisor.start().unwrap();
+        Leg {
+            label,
+            supervisor,
+            counters,
+            consumer,
+            format,
+            wal_format,
+        }
+    }
+
+    /// Issue #82: the gap padder ran on **both** legs with the system tap's
+    /// format, so a mono mic's hole was filled with twice the silence it
+    /// needed and everything after it in that leg sat at double its real
+    /// offset.
+    ///
+    /// Asserted per leg, deliberately, and never on the total: a 2× overshoot
+    /// on one leg is invisible in a sum across the two, which is exactly how
+    /// this shipped.
+    #[test]
+    fn each_leg_pads_its_gap_with_its_own_channel_count() {
+        let root = scratch_dir("per-leg-gap");
+        let clock = ManualClock::new();
+        let plat = MockPlatform::macos_taps();
+        let mut scratch = vec![0.0f32; 48_000];
+
+        // The ordinary macOS shape: a stereo system tap and a mono mic.
+        let mut wal = SessionWal::create_with_formats(
+            &root,
+            TrackFormat::new(48_000, 2),
+            Some(TrackFormat::new(48_000, 1)),
+        )
+        .unwrap();
+        // Resolved the way `record` resolves them, and the way every reader
+        // does: one answer per leg, not one answer for the session.
+        let formats = wal_formats(&wal);
+        assert_eq!(formats.system.channels, 2);
+        assert_eq!(formats.mic.channels, 1, "the mic leg really is mono");
+
+        let mut system = fake_leg("system", TapId::system_default(), formats.system, &clock);
+        let mut mic = fake_leg("mic", TapId::mic("default"), formats.mic, &clock);
+
+        // One second of audible audio down each leg, each at its own shape.
+        Channel::System
+            .write(&mut wal, &vec![0.5f32; 48_000 * 2])
+            .unwrap();
+        Channel::Mic.write(&mut wal, &vec![0.5f32; 48_000]).unwrap();
+
+        // Five seconds in which neither tap delivered a buffer: both starve,
+        // both rebuild, and both owe the stream five seconds of silence.
+        clock.advance(Duration::from_secs(5));
+        supervise(
+            &mut wal,
+            Channel::System,
+            &mut system,
+            &plat,
+            0,
+            &mut scratch,
+        )
+        .unwrap();
+        supervise(&mut wal, Channel::Mic, &mut mic, &plat, 0, &mut scratch).unwrap();
+
+        assert_eq!(system.supervisor.rebuilds(), 1, "the system tap rebuilt");
+        assert_eq!(mic.supervisor.rebuilds(), 1, "and so did the mic");
+
+        let dir = wal.finalize().unwrap();
+        let state = SessionState::read(&dir).unwrap();
+
+        // Bytes, per leg, because that is where the error lives: the mic's
+        // padding is counted in samples and a mono second is half a stereo
+        // one.
+        let bytes = |name: &str| std::fs::metadata(dir.join(name)).unwrap().len();
+        assert_eq!(
+            bytes("system.pcm"),
+            6 * 48_000 * 2 * 2,
+            "1 s + 5 s of stereo silence"
+        );
+        assert_eq!(
+            bytes("mic.pcm"),
+            6 * 48_000 * 2,
+            "1 s + 5 s of MONO silence, not the system tap's stereo"
+        );
+
+        // And therefore the acceptance criterion: the two legs cover the same
+        // stretch of the meeting and end at the same moment.
+        assert_eq!(state.system_frames, 6 * 48_000);
+        assert_eq!(
+            state.mic_frames, state.system_frames,
+            "the legs must come out at equal duration"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Issue #25's acceptance criterion, at the only layer where it can be
@@ -568,7 +728,7 @@ mod tests {
             Channel::System,
             "system",
             &gap,
-            f48(),
+            stereo48(),
             epoch,
             &mut scratch,
         )
@@ -635,7 +795,7 @@ mod tests {
             Channel::System,
             "system",
             &gap,
-            f48(),
+            stereo48(),
             0,
             &mut scratch,
         )
