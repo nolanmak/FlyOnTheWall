@@ -206,6 +206,9 @@ fn recorder(
         root.to_path_buf(),
         tokio::runtime::Handle::current(),
         fotwd::session::SegmentTap::default(),
+        // These tests are about the start deadline; nothing here persists a
+        // meeting, so there is nothing to announce.
+        fotwd::recording::ReadyTap::default(),
         taps,
         Box::new(|| Transcription::Disabled),
         Box::new(|_root, _outcome| None),

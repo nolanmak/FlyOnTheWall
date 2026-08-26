@@ -11,8 +11,9 @@
 //! A live recording has no library id; persist mints one only at the end. The
 //! deltas therefore carry the **session id** (`TranscriptSegment.session_id`,
 //! which every segment already has), and nothing downstream minds: the UI's
-//! renderer appends deltas without reading the id at all, and the post-stop
-//! library refresh shows the persisted meeting under its real id. Threading a
+//! renderer appends deltas without reading the id at all. The library id is
+//! sent separately once it exists, on the `meeting_ready` frame (#78) — which
+//! is what actually gets the finished meeting onto an open tab. Threading a
 //! pre-minted UUID through `persist_session` would touch the store for a
 //! field no consumer reads today.
 

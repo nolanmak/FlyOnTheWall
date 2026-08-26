@@ -217,7 +217,8 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
     // WebSocket have existed since the UI shipped; this closure is the first
     // thing in production to feed them. Deltas carry the session id — persist
     // mints the library id only at the end, and the renderer does not read
-    // the id anyway; the post-stop refresh shows the persisted meeting.
+    // the id anyway. The library id reaches the client separately, on the
+    // `meeting_ready` frame the second tap below sends (#78).
     //
     // Late-bound because the hub lives inside the state that `bind` creates,
     // and the recorder must exist before `bind` is called. Until the slot is
@@ -226,6 +227,18 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
     let hub_slot: Arc<std::sync::OnceLock<Arc<fotw_web::DeltaHub>>> =
         Arc::new(std::sync::OnceLock::new());
     let hub_for_tap = Arc::clone(&hub_slot);
+    let hub_for_ready = Arc::clone(&hub_slot);
+    // The library-changed producer (#78), through the same late-bound slot for
+    // the same reason. Nothing told an open dashboard that a meeting had
+    // finished, so the list stayed stale until the tab was reloaded: three of
+    // `loadMeetings()`'s four call sites cannot fire on a stop, and `resync`
+    // fires only when a client is more than `BACKLOG` frames behind.
+    let on_ready = crate::recording::ReadyTap::new(move |meeting_id, reason| {
+        let Some(hub) = hub_for_ready.get() else {
+            return;
+        };
+        hub.announce_meeting_ready(meeting_id, reason);
+    });
     // `Delta.idx` is documented as the index within *the* transcript, so the
     // counter resets when the session changes — a daemon-lifetime counter
     // would leak how many segments earlier meetings produced.
@@ -234,7 +247,7 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
     // persist-time pass is authoritative; this one keeps speaker echo off
     // the screen while the meeting runs. A mic final that arrives BEFORE
     // its system counterpart (the observed skew direction) leaks here and
-    // is cleaned at persist — the documented post-stop-refresh contract.
+    // is cleaned at persist, which the `meeting_ready` refresh then shows.
     struct LiveTap {
         session: String,
         next_idx: i64,
@@ -312,6 +325,7 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
         root.clone(),
         tokio::runtime::Handle::current(),
         on_segment,
+        on_ready,
     ));
 
     // The GitHub export target (issue #63). Its own library connection, as

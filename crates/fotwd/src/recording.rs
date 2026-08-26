@@ -59,7 +59,7 @@ use fotw_audio::{AudioPlatform, AudioTap, DeviceId, FormatRequest, SystemScope, 
 use fotw_secrets::KeyStore;
 use fotw_shell::StartOrigin;
 
-use fotw_web::{RecorderControl, RecorderError, RecordingStatus};
+use fotw_web::{MeetingReadyReason, RecorderControl, RecorderError, RecordingStatus};
 
 use crate::audit::{AuditKind, AuditLog};
 use crate::consent::{JurisdictionSignals, Rules};
@@ -93,6 +93,60 @@ pub type Finisher = Box<dyn Fn(&Path, &SessionOutcome) -> Option<String> + Send 
 /// that created it, and macOS prompts every single time.
 pub type TranscriptionFactory = Box<dyn Fn() -> Transcription + Send + Sync>;
 
+/// The closure shape a [`ReadyTap`] holds.
+type ReadyFn = dyn Fn(&str, MeetingReadyReason) + Send + Sync;
+
+/// A callback told when a meeting becomes worth fetching (#78).
+///
+/// The library-changed seam, built the same way as [`SegmentTap`] and for the
+/// same reason: the hub lives inside the web server's state, which does not
+/// exist until after the recorder does, so the recorder takes a callback
+/// rather than a hub. `serve` hands over one that announces on the hub; the
+/// default is silence, so every caller that does not name the feature — the
+/// tests, and any future embedder — keeps its old behaviour.
+///
+/// It must not block: it fires from the `spawn_blocking` thread the finisher
+/// runs on, between persist and promote, and anything that waited there would
+/// hold the recorder's slot. [`fotw_web::DeltaHub::announce_meeting_ready`] is
+/// a synchronous `broadcast::send` by design.
+///
+/// # What this deliberately does not reach
+///
+/// `fotwd record` is a **separate process** from `fotwd serve`. It persists
+/// through its own [`crate::open_library`] handle (`main.rs`) and can never
+/// reach the serving process's in-memory hub without IPC, which #78 did not
+/// take on. A meeting recorded from the CLI while a dashboard is open is
+/// therefore still reload-only. Said here rather than discovered.
+#[derive(Clone, Default)]
+pub struct ReadyTap(Option<Arc<ReadyFn>>);
+
+impl std::fmt::Debug for ReadyTap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The meeting id is not content, but it names a row in the user's
+        // library, and §10's never-log rule does not stop at log files.
+        f.write_str(if self.0.is_some() {
+            "ReadyTap(<set>)"
+        } else {
+            "ReadyTap(<none>)"
+        })
+    }
+}
+
+impl ReadyTap {
+    /// A tap that hands each announcement to `f`.
+    #[must_use]
+    pub fn new(f: impl Fn(&str, MeetingReadyReason) + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(f)))
+    }
+
+    /// Announce one meeting, or do nothing when no tap was set.
+    pub fn emit(&self, meeting_id: &str, reason: MeetingReadyReason) {
+        if let Some(f) = &self.0 {
+            f(meeting_id, reason);
+        }
+    }
+}
+
 /// A recording in flight, or one still writing itself to disk.
 struct Live {
     stop: StopSignal,
@@ -120,6 +174,9 @@ pub struct DaemonRecorder {
     ready_deadline: Duration,
     /// Handed to every session for the live transcript (#61).
     on_segment: SegmentTap,
+    /// Told when a meeting lands in the library, so an open tab can refetch
+    /// without being reloaded (#78).
+    on_ready: ReadyTap,
     live: Arc<Mutex<Option<Live>>>,
 }
 
@@ -152,11 +209,22 @@ pub const READY_DEADLINE: Duration = Duration::from_secs(15);
 impl DaemonRecorder {
     /// A recorder that opens the host's real devices.
     #[must_use]
-    pub fn new(root: PathBuf, handle: tokio::runtime::Handle, on_segment: SegmentTap) -> Self {
+    pub fn new(
+        root: PathBuf,
+        handle: tokio::runtime::Handle,
+        on_segment: SegmentTap,
+        on_ready: ReadyTap,
+    ) -> Self {
+        // The finisher is where `persisted` is announced, so the real one
+        // carries the tap with it. `with_parts` takes the finisher whole, so a
+        // test that injects its own gets no announcements — which is right:
+        // there is no hub behind them.
+        let finish_ready = on_ready.clone();
         Self::with_parts(
             root,
             handle,
             on_segment,
+            on_ready,
             Box::new(|| {
                 let plat = platform::host();
                 let system = plat
@@ -170,7 +238,7 @@ impl DaemonRecorder {
                 Ok((system, mic))
             }),
             Box::new(keychain_transcription),
-            Box::new(persist_and_promote),
+            Box::new(move |root, outcome| persist_and_promote(root, outcome, &finish_ready)),
             UI_CEILING,
             READY_DEADLINE,
         )
@@ -183,6 +251,7 @@ impl DaemonRecorder {
         root: PathBuf,
         handle: tokio::runtime::Handle,
         on_segment: SegmentTap,
+        on_ready: ReadyTap,
         open_taps: TapOpener,
         transcription: TranscriptionFactory,
         finish: Finisher,
@@ -198,6 +267,7 @@ impl DaemonRecorder {
             ceiling,
             ready_deadline,
             on_segment,
+            on_ready,
             live: Arc::new(Mutex::new(None)),
         }
     }
@@ -255,7 +325,15 @@ fn keychain_transcription() -> Transcription {
 /// out of the scratch `sessions/` lifetime into the durable one — skipping
 /// that is what left every recording sitting in `sessions/` with the retention
 /// engine unable to see any of it.
-fn persist_and_promote(root: &Path, outcome: &SessionOutcome) -> Option<String> {
+///
+/// `ready` is told **between** the two, not after (#78). `persist_session`
+/// leaves the row in `ready` and queryable, so the dashboard can list the
+/// meeting from that instant; promotion then re-encodes the whole call to
+/// Opus, which is minutes on a long one. Announcing after promotion would
+/// leave the library stale for exactly as long as the encode takes, and would
+/// announce nothing at all when promotion fails — even though the row it names
+/// is right there.
+fn persist_and_promote(root: &Path, outcome: &SessionOutcome, ready: &ReadyTap) -> Option<String> {
     if !outcome.segments.is_empty()
         && let Err(e) = session::append_segments(&outcome.dir, &outcome.segments)
     {
@@ -281,6 +359,8 @@ fn persist_and_promote(root: &Path, outcome: &SessionOutcome) -> Option<String> 
                 None
             }
             Ok(id) => {
+                // Before promotion, on purpose — see this function's header.
+                ready.emit(&id, MeetingReadyReason::Persisted);
                 if let Err(e) = crate::retention::promote_session(
                     &mut db,
                     &data_root,
@@ -361,6 +441,7 @@ impl RecorderControl for DaemonRecorder {
             started_at_ms,
             Arc::clone(&live),
             finish,
+            self.on_ready.clone(),
         ));
 
         // Do not answer until capture is real. Answering on spawn is what let
@@ -429,6 +510,7 @@ async fn spawn_session(
     started_at_ms: u64,
     live: Arc<Mutex<Option<Live>>>,
     finish: Arc<Finisher>,
+    on_ready: ReadyTap,
 ) {
     let outcome =
         session::run_with_control(&root, system, mic, transcription, ceiling, control).await;
@@ -466,7 +548,7 @@ async fn spawn_session(
     *live.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
     if let Some(meeting_id) = persisted {
-        enrich_and_announce(&root, &meeting_id).await;
+        enrich_and_announce(&root, &meeting_id, &on_ready).await;
     }
 }
 
@@ -477,19 +559,23 @@ async fn spawn_session(
 /// nothing can fail the recording: the audio and the transcript are on disk
 /// before this is called.
 ///
-/// This is the hook #78 wants: once enrichment returns, the meeting's title
-/// and summary are final, and *that* is the moment to publish a
-/// `meeting_ready` frame to the dashboard so it can redraw the row it already
-/// listed. `Finishing` ends before this runs, so the two are separate events
-/// and must stay so.
+/// This is the hook #78 asked for, and it is now wired: the invariant is
+/// **announce `enriched` immediately after `enrich_meeting` returns, wherever
+/// that call lives** — the tap travels with the call if this ever moves again.
+/// The row was already listed by the `persisted` announcement minutes earlier;
+/// this second one is what puts the real title and summary on a pane the user
+/// may already have open. `Finishing` ends before this runs, so the two are
+/// separate events and must stay so.
 ///
 /// This call went missing once already — a patch matched stale text, replaced
 /// nothing, and asserted nothing — and every dashboard meeting kept its epoch
-/// title while the CLI path worked. There is no unit pin: enrichment opens the
-/// real library and keychain, which no test may touch. If this call disappears
-/// again, the symptom is epoch titles on dashboard meetings while `fotwd
-/// record` titles fine.
-async fn enrich_and_announce(root: &Path, meeting_id: &str) {
+/// title while the CLI path worked. There is no unit pin, for either statement
+/// below: enrichment opens the real library and keychain, which no test may
+/// touch. If the enrich call disappears again, the symptom is epoch titles on
+/// dashboard meetings while `fotwd record` titles fine; if the announcement
+/// does, it is a dashboard that lists the meeting under its epoch title and
+/// only shows the real one after a reload.
+async fn enrich_and_announce(root: &Path, meeting_id: &str, ready: &ReadyTap) {
     let report = crate::enrich::enrich_meeting(root, meeting_id).await;
     if let Some(title) = &report.title {
         eprintln!("  meeting titled: {title}");
@@ -497,4 +583,7 @@ async fn enrich_and_announce(root: &Path, meeting_id: &str) {
     for problem in &report.problems {
         eprintln!("  ! enrichment: {problem}");
     }
+    // Unconditional: `problems` is non-fatal and a partial enrichment — a
+    // title but no summary — is still something the open tab should be shown.
+    ready.emit(meeting_id, MeetingReadyReason::Enriched);
 }

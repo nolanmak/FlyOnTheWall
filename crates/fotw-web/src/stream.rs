@@ -83,11 +83,47 @@ pub struct Delta {
 /// What a subscriber receives: one 100 ms batch.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Frame {
-    /// Always `deltas`. Present so the client can switch on it when this grows
-    /// a second message type without reparsing by shape.
+    /// Always `deltas` on this struct. The switch it was put here for is now
+    /// real: `resync` and [`MeetingReady`]'s `meeting_ready` share the
+    /// channel, and the client dispatches on this field rather than guessing
+    /// from shape.
     pub kind: String,
     /// Every delta published since the previous tick, in publication order.
     pub deltas: Vec<Delta>,
+}
+
+/// Why a meeting just became worth re-fetching (#78).
+///
+/// The client treats both identically — refresh the list, redraw the pane if
+/// it is the one open. They are distinguished for tests and for anyone
+/// watching the wire, where "the row exists" and "the row finally has a
+/// title" are minutes apart on a long meeting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MeetingReadyReason {
+    /// The row is in the library and queryable. Sent before promotion: the
+    /// Opus encode can take minutes and the meeting is already listable.
+    Persisted,
+    /// Enrichment finished, so the title and summary are final.
+    Enriched,
+}
+
+/// The library-changed frame: a meeting is queryable, go and fetch it.
+///
+/// Nothing tells an open dashboard that a recording finished, so the list
+/// stayed stale until the tab was reloaded (#78). This is that event. It
+/// carries no `deltas` field on purpose — a client from before this frame
+/// existed falls through to `appendDeltas(frame.deltas || [])`, which no-ops
+/// on an empty array.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeetingReady {
+    /// Always `meeting_ready`.
+    pub kind: String,
+    /// The meeting to fetch — the library id, not the session id the live
+    /// deltas carry. The client matches it against the open detail pane.
+    pub meeting_id: String,
+    /// Which of the two moments this is.
+    pub reason: MeetingReadyReason,
 }
 
 /// The fan-out point between the pipeline and every open WebSocket.
@@ -149,6 +185,39 @@ impl DeltaHub {
         // state of a meeting nobody has opened a tab for.
         let _ = self.tx.send(Arc::from(json.as_str()));
         n
+    }
+
+    /// Tell every open tab that a meeting is worth fetching (#78).
+    ///
+    /// Not a [`DeltaHub::publish`]: that buffers a `Delta`, and
+    /// [`DeltaHub::flush`] hard-codes `kind: "deltas"` and drops an empty
+    /// batch, so a non-delta frame cannot ride the batching path at all. It
+    /// goes straight down the channel underneath, which is kind-agnostic —
+    /// exactly how `resync` already travels.
+    ///
+    /// Flushes first, so anything already buffered keeps its place in
+    /// publication order: the finisher announces from a blocking thread that
+    /// can land between two ticks, and a browser told the meeting is over
+    /// before it was told the last sentence of it would draw them in the wrong
+    /// order.
+    ///
+    /// Sends immediately rather than waiting for a tick — the point of the
+    /// frame is that the tab stops being stale *now* — and is synchronous and
+    /// non-blocking, because the caller is the `spawn_blocking` thread the
+    /// session finisher runs on and must not be made to wait on a browser.
+    pub fn announce_meeting_ready(&self, meeting_id: &str, reason: MeetingReadyReason) {
+        self.flush();
+        let frame = MeetingReady {
+            kind: "meeting_ready".to_owned(),
+            meeting_id: meeting_id.to_owned(),
+            reason,
+        };
+        let Ok(json) = serde_json::to_string(&frame) else {
+            return;
+        };
+        // As in `flush`: no subscribers is the normal state of a daemon
+        // nobody has a tab open on, and it must never fail a persist.
+        let _ = self.tx.send(Arc::from(json.as_str()));
     }
 
     /// A receiver for every frame broadcast from now on.
@@ -409,6 +478,84 @@ mod tests {
         assert!(
             frames >= 2,
             "got {frames} frames; the flusher is not running"
+        );
+    }
+
+    // --------------------------------------------------------------- #78
+
+    /// The frame the library refresh rides on, pinned byte for byte.
+    ///
+    /// Exact JSON rather than a round-trip through [`MeetingReady`], because
+    /// the consumer is `app.js` and it switches on the literal strings
+    /// `meeting_ready` and reads `frame.meeting_id`. A rename on this side
+    /// that still deserialises here would leave every open tab stale again,
+    /// which is the bug.
+    #[tokio::test]
+    async fn an_announcement_reaches_subscribers_without_waiting_for_a_tick() {
+        let hub = Arc::new(DeltaHub::new());
+        let mut rx = hub.subscribe();
+
+        hub.announce_meeting_ready("m-42", MeetingReadyReason::Persisted);
+
+        let json = rx.try_recv().expect("no tick may be needed");
+        assert_eq!(
+            json.as_ref(),
+            r#"{"kind":"meeting_ready","meeting_id":"m-42","reason":"persisted"}"#
+        );
+
+        hub.announce_meeting_ready("m-42", MeetingReadyReason::Enriched);
+        let json = rx.try_recv().expect("the second announcement too");
+        assert_eq!(
+            json.as_ref(),
+            r#"{"kind":"meeting_ready","meeting_id":"m-42","reason":"enriched"}"#
+        );
+    }
+
+    /// Publication order, which is the whole reason this flushes first.
+    ///
+    /// The finisher announces from a blocking thread that can land between
+    /// two 10 Hz ticks, so the last words of the meeting may still be sitting
+    /// in the buffer. Sending "ready" ahead of them would put the meeting's
+    /// closing sentence on screen *after* the library said it was done.
+    #[tokio::test]
+    async fn an_announcement_flushes_the_buffered_deltas_first() {
+        let hub = Arc::new(DeltaHub::new());
+        let mut rx = hub.subscribe();
+
+        hub.publish(delta("the last thing anyone said"));
+        hub.announce_meeting_ready("m-42", MeetingReadyReason::Persisted);
+
+        let first: Frame = serde_json::from_str(&rx.try_recv().expect("the deltas")).unwrap();
+        assert_eq!(first.kind, "deltas");
+        assert_eq!(first.deltas[0].text, "the last thing anyone said");
+
+        let second: MeetingReady =
+            serde_json::from_str(&rx.try_recv().expect("then the announcement")).unwrap();
+        assert_eq!(second.meeting_id, "m-42");
+        assert_eq!(second.reason, MeetingReadyReason::Persisted);
+    }
+
+    /// The normal state of a daemon nobody has opened a tab for. The finisher
+    /// must not learn about it, and must certainly not fail a persist over it.
+    #[tokio::test]
+    async fn announcing_to_nobody_is_not_an_error() {
+        let hub = Arc::new(DeltaHub::new());
+        hub.announce_meeting_ready("m-42", MeetingReadyReason::Persisted);
+        assert_eq!(hub.subscriber_count(), 0);
+    }
+
+    /// An announcement is not a tick: it must not manufacture an empty
+    /// `deltas` frame on the way past, or a silent meeting starts costing the
+    /// wake-ups `silence_costs_nothing` exists to forbid.
+    #[tokio::test]
+    async fn an_announcement_over_an_empty_buffer_sends_exactly_one_frame() {
+        let hub = Arc::new(DeltaHub::new());
+        let mut rx = hub.subscribe();
+        hub.announce_meeting_ready("m-42", MeetingReadyReason::Enriched);
+        assert!(rx.try_recv().is_ok(), "the announcement");
+        assert!(
+            rx.try_recv().is_err(),
+            "an empty flush must not have sent a `deltas` frame as well"
         );
     }
 
