@@ -27,6 +27,7 @@
 //! run on the *output*. A glowing summary with no citations is still caught.
 
 use crate::hash::sha256_hex;
+use crate::schema::EXTRACTION_SCHEMA;
 
 /// The versioned prompt file (spec 8.3). Compiled in, so a corrupted or
 /// missing file is a build failure rather than a runtime one.
@@ -197,11 +198,34 @@ pub fn augment_instruction(meeting_date: &str, has_notes: bool) -> String {
 /// nullable fields "load-bearing" precisely because they are the mechanism that
 /// lets the model decline to invent — and a schema that permits null while a
 /// prompt implies every field should be filled gets filled.
+///
+/// `schema_transmitted` is the adapter's `strict_json_schema` capability. When
+/// it is false, `run_call_b` sends no `output_config.format`, so telling the
+/// model to answer "as JSON matching the provided schema" names a schema it was
+/// never provided (#75). That arm inlines [`EXTRACTION_SCHEMA`] and forbids the
+/// fence instead. Rewording alone would not be enough: the instruction never
+/// names the five top-level keys, and [`crate::schema::Extraction`] has no
+/// serde defaults, so a well-intentioned wrong-keyed answer yields zero items
+/// every time.
 #[must_use]
-pub fn extraction_instruction(meeting_date: &str) -> String {
+pub fn extraction_instruction(meeting_date: &str, schema_transmitted: bool) -> String {
+    let (shape, schema_clause) = if schema_transmitted {
+        ("as JSON matching the provided schema.", String::new())
+    } else {
+        (
+            "as a single raw JSON object.",
+            format!(
+                "\n\nAnswer with that object and nothing else: no code fence, no `json` marker, \
+                 no preamble, no commentary before or after it. The first character of your \
+                 reply must be `{{` and the last must be `}}`.\n\nThe object must conform to \
+                 this JSON Schema:\n\n{}",
+                schema_text()
+            ),
+        )
+    };
     format!(
         "Meeting date: {meeting_date}. Extract action items, decisions, open questions, \
-         follow-ups and topics from the transcript above, as JSON matching the provided schema.\n\n\
+         follow-ups and topics from the transcript above, {shape}\n\n\
          Rules:\n\
          - `evidence_segment_ids` must list the `[#N]` ids of the segments that support the item. \
          At least one, and only ids you can see in the transcript.\n\
@@ -215,8 +239,18 @@ pub fn extraction_instruction(meeting_date: &str) -> String {
          from urgency.\n\
          - `confidence` is `explicit` when the item was stated outright and `implied` when you \
          inferred it.\n\
-         - An empty array is a valid and common answer. Do not pad it."
+         - An empty array is a valid and common answer. Do not pad it.{schema_clause}"
     )
+}
+
+/// [`EXTRACTION_SCHEMA`] rendered for a prompt.
+///
+/// Pretty-printed rather than compact: the model is being asked to read it, and
+/// the schema is a one-off block after the transcript rather than part of the
+/// cached prefix, so the extra tokens buy legibility cheaply.
+fn schema_text() -> String {
+    serde_json::to_string_pretty(&*EXTRACTION_SCHEMA)
+        .unwrap_or_else(|_| EXTRACTION_SCHEMA.to_string())
 }
 
 #[cfg(test)]
@@ -382,10 +416,70 @@ mod tests {
         assert_eq!(before.len(), 64);
     }
 
+    /// The instruction Call B has always sent alongside a transmitted schema.
+    ///
+    /// Pinned as bytes rather than as substrings: #75 changed only the arm for
+    /// adapters that cannot be sent one, and an edit drifting into this arm
+    /// would silently change what every API run asks for.
+    const SCHEMA_ARM: &str = "Meeting date: 2026-08-11. Extract action items, decisions, open \
+         questions, follow-ups and topics from the transcript above, as JSON matching the \
+         provided schema.\n\n\
+         Rules:\n\
+         - `evidence_segment_ids` must list the `[#N]` ids of the segments that support the item. \
+         At least one, and only ids you can see in the transcript.\n\
+         - `evidence_quote` must be copied verbatim from those segments — the spoken words only, \
+         without the `[#N]` prefix, the speaker label or the timestamp.\n\
+         - `owner` must be a speaker label exactly as it appears in the transcript, or null. \
+         **An action item with a null owner is correct and expected. Guessing an owner is a \
+         failure.** If nobody took the item, the owner is null.\n\
+         - `due` is ISO-8601 resolved against the meeting date, and `due_raw` is the literal \
+         phrase that was said. If no deadline was said, both are null. Do not infer a deadline \
+         from urgency.\n\
+         - `confidence` is `explicit` when the item was stated outright and `implied` when you \
+         inferred it.\n\
+         - An empty array is a valid and common answer. Do not pad it.";
+
+    #[test]
+    fn the_schema_arm_of_the_extraction_instruction_is_unchanged() {
+        assert_eq!(extraction_instruction("2026-08-11", true), SCHEMA_ARM);
+    }
+
+    #[test]
+    fn the_no_schema_arm_forbids_fences_and_inlines_the_schema() {
+        // #75: with no `output_config.format` on the call there is no "provided
+        // schema" to match, so the instruction has to carry the shape itself.
+        let without = extraction_instruction("2026-08-11", false);
+
+        assert!(!without.contains("the provided schema"));
+        assert!(without.contains("as a single raw JSON object."));
+        assert!(without.contains("no code fence"));
+        assert!(without.contains("no commentary"));
+
+        // Naming the five top-level keys is the load-bearing half. `Extraction`
+        // has no serde defaults, so a wrong-keyed answer -- however
+        // well-intentioned -- yields zero items every single time.
+        for key in [
+            "action_items",
+            "decisions",
+            "open_questions",
+            "follow_ups",
+            "topics",
+        ] {
+            assert!(without.contains(key), "the no-schema arm never names {key}");
+        }
+        // The real schema, not a paraphrase of it.
+        assert!(without.contains("additionalProperties"));
+        assert!(without.contains("evidence_quote"));
+
+        // And the shared rules survive on both arms.
+        assert!(without.contains("null owner is correct and expected"));
+        assert!(without.contains("Do not pad it."));
+    }
+
     #[test]
     fn the_extraction_instruction_says_a_null_owner_is_correct() {
         // Spec 8.5: the nullable fields only work if the prompt says so.
-        let instruction = extraction_instruction("2026-08-11").to_lowercase();
+        let instruction = extraction_instruction("2026-08-11", true).to_lowercase();
         assert!(instruction.contains("null owner is correct and expected"));
         assert!(instruction.contains("guessing an owner is a"));
         assert!(instruction.contains("empty array is a valid"));

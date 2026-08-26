@@ -1643,6 +1643,11 @@ async fn summarize_command(root: PathBuf, meeting_id: String, slug: Option<Strin
                     out.dropped_items
                 );
             }
+            for warning in &out.warnings {
+                // Same reasoning one line up: a summary missing its structured
+                // half still prints, but never silently (#75).
+                println!("  warning    : {warning}");
+            }
             println!();
             for line in out.markdown.lines() {
                 println!("  {line}");

@@ -13,6 +13,7 @@
 //! same user), and the model-generated shell codex may run is boxed to
 //! `--sandbox read-only` — a summariser has no business writing the disk.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use fotw_summarize::adapter::{DocumentPayload, LlmAdapter, LlmRequest};
@@ -21,35 +22,51 @@ use fotw_summarize::claude_cli::{CliOutput, CliTransport};
 use fotw_summarize::codex_cli::CodexCliAdapter;
 use fotw_summarize::document::TranscriptDocument;
 use fotw_summarize::error::SummarizeError;
+use fotw_summarize::pipeline::Pipeline;
 use fotw_summarize::testing::{block_on, sample_meeting};
 use fotw_summarize::transport::BoxFuture;
 
 /// Records what the adapter asked for and answers with a canned result.
 struct FakeCli {
     calls: Mutex<Vec<(Vec<String>, String)>>,
-    output: CliOutput,
+    /// One answer per invocation, in order.
+    ///
+    /// A queue rather than a single output because the two-call pipeline
+    /// invokes the adapter twice and the two answers are different shapes.
+    /// Running out is an error rather than a repeat, so a test that makes an
+    /// unexpected extra call fails naming the call — the same bargain
+    /// `MockTransport` strikes.
+    outputs: Mutex<VecDeque<CliOutput>>,
 }
 
 impl FakeCli {
     fn answering(output: CliOutput) -> Arc<Self> {
+        Self::scripted(vec![output])
+    }
+
+    fn scripted(outputs: Vec<CliOutput>) -> Arc<Self> {
         Arc::new(Self {
             calls: Mutex::new(Vec::new()),
-            output,
+            outputs: Mutex::new(outputs.into()),
         })
     }
 
     fn ok(jsonl: &str) -> Arc<Self> {
-        Self::answering(CliOutput {
-            status: 0,
-            stdout: jsonl.to_owned(),
-            stderr: String::new(),
-        })
+        Self::answering(exit_zero(jsonl))
     }
 
     fn only_call(&self) -> (Vec<String>, String) {
         let calls = self.calls.lock().unwrap();
         assert_eq!(calls.len(), 1, "expected exactly one CLI invocation");
         calls[0].clone()
+    }
+}
+
+fn exit_zero(stdout: &str) -> CliOutput {
+    CliOutput {
+        status: 0,
+        stdout: stdout.to_owned(),
+        stderr: String::new(),
     }
 }
 
@@ -63,8 +80,12 @@ impl CliTransport for FakeCli {
             .lock()
             .unwrap()
             .push((argv.to_vec(), stdin.to_owned()));
-        let output = self.output.clone();
-        Box::pin(async move { Ok(output) })
+        let next = self.outputs.lock().unwrap().pop_front();
+        Box::pin(async move {
+            next.ok_or_else(|| {
+                SummarizeError::Transport("FakeCli ran out of scripted answers".to_owned())
+            })
+        })
     }
 }
 
@@ -253,6 +274,56 @@ fn a_nonzero_exit_is_a_transport_error_carrying_stderr() {
         SummarizeError::Transport(msg) => assert!(msg.contains("not logged in")),
         other => panic!("expected Transport, got {other:?}"),
     }
+}
+
+// ------------------------------------------------------- the whole pipeline
+
+/// An extraction whose evidence resolves against [`sample_meeting`].
+fn extraction_json() -> String {
+    serde_json::json!({
+        "action_items": [{
+            "text": "Write the migration script",
+            "owner": "S0",
+            "due": null,
+            "due_raw": null,
+            "confidence": "explicit",
+            "evidence_segment_ids": [2],
+            "evidence_quote": "I will write the migration script by Friday"
+        }],
+        "decisions": [], "open_questions": [], "follow_ups": [], "topics": []
+    })
+    .to_string()
+}
+
+/// #75's acceptance shape for codex: `parse_stream` strips the JSONL wrapper,
+/// but the `agent_message` it leaves behind is a chatty assistant turn, not
+/// bare JSON — and nothing was ever sent that could make it one.
+#[test]
+fn a_chatty_agent_message_with_fenced_json_still_yields_a_complete_summary() {
+    let cli = FakeCli::scripted(vec![
+        exit_zero(&stream(
+            "The team agreed to move the storage layer to SQLite.",
+        )),
+        exit_zero(&stream(&format!(
+            "Sure — here is the extraction:\n\n```json\n{}\n```\n\nLet me know if you want more.",
+            extraction_json()
+        ))),
+    ]);
+    let adapter = CodexCliAdapter::new(cli, None);
+    let document = TranscriptDocument::from_segments(&sample_meeting());
+
+    let pipeline = Pipeline::new(&adapter, &adapter);
+    let outcome = block_on(pipeline.run(&document, "")).expect("chatter must not lose the summary");
+
+    assert!(
+        outcome.markdown().contains("SQLite"),
+        "Call A's prose was lost"
+    );
+    assert_eq!(
+        outcome.validation.extraction.action_items.len(),
+        1,
+        "the fenced extraction was not recovered"
+    );
 }
 
 #[test]

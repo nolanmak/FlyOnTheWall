@@ -90,6 +90,15 @@ pub enum Warning {
         /// How many chunks.
         chunks: usize,
     },
+    /// Call B's answer could not be read as an extraction (#75).
+    ///
+    /// A summary with no action items beats no summary, so the run keeps Call
+    /// A's prose and reports this instead of failing. One per chunk: under
+    /// map-reduce the chunks that answered well keep their items.
+    ExtractionFailed {
+        /// The parse failure, so the message can name why.
+        detail: String,
+    },
 }
 
 /// How to run the pipeline.
@@ -226,8 +235,14 @@ impl<'a> Pipeline<'a> {
     /// # Errors
     ///
     /// Any transport, HTTP or decoding failure from either call, and
-    /// [`SummarizeError::SchemaViolation`] if Call B's JSON does not match the
-    /// extraction schema.
+    /// [`SummarizeError::Truncated`] if a response stopped early.
+    ///
+    /// A Call B answer that does not parse is **not** one of them: it becomes a
+    /// [`Warning::ExtractionFailed`] and the run keeps Call A's prose (#75).
+    /// The line is drawn there because a transport or HTTP failure means the
+    /// call did not happen, and a regenerate can plausibly produce a whole
+    /// summary; a schema violation means it happened and the prose half of it
+    /// is already good.
     pub async fn run(
         &self,
         document: &TranscriptDocument,
@@ -240,7 +255,8 @@ impl<'a> Pipeline<'a> {
         let (blocks, usage_a) = self
             .run_call_a(document, user_notes, &system, &chunks)
             .await?;
-        let (extraction, usage_b) = self.run_call_b(document, &system, &chunks).await?;
+        let (extraction, usage_b, extraction_failures) =
+            self.run_call_b(document, &system, &chunks).await?;
 
         let coverage = coverage::measure(&blocks, &self.config.coverage);
         let validation = validate::validate(&extraction, document, &self.config.validator);
@@ -255,6 +271,9 @@ impl<'a> Pipeline<'a> {
             warnings.push(Warning::ItemsDropped {
                 count: validation.drop_count(),
             });
+        }
+        for detail in extraction_failures {
+            warnings.push(Warning::ExtractionFailed { detail });
         }
         if self.expects_cache_hit() && usage_b.cache_read_input_tokens == 0 {
             warnings.push(Warning::CachePrefixMissed);
@@ -390,15 +409,21 @@ impl<'a> Pipeline<'a> {
     /// Extraction needs no reduce step: `evidence_segment_ids` are global, so
     /// two chunks' action items merge by appending, and the validator drops the
     /// duplicates' evidence problems if there are any.
+    ///
+    /// Returns the merged extraction, the usage, and one detail string per
+    /// chunk whose answer could not be parsed (#75). Because there is no reduce
+    /// step, this loop is the only place per-chunk tolerance can live — and it
+    /// is what stops chunk 3's code fence from zeroing chunks 1 and 2.
     async fn run_call_b(
         &self,
         document: &TranscriptDocument,
         system: &SystemPrompt,
         chunks: &[Chunk],
-    ) -> Result<(Extraction, Usage), SummarizeError> {
+    ) -> Result<(Extraction, Usage, Vec<String>), SummarizeError> {
         let capabilities = self.extraction.capabilities();
         let mut merged = Extraction::default();
         let mut usage = Usage::default();
+        let mut failures = Vec::new();
 
         for chunk in chunks {
             let request = LlmRequest {
@@ -413,7 +438,13 @@ impl<'a> Pipeline<'a> {
                     title: DOCUMENT_TITLE.to_string(),
                 }),
                 user_notes: None,
-                instruction: prompt::extraction_instruction(&self.config.meeting_date),
+                // The capability decides the wording: with no
+                // `output_format` below there is no "provided schema" to
+                // match, so the instruction has to carry the shape itself.
+                instruction: prompt::extraction_instruction(
+                    &self.config.meeting_date,
+                    capabilities.strict_json_schema,
+                ),
                 // Citations off. Spec 8.4: mutually exclusive with the format
                 // below, and the evidence linkage is explicit instead.
                 citations: false,
@@ -430,11 +461,19 @@ impl<'a> Pipeline<'a> {
 
             let response = self.extraction.complete(&request).await?;
             response.ensure_complete()?;
+            // Added before the parse, so a chunk whose answer we could not use
+            // is still paid for in the running total (SUM-11). Those tokens
+            // were spent either way.
             usage = add(usage, response.usage);
-            merge(&mut merged, parse_extraction(&response)?);
+            match parse_extraction(&response) {
+                Ok(extraction) => merge(&mut merged, extraction),
+                // The model answering badly is not the call failing (#75).
+                Err(SummarizeError::SchemaViolation(detail)) => failures.push(detail),
+                Err(other) => return Err(other),
+            }
         }
 
-        Ok((merged, usage))
+        Ok((merged, usage, failures))
     }
 
     /// The model id for a call: the preset's choice, or the adapter's own.
@@ -451,15 +490,81 @@ impl PipelineConfig {
     }
 }
 
-/// Parse Call B's JSON body.
+/// Parse Call B's JSON body, tolerating the wrapping a model adds when it was
+/// never sent a schema to enforce (#75).
+///
+/// Strict first, unconditionally: an adapter with `strict_json_schema` answers
+/// with bare JSON and takes exactly the path it always did, which is why this
+/// needs no capability gate — a gate here would be a branch that never fires.
+/// Only when the strict parse fails do we go looking for a JSON object inside
+/// the answer, which subsumes a markdown code fence, a "Here's the extraction:"
+/// preamble and trailing commentary in one scan: backticks are not braces.
 fn parse_extraction(response: &LlmResponse) -> Result<Extraction, SummarizeError> {
     let text = response.text();
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Ok(Extraction::default());
     }
-    serde_json::from_str(trimmed)
-        .map_err(|error| SummarizeError::SchemaViolation(error.to_string()))
+    let strict = match serde_json::from_str(trimmed) {
+        Ok(extraction) => return Ok(extraction),
+        Err(error) => error,
+    };
+    // The *strict* error, not the last candidate's: it describes the answer the
+    // model actually gave, which is what a warning has to name.
+    embedded_object(trimmed).ok_or_else(|| SummarizeError::SchemaViolation(strict.to_string()))
+}
+
+/// The first balanced `{...}` slice in `text` that parses as an [`Extraction`].
+///
+/// Every `{` is a candidate rather than only the first. A preamble reading
+/// "I found {2} items:" would otherwise hand back that slice and give up, and
+/// a wrapper like `{"result": {…}}` would fail the same way — recovered by the
+/// same retry, because [`Extraction`] has no serde defaults and so rejects any
+/// object missing its five keys.
+fn embedded_object(text: &str) -> Option<Extraction> {
+    let bytes = text.as_bytes();
+    for (start, _) in text.match_indices('{') {
+        if let Some(end) = balanced_end(bytes, start)
+            && let Ok(extraction) = serde_json::from_str(&text[start..end])
+        {
+            return Some(extraction);
+        }
+    }
+    None
+}
+
+/// The index one past the `}` closing the object that opens at `start`.
+///
+/// String- and escape-aware. A naive depth counter truncates the object at the
+/// first `}` inside a quoted value — "Confirm the } in the config" is a
+/// perfectly ordinary thing for a meeting to be about.
+fn balanced_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, byte) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn merge(into: &mut Extraction, from: Extraction) {
@@ -629,6 +734,19 @@ mod tests {
                 "output_tokens": 120,
                 "cache_read_input_tokens": cache_read
             }
+        })
+    }
+
+    /// A Call B response whose answer text is exactly `text`.
+    ///
+    /// [`extraction_response`] serializes a `Value`, so it can only ever
+    /// produce bare JSON. Nothing enforces that on a CLI engine
+    /// (`strict_json_schema: false`), which is the whole subject of #75.
+    fn raw_extraction_response(text: &str) -> Value {
+        json!({
+            "content": [{ "type": "text", "text": text }],
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": 10, "output_tokens": 120 }
         })
     }
 
@@ -1050,8 +1168,72 @@ mod tests {
         assert!(requests[0].body["messages"][0]["content"][0]["cache_control"].is_null());
     }
 
+    // -- #75: a malformed Call B must not discard Call A --------------------
+
+    /// Run the two calls with an arbitrary Call B answer text.
+    fn run_with_call_b_answer(answer: &str) -> SummaryOutcome {
+        let (outcome, _) = run_with(
+            vec![prose_response(true), raw_extraction_response(answer)],
+            PipelineConfig::default(),
+            "",
+        );
+        outcome
+    }
+
     #[test]
-    fn call_b_json_that_is_not_the_schema_is_a_schema_violation_not_a_panic() {
+    fn a_fenced_call_b_answer_still_yields_a_complete_summary() {
+        // The #75 headline: one markdown fence around otherwise-perfect JSON
+        // used to take the whole run down, prose included.
+        let outcome = run_with_call_b_answer(&format!("```json\n{}\n```", good_extraction()));
+        assert!(
+            outcome.markdown().contains("SQLite"),
+            "Call A's prose was lost"
+        );
+        assert_eq!(outcome.validation.extraction.action_items.len(), 1);
+    }
+
+    #[test]
+    fn a_preamble_before_call_bs_json_is_ignored() {
+        let outcome =
+            run_with_call_b_answer(&format!("Here's the extraction:\n\n{}", good_extraction()));
+        assert_eq!(outcome.validation.extraction.action_items.len(), 1);
+    }
+
+    #[test]
+    fn trailing_commentary_after_call_bs_json_is_ignored() {
+        let outcome = run_with_call_b_answer(&format!(
+            "{}\n\nLet me know if you would like more detail.",
+            good_extraction()
+        ));
+        assert_eq!(outcome.validation.extraction.action_items.len(), 1);
+    }
+
+    #[test]
+    fn a_brace_inside_a_json_string_does_not_end_the_object() {
+        // A depth counter that is not string-aware closes the object at the
+        // `}` inside this value and then parses a truncated slice.
+        let mut body = good_extraction();
+        body["action_items"][0]["text"] = json!("Confirm the } in the config before Friday");
+        let outcome = run_with_call_b_answer(&format!("```json\n{body}\n```"));
+        assert_eq!(
+            outcome.validation.extraction.action_items[0].text,
+            "Confirm the } in the config before Friday"
+        );
+    }
+
+    #[test]
+    fn a_brace_in_the_preamble_does_not_win_over_the_real_object() {
+        // Taking the first `{` would slice out `{2}` and give up.
+        let outcome =
+            run_with_call_b_answer(&format!("I found {{2}} items: {}", good_extraction()));
+        assert_eq!(outcome.validation.extraction.action_items.len(), 1);
+    }
+
+    #[test]
+    fn call_b_json_that_is_not_the_schema_keeps_call_a_and_warns() {
+        // #75 deliberately reverses this test's original contract: it used to
+        // assert that a schema violation escaped `run`. A summary with no
+        // action items beats no summary, so the violation is now a warning.
         let transport = MockTransport::new()
             .with_json(prose_response(true))
             .with_json(json!({
@@ -1060,8 +1242,108 @@ mod tests {
             }));
         let adapter = AnthropicAdapter::new(transport, "claude-opus-5", "k");
         let pipeline = Pipeline::new(&adapter, &adapter);
-        let error = block_on(pipeline.run(&document(), "")).expect_err("bad JSON");
-        assert!(matches!(error, SummarizeError::SchemaViolation(_)));
+        let outcome = block_on(pipeline.run(&document(), "")).expect("Call A's prose survives");
+        assert!(outcome.markdown().contains("SQLite"));
+        assert_eq!(outcome.validation.extraction.item_count(), 0);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| matches!(w, Warning::ExtractionFailed { .. })),
+            "the violation was swallowed instead of reported: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn an_unparseable_call_b_still_returns_call_as_prose_with_its_usage_counted() {
+        // Token accounting has to stay honest for a chunk whose answer we
+        // could not use: those tokens were spent either way (SUM-11).
+        let outcome = run_with_call_b_answer("I could not find anything to extract, sorry!");
+        assert!(outcome.markdown().contains("SQLite"));
+        assert_eq!(outcome.validation.extraction.item_count(), 0);
+        assert_eq!(outcome.usage_b.output_tokens, 120);
+
+        // The warning has to name the failure, not merely exist -- it is the
+        // only thing that will reach the user.
+        let detail = outcome
+            .warnings
+            .iter()
+            .find_map(|w| match w {
+                Warning::ExtractionFailed { detail } => Some(detail.clone()),
+                _ => None,
+            })
+            .expect("the unparseable answer went unreported");
+        assert!(
+            detail.contains("expected value"),
+            "the warning does not carry the serde error: {detail}"
+        );
+    }
+
+    #[test]
+    fn an_empty_code_fence_is_an_extraction_failure_not_a_silent_zero() {
+        // ```json\n``` trims to something non-empty with no `{` in it. That is
+        // a malformed answer, not the model declining to extract, and it is
+        // reported rather than passed off as a clean zero.
+        let outcome = run_with_call_b_answer("```json\n```");
+        assert!(outcome.markdown().contains("SQLite"));
+        assert_eq!(outcome.validation.extraction.item_count(), 0);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| matches!(w, Warning::ExtractionFailed { .. })),
+            "an empty fence was passed off as a clean zero: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn a_transport_failure_on_call_b_still_fails_the_run() {
+        // The boundary of the soft path: a schema violation is the model
+        // answering badly, a transport failure is the call not happening. Only
+        // the first is worth keeping a half-finished run for.
+        let transport = MockTransport::new()
+            .with_json(prose_response(true))
+            .with_error(SummarizeError::Transport("connection reset".to_string()));
+        let adapter = AnthropicAdapter::new(transport, "claude-opus-5", "k");
+        let pipeline = Pipeline::new(&adapter, &adapter);
+        let error = block_on(pipeline.run(&document(), "")).expect_err("transport is still hard");
+        assert!(matches!(error, SummarizeError::Transport(_)));
+    }
+
+    #[test]
+    fn call_b_inlines_the_schema_in_its_instruction_only_when_it_cannot_transmit_one() {
+        // Call B never sends `output_config.format` to an adapter that cannot
+        // enforce it, so the shape has to reach the model in the instruction
+        // instead -- otherwise it is asked to match "the provided schema" it
+        // was never provided.
+        let (_, strict) = default_run();
+        assert!(
+            !strict[1].body.to_string().contains("no code fence"),
+            "a schema-enforcing adapter does not need the prose rules"
+        );
+
+        let transport = MockTransport::new()
+            .with_json(prose_response(false))
+            .with_json(extraction_response(good_extraction(), 0));
+        let adapter = AnthropicAdapter::new(transport.clone(), "llama-3.3-70b", "k")
+            .with_capabilities(Capabilities {
+                usable_context_tokens: 1_000_000,
+                ..Capabilities::local_default()
+            });
+        let pipeline = Pipeline::new(&adapter, &adapter);
+        block_on(pipeline.run(&document(), "")).expect("runs");
+
+        let call_b = transport.requests()[1].body.to_string();
+        assert!(
+            call_b.contains("no code fence"),
+            "the no-schema instruction must forbid fences"
+        );
+        assert!(
+            call_b.contains("evidence_segment_ids") && call_b.contains("action_items"),
+            "the no-schema instruction must name the shape it wants"
+        );
     }
 
     #[test]
@@ -1309,6 +1591,58 @@ mod tests {
         assert!(
             outcome.validation.extraction.action_items.len() > 1,
             "chunked extractions were not merged"
+        );
+    }
+
+    #[test]
+    fn one_bad_chunk_keeps_the_other_chunks_extraction() {
+        // Call B has no reduce step by design, so the per-chunk loop is where
+        // tolerance has to live: chunk N's fence must not zero chunks 1..N-1.
+        let document = long_document();
+        let capabilities = Capabilities {
+            usable_context_tokens: 12_000,
+            ..Capabilities::anthropic_frontier()
+        };
+        let chunk_count = chunk::plan(&document, &capabilities)
+            .chunks(&document)
+            .len();
+        assert!(chunk_count > 1);
+
+        let mut transport = MockTransport::new();
+        for _ in 0..chunk_count {
+            transport = transport.with_json(prose_response(true));
+        }
+        transport = transport.with_json(json!({
+            "content": [{ "type": "text", "text": format!("{LONG_CLAIM} [[seg:401]]") }],
+            "stop_reason": "end_turn",
+            "usage": { "output_tokens": 500 }
+        }));
+        // Every chunk answers well except the last, which is chatty.
+        for index in 0..chunk_count {
+            transport = if index + 1 == chunk_count {
+                transport.with_json(raw_extraction_response("Sure! Here is nothing useful."))
+            } else {
+                transport.with_json(extraction_response(chunked_extraction(), 5))
+            };
+        }
+
+        let adapter = small_context_adapter(transport);
+        let pipeline = Pipeline::new(&adapter, &adapter);
+        let outcome = block_on(pipeline.run(&document, "")).expect("one bad chunk is survivable");
+        assert_eq!(
+            outcome.validation.extraction.action_items.len(),
+            chunk_count - 1,
+            "the good chunks' items were discarded with the bad one"
+        );
+        assert_eq!(
+            outcome
+                .warnings
+                .iter()
+                .filter(|w| matches!(w, Warning::ExtractionFailed { .. }))
+                .count(),
+            1,
+            "one bad chunk should produce exactly one warning: {:?}",
+            outcome.warnings
         );
     }
 
