@@ -72,6 +72,7 @@ pub mod prompt;
 pub mod schema;
 pub mod template;
 pub mod testing;
+pub mod title;
 pub mod tokens;
 pub mod transport;
 pub mod validate;

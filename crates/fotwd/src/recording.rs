@@ -341,12 +341,10 @@ fn persist_and_promote(root: &Path, outcome: &SessionOutcome, ready: &ReadyTap) 
     }
 
     let data_root = root.parent().unwrap_or(root).to_path_buf();
-    let title = format!(
-        "Untitled recording — {}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs())
-    );
+    // A dated placeholder, not an epoch second: enrichment replaces it within
+    // seconds when there is speech to name, and a meeting recorded in silence
+    // keeps this forever (#76, and #67's transcript-less acceptance).
+    let title = crate::enrich::dated_fallback_title(fotw_store::now_ms());
 
     match crate::open_library(root) {
         Err(e) => {

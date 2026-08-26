@@ -14,6 +14,7 @@ use fotw_stt::{Source, TimestampSource, TranscriptSegment};
 use fotw_summarize::document::TranscriptDocument;
 use fotw_summarize::pipeline::{Pipeline, PipelineConfig, SummaryOutcome, Warning};
 use fotw_summarize::template::Template;
+use fotw_summarize::title;
 use fotw_summarize::{AnthropicAdapter, Preset};
 
 use crate::transport::AllowlistedTransport;
@@ -22,6 +23,16 @@ use crate::transport::AllowlistedTransport;
 /// prompt — and finite, because a hung CLI must not become a meeting whose
 /// enrichment never finishes.
 const CLI_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long the *title* call may take — deliberately not [`CLI_DEADLINE`].
+///
+/// It is 64 output tokens over an 8 KiB head of transcript, and the whole
+/// reason it is its own call is that it answers in seconds where the summary
+/// takes minutes (#76). Enrichment no longer holds the recorder's slot (#77),
+/// so a hang here cannot block Start any more — but five minutes spent waiting
+/// for a one-line answer is still five minutes of an untitled meeting, and the
+/// GitHub export now waits behind the same pass.
+const TITLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// What a summarisation run produced.
 #[derive(Debug)]
@@ -55,6 +66,11 @@ pub enum SummarizeRunError {
          summarised later."
     )]
     NoKey,
+    /// The engine answered the title call with something that is not a title
+    /// (#76). Its own outcome, not a decode failure: the bytes parsed fine and
+    /// the sanitizer refused what was in them.
+    #[error("the engine's reply was not a usable title")]
+    NotATitle,
     /// The store failed.
     #[error("store: {0}")]
     Store(#[from] fotw_store::StoreError),
@@ -134,67 +150,15 @@ where
     // to the user, and hardcoding a tier here would fight their settings.
     let prose_model = Preset::Balanced.prose_model().unwrap_or("claude-opus-5");
     let extraction_model = Preset::Cheap.prose_model().unwrap_or("claude-haiku-4-5");
-    let (prose, extraction, provider_name, recorded_model): (
-        Box<dyn fotw_summarize::adapter::LlmAdapter>,
-        Box<dyn fotw_summarize::adapter::LlmAdapter>,
-        &str,
-        String,
-    ) = match &engine {
-        crate::engine::Engine::Anthropic { key } => (
-            Box::new(AnthropicAdapter::new(
-                Arc::clone(&transport),
-                prose_model,
-                key.expose(),
-            )),
-            Box::new(AnthropicAdapter::new(
-                Arc::clone(&transport),
-                extraction_model,
-                key.expose(),
-            )),
-            "anthropic",
-            prose_model.to_owned(),
-        ),
-        crate::engine::Engine::ClaudeCli { binary } => {
-            let runner = Arc::new(crate::engine::TokioCliRunner::new(
-                binary.clone(),
-                CLI_DEADLINE,
-            ));
-            (
-                Box::new(fotw_summarize::claude_cli::ClaudeCliAdapter::new(
-                    Arc::clone(&runner),
-                    None,
-                )),
-                Box::new(fotw_summarize::claude_cli::ClaudeCliAdapter::new(
-                    runner, None,
-                )),
-                "claude-cli",
-                "claude-cli".to_owned(),
-            )
-        }
-        crate::engine::Engine::Codex { binary } => {
-            // Same shape as the claude arm: both calls share one runner, and
-            // the model choice is the subscription's own default (None), never
-            // ours to hardcode into their plan. `shielded` because codex is
-            // agentic — it runs shell over the untrusted transcript — so the
-            // child gets an empty $HOME (see TokioCliRunner's docs).
-            let runner = Arc::new(crate::engine::TokioCliRunner::shielded(
-                binary.clone(),
-                CLI_DEADLINE,
-            ));
-            (
-                Box::new(fotw_summarize::codex_cli::CodexCliAdapter::new(
-                    Arc::clone(&runner),
-                    None,
-                )),
-                Box::new(fotw_summarize::codex_cli::CodexCliAdapter::new(
-                    runner, None,
-                )),
-                "codex-cli",
-                "codex-cli".to_owned(),
-            )
-        }
-    };
-    let (prose, extraction) = (&*prose, &*extraction);
+    let built = engine_adapters(
+        &engine,
+        &transport,
+        prose_model,
+        extraction_model,
+        CLI_DEADLINE,
+    );
+    let (provider_name, recorded_model) = (built.provider, built.model.clone());
+    let (prose, extraction) = (&*built.prose, &*built.extraction);
 
     // The template arrives as a parsed file (SUM-08), and what crosses this
     // seam is still just its rendered body -- untrusted text that
@@ -256,6 +220,153 @@ where
         dropped_items: outcome.validation.dropped.len(),
         warnings,
     })
+}
+
+/// The adapters one engine provides, and what to record about a run on them.
+///
+/// Built by [`engine_adapters`] so the three-arm match over [`Engine`] lives in
+/// one place: the title call (#76) needs the same construction with a
+/// different deadline, and a second copy of it is a second place for the codex
+/// read shield to be forgotten.
+struct EngineAdapters {
+    /// Call A's adapter, and the whole of the title call's.
+    prose: Box<dyn fotw_summarize::adapter::LlmAdapter>,
+    /// Call B's.
+    extraction: Box<dyn fotw_summarize::adapter::LlmAdapter>,
+    /// What the summary row records as its provider.
+    provider: &'static str,
+    /// What the summary row records as its model.
+    model: String,
+}
+
+/// Build both adapters for `engine`, giving any subprocess `deadline`.
+///
+/// On the API the two are two models — extraction is low-difficulty, so it
+/// runs on the cheap tier (spec 8.4's split). On a CLI both share one runner
+/// and the subscription's own configured default model: the plan's model
+/// choice belongs to the user, and hardcoding a tier here would fight their
+/// settings.
+fn engine_adapters<T>(
+    engine: &crate::engine::Engine,
+    transport: &Arc<T>,
+    prose_model: &str,
+    extraction_model: &str,
+    deadline: std::time::Duration,
+) -> EngineAdapters
+where
+    T: fotw_summarize::transport::HttpTransport + 'static,
+{
+    match engine {
+        crate::engine::Engine::Anthropic { key } => EngineAdapters {
+            prose: Box::new(AnthropicAdapter::new(
+                Arc::clone(transport),
+                prose_model,
+                key.expose(),
+            )),
+            extraction: Box::new(AnthropicAdapter::new(
+                Arc::clone(transport),
+                extraction_model,
+                key.expose(),
+            )),
+            provider: "anthropic",
+            model: prose_model.to_owned(),
+        },
+        crate::engine::Engine::ClaudeCli { binary } => {
+            let runner = Arc::new(crate::engine::TokioCliRunner::new(binary.clone(), deadline));
+            EngineAdapters {
+                prose: Box::new(fotw_summarize::claude_cli::ClaudeCliAdapter::new(
+                    Arc::clone(&runner),
+                    None,
+                )),
+                extraction: Box::new(fotw_summarize::claude_cli::ClaudeCliAdapter::new(
+                    runner, None,
+                )),
+                provider: "claude-cli",
+                model: "claude-cli".to_owned(),
+            }
+        }
+        crate::engine::Engine::Codex { binary } => {
+            // Same shape as the claude arm, plus the read shield: codex is
+            // agentic — it runs shell over the untrusted transcript — so the
+            // child gets an empty $HOME (see TokioCliRunner's docs).
+            let runner = Arc::new(crate::engine::TokioCliRunner::shielded(
+                binary.clone(),
+                deadline,
+            ));
+            EngineAdapters {
+                prose: Box::new(fotw_summarize::codex_cli::CodexCliAdapter::new(
+                    Arc::clone(&runner),
+                    None,
+                )),
+                extraction: Box::new(fotw_summarize::codex_cli::CodexCliAdapter::new(
+                    runner, None,
+                )),
+                provider: "codex-cli",
+                model: "codex-cli".to_owned(),
+            }
+        }
+    }
+}
+
+/// Ask the engine to name a meeting, over the daemon's real transport (#76).
+pub async fn title_meeting(
+    db: &mut Db,
+    store: &dyn KeyStore,
+    meeting_id: &str,
+    segments: &[TranscriptSegment],
+) -> Result<String, SummarizeRunError> {
+    let transport = Arc::new(AllowlistedTransport::new());
+    title_meeting_with(db, store, meeting_id, segments, transport).await
+}
+
+/// [`title_meeting`] over an injected transport.
+///
+/// Takes the segments the caller already loaded rather than re-reading them:
+/// the only caller is enrichment, which holds them for `fallback_title`
+/// anyway, and this call deliberately reads a *head* of them rather than the
+/// meeting.
+///
+/// One [`LlmAdapter::complete`](fotw_summarize::adapter::LlmAdapter::complete)
+/// against the cheap arm — naming a meeting is the lowest-difficulty task this
+/// daemon has — and the answer goes through
+/// [`clean_title`](fotw_summarize::title::clean_title) before it is anything
+/// but bytes. A reply that is not a name is an error here, which is what puts
+/// the meeting back on the local fallback.
+///
+/// # Errors
+///
+/// [`SummarizeRunError::NoTranscript`] with nothing to read,
+/// [`SummarizeRunError::NoKey`] with no engine, and whatever the provider or
+/// the sanitizer refused.
+pub async fn title_meeting_with<T>(
+    db: &mut Db,
+    store: &dyn KeyStore,
+    meeting_id: &str,
+    segments: &[TranscriptSegment],
+    transport: Arc<T>,
+) -> Result<String, SummarizeRunError>
+where
+    T: fotw_summarize::transport::HttpTransport + 'static,
+{
+    if segments.is_empty() {
+        return Err(SummarizeRunError::NoTranscript(meeting_id.to_owned()));
+    }
+    let engine = crate::engine::resolve_engine(store, db).ok_or(SummarizeRunError::NoKey)?;
+    let model = Preset::Cheap
+        .extraction_model()
+        .unwrap_or("claude-haiku-4-5");
+    let built = engine_adapters(&engine, &transport, model, model, TITLE_DEADLINE);
+
+    let document = TranscriptDocument::from_segments(segments);
+    let request = title::title_request(&document, title::head_indices(&document), model);
+    let response = built.prose.complete(&request).await?;
+    // SUM-10, and it means something specific here: the cap is 64 output
+    // tokens over an instruction that says "the title alone". A model that ran
+    // into that did not answer the question, and the local fallback is more
+    // honest than the first line of whatever it was writing instead.
+    response.ensure_complete()?;
+
+    title::clean_title(&response.text()).ok_or(SummarizeRunError::NotATitle)
 }
 
 /// The pipeline warnings worth putting in front of a user, worded for one.
