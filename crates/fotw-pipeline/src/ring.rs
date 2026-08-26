@@ -32,7 +32,10 @@ impl AudioRing {
                 inner: producer,
                 dropped: Arc::clone(&dropped),
             },
-            RingConsumer { inner: consumer },
+            RingConsumer {
+                inner: consumer,
+                dropped,
+            },
         )
     }
 }
@@ -91,6 +94,7 @@ impl RingProducer {
 #[derive(Debug)]
 pub struct RingConsumer {
     inner: Consumer<f32>,
+    dropped: Arc<AtomicU64>,
 }
 
 impl RingConsumer {
@@ -98,6 +102,18 @@ impl RingConsumer {
     pub fn pop_into(&mut self, out: &mut [f32]) -> usize {
         let (popped, _unfilled) = self.inner.pop_partial_slice(out);
         popped.len()
+    }
+
+    /// Samples the producer dropped because this half could not keep up.
+    ///
+    /// The same counter [`RingProducer::dropped_frames`] reads, from the side
+    /// that can actually report it: the producer moves onto the audio thread
+    /// and is never seen again, so a pump that only holds a consumer had no
+    /// way to read its own shortfall — which is why ring drops were invisible
+    /// for the life of the project (#79).
+    #[must_use]
+    pub fn dropped_frames(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// Samples ready to read.
