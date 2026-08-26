@@ -200,6 +200,21 @@ mod tests {
         }
     }
 
+    /// The one pin `app.js` can have: there is no JS harness in this project,
+    /// so nothing else in the suite would notice the client losing the third
+    /// recording state and going back to a clock that climbs past Stop (#77).
+    /// A grep is weak, and it is not nothing.
+    #[test]
+    fn the_spa_knows_about_the_finishing_state() {
+        let js = Ui::get("app.js").unwrap();
+        let js = String::from_utf8(js.data.into_owned()).unwrap();
+        assert!(
+            js.contains("\"finishing\""),
+            "the SPA must switch on the daemon's finishing state, or Stop \
+             leaves the session clock running"
+        );
+    }
+
     #[test]
     fn an_unknown_extension_is_not_served_as_html() {
         assert_eq!(content_type("x.bin"), "application/octet-stream");
