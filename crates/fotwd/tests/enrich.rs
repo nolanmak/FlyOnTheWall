@@ -8,6 +8,7 @@ use fotw_secrets::InMemoryKeyStore;
 use fotw_store::{Db, DbKey, NewMeeting, NewSegment};
 use fotwd::engine::SummarizeSettings;
 use fotwd::enrich::enrich_meeting_with;
+use fotwd::testing::{STUB_ENGINE_NAME, UNRESOLVABLE_ENGINE, skip_if_engine_live};
 
 fn db() -> Db {
     Db::open_in_memory(&DbKey::from_bytes([9u8; 32])).unwrap()
@@ -56,7 +57,7 @@ fn failing_cli(name: &str) -> String {
     let dir = std::env::temp_dir().join(format!("fotw-enrich-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let bin = dir.join("claude");
+    let bin = dir.join(STUB_ENGINE_NAME);
     std::fs::write(&bin, "#!/bin/sh\necho 'usage limit reached' >&2\nexit 1\n").unwrap();
     #[cfg(unix)]
     {
@@ -106,15 +107,15 @@ async fn without_an_engine_the_fallback_title_lands_and_nothing_egresses() {
 /// configured string is persisted, because a report that will not name the
 /// binary cannot be acted on.
 ///
-/// The binary is named `fotw-no-such-engine` rather than `claude` on purpose.
+/// The path comes from [`UNRESOLVABLE_ENGINE`] rather than being written here.
 /// A dead path whose *basename* resolves is the stale-row rescue working, and
 /// this test would then run the developer's real CLI — sending a fixture
-/// transcript to a provider from `cargo test`.
+/// transcript to a provider from `cargo test` (#83).
 #[tokio::test]
 async fn an_engine_the_daemon_cannot_resolve_is_reported_by_name() {
     let mut db = db();
     let meeting = meeting_with_transcript(&mut db);
-    cli_settings(&mut db, "/no/such/place/fotw-no-such-engine");
+    cli_settings(&mut db, UNRESOLVABLE_ENGINE);
 
     let report = enrich_meeting_with(&mut db, &InMemoryKeyStore::new(), &meeting).await;
 
@@ -124,18 +125,38 @@ async fn an_engine_the_daemon_cannot_resolve_is_reported_by_name() {
         "an unresolvable engine still gets the fallback title"
     );
     assert_eq!(row.enrich_status.as_deref(), Some("engine_unresolvable"));
-    assert_eq!(
-        row.enrich_detail.as_deref(),
-        Some("/no/such/place/fotw-no-such-engine")
-    );
+    assert_eq!(row.enrich_detail.as_deref(), Some(UNRESOLVABLE_ENGINE));
     assert!(
         report
             .problems
             .iter()
-            .any(|p| p.contains("/no/such/place/fotw-no-such-engine")),
+            .any(|p| p.contains(UNRESOLVABLE_ENGINE)),
         "the report must name the binary that failed: {:?}",
         report.problems
     );
+}
+
+/// #83's acceptance, at the site of the incident: the same test as above, with
+/// the one word changed that turns it into an egress.
+///
+/// Written `/no/such/place/claude`, this fixture used to reach
+/// `TokioCliRunner` with the developer's real `claude` and a transcript on its
+/// stdin. It now stops in `resolve_binary`, before an `Engine` exists to hand
+/// to a runner — a panic naming the issue instead of seventeen silent seconds.
+///
+/// The literal path is deliberate and must stay literal: this is the one test
+/// whose job is to write the dangerous thing on purpose and prove it is caught.
+#[tokio::test]
+#[should_panic(expected = "#83")]
+async fn a_fixture_that_names_a_dead_claude_is_stopped_before_it_can_spawn_one() {
+    // Load-bearing, not tidiness: with the guard down this body really would
+    // spawn the developer's `claude` and hand it the fixture transcript.
+    skip_if_engine_live();
+    let mut db = db();
+    let meeting = meeting_with_transcript(&mut db);
+    cli_settings(&mut db, "/no/such/place/claude");
+
+    enrich_meeting_with(&mut db, &InMemoryKeyStore::new(), &meeting).await;
 }
 
 /// A title the user typed is never overwritten. Only the timestamp fallback
@@ -269,10 +290,10 @@ const EXTRACTION: &str =
 
 /// A stub CLI that answers `replies` in order and refuses a fourth question.
 ///
-/// The binary is named `fotw-stub-engine`, never `claude`: `resolve_binary`
+/// The binary is named [`STUB_ENGINE_NAME`], never `claude`: `resolve_binary`
 /// falls back to a configured path's *basename* (#74), so a stub whose path
 /// went missing would resolve to the developer's real CLI and send a fixture
-/// transcript to a provider from `cargo test`.
+/// transcript to a provider from `cargo test` (#83).
 fn scripted_cli(name: &str, replies: &[&str]) -> ScriptedCli {
     let dir = std::env::temp_dir().join(format!("fotw-enrich-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -281,7 +302,7 @@ fn scripted_cli(name: &str, replies: &[&str]) -> ScriptedCli {
         std::fs::write(dir.join(format!("{}.json", i + 1)), envelope(reply)).unwrap();
     }
 
-    let bin = dir.join("fotw-stub-engine");
+    let bin = dir.join(STUB_ENGINE_NAME);
     std::fs::write(
         &bin,
         "#!/bin/sh\n\
@@ -497,7 +518,7 @@ async fn every_enrichment_path_leaves_a_finished_stamp() {
     {
         let mut lib = db();
         let meeting = meeting_with_transcript(&mut lib);
-        cli_settings(&mut lib, "/no/such/place/fotw-no-such-engine");
+        cli_settings(&mut lib, UNRESOLVABLE_ENGINE);
         enrich_meeting_with(&mut lib, &InMemoryKeyStore::new(), &meeting).await;
         assert!(finished_stamp(&lib, &meeting) > 0, "unresolvable engine");
     }

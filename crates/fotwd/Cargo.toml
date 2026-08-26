@@ -6,6 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Compiles the #83 test-egress refusal into `engine::resolve_binary`, and with
+# it `fotwd::testing`. Never enabled for a shipped build -- see the self
+# dev-dependency below for how it is switched on, and why it has to be.
+test-guards = []
+
 [dependencies]
 fotw-audio = { path = "../fotw-audio" }
 fotw-pipeline = { path = "../fotw-pipeline" }
@@ -43,6 +49,22 @@ tokio = { workspace = true, features = [
 reqwest = { version = "0.13.4", default-features = false, features = ["http2", "native-tls", "json", "charset"] }
 
 [dev-dependencies]
+# This crate, on itself, purely to turn `test-guards` on for the library that
+# `tests/*.rs` link against. It reads like a cycle and is not one: cargo allows
+# a dev-dependency back onto the same package, and a dev-dependency's features
+# are unified only when a dev target is actually being built.
+#
+# `#[cfg(test)]` cannot do this job. Integration tests are separate binaries
+# linking the *library*, which cargo builds without `--cfg test`, so a
+# `#[cfg(test)]` guard inside `engine.rs` is invisible to exactly the tests
+# that can spawn an engine -- which is the whole of #83's hazard. This feature
+# is the switch that reaches them.
+#
+# Verified against the build paths that matter: `cargo build -p fotwd`
+# (`just bundle`, `just dev-sign`), `cargo build -p fotwd --release`
+# (`just bundle release`) and `cargo build --workspace` (`just build`) all
+# resolve it OFF; `cargo test` and `cargo clippy --all-targets` resolve it ON.
+fotwd = { path = ".", features = ["test-guards"] }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }
 # The recovery round trip creates several throwaway libraries per test and has
 # to leave nothing behind when one fails mid-way -- the older

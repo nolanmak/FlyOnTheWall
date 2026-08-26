@@ -47,6 +47,15 @@ pub enum CliKind {
 }
 
 impl CliKind {
+    /// Every engine there is.
+    ///
+    /// Enumerated rather than left to each caller's `match`, so a guard that
+    /// has to answer "is this the name of a real CLI" cannot learn about one
+    /// engine and not the other — see `refuse_test_egress` (#83). A third
+    /// engine added to the enum and not to this array is a compile error at
+    /// the array length, which is the point of writing it down.
+    pub const ALL: [Self; 2] = [Self::Claude, Self::Codex];
+
     /// The binary a bare enablement defaults to when the user names none.
     ///
     /// Resolved to an **absolute path** when one can be found, because the
@@ -279,11 +288,104 @@ pub fn resolve_engine(store: &dyn KeyStore, db: &Db) -> Option<Engine> {
 /// Public so `fotwd engine` can report what the *daemon* would resolve rather
 /// than what the shell would — the two disagreeing is the whole of #74's
 /// second mechanism.
+///
+/// This is the only function in the tree that hands [`probe`] the real
+/// machine, and therefore the only door from a settings row to a binary that
+/// will actually be spawned. That makes it the one place the #83 guard has to
+/// stand; see `refuse_test_egress` below.
 #[must_use]
 pub fn resolve_binary(configured: &str) -> Option<PathBuf> {
+    #[cfg(feature = "test-guards")]
+    refuse_test_egress(configured);
     let path_var = std::env::var_os("PATH");
     let home = std::env::var_os("HOME").map(PathBuf::from);
     probe(configured, path_var.as_deref(), home.as_deref())
+}
+
+/// Whether this process asked for real engines — #83's escape hatch.
+///
+/// Off unless `FOTW_ENGINE_LIVE=1`, the same shape and the same reasoning as
+/// `fotw_secrets::os_tests_enabled`'s `FOTW_KEYCHAIN_TESTS`: a test that
+/// spends someone's subscription runs because it was asked to, never because
+/// it happened to be in the suite.
+#[cfg(feature = "test-guards")]
+#[must_use]
+pub fn engine_live_opt_in() -> bool {
+    std::env::var("FOTW_ENGINE_LIVE").is_ok_and(|value| value == "1")
+}
+
+/// Stop a test from resolving the developer's own `claude` or `codex` — #83.
+///
+/// # The hazard
+///
+/// [`probe`]'s basename rescue is correct in production and dangerous in
+/// `cargo test`, for the same reason: it finds a real engine even when the
+/// configured path is a fiction. A fixture that configures
+/// `/no/such/place/claude` gets the dead directory stripped, the basename
+/// probed against *this machine's* install spots, and the developer's real
+/// `~/.local/bin/claude` handed back — which enrichment then spawns with a
+/// transcript on stdin. That is a fixture leaving the machine from a test run.
+/// It has happened once already, during #74's own development, and the only
+/// thing that gave it away was the test taking 17 seconds.
+///
+/// Naming test fixtures `fotw-no-such-engine` avoids it by convention, and
+/// convention is one plausible `dir.join("claude")` away from failing.
+///
+/// # What is refused, and what is not
+///
+/// Refused: a configured value whose basename is a real engine and which is
+/// not itself an executable file — the rescue's exact precondition, and also
+/// the bare `"claude"` a settings fixture might carry. Allowed: a path that
+/// really is there (a test's own stub, used verbatim, never probed), and any
+/// name no installer uses, such as [`crate::testing::UNRESOLVABLE_ENGINE`].
+///
+/// The pure [`probe`] is deliberately *not* guarded. It takes `PATH` and
+/// `HOME` as arguments, so a test that hands it a `tempfile` home is
+/// describing a machine rather than touching one, and `tests/engine.rs` pins
+/// the whole of #74's candidate order that way.
+///
+/// # Getting past it on purpose
+///
+/// `FOTW_ENGINE_LIVE=1`, the same shape as `FOTW_CODEX_LIVE=1` in
+/// `tests/codex_live.rs` and `FOTW_KEYCHAIN_TESTS=1` in `fotw-secrets`: a test
+/// that means to spend someone's subscription says so out loud.
+///
+/// # Panics
+///
+/// That is the entire mechanism — a loud, immediate failure in place of a
+/// silent egress.
+#[cfg(feature = "test-guards")]
+fn refuse_test_egress(configured: &str) {
+    let path = std::path::Path::new(configured);
+    // The configured path is really there, so `probe` returns it verbatim and
+    // never looks at the basename. Every stub-planting test in the suite lives
+    // here, and is safe by construction rather than by naming.
+    if is_executable(path) {
+        return;
+    }
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    if !CliKind::ALL.iter().any(|kind| kind.bare_name() == name) {
+        return;
+    }
+    if engine_live_opt_in() {
+        return;
+    }
+    panic!(
+        "refusing to resolve `{configured}` from a test — #83.\n\n  \
+         Its basename is the real `{name}` CLI and that path is not there, so \
+         the #74 basename rescue would\n  \
+         probe this machine's own install spots, find your `{name}`, and hand \
+         it back for the caller to\n  \
+         spawn — with whatever transcript the fixture is holding on its stdin.\n\n  \
+         Configure `fotwd::testing::UNRESOLVABLE_ENGINE` for an engine no \
+         machine can resolve, or plant a\n  \
+         real stub named `fotwd::testing::STUB_ENGINE_NAME`. To drive the real \
+         CLI on purpose, set\n  \
+         FOTW_ENGINE_LIVE=1, the way `tests/codex_live.rs` gates on \
+         FOTW_CODEX_LIVE=1."
+    );
 }
 
 /// Find the binary a settings row names, the way `resolve_gh` does it
@@ -307,8 +409,24 @@ pub fn resolve_binary(configured: &str) -> Option<PathBuf> {
 /// merge triple, and a read that silently wins merges against the user's other
 /// laptop is a worse bug than the one being fixed.
 ///
+/// # Why that rescue is a hazard in tests, and only in tests
+///
+/// The rescue's whole value is that it finds a real engine when the configured
+/// path is wrong — which is precisely what makes it dangerous under
+/// `cargo test`, where the configured path is *deliberately* wrong. A fixture
+/// naming `/no/such/place/claude` has the dead directory stripped and gets the
+/// developer's own `claude` back, and the caller spawns it with a transcript.
+/// See #83, and `refuse_test_egress`, which stands at [`resolve_binary`] —
+/// the only caller that hands this function the real machine.
+///
+/// It stands *there* and not here on purpose. Weakening this function is the
+/// one thing #83 must not do: the rescue is the entire fix for #74 and the
+/// reason summaries work at all on a LaunchServices-launched daemon. The
+/// candidate order below is production behaviour, in tests and out.
+///
 /// Pure by construction — `path_var` and `home` are arguments — so the whole
-/// candidate order is testable without mutating process-global environment.
+/// candidate order is testable without mutating process-global environment,
+/// and a test describing a machine is never a test touching one.
 #[must_use]
 pub fn probe(
     configured: &str,

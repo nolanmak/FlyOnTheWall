@@ -16,6 +16,7 @@ use fotw_secrets::InMemoryKeyStore;
 use fotw_store::{Db, DbKey, NewMeeting, NewSegment};
 use fotwd::engine::SummarizeSettings;
 use fotwd::enrich::backfill_once;
+use fotwd::testing::STUB_ENGINE_NAME;
 
 fn db() -> Db {
     Db::open_in_memory(&DbKey::from_bytes([5u8; 32])).unwrap()
@@ -64,6 +65,11 @@ fn enable_cli(db: &mut Db, binary: &str) {
 ///
 /// The call counter lives on disk because each invocation is a fresh process;
 /// even calls are Call A's prose, odd calls are Call B's extraction.
+///
+/// The stub is [`STUB_ENGINE_NAME`], never `claude`. A configured path that
+/// exists is used verbatim, so this was safe by construction — but only while
+/// the file is there, and the day it is not, #74's basename rescue would find
+/// the developer's real CLI and hand it a fixture transcript (#83).
 fn working_cli(name: &str) -> String {
     let dir = std::env::temp_dir().join(format!("fotw-backfill-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -85,7 +91,7 @@ fn working_cli(name: &str) -> String {
     )
     .unwrap();
 
-    let bin = dir.join("claude");
+    let bin = dir.join(STUB_ENGINE_NAME);
     std::fs::write(
         &bin,
         "#!/bin/sh\n\

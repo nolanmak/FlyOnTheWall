@@ -12,9 +12,10 @@ use fotw_secrets::{InMemoryKeyStore, KeyStore, Provider, SecretKey, SecretString
 use fotw_stt::Source;
 use fotw_stt::transcript::{TimestampSource, TranscriptSegment};
 use fotwd::engine::{
-    Engine, EngineResolution, SummarizeSettings, fallback_title, probe, resolve_engine,
-    resolve_engine_detailed,
+    Engine, EngineResolution, SummarizeSettings, fallback_title, probe, resolve_binary,
+    resolve_engine, resolve_engine_detailed,
 };
+use fotwd::testing::{UNRESOLVABLE_ENGINE, skip_if_engine_live};
 
 fn db() -> fotw_store::Db {
     fotw_store::Db::open_in_memory(&key32()).unwrap()
@@ -309,6 +310,103 @@ fn a_binary_that_exists_nowhere_resolves_to_nothing() {
     let home = FakeHome::new();
     assert!(probe("claude", Some(std::ffi::OsStr::new("")), Some(home.path())).is_none());
     assert!(probe("", Some(std::ffi::OsStr::new("")), Some(home.path())).is_none());
+}
+
+// ------------------------------------------ the test-egress guard — #83
+
+/// The hazard, shown at the seam that leads to it and no further.
+///
+/// This is what a test that hand-writes `/no/such/place/claude` actually
+/// gets: the #74 rescue strips the dead directory, probes the basename, and
+/// hands back a real, runnable `claude` — which the caller then spawns with a
+/// fixture transcript on stdin. That is an egress out of `cargo test`, and it
+/// happened once already during #74's own development.
+///
+/// The `$HOME` here is a fake one, so this proves the *resolution* without
+/// touching the developer's own install and without spawning anything. It
+/// also pins the non-goal: the rescue itself must keep working exactly like
+/// this, because it is the whole of #74.
+#[test]
+fn a_dead_claude_path_resolves_to_a_real_installed_claude() {
+    let home = FakeHome::new();
+    let installed = home.install(".local/bin/claude");
+
+    let found = probe(
+        "/no/such/place/claude",
+        Some(std::ffi::OsStr::new("")),
+        Some(home.path()),
+    );
+    assert_eq!(
+        found.as_deref(),
+        Some(installed.as_path()),
+        "the rescue works as #74 intends — which is exactly why a test must \
+         never reach it through the real machine's HOME and PATH"
+    );
+}
+
+/// So the door that *does* read the real machine refuses instead.
+///
+/// [`resolve_binary`] is the only way a settings row becomes a spawnable
+/// path, and it is the only entry point that consults this process's real
+/// `HOME` and `PATH`. In a test build it declines the rescue's precondition —
+/// a configured path that is not there, named after an engine that is — and
+/// says so loudly. The pure [`probe`] above is untouched.
+#[test]
+#[should_panic(expected = "#83")]
+fn resolving_a_dead_claude_path_against_the_real_machine_is_refused() {
+    skip_if_engine_live();
+    let _ = resolve_binary("/no/such/place/claude");
+}
+
+#[test]
+#[should_panic(expected = "#83")]
+fn resolving_a_dead_codex_path_against_the_real_machine_is_refused() {
+    skip_if_engine_live();
+    let _ = resolve_binary("/no/such/place/codex");
+}
+
+/// The acceptance criterion in the shape a test really writes it: a settings
+/// row is the thing a fixture configures, and enrichment turns it into a
+/// spawn two calls later. The refusal has to land here, before an `Engine`
+/// exists to hand to a runner.
+#[test]
+#[should_panic(expected = "#83")]
+fn an_engine_row_naming_a_dead_claude_never_becomes_a_spawnable_engine() {
+    skip_if_engine_live();
+    let mut db = db();
+    write_settings(&mut db, &cli_settings("/no/such/place/claude", true));
+    let _ = resolve_engine_detailed(&InMemoryKeyStore::new(), &db);
+}
+
+/// The guard is about the *rescue*, not about the word "claude". A path that
+/// exists is used verbatim and never probed, so a test that plants its own
+/// stub is safe by construction and must stay allowed — several already do.
+#[test]
+fn a_configured_path_that_exists_is_never_guarded() {
+    assert_eq!(
+        resolve_binary("/bin/echo").as_deref(),
+        Some(std::path::Path::new("/bin/echo"))
+    );
+}
+
+/// And the name the helper mints is not a hazard either: it resolves to
+/// nothing on every machine, which is the whole point of minting it. This is
+/// the assertion that keeps [`UNRESOLVABLE_ENGINE`] honest — a helper whose
+/// path quietly started resolving would defeat every test that uses it.
+#[test]
+fn the_minted_unresolvable_engine_resolves_to_nothing_and_is_not_guarded() {
+    assert!(resolve_binary(UNRESOLVABLE_ENGINE).is_none());
+}
+
+/// A settings row is not the only thing a fixture can carry: a bare `"claude"`
+/// resolves off the developer's own `PATH` with no rescue involved at all.
+/// That is a real engine reached from `cargo test` just the same, so the
+/// refusal is about the *name*, not about the path having directories in it.
+#[test]
+#[should_panic(expected = "#83")]
+fn a_bare_engine_name_is_refused_too_it_resolves_off_the_real_path() {
+    skip_if_engine_live();
+    let _ = resolve_binary("claude");
 }
 
 // -------------------------------------------------- the reported resolution

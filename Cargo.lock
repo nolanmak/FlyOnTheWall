@@ -956,6 +956,7 @@ dependencies = [
  "fotw-stt",
  "fotw-summarize",
  "fotw-web",
+ "fotwd",
  "reqwest",
  "serde",
  "serde_json",
