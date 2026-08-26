@@ -30,7 +30,7 @@ use std::time::Duration;
 use fotw_audio::{AudioTap, CaptureTimestamp, FrameFlags, FrameSink, StreamFormat, TapError};
 use fotw_pipeline::resample::{Downmixer, Resampler16k};
 use fotw_pipeline::ring::{AudioRing, RingConsumer, RingProducer};
-use fotw_pipeline::wal::{SessionWal, SttRecord};
+use fotw_pipeline::wal::{SessionWal, SttRecord, TrackFormat};
 use fotw_stt::deepgram::DeepgramConfig;
 use fotw_stt::{DeepgramStream, DeepgramStreamConfig, Source, StreamEvent, TranscriptSegment};
 
@@ -829,8 +829,16 @@ pub async fn run_with_control(
         .ok()
     });
 
-    let wal = SessionWal::create(root, sys_format.sample_rate_hz, sys_format.channels)
-        .map_err(|e| format!("could not create the session: {e}"))?;
+    // A format per leg, because the two taps are two devices: the system tap
+    // is 48 kHz stereo and the mic is usually mono. Recording the system's
+    // count for both is #80 — the encoder then reads the mono mic WAL as
+    // stereo and archives it at half its real length, at 2× speed.
+    let wal = SessionWal::create_with_formats(
+        root,
+        TrackFormat::new(sys_format.sample_rate_hz, sys_format.channels),
+        mic_format.map(|f| TrackFormat::new(f.sample_rate_hz, f.channels)),
+    )
+    .map_err(|e| format!("could not create the session: {e}"))?;
     let dir = wal.dir().to_path_buf();
     let started_at_ms = wal.manifest().started_at_ms;
 

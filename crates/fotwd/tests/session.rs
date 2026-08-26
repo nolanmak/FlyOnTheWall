@@ -9,7 +9,7 @@ use std::time::Duration;
 use fotw_audio::platform::file::{FileAudioSource, ReplaySpeed};
 use fotw_audio::wav::WavData;
 use fotw_audio::{AudioTap, SampleFormat, StreamFormat, TapId};
-use fotw_pipeline::wal::{SessionState, recover};
+use fotw_pipeline::wal::{SessionState, TrackFormat, recover};
 use fotwd::session::{self, Transcription};
 
 fn tmpdir(name: &str) -> std::path::PathBuf {
@@ -212,4 +212,53 @@ fn transcript_text_joins_segments_and_skips_blanks() {
         ..Default::default()
     };
     assert_eq!(outcome.transcript_text(), "hello world");
+}
+
+/// `seconds` of an 880 Hz tone at 48 kHz **mono** — the ordinary mic shape,
+/// and deliberately not the system tap's.
+fn mono_tone(seconds: f32) -> WavData {
+    let format = StreamFormat::new(48_000, 1, SampleFormat::I16);
+    let n = (48_000.0 * seconds) as usize;
+    let samples = (0..n)
+        .map(|i| (i as f32 / 48_000.0 * 880.0 * std::f32::consts::TAU).sin() * 0.5)
+        .collect();
+    WavData { format, samples }
+}
+
+#[tokio::test]
+async fn each_leg_records_its_own_format_so_a_mono_mic_is_not_read_as_stereo() {
+    // #80 originated here: the WAL was created with the system tap's format
+    // and the encoder applied it to both legs, so a mono mic WAL came back at
+    // half its real length at 2× speed. The manifest has to carry what each
+    // tap actually reported.
+    let root = tmpdir("legformats");
+    let outcome = session::run(
+        &root,
+        source(tone(2.0)),
+        Some(source(mono_tone(2.0))),
+        Transcription::Disabled,
+        Duration::from_millis(900),
+    )
+    .await
+    .unwrap();
+
+    let state = SessionState::read(&outcome.dir).unwrap();
+    assert_eq!(
+        state.manifest.system_format,
+        Some(TrackFormat::new(48_000, 2))
+    );
+    assert_eq!(state.manifest.mic_format, Some(TrackFormat::new(48_000, 1)));
+
+    // Which makes the two legs the same length in frames — the same wall
+    // clock, read at each leg's own frame size. Loose bounds because this is
+    // a real-time replay and the mic tap starts second; a factor of two is
+    // the bug, and nothing near it is timing jitter.
+    let (sys, mic) = (state.system_frames, state.mic_frames);
+    assert!(sys > 0 && mic > 0, "a leg is empty: {sys} / {mic}");
+    let ratio = mic as f64 / sys as f64;
+    assert!(
+        (0.8..=1.2).contains(&ratio),
+        "the mic leg is {ratio:.2}× the system leg ({mic} frames against \
+         {sys}) for the same wall clock"
+    );
 }

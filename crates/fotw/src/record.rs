@@ -51,7 +51,7 @@ use fotw_audio::{
     StreamFormat, SystemScope, TapError, TapId, platform,
 };
 use fotw_pipeline::ring::{AudioRing, RingConsumer, RingProducer};
-use fotw_pipeline::wal::SessionWal;
+use fotw_pipeline::wal::{SessionWal, TrackFormat};
 
 /// Ring capacity. Ten seconds is generous — the pump drains every 100 ms —
 /// but the cost is 1.3 MB and the benefit is surviving a stalled disk.
@@ -249,9 +249,19 @@ pub fn record(root: PathBuf, seconds: u64) -> Result<PathBuf, String> {
     // host-clock bounds convert to session-relative milliseconds by
     // subtraction. `SessionWal` does not record one itself.
     let session_epoch_ns = clock.now_ns();
-    let mut wal = SessionWal::create(&root, sys_format.sample_rate_hz, sys_format.channels)
-        .map_err(|e| format!("could not create the session: {e}"))?;
+    // A format per leg: the mic is its own device and usually mono where the
+    // system tap is stereo, and one count applied to both is #80 — the
+    // encoder reads the mono mic WAL as stereo and archives it at half its
+    // real length.
+    let mut wal = SessionWal::create_with_formats(
+        &root,
+        TrackFormat::new(sys_format.sample_rate_hz, sys_format.channels),
+        mic_format.map(|f| TrackFormat::new(f.sample_rate_hz, f.channels)),
+    )
+    .map_err(|e| format!("could not create the session: {e}"))?;
     let dir = wal.dir().to_path_buf();
+    // The system leg's shape, which is what the manifest's pre-schema-4
+    // fields carry.
     let wal_format = StreamFormat::new(
         wal.manifest().sample_rate_hz,
         wal.manifest().channels,

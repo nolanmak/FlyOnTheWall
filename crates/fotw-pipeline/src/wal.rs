@@ -77,6 +77,14 @@ pub const LEGS: [(&str, &str); 2] = [("system.pcm", "system.opus"), ("mic.pcm", 
 /// meeting never needs more than a few hundred kilobytes of resident buffer.
 const TRANSCODE_CHUNK_SAMPLES: usize = 65_536;
 
+/// The manifest schema this build writes.
+///
+/// Also the first schema that records a format per leg, which is what makes
+/// an absent `mic_format` readable: at 4 or above it means the mic tap never
+/// ran, below it means the writer did not know per-track formats existed and
+/// the mic's real shape has to be inferred (#80).
+const SCHEMA: u32 = 4;
+
 /// An interval of audio that was not captured.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Gap {
@@ -96,14 +104,70 @@ impl Gap {
     }
 }
 
+/// The shape of one PCM leg on disk.
+///
+/// Per leg, because the two legs are two devices: the macOS system tap is
+/// 48 kHz stereo and a mic is whatever the user plugged in. One count for both
+/// is #80 — a mono mic file read as stereo turns every pair of consecutive
+/// samples into one frame, so the archived track is exactly half its real
+/// length and plays at 2×.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrackFormat {
+    /// Sample rate of this leg's PCM.
+    pub sample_rate_hz: u32,
+    /// Interleaved channels in this leg's PCM.
+    pub channels: u16,
+}
+
+impl TrackFormat {
+    /// One leg's format.
+    #[must_use]
+    pub const fn new(sample_rate_hz: u32, channels: u16) -> Self {
+        Self {
+            sample_rate_hz,
+            channels,
+        }
+    }
+
+    /// The same format with the zeroes taken out.
+    ///
+    /// A zero in either field is a manifest no reader can honour — it divides
+    /// by frame size — and refusing the session over it would lose the
+    /// meeting, so the safe interpretation is substituted instead.
+    fn sane(self) -> Self {
+        Self {
+            sample_rate_hz: self.sample_rate_hz.max(1),
+            channels: self.channels.max(1),
+        }
+    }
+}
+
+/// How a session's two PCM legs are to be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionFormats {
+    /// Format of `system.pcm`.
+    pub system: TrackFormat,
+    /// Format of `mic.pcm`.
+    pub mic: TrackFormat,
+    /// Whether the mic's format was worked out rather than read.
+    ///
+    /// True for a manifest written before schema 4, which recorded one
+    /// session-wide count for both legs. Worth surfacing: a wrong guess here
+    /// is silent, and silence is how #80 shipped.
+    pub mic_inferred: bool,
+}
+
 /// Everything needed to interpret the PCM files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     /// Session id, also the directory name.
     pub id: String,
-    /// Sample rate of both PCM files.
+    /// Sample rate of `system.pcm`.
+    ///
+    /// Retained alongside [`system_format`](Self::system_format) so a reader
+    /// that predates schema 4 still finds what it expects.
     pub sample_rate_hz: u32,
-    /// Channels in each PCM file.
+    /// Channels in `system.pcm`. As above: kept for older readers.
     pub channels: u16,
     /// Wall clock at session start, for display.
     pub started_at_ms: u64,
@@ -113,6 +177,17 @@ pub struct Manifest {
     pub app_version: String,
     /// Schema version of this manifest.
     pub schema: u32,
+    /// Format of `system.pcm`, from schema 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_format: Option<TrackFormat>,
+    /// Format of `mic.pcm`, from schema 4.
+    ///
+    /// Absent at schema 4 or above means no mic tap ran and the file is
+    /// empty; absent below it means the writer recorded only the one
+    /// session-wide count, and the mic's real shape has to be inferred. Both
+    /// are resolved by [`Manifest::track_formats`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mic_format: Option<TrackFormat>,
     /// Absent until a clean finalize. Its absence is the recovery signal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended_at_ms: Option<u64>,
@@ -142,6 +217,80 @@ pub struct Manifest {
     /// copy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub promoted: Option<crate::promote::Promotion>,
+}
+
+impl Manifest {
+    /// The formats this session's two PCM legs are to be read with.
+    ///
+    /// The directory is a parameter because a pre-schema-4 manifest does not
+    /// contain the answer: it recorded one channel count for the session and
+    /// it was the system tap's, so the mic's has to come from the files
+    /// themselves — see [`infer_mic_channels`].
+    #[must_use]
+    pub fn track_formats(&self, dir: &Path) -> SessionFormats {
+        let global = TrackFormat::new(self.sample_rate_hz, self.channels).sane();
+        let system = self.system_format.map_or(global, TrackFormat::sane);
+
+        if let Some(mic) = self.mic_format {
+            return SessionFormats {
+                system,
+                mic: mic.sane(),
+                mic_inferred: false,
+            };
+        }
+        if self.schema >= SCHEMA {
+            // A writer that knows about per-track formats and recorded none
+            // for the mic is saying the mic tap never ran. The file is empty,
+            // so any format reads it identically.
+            return SessionFormats {
+                system,
+                mic: global,
+                mic_inferred: false,
+            };
+        }
+
+        let bytes = |name: &str| {
+            std::fs::metadata(dir.join(name))
+                .map(|m| m.len())
+                .unwrap_or(0)
+        };
+        SessionFormats {
+            system,
+            mic: TrackFormat {
+                channels: infer_mic_channels(global.channels, bytes(LEGS[0].0), bytes(LEGS[1].0)),
+                ..global
+            },
+            mic_inferred: true,
+        }
+    }
+}
+
+/// Work out a pre-schema-4 mic leg's channel count from the two legs' sizes.
+///
+/// The legs cover the same wall clock, so their byte counts stand in the ratio
+/// of their channel counts: `mic_bytes ≈ sys_bytes × mic_ch / sys_ch`. A mic
+/// file at half a stereo system's bytes was mono, which is what every session
+/// on disk from before #80 turns out to be.
+///
+/// Deliberately conservative. Only the one case the evidence actually
+/// distinguishes — a mic leg within a tenth of the size a mono leg would be —
+/// overrides the recorded count; anything else keeps it, because reading a
+/// genuinely stereo leg as mono is the same bug pointed the other way and the
+/// two legs' sizes are not guaranteed to match (the mic tap starts second, and
+/// a stalled tap leaves its leg short). A mic that stalled badly enough to
+/// land in the band is misread, and there is nothing on disk that would say
+/// otherwise; that is why the caller logs the choice.
+fn infer_mic_channels(global_channels: u16, sys_bytes: u64, mic_bytes: u64) -> u16 {
+    if global_channels < 2 || sys_bytes == 0 || mic_bytes == 0 {
+        return global_channels.max(1);
+    }
+    let ratio = mic_bytes as f64 / sys_bytes as f64;
+    let mono_ratio = 1.0 / f64::from(global_channels);
+    if (ratio - mono_ratio).abs() <= mono_ratio * 0.1 {
+        1
+    } else {
+        global_channels
+    }
 }
 
 /// One transcoded leg of a session.
@@ -239,11 +388,31 @@ pub struct SessionWal {
 }
 
 impl SessionWal {
-    /// Create a new session directory under `root`.
+    /// Create a new session directory under `root` for two legs of the same
+    /// shape.
+    ///
+    /// A session whose taps disagree — the ordinary case, where the system tap
+    /// is stereo and the mic is mono — must use
+    /// [`create_with_formats`](Self::create_with_formats) instead. One count
+    /// applied to both legs is #80.
     pub fn create(
         root: impl AsRef<Path>,
         sample_rate_hz: u32,
         channels: u16,
+    ) -> std::io::Result<Self> {
+        let format = TrackFormat::new(sample_rate_hz, channels);
+        Self::create_with_formats(root, format, Some(format))
+    }
+
+    /// Create a new session directory under `root`, recording each leg's own
+    /// format.
+    ///
+    /// `mic` is optional because a meeting with no mic tap is an ordinary
+    /// meeting: the leg exists, stays empty, and has no format to record.
+    pub fn create_with_formats(
+        root: impl AsRef<Path>,
+        system: TrackFormat,
+        mic: Option<TrackFormat>,
     ) -> std::io::Result<Self> {
         let id = session_id();
         let dir = root.as_ref().join(&id);
@@ -251,16 +420,19 @@ impl SessionWal {
 
         let manifest = Manifest {
             id,
-            sample_rate_hz,
-            channels,
+            sample_rate_hz: system.sample_rate_hz,
+            channels: system.channels,
             started_at_ms: now_ms(),
             host_epoch_ns: 0,
             app_version: env!("CARGO_PKG_VERSION").to_string(),
-            // 2 adds `encoded`; 3 adds `claim` and `promoted`. Every one of
-            // those fields is `#[serde(default)]`, so an older manifest still
-            // reads; the bump exists to make the absence of a field
-            // distinguishable from a writer that did not know about it.
-            schema: 3,
+            // 2 adds `encoded`; 3 adds `claim` and `promoted`; 4 adds
+            // `system_format` and `mic_format`. Every one of those fields is
+            // `#[serde(default)]`, so an older manifest still reads; the bump
+            // exists to make the absence of a field distinguishable from a
+            // writer that did not know about it.
+            schema: SCHEMA,
+            system_format: Some(system),
+            mic_format: mic,
             ended_at_ms: None,
             gaps: Vec::new(),
             encoded: None,
@@ -405,19 +577,23 @@ impl SessionState {
         let dir = dir.as_ref().to_path_buf();
         let manifest = read_manifest(&dir)?;
 
-        let frame_bytes = BYTES_PER_SAMPLE * u64::from(manifest.channels.max(1));
+        // A frame is a frame of *this* leg: the mic is usually mono where the
+        // system tap is stereo, and counting one with the other's frame size
+        // reports half a meeting (#80).
+        let formats = manifest.track_formats(&dir);
         // Integer division deliberately discards a partial trailing frame: a
         // kill mid-write leaves one, and rejecting the file over it would
         // throw away the entire meeting.
-        let frames = |name: &str| -> u64 {
+        let frames = |name: &str, format: TrackFormat| -> u64 {
+            let frame_bytes = BYTES_PER_SAMPLE * u64::from(format.channels);
             std::fs::metadata(dir.join(name))
                 .map(|m| m.len() / frame_bytes)
                 .unwrap_or(0)
         };
 
         Ok(Self {
-            system_frames: frames("system.pcm"),
-            mic_frames: frames("mic.pcm"),
+            system_frames: frames("system.pcm", formats.system),
+            mic_frames: frames("mic.pcm", formats.mic),
             stt: read_jsonl(&dir.join("stt.jsonl")),
             manifest,
             dir,
@@ -474,8 +650,21 @@ pub fn encode_session(dir: impl AsRef<Path>) -> Result<EncodedSession, OpusError
     let dir = dir.as_ref();
     let mut manifest = read_manifest(dir)?;
 
-    let system = encode_track(dir, LEGS[0].0, LEGS[0].1, &manifest)?;
-    let mic = encode_track(dir, LEGS[1].0, LEGS[1].1, &manifest)?;
+    let formats = manifest.track_formats(dir);
+    if formats.mic_inferred {
+        // Said out loud because it is a guess with a permanent consequence:
+        // the PCM is unlinked after this, and a mic track encoded at the
+        // wrong channel count is half its real length forever. #80 shipped
+        // because the wrong count was applied in silence.
+        eprintln!(
+            "  ! session {}: manifest schema {} records no per-track format; \
+             reading mic.pcm as {} channel(s) against system.pcm's {} (#80)",
+            manifest.id, manifest.schema, formats.mic.channels, formats.system.channels
+        );
+    }
+
+    let system = encode_track(dir, LEGS[0].0, LEGS[0].1, formats.system)?;
+    let mic = encode_track(dir, LEGS[1].0, LEGS[1].1, formats.mic)?;
     let encoded = EncodedSession { system, mic };
 
     manifest.encoded = Some(encoded.clone());
@@ -541,10 +730,11 @@ pub(crate) fn write_manifest_at(dir: &Path, manifest: &Manifest) -> std::io::Res
 ///
 /// Three shape problems get solved here, in an order that is not arbitrary:
 ///
-/// * **Channels.** Opus tracks are mono (§9.5), so a multi-channel session is
+/// * **Channels.** Opus tracks are mono (§9.5), so a multi-channel leg is
 ///   averaged down first. Downmixing *before* the resampler halves the work
 ///   the filter has to do, which is the same reasoning as
-///   [`crate::resample`]'s.
+///   [`crate::resample`]'s. The count is this *leg's* — the two taps are two
+///   devices, and applying one leg's count to the other is #80.
 /// * **Rate.** libopus accepts only 8/12/16/24/48 kHz. The pipeline's own rate
 ///   is 16 kHz so the common path resamples nothing; anything else is put
 ///   through [`Resampler16k`] rather than rejected, because a session
@@ -558,19 +748,21 @@ fn encode_track(
     dir: &Path,
     pcm_name: &str,
     opus_name: &str,
-    manifest: &Manifest,
+    format: TrackFormat,
 ) -> Result<EncodedTrack, OpusError> {
     let pcm_path = dir.join(pcm_name);
     let opus_path = dir.join(opus_name);
     let pcm_bytes = std::fs::metadata(&pcm_path).map(|m| m.len()).unwrap_or(0);
 
-    let channels = manifest.channels.max(1);
-    let session_rate = manifest.sample_rate_hz.max(1);
-    let (encode_rate, mut resampler) = if SUPPORTED_RATES.contains(&session_rate) {
-        (session_rate, None)
+    let TrackFormat {
+        sample_rate_hz: track_rate,
+        channels,
+    } = format.sane();
+    let (encode_rate, mut resampler) = if SUPPORTED_RATES.contains(&track_rate) {
+        (track_rate, None)
     } else {
-        let r = Resampler16k::new(session_rate, 1)
-            .map_err(|e| OpusError::Container(format!("cannot resample {session_rate} Hz: {e}")))?;
+        let r = Resampler16k::new(track_rate, 1)
+            .map_err(|e| OpusError::Container(format!("cannot resample {track_rate} Hz: {e}")))?;
         (TARGET_RATE, Some(r))
     };
 
