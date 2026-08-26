@@ -24,6 +24,11 @@ pub mod secrets;
 pub mod serve;
 pub mod session;
 pub mod summarize;
+/// Names the integration tests share, so none of them hand-writes one that
+/// resolves to a real engine — #83. Absent from every shipped build; see the
+/// `test-guards` feature in `Cargo.toml`.
+#[cfg(feature = "test-guards")]
+pub mod testing;
 pub mod transport;
 
 pub use session::{SessionOutcome, Transcription};
