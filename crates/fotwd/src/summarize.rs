@@ -12,7 +12,7 @@ use fotw_secrets::KeyStore;
 use fotw_store::{Db, NewSummary};
 use fotw_stt::{Source, TimestampSource, TranscriptSegment};
 use fotw_summarize::document::TranscriptDocument;
-use fotw_summarize::pipeline::{Pipeline, PipelineConfig};
+use fotw_summarize::pipeline::{Pipeline, PipelineConfig, SummaryOutcome, Warning};
 use fotw_summarize::template::Template;
 use fotw_summarize::{AnthropicAdapter, Preset};
 
@@ -36,6 +36,8 @@ pub struct SummarizeOutcome {
     pub kept_items: usize,
     /// Extracted items dropped because their evidence did not check out.
     pub dropped_items: usize,
+    /// What the user should be told, already worded for a human.
+    pub warnings: Vec<String>,
 }
 
 /// Errors from a summarisation run.
@@ -204,7 +206,18 @@ where
     });
 
     let outcome = pipeline.run(&document, &notes).await?;
-    let markdown = outcome.markdown();
+    let warnings = user_warnings(&outcome);
+
+    // The admonition rides in *our* rendered markdown, never in
+    // `SummaryOutcome::blocks`: spec 8.6 keeps Call A's blocks unmodified, and
+    // this is a note about the run rather than something the model wrote. It
+    // needs no schema change — `body_md` already reaches the web view, the
+    // export and FTS, so the note becomes searchable, which is fine.
+    let mut markdown = outcome.markdown();
+    for warning in &warnings {
+        markdown.push_str(&format!("\n\n> [!WARNING]\n> {warning}\n"));
+    }
+
     let coverage = if outcome.coverage.total_claims == 0 {
         1.0
     } else {
@@ -241,7 +254,38 @@ where
         coverage,
         kept_items: outcome.validation.extraction.action_items.len(),
         dropped_items: outcome.validation.dropped.len(),
+        warnings,
     })
+}
+
+/// The pipeline warnings worth putting in front of a user, worded for one.
+///
+/// A deliberately chosen subset rather than every [`Warning`]. Rendering the
+/// list verbatim would print a cache miss on every CLI run:
+/// `Pipeline::expects_cache_hit` never looks at `prompt_cache`, and both CLI
+/// adapters declare `PromptCache::None`, so a miss that could not have been a
+/// hit fires every time. A warning that is always wrong teaches people to
+/// ignore the ones that are not.
+fn user_warnings(outcome: &SummaryOutcome) -> Vec<String> {
+    // Under map-reduce the chunks that answered well keep their items, so the
+    // honest wording depends on whether anything survived (#75).
+    let salvaged = outcome.validation.extraction.item_count() > 0;
+    outcome
+        .warnings
+        .iter()
+        .filter_map(|warning| match warning {
+            Warning::ExtractionFailed { detail } => Some(format!(
+                "Extraction failed ({detail}) — {}. The notes above came from a separate call \
+                 and are unaffected.",
+                if salvaged {
+                    "some structured items may be missing"
+                } else {
+                    "no action items were extracted from this meeting"
+                }
+            )),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Rebuild `TranscriptSegment`s from stored rows.

@@ -155,8 +155,10 @@ async fn the_stored_transcript_reaches_the_provider_as_a_document() {
         "stop_reason": "end_turn"
     })));
 
-    // The pipeline will reject the extraction shape; what matters here is that
-    // the text made it out of SQLite and into a request body at all.
+    // Only one response is queued, so Call B runs out of mock and fails at the
+    // transport — still a hard failure after #75, which softened only a schema
+    // violation. What matters here is that the text made it out of SQLite and
+    // into a request body at all.
     let _ = summarize::summarize_meeting_with(&mut db, &store, &id, &general(), Arc::clone(&mock))
         .await;
 
@@ -218,5 +220,61 @@ async fn the_request_never_carries_both_citations_and_a_structured_format() {
     assert!(
         checked > 0,
         "no requests were inspected — the test is vacuous"
+    );
+}
+
+/// #75: a Call B answer the pipeline cannot parse must still leave a summary
+/// row behind — the prose Call A already wrote, plus a note saying what is
+/// missing from it. Before this, the meeting ended with no summary at all and
+/// the reason went to a stderr nobody receives (#74).
+#[tokio::test]
+async fn an_unparseable_extraction_still_stores_a_summary_with_a_warning() {
+    let dir = tmpdir("badextraction");
+    let mut db = db_at(&dir);
+    let id = seeded_meeting(&mut db, &dir);
+    let store = keystore_with_anthropic();
+
+    let mock = Arc::new(
+        MockTransport::new()
+            .with_json(serde_json::json!({
+                "content": [{"type": "text", "text": "Numbers were above target."}],
+                "usage": {"input_tokens": 100, "output_tokens": 20},
+                "stop_reason": "end_turn"
+            }))
+            .with_json(serde_json::json!({
+                "content": [{"type": "text", "text": "I'm afraid I can't help with that."}],
+                "usage": {"input_tokens": 100, "output_tokens": 8},
+                "stop_reason": "end_turn"
+            })),
+    );
+
+    let outcome =
+        summarize::summarize_meeting_with(&mut db, &store, &id, &general(), Arc::clone(&mock))
+            .await
+            .expect("a summary with no items beats no summary");
+
+    let stored = db
+        .meetings()
+        .current_summary(&id)
+        .unwrap()
+        .expect("the summary row was not written");
+    assert!(
+        stored.body_md.contains("Numbers were above target"),
+        "Call A's prose did not reach the store: {}",
+        stored.body_md
+    );
+    assert!(
+        stored.body_md.contains('>') && stored.body_md.to_lowercase().contains("action items"),
+        "the stored markdown carries no admonition about the missing items: {}",
+        stored.body_md
+    );
+    // Named, not merely non-empty: `LowGrounding` alone would satisfy that.
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|w| w.to_lowercase().contains("extraction")),
+        "no warning named the extraction failure: {:?}",
+        outcome.warnings
     );
 }

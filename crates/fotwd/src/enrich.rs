@@ -74,7 +74,14 @@ pub async fn enrich_meeting_with(
                         .push("no templates installed — run `fotwd templates install`".to_owned()),
                     Some(template) => {
                         match summarize_meeting(db, store, meeting_id, template).await {
-                            Ok(outcome) => report.summary_version = Some(outcome.version),
+                            Ok(outcome) => {
+                                report.summary_version = Some(outcome.version);
+                                // A summary that stored fine but lost its
+                                // structured half is a problem the user should
+                                // hear about, and this report is the only
+                                // channel the daemon path has (#75).
+                                report.problems.extend(outcome.warnings);
+                            }
                             // NoKey here means the engine vanished between
                             // resolve and run — a race worth naming, not
                             // worth failing differently over.
