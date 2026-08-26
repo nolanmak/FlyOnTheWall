@@ -25,10 +25,31 @@
 //!
 //! `stop()` trips the signal and returns immediately: finalizing encodes the
 //! whole meeting to Opus, and an HTTP handler that waited for that would hang
-//! for minutes on a long call. But the slot is not cleared until the task is
-//! genuinely done, so a second Start during finalization is refused rather
-//! than opening a second tap on the same device. Status reads `recording`
-//! until the session is fully on disk, which is also the honest answer.
+//! for minutes on a long call. But the slot is not cleared until the meeting
+//! is genuinely on disk, so a second Start during finalization is refused
+//! rather than opening a second tap on the same device.
+//!
+//! What that window is *called* was the bug. It used to read `recording`,
+//! which is true of the slot and false of everything the user can see: the tap
+//! is shut, the meeting cannot get any longer, and the dashboard drew a
+//! climbing clock over a microphone that was already closed. Status now reads
+//! `finishing` there, with the clock frozen at the length the meeting ended on
+//! (#77). The guard is unchanged — `Finishing` is not `Idle`.
+//!
+//! # Where finishing ends
+//!
+//! At persist-and-promote, not at the end of enrichment. Titles and summaries
+//! are derived work over a meeting that is already safe on disk, and the CLI
+//! deadline is 300 s per call with several calls for a chunked meeting, so
+//! waiting for them held the slot — and the user's clock — for minutes.
+//! [`enrich_and_announce`] therefore runs *after* the slot clears.
+//!
+//! That is a real concurrency change and this header owns it: enrichment can
+//! now overlap live capture of the next meeting, and one meeting's enrichment
+//! can overlap another's. It is safe for the library — SQLite runs in WAL with
+//! a busy timeout (`fotw-store/src/db.rs`) and enrichment only writes the
+//! title and summary rows of a meeting that is already persisted — but it is
+//! real CPU beside live Opus encoding and streaming transcription.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -76,6 +97,13 @@ pub type TranscriptionFactory = Box<dyn Fn() -> Transcription + Send + Sync>;
 struct Live {
     stop: StopSignal,
     started_at_ms: u64,
+    /// When Stop was pressed, once it has been. `Some` is what separates
+    /// finishing from recording, and it is the frozen clock's only source.
+    ///
+    /// A plain field rather than an atomic: every read and write of it already
+    /// holds the mutex around the slot, so an atomic would buy nothing and
+    /// invite a caller to touch it without one.
+    stopped_at_ms: Option<u64>,
     /// So `status()` can report a provider failure while the meeting is still
     /// running, rather than leaving it to be discovered in an empty file.
     errors: SttErrors,
@@ -311,6 +339,7 @@ impl RecorderControl for DaemonRecorder {
         *slot = Some(Live {
             stop: stop.clone(),
             started_at_ms,
+            stopped_at_ms: None,
             errors: control.errors.clone(),
         });
         drop(slot);
@@ -353,27 +382,36 @@ impl RecorderControl for DaemonRecorder {
     }
 
     fn stop(&self) -> Result<RecordingStatus, RecorderError> {
-        let slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(live) = slot.as_ref() else {
+        let mut slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(live) = slot.as_mut() else {
             return Err(RecorderError::NotRecording);
         };
+        // Set once. A reloaded tab presses Stop again, and a second stop that
+        // moved this forward would make the meeting appear to grow after it
+        // ended — the clock is frozen at the first Stop or it is not frozen.
+        let ended_at_ms = *live.stopped_at_ms.get_or_insert(now_ms());
         // Trip and return. The task clears the slot once the meeting is on
-        // disk; until then status honestly still reads `recording`.
+        // disk; until then status reads `finishing`.
         live.stop.stop();
-        Ok(RecordingStatus::recording(
-            live.started_at_ms,
-            now_ms().saturating_sub(live.started_at_ms),
-        )
-        .with_transcription_error(live.errors.latest()))
+        Ok(RecordingStatus::finishing(live.started_at_ms, ended_at_ms)
+            .with_transcription_error(live.errors.latest()))
     }
 
     fn status(&self) -> RecordingStatus {
         let slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
         slot.as_ref().map_or_else(RecordingStatus::idle, |live| {
-            RecordingStatus::recording(
-                live.started_at_ms,
-                now_ms().saturating_sub(live.started_at_ms),
-            )
+            match live.stopped_at_ms {
+                // Frozen: the tap is shut, so the number cannot grow.
+                Some(ended_at_ms) => RecordingStatus::finishing(live.started_at_ms, ended_at_ms),
+                None => RecordingStatus::recording(
+                    live.started_at_ms,
+                    now_ms().saturating_sub(live.started_at_ms),
+                ),
+            }
+            // Kept for finishing too: a tab loaded mid-finalize must still see
+            // that transcription failed, or an empty transcript is
+            // indistinguishable from a quiet meeting exactly when someone goes
+            // looking for the words.
             .with_transcription_error(live.errors.latest())
         })
     }
@@ -395,7 +433,9 @@ async fn spawn_session(
     let outcome =
         session::run_with_control(&root, system, mic, transcription, ceiling, control).await;
 
-    match outcome {
+    // The meeting's id once it is genuinely in the library. `None` covers a
+    // recording that failed and a session that persisted nothing.
+    let persisted = match outcome {
         Ok(outcome) => {
             for e in &outcome.stt_errors {
                 eprintln!("  ! transcription failed during this meeting: {e}");
@@ -409,31 +449,52 @@ async fn spawn_session(
             }
             // Blocking work — Opus encoding and SQLite — off the runtime.
             let root2 = root.clone();
-            let persisted = tokio::task::spawn_blocking(move || (finish)(&root2, &outcome)).await;
-
-            // Enrichment (#67/#68): title, summary, action items — derived
-            // work over a meeting already safe on disk, so problems print
-            // and nothing here can fail the recording.
-            //
-            // This call went missing once already — a patch matched stale
-            // text, replaced nothing, and asserted nothing — and every
-            // dashboard meeting kept its epoch title while the CLI path
-            // worked. There is no unit pin: enrichment opens the real
-            // library and keychain, which no test may touch. If this block
-            // disappears again, the symptom is epoch titles on dashboard
-            // meetings while `fotwd record` titles fine.
-            if let Ok(Some(meeting_id)) = persisted {
-                let report = crate::enrich::enrich_meeting(&root, &meeting_id).await;
-                if let Some(title) = &report.title {
-                    eprintln!("  meeting titled: {title}");
-                }
-                for problem in &report.problems {
-                    eprintln!("  ! enrichment: {problem}");
-                }
-            }
+            tokio::task::spawn_blocking(move || (finish)(&root2, &outcome))
+                .await
+                .ok()
+                .flatten()
         }
-        Err(e) => eprintln!("  ! the recording failed: {e}"),
-    }
+        Err(e) => {
+            eprintln!("  ! the recording failed: {e}");
+            None
+        }
+    };
 
+    // Finishing ends here. The meeting is persisted and promoted, so the slot
+    // can free and the dashboard can stop saying "finishing…" — everything
+    // below is derived work over a file that is already safe (#77).
     *live.lock().unwrap_or_else(|e| e.into_inner()) = None;
+
+    if let Some(meeting_id) = persisted {
+        enrich_and_announce(&root, &meeting_id).await;
+    }
+}
+
+/// Title, summary and action items for a meeting already in the library.
+///
+/// Runs in the tail of the session task, after the recorder's slot has been
+/// freed, so nothing here can hold the user's clock (#77). Problems print and
+/// nothing can fail the recording: the audio and the transcript are on disk
+/// before this is called.
+///
+/// This is the hook #78 wants: once enrichment returns, the meeting's title
+/// and summary are final, and *that* is the moment to publish a
+/// `meeting_ready` frame to the dashboard so it can redraw the row it already
+/// listed. `Finishing` ends before this runs, so the two are separate events
+/// and must stay so.
+///
+/// This call went missing once already — a patch matched stale text, replaced
+/// nothing, and asserted nothing — and every dashboard meeting kept its epoch
+/// title while the CLI path worked. There is no unit pin: enrichment opens the
+/// real library and keychain, which no test may touch. If this call disappears
+/// again, the symptom is epoch titles on dashboard meetings while `fotwd
+/// record` titles fine.
+async fn enrich_and_announce(root: &Path, meeting_id: &str) {
+    let report = crate::enrich::enrich_meeting(root, meeting_id).await;
+    if let Some(title) = &report.title {
+        eprintln!("  meeting titled: {title}");
+    }
+    for problem in &report.problems {
+        eprintln!("  ! enrichment: {problem}");
+    }
 }

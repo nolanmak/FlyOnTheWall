@@ -30,20 +30,43 @@ pub enum RecordingState {
     Idle,
     /// Capture is running.
     Recording,
+    /// Capture has stopped; the meeting is still being written to the library.
+    ///
+    /// The name matches `fotw_shell::Phase::Finishing`, which has modelled
+    /// this correctly since the menu bar shipped. The dashboard had only two
+    /// words, so it spent the whole of finalization saying `recording` — a
+    /// clock that kept climbing after Stop and a button that still offered to
+    /// stop something (#77). The recorder's slot is occupied here, so a second
+    /// Start is refused exactly as it is while recording.
+    Finishing,
 }
 
 /// What the recorder is doing, with the timings the UI renders.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingStatus {
-    /// Idle or recording. Never absent, so the UI has no third case to guess.
+    /// Idle, recording or finishing. Never absent: the UI switches on this
+    /// word and has no fourth case to guess.
     pub state: RecordingState,
     /// Epoch milliseconds capture began; `null` while idle.
     ///
     /// Deliberately `null` rather than absent or zero: the UI renders a
     /// "recording since HH:MM" from it, and zero is a value that renders.
     pub started_at_ms: Option<u64>,
-    /// Milliseconds since capture began; `null` while idle.
+    /// How long the meeting has run, in milliseconds; `null` while idle.
+    ///
+    /// While recording this counts up. While finishing it is *frozen* at the
+    /// length the meeting ended on: capture has stopped, so the session cannot
+    /// get any longer, and a number that kept moving would be a lie the user
+    /// watches (#77).
     pub elapsed_ms: Option<u64>,
+    /// Epoch milliseconds capture stopped; `null` unless finishing.
+    ///
+    /// Carried rather than derived from `started_at_ms + elapsed_ms` because
+    /// the daemon genuinely holds it, and a client that reconstructed it would
+    /// be reconstructing the one value this state exists to freeze. Defaulted
+    /// so an older client's stored body still deserializes.
+    #[serde(default)]
+    pub ended_at_ms: Option<u64>,
     /// What the transcription provider last failed with, or `null`.
     ///
     /// Surfaced live rather than only at the end. Two Deepgram bugs each
@@ -63,6 +86,7 @@ impl RecordingStatus {
             state: RecordingState::Idle,
             started_at_ms: None,
             elapsed_ms: None,
+            ended_at_ms: None,
             transcription_error: None,
         }
     }
@@ -74,6 +98,23 @@ impl RecordingStatus {
             state: RecordingState::Recording,
             started_at_ms: Some(started_at_ms),
             elapsed_ms: Some(elapsed_ms),
+            ended_at_ms: None,
+            transcription_error: None,
+        }
+    }
+
+    /// Capture stopped at `ended_at_ms`; the meeting is still being written.
+    ///
+    /// `elapsed_ms` is computed here rather than passed in so there is one
+    /// place the frozen clock can come from, and it cannot disagree with the
+    /// two timestamps beside it.
+    #[must_use]
+    pub fn finishing(started_at_ms: u64, ended_at_ms: u64) -> Self {
+        Self {
+            state: RecordingState::Finishing,
+            started_at_ms: Some(started_at_ms),
+            elapsed_ms: Some(ended_at_ms.saturating_sub(started_at_ms)),
+            ended_at_ms: Some(ended_at_ms),
             transcription_error: None,
         }
     }
@@ -85,10 +126,24 @@ impl RecordingStatus {
         self
     }
 
-    /// Whether capture is in flight.
+    /// Whether capture is in flight — a live tap, a running clock.
+    ///
+    /// Deliberately false while finishing: the microphone is closed and the
+    /// session cannot get any longer. Callers asking "may I start?" want
+    /// [`RecordingStatus::is_active`] instead.
     #[must_use]
     pub fn is_recording(&self) -> bool {
         self.state == RecordingState::Recording
+    }
+
+    /// Whether the recorder's single slot is occupied.
+    ///
+    /// True while recording *and* while finishing: a Start arriving during
+    /// finalization would open a second tap on the same device, so the slot
+    /// stays taken until the meeting is on disk.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.state != RecordingState::Idle
     }
 }
 
@@ -132,6 +187,13 @@ pub trait RecorderControl: Send + Sync + 'static {
     fn start(&self) -> Result<RecordingStatus, RecorderError>;
 
     /// Stop capturing and finalize the session.
+    ///
+    /// Returns as soon as the tap is closed, not when the meeting is on disk:
+    /// encoding a long call takes minutes and an HTTP handler cannot wait for
+    /// it. The status that comes back is therefore
+    /// [`RecordingState::Finishing`], with the clock frozen at the meeting's
+    /// final length — an implementation that answers `Idle` here is claiming a
+    /// meeting exists in the library before it does.
     ///
     /// # Errors
     ///

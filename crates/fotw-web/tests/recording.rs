@@ -25,39 +25,81 @@ use fotw_web::{
     MemorySource, RecorderControl, RecorderError, RecordingState, RecordingStatus, WebServer,
 };
 
-/// A recorder that moves between the two states without touching a device.
+/// When the fake's meeting began, and when Stop froze it.
+const FAKE_STARTED_MS: u64 = 1_787_000_000_000;
+const FAKE_ENDED_MS: u64 = FAKE_STARTED_MS + 90_000;
+
+/// The slot `DaemonRecorder` holds, without a device in it.
+#[derive(Debug, Clone, Copy)]
+struct FakeLive {
+    started_at_ms: u64,
+    /// `Some` once Stop has been pressed: capture is over, the meeting is not
+    /// yet on disk. Set once, so a reloaded tab's second Stop cannot shift the
+    /// frozen clock — the same rule `DaemonRecorder::stop` follows.
+    stopped_at_ms: Option<u64>,
+}
+
+/// A recorder that walks the same three states the daemon does, without
+/// touching a device.
+///
+/// The two doubles used to encode opposite contracts — this one returned
+/// `idle()` from `stop()` while `DaemonRecorder` returned `recording` — and
+/// nothing bridged them, which is why #77 looked fine in CI for the life of
+/// the feature. `finish()` is the test's hand on the slot clear at the end of
+/// `fotwd`'s session task: nothing here happens on a timer.
 #[derive(Debug, Default)]
 struct FakeRecorder {
-    started_at_ms: Mutex<Option<u64>>,
+    live: Mutex<Option<FakeLive>>,
     starts: AtomicU64,
     stops: AtomicU64,
 }
 
+impl FakeRecorder {
+    /// The meeting reached the library: the slot frees and Start works again.
+    ///
+    /// Test-only, and deliberately not on [`RecorderControl`] — the real
+    /// daemon reaches this state on its own, from the session task.
+    fn finish(&self) {
+        *self.live.lock().unwrap() = None;
+    }
+}
+
 impl RecorderControl for FakeRecorder {
     fn start(&self) -> Result<RecordingStatus, RecorderError> {
-        let mut at = self.started_at_ms.lock().unwrap();
-        if at.is_some() {
+        let mut live = self.live.lock().unwrap();
+        // Occupied covers finishing as well as recording: the tap is closed
+        // but the session still owns the device and the session directory.
+        if live.is_some() {
             return Err(RecorderError::AlreadyRecording);
         }
         self.starts.fetch_add(1, Ordering::Relaxed);
-        *at = Some(1_787_000_000_000);
-        Ok(RecordingStatus::recording(1_787_000_000_000, 0))
+        *live = Some(FakeLive {
+            started_at_ms: FAKE_STARTED_MS,
+            stopped_at_ms: None,
+        });
+        Ok(RecordingStatus::recording(FAKE_STARTED_MS, 0))
     }
 
     fn stop(&self) -> Result<RecordingStatus, RecorderError> {
-        let mut at = self.started_at_ms.lock().unwrap();
-        if at.is_none() {
+        let mut live = self.live.lock().unwrap();
+        let Some(live) = live.as_mut() else {
             return Err(RecorderError::NotRecording);
-        }
+        };
         self.stops.fetch_add(1, Ordering::Relaxed);
-        *at = None;
-        Ok(RecordingStatus::idle())
+        let ended = *live.stopped_at_ms.get_or_insert(FAKE_ENDED_MS);
+        Ok(RecordingStatus::finishing(live.started_at_ms, ended))
     }
 
     fn status(&self) -> RecordingStatus {
-        match *self.started_at_ms.lock().unwrap() {
-            Some(at) => RecordingStatus::recording(at, 1_000),
+        match *self.live.lock().unwrap() {
             None => RecordingStatus::idle(),
+            Some(FakeLive {
+                started_at_ms,
+                stopped_at_ms: Some(ended),
+            }) => RecordingStatus::finishing(started_at_ms, ended),
+            Some(FakeLive { started_at_ms, .. }) => {
+                RecordingStatus::recording(started_at_ms, 1_000)
+            }
         }
     }
 }
@@ -229,8 +271,12 @@ async fn a_wrong_acknowledgement_value_is_refused() {
     assert_eq!(r.recorder.starts.load(Ordering::Relaxed), 0);
 }
 
+/// Stop is not the end of the session (#77). The daemon holds its slot until
+/// the meeting is genuinely on disk, and the honest word for that window is
+/// `finishing` — this double used to answer `idle` and the daemon answered
+/// `recording`, so the dashboard's clock kept climbing past Stop.
 #[tokio::test]
-async fn stopping_returns_to_idle() {
+async fn stopping_reports_finishing_until_the_meeting_is_on_disk() {
     let r = rig().await;
     let auth = r.h.authorised();
 
@@ -239,8 +285,79 @@ async fn stopping_returns_to_idle() {
     let stopped = r.h.post("/api/recording/stop", &auth, None).await;
 
     assert_eq!(stopped.status, 200);
-    assert_eq!(state_of(&stopped.body), "idle");
+    assert_eq!(state_of(&stopped.body), "finishing");
     assert_eq!(r.recorder.stops.load(Ordering::Relaxed), 1);
+
+    let v: serde_json::Value = serde_json::from_str(&stopped.body).unwrap();
+    assert_eq!(v["started_at_ms"].as_u64(), Some(FAKE_STARTED_MS));
+    assert_eq!(v["ended_at_ms"].as_u64(), Some(FAKE_ENDED_MS));
+    assert_eq!(
+        v["elapsed_ms"].as_u64(),
+        Some(FAKE_ENDED_MS - FAKE_STARTED_MS),
+        "the finishing clock is frozen at the meeting's final length: {}",
+        stopped.body
+    );
+
+    // The status route agrees with the stop response until the slot clears —
+    // a tab reloaded mid-finalize must see the same thing.
+    assert_eq!(
+        state_of(&r.h.get("/api/recording/status", &auth).await.body),
+        "finishing"
+    );
+
+    // Only the meeting landing ends it, which is what `finish()` models.
+    r.recorder.finish();
+    assert_eq!(
+        state_of(&r.h.get("/api/recording/status", &auth).await.body),
+        "idle"
+    );
+}
+
+/// A second Stop is what a reloaded tab does. It must not move the frozen
+/// clock forward, or the meeting appears to grow after it ended.
+#[tokio::test]
+async fn a_second_stop_keeps_the_first_end_time() {
+    let r = rig().await;
+    let auth = r.h.authorised();
+
+    r.h.post("/api/recording/start?ack=all-party", &auth, None)
+        .await;
+    let first = r.h.post("/api/recording/stop", &auth, None).await;
+    let second = r.h.post("/api/recording/stop", &auth, None).await;
+
+    assert_eq!(state_of(&second.body), "finishing");
+    let a: serde_json::Value = serde_json::from_str(&first.body).unwrap();
+    let b: serde_json::Value = serde_json::from_str(&second.body).unwrap();
+    assert_eq!(a["ended_at_ms"], b["ended_at_ms"]);
+    assert_eq!(a["elapsed_ms"], b["elapsed_ms"]);
+}
+
+/// A Start arriving while the previous meeting is still being written is
+/// refused — the slot is occupied — and the body beside the refusal must say
+/// `finishing`, because that is what the dashboard renders. ING-09: the
+/// refusal is data, so the status code does not move.
+#[tokio::test]
+async fn starting_during_finishing_is_refused_and_says_finishing() {
+    let r = rig().await;
+    let auth = r.h.authorised();
+
+    r.h.post("/api/recording/start?ack=all-party", &auth, None)
+        .await;
+    r.h.post("/api/recording/stop", &auth, None).await;
+
+    let again =
+        r.h.post("/api/recording/start?ack=all-party", &auth, None)
+            .await;
+
+    assert_eq!(again.status, 200);
+    assert_eq!(state_of(&again.body), "finishing");
+    let v: serde_json::Value = serde_json::from_str(&again.body).unwrap();
+    assert_eq!(v["error"].as_str(), Some("already_recording"));
+    assert_eq!(
+        r.recorder.starts.load(Ordering::Relaxed),
+        1,
+        "a second tap was opened while the first meeting was still being written"
+    );
 }
 
 /// Double-clicking Start must not open a second tap on the same device.
@@ -341,6 +458,10 @@ fn the_wire_spelling_of_the_states_is_stable() {
         serde_json::to_value(RecordingState::Recording).unwrap(),
         serde_json::Value::String("recording".into())
     );
+    assert_eq!(
+        serde_json::to_value(RecordingState::Finishing).unwrap(),
+        serde_json::Value::String("finishing".into())
+    );
 }
 
 /// An idle status must not carry a start time — the UI renders "since HH:MM"
@@ -351,6 +472,48 @@ fn an_idle_status_carries_no_timestamps() {
     assert_eq!(v["state"], "idle");
     assert!(v["started_at_ms"].is_null());
     assert!(v["elapsed_ms"].is_null());
+    // Present and null, not absent: finishing (#77) carries an end time, and a
+    // key that vanishes when idle is one the UI has to guard rather than read.
+    // `v["ended_at_ms"].is_null()` would pass for a field never added at all.
+    assert_eq!(
+        v.get("ended_at_ms"),
+        Some(&serde_json::Value::Null),
+        "idle must spell the end time null rather than omit it: {v}"
+    );
+}
+
+/// The finishing body is the whole of #77: a word the UI can switch on and a
+/// clock that has stopped. `elapsed_ms` is frozen at the meeting's length
+/// rather than counting on, because capture ended and the session cannot get
+/// any longer.
+#[test]
+fn a_finishing_status_carries_a_frozen_clock() {
+    let v = serde_json::to_value(RecordingStatus::finishing(
+        FAKE_STARTED_MS,
+        FAKE_STARTED_MS + 90_000,
+    ))
+    .unwrap();
+    assert_eq!(v["state"], "finishing");
+    assert_eq!(v["started_at_ms"].as_u64(), Some(FAKE_STARTED_MS));
+    assert_eq!(v["ended_at_ms"].as_u64(), Some(FAKE_STARTED_MS + 90_000));
+    assert_eq!(v["elapsed_ms"].as_u64(), Some(90_000));
+}
+
+/// A tab loaded mid-finalize must still see a provider failure. The field
+/// exists so an empty transcript is never mistaken for a quiet meeting, and
+/// the end of the meeting is exactly when someone goes looking for the words.
+#[test]
+fn a_finishing_status_can_still_report_a_transcription_failure() {
+    let v = serde_json::to_value(
+        RecordingStatus::finishing(FAKE_STARTED_MS, FAKE_ENDED_MS)
+            .with_transcription_error(Some("deepgram closed the socket".to_owned())),
+    )
+    .unwrap();
+    assert_eq!(v["state"], "finishing");
+    assert_eq!(
+        v["transcription_error"].as_str(),
+        Some("deepgram closed the socket")
+    );
 }
 
 // ------------------------------------------------- transcription failures

@@ -406,20 +406,60 @@ function appendDeltas(deltas) {
 // menu bar shows up here before anyone wonders.
 const RECORDING_POLL_MS = 5000;
 
-let recordingNow = false;
+// How often to re-read while the meeting is being written (#77).
+//
+// Finishing is short and the user is waiting on it — a five-second gap between
+// "Finishing…" and "Saved" reads as a hang. This rate applies only inside that
+// window; the base poll above is what runs the rest of the time.
+const FINISHING_POLL_MS = 1000;
+
+// The daemon's own word: "idle", "recording" or "finishing". One value drives
+// the badge, the button, the clock and the poll rate, so nothing can disagree
+// with anything else.
+let recState = "idle";
 let recordingSince = null;
 let clockTimer = null;
+let finishingTimer = null;
+// How long the last meeting ran. Kept after the state falls back to idle: the
+// clock used to go from ticking to gone, so the one number a user wants at the
+// end — how long that was — was the one they never saw.
+let lastFinalMs = null;
+
+function formatElapsed(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = String(s % 60).padStart(2, "0");
+  return h > 0 ? h + ":" + String(m).padStart(2, "0") + ":" + sec : m + ":" + sec;
+}
 
 // Ticks locally every second from the last started_at_ms the poll reported.
 // The poll corrects drift; the local tick is what makes it a clock rather
 // than a number that jumps every five seconds.
 function paintClock() {
   if (!recordingSince) return;
-  const s = Math.max(0, Math.floor((Date.now() - recordingSince) / 1000));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = String(s % 60).padStart(2, "0");
-  el.elapsed.textContent = h > 0 ? h + ":" + String(m).padStart(2, "0") + ":" + sec : m + ":" + sec;
+  el.elapsed.textContent = formatElapsed(Date.now() - recordingSince);
+}
+
+function stopClock() {
+  if (clockTimer) {
+    clearInterval(clockTimer);
+    clockTimer = null;
+  }
+}
+
+// One extra timer, never two. `setInterval` here is fixed-rate, so starting one
+// per poll that saw "finishing" would stack them, and each survives the state
+// that created it.
+function startFinishingPoll() {
+  if (!finishingTimer) finishingTimer = setInterval(pollRecording, FINISHING_POLL_MS);
+}
+
+function stopFinishingPoll() {
+  if (finishingTimer) {
+    clearInterval(finishingTimer);
+    finishingTimer = null;
+  }
 }
 
 // A daemon with no recorder answers 404 on these paths, which is
@@ -441,44 +481,94 @@ async function pollRecording() {
 function showRecordingControls(visible) {
   el.record.hidden = !visible;
   el.consentLabel.hidden = !visible;
-  if (!visible) el.recording.hidden = true;
+  if (!visible) {
+    el.recording.hidden = true;
+    // Nothing left to poll for: a build with no recorder answers 404 forever.
+    stopFinishingPoll();
+  }
+}
+
+// The one place the button's label and enabled state are decided, so the
+// consent handler cannot contradict the poll.
+//
+// CON-01 lives in the last branch: Start is enabled only by a ticked box. The
+// other two are what #77 got wrong — a box ticked *during* finishing used to
+// re-enable a button with nothing to do, and Stop must never be gated on the
+// box, because a user who cannot stop a recording is the worse failure.
+function paintRecordButton() {
+  el.record.textContent = recState === "idle" ? "Start" : "Stop";
+  if (recState === "finishing") el.record.disabled = true;
+  else if (recState === "recording") el.record.disabled = false;
+  else el.record.disabled = !el.consent.checked;
 }
 
 function renderRecording(body) {
-  recordingNow = body.state === "recording";
+  const was = recState;
+  // Anything the daemon does not name is treated as idle. An unrecognised
+  // word must never be the one that leaves a clock running.
+  recState =
+    body.state === "recording" || body.state === "finishing" ? body.state : "idle";
   showRecordingControls(true);
 
-  el.recording.hidden = !recordingNow;
-  el.record.textContent = recordingNow ? "Stop" : "Start";
+  el.recording.hidden = recState === "idle";
+  // The badge is static markup ("recording", index.html), so the finishing
+  // word has to be written *and* written back, or it sticks for the rest of
+  // the tab's life and the next meeting records under a "finishing…" label.
+  // ING-11: textContent, as everything in this file writes text.
+  el.recording.textContent = recState === "finishing" ? "finishing…" : "recording";
 
   // The session clock (#66 follow-up): a recording with no visible duration
-  // is how a 37-minute accident happens.
-  if (recordingNow && body.started_at_ms) {
+  // is how a 37-minute accident happens. Exhaustive on purpose — a
+  // "recording" with a null started_at_ms used to fall through both branches
+  // and leave the timer ticking on the previous session's start.
+  if (recState === "recording" && body.started_at_ms) {
     recordingSince = body.started_at_ms;
+    lastFinalMs = null;
     el.elapsed.hidden = false;
     paintClock();
     if (!clockTimer) clockTimer = setInterval(paintClock, 1000);
-  } else if (!recordingNow) {
+  } else {
+    // Frozen, not hidden. The clock stopped with capture, and the number the
+    // meeting ended on is the one the user is looking for (#77) — hiding it
+    // is why the duration went from ticking straight to gone. The server's
+    // own elapsed_ms is the source: it froze it, we only draw it.
     recordingSince = null;
-    el.elapsed.hidden = true;
-    if (clockTimer) {
-      clearInterval(clockTimer);
-      clockTimer = null;
+    stopClock();
+    if (recState === "finishing" && typeof body.elapsed_ms === "number") {
+      lastFinalMs = body.elapsed_ms;
     }
+    el.elapsed.hidden = lastFinalMs === null;
+    if (lastFinalMs !== null) el.elapsed.textContent = formatElapsed(lastFinalMs);
   }
 
   // The tick box is the control CON-01 asks for, so it is only meaningful
-  // before a recording exists. While one is running, Stop must never be
-  // gated on it — a user who cannot stop a recording is the worse failure.
-  el.consentLabel.hidden = recordingNow;
-  el.record.disabled = !recordingNow && !el.consent.checked;
+  // before a recording exists.
+  el.consentLabel.hidden = recState !== "idle";
+  paintRecordButton();
+
+  // finishing → idle is the moment the meeting reached the library, which is
+  // the only moment the list is worth refetching. #78 replaces this poll with
+  // a pushed frame; the transition it fires on is this one.
+  if (was === "finishing" && recState === "idle") {
+    say(lastFinalMs === null ? "Saved to your library." : "Saved — " + formatElapsed(lastFinalMs) + ".");
+    loadMeetings();
+  }
+  if (recState === "finishing") startFinishingPoll();
+  else stopFinishingPoll();
 
   // Said out loud while the meeting is still running. Two Deepgram bugs each
   // killed the stream on connect and reported nothing anywhere, so hours of
   // audio were captured beside an empty transcript that looked exactly like a
   // quiet meeting. Finding out afterwards is finding out too late.
+  // Kept accurate for finishing too: the daemon still reports the failure
+  // there, and "Recording, but…" over a closed microphone is the same class of
+  // lie #77 is about.
   if (body.transcription_error) {
-    say("Recording, but transcription is failing: " + body.transcription_error);
+    say(
+      (recState === "finishing"
+        ? "Transcription failed during this meeting: "
+        : "Recording, but transcription is failing: ") + body.transcription_error,
+    );
   }
 }
 
@@ -504,9 +594,14 @@ function showLive() {
 }
 
 async function onRecord() {
-  const path = recordingNow
-    ? "/api/recording/stop"
-    : "/api/recording/start?ack=all-party";
+  // Nothing to press while the meeting is being written: capture is already
+  // over and Start is refused until the slot frees. The button is disabled in
+  // that state, so this only catches a click that raced the poll.
+  if (recState === "finishing") return;
+  const path =
+    recState === "recording"
+      ? "/api/recording/stop"
+      : "/api/recording/start?ack=all-party";
   el.record.disabled = true;
   try {
     const body = await api(path, { method: "POST" });
@@ -518,13 +613,21 @@ async function onRecord() {
     } else if (body.state === "recording") {
       say("Recording. Tell the other participants.");
       showLive();
+    } else if (body.state === "finishing") {
+      // Stop branches on the *answer*, not on what was asked. It used to fall
+      // into the start branch, announce "Recording. Tell the other
+      // participants." and call showLive(), which wiped the pane holding the
+      // meeting's own transcript (#77).
+      say("Stopped. Finishing — writing the meeting to your library.");
     } else {
       say("Stopped. The meeting is being written to your library.");
       await loadMeetings();
     }
   } catch (e) {
     say("Could not reach the recorder.");
-    el.record.disabled = false;
+    // Not a flat `disabled = false`: CON-01 says an idle Start stays disabled
+    // until the box is ticked.
+    paintRecordButton();
   }
 }
 
@@ -680,9 +783,9 @@ async function main() {
   el.search.addEventListener("input", onSearch);
   el.record.addEventListener("click", onRecord);
   // Re-evaluates the disabled state; the box gates Start and nothing else.
-  el.consent.addEventListener("change", function () {
-    el.record.disabled = !recordingNow && !el.consent.checked;
-  });
+  // Through `paintRecordButton` so it is state-aware: ticking the box while a
+  // meeting is being written must not re-enable a button with nothing to do.
+  el.consent.addEventListener("change", paintRecordButton);
   el.ghSave.addEventListener("click", onGithubSave);
   el.ghSettings.addEventListener("toggle", function () {
     if (el.ghSettings.open) loadGithubRepos();

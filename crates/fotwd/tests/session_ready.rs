@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use fotw_audio::platform::file::{FileAudioSource, ReplaySpeed};
 use fotw_audio::wav::WavData;
 use fotw_audio::{AudioTap, FrameSink, SampleFormat, StreamFormat, TapError, TapId};
-use fotw_web::{RecorderControl, RecorderError};
+use fotw_web::{RecorderControl, RecorderError, RecordingState};
 use fotwd::recording::DaemonRecorder;
 use fotwd::session::{self, ReadySignal, SessionControl, Transcription};
 
@@ -268,9 +268,11 @@ async fn a_wedged_device_fails_the_start_instead_of_lying() {
     );
 
     // And the slot must be free, or Start is dead until the daemon restarts.
+    // `is_active()`, not `!is_recording()`: finishing is not recording either,
+    // and a slot stuck there refuses every Start just as thoroughly (#77).
     assert!(
-        !rec.status().is_recording(),
-        "a failed start left the recorder claiming to record"
+        !rec.status().is_active(),
+        "a failed start left the recorder holding the slot"
     );
     released.store(true, Ordering::Relaxed);
 }
@@ -292,7 +294,7 @@ async fn a_start_that_cannot_open_a_device_leaves_the_recorder_idle() {
         .start()
         .expect_err("a missing device must not report success");
     assert!(matches!(err, RecorderError::Failed(_)));
-    assert!(!rec.status().is_recording());
+    assert_eq!(rec.status().state, RecordingState::Idle);
 
     let log = std::fs::read_to_string(root.join("audit.jsonl")).expect("audit log");
     assert!(
