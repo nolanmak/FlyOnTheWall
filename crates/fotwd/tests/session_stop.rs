@@ -89,7 +89,10 @@ async fn a_stop_ends_a_long_session_early() {
         took < Duration::from_secs(10),
         "stop was ignored; the session ran for {took:?}"
     );
-    assert!(outcome.total_buffers > 0, "the tap delivered nothing");
+    assert!(
+        outcome.system_buffers.total > 0,
+        "the tap delivered nothing"
+    );
     assert!(
         outcome.captured_audio(),
         "audio captured before the stop must still be real"
@@ -119,7 +122,7 @@ async fn the_duration_still_ends_a_session_nobody_stops() {
         began.elapsed() < Duration::from_secs(10),
         "the duration ceiling was not honoured"
     );
-    assert!(outcome.total_buffers > 0);
+    assert!(outcome.system_buffers.total > 0);
 }
 
 /// A signal already tripped before the session opens must not hang waiting for

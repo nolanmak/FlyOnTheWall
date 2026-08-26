@@ -26,7 +26,7 @@ pub mod session;
 pub mod summarize;
 pub mod transport;
 
-pub use session::{SessionOutcome, Transcription};
+pub use session::{LegAudio, LegBuffers, SessionOutcome, Transcription};
 
 use std::path::Path;
 
