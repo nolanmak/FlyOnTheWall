@@ -10,6 +10,7 @@ pub mod audit;
 pub mod consent;
 pub mod detect;
 pub mod engine;
+pub mod engine_control;
 pub mod enrich;
 pub mod github;
 pub mod mcp;

@@ -242,7 +242,19 @@ impl Server {
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| "get_meeting needs a `meeting_id`".to_owned())?;
         match self.db.export_meeting(id) {
-            Ok(doc) => Ok(doc.to_markdown()),
+            Ok(doc) => {
+                let mut markdown = doc.to_markdown();
+                // An agent reading a meeting with no summary is in the same
+                // position the dashboard was in before #74: it cannot tell
+                // "nothing worth summarising" from "the engine is broken", and
+                // it will happily report the meeting as having no decisions.
+                if let Some(note) = enrich_note(&doc) {
+                    markdown.push_str("\n> ");
+                    markdown.push_str(&note);
+                    markdown.push('\n');
+                }
+                Ok(markdown)
+            }
             // A missing meeting is a tool-level "no", not a crash.
             Err(_) => Err(format!("no meeting with id `{id}`")),
         }
@@ -271,6 +283,37 @@ impl Server {
             })
             .collect();
         Ok(serde_json::to_string_pretty(&json!({ "meetings": results })).unwrap_or_default())
+    }
+}
+
+/// Why a meeting has no summary, for an agent, or `None` to stay silent.
+///
+/// Silent when there *is* a summary, and silent when enrichment has not run
+/// yet — a meeting that finished four seconds ago is not broken.
+fn enrich_note(doc: &fotw_store::MeetingDoc) -> Option<String> {
+    if doc.summaries.iter().any(|s| s.is_current != 0) {
+        return None;
+    }
+    match doc.meeting.enrich_status.as_deref()? {
+        "no_engine" => Some(
+            "No summary: no summarization engine is configured on this machine, so this \
+             meeting has its transcript but no derived summary or action items."
+                .to_owned(),
+        ),
+        "engine_unresolvable" => Some(format!(
+            "No summary: the configured summarization engine could not be found on this \
+             machine ({}), so this meeting has its transcript only.",
+            doc.meeting.enrich_detail.as_deref().unwrap_or("unknown")
+        )),
+        "failed" => Some(format!(
+            "No summary: summarization failed for this meeting ({}). The transcript below \
+             is complete and unaffected.",
+            doc.meeting
+                .enrich_detail
+                .as_deref()
+                .unwrap_or("no reason recorded")
+        )),
+        _ => None,
     }
 }
 
@@ -389,6 +432,29 @@ mod tests {
         assert!(!is_error);
         assert!(text.contains("type: meeting-transcript"), "OKF frontmatter");
         assert!(text.contains("move storage to SQLite"), "the transcript");
+    }
+
+    /// The same blank silence the dashboard had (#74), in the surface an agent
+    /// reads. Without this an agent reports "no decisions were made" about a
+    /// meeting whose engine was never installed.
+    #[test]
+    fn a_meeting_with_no_summary_says_which_kind_of_no_summary_it_is() {
+        let (mut s, id) = server_with_a_meeting();
+        let (clean, _) = tool_text(&mut s, "get_meeting", json!({"meeting_id": id.clone()}));
+        assert!(
+            !clean.contains("No summary:"),
+            "a meeting nothing has reported on stays silent: {clean}"
+        );
+
+        s.db.meetings()
+            .set_enrich_report(&id, "engine_unresolvable", Some("claude"))
+            .unwrap();
+        let (text, is_error) = tool_text(&mut s, "get_meeting", json!({"meeting_id": id}));
+        assert!(!is_error, "a missing summary is not a tool error");
+        assert!(
+            text.contains("could not be found on this machine (claude)"),
+            "the reason must reach the agent: {text}"
+        );
     }
 
     #[test]

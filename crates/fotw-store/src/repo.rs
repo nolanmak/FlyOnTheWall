@@ -163,6 +163,83 @@ impl MeetingRepo<'_> {
         Ok(())
     }
 
+    /// Record what the last enrichment pass found (#74).
+    ///
+    /// `status` is one of `ok`, `no_engine`, `engine_unresolvable`, `failed`;
+    /// `detail` is the reason for the two that have one, and is cleared on the
+    /// ones that do not — a healthy status beside a stale reason is worse than
+    /// no reason at all.
+    ///
+    /// # The one mutation here that does not bump the merge triple
+    ///
+    /// [`Self::set_title`], [`Self::set_state`] and [`Self::finish`] all bump
+    /// `updated_at` and `lamport`, and say why: an edit that does not move the
+    /// clock is invisible to sync (§9.7 invariant 2). This one deliberately
+    /// does not, because it is not an edit to the meeting — it is *this
+    /// device's* diagnosis of *this device's* daemon. Whether a `claude` binary
+    /// resolves on this laptop says nothing about the user's other one, so
+    /// letting it win a merge would overwrite the other machine's real,
+    /// possibly successful report with a local failure. The column is derived
+    /// state that happens to live on the row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when there is no such meeting.
+    pub fn set_enrich_report(
+        &mut self,
+        meeting_id: &str,
+        status: &str,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        let n = self.db.conn().execute(
+            "UPDATE meetings SET enrich_status = ?2, enrich_detail = ?3 WHERE id = ?1",
+            params![meeting_id, status, detail],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound {
+                kind: "meeting",
+                id: meeting_id.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Meetings that have something to summarise and no summary, oldest first.
+    ///
+    /// The backfill sweeper's query (#74). `insert_summary` has one production
+    /// caller, so a meeting that missed its single enrichment window — the
+    /// daemon was restarting, the engine was not installed yet — stayed
+    /// unsummarised forever; 33 of them did.
+    ///
+    /// `failed` is excluded. A meeting whose engine ran and errored would
+    /// otherwise be retried on every pass, which is how an hourly sweeper burns
+    /// a subscription in a loop against a usage limit that is not going away.
+    /// `fotwd summarize <id>` stays the manual retry for those.
+    ///
+    /// # Errors
+    ///
+    /// Propagates SQLite failures.
+    pub fn needing_summary(&self, limit: i64) -> Result<Vec<String>> {
+        let conn = self.db.conn();
+        let mut stmt = conn.prepare(
+            "SELECT m.id FROM meetings m
+              WHERE EXISTS (SELECT 1 FROM segments s WHERE s.meeting_id = m.id)
+                AND NOT EXISTS (
+                      SELECT 1 FROM summaries su
+                       WHERE su.meeting_id = m.id AND su.is_current = 1)
+                AND (m.enrich_status IS NULL
+                     OR m.enrich_status IN ('no_engine', 'engine_unresolvable'))
+              ORDER BY m.started_at_ms ASC, m.id ASC
+              LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     // ---------------------------------------------------------- transcripts
 
     /// Create a transcript for a meeting.

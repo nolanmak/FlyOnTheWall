@@ -428,3 +428,147 @@ fn a_meeting_title_can_be_set_after_the_fact() {
     let row = db.meetings().get(&meeting).unwrap();
     assert_eq!(row.title, "Interconnect bandwidth planning");
 }
+
+// ------------------------------------------------------------ enrich report
+
+/// What enrichment found, kept where the API can serve it (#74).
+///
+/// The deliberate exception to §9.7 invariant 2: this is device-local derived
+/// state — what *this* machine's daemon could resolve — so writing it must not
+/// bump `lamport`/`updated_at` and win a merge against the other laptop's real
+/// edit. Every other `meetings` mutation bumps both; this one is documented
+/// beside them for exactly that reason.
+#[test]
+fn an_enrich_report_round_trips_without_bumping_the_merge_counter() {
+    let mut db = db();
+    let meeting = db
+        .meetings()
+        .create(NewMeeting::new("dev-1", "UTC"))
+        .unwrap();
+    let before = db.meetings().get(&meeting).unwrap();
+    assert_eq!(before.enrich_status, None, "nothing has enriched it yet");
+    assert_eq!(before.enrich_detail, None);
+
+    db.meetings()
+        .set_enrich_report(&meeting, "engine_unresolvable", Some("claude"))
+        .unwrap();
+
+    let after = db.meetings().get(&meeting).unwrap();
+    assert_eq!(after.enrich_status.as_deref(), Some("engine_unresolvable"));
+    assert_eq!(after.enrich_detail.as_deref(), Some("claude"));
+    assert_eq!(
+        after.lamport, before.lamport,
+        "a device-local diagnostic must not out-rank another device's edit"
+    );
+    assert_eq!(after.updated_at, before.updated_at);
+
+    // A repair clears the detail rather than leaving a stale reason beside a
+    // healthy status.
+    db.meetings()
+        .set_enrich_report(&meeting, "ok", None)
+        .unwrap();
+    let repaired = db.meetings().get(&meeting).unwrap();
+    assert_eq!(repaired.enrich_status.as_deref(), Some("ok"));
+    assert_eq!(repaired.enrich_detail, None);
+}
+
+#[test]
+fn an_enrich_report_for_an_unknown_meeting_is_not_found() {
+    let mut db = db();
+    let err = db
+        .meetings()
+        .set_enrich_report("nope", "ok", None)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::NotFound {
+            kind: "meeting",
+            ..
+        }
+    ));
+}
+
+/// The backfill sweeper's query (#74): 33 meetings in the real library missed
+/// their single enrichment window, so "has a transcript but no summary" has to
+/// be answerable without a manual command per meeting.
+///
+/// `failed` is excluded on purpose. A meeting whose engine ran and errored
+/// would otherwise be retried every hour, which is how a laptop burns a
+/// subscription in a loop; `fotwd summarize <id>` stays the documented manual
+/// retry for those.
+#[test]
+fn needing_summary_offers_the_oldest_unsummarised_meetings_and_never_a_failed_one() {
+    let mut db = db();
+
+    // A meeting with a transcript and no summary, in each interesting state.
+    let mut with_transcript = |started: i64, status: Option<&str>| {
+        let id = db
+            .meetings()
+            .create(NewMeeting::new("dev-1", "UTC").started_at_ms(started))
+            .unwrap();
+        let t = db
+            .meetings()
+            .create_transcript(&id, "deepgram", "nova-3", true)
+            .unwrap();
+        db.meetings()
+            .append_segments(&t, &[NewSegment::new(0, 0, 900, "the ingress cutover")])
+            .unwrap();
+        if let Some(status) = status {
+            db.meetings().set_enrich_report(&id, status, None).unwrap();
+        }
+        id
+    };
+
+    let never_tried = with_transcript(3_000, None);
+    let no_engine = with_transcript(1_000, Some("no_engine"));
+    let unresolvable = with_transcript(2_000, Some("engine_unresolvable"));
+    let failed = with_transcript(500, Some("failed"));
+    let already_ok = with_transcript(400, Some("ok"));
+
+    let ids = db.meetings().needing_summary(10).unwrap();
+    assert_eq!(
+        ids,
+        vec![no_engine.clone(), unresolvable.clone(), never_tried.clone()],
+        "oldest first, and neither `failed` nor `ok` is retried"
+    );
+    assert!(!ids.contains(&failed));
+    assert!(!ids.contains(&already_ok));
+
+    // A meeting that has a summary drops out, even with a stale status.
+    db.meetings()
+        .insert_summary(
+            &no_engine,
+            NewSummary {
+                transcript_id: None,
+                provider: "claude-cli".to_owned(),
+                model: "claude-cli".to_owned(),
+                prompt_hash: "h".to_owned(),
+                body_md: "## Decisions".to_owned(),
+                coverage: None,
+                input_tokens: None,
+                output_tokens: None,
+                cost_micros: None,
+                template_id: None,
+                origin_device_id: "dev-1".to_owned(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        db.meetings().needing_summary(10).unwrap(),
+        vec![unresolvable.clone(), never_tried.clone()],
+        "a summarised meeting is done, whatever its status column says"
+    );
+
+    // The cap holds: one pass must not walk the whole library.
+    assert_eq!(
+        db.meetings().needing_summary(1).unwrap(),
+        vec![unresolvable]
+    );
+
+    // A meeting with no transcript at all is not a candidate — silence is a
+    // normal state, not a missing summary.
+    db.meetings()
+        .create(NewMeeting::new("dev-1", "UTC").started_at_ms(100))
+        .unwrap();
+    assert_eq!(db.meetings().needing_summary(10).unwrap().len(), 2);
+}

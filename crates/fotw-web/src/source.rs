@@ -94,6 +94,22 @@ pub struct MeetingDetail {
     pub meeting: MeetingRow,
     /// The current summary's markdown body, if one has been generated.
     pub summary_md: Option<String>,
+    /// Why there is no summary, when there is none: `no_engine`,
+    /// `engine_unresolvable`, `failed` — or `ok` when there is one.
+    ///
+    /// The renderer used to skip the whole section under
+    /// `if (detail.summary_md)`, which made "no engine configured", "engine
+    /// broken" and "engine fine but still running" one blank space. Without
+    /// this field the client cannot tell them apart, so it is part of the
+    /// contract rather than a nicety (#74).
+    pub enrich_status: Option<String>,
+    /// The reason behind [`MeetingDetail::enrich_status`], when it has one.
+    ///
+    /// **Attacker-influenced.** For `failed` this is an engine subprocess's
+    /// stderr, and that subprocess was just fed an untrusted transcript — so
+    /// it reaches the DOM through `textContent` and never `innerHTML`
+    /// (ING-11).
+    pub enrich_detail: Option<String>,
     /// The user's own notes, if they typed any.
     ///
     /// Search has always indexed notes, so a user could match their own note,
