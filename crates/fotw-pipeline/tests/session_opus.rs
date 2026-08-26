@@ -14,7 +14,7 @@
 use std::f32::consts::TAU;
 
 use fotw_pipeline::opus::decode_ogg_opus_file;
-use fotw_pipeline::wal::{SessionState, SessionWal, discard_pcm, encode_session};
+use fotw_pipeline::wal::{SessionState, SessionWal, TrackFormat, discard_pcm, encode_session};
 
 fn tmpdir(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("fotw-session-opus-{name}-{}", std::process::id()));
@@ -304,5 +304,159 @@ fn a_multichannel_session_is_downmixed_to_the_mono_stream_9_5_specifies() {
     println!(
         "48 kHz stereo i16 -> 16 kHz-class mono Opus: {} B -> {} B = {ratio:.1}x",
         encoded.system.pcm_bytes, encoded.system.opus_bytes
+    );
+}
+
+/// A manifest exactly as schema 3 wrote it: one session-wide `channels`, and
+/// it is the system tap's. Every session archived before schema 4 is on disk
+/// in this shape, so it has to keep parsing and keep encoding correctly.
+const SCHEMA_3_MANIFEST: &str = r#"{
+  "id": "1756200000000-0badc0de",
+  "sample_rate_hz": 48000,
+  "channels": 2,
+  "started_at_ms": 1756200000000,
+  "host_epoch_ns": 0,
+  "app_version": "0.1.0",
+  "schema": 3,
+  "ended_at_ms": 1756200002000,
+  "gaps": []
+}"#;
+
+/// A session directory written by hand, manifest and all.
+///
+/// Fixtures for older schemas cannot go through `SessionWal`: it only writes
+/// the current one.
+fn hand_written_session(
+    root: &std::path::Path,
+    manifest: &str,
+    system: &[f32],
+    mic: &[f32],
+) -> std::path::PathBuf {
+    let dir = root.join("1756200000000-0badc0de");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("manifest.json"), manifest).unwrap();
+    for (name, pcm) in [("system.pcm", system), ("mic.pcm", mic)] {
+        let mut bytes = Vec::with_capacity(pcm.len() * 2);
+        for s in pcm {
+            bytes.extend_from_slice(&((s.clamp(-1.0, 1.0) * 32_767.0) as i16).to_le_bytes());
+        }
+        std::fs::write(dir.join(name), bytes).unwrap();
+    }
+    dir
+}
+
+/// The same tone in both channels of an interleaved stereo buffer.
+fn interleaved_stereo(mono: &[f32]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(mono.len() * 2);
+    for s in mono {
+        out.push(*s);
+        out.push(*s);
+    }
+    out
+}
+
+#[test]
+fn a_mono_mic_beside_a_stereo_system_leg_encodes_to_tracks_of_equal_duration() {
+    // #80: the manifest recorded one channel count for the session and it was
+    // the system tap's, so a mono mic WAL was read as stereo — every pair of
+    // consecutive samples became one frame, and the archived mic track came
+    // out at exactly half its real length, playing at 2x. The two legs cover
+    // the same wall clock; the two Opus tracks must too.
+    let root = tmpdir("mixed-formats");
+    let rate = 48_000u32;
+    let mut wal = SessionWal::create_with_formats(
+        &root,
+        TrackFormat::new(rate, 2),
+        Some(TrackFormat::new(rate, 1)),
+    )
+    .unwrap();
+
+    let system = interleaved_stereo(&tone(440.0, 2.0, 0.5, rate));
+    let mic = tone(880.0, 2.0, 0.5, rate);
+    wal.write_system(&system).unwrap();
+    wal.write_mic(&mic).unwrap();
+    let (dir, _) = wal.finalize_and_encode().unwrap();
+
+    let sys = decode_ogg_opus_file(dir.join("system.opus"), rate).unwrap();
+    let mic = decode_ogg_opus_file(dir.join("mic.opus"), rate).unwrap();
+
+    // Packets, not milliseconds: a 20 ms packet count is what the diagnosis
+    // measured (46,019 against 92,046) and it has no rounding in it.
+    assert_eq!(
+        mic.packets, sys.packets,
+        "mic.opus is {} packets against system.opus's {} for the same \
+         2,000 ms — the mic leg's own channel count was not used",
+        mic.packets, sys.packets
+    );
+    assert_eq!(mic.samples.len(), sys.samples.len());
+
+    // Pitch is what the frame-size mistake destroys and what a listener
+    // hears: reading mono as stereo averages adjacent samples, which lands
+    // 880 Hz on 1,760 Hz at half the length.
+    assert_tone(
+        &mic.samples[rate as usize / 20..],
+        rate,
+        880.0,
+        "the mono mic leg",
+    );
+}
+
+#[test]
+fn a_schema_3_session_infers_the_mic_was_mono_from_the_byte_ratio() {
+    // The legacy path. Nothing on disk says what the mic's format was, but
+    // the legs cover the same wall clock, so their byte counts stand in the
+    // ratio of their channel counts: a mic file at half a stereo system's
+    // bytes was mono. This is the shape every already-archived session has.
+    let root = tmpdir("schema-3");
+    let rate = 48_000u32;
+    let system = interleaved_stereo(&tone(440.0, 2.0, 0.5, rate));
+    let mic = tone(880.0, 2.0, 0.5, rate);
+    let dir = hand_written_session(&root, SCHEMA_3_MANIFEST, &system, &mic);
+
+    encode_session(&dir).unwrap();
+
+    let sys = decode_ogg_opus_file(dir.join("system.opus"), rate).unwrap();
+    let mic = decode_ogg_opus_file(dir.join("mic.opus"), rate).unwrap();
+    assert_eq!(
+        mic.packets, sys.packets,
+        "mic.opus is {} packets against system.opus's {}; the inference did \
+         not fire",
+        mic.packets, sys.packets
+    );
+    assert_tone(
+        &mic.samples[rate as usize / 20..],
+        rate,
+        880.0,
+        "a legacy mono mic leg",
+    );
+}
+
+#[test]
+fn a_schema_3_session_whose_legs_match_keeps_the_recorded_channel_count() {
+    // The other half of the inference, and the reason it is not just "assume
+    // the mic was mono": a genuinely stereo mic leg is the same size as the
+    // system leg, and reading *that* as mono is the same bug pointed the
+    // other way.
+    let root = tmpdir("schema-3-stereo");
+    let rate = 48_000u32;
+    let system = interleaved_stereo(&tone(440.0, 2.0, 0.5, rate));
+    let mic = interleaved_stereo(&tone(880.0, 2.0, 0.5, rate));
+    let dir = hand_written_session(&root, SCHEMA_3_MANIFEST, &system, &mic);
+
+    encode_session(&dir).unwrap();
+
+    let sys = decode_ogg_opus_file(dir.join("system.opus"), rate).unwrap();
+    let mic = decode_ogg_opus_file(dir.join("mic.opus"), rate).unwrap();
+    assert_eq!(mic.packets, sys.packets);
+    let d = mic.duration_ms();
+    assert!(
+        (1_950..=2_050).contains(&d),
+        "a stereo mic leg decoded to {d} ms of a 2,000 ms recording"
+    );
+    assert_tone(
+        &mic.samples[rate as usize / 20..],
+        rate,
+        880.0,
+        "a legacy stereo mic leg",
     );
 }

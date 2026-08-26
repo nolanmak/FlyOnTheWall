@@ -305,8 +305,9 @@ Per-session directory under the app's local data dir:
 sessions/<ulid>/
   system.pcm      headerless raw i16 @16k mono — no header to rewrite
   mic.pcm
-  manifest.json   rates, channels, wall-clock + host-time epoch, app version,
-                  schema version, gap markers; `ended_at` absent until clean finalize
+  manifest.json   rate and channels PER LEG (the two taps are two devices),
+                  wall-clock + host-time epoch, app version, schema version,
+                  gap markers; `ended_at` absent until clean finalize
   stt.jsonl       append-only, one object per finalized result, with audio_byte_offset
   notes.json      debounce-saved at 500 ms and on blur
 ```

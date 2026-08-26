@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use fotw_pipeline::wal::{SessionState, SessionWal, SttRecord, recover};
+use fotw_pipeline::wal::{SessionState, SessionWal, SttRecord, TrackFormat, recover};
 
 fn tmpdir(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("fotw-wal-{name}-{}", std::process::id()));
@@ -168,4 +168,102 @@ fn the_manifest_records_gap_markers_across_a_device_rebuild() {
     assert_eq!(s.manifest.gaps.len(), 1);
     assert_eq!(s.manifest.gaps[0].duration_ms(), 250);
     assert!(s.manifest.ended_at_ms.is_some());
+}
+
+#[test]
+fn a_schema_3_manifest_still_loads_and_its_legs_are_counted_separately() {
+    // Manifests are read far more often than they are written, and there are
+    // schema-3 sessions on disk right now. Every field added since is
+    // `#[serde(default)]` precisely so this document keeps parsing — and the
+    // per-leg frame counts have to come out right for it too, which for a
+    // schema-3 manifest means inferring the mic's channel count rather than
+    // trusting the one session-wide number (#80).
+    let root = tmpdir("schema-3");
+    let dir = root.join("1756200000000-0badc0de");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("manifest.json"),
+        r#"{
+  "id": "1756200000000-0badc0de",
+  "sample_rate_hz": 48000,
+  "channels": 2,
+  "started_at_ms": 1756200000000,
+  "host_epoch_ns": 0,
+  "app_version": "0.1.0",
+  "schema": 3,
+  "gaps": []
+}"#,
+    )
+    .unwrap();
+    // 1,000 frames each: stereo is 4 bytes a frame, mono 2.
+    std::fs::write(dir.join("system.pcm"), vec![0u8; 4_000]).unwrap();
+    std::fs::write(dir.join("mic.pcm"), vec![0u8; 2_000]).unwrap();
+
+    let s = SessionState::read(&dir).unwrap();
+    assert_eq!(s.manifest.schema, 3);
+    assert_eq!(s.manifest.sample_rate_hz, 48_000);
+    assert_eq!(s.manifest.channels, 2);
+    assert!(!s.is_finalized(), "no `ended_at_ms` means recoverable");
+    assert_eq!(s.system_frames, 1_000);
+    assert_eq!(
+        s.mic_frames, 1_000,
+        "the mic leg is half the system leg's bytes for the same wall clock, \
+         so it is mono; counting it as stereo halves the meeting"
+    );
+
+    // And the guess is visible as a guess. Nothing in a schema-3 manifest
+    // says what the mic's format was, so a caller has to be able to tell that
+    // the answer was worked out rather than read.
+    assert!(s.manifest.system_format.is_none());
+    assert!(s.manifest.mic_format.is_none());
+    let f = s.manifest.track_formats(&dir);
+    assert!(f.mic_inferred);
+    assert_eq!(f.mic, TrackFormat::new(48_000, 1));
+    assert_eq!(f.system, TrackFormat::new(48_000, 2));
+}
+
+#[test]
+fn a_new_session_records_a_format_for_each_leg() {
+    // Schema 4. The two taps are two devices — 48 kHz stereo system audio
+    // beside a 44.1 kHz mono headset is the ordinary case, not an exotic one
+    // — and the manifest is the only thing that says how to read either file.
+    let root = tmpdir("per-leg-format");
+    let system = TrackFormat::new(48_000, 2);
+    let mic = TrackFormat::new(44_100, 1);
+    let dir = SessionWal::create_with_formats(&root, system, Some(mic))
+        .unwrap()
+        .finalize()
+        .unwrap();
+
+    let s = SessionState::read(&dir).unwrap();
+    assert_eq!(s.manifest.schema, 4);
+    assert_eq!(s.manifest.system_format, Some(system));
+    assert_eq!(s.manifest.mic_format, Some(mic));
+    // The pre-4 fields keep describing the system leg, so a reader that
+    // predates the split still finds what it expects.
+    assert_eq!(s.manifest.sample_rate_hz, 48_000);
+    assert_eq!(s.manifest.channels, 2);
+
+    let f = s.manifest.track_formats(&dir);
+    assert!(!f.mic_inferred, "a recorded format is not a guess");
+    assert_eq!(f.mic, mic);
+    assert_eq!(f.system, system);
+}
+
+#[test]
+fn a_session_with_no_mic_tap_records_no_mic_format_and_infers_nothing() {
+    // A mic-denied meeting is an ordinary meeting. The leg exists and stays
+    // empty, so there is no format to record — and an absent `mic_format` at
+    // schema 4 must not send the reader down the legacy inference, which is
+    // there for manifests written before per-track formats were.
+    let root = tmpdir("no-mic");
+    let dir = SessionWal::create_with_formats(&root, TrackFormat::new(48_000, 2), None)
+        .unwrap()
+        .finalize()
+        .unwrap();
+
+    let s = SessionState::read(&dir).unwrap();
+    assert_eq!(s.manifest.mic_format, None);
+    assert_eq!(s.mic_frames, 0);
+    assert!(!s.manifest.track_formats(&dir).mic_inferred);
 }
