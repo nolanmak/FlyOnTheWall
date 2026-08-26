@@ -48,8 +48,10 @@ use fotw_store::Db;
 use fotw_summarize::template::{TemplateSet, default_templates_dir};
 use serde::{Deserialize, Serialize};
 
-use crate::engine::{EngineResolution, fallback_title, resolve_engine, resolve_engine_detailed};
-use crate::summarize::{SummarizeRunError, summarize_meeting, title_meeting};
+use crate::engine::{
+    Engine, EngineResolution, fallback_title, resolve_engine, resolve_engine_detailed,
+};
+use crate::summarize::{SummarizeRunError, summarize_meeting_on, title_meeting_on};
 
 /// The prefix the title minted at persist time carries. A title starting with
 /// it is a placeholder nobody chose, and always replaceable.
@@ -197,7 +199,16 @@ pub async fn enrich_meeting_with(
                 report.problems.push(unresolvable(&configured));
                 ("engine_unresolvable", Some(configured))
             }
-            EngineResolution::Engine(_) => {
+            // Resolved **once**, and carried down. Both calls below used to go
+            // back and resolve for themselves, so one meeting cost three trips
+            // through the keystore — and on the Anthropic arm three keychain
+            // reads, through the store whose 5-second timeout exists because
+            // those can block (#87). The answer cannot sensibly change inside
+            // one pass, and where it does — a binary uninstalled between the
+            // title call and Call A — the spawn says so by name, which is a
+            // better report than the "no engine is configured" a second
+            // resolve produced for a machine that plainly has one.
+            EngineResolution::Engine(engine) => {
                 // The title **first**, which is what makes #67's "within
                 // seconds of finalising" true: it is one small call over the
                 // head of the transcript and it answers in seconds, where the
@@ -206,10 +217,17 @@ pub async fn enrich_meeting_with(
                 // summary-derived title; a separate call is better, because it
                 // lands even when the templates are missing or Call B fails.
                 if replaceable {
-                    title_from_engine(db, store, meeting_id, &segments, &mut receipt, &mut report)
-                        .await;
+                    title_from_engine(
+                        db,
+                        &engine,
+                        meeting_id,
+                        &segments,
+                        &mut receipt,
+                        &mut report,
+                    )
+                    .await;
                 }
-                summarize(db, store, meeting_id, &mut report).await
+                summarize(db, &engine, meeting_id, &mut report).await
             }
         };
         // Best-effort, per the module docs: a report that could not be stored
@@ -259,13 +277,13 @@ pub async fn enrich_meeting_with(
 /// name and never its summary.
 async fn title_from_engine(
     db: &mut Db,
-    store: &dyn KeyStore,
+    engine: &Engine,
     meeting_id: &str,
     segments: &[fotw_stt::TranscriptSegment],
     receipt: &mut EnrichReceipt,
     report: &mut EnrichReport,
 ) {
-    match title_meeting(db, store, meeting_id, segments).await {
+    match title_meeting_on(engine, meeting_id, segments).await {
         Ok(named) => mint(db, meeting_id, &named, receipt, report),
         Err(e) => report.problems.push(format!("title: {e}")),
     }
@@ -357,7 +375,7 @@ pub async fn backfill_once(db: &mut Db, store: &dyn KeyStore, limit: i64) -> usi
 /// backfill sweeper, which is right, but for the wrong reason.
 async fn summarize(
     db: &mut Db,
-    store: &dyn KeyStore,
+    engine: &Engine,
     meeting_id: &str,
     report: &mut EnrichReport,
 ) -> (&'static str, Option<String>) {
@@ -379,7 +397,7 @@ async fn summarize(
         return fail("no templates installed — run `fotwd templates install`".to_owned());
     };
 
-    match summarize_meeting(db, store, meeting_id, template).await {
+    match summarize_meeting_on(db, engine, meeting_id, template).await {
         Ok(outcome) => {
             report.summary_version = Some(outcome.version);
             // A summary that stored fine but lost its structured half is a
@@ -388,8 +406,12 @@ async fn summarize(
             report.problems.extend(outcome.warnings);
             ("ok", None)
         }
-        // NoKey here means the engine vanished between resolve and run — a
-        // race worth naming, not worth failing differently over.
+        // Unreachable from here since #87 — the engine arrives resolved, so
+        // this call has nothing left to fail to resolve. Kept because the arm
+        // is a *classification*, not a code path: `no_engine` and `failed` are
+        // the two states #74 split apart, and anything that put a resolve back
+        // inside the run would otherwise report a missing engine as a broken
+        // one without a single test noticing.
         Err(SummarizeRunError::NoKey) => {
             report.problems.push(NO_ENGINE.to_owned());
             ("no_engine", None)

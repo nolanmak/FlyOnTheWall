@@ -104,7 +104,9 @@ pub struct SummarizeSettingsDoc {
     /// Which CLI.
     pub cli_kind: CliEngine,
     /// The binary to run. A bare name is probed; a path is used as-is when it
-    /// resolves. Empty means "the default for this engine".
+    /// resolves. Empty means "the default for this engine", which the daemon
+    /// stores as that engine's **bare name** rather than as today's path, so
+    /// the row survives the CLI being reinstalled somewhere else (#87).
     pub binary: String,
 }
 

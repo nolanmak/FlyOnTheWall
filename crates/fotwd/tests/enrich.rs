@@ -4,7 +4,7 @@
 //! already safe on disk, and everything here is derived. Problems are
 //! reported, not thrown — the same posture as `stt_errors`.
 
-use fotw_secrets::InMemoryKeyStore;
+use fotw_secrets::{InMemoryKeyStore, KeyStore, SecretKey, SecretString, SecretsError};
 use fotw_store::{Db, DbKey, NewMeeting, NewSegment};
 use fotwd::engine::SummarizeSettings;
 use fotwd::enrich::enrich_meeting_with;
@@ -485,6 +485,159 @@ async fn a_meeting_with_no_transcript_is_left_alone() {
     // Left alone, but *stamped*: it has nothing to wait for, and the GitHub
     // exporter must not hold a speechless meeting back forever (#76).
     assert!(finished_stamp(&db, &meeting) > 0);
+}
+
+// ------------------------------------------- resolving the engine — #87
+
+/// A [`KeyStore`] that counts what enrichment asked it for.
+///
+/// The count *is* the resolution count. `resolve_engine_detailed` tries the
+/// Anthropic key first and falls through to the settings row only when the
+/// store says there is none, so one `get` is one trip through the resolver —
+/// and on the API arm one trip through the OS keychain, which is what #87 is
+/// counting and what the 5-second `KEYCHAIN_TIMEOUT` and #53's ACL prompts
+/// make expensive.
+///
+/// Wrapping [`InMemoryKeyStore`] rather than reimplementing it keeps this a
+/// meter on the real contract: everything it is asked, it asks onward.
+struct CountingKeyStore {
+    inner: InMemoryKeyStore,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingKeyStore {
+    fn new() -> Self {
+        Self {
+            inner: InMemoryKeyStore::new(),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// How many times anything read a secret out of this store.
+    fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl KeyStore for CountingKeyStore {
+    fn set(&self, key: SecretKey, secret: &SecretString) -> Result<(), SecretsError> {
+        self.inner.set(key, secret)
+    }
+
+    fn get(&self, key: SecretKey) -> Result<SecretString, SecretsError> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.get(key)
+    }
+
+    fn delete(&self, key: SecretKey) -> Result<(), SecretsError> {
+        self.inner.delete(key)
+    }
+
+    fn contains(&self, key: SecretKey) -> Result<bool, SecretsError> {
+        self.inner.contains(key)
+    }
+}
+
+/// #87's acceptance: one meeting, one engine resolution, one keychain read.
+///
+/// Enrichment resolved three times — once for its own report, once inside
+/// `title_meeting` (#76) and once inside `summarize_meeting` — and each was a
+/// `get` on a store whose timeout exists because a keychain read can block.
+/// The resolver's answer is now carried down instead of asked for again.
+///
+/// The invocation count rides along deliberately: "resolved once" must not be
+/// bought by making one of the three *calls* stop happening.
+#[tokio::test]
+async fn a_meeting_is_enriched_on_one_engine_resolution() {
+    let mut db = db();
+    let meeting = meeting_with_transcript(&mut db);
+    let cli = scripted_cli(
+        "resolved-once",
+        &["Interconnect Bandwidth", PROSE, EXTRACTION],
+    );
+    cli_settings(&mut db, &cli.binary);
+    let store = CountingKeyStore::new();
+
+    let report = enrich_meeting_with(&mut db, &store, &meeting).await;
+
+    assert!(
+        report.problems.is_empty(),
+        "a clean run reports nothing: {:?}",
+        report.problems
+    );
+    assert_eq!(
+        cli.invocations(),
+        3,
+        "the title call and both summary calls must still happen"
+    );
+    assert_eq!(
+        store.reads(),
+        1,
+        "the engine was resolved once per meeting and no more"
+    );
+}
+
+/// The race the single resolution opens, answered on purpose.
+///
+/// With one resolution at the top of the pass, a binary that disappears
+/// between the title call and Call A is discovered by the *spawn* rather than
+/// by a second resolve. That is the right answer and not merely the cheap one:
+/// re-resolving never closed the race either — `SummarizeRunError::NoKey` is
+/// documented in `enrich.rs` as "the engine vanished between resolve and run"
+/// — and the report it produced was worse. "No summarization engine is
+/// configured" is false of a machine where one is configured and was running
+/// sixty seconds ago, and it sends the user to the settings pane to fix
+/// something that is not broken. A `failed` naming the binary and the OS's own
+/// error is what someone can act on.
+#[tokio::test]
+async fn an_engine_that_vanishes_mid_pass_is_reported_by_name_not_as_no_engine() {
+    let mut db = db();
+    let meeting = meeting_with_transcript(&mut db);
+    // Answers the title call and then deletes itself, so Call A's spawn is the
+    // first thing to notice it is gone.
+    let cli = scripted_cli("vanishing", &["Interconnect Bandwidth"]);
+    std::fs::write(
+        &cli.binary,
+        "#!/bin/sh\n\
+         cat > /dev/null\n\
+         d=$(dirname \"$0\")\n\
+         cat \"$d/1.json\"\n\
+         rm -f \"$0\"\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&cli.binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    cli_settings(&mut db, &cli.binary);
+
+    let report = enrich_meeting_with(&mut db, &InMemoryKeyStore::new(), &meeting).await;
+
+    // The title landed before the engine went away, and keeps its meeting.
+    assert_eq!(
+        db.meetings().get(&meeting).unwrap().title,
+        "Interconnect Bandwidth"
+    );
+    let row = db.meetings().get(&meeting).unwrap();
+    assert_eq!(
+        row.enrich_status.as_deref(),
+        Some("failed"),
+        "a configured engine that went missing mid-pass is not `no_engine`"
+    );
+    assert!(
+        row.enrich_detail
+            .as_deref()
+            .is_some_and(|d| d.contains(STUB_ENGINE_NAME)),
+        "the report must name the binary that could not be started: {:?}",
+        row.enrich_detail
+    );
+    assert!(
+        report.problems.iter().any(|p| p.contains(STUB_ENGINE_NAME)),
+        "{:?}",
+        report.problems
+    );
 }
 
 // -------------------------------------------------------------- the stamps

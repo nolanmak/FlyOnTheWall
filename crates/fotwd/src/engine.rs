@@ -56,39 +56,31 @@ impl CliKind {
     /// the array length, which is the point of writing it down.
     pub const ALL: [Self; 2] = [Self::Claude, Self::Codex];
 
-    /// The binary a bare enablement defaults to when the user names none.
+    /// What a bare enablement stores when the user names no binary.
     ///
-    /// Resolved to an **absolute path** when one can be found, because the
-    /// daemon runs as a LaunchServices-launched `.app` whose PATH is minimal
-    /// (`/usr/bin:/bin:/usr/sbin:/sbin`) — it does not include `~/.local/bin`
-    /// or Homebrew, where both CLIs actually install. A bare name stored here
-    /// resolves fine from the user's shell (where `fotwd engine` runs) and
-    /// then fails to resolve inside the daemon, which is precisely the silent
-    /// "configured but no summaries" trap. Probing the real install spots at
-    /// configure time turns that into a path that works from both.
+    /// The **bare name**, and never a path — #87.
+    ///
+    /// `a0c40eb` probed the install directories here and froze the winner into
+    /// the settings row. That bought reach: a bare name resolved fine from the
+    /// user's shell, where `fotwd engine` runs, and then resolved to nothing
+    /// inside a LaunchServices-launched `.app` whose PATH is
+    /// `/usr/bin:/bin:/usr/sbin:/sbin` — the silent "configured but no
+    /// summaries" trap. It also manufactured, one enablement at a time, every
+    /// stale row [`probe`]'s basename rescue now exists to survive: the frozen
+    /// path is wrong the moment the user upgrades node, moves a Homebrew
+    /// prefix or reinstalls the CLI, and nothing ever rewrites it.
+    ///
+    /// [`resolve_binary`] answers "where is it" at *call* time now (#74), from
+    /// inside the daemon, which is what made the freezing worth anything. So
+    /// the row keeps the one fact that cannot go stale — which engine — and
+    /// the daemon re-derives the rest on every pass.
+    ///
+    /// This is only the default. `--binary /some/path` is a different intent —
+    /// *that* one, not whichever one you find — and is stored verbatim; see
+    /// [`SummarizeSettings::binary`].
     #[must_use]
     pub fn default_binary(self) -> String {
-        let bare = match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-        };
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        // codex also ships as an app bundle; prefer it when present.
-        if self == Self::Codex {
-            candidates.push(PathBuf::from(
-                "/Applications/Codex.app/Contents/Resources/codex",
-            ));
-        }
-        if let Some(home) = std::env::var_os("HOME") {
-            candidates.push(PathBuf::from(&home).join(".local/bin").join(bare));
-        }
-        candidates.push(PathBuf::from("/opt/homebrew/bin").join(bare));
-        candidates.push(PathBuf::from("/usr/local/bin").join(bare));
-
-        candidates
-            .into_iter()
-            .find(|p| p.is_file())
-            .map_or_else(|| bare.to_owned(), |p| p.to_string_lossy().into_owned())
+        self.bare_name().to_owned()
     }
 
     /// The binary name this engine installs under.
@@ -159,7 +151,20 @@ pub struct SummarizeSettings {
     pub acknowledged_egress: bool,
     /// Which CLI. Defaults to claude for rows written before codex existed.
     pub cli_kind: CliKind,
-    /// The binary to run. A bare name resolves on PATH; a path is used as-is.
+    /// The binary to run, as [`resolve_binary`] is given it.
+    ///
+    /// **What a bare enablement stores is the bare name** — `"claude"`,
+    /// `"codex"` — because that is the only spelling that cannot go stale
+    /// (#87). [`resolve_binary`] probes `$PATH` and the real install
+    /// directories on every pass, so the row says *which* engine and the
+    /// daemon says *where*, and a node upgrade or a moved Homebrew prefix
+    /// costs the user nothing.
+    ///
+    /// A path here is a path the user chose — `--binary`, or the dashboard's
+    /// field — and is used verbatim while it exists. A path that has stopped
+    /// existing falls back to its basename rather than failing, which is what
+    /// rescues the rows written before #87 by a build that froze the probe's
+    /// answer at configure time.
     pub binary: String,
 }
 

@@ -96,26 +96,63 @@ pub(crate) fn stored_segments(
     Ok(load_segments(db, &transcript_id)?)
 }
 
-/// Summarise a stored meeting using the daemon's real, allowlisted transport.
+/// Summarise a stored meeting, resolving the engine and using the daemon's
+/// real, allowlisted transport.
+///
+/// The entry point for `fotwd summarize <id>`, which arrives holding a
+/// keystore and no engine. Enrichment has already resolved one and calls
+/// [`summarize_meeting_on`] instead (#87).
+///
+/// # Errors
+///
+/// [`SummarizeRunError::NoKey`] when nothing is configured, plus whatever
+/// [`summarize_meeting_on`] failed with.
 pub async fn summarize_meeting(
     db: &mut Db,
     store: &dyn KeyStore,
     meeting_id: &str,
     template: &Template,
 ) -> Result<SummarizeOutcome, SummarizeRunError> {
-    let transport = Arc::new(AllowlistedTransport::new());
-    summarize_meeting_with(db, store, meeting_id, template, transport).await
+    let engine = crate::engine::resolve_engine(store, db).ok_or(SummarizeRunError::NoKey)?;
+    summarize_meeting_on(db, &engine, meeting_id, template).await
 }
 
-/// Summarise a stored meeting over an injected transport.
+/// [`summarize_meeting`] on an engine the caller already resolved.
+///
+/// The engine is an argument rather than something to go and find, because
+/// finding it is not free: on the Anthropic arm it is a keychain read, through
+/// a store whose 5-second timeout exists because keychain reads can block and
+/// whose ACL prompts are #53. Enrichment used to pay for three of them per
+/// meeting — its own report, the title call and this one — for an answer that
+/// cannot sensibly change inside one pass (#87).
+///
+/// # Errors
+///
+/// [`SummarizeRunError::NoTranscript`] with nothing to summarise, and whatever
+/// the store or the pipeline failed with.
+pub async fn summarize_meeting_on(
+    db: &mut Db,
+    engine: &crate::engine::Engine,
+    meeting_id: &str,
+    template: &Template,
+) -> Result<SummarizeOutcome, SummarizeRunError> {
+    let transport = Arc::new(AllowlistedTransport::new());
+    summarize_meeting_with(db, engine, meeting_id, template, transport).await
+}
+
+/// [`summarize_meeting_on`] over an injected transport.
 ///
 /// Split out so the glue between the database and the pipeline — loading
 /// segments, rebuilding the document, versioning the result — is testable
 /// without a network or a key. That glue is where the seams are, and it is
 /// exactly what the pipeline's own 157 tests cannot reach.
+///
+/// # Errors
+///
+/// As [`summarize_meeting_on`].
 pub async fn summarize_meeting_with<T>(
     db: &mut Db,
-    store: &dyn KeyStore,
+    engine: &crate::engine::Engine,
     meeting_id: &str,
     template: &Template,
     transport: Arc<T>,
@@ -131,8 +168,6 @@ where
     if segments.is_empty() {
         return Err(SummarizeRunError::NoTranscript(meeting_id.to_owned()));
     }
-
-    let engine = crate::engine::resolve_engine(store, db).ok_or(SummarizeRunError::NoKey)?;
 
     // The user's typed notes, if any. They are a *saliency signal*, not just
     // another input: the prompt contract treats each line as a pointer to
@@ -152,7 +187,7 @@ where
     let prose_model = Preset::Balanced.prose_model().unwrap_or("claude-opus-5");
     let extraction_model = Preset::Cheap.prose_model().unwrap_or("claude-haiku-4-5");
     let built = engine_adapters(
-        &engine,
+        engine,
         &transport,
         prose_model,
         extraction_model,
@@ -328,23 +363,31 @@ where
     }
 }
 
-/// Ask the engine to name a meeting, over the daemon's real transport (#76).
-pub async fn title_meeting(
-    db: &mut Db,
-    store: &dyn KeyStore,
+/// Ask an engine to name a meeting, over the daemon's real transport (#76).
+///
+/// The engine is an argument for [`summarize_meeting_on`]'s reason: enrichment
+/// has one already, and re-resolving it here was one of the three keychain
+/// reads a single meeting used to cost (#87).
+///
+/// # Errors
+///
+/// As [`title_meeting_with`].
+pub async fn title_meeting_on(
+    engine: &crate::engine::Engine,
     meeting_id: &str,
     segments: &[TranscriptSegment],
 ) -> Result<String, SummarizeRunError> {
     let transport = Arc::new(AllowlistedTransport::new());
-    title_meeting_with(db, store, meeting_id, segments, transport).await
+    title_meeting_with(engine, meeting_id, segments, transport).await
 }
 
-/// [`title_meeting`] over an injected transport.
+/// [`title_meeting_on`] over an injected transport.
 ///
 /// Takes the segments the caller already loaded rather than re-reading them:
 /// the only caller is enrichment, which holds them for `fallback_title`
 /// anyway, and this call deliberately reads a *head* of them rather than the
-/// meeting.
+/// meeting. With the engine passed in too, this touches neither the library
+/// nor the keychain — which is why it takes neither.
 ///
 /// One [`LlmAdapter::complete`](fotw_summarize::adapter::LlmAdapter::complete)
 /// against the cheap arm — naming a meeting is the lowest-difficulty task this
@@ -355,12 +398,10 @@ pub async fn title_meeting(
 ///
 /// # Errors
 ///
-/// [`SummarizeRunError::NoTranscript`] with nothing to read,
-/// [`SummarizeRunError::NoKey`] with no engine, and whatever the provider or
-/// the sanitizer refused.
+/// [`SummarizeRunError::NoTranscript`] with nothing to read, and whatever the
+/// provider or the sanitizer refused.
 pub async fn title_meeting_with<T>(
-    db: &mut Db,
-    store: &dyn KeyStore,
+    engine: &crate::engine::Engine,
     meeting_id: &str,
     segments: &[TranscriptSegment],
     transport: Arc<T>,
@@ -371,11 +412,10 @@ where
     if segments.is_empty() {
         return Err(SummarizeRunError::NoTranscript(meeting_id.to_owned()));
     }
-    let engine = crate::engine::resolve_engine(store, db).ok_or(SummarizeRunError::NoKey)?;
     let model = Preset::Cheap
         .extraction_model()
         .unwrap_or("claude-haiku-4-5");
-    let built = engine_adapters(&engine, &transport, model, model, TITLE_DEADLINE);
+    let built = engine_adapters(engine, &transport, model, model, TITLE_DEADLINE);
 
     let document = TranscriptDocument::from_segments(segments);
     let request = title::title_request(&document, title::head_indices(&document), model);
