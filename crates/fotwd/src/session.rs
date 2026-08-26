@@ -55,11 +55,16 @@ pub struct SessionOutcome {
     pub system_samples: u64,
     /// Interleaved samples written for the mic leg.
     pub mic_samples: u64,
-    /// What the transcription provider failed with, if anything.
+    /// How this meeting was degraded, if it was: what the transcription
+    /// provider failed with, and what capture lost on the way in.
     ///
     /// Empty is not the same as "transcription worked": a session with
     /// [`Transcription::Disabled`] also has none. The two are distinguished by
     /// what the caller configured, not by this field.
+    ///
+    /// Named for the provider because that is all it used to carry. Ring drops
+    /// joined it in #79 rather than getting a channel of their own: this is the
+    /// only degradation channel with a reader on the other end.
     pub stt_errors: Vec<String>,
     /// Buffers the tap delivered that were digitally silent.
     pub silent_buffers: u64,
@@ -852,8 +857,8 @@ pub async fn run_with_control(
     let stop = Arc::new(AtomicBool::new(false));
     let pump_stop = Arc::clone(&stop);
     let feeds = SttFeeds {
-        system: sys_stt.clone(),
-        mic: mic_stt.clone(),
+        system: sys_stt.clone().map(|s| s as Arc<dyn PcmFeed>),
+        mic: mic_stt.clone().map(|s| s as Arc<dyn PcmFeed>),
         echo_gate: (sys_stt.is_some()
             && mic_stt.is_some()
             && echo_gate_enabled(std::env::var("FOTW_ECHO_GATE").ok().as_deref()))
@@ -912,6 +917,18 @@ pub async fn run_with_control(
     stop.store(true, Ordering::Release);
     let (system_samples, mic_samples, dropped_samples) =
         pump.join().map_err(|_| "pump panicked".to_string())??;
+
+    // Audio the pump was too slow to collect is audio that exists nowhere: the
+    // ring sits upstream of the WAL, so a drop is not a degraded transcript,
+    // it is a hole in the recording. It rides the same channel as a provider
+    // failure because that is the only one a human ever sees — the field below
+    // has never been read by anything (#79).
+    if dropped_samples > 0 {
+        control.errors.record(format!(
+            "capture: {dropped_samples} samples were dropped at a full ring — \
+             the pump could not keep up with the audio thread"
+        ));
+    }
 
     for stream in [sys_stt, mic_stt].into_iter().flatten() {
         let _ = stream.flush().await;
@@ -983,13 +1000,31 @@ fn spawn_leg_collector(
     })
 }
 
+/// One leg's provider connection, as narrow as the pump's use of it.
+///
+/// The pump only ever hands a leg 16 kHz mono PCM, and how much of it a leg
+/// has been handed *is that leg's clock* — Deepgram stamps a segment by how
+/// much audio the socket has swallowed, nothing else. A trait here is what
+/// makes that count observable without a socket, which is what issue #79's
+/// cross-leg tests need.
+trait PcmFeed: Send + Sync {
+    /// Hand the provider 16-bit little-endian mono PCM.
+    fn write_pcm(&self, pcm: &[i16]);
+}
+
+impl PcmFeed for DeepgramStream {
+    fn write_pcm(&self, pcm: &[i16]) {
+        self.write(pcm);
+    }
+}
+
 /// The provider connections the pump feeds, one per leg.
 ///
 /// A struct rather than two more parameters: the pump's argument list was at
 /// clippy's limit, and these two travel together or not at all.
 struct SttFeeds {
-    system: Option<Arc<DeepgramStream>>,
-    mic: Option<Arc<DeepgramStream>>,
+    system: Option<Arc<dyn PcmFeed>>,
+    mic: Option<Arc<dyn PcmFeed>>,
     /// CAP-11 v1 (#71): withholds echo-dominated mic chunks from the mic
     /// feed when the mic is judged to be hearing the speakers. Present only
     /// when both feeds are live — with one leg there is nothing to couple.
@@ -1008,6 +1043,9 @@ fn pump_loop(
 ) -> Result<(u64, u64, u64), String> {
     let mut scratch = vec![0.0f32; 48_000];
     let (mut sys_written, mut mic_written) = (0u64, 0u64);
+    // What a suppressed mic chunk is fed as. Kept across iterations because
+    // chunk sizes settle: after the first few rounds this stops growing.
+    let mut hush: Vec<i16> = Vec::new();
 
     let mut resampler = Resampler16k::new(sys_format.sample_rate_hz, sys_format.channels)
         .map_err(|e| format!("resampler: {e}"))?;
@@ -1049,7 +1087,7 @@ fn pump_loop(
                     if let Some(gate) = stt.echo_gate.as_mut() {
                         gate.push_system(&mono);
                     }
-                    h.write(&Downmixer::to_i16(&mono));
+                    h.write_pcm(&Downmixer::to_i16(&mono));
                 }
             }
         }
@@ -1078,8 +1116,22 @@ fn pump_loop(
                     let suppress = stt.echo_gate.as_mut().is_some_and(|g| {
                         g.assess(&mono) == fotw_pipeline::echo::GateVerdict::Suppress
                     });
-                    if !suppress {
-                        h.write(&Downmixer::to_i16(&mono));
+                    if suppress {
+                        // Silence, not absence (#79). This leg's clock is the
+                        // amount of PCM its socket has swallowed — Deepgram
+                        // stamps every segment from it — so withholding a
+                        // chunk does not skip a second, it *deletes* one, and
+                        // every word after it is stamped a second early.
+                        // Suppression's effect survives the change because
+                        // silence transcribes as nothing; what it stops
+                        // costing is time. Feeding zeros also keeps the socket
+                        // from going quiet through sustained far-end speech,
+                        // which is the audio-starvation half of #70.
+                        hush.clear();
+                        hush.resize(mono.len(), 0);
+                        h.write_pcm(&hush);
+                    } else {
+                        h.write_pcm(&Downmixer::to_i16(&mono));
                     }
                 }
             }
@@ -1113,7 +1165,15 @@ fn pump_loop(
     // the user to ignore the one prompt that matters.
     wal.finalize()
         .map_err(|e| format!("finalize failed: {e}"))?;
-    Ok((sys_written, mic_written, 0))
+    // Read after the drain, so this is the final count rather than a snapshot
+    // taken while the taps were still delivering. Both legs are summed: the
+    // caller's field is one number, and either leg falling behind means the
+    // same thing about this machine.
+    Ok((
+        sys_written,
+        mic_written,
+        sys.dropped_frames() + mic.dropped_frames(),
+    ))
 }
 
 /// Append finalized segments to the session's `stt.jsonl`.
@@ -1142,4 +1202,279 @@ pub fn append_segments(dir: &Path, segments: &[TranscriptSegment]) -> std::io::R
         )?;
     }
     f.sync_data()
+}
+
+#[cfg(test)]
+mod pump_clock_tests {
+    //! Where the two legs' clocks meet: the pump.
+    //!
+    //! A segment's `start_ms` is Deepgram's connection-relative time, and
+    //! Deepgram's clock is *how much PCM the socket has been fed* — `replay.rs`
+    //! says so in as many words. So anything the pump declines to feed a leg is
+    //! time deleted from that leg's timeline, and the echo gate declined about
+    //! a third of a real 30.5-minute meeting: its mic transcript ended at 22:01
+    //! against the system leg's 30:31 (#79).
+    //!
+    //! Nothing crossed the legs before these tests. `fotw-stt`'s clock suite is
+    //! unit math, the gate's own suite counts verdicts and stops there, and
+    //! `mic_stt.rs` hand-writes `start_ms` — so the one question that mattered,
+    //! *what does suppression do to the downstream clock*, was never asked.
+
+    use super::*;
+    use fotw_audio::SampleFormat;
+
+    const CAPTURE_RATE: u32 = 48_000;
+    const CHANNELS: u16 = 2;
+    /// What both legs are resampled to before a provider sees them.
+    const FEED_RATE: u64 = 16_000;
+    /// Long enough for the gate to warm up, engage and hold; short enough that
+    /// the whole fixture fits in one ring without dropping.
+    const SECONDS: usize = 8;
+
+    fn capture_format() -> StreamFormat {
+        StreamFormat::new(CAPTURE_RATE, CHANNELS, SampleFormat::F32)
+    }
+
+    /// A leg's provider connection, standing in for the socket and remembering
+    /// what it swallowed. Fed samples are the clock; a write that is all zeros
+    /// is what suppression is supposed to look like now.
+    #[derive(Default)]
+    struct CountingFeed {
+        samples: AtomicU64,
+        writes: AtomicU64,
+        silent_writes: AtomicU64,
+    }
+
+    impl PcmFeed for CountingFeed {
+        fn write_pcm(&self, pcm: &[i16]) {
+            self.samples.fetch_add(pcm.len() as u64, Ordering::Relaxed);
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            if pcm.iter().all(|s| *s == 0) {
+                self.silent_writes.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Deterministic speech-like audio: broadband noise under a syllable-paced
+    /// envelope, mono at the capture rate.
+    ///
+    /// Noise under an aperiodic envelope for the reason `fotw-pipeline`'s gate
+    /// suite documents at length — a periodic signal correlates with itself, so
+    /// a tone would engage the gate for a reason a room never supplies.
+    fn speech_like(seed: u32, n: usize) -> Vec<f32> {
+        let mut carrier = seed.wrapping_mul(2_654_435_761).max(1);
+        let mut envelope = seed.wrapping_mul(747_796_405).wrapping_add(1);
+        let xorshift = |s: &mut u32| {
+            *s ^= *s << 13;
+            *s ^= *s >> 17;
+            *s ^= *s << 5;
+            *s
+        };
+        let mut level = 0.5f32;
+        let mut target = 0.5f32;
+        (0..n)
+            .map(|i| {
+                // A new loudness target every ~150 ms with a slow glide toward
+                // it: deep, aperiodic, syllable-paced swings.
+                if i % (CAPTURE_RATE as usize * 150 / 1_000) == 0 {
+                    target = xorshift(&mut envelope) as f32 / u32::MAX as f32;
+                }
+                level += 0.0007 * (target - level);
+                let swung = 0.03 + 0.97 * level.clamp(0.0, 1.0).powi(2);
+                let noise = (xorshift(&mut carrier) as f32 / u32::MAX as f32) * 2.0 - 1.0;
+                swung * 0.3 * noise
+            })
+            .collect()
+    }
+
+    /// The mic on speakers: a delayed, quieter copy of what is playing. Enough
+    /// to make the gate engage, which is all this fixture is for — the room
+    /// modelling that derives the gate's thresholds lives in its own suite.
+    fn echoed(source: &[f32], lag: usize) -> Vec<f32> {
+        (0..source.len())
+            .map(|i| {
+                i.checked_sub(lag)
+                    .and_then(|j| source.get(j))
+                    .copied()
+                    .unwrap_or(0.0)
+                    * 0.3
+            })
+            .collect()
+    }
+
+    fn interleave(mono: &[f32]) -> Vec<f32> {
+        mono.iter().flat_map(|s| [*s, *s]).collect()
+    }
+
+    /// What each leg's socket was handed, once the pump had drained both rings.
+    struct FedClocks {
+        system_samples: u64,
+        mic_samples: u64,
+        mic_writes: u64,
+        mic_silent_writes: u64,
+    }
+
+    /// A root nobody else in this binary will touch. The counter matters:
+    /// these tests run in parallel and two of them drive the same gated
+    /// fixture, so a name built from the test's role alone has one clearing
+    /// the directory out from under the other's open WAL.
+    fn tmp_root(name: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("fotwd-pump-{name}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("a temp root");
+        root
+    }
+
+    /// Drive both legs through the real pump with prefilled rings.
+    ///
+    /// The stop latch is set before the first iteration, so the loop drains
+    /// what is there and returns: no threads, no timers, byte-identical every
+    /// run. The audio is the coupled case the gate exists for — the mic hears
+    /// the speakers — so `gated` decides whether a third of the mic leg gets
+    /// judged echo.
+    fn drive_both_legs(gated: bool) -> FedClocks {
+        let root = tmp_root(if gated { "gated" } else { "open" });
+        let wal = SessionWal::create(&root, CAPTURE_RATE, CHANNELS).expect("a session");
+
+        let mono = speech_like(3, CAPTURE_RATE as usize * SECONDS);
+        let system = interleave(&mono);
+        let mic = interleave(&echoed(&mono, 40 * CAPTURE_RATE as usize / 1_000));
+
+        let (mut sys_prod, sys_cons) = AudioRing::with_capacity_frames(RING_SAMPLES);
+        let (mut mic_prod, mic_cons) = AudioRing::with_capacity_frames(RING_SAMPLES);
+        assert_eq!(
+            sys_prod.push_block(&system),
+            system.len(),
+            "the fixture has to fit the ring or the test measures drops instead"
+        );
+        assert_eq!(mic_prod.push_block(&mic), mic.len());
+
+        let sys_feed = Arc::new(CountingFeed::default());
+        let mic_feed = Arc::new(CountingFeed::default());
+        let feeds = SttFeeds {
+            system: Some(Arc::clone(&sys_feed) as Arc<dyn PcmFeed>),
+            mic: Some(Arc::clone(&mic_feed) as Arc<dyn PcmFeed>),
+            echo_gate: gated.then(|| fotw_pipeline::echo::EchoGate::new(FEED_RATE as u32)),
+        };
+
+        let stop = AtomicBool::new(true);
+        pump_loop(
+            wal,
+            sys_cons,
+            mic_cons,
+            capture_format(),
+            Some(capture_format()),
+            feeds,
+            &stop,
+        )
+        .expect("the pump drains cleanly");
+        let _ = std::fs::remove_dir_all(&root);
+
+        FedClocks {
+            system_samples: sys_feed.samples.load(Ordering::Relaxed),
+            mic_samples: mic_feed.samples.load(Ordering::Relaxed),
+            mic_writes: mic_feed.writes.load(Ordering::Relaxed),
+            mic_silent_writes: mic_feed.silent_writes.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The reported bug, at the seam it is made at.
+    ///
+    /// The gate suppresses most of this mic leg, and both legs must still come
+    /// out of the pump having been fed the same amount of audio. A mic leg fed
+    /// less than the system leg does not merely lose the suppressed words — it
+    /// reports every word *after* them at the wrong time, and the error
+    /// accumulates for the length of the meeting.
+    #[test]
+    fn suppressing_the_mic_leg_does_not_move_its_clock_off_the_system_legs() {
+        let fed = drive_both_legs(true);
+
+        let skew = fed.system_samples.abs_diff(fed.mic_samples) * 1_000 / FEED_RATE;
+        assert!(
+            skew <= 100,
+            "the legs' fed-PCM clocks are {skew} ms apart after {SECONDS}s \
+             (system fed {} samples, mic {})",
+            fed.system_samples,
+            fed.mic_samples
+        );
+
+        // And the gate really did work on this fixture — otherwise the
+        // agreement above is the agreement of two ungated legs, which proves
+        // nothing about suppression.
+        assert!(
+            fed.mic_silent_writes * 3 >= fed.mic_writes,
+            "the fixture never engaged the gate: {}/{} mic chunks fed as silence",
+            fed.mic_silent_writes,
+            fed.mic_writes
+        );
+    }
+
+    /// Suppression costs the mic leg words, never samples.
+    ///
+    /// The same audio with the gate off is the control: the leg's fed-sample
+    /// count — its clock — must be identical either way, and only the content
+    /// of the suppressed chunks may differ.
+    #[test]
+    fn suppression_does_not_shrink_the_mic_legs_fed_sample_count() {
+        let gated = drive_both_legs(true);
+        let open = drive_both_legs(false);
+
+        assert_eq!(
+            gated.mic_samples, open.mic_samples,
+            "the gate changed how much audio the mic socket was fed"
+        );
+        assert_eq!(
+            gated.mic_writes, open.mic_writes,
+            "the gate changed how many chunks the mic socket saw"
+        );
+        assert!(
+            gated.mic_silent_writes > 0,
+            "the gate never engaged, so this proves nothing"
+        );
+        assert_eq!(
+            open.mic_silent_writes, 0,
+            "ungated mic audio must not arrive as silence"
+        );
+    }
+
+    /// Ring drops were counted and then thrown away: the pump returned a
+    /// hardcoded zero, so mic frames lost at a full ring reached no field, no
+    /// log line and no human (#79).
+    #[test]
+    fn frames_dropped_at_a_full_ring_reach_the_pumps_caller() {
+        let root = tmp_root("drops");
+        let wal = SessionWal::create(&root, CAPTURE_RATE, CHANNELS).expect("a session");
+
+        // A ring far smaller than the block the audio thread hands it: the
+        // producer takes what fits and drops the rest, which is the whole
+        // contract that makes the real-time side non-blocking.
+        let (mut sys_prod, sys_cons) = AudioRing::with_capacity_frames(4_096);
+        let (mut mic_prod, mic_cons) = AudioRing::with_capacity_frames(4_096);
+        let block = vec![0.25f32; 6_000];
+        sys_prod.push_block(&block);
+        mic_prod.push_block(&block);
+        let expected = 2 * (block.len() - 4_096) as u64;
+
+        let stop = AtomicBool::new(true);
+        let (_, _, dropped) = pump_loop(
+            wal,
+            sys_cons,
+            mic_cons,
+            capture_format(),
+            Some(capture_format()),
+            SttFeeds {
+                system: None,
+                mic: None,
+                echo_gate: None,
+            },
+            &stop,
+        )
+        .expect("the pump drains cleanly");
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(dropped, expected, "the shortfall both rings counted");
+    }
 }

@@ -519,8 +519,12 @@ async fn spawn_session(
     // recording that failed and a session that persisted nothing.
     let persisted = match outcome {
         Ok(outcome) => {
+            // Each entry names its own leg or stage ("mic: …", "capture: …"),
+            // and since #79 they are not all transcription failures — a ring
+            // drop rides this channel too, because it is the only one anybody
+            // reads.
             for e in &outcome.stt_errors {
-                eprintln!("  ! transcription failed during this meeting: {e}");
+                eprintln!("  ! this meeting was degraded: {e}");
             }
             let audit = AuditLog::at(&root);
             if let Err(e) = audit.record(AuditKind::SessionEnd {

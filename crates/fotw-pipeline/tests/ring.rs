@@ -49,6 +49,15 @@ fn an_overrun_drops_and_counts_rather_than_blocking() {
     let written = producer.push_block(&block);
     assert!(written < 480, "second block cannot fit entirely");
     assert!(producer.dropped_frames() > 0, "the shortfall was counted");
+    // And it is readable from the half that can report it. The producer moves
+    // onto the audio thread and is never seen again, so a count only the
+    // producer can read is a count nobody reads — which is exactly how ring
+    // drops stayed invisible in the daemon (#79).
+    assert_eq!(
+        consumer.dropped_frames(),
+        producer.dropped_frames(),
+        "both halves read one counter"
+    );
 
     // The ring still yields exactly what it accepted, uncorrupted.
     let mut out = vec![0.0f32; 1024];
