@@ -8,11 +8,12 @@
 
 use std::sync::Arc;
 
-use fotw_secrets::{InMemoryKeyStore, KeyStore, Provider, SecretKey, SecretString};
+use fotw_secrets::{InMemoryKeyStore, SecretString};
 use fotw_store::{Db, DbKey};
 use fotw_stt::{Source, TimestampSource, TranscriptSegment};
 use fotw_summarize::template::{Template, TemplateSet};
 use fotw_summarize::testing::MockTransport;
+use fotwd::engine::Engine;
 use fotwd::persist;
 use fotwd::session::{LegBuffers, SessionOutcome};
 use fotwd::summarize;
@@ -36,14 +37,16 @@ fn general() -> Template {
     TemplateSet::builtin().get("general").unwrap().clone()
 }
 
-fn keystore_with_anthropic() -> InMemoryKeyStore {
-    let s = InMemoryKeyStore::new();
-    s.set(
-        SecretKey::ApiKey(Provider::Anthropic),
-        &SecretString::new("test-key"),
-    )
-    .unwrap();
-    s
+/// The API engine, already resolved.
+///
+/// Since #87 the engine is an argument to these functions rather than
+/// something they go and find, so a test that wants the Anthropic arm says so
+/// directly instead of seeding a keystore and hoping the resolver agrees.
+/// Resolution itself has its own suite in `tests/engine.rs`.
+fn anthropic() -> Engine {
+    Engine::Anthropic {
+        key: SecretString::new("test-key"),
+    }
 }
 
 fn seg(idx: u64, text: &str, start: u64) -> TranscriptSegment {
@@ -99,7 +102,6 @@ fn seeded_meeting(db: &mut Db, dir: &std::path::Path) -> String {
 async fn a_meeting_with_no_transcript_is_a_typed_error_not_a_crash() {
     let dir = tmpdir("notranscript");
     let mut db = db_at(&dir);
-    let store = keystore_with_anthropic();
 
     let outcome = SessionOutcome {
         dir: dir.to_path_buf(),
@@ -109,7 +111,7 @@ async fn a_meeting_with_no_transcript_is_a_typed_error_not_a_crash() {
 
     let err = summarize::summarize_meeting_with(
         &mut db,
-        &store,
+        &anthropic(),
         &id,
         &general(),
         Arc::new(MockTransport::new()),
@@ -121,6 +123,13 @@ async fn a_meeting_with_no_transcript_is_a_typed_error_not_a_crash() {
 
 /// Recording without an LLM key configured must leave the transcript intact
 /// and say so, not fail in a way that suggests the meeting was damaged.
+///
+/// Asserted against `summarize_meeting` rather than `summarize_meeting_with`,
+/// because that is where resolution lives since #87: the injected-transport
+/// form is handed an engine and so has nothing left to fail to resolve. The
+/// contract is unchanged and it is still `NoKey` — only the door it comes out
+/// of moved. Nothing here reaches a network: the resolve fails before this
+/// function builds a transport at all.
 #[tokio::test]
 async fn a_missing_key_is_reported_without_touching_the_transcript() {
     let dir = tmpdir("nokey");
@@ -128,15 +137,9 @@ async fn a_missing_key_is_reported_without_touching_the_transcript() {
     let id = seeded_meeting(&mut db, &dir);
     let empty_store = InMemoryKeyStore::new();
 
-    let err = summarize::summarize_meeting_with(
-        &mut db,
-        &empty_store,
-        &id,
-        &general(),
-        Arc::new(MockTransport::new()),
-    )
-    .await
-    .unwrap_err();
+    let err = summarize::summarize_meeting(&mut db, &empty_store, &id, &general())
+        .await
+        .unwrap_err();
     assert!(matches!(err, summarize::SummarizeRunError::NoKey));
 
     // The transcript is untouched and still queryable.
@@ -150,7 +153,7 @@ async fn the_stored_transcript_reaches_the_provider_as_a_document() {
     let dir = tmpdir("roundtrip");
     let mut db = db_at(&dir);
     let id = seeded_meeting(&mut db, &dir);
-    let store = keystore_with_anthropic();
+    let engine = anthropic();
 
     let mock = Arc::new(MockTransport::new().with_json(serde_json::json!({
         "content": [{"type": "text", "text": "Numbers were above target."}],
@@ -162,7 +165,7 @@ async fn the_stored_transcript_reaches_the_provider_as_a_document() {
     // transport — still a hard failure after #75, which softened only a schema
     // violation. What matters here is that the text made it out of SQLite and
     // into a request body at all.
-    let _ = summarize::summarize_meeting_with(&mut db, &store, &id, &general(), Arc::clone(&mock))
+    let _ = summarize::summarize_meeting_with(&mut db, &engine, &id, &general(), Arc::clone(&mock))
         .await;
 
     assert!(mock.call_count() > 0, "no request was made");
@@ -191,14 +194,14 @@ async fn the_request_never_carries_both_citations_and_a_structured_format() {
     let dir = tmpdir("mutex");
     let mut db = db_at(&dir);
     let id = seeded_meeting(&mut db, &dir);
-    let store = keystore_with_anthropic();
+    let engine = anthropic();
 
     let mock = Arc::new(MockTransport::new().with_json(serde_json::json!({
         "content": [{"type": "text", "text": "x"}],
         "usage": {"input_tokens": 1, "output_tokens": 1},
         "stop_reason": "end_turn"
     })));
-    let _ = summarize::summarize_meeting_with(&mut db, &store, &id, &general(), Arc::clone(&mock))
+    let _ = summarize::summarize_meeting_with(&mut db, &engine, &id, &general(), Arc::clone(&mock))
         .await;
 
     // The predicate is `enabled == true`, not the mere presence of the key:
@@ -235,7 +238,7 @@ async fn an_unparseable_extraction_still_stores_a_summary_with_a_warning() {
     let dir = tmpdir("badextraction");
     let mut db = db_at(&dir);
     let id = seeded_meeting(&mut db, &dir);
-    let store = keystore_with_anthropic();
+    let engine = anthropic();
 
     let mock = Arc::new(
         MockTransport::new()
@@ -252,7 +255,7 @@ async fn an_unparseable_extraction_still_stores_a_summary_with_a_warning() {
     );
 
     let outcome =
-        summarize::summarize_meeting_with(&mut db, &store, &id, &general(), Arc::clone(&mock))
+        summarize::summarize_meeting_with(&mut db, &engine, &id, &general(), Arc::clone(&mock))
             .await
             .expect("a summary with no items beats no summary");
 
@@ -292,7 +295,7 @@ async fn a_weakly_grounded_summary_says_so_above_the_summary_itself() {
     let dir = tmpdir("lowgrounding");
     let mut db = db_at(&dir);
     let id = seeded_meeting(&mut db, &dir);
-    let store = keystore_with_anthropic();
+    let engine = anthropic();
 
     // A substantive claim (spec 8.6: over 12 words) carrying no citation, so
     // coverage measures 0 of 1 and the threshold is missed by the whole range.
@@ -317,7 +320,7 @@ async fn a_weakly_grounded_summary_says_so_above_the_summary_itself() {
     );
 
     let outcome =
-        summarize::summarize_meeting_with(&mut db, &store, &id, &general(), Arc::clone(&mock))
+        summarize::summarize_meeting_with(&mut db, &engine, &id, &general(), Arc::clone(&mock))
             .await
             .expect("a weakly grounded summary is still a summary");
 

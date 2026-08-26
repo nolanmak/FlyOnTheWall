@@ -12,7 +12,7 @@ use fotw_secrets::{InMemoryKeyStore, KeyStore, Provider, SecretKey, SecretString
 use fotw_stt::Source;
 use fotw_stt::transcript::{TimestampSource, TranscriptSegment};
 use fotwd::engine::{
-    Engine, EngineResolution, SummarizeSettings, fallback_title, probe, resolve_binary,
+    CliKind, Engine, EngineResolution, SummarizeSettings, fallback_title, probe, resolve_binary,
     resolve_engine, resolve_engine_detailed,
 };
 use fotwd::testing::{UNRESOLVABLE_ENGINE, skip_if_engine_live};
@@ -303,6 +303,32 @@ fn a_configured_path_that_exists_is_used_verbatim() {
         Some(home.path()),
     );
     assert_eq!(found.as_deref(), Some(chosen.as_path()));
+}
+
+/// What a bare enablement writes into the settings row — #87.
+///
+/// `a0c40eb` probed the install directories here and froze the winner, which
+/// is the mechanism that manufactured every stale row the basename rescue
+/// above exists to survive: the row is wrong the moment the user upgrades
+/// node, moves a Homebrew prefix, or reinstalls the CLI. With call-time
+/// probing in [`resolve_binary`] there is nothing left for a stored path to
+/// buy, so the row holds the name and the daemon answers "where" on every run.
+///
+/// Asserted as an equality rather than "has no separator" on purpose: the
+/// value is now a pure function of the engine, and a test that would pass on a
+/// machine with no CLI installed is a test that pins nothing.
+#[test]
+fn the_default_binary_is_the_bare_name_so_the_row_cannot_go_stale() {
+    assert_eq!(CliKind::Claude.default_binary(), "claude");
+    assert_eq!(CliKind::Codex.default_binary(), "codex");
+    for kind in CliKind::ALL {
+        assert_eq!(
+            kind.default_binary(),
+            kind.bare_name(),
+            "a default that is not the bare name is a path frozen at configure \
+             time, which is #87"
+        );
+    }
 }
 
 #[test]

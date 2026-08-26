@@ -137,3 +137,84 @@ fn to_doc(settings: &SummarizeSettings) -> SummarizeSettingsDoc {
         binary: settings.binary.clone(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fotw_secrets::InMemoryKeyStore;
+    use fotw_store::DbKey;
+    use fotw_web::CliEngine;
+
+    /// A control over a throwaway library and an empty keystore.
+    ///
+    /// The store is leaked because [`EngineControl`] holds a `&'static dyn
+    /// KeyStore` — the daemon's real one is a process-lifetime `OnceLock`, and
+    /// a test that faked that with a shorter lifetime would not be exercising
+    /// the same type.
+    ///
+    /// Nothing here calls [`EngineControl::status`], and that is deliberate:
+    /// `status` runs `resolve_binary` against the *real* machine, so a row
+    /// holding the bare `"claude"` these tests write is exactly the case #83's
+    /// guard refuses. Storing what the row should hold is what is under test.
+    fn control() -> EngineControl {
+        let db = Db::open_in_memory(&DbKey::from_bytes([0x21; 32])).unwrap();
+        let store: &'static InMemoryKeyStore = Box::leak(Box::new(InMemoryKeyStore::new()));
+        EngineControl::new(db, store)
+    }
+
+    fn enable(binary: &str, kind: CliEngine) -> SummarizeSettingsDoc {
+        SummarizeSettingsDoc {
+            cli_enabled: true,
+            acknowledged_egress: true,
+            cli_kind: kind,
+            binary: binary.to_owned(),
+        }
+    }
+
+    /// #87: "pick one for me" stores the *name*, never today's path.
+    ///
+    /// The row a bare enablement writes has to stay right across a node
+    /// upgrade, a Homebrew prefix move and a reinstall, and the only way it
+    /// can is by not naming a directory. `resolve_binary` answers "where" on
+    /// every run, so there is nothing a stored path buys.
+    #[test]
+    fn turning_the_engine_on_without_a_path_stores_the_bare_name() {
+        let control = control();
+        let stored = control.set_settings(enable("", CliEngine::Claude)).unwrap();
+        assert_eq!(stored.binary, "claude");
+
+        let stored = control.set_settings(enable("", CliEngine::Codex)).unwrap();
+        assert_eq!(stored.binary, "codex");
+    }
+
+    /// A path the user typed is a different intent from "pick one for me", and
+    /// survives verbatim. `probe` uses such a path as-is while it exists and
+    /// only falls back to its basename when it does not (#74), so this is a
+    /// choice the daemon still honours rather than a row it has to repair.
+    #[test]
+    fn a_binary_the_user_typed_is_stored_verbatim() {
+        let control = control();
+        let stored = control
+            .set_settings(enable("/opt/custom/bin/claude", CliEngine::Claude))
+            .unwrap();
+        assert_eq!(stored.binary, "/opt/custom/bin/claude");
+    }
+
+    /// And is not quietly downgraded to the default by an unrelated edit.
+    ///
+    /// The settings pane posts the whole document, so a user who only ticks a
+    /// checkbox re-sends an empty `binary`. Before the bare-name default that
+    /// mistake would have swapped one working path for another; now it would
+    /// silently discard a path the user chose on a machine where the probe
+    /// finds something else.
+    #[test]
+    fn toggling_a_checkbox_does_not_discard_the_path_the_user_typed() {
+        let control = control();
+        control
+            .set_settings(enable("/opt/custom/bin/claude", CliEngine::Claude))
+            .unwrap();
+
+        let stored = control.set_settings(enable("", CliEngine::Claude)).unwrap();
+        assert_eq!(stored.binary, "/opt/custom/bin/claude");
+    }
+}
