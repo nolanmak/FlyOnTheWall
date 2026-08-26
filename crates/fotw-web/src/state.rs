@@ -13,6 +13,7 @@ use crate::ingress::IngressPolicy;
 use crate::recorder::RecorderControl;
 use crate::source::MeetingSource;
 use crate::stream::DeltaHub;
+use crate::summarize::SummarizeControl;
 use crate::tokens::{HANDOFF_TTL, TokenTable, WS_TICKET_TTL};
 
 /// Shared, cheap to clone, immutable except for the token tables and the hub.
@@ -31,6 +32,7 @@ struct Inner {
     csp: String,
     recorder: Option<Arc<dyn RecorderControl>>,
     github: Option<Arc<dyn GithubExport>>,
+    summarize: Option<Arc<dyn SummarizeControl>>,
 }
 
 impl std::fmt::Debug for dyn RecorderControl {
@@ -45,6 +47,13 @@ impl std::fmt::Debug for dyn GithubExport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // It holds the library handle the pusher exports transcripts from.
         f.write_str("GithubExport(<redacted>)")
+    }
+}
+
+impl std::fmt::Debug for dyn SummarizeControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // It holds the library handle and reads the keychain.
+        f.write_str("SummarizeControl(<redacted>)")
     }
 }
 
@@ -90,6 +99,23 @@ impl AppState {
         recorder: Option<Arc<dyn RecorderControl>>,
         github: Option<Arc<dyn GithubExport>>,
     ) -> Self {
+        Self::with_all_controls(policy, source, recorder, github, None)
+    }
+
+    /// [`AppState::with_controls`], with the summarize-engine control as well
+    /// (issue #74).
+    ///
+    /// Grown the same way the two before it grew: existing call sites keep the
+    /// arity that says what they actually have, rather than every one of them
+    /// gaining a `None`.
+    #[must_use]
+    pub fn with_all_controls(
+        policy: IngressPolicy,
+        source: Arc<dyn MeetingSource>,
+        recorder: Option<Arc<dyn RecorderControl>>,
+        github: Option<Arc<dyn GithubExport>>,
+        summarize: Option<Arc<dyn SummarizeControl>>,
+    ) -> Self {
         let csp = content_security_policy(policy.origin());
         Self {
             inner: Arc::new(Inner {
@@ -97,6 +123,7 @@ impl AppState {
                 source,
                 recorder,
                 github,
+                summarize,
                 tickets: TokenTable::new(WS_TICKET_TTL),
                 handoff: TokenTable::new(HANDOFF_TTL),
                 hub: Arc::new(DeltaHub::new()),
@@ -129,6 +156,16 @@ impl AppState {
     #[must_use]
     pub fn github(&self) -> Option<Arc<dyn GithubExport>> {
         self.inner.github.clone()
+    }
+
+    /// The summarize-engine control, if this daemon has one.
+    ///
+    /// `None` on a read-only server, and the handlers answer a bare 404 — a
+    /// build that cannot summarise is indistinguishable from one that has
+    /// never heard of the route (ING-09).
+    #[must_use]
+    pub fn summarize(&self) -> Option<Arc<dyn SummarizeControl>> {
+        self.inner.summarize.clone()
     }
 
     /// The library, for [`tokio::task::spawn_blocking`].

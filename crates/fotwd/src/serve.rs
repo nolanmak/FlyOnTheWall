@@ -23,8 +23,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use fotw_web::{DaemonState, GithubExport, StoreSource, WebServer, write_state_file};
+use fotw_web::{
+    DaemonState, GithubExport, StoreSource, SummarizeControl, WebServer, write_state_file,
+};
 
+use crate::engine_control::EngineControl;
 use crate::github::{GithubExporter, SystemGh};
 use crate::retention::{self, Schedule, SweepMode, Tick};
 
@@ -44,6 +47,23 @@ const SWEEP_POLL: Duration = Duration::from_secs(60);
 /// the meeting that finished while the daemon was down. One minute is
 /// invisible next to "the meeting just ended".
 const GITHUB_POLL: Duration = Duration::from_secs(60);
+
+/// How often the enrichment backfill wakes to ask whether it may run.
+///
+/// Same shape as the sweeper's, and for the same reason: the cadence is
+/// hourly, but the veto — "is a recording in flight" — changes on a human
+/// timescale, and a pass deferred by a meeting should start shortly after the
+/// meeting ends.
+const BACKFILL_POLL: Duration = Duration::from_secs(60);
+
+/// How many stranded meetings one backfill pass may enrich.
+///
+/// Small deliberately. Each one is a CLI invocation with a 300-second
+/// deadline, and the machine this runs on is the user's laptop, not a worker
+/// pool. Thirty-three meetings drain over eleven hours, which nobody notices;
+/// thirty-three back to back is a fan that comes on for no reason anyone can
+/// see (#74).
+const BACKFILL_PER_PASS: i64 = 3;
 
 /// Where the CLI looks for a running daemon.
 #[must_use]
@@ -348,11 +368,28 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
         spawn_github_pusher(Arc::clone(exporter));
     }
 
-    let server = WebServer::bind_with_controls(
+    // The engine settings pane (issue #74). Its own library connection for the
+    // same reason the exporter has one, and non-fatal for the same reason: a
+    // dashboard without the engine section beats a dashboard that will not
+    // open, and the section's absence is a bare 404 the page already handles.
+    let summarize = match crate::open_library(&root).and_then(|db| {
+        crate::secrets::keystore()
+            .map_err(|e| e.to_string())
+            .map(|s| (db, s))
+    }) {
+        Ok((db, store)) => Some(Arc::new(EngineControl::new(db, store))),
+        Err(e) => {
+            eprintln!("  ! the summarization settings are not available: {e}");
+            None
+        }
+    };
+
+    let server = WebServer::bind_with_all_controls(
         port,
         source,
         Some(Arc::clone(&recorder) as Arc<dyn fotw_web::RecorderControl>),
         github.map(|g| g as Arc<dyn GithubExport>),
+        summarize.map(|s| s as Arc<dyn SummarizeControl>),
     )
     .await
     .map_err(|e| format!("could not bind 127.0.0.1: {e}"))?;
@@ -378,6 +415,14 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
     if let Err(e) = spawn_sweeper(&root) {
         eprintln!("  ! retention is not running: {e}");
         eprintln!("    Audio will accumulate. `fotwd retention` shows what is on disk.");
+    }
+
+    // Issue #74's backfill. Non-fatal on the same terms: a library that misses
+    // this keeps its meetings and can still be summarised by hand.
+    if let Err(e) = spawn_enrich_backfill(&root) {
+        eprintln!("  ! the summary backfill is not running: {e}");
+        eprintln!("    Meetings that missed enrichment stay unsummarised until");
+        eprintln!("    `fotwd summarize <id>` is run for each of them.");
     }
 
     let daemon = DaemonState {
@@ -448,6 +493,48 @@ fn spawn_github_pusher(exporter: Arc<GithubExporter>) {
         // Worth a line, not a refusal: manual pushes still work.
         eprintln!("  ! automatic GitHub pushes are not running: {e}");
     }
+}
+
+/// Start the enrichment backfill.
+///
+/// # Why a tokio task and not a thread
+///
+/// The other two background loops here are threads because everything they do
+/// blocks. This one does not: enrichment is `async` all the way down — it
+/// awaits a subprocess with a deadline — so a thread would need a runtime of
+/// its own to drive it. It spends almost all of its life parked on a timer.
+///
+/// # Why a second connection
+///
+/// Same as the sweeper's: the UI's `Db` is sealed inside `StoreSource`'s mutex
+/// with no accessor, and §9.1's `busy_timeout = 5000` exists for exactly this
+/// — a second writer touching a handful of rows once an hour.
+fn spawn_enrich_backfill(root: &Path) -> Result<(), String> {
+    let sessions = root.to_path_buf();
+    let mut db = crate::open_library(root)?;
+    let store = crate::secrets::keystore().map_err(|e| e.to_string())?;
+
+    tokio::spawn(async move {
+        let mut schedule = Schedule::hourly();
+        loop {
+            let now = fotw_store::now_ms().max(0) as u64;
+            // The same veto the sweeper honours, and never overridden by how
+            // long it has been: a CLI invocation is a subprocess, and
+            // competing with a live capture is how buffers get dropped.
+            let recording = retention::recording_in_flight(&sessions, now);
+            if schedule.poll(now, recording) == Tick::Run {
+                let done = crate::enrich::backfill_once(&mut db, store, BACKFILL_PER_PASS).await;
+                if done > 0 {
+                    // Loud only when it did something, like the sweeper: a
+                    // pass that found nothing is the overwhelmingly common
+                    // case and prints nothing.
+                    println!("  summarised : {done} meeting(s) that had been missed");
+                }
+            }
+            tokio::time::sleep(BACKFILL_POLL).await;
+        }
+    });
+    Ok(())
 }
 
 /// Start the retention sweeper on its own thread.

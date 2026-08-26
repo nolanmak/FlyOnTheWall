@@ -81,6 +81,59 @@ impl CliKind {
             .find(|p| p.is_file())
             .map_or_else(|| bare.to_owned(), |p| p.to_string_lossy().into_owned())
     }
+
+    /// The binary name this engine installs under.
+    #[must_use]
+    pub fn bare_name(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
+    /// The `fotwd engine <sub>` that configures it.
+    #[must_use]
+    pub fn subcommand(self) -> &'static str {
+        match self {
+            Self::Claude => "claude-cli",
+            Self::Codex => "codex-cli",
+        }
+    }
+
+    /// KEY-04's disclosure for this engine, one line at a time.
+    ///
+    /// The words live in [`fotw_web::CliEngine`], not here, and that direction
+    /// is deliberate: the dashboard's settings pane and `fotwd engine`'s
+    /// confirmation prompt show the same disclosure, and `fotwd` is the crate
+    /// that can see both. Two copies would be one copy that is eventually
+    /// wrong about which host a transcript goes to, which is the one thing a
+    /// disclosure must never be. Lines carry no leading indentation; each
+    /// surface indents for itself.
+    #[must_use]
+    pub fn disclosure(self) -> &'static [&'static str] {
+        fotw_web::CliEngine::from(self).disclosure()
+    }
+}
+
+/// The wire spelling is shared, so the mapping is total and lossless in both
+/// directions — and lives beside [`CliKind`] so a third engine cannot be added
+/// on one side only.
+impl From<CliKind> for fotw_web::CliEngine {
+    fn from(kind: CliKind) -> Self {
+        match kind {
+            CliKind::Claude => Self::Claude,
+            CliKind::Codex => Self::Codex,
+        }
+    }
+}
+
+impl From<fotw_web::CliEngine> for CliKind {
+    fn from(engine: fotw_web::CliEngine) -> Self {
+        match engine {
+            fotw_web::CliEngine::Claude => Self::Claude,
+            fotw_web::CliEngine::Codex => Self::Codex,
+        }
+    }
 }
 
 /// The persisted CLI-engine choice.
@@ -143,46 +196,213 @@ impl std::fmt::Debug for Engine {
     }
 }
 
-/// Pick the engine for this machine, or `None` when summaries stay local.
+impl Engine {
+    /// The binary this engine runs, for the CLI engines.
+    ///
+    /// `None` for the API engine, which runs no subprocess. Exists so a status
+    /// line can print the path the daemon *resolved* beside the string that was
+    /// *configured* — see [`resolve_engine_detailed`].
+    #[must_use]
+    pub fn binary(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::Anthropic { .. } => None,
+            Self::ClaudeCli { binary } | Self::Codex { binary } => Some(binary),
+        }
+    }
+}
+
+/// What this machine's daemon would do, in the three cases that used to look
+/// identical from outside (#74).
+#[derive(Debug)]
+pub enum EngineResolution {
+    /// An engine, ready to build adapters from.
+    Engine(Engine),
+    /// Nobody has configured one: no API key, and no acknowledged CLI.
+    /// Summaries stay local and nothing leaves the device.
+    NoneConfigured,
+    /// A CLI *is* configured and acknowledged, and this machine cannot find
+    /// its binary. The string is what the settings row holds, because a status
+    /// line that will not name the failing binary cannot be acted on.
+    Unresolvable {
+        /// The configured binary, verbatim from the settings row.
+        configured: String,
+    },
+}
+
+/// Pick the engine for this machine, and say which of the three states it is
+/// in when there is none.
 ///
 /// An Anthropic API key always wins — it is explicit configuration and keeps
 /// the pre-CLI behavior byte-for-byte. With no key, the enabled-and-
 /// acknowledged CLI serves, `cli_kind` deciding which. With neither,
 /// enrichment stays local and nothing leaves the device.
+///
+/// An enabled-but-unacknowledged CLI reports as [`EngineResolution::NoneConfigured`],
+/// not as unresolvable: without the acknowledgement nothing is configured yet,
+/// and telling the user their binary is missing would send them to fix the
+/// wrong thing.
 #[must_use]
-pub fn resolve_engine(store: &dyn KeyStore, db: &Db) -> Option<Engine> {
+pub fn resolve_engine_detailed(store: &dyn KeyStore, db: &Db) -> EngineResolution {
     if let Ok(key) = store.get(SecretKey::ApiKey(Provider::Anthropic)) {
-        return Some(Engine::Anthropic { key });
+        return EngineResolution::Engine(Engine::Anthropic { key });
     }
 
     let settings = SummarizeSettings::read(db);
     if !settings.cli_enabled || !settings.acknowledged_egress || settings.binary.is_empty() {
-        return None;
+        return EngineResolution::NoneConfigured;
     }
     // Resolved now rather than at call time: "no engine" at resolution is a
     // visible state the caller can report, where a spawn failure hours later
     // inside a finished meeting's enrichment is a surprise in a log.
-    let binary = resolve_binary(&settings.binary)?;
-    Some(match settings.cli_kind {
+    let Some(binary) = resolve_binary(&settings.binary) else {
+        return EngineResolution::Unresolvable {
+            configured: settings.binary,
+        };
+    };
+    EngineResolution::Engine(match settings.cli_kind {
         CliKind::Claude => Engine::ClaudeCli { binary },
         CliKind::Codex => Engine::Codex { binary },
     })
 }
 
-/// A bare name searched on PATH; anything with a separator taken literally.
-///
-/// Public so `fotwd engine` can warn at configuration time when the binary it
-/// just stored will not resolve — a spawn failure hours later inside a
-/// finished meeting's enrichment is a far worse place to learn it.
-pub fn resolve_binary(configured: &str) -> Option<PathBuf> {
-    let direct = PathBuf::from(configured);
-    if configured.contains(std::path::MAIN_SEPARATOR) {
-        return is_executable(&direct).then_some(direct);
+/// [`resolve_engine_detailed`], for the callers that only need the engine.
+#[must_use]
+pub fn resolve_engine(store: &dyn KeyStore, db: &Db) -> Option<Engine> {
+    match resolve_engine_detailed(store, db) {
+        EngineResolution::Engine(engine) => Some(engine),
+        EngineResolution::NoneConfigured | EngineResolution::Unresolvable { .. } => None,
     }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(configured))
+}
+
+/// [`probe`] against this process's real `PATH` and `HOME`.
+///
+/// Public so `fotwd engine` can report what the *daemon* would resolve rather
+/// than what the shell would — the two disagreeing is the whole of #74's
+/// second mechanism.
+#[must_use]
+pub fn resolve_binary(configured: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH");
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    probe(configured, path_var.as_deref(), home.as_deref())
+}
+
+/// Find the binary a settings row names, the way `resolve_gh` does it
+/// (`github.rs`): `$PATH` first, then the places the installers really use.
+///
+/// # Why this is not just `$PATH`
+///
+/// A LaunchServices-launched `.app` gets `PATH=/usr/bin:/bin:/usr/sbin:/sbin`
+/// — confirmed with `ps eww` on a running daemon — and neither `claude` nor
+/// `codex` installs into any of those four. So the bare name that resolves
+/// perfectly from the user's shell, where `fotwd engine` runs and reports the
+/// engine healthy, resolves to nothing inside the daemon that has to run it.
+/// Probing at *call* time is what makes those two answers the same answer.
+///
+/// # Why a configured path still falls back to its basename
+///
+/// `a0c40eb` probed at configure time and froze the answer into the settings
+/// row. A row written then still names wherever the binary lived that day.
+/// Falling back to the basename rescues it — and rescues it from a *read*
+/// path, which is why nothing is rewritten: `put_setting` bumps the settings
+/// merge triple, and a read that silently wins merges against the user's other
+/// laptop is a worse bug than the one being fixed.
+///
+/// Pure by construction — `path_var` and `home` are arguments — so the whole
+/// candidate order is testable without mutating process-global environment.
+#[must_use]
+pub fn probe(
+    configured: &str,
+    path_var: Option<&std::ffi::OsStr>,
+    home: Option<&std::path::Path>,
+) -> Option<PathBuf> {
+    if configured.is_empty() {
+        return None;
+    }
+    let name = if configured.contains(std::path::MAIN_SEPARATOR) {
+        let direct = PathBuf::from(configured);
+        // The user named a specific binary and it is there: never second-guess
+        // that by probing.
+        if is_executable(&direct) {
+            return Some(direct);
+        }
+        std::path::Path::new(configured).file_name()?.to_owned()
+    } else {
+        std::ffi::OsString::from(configured)
+    };
+
+    let from_path = path_var
+        .map(|p| std::env::split_paths(p).collect::<Vec<_>>())
+        .unwrap_or_default();
+    from_path
+        .into_iter()
+        // An empty `PATH` element means "the current directory" to a shell.
+        // For a daemon whose working directory is whatever LaunchServices
+        // handed it, that is not a search path, it is an accident.
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .chain(candidate_dirs(home))
+        .map(|dir| dir.join(&name))
         .find(|candidate| is_executable(candidate))
+}
+
+/// Where the two CLIs actually install, searched after `$PATH`.
+///
+/// Also the tail of the `PATH` handed to the spawned child (see
+/// [`TokioCliRunner`]), so the list is written once.
+///
+/// `~/.claude/local` is the claude installer's own private prefix, `~/.bun/bin`
+/// is bun's, and `~/.nvm/versions/node/*/bin` is where an npm-installed
+/// `claude` lands — a directory name nothing could guess, which is why it is
+/// enumerated rather than assumed.
+#[must_use]
+pub fn candidate_dirs(home: Option<&std::path::Path>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = home {
+        dirs.push(home.join(".local/bin"));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    if let Some(home) = home {
+        dirs.push(home.join(".claude/local"));
+        dirs.push(home.join(".bun/bin"));
+        dirs.extend(nvm_bin_dirs(home));
+    }
+    // codex also ships as an app bundle, which puts its binary somewhere no
+    // `bin` directory convention would find.
+    dirs.push(PathBuf::from("/Applications/Codex.app/Contents/Resources"));
+    dirs
+}
+
+/// Every installed node's `bin`, newest first.
+///
+/// Sorted explicitly, and that is the point: `read_dir` order is unspecified,
+/// so taking whatever came back first is a coin flip that could pin the daemon
+/// to a node 16 install the user forgot they had.
+fn nvm_bin_dirs(home: &std::path::Path) -> Vec<PathBuf> {
+    let root = home.join(".nvm/versions/node");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut versions: Vec<(Vec<u64>, std::ffi::OsString)> = entries
+        .flatten()
+        .map(|e| (version_key(&e.file_name()), e.file_name()))
+        .collect();
+    // Descending, and numeric rather than lexical: `v9` sorts above `v22` as
+    // text, which is exactly backwards.
+    versions.sort_by(|a, b| b.cmp(a));
+    versions
+        .into_iter()
+        .map(|(_, name)| root.join(name).join("bin"))
+        .collect()
+}
+
+/// `v22.3.0` as `[22, 3, 0]`; anything unparseable as a zero, so a stray
+/// directory sorts last instead of panicking.
+fn version_key(name: &std::ffi::OsStr) -> Vec<u64> {
+    name.to_string_lossy()
+        .trim_start_matches('v')
+        .split('.')
+        .map(|part| part.parse().unwrap_or(0))
+        .collect()
 }
 
 #[cfg(unix)]
@@ -284,6 +504,47 @@ impl TokioCliRunner {
     }
 }
 
+/// The `PATH` the engine child gets: its own directory, then ours, then the
+/// install spots [`candidate_dirs`] knows about.
+///
+/// # Why the binary's own directory comes first
+///
+/// An npm/nvm-installed `claude` is a `#!/usr/bin/env node` shim, and `node`
+/// sits *beside* it in the same versioned directory. Resolving the shim's
+/// absolute path — which is all [`probe`] does — does not help the shim find
+/// its own interpreter: with the daemon's inherited
+/// `PATH=/usr/bin:/bin:/usr/sbin:/sbin` the child dies with
+/// `env: node: No such file or directory`, and the meeting silently gets no
+/// summary. This one entry is that bug's fix (#74).
+///
+/// The inherited `PATH` follows, so a CLI that shells out to something the
+/// user installed still finds it, and the probe's candidates come last so the
+/// same list serves both "where do we look" and "where should the child look".
+///
+/// `HOME` here is deliberately the **real** home even for a shielded runner:
+/// the CLIs are installed under the user's home, and the shield's job is to
+/// hide `~`-relative *secrets* from an agentic child, not to make its own
+/// installation unreachable.
+fn child_path(binary: &std::path::Path) -> std::ffi::OsString {
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(parent) = binary.parent() {
+        dirs.push(parent.to_path_buf());
+    }
+    dirs.extend(std::env::split_paths(&inherited));
+    dirs.extend(candidate_dirs(home.as_deref()));
+
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|dir| !dir.as_os_str().is_empty() && seen.insert(dir.clone()));
+
+    // A directory containing the separator cannot be joined. Falling back to
+    // the inherited PATH keeps the child no worse off than before; falling
+    // back to an empty one would break every CLI that shells out.
+    std::env::join_paths(dirs).unwrap_or(inherited)
+}
+
 impl fotw_summarize::claude_cli::CliTransport for TokioCliRunner {
     fn run<'a>(
         &'a self,
@@ -310,6 +571,9 @@ impl fotw_summarize::claude_cli::CliTransport for TokioCliRunner {
                 .env_remove("DEEPGRAM_API_KEY")
                 .env_remove("ANTHROPIC_API_KEY")
                 .env_remove("OPENAI_API_KEY")
+                // …and a `PATH` the child can actually work with. Applied to
+                // both arms: the shield below replaces `HOME`, never this.
+                .env("PATH", child_path(&self.binary))
                 .kill_on_drop(true);
 
             // The read shield: an empty $HOME so a prompt-injected

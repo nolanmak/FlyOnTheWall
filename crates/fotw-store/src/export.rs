@@ -310,6 +310,24 @@ row_type!(
         updated_at: i64,
         lamport: i64,
         origin_device_id: String,
+        /// What the last enrichment pass found (#74). Added by migration 0003,
+        /// so `#[serde(default)]`: an archive written before it must still
+        /// import, per the additive rule in the module docs.
+        ///
+        /// This is *device-local* state — which binary the daemon on that
+        /// machine could resolve — and it rides the archive anyway, because
+        /// the column-coverage guard makes `meeting@1` mean "every column of
+        /// `meetings`" with no exceptions anyone has to remember. The
+        /// consequence, stated rather than discovered later: an import carries
+        /// the exporting machine's diagnosis, and the first enrichment pass on
+        /// the importing machine replaces it with the truth there.
+        #[serde(default)]
+        enrich_status: Option<String>,
+        /// The reason behind `enrich_status`. Same additive rule, and the same
+        /// untrusted-text caveat as the column it mirrors: for `failed` it is
+        /// an engine's own stderr.
+        #[serde(default)]
+        enrich_detail: Option<String>,
     }
 );
 

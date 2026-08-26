@@ -147,6 +147,7 @@ async fn a_foreign_origin_is_refused_on_every_endpoint() {
         "/api/search?q=loopback",
         "/api/settings/github",
         "/api/settings/github/repos",
+        "/api/settings/summarize",
     ] {
         let mut headers = h.authorised();
         headers[1] = ("Origin".into(), "http://evil.test".into());
@@ -186,6 +187,7 @@ async fn no_token_no_data() {
         "/api/search?q=loopback",
         "/api/settings/github",
         "/api/settings/github/repos",
+        "/api/settings/summarize",
     ] {
         let res = h.get(path, &h.anonymous()).await;
         assert_eq!(res.status, 404, "{path} must require the bearer token");
@@ -197,6 +199,12 @@ async fn no_token_no_data() {
     );
     assert_eq!(
         h.post("/api/settings/github", &h.anonymous(), None)
+            .await
+            .status,
+        404
+    );
+    assert_eq!(
+        h.post("/api/settings/summarize", &h.anonymous(), None)
             .await
             .status,
         404

@@ -79,6 +79,23 @@ impl WebServer {
         recorder: Option<Arc<dyn crate::recorder::RecorderControl>>,
         github: Option<Arc<dyn crate::github::GithubExport>>,
     ) -> io::Result<Self> {
+        Self::bind_with_all_controls(port, source, recorder, github, None).await
+    }
+
+    /// [`WebServer::bind_with_controls`], with the summarize-engine control as
+    /// well (issue #74).
+    ///
+    /// # Errors
+    ///
+    /// Whatever binding the loopback listener failed with, or if the bound
+    /// address is somehow not loopback.
+    pub async fn bind_with_all_controls(
+        port: u16,
+        source: Arc<dyn MeetingSource>,
+        recorder: Option<Arc<dyn crate::recorder::RecorderControl>>,
+        github: Option<Arc<dyn crate::github::GithubExport>>,
+        summarize: Option<Arc<dyn crate::summarize::SummarizeControl>>,
+    ) -> io::Result<Self> {
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await?;
         let addr = listener.local_addr()?;
         if !addr.ip().is_loopback() {
@@ -86,11 +103,12 @@ impl WebServer {
                 "refusing to serve: bound {addr}, which is not loopback"
             )));
         }
-        let state = AppState::with_controls(
+        let state = AppState::with_all_controls(
             IngressPolicy::for_loopback_port(addr.port()),
             source,
             recorder,
             github,
+            summarize,
         );
         Ok(Self {
             listener,
@@ -179,6 +197,12 @@ fn routes(state: AppState) -> Router {
             get(api::github_settings).post(api::github_set_settings),
         )
         .route("/api/settings/github/repos", get(api::github_repos))
+        // Inside `routes()` like every other API path, so the ingress guard
+        // wraps it: a route added outside would answer without a bearer.
+        .route(
+            "/api/settings/summarize",
+            get(api::summarize_settings).post(api::summarize_set_settings),
+        )
         .route("/api/meetings/{id}/github-push", post(api::github_push))
         // Both of these are ING-09. The fallback is the same bare 404 the
         // guard returns, so "wrong token" and "no such path" are one response.

@@ -107,6 +107,8 @@ impl MeetingSource for StoreSource {
         };
 
         Ok(Some(MeetingDetail {
+            enrich_status: meeting.enrich_status.clone(),
+            enrich_detail: meeting.enrich_detail.clone(),
             meeting: row(meeting),
             summary_md,
             note_md,

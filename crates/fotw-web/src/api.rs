@@ -29,6 +29,7 @@ use crate::query::query_param;
 use crate::recorder::{RecorderError, RecordingStatus};
 use crate::source::{Hit, MeetingDetail, MeetingRow, SourceError};
 use crate::state::AppState;
+use crate::summarize::{SummarizeSettingsDoc, SummarizeStatus};
 use crate::tokens::WS_TICKET_TTL;
 
 /// The most meetings one request may ask for.
@@ -230,6 +231,91 @@ pub struct GithubPushResponse {
     /// [`GithubError`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// `GET`/`POST /api/settings/summarize`.
+///
+/// The status rides along with the settings on both verbs, so the form can
+/// render "this is what the daemon actually resolves" without a second round
+/// trip — and so a save immediately shows whether the binary just chosen is
+/// one this machine can find (#74).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SummarizeSettingsResponse {
+    /// What is stored — after a refused save, what is *still* stored.
+    pub settings: SummarizeSettingsDoc,
+    /// What the daemon would resolve right now.
+    pub status: SummarizeStatus,
+    /// Why a save was refused, when it was: `disclosure_required` (KEY-04) or
+    /// `invalid_settings: <why>`. Beside a 200, per ING-09.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `GET /api/settings/summarize`
+pub async fn summarize_settings(State(state): State<AppState>) -> Response {
+    let Some(control) = state.summarize() else {
+        return not_found();
+    };
+    // The library and the keychain both block.
+    let result = tokio::task::spawn_blocking(move || (control.settings(), control.status())).await;
+    let Ok((settings, status)) = result else {
+        return server_error();
+    };
+    json(
+        &state,
+        &SummarizeSettingsResponse {
+            settings,
+            status,
+            error: None,
+        },
+    )
+}
+
+/// `POST /api/settings/summarize`
+///
+/// Validation runs here, once, so the control behind the trait only ever
+/// stores what [`SummarizeSettingsDoc::normalized`] accepted — including
+/// KEY-04's refusal to enable the CLI without the egress acknowledgement.
+pub async fn summarize_set_settings(
+    State(state): State<AppState>,
+    body: Result<axum::Json<SummarizeSettingsDoc>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Some(control) = state.summarize() else {
+        return not_found();
+    };
+    // A malformed body is refused exactly as a wrong token is — axum's own
+    // rejection text describes the endpoint to whoever is probing it.
+    let Ok(axum::Json(submitted)) = body else {
+        return not_found();
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        let outcome = match submitted.normalized() {
+            Ok(valid) => match control.set_settings(valid) {
+                Ok(stored) => (stored, None),
+                Err(e) => (control.settings(), Some(e.to_string())),
+            },
+            // The refusal answers with what is still stored, so the UI never
+            // has to guess whether a rejected save changed anything.
+            Err(e) => (control.settings(), Some(e.to_string())),
+        };
+        // Read the status *after* the write, so a save that fixed the binary
+        // reports as fixed in the same response.
+        (outcome.0, control.status(), outcome.1)
+    })
+    .await;
+
+    let Ok((settings, status, error)) = result else {
+        return server_error();
+    };
+    json(
+        &state,
+        &SummarizeSettingsResponse {
+            settings,
+            status,
+            error,
+        },
+    )
 }
 
 /// `GET /api/settings/github`

@@ -1276,28 +1276,39 @@ fn engine_command(args: &[String]) -> ExitCode {
             if has_key {
                 println!("  engine     : anthropic API (key in keychain — always wins)");
             } else if settings.cli_enabled && settings.acknowledged_egress {
-                let name = match settings.cli_kind {
-                    CliKind::Claude => "claude",
-                    CliKind::Codex => "codex",
-                };
+                let name = settings.cli_kind.bare_name();
+                let sub = settings.cli_kind.subcommand();
                 // Report what enrichment will actually do, not just what was
-                // configured: `resolve_engine` returns None — a fallback title
-                // only — if the binary no longer resolves, and codex is
-                // usually a shell alias the daemon cannot see. Re-run the same
-                // check here so status and behavior cannot disagree.
-                if fotwd::engine::resolve_binary(&settings.binary).is_some() {
-                    println!("  engine     : {name} CLI (`{}`)", settings.binary);
-                } else {
-                    println!(
-                        "  engine     : none — {name} CLI configured (`{}`), but that binary",
-                        settings.binary
-                    );
-                    println!(
-                        "               does not resolve, so meetings get a fallback title only."
-                    );
-                    println!(
-                        "    fix: `fotwd engine {name}-cli --i-acknowledge-egress --binary <path>`"
-                    );
+                // configured. `resolve_binary` now probes the same install
+                // spots the daemon's own resolution does (#74) — before that
+                // this arm searched the *shell's* PATH, where `~/.local/bin`
+                // is present, and cheerfully reported an engine the daemon
+                // could not see. The one diagnostic there is lied in exactly
+                // the case it exists to catch.
+                match fotwd::engine::resolve_binary(&settings.binary) {
+                    Some(resolved) => {
+                        println!("  engine     : {name} CLI (`{}`)", resolved.display());
+                        if resolved.as_os_str() != std::ffi::OsStr::new(&settings.binary) {
+                            // Both, or the status names a binary the daemon is
+                            // not running — a new way for it to be wrong.
+                            println!(
+                                "               configured as `{}`; the daemon resolves it here",
+                                settings.binary
+                            );
+                        }
+                    }
+                    None => {
+                        println!(
+                            "  engine     : none — {name} CLI configured (`{}`), but that binary",
+                            settings.binary
+                        );
+                        println!(
+                            "               does not resolve, so meetings get a fallback title only."
+                        );
+                        println!(
+                            "    fix: `fotwd engine {sub} --i-acknowledge-egress --binary <path>`"
+                        );
+                    }
                 }
             } else {
                 println!("  engine     : none — meetings get a local fallback title only");
@@ -1326,38 +1337,19 @@ fn engine_command(args: &[String]) -> ExitCode {
             // Anthropic API is no-training-by-default, while a consumer ChatGPT
             // subscription trains on conversations by default — so the codex
             // disclosure says so rather than implying "same as an API key".
-            let (kind, cli, disclosure): (CliKind, &str, &[&str]) = if sub == "claude-cli" {
-                (
-                    CliKind::Claude,
-                    "claude",
-                    &[
-                        "  Enabling this sends each finished meeting's transcript to Anthropic",
-                        "  (api.anthropic.com) through your local `claude` login. On a Claude",
-                        "  subscription, conversations are not used for training by default;",
-                        "  confirm current terms: https://www.anthropic.com/legal/privacy",
-                    ],
-                )
+            let kind = if sub == "claude-cli" {
+                CliKind::Claude
             } else {
-                (
-                    CliKind::Codex,
-                    "codex",
-                    &[
-                        "  Enabling this sends each finished meeting's transcript to OpenAI",
-                        "  (chatgpt.com / api.openai.com) through your local `codex` login.",
-                        "  NOTE: a consumer ChatGPT subscription MAY be used to train OpenAI's",
-                        "  models by default — unlike a no-training API key. Review and opt out:",
-                        "  https://help.openai.com/en/articles/7730893-data-controls-faq",
-                        "  codex is also an agentic CLI: it can run shell over the transcript,",
-                        "  so FlyOnTheWall runs it read-only with an empty HOME to shield your",
-                        "  files. Prefer claude-cli if you want a non-agentic engine.",
-                    ],
-                )
+                CliKind::Codex
             };
+            let cli = kind.bare_name();
             // The disclosure is the point, not a speed bump: KEY-04's duty,
-            // for a path with no key to hang it on.
+            // for a path with no key to hang it on. The words live in
+            // `engine.rs` because the dashboard's settings pane shows the same
+            // ones, and two copies is one copy that will be wrong.
             if !args.iter().any(|a| a == "--i-acknowledge-egress") {
-                for line in disclosure {
-                    eprintln!("{line}");
+                for line in kind.disclosure() {
+                    eprintln!("  {line}");
                 }
                 eprintln!();
                 eprintln!("  Re-run with --i-acknowledge-egress to confirm.");
@@ -1371,8 +1363,16 @@ fn engine_command(args: &[String]) -> ExitCode {
             };
             match write(&mut db, &settings) {
                 Ok(()) => {
-                    if fotwd::engine::resolve_binary(&settings.binary).is_some() {
-                        println!("  engine     : {cli} CLI (`{}`)", settings.binary);
+                    // The same call-time probe the daemon uses, so "saved and
+                    // working" here means working *there* (#74).
+                    if let Some(resolved) = fotwd::engine::resolve_binary(&settings.binary) {
+                        println!("  engine     : {cli} CLI (`{}`)", resolved.display());
+                        if resolved.as_os_str() != std::ffi::OsStr::new(&settings.binary) {
+                            println!(
+                                "               configured as `{}`; the daemon resolves it here",
+                                settings.binary
+                            );
+                        }
                         println!(
                             "  Finished meetings now get a title, a summary and action items."
                         );
@@ -1647,6 +1647,14 @@ async fn summarize_command(root: PathBuf, meeting_id: String, slug: Option<Strin
                 // Same reasoning one line up: a summary missing its structured
                 // half still prints, but never silently (#75).
                 println!("  warning    : {warning}");
+            }
+            // The meeting is repaired, so its report must stop saying it is
+            // broken. Without this a hand-fixed meeting keeps `failed`
+            // forever: the backfill sweeper excludes `failed` on purpose, so
+            // nothing else would ever clear it, and the API and the dashboard
+            // would serve "Summary failed" over a summary that is right there.
+            if let Err(e) = db.meetings().set_enrich_report(&meeting_id, "ok", None) {
+                eprintln!("  ! the summary was stored, but its status was not: {e}");
             }
             println!();
             for line in out.markdown.lines() {

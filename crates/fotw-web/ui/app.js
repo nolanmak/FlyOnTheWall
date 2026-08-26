@@ -44,6 +44,14 @@ const el = {
   ghEnabled: document.getElementById("gh-enabled"),
   ghSave: document.getElementById("gh-save"),
   ghRepoList: document.getElementById("gh-repo-list"),
+  sumSettings: document.getElementById("sum-settings"),
+  sumKind: document.getElementById("sum-kind"),
+  sumBinary: document.getElementById("sum-binary"),
+  sumDisclosure: document.getElementById("sum-disclosure"),
+  sumAck: document.getElementById("sum-ack"),
+  sumEnabled: document.getElementById("sum-enabled"),
+  sumSave: document.getElementById("sum-save"),
+  sumStatus: document.getElementById("sum-status"),
 };
 
 // --------------------------------------------------------------- ING-10
@@ -215,6 +223,21 @@ function renderDetail(detail) {
     renderMarkdown(detail.summary_md, body);
     summary.appendChild(body);
     el.detail.appendChild(summary);
+  } else {
+    // The silent skip that was here is issue #74: "engine off", "engine
+    // broken" and "engine fine" all rendered as the same blank space, and 33
+    // meetings sat in that state without a word anywhere the user could see.
+    const why = noSummaryReason(detail);
+    if (why) {
+      const section = document.createElement("section");
+      section.className = "summary summary-missing";
+      section.appendChild(text("h3", "Summary"));
+      // Through `text()`, which sets textContent: `enrich_detail` carries an
+      // engine subprocess's stderr, and that subprocess was just fed an
+      // untrusted transcript. Nothing here builds markup from it (ING-11).
+      section.appendChild(text("p", why, "empty"));
+      el.detail.appendChild(section);
+    }
   }
 
   const transcript = document.createElement("section");
@@ -229,6 +252,27 @@ function renderDetail(detail) {
   }
   transcript.appendChild(body);
   el.detail.appendChild(transcript);
+}
+
+// Why this meeting has no summary, in words, or null to stay silent.
+//
+// Null for a meeting that has not been through enrichment yet (a null status)
+// — a meeting that finished four seconds ago is not broken, and claiming it is
+// would be its own kind of wrong.
+function noSummaryReason(detail) {
+  switch (detail.enrich_status) {
+    case "no_engine":
+      return "No summary — no summarization engine is configured. Turn one on under Summaries below.";
+    case "engine_unresolvable":
+      return (
+        "No summary — the configured engine could not be found: " +
+        (detail.enrich_detail || "unknown binary")
+      );
+    case "failed":
+      return "Summary failed: " + (detail.enrich_detail || "no reason was recorded");
+    default:
+      return null;
+  }
 }
 
 function renderHits(hits) {
@@ -777,6 +821,112 @@ async function onGithubSave() {
   el.ghSave.disabled = false;
 }
 
+// ------------------------------------------- issue #74, summarization engine
+
+// Same "404 means the feature is absent" convention as the GitHub section.
+let summarizePresent = true;
+let summarizeDisclosures = {};
+
+function renderSummarizeForm(body) {
+  const s = body.settings;
+  el.sumKind.value = s.cli_kind || "claude";
+  el.sumBinary.value = s.binary || "";
+  el.sumAck.checked = Boolean(s.acknowledged_egress);
+  el.sumEnabled.checked = Boolean(s.cli_enabled);
+  summarizeDisclosures = body.status.disclosures || {};
+  paintDisclosure();
+  el.sumStatus.textContent = summarizeStatusLine(body.status);
+  el.sumSettings.hidden = false;
+}
+
+// KEY-04's own words, from the daemon, for the engine the picker is on right
+// now — not for the one that happens to be stored. A checkbox beside the
+// wrong disclosure collects an acknowledgement of facts that are not true of
+// what is about to be saved.
+function paintDisclosure() {
+  const lines = summarizeDisclosures[el.sumKind.value] || [];
+  el.sumDisclosure.textContent = lines.join(" ");
+}
+
+// What the daemon actually resolves — the diagnostic that cannot lie, since it
+// is the daemon's own answer and not the shell's.
+function summarizeStatusLine(status) {
+  if (status.engine === "anthropic") {
+    return "Engine: the Anthropic API (a key is in your keychain, and it wins over any CLI).";
+  }
+  if (status.engine === "none") {
+    if (status.configured_binary && !status.binary_resolves) {
+      return (
+        "Engine: none. `" +
+        status.configured_binary +
+        "` is configured, but this daemon cannot find it. Enter a full path above."
+      );
+    }
+    return "Engine: none. Finished meetings get a title but no summary.";
+  }
+  let line = "Engine: " + status.engine + " (" + (status.resolved_binary || "") + ")";
+  // Both, whenever they differ: a status that named only the configured
+  // spelling would describe a binary the daemon is not running.
+  if (status.resolved_binary && status.resolved_binary !== status.configured_binary) {
+    line += ", configured as `" + status.configured_binary + "`";
+  }
+  return line + ".";
+}
+
+async function loadSummarize() {
+  if (!summarizePresent) return;
+  try {
+    renderSummarizeForm(await api("/api/settings/summarize"));
+  } catch (e) {
+    // Not "the request failed" — this build has no engine control at all.
+    summarizePresent = false;
+    el.sumSettings.hidden = true;
+  }
+}
+
+async function onSummarizeSave() {
+  el.sumSave.disabled = true;
+  try {
+    const body = await api("/api/settings/summarize", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        cli_enabled: el.sumEnabled.checked,
+        acknowledged_egress: el.sumAck.checked,
+        cli_kind: el.sumKind.value,
+        binary: el.sumBinary.value,
+      }),
+    });
+    if (body.error === "disclosure_required") {
+      // KEY-04 is enforced by the API, not by this checkbox — the box is the
+      // affordance, the refusal is the control.
+      say("Not saved. Tick the box acknowledging that transcripts leave this machine.");
+      el.sumSave.disabled = false;
+      return;
+    }
+    if (body.error) {
+      say("Not saved. " + body.error.replace("invalid_settings: ", ""));
+      el.sumSave.disabled = false;
+      return;
+    }
+    renderSummarizeForm(body);
+    // The open meeting's "no summary" line depends on the engine, so redraw.
+    if (currentDetail) renderDetail(currentDetail);
+    if (body.settings.cli_enabled && body.status.binary_resolves) {
+      say("Saved. Finished meetings now get a summary and action items.");
+    } else if (body.settings.cli_enabled) {
+      // Saved but inert: say so rather than promising summaries that will not
+      // appear — the exact silence #74 is about.
+      say("Saved, but `" + body.status.configured_binary + "` does not resolve here. Enter a full path.");
+    } else {
+      say("Saved. Summaries are off.");
+    }
+  } catch (e) {
+    say("Could not save the summarization settings.");
+  }
+  el.sumSave.disabled = false;
+}
+
 async function onGithubPush(meetingId, button) {
   button.disabled = true;
   say("Pushing to " + (githubSettings ? githubSettings.repo : "GitHub") + "…");
@@ -826,11 +976,16 @@ async function main() {
   // meeting is being written must not re-enable a button with nothing to do.
   el.consent.addEventListener("change", paintRecordButton);
   el.ghSave.addEventListener("click", onGithubSave);
+  el.sumSave.addEventListener("click", onSummarizeSave);
+  // The disclosure differs per engine, so it follows the picker rather than
+  // waiting for a save.
+  el.sumKind.addEventListener("change", paintDisclosure);
   el.ghSettings.addEventListener("toggle", function () {
     if (el.ghSettings.open) loadGithubRepos();
   });
   await loadMeetings();
   await loadGithub();
+  await loadSummarize();
   await pollRecording();
   setInterval(pollRecording, RECORDING_POLL_MS);
   connectStream();

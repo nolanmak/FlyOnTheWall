@@ -80,6 +80,41 @@
       </label>
       <button id="gh-save" type="button">Save</button>
     </details>
+    <details id="sum-settings" class="gh-settings" hidden>
+      <summary>Summaries</summary>
+      <p class="gh-note">
+        Turns a finished meeting into a summary with its action items, using a
+        CLI you already have logged in. Nothing is sent until this is enabled.
+      </p>
+      <label class="gh-field">
+        engine
+        <select id="sum-kind">
+          <option value="claude">claude CLI</option>
+          <option value="codex">codex CLI</option>
+        </select>
+      </label>
+      <label class="gh-field">
+        binary
+        <input
+          id="sum-binary"
+          type="text"
+          placeholder="claude"
+          autocomplete="off"
+          spellcheck="false"
+        />
+      </label>
+      <p id="sum-disclosure" class="gh-note"></p>
+      <label class="gh-check">
+        <input id="sum-ack" type="checkbox" />
+        I understand transcripts leave this machine
+      </label>
+      <label class="gh-check">
+        <input id="sum-enabled" type="checkbox" />
+        enabled
+      </label>
+      <button id="sum-save" type="button">Save</button>
+      <p id="sum-status" class="gh-note"></p>
+    </details>
     <p id="status" role="status"></p>
     <script src="/assets/app.js"></script>
   </body>

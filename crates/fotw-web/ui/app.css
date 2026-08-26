@@ -267,7 +267,8 @@ section {
   color: var(--muted);
 }
 
-.gh-field input {
+.gh-field input,
+.gh-field select {
   padding: 4px 8px;
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -286,6 +287,7 @@ section {
 }
 
 #gh-save,
+#sum-save,
 .gh-push {
   font: inherit;
   font-size: 12px;
@@ -299,6 +301,7 @@ section {
 }
 
 #gh-save:disabled,
+#sum-save:disabled,
 .gh-push:disabled {
   color: var(--muted);
   cursor: not-allowed;

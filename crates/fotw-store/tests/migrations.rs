@@ -26,9 +26,43 @@ fn a_fresh_database_lands_on_the_latest_version() {
     let db = Db::open(&path, &test_key()).unwrap();
     assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
     assert_eq!(
-        LATEST_SCHEMA_VERSION, 2,
-        "0001 initial schema, 0002 fts5 search indexes"
+        LATEST_SCHEMA_VERSION, 3,
+        "0001 initial schema, 0002 fts5 search indexes, 0003 enrich report"
     );
+}
+
+/// A library written by the shipped 0002 must gain the enrichment report
+/// columns without losing a row — the state every existing install is in when
+/// it first meets #74's build.
+#[test]
+fn a_v2_library_migrates_forward_and_keeps_its_meetings() {
+    let (_dir, path) = tmp_db();
+    {
+        let conn = raw(&path);
+        conn.execute_batch(include_str!("../src/schema/0001_initial.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../src/schema/0002_fts.sql"))
+            .unwrap();
+        conn.execute_batch("PRAGMA user_version = 2;").unwrap();
+        conn.execute(
+            "INSERT INTO meetings (id, title, started_at_ms, tz, state, created_at, updated_at, origin_device_id)
+             VALUES ('m1', 'Kubernetes migration', 0, 'UTC', 'ready', 0, 0, 'd1')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let mut db = Db::open(&path, &test_key()).unwrap();
+    assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+
+    let row = db.meetings().get("m1").unwrap();
+    assert_eq!(row.title, "Kubernetes migration");
+    assert_eq!(
+        row.enrich_status, None,
+        "a meeting that pre-dates the report has never been enriched by a \
+         build that could say so"
+    );
+    assert_eq!(row.enrich_detail, None);
 }
 
 /// A library written by the shipped 0001 must migrate *forward* into the search

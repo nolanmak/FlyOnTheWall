@@ -49,12 +49,26 @@ pub struct Meeting {
     pub lamport: i64,
     /// The device that created this row.
     pub origin_device_id: String,
+    /// What the last enrichment pass found: `ok`, `no_engine`,
+    /// `engine_unresolvable` or `failed` (#74). `None` means no pass has ever
+    /// reported — a meeting recorded before the report existed, or one whose
+    /// enrichment has not run yet.
+    pub enrich_status: Option<String>,
+    /// The reason behind [`Meeting::enrich_status`], for the states that have
+    /// one: the configured binary that would not resolve, or the engine's own
+    /// first complaint.
+    ///
+    /// **Attacker-influenced.** For `failed` this is a child process's stderr,
+    /// and that child was just fed an untrusted transcript — so it reaches the
+    /// DOM through `textContent` and never `innerHTML` (ING-11).
+    pub enrich_detail: Option<String>,
 }
 
 impl Meeting {
     pub(crate) const COLUMNS: &'static str = "id, title, started_at_ms, ended_at_ms, duration_ms, \
          tz, folder_id, template_id, state, language, disclosed, retain_audio, \
-         retain_audio_days, created_at, updated_at, lamport, origin_device_id";
+         retain_audio_days, created_at, updated_at, lamport, origin_device_id, \
+         enrich_status, enrich_detail";
 
     pub(crate) fn from_row(row: &Row<'_>) -> Result<Self> {
         Ok(Self {
@@ -75,6 +89,8 @@ impl Meeting {
             updated_at: row.get(14)?,
             lamport: row.get(15)?,
             origin_device_id: row.get(16)?,
+            enrich_status: row.get(17)?,
+            enrich_detail: row.get(18)?,
         })
     }
 }

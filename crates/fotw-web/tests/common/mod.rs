@@ -50,6 +50,8 @@ pub async fn start() -> Harness {
             state: "ready".to_owned(),
         },
         summary_md: Some("## Decisions\n- ship the guard".to_owned()),
+        enrich_status: Some("ok".to_owned()),
+        enrich_detail: None,
         note_md: Some(NOTE_TEXT.to_owned()),
         segments: vec![Segment {
             idx: 0,

@@ -117,6 +117,8 @@ async fn a_meeting_without_notes_returns_null_not_empty_string() {
             state: "ready".to_owned(),
         },
         summary_md: None,
+        enrich_status: None,
+        enrich_detail: None,
         note_md: None,
         segments: Vec::new(),
     });
@@ -152,5 +154,84 @@ async fn a_meeting_without_notes_returns_null_not_empty_string() {
         body["note_md"].is_null(),
         "expected null, got {}",
         body["note_md"]
+    );
+}
+
+/// A summary the API actually serves, asserted through the real handler.
+///
+/// The whole of #74 is a summary section that renders only under
+/// `if (detail.summary_md)`, and 33 meetings for which that field was `null`.
+/// Every other `summary_md` assertion outside `fotw-store` asserts absence;
+/// this one asserts the field arrives with content in it.
+#[tokio::test]
+async fn a_summary_reaches_the_client_with_its_status() {
+    let h = common::start().await;
+    let res = h
+        .get(&format!("/api/meetings/{MEETING_ID}"), &h.authorised())
+        .await;
+    assert_eq!(res.status, 200);
+
+    let body = detail_json(&res.body);
+    assert_eq!(
+        body["summary_md"], "## Decisions\n- ship the guard",
+        "the fixture's summary must survive the API"
+    );
+    assert_eq!(body["enrich_status"], "ok");
+    assert!(body["enrich_detail"].is_null());
+}
+
+/// The three states that used to render identically. The client cannot
+/// distinguish them without the field, so the field is part of the contract.
+#[tokio::test]
+async fn a_meeting_with_no_summary_says_which_kind_of_no_summary_it_is() {
+    use fotw_web::{MeetingDetail, MeetingRow, MemorySource, WebServer};
+
+    let source = MemorySource::new().with_meeting(MeetingDetail {
+        meeting: MeetingRow {
+            id: MEETING_ID.to_owned(),
+            title: "Broken engine".to_owned(),
+            started_at_ms: 1_754_900_000_000,
+            duration_ms: Some(60_000),
+            state: "ready".to_owned(),
+        },
+        summary_md: None,
+        enrich_status: Some("engine_unresolvable".to_owned()),
+        enrich_detail: Some("claude".to_owned()),
+        note_md: None,
+        segments: Vec::new(),
+    });
+    let server = WebServer::bind(0, std::sync::Arc::new(source))
+        .await
+        .expect("bind");
+    let addr = server.addr();
+    let state = server.state().clone();
+    let headers = vec![
+        ("Host".to_string(), state.policy().authority().to_owned()),
+        (
+            "Authorization".to_string(),
+            format!("Bearer {}", state.policy().secret().expose_hex()),
+        ),
+    ];
+    tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+
+    let res = common::send(
+        addr,
+        &common::build(
+            "GET",
+            &format!("/api/meetings/{MEETING_ID}"),
+            &headers,
+            None,
+        ),
+    )
+    .await;
+
+    let body = detail_json(&res.body);
+    assert!(body["summary_md"].is_null());
+    assert_eq!(body["enrich_status"], "engine_unresolvable");
+    assert_eq!(
+        body["enrich_detail"], "claude",
+        "the reason is what turns a blank pane into something actionable"
     );
 }
