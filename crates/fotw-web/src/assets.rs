@@ -163,6 +163,25 @@ fn content_type(path: &str) -> HeaderValue {
 mod tests {
     use super::*;
 
+    /// One embedded asset, as text.
+    fn asset_text(name: &str) -> String {
+        let file = Ui::get(name).expect("the asset is embedded");
+        String::from_utf8(file.data.into_owned()).expect("the bundle is UTF-8")
+    }
+
+    /// The body of one CSS rule, so a pin can assert what a class is *styled*
+    /// with rather than that its name appears somewhere in the file.
+    fn css_rule<'a>(css: &'a str, selector: &str) -> &'a str {
+        let head = format!("\n{selector} {{");
+        assert!(css.contains(&head), "app.css has no `{selector}` rule");
+        let body = &css[css.find(&head).unwrap() + head.len()..];
+        &body[..body.find('}').unwrap()]
+    }
+
+    /// CON-02's red, spelled once. `.recording` is the only rule that may
+    /// carry it: it means audio is being captured right now.
+    const INDICATOR_RED: &str = "#d2453d";
+
     /// The `debug-embed` failure, caught at test time rather than at
     /// notarisation time. If the feature were off and the folder missing, this
     /// is the assertion that would fail.
@@ -250,6 +269,75 @@ mod tests {
             js.contains("[!WARNING]"),
             "the SPA must know the admonition markers the daemon emits, or \
              the marker line renders as literal text inside the callout"
+        );
+    }
+
+    /// The fourth pin of the same weak kind, for #91. A meeting that has
+    /// stopped capturing and is being written to disk was rendering in
+    /// `.recording` — the exact red that means audio is arriving *right now*
+    /// — because #77 gave the recorder a third state and left the badge on
+    /// the first one's class. #90 added `--caution` for precisely this class
+    /// of "important, but not that".
+    ///
+    /// A colour cannot be asserted without a browser, so this asserts the two
+    /// halves that decide it: the client gives the badge a class per state,
+    /// and that class is styled in the caution token rather than in the
+    /// indicator's red.
+    #[test]
+    fn the_finishing_badge_is_not_dressed_as_the_recording_indicator() {
+        let js = asset_text("app.js");
+        let css = asset_text("app.css");
+        assert!(
+            js.contains("el.recording.className"),
+            "the badge must take its class from the state, or finishing keeps \
+             CON-02's red over a meeting whose taps are already closed"
+        );
+        let finishing = css_rule(&css, ".finishing");
+        assert!(
+            finishing.contains("var(--caution)"),
+            "the finishing badge is the caution colour (#90's token): {finishing}"
+        );
+        assert!(
+            !finishing.contains(INDICATOR_RED),
+            "CON-02's red means capture is live and means nothing else: {finishing}"
+        );
+        // The other direction, and the one that matters: this narrows what the
+        // red covers, it does not weaken the red.
+        assert!(
+            css_rule(&css, ".recording").contains(INDICATOR_RED),
+            "the live-capture badge must keep CON-02's red"
+        );
+    }
+
+    /// The fifth, for #91's other half. Stopping a recording started on the
+    /// dashboard left the pane showing a "Recording" header over a meeting
+    /// that was already in the library: `showLive` sets `currentDetail =
+    /// null`, so #78's re-open — which matches the frame's id against the
+    /// open pane — had nothing to match against.
+    ///
+    /// The guard is the half worth pinning. `currentDetail` is null both when
+    /// the live pane is up and when nothing has been opened at all, so the
+    /// client needs some other way to know it is replacing its own live pane
+    /// rather than a meeting someone chose to read.
+    #[test]
+    fn the_spa_opens_the_meeting_a_finished_recording_became() {
+        let js = asset_text("app.js");
+        assert!(
+            js.contains("openMeeting(frame.meeting_id)"),
+            "the SPA must open the meeting the frame names, or the pane keeps \
+             the live header until the user clicks something"
+        );
+        assert!(
+            js.contains("\"persisted\""),
+            "the SPA must branch on which of the two meeting_ready moments \
+             this is, or a later frame reopens a pane the user has moved on \
+             from"
+        );
+        assert!(
+            js.contains("live-pane"),
+            "the live pane needs a marker the client can look for: \
+             `currentDetail` is null both when it is showing and when nothing \
+             has been opened at all"
         );
     }
 

@@ -6,6 +6,7 @@
 
 use fotw_secrets::{InMemoryKeyStore, KeyStore, SecretKey, SecretString, SecretsError};
 use fotw_store::{Db, DbKey, NewMeeting, NewSegment};
+use fotw_summarize::template::{FALLBACK_SLUG, TemplateSet, default_templates_dir};
 use fotwd::engine::SummarizeSettings;
 use fotwd::enrich::enrich_meeting_with;
 use fotwd::testing::{STUB_ENGINE_NAME, UNRESOLVABLE_ENGINE, skip_if_engine_live};
@@ -362,6 +363,75 @@ async fn a_working_engine_names_the_meeting_instead_of_quoting_it() {
         3,
         "one title call, then Call A and Call B — a title derived from the \
          summary would be two"
+    );
+}
+
+/// SUM-08's template matching, finally with an input (#91).
+///
+/// `enrich::summarize` chooses with `set.for_event_title(&title)`, where
+/// `title` is the meeting's own column read straight back out of the library.
+/// Until #76 put the title call ahead of the summary that column still held
+/// `dated_fallback_title`'s placeholder, and an epoch stamp matches no
+/// `default_for` glob — so every meeting this daemon summarised got `general`
+/// however its templates were written. This is not a behaviour change
+/// arriving late; it is the first time the function has had anything to match
+/// on. What SUM-08 actually names is a *calendar event* title, and calendar
+/// integration (MTG-01, #39) is not built.
+///
+/// The two facts are pinned separately because they are two different kinds
+/// of claim. The shipped set is fixed, so "a standup is a standup and a
+/// placeholder is nothing" is asserted against the builtins. Which template
+/// the daemon *used* is read back off the stored summary's `prompt_hash` —
+/// the sha256 of the assembled system prompt, template body included — and
+/// compared against the same set the daemon loads. That is the only channel
+/// there is: the summary row has a `template_id` column and nothing writes
+/// it.
+#[tokio::test]
+async fn a_meeting_the_engine_named_selects_the_template_its_title_claims() {
+    let mut db = db();
+    let meeting = meeting_with_transcript(&mut db);
+
+    let builtin = TemplateSet::builtin();
+    let placeholder = db.meetings().get(&meeting).unwrap().title;
+    assert_eq!(
+        builtin.for_event_title(&placeholder).unwrap().slug,
+        FALLBACK_SLUG,
+        "a persist-time placeholder is not a title: {placeholder}"
+    );
+    assert_eq!(
+        builtin.for_event_title("Weekly Standup").unwrap().slug,
+        "standup",
+        "the name the engine gives a meeting is what SUM-08 matches on today"
+    );
+
+    let cli = scripted_cli("template", &["Weekly Standup", PROSE, EXTRACTION]);
+    cli_settings(&mut db, &cli.binary);
+
+    let report = enrich_meeting_with(&mut db, &InMemoryKeyStore::new(), &meeting).await;
+
+    assert!(
+        report.problems.is_empty(),
+        "a clean run reports nothing: {:?}",
+        report.problems
+    );
+    assert_eq!(db.meetings().get(&meeting).unwrap().title, "Weekly Standup");
+
+    // Against the set the daemon itself loaded, not the builtins: a machine
+    // with its own templates directory answers this question its own way, and
+    // the claim is that the *title* decided it, not which file won.
+    let set = TemplateSet::load_or_builtin(default_templates_dir()).unwrap();
+    let chosen = set.for_event_title("Weekly Standup").unwrap();
+    let expected = fotw_summarize::prompt::assemble(&chosen.prompt_body());
+    let summary = db
+        .meetings()
+        .current_summary(&meeting)
+        .unwrap()
+        .expect("a working engine writes a summary row");
+    assert_eq!(
+        summary.prompt_hash,
+        expected.prompt_hash(),
+        "the summary must be produced from the template the meeting's own \
+         title selects, not from the one its placeholder fell back to"
     );
 }
 

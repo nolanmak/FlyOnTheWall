@@ -469,6 +469,35 @@ async function connectStream() {
     // Both mean the same thing on this side — what is on screen is older
     // than what the daemon has.
     if (frame.kind === "meeting_ready") {
+      // #91: and one of them means more than that. Stopping a recording
+      // started here left the pane showing its "Recording" header over a
+      // meeting already in the library — `showLive` nulls `currentDetail`, so
+      // the re-open in `refreshLibrary` below never has an id to match. Adopt
+      // the meeting the frame names instead.
+      //
+      // On "persisted", the first of the two frames: the row is queryable
+      // from that instant, minutes before promotion finishes, and the
+      // "enriched" frame that follows then finds the pane open and lands the
+      // real title and summary through the very branch that could not match
+      // before. Matching one named reason also means a reason added later
+      // cannot quietly inherit the right to replace what is on screen.
+      //
+      // Only while this tab's own capture is over, and only over the live
+      // pane. Nothing in the frame says whose meeting it is, so a meeting
+      // finishing elsewhere must not take down a view with words still
+      // arriving in it — nothing can announce from elsewhere today, since
+      // `fotwd record` is a separate process with no hub, but the cost of
+      // being right about it is one comparison. And someone who clicked into
+      // an older meeting mid-recording is reading it: `showLive` is right
+      // that taking a pane away unasked is rude, and the live pane is the
+      // only one this is allowed to replace.
+      if (
+        frame.reason === "persisted" &&
+        recState !== "recording" &&
+        liveIsShowing()
+      ) {
+        openMeeting(frame.meeting_id);
+      }
       refreshLibrary(frame.meeting_id);
       return;
     }
@@ -642,6 +671,12 @@ function renderRecording(body) {
   // the tab's life and the next meeting records under a "finishing…" label.
   // ING-11: textContent, as everything in this file writes text.
   el.recording.textContent = recState === "finishing" ? "finishing…" : "recording";
+  // And the class with it (#91). The badge shipped permanently in `.recording`
+  // — CON-02's red, which means audio is being captured *right now* — so a
+  // meeting whose taps had already closed announced itself in the one colour
+  // that must never be diluted. Written back for the same reason the word is:
+  // a class left behind outlives the state that set it. See app.css.
+  el.recording.className = recState === "finishing" ? "finishing" : "recording";
 
   // The session clock (#66 follow-up): a recording with no visible duration
   // is how a 37-minute accident happens. Exhaustive on purpose — a
@@ -711,6 +746,12 @@ function renderRecording(body) {
 // Only called from the Start click, never from the poll: replacing the detail
 // pane is acceptable as the direct result of an action, and rude as a side
 // effect of a timer while someone is reading an old meeting.
+//
+// The pane it draws carries an id, and that marker is the whole of what lets
+// the `meeting_ready` handler replace *this* pane and no other (#91). A
+// marker in the DOM rather than a flag beside it: `clear(el.detail)` destroys
+// it in the same breath as the pane it belongs to, so there is no second piece
+// of state left able to outlive the thing it describes.
 function showLive() {
   currentDetail = null;
   clear(el.detail);
@@ -720,10 +761,20 @@ function showLive() {
   );
   const transcript = document.createElement("section");
   transcript.className = "transcript";
+  transcript.id = "live-pane";
   const body = document.createElement("div");
   body.id = "segments";
   transcript.appendChild(body);
   el.detail.appendChild(transcript);
+}
+
+// Is the live view the thing on screen?
+//
+// Not answerable from `currentDetail`: it is null while the live pane is up
+// and null in a tab that has opened nothing at all, and those are exactly the
+// two cases this has to tell apart.
+function liveIsShowing() {
+  return document.getElementById("live-pane") !== null;
 }
 
 async function onRecord() {
