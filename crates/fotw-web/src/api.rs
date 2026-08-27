@@ -107,6 +107,21 @@ pub struct RecordingResponse {
 /// UI's tick box, and CON-01's "no silent auto-record", on the wire.
 const CONSENT_ACK: &str = "all-party";
 
+/// `GET /api/health`
+///
+/// Read-only, and the one endpoint whose whole value is that it can be asked
+/// of a *running* daemon (#101). `spawn_blocking` because the report counts
+/// the enrichment queue, and that is a SQLite read.
+pub async fn health(State(state): State<AppState>) -> Response {
+    let Some(health) = state.health() else {
+        return not_found();
+    };
+    let Ok(report) = tokio::task::spawn_blocking(move || health.report()).await else {
+        return not_found();
+    };
+    json(&state, &report)
+}
+
 /// `GET /api/recording/status`
 pub async fn recording_status(State(state): State<AppState>) -> Response {
     let Some(recorder) = state.recorder() else {

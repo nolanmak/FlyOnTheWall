@@ -165,7 +165,7 @@ pub fn deepgram_key(store: &dyn KeyStore) -> Option<(SecretString, Origin)> {
             // Say it out loud rather than falling through to the environment:
             // silently using a different key source after a keychain stall is
             // how a user ends up debugging the wrong thing.
-            eprintln!("  ! keychain: {e}");
+            crate::diag!("  ! keychain: {e}");
         }
         Err(_) => {}
     }

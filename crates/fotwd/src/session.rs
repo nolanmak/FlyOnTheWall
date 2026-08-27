@@ -1480,7 +1480,7 @@ fn spawn_leg_collector(
                 // after the speaker paused, which reads as "not realtime".
                 StreamEvent::Partial(seg) => tap.emit(&seg, TapKind::Partial),
                 StreamEvent::Error(e) => {
-                    eprintln!("  ! transcription ({leg}): {e}");
+                    crate::diag!("  ! transcription ({leg}): {e}");
                     errors.record(format!("{leg}: {e}"));
                 }
                 _ => {}
@@ -1696,7 +1696,7 @@ fn pump_loop(
         if suppressed > 0 {
             // Once, at the end — CAP-11's metric, and the honest nudge: the
             // gate working hard means the user is on speakers.
-            eprintln!(
+            crate::diag!(
                 "  echo gate  : withheld {suppressed}/{assessed} mic chunks from \
                  transcription (speakers detected — headphones transcribe better)"
             );

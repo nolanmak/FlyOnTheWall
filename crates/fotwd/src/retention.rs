@@ -249,7 +249,7 @@ impl SweepReport {
 /// megabytes of a user's meeting goes is technically true and useless, and the
 /// entire point of the dry run is that the user can see what is about to
 /// happen.
-fn human(bytes: u64) -> String {
+pub(crate) fn human(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     let b = bytes as f64;
     if b >= KIB * KIB * KIB {

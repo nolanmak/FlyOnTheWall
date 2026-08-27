@@ -29,7 +29,13 @@ use fotw_web::{
 
 use crate::engine_control::EngineControl;
 use crate::github::{GithubExporter, SystemGh};
+use crate::health::Health;
+// Every diagnostic in this file goes to the terminal *and* to the daemon's own
+// log (#101). `diag!` is stderr, `note!` is stdout; neither redirects anything
+// away from the terminal, because stderr still works fine when `fotwd serve`
+// is run from one.
 use crate::retention::{self, Schedule, SweepMode, Tick};
+use crate::{diag, note};
 
 /// How often the sweeper thread wakes to ask whether it may run.
 ///
@@ -225,6 +231,28 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
         return Ok(());
     }
 
+    // The durable half of every diagnostic below (#101). Opened before the
+    // library, because "the daemon will not start" is the failure most in need
+    // of a record: this process's stderr belongs to LaunchServices and is
+    // discarded, and by the time anyone asks, the process is gone.
+    //
+    // A journal that will not open is said out loud and is never fatal. This
+    // daemon's job is recording meetings; refusing to do it because it could
+    // not open its own diagnostics file would have the priorities backwards.
+    let log_path = match crate::journal::install(&root) {
+        Ok(path) => Some(path),
+        Err(e) => {
+            eprintln!("  ! the daemon log is not being written: {e}");
+            eprintln!("    Diagnostics stay on this terminal's stderr only.");
+            None
+        }
+    };
+    crate::journal::record(&format!(
+        "daemon   : serve starting — pid {}, sessions {}",
+        std::process::id(),
+        root.display()
+    ));
+
     let db = crate::open_library(&root)?;
     let source = Arc::new(StoreSource::new(db));
 
@@ -360,12 +388,26 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
             Arc::new(SystemGh),
         ))),
         Err(e) => {
-            eprintln!("  ! GitHub export is not available: {e}");
+            diag!("  ! GitHub export is not available: {e}");
             None
         }
     };
+    // #101's `GET /api/health`. Its own library connection, for the queue
+    // depth alone, and absent rather than fatal on the same terms as every
+    // other control here: a dashboard that cannot say what the daemon is doing
+    // beats one that will not open. When it is absent the endpoint is the same
+    // bare 404 as a build that never had it (ING-09), and the journal still
+    // carries the whole story.
+    let health = match crate::open_library(&root) {
+        Ok(db) => Some(Arc::new(Health::new(log_path.map(Path::to_path_buf), db))),
+        Err(e) => {
+            diag!("  ! the daemon health surface is not available: {e}");
+            None
+        }
+    };
+
     if let Some(exporter) = &github {
-        spawn_github_pusher(Arc::clone(exporter));
+        spawn_github_pusher(Arc::clone(exporter), health.clone());
     }
 
     // The engine settings pane (issue #74). Its own library connection for the
@@ -379,7 +421,7 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
     }) {
         Ok((db, store)) => Some(Arc::new(EngineControl::new(db, store))),
         Err(e) => {
-            eprintln!("  ! the summarization settings are not available: {e}");
+            diag!("  ! the summarization settings are not available: {e}");
             None
         }
     };
@@ -405,6 +447,14 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
     // The live-transcript tap can publish from here on.
     let _ = hub_slot.set(Arc::clone(hub));
 
+    // Late-bound for the reason `AppState::set_health` records: what it
+    // reports includes the port that was just bound and the log this process
+    // opened, neither of which existed when the state was constructed. Nothing
+    // can call the endpoint yet — `serve()` is below.
+    if let Some(health) = &health {
+        state.set_health(Arc::clone(health) as Arc<dyn fotw_web::DaemonHealth>);
+    }
+
     // §9.5's sweeper, and issue #41's "on app start and hourly". Started
     // before the URL is printed so a daemon that is killed a second later
     // still finished whatever promotion the last run interrupted.
@@ -412,17 +462,17 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
     // Non-fatal on purpose: a sweeper that cannot start is a disk that fills
     // slowly, which is a far smaller problem than a UI that will not open at
     // all. It is said out loud rather than swallowed.
-    if let Err(e) = spawn_sweeper(&root) {
-        eprintln!("  ! retention is not running: {e}");
-        eprintln!("    Audio will accumulate. `fotwd retention` shows what is on disk.");
+    if let Err(e) = spawn_sweeper(&root, health.clone()) {
+        diag!("  ! retention is not running: {e}");
+        diag!("    Audio will accumulate. `fotwd retention` shows what is on disk.");
     }
 
     // Issue #74's backfill. Non-fatal on the same terms: a library that misses
     // this keeps its meetings and can still be summarised by hand.
-    if let Err(e) = spawn_enrich_backfill(&root) {
-        eprintln!("  ! the summary backfill is not running: {e}");
-        eprintln!("    Meetings that missed enrichment stay unsummarised until");
-        eprintln!("    `fotwd summarize <id>` is run for each of them.");
+    if let Err(e) = spawn_enrich_backfill(&root, health.clone()) {
+        diag!("  ! the summary backfill is not running: {e}");
+        diag!("    Meetings that missed enrichment stay unsummarised until");
+        diag!("    `fotwd summarize <id>` is run for each of them.");
     }
 
     let daemon = DaemonState {
@@ -444,6 +494,13 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
 
     println!("  listening  : http://{addr}");
     println!("  state file : {} (0600)", path.display());
+    // Printed beside the state file because it is the same kind of fact: a
+    // path a person needs when the daemon is not in front of them. `tail -f`
+    // on it is the answer to the question that cost a misdiagnosis (#101).
+    if let Some(log) = log_path {
+        println!("  log        : {} (0600)", log.display());
+    }
+    crate::journal::record(&format!("daemon   : listening on {addr}"));
 
     match launch {
         Launch::OpenBrowser => {
@@ -464,7 +521,15 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
 
     println!();
     println!("  Ctrl-C to stop.");
-    server.serve().await.map_err(|e| format!("server: {e}"))
+    // A daemon that stopped serving stopped for a reason, and the reason is
+    // the last thing the log should hold. A `Ctrl-C` or a `kill` never reaches
+    // here, which is itself informative: a journal whose last line is
+    // `listening` was ended from outside, not by a failure.
+    let outcome = server.serve().await.map_err(|e| format!("server: {e}"));
+    if let Err(e) = &outcome {
+        crate::journal::record(&format!("daemon   : ! the server stopped: {e}"));
+    }
+    outcome
 }
 
 /// Start the auto-push worker on its own thread.
@@ -473,25 +538,52 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
 /// does is blocking — SQLite, then a subprocess — and it is a long-lived
 /// loop, not a unit of work. When manual mode or a disabled target makes
 /// `auto_push_pending` a no-op, the loop is one settings read a minute.
-fn spawn_github_pusher(exporter: Arc<GithubExporter>) {
+///
+/// # Why the log gets a line and the terminal does not (#101)
+///
+/// A round that pushed nothing is the overwhelmingly common case, and printing
+/// it once a minute would make `fotwd serve` unreadable. But the *same*
+/// silence is what a dead thread produces, and telling those apart from
+/// outside is the whole of this issue. A [`Pulse`](crate::journal::Pulse)
+/// resolves it: the answer goes to the journal when it changes, and once an
+/// hour when it does not.
+fn spawn_github_pusher(exporter: Arc<GithubExporter>, health: Option<Arc<Health>>) {
     if let Err(e) = std::thread::Builder::new()
         .name("fotw-github".into())
         .spawn(move || {
+            let mut pulse = crate::journal::Pulse::hourly();
             loop {
                 // Sync the OKF bundle (index.md/log.md) once per batch, not
                 // once per meeting: a backlog of 200 pushes should rewrite the
                 // index once, not 200 times.
-                if exporter.auto_push_pending() > 0
+                let pushed = exporter.auto_push_pending();
+                if pushed > 0
                     && let Err(e) = fotw_web::GithubExport::sync_bundle(exporter.as_ref())
                 {
-                    eprintln!("  ! pushed meetings, but could not sync the bundle index: {e}");
+                    diag!("  ! pushed meetings, but could not sync the bundle index: {e}");
+                }
+                let now = fotw_store::now_ms().max(0) as u64;
+                let summary = if pushed == 0 {
+                    "nothing owed".to_owned()
+                } else {
+                    format!("{pushed} meeting(s) pushed")
+                };
+                // The health surface takes every round, unpulsed: its whole
+                // job is "when did this last happen", and a suppressed line
+                // would make a working pusher look an hour stale.
+                if let Some(health) = &health {
+                    health.note_github(&summary);
+                }
+                let line = format!("github   : push round — {summary}");
+                if pulse.due(now, &line) {
+                    crate::journal::record(&line);
                 }
                 std::thread::sleep(GITHUB_POLL);
             }
         })
     {
         // Worth a line, not a refusal: manual pushes still work.
-        eprintln!("  ! automatic GitHub pushes are not running: {e}");
+        diag!("  ! automatic GitHub pushes are not running: {e}");
     }
 }
 
@@ -509,10 +601,20 @@ fn spawn_github_pusher(exporter: Arc<GithubExporter>) {
 /// Same as the sweeper's: the UI's `Db` is sealed inside `StoreSource`'s mutex
 /// with no accessor, and §9.1's `busy_timeout = 5000` exists for exactly this
 /// — a second writer touching a handful of rows once an hour.
-fn spawn_enrich_backfill(root: &Path) -> Result<(), String> {
+fn spawn_enrich_backfill(root: &Path, health: Option<Arc<Health>>) -> Result<(), String> {
     let sessions = root.to_path_buf();
     let mut db = crate::open_library(root)?;
     let store = crate::secrets::keystore().map_err(|e| e.to_string())?;
+
+    // Resolved once here, so the answer to "what engine is this daemon using"
+    // is right from the moment it starts rather than an hour later at the
+    // first pass. Every pass refreshes it — which is also how a change made in
+    // the settings pane reaches the health surface.
+    let engine = crate::engine::resolve_engine_detailed(store, &db).label();
+    crate::journal::record(&format!("daemon   : summarize engine resolves to {engine}"));
+    if let Some(health) = &health {
+        health.note_engine(&engine);
+    }
 
     tokio::spawn(async move {
         // The legacy-title sweep, before the first tick and never again (#88).
@@ -526,10 +628,16 @@ fn spawn_enrich_backfill(root: &Path) -> Result<(), String> {
         // does arrive they are already replaceable.
         if let Some(found) = crate::enrich::adopt_legacy_titles_once(&mut db) {
             for problem in &found.problems {
-                eprintln!("  ! {problem}");
+                diag!("  ! {problem}");
             }
+            crate::journal::record(&format!(
+                "backfill : legacy-title sweep — {} scanned, {} adopted, {} problem(s)",
+                found.scanned,
+                found.adopted.len(),
+                found.problems.len()
+            ));
             if !found.adopted.is_empty() {
-                println!(
+                note!(
                     "  recovered  : {} meeting(s) named by an older build can be re-titled again \
                      — `fotwd retitle-legacy --apply` to do it now",
                     found.adopted.len()
@@ -538,20 +646,44 @@ fn spawn_enrich_backfill(root: &Path) -> Result<(), String> {
         }
 
         let mut schedule = Schedule::hourly();
+        // The held state is a pulse rather than a line per poll: a two-hour
+        // meeting would otherwise contribute 120 identical lines, and the fact
+        // worth recording is that the backfill is deferred, not that it was
+        // deferred again a minute later.
+        let mut held = crate::journal::Pulse::hourly();
         loop {
             let now = fotw_store::now_ms().max(0) as u64;
             // The same veto the sweeper honours, and never overridden by how
             // long it has been: a CLI invocation is a subprocess, and
             // competing with a live capture is how buffers get dropped.
             let recording = retention::recording_in_flight(&sessions, now);
-            if schedule.poll(now, recording) == Tick::Run {
-                let done = crate::enrich::backfill_once(&mut db, store, BACKFILL_PER_PASS).await;
-                if done > 0 {
-                    // Loud only when it did something, like the sweeper: a
-                    // pass that found nothing is the overwhelmingly common
-                    // case and prints nothing.
-                    println!("  summarised : {done} meeting(s) that had been missed");
+            match schedule.poll(now, recording) {
+                Tick::Run => {
+                    // Every line of the pass itself — that it started, what it
+                    // selected, what each meeting cost and how it ended — is
+                    // written inside `backfill_once`, where the loop is.
+                    let pass =
+                        crate::enrich::backfill_once(&mut db, store, BACKFILL_PER_PASS).await;
+                    if let Some(health) = &health {
+                        health.note_backfill(&pass);
+                    }
+                    if pass.summarised > 0 {
+                        // Loud on the terminal only when it did something, like
+                        // the sweeper. The journal has the rest.
+                        note!(
+                            "  summarised : {} meeting(s) that had been missed",
+                            pass.summarised
+                        );
+                    }
                 }
+                Tick::HeldForRecording => {
+                    if held.due(now, "held") {
+                        crate::journal::record(
+                            "backfill : due, but held — a recording is in flight",
+                        );
+                    }
+                }
+                Tick::Waiting { .. } => {}
             }
             tokio::time::sleep(BACKFILL_POLL).await;
         }
@@ -575,7 +707,7 @@ fn spawn_enrich_backfill(root: &Path) -> Result<(), String> {
 /// no accessor. SQLite in WAL mode serialises writers and `Db::open` sets
 /// `busy_timeout = 5000` (§9.1), so a second writer that touches a handful of
 /// rows once an hour is exactly the case that setting exists for.
-fn spawn_sweeper(root: &Path) -> Result<(), String> {
+fn spawn_sweeper(root: &Path, health: Option<Arc<Health>>) -> Result<(), String> {
     let sessions = root.to_path_buf();
     let data_root = sessions.parent().unwrap_or(&sessions).to_path_buf();
     let mut db = crate::open_library(root)?;
@@ -584,14 +716,30 @@ fn spawn_sweeper(root: &Path) -> Result<(), String> {
         .name("fotw-sweeper".into())
         .spawn(move || {
             let mut schedule = Schedule::hourly();
+            let mut held = crate::journal::Pulse::hourly();
             loop {
                 let now = fotw_store::now_ms().max(0) as u64;
                 // The veto, checked every time and never overridden by how
                 // long it has been. Competing for disk I/O with a live capture
                 // is how buffers get dropped.
                 let recording = retention::recording_in_flight(&sessions, now);
-                if schedule.poll(now, recording) == Tick::Run {
-                    sweep_once(&mut db, &data_root);
+                match schedule.poll(now, recording) {
+                    Tick::Run => {
+                        let summary = sweep_once(&mut db, &data_root);
+                        if let Some(health) = &health {
+                            health.note_retention(&summary);
+                        }
+                    }
+                    // Pulsed for the backfill's reason: a long meeting would
+                    // otherwise write this line sixty times an hour.
+                    Tick::HeldForRecording => {
+                        if held.due(now, "held") {
+                            crate::journal::record(
+                                "retention: due, but held — a recording is in flight",
+                            );
+                        }
+                    }
+                    Tick::Waiting { .. } => {}
                 }
                 std::thread::sleep(SWEEP_POLL);
             }
@@ -602,14 +750,26 @@ fn spawn_sweeper(root: &Path) -> Result<(), String> {
 
 /// One pass: finish interrupted promotions, then apply the retention policy.
 ///
-/// Loud about everything irreversible and quiet about everything else. A sweep
-/// that deletes nothing — the overwhelmingly common case — prints nothing, so
-/// the lines that do appear are all deletions.
-fn sweep_once(db: &mut fotw_store::Db, data_root: &Path) {
+/// Loud about everything irreversible and quiet about everything else on the
+/// **terminal**: a sweep that deletes nothing — the overwhelmingly common case
+/// — prints nothing, so the lines that do appear are all deletions.
+///
+/// The journal is the other way round (#101). Cheap silence is a feature for a
+/// terminal and a bug for a log, so every sweep writes one line saying it ran
+/// and what it concluded, and every eviction writes its own line — a deletion
+/// is the one thing here that cannot be recovered by running it again, and the
+/// evidence that it happened has to outlive the process that did it.
+fn sweep_once(db: &mut fotw_store::Db, data_root: &Path) -> String {
+    let mut archived = 0usize;
     for outcome in retention::resume_promotions(db, data_root) {
         match outcome {
-            Ok(p) => println!("  archived   : {} ({} bytes)", p.rel_dir, p.bytes()),
-            Err(e) => eprintln!("  ! could not archive a pending session: {e}"),
+            Ok(p) => {
+                archived += 1;
+                // `rel_dir` is `media/<yyyy>/<mm>/<meeting_id>` — an id and two
+                // numbers, with no title anywhere in it (§10).
+                note!("  archived   : {} ({} bytes)", p.rel_dir, p.bytes());
+            }
+            Err(e) => diag!("  ! could not archive a pending session: {e}"),
         }
     }
 
@@ -625,8 +785,33 @@ fn sweep_once(db: &mut fotw_store::Db, data_root: &Path) {
             {
                 print!("{}", report.render());
             }
+            // One line per eviction rather than `render()` flattened: the
+            // report is a page of prose, and a page of prose on one line is
+            // unreadable at exactly the moment someone needs to read it.
+            for ev in &report.plan.evictions {
+                crate::journal::record(&format!(
+                    "retention: evicted meeting {} — {} file(s), {}",
+                    ev.meeting_id,
+                    ev.paths.len(),
+                    retention::human(ev.audio_bytes)
+                ));
+            }
+            let summary = format!(
+                "{archived} archived, {} evicted, {} reclaimed, {} on disk, \
+                 {} warning(s), {} error(s)",
+                report.plan.evictions.len(),
+                retention::human(report.bytes_reclaimed),
+                retention::human(report.usage.audio_bytes),
+                report.plan.warnings.len(),
+                report.errors.len()
+            );
+            crate::journal::record(&format!("retention: sweep finished — {summary}"));
+            summary
         }
-        Err(e) => eprintln!("  ! retention sweep failed: {e}"),
+        Err(e) => {
+            diag!("  ! retention sweep failed: {e}");
+            format!("sweep failed: {e}")
+        }
     }
 }
 

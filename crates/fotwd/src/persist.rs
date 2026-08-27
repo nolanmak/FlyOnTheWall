@@ -35,7 +35,7 @@ pub fn persist_session(db: &mut Db, outcome: &SessionOutcome, title: &str) -> St
             let mut segments = outcome.segments.clone();
             let dropped = crate::session::dedupe_cross_leg(&mut segments);
             if dropped > 0 {
-                eprintln!(
+                crate::diag!(
                     "  dedupe     : dropped {dropped} mic segment(s) that duplicated the \
                  system leg (speaker echo)"
                 );

@@ -627,6 +627,7 @@ mod tests {
             "/api/meetings/abc",
             "/api/search",
             "/api/ws-ticket",
+            "/api/health",
             "/api/handoff/../meetings",
             "/assets",
         ] {

@@ -37,6 +37,9 @@ use fotw_store::{Db, StoreError};
 use fotw_web::{GithubError, GithubExport, GithubMode, GithubReceipt, GithubSettings};
 
 use crate::audit::{AuditKind, AuditLog};
+// The auto-push worker runs inside the daemon, whose stderr is discarded, so
+// its diagnostics go to the daemon's log as well (#101).
+use crate::{diag, note};
 
 /// The `settings` key the target lives under, as `"retention"` does for §9.3.
 pub const SETTINGS_KEY: &str = "github_export";
@@ -268,7 +271,7 @@ impl GithubExporter {
                     // The id and the repo, never the path: the path carries a
                     // slug of the meeting title, and titles are on §10's
                     // never-log list.
-                    println!("  pushed     : {} -> {}", id, receipt.repo);
+                    note!("  pushed     : {} -> {}", id, receipt.repo);
                     pushed += 1;
                 }
                 // The environment's fault, not this meeting's. Nothing is
@@ -280,11 +283,11 @@ impl GithubExporter {
                     | GithubError::RepoNotFound
                     | GithubError::Disabled),
                 ) => {
-                    eprintln!("  ! GitHub pushes are stalled: {e}");
+                    diag!("  ! GitHub pushes are stalled: {e}");
                     break;
                 }
                 Err(e) => {
-                    eprintln!("  ! could not push meeting {id} to GitHub: {e}");
+                    diag!("  ! could not push meeting {id} to GitHub: {e}");
                     self.failed_auto
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -668,7 +671,7 @@ impl GithubExporter {
             match serde_json::to_string(&receipts) {
                 Ok(json) => {
                     if let Err(e) = db.put_setting(RECEIPTS_KEY, &json) {
-                        eprintln!("  ! pushed, but could not save the receipt: {e}");
+                        diag!("  ! pushed, but could not save the receipt: {e}");
                         // Without the receipt, the worker would see this
                         // meeting as owed again next minute and commit it
                         // again, forever. Parking it caps the damage at one
@@ -679,7 +682,7 @@ impl GithubExporter {
                             .insert(meeting_id.to_owned());
                     }
                 }
-                Err(e) => eprintln!("  ! pushed, but could not encode the receipt: {e}"),
+                Err(e) => diag!("  ! pushed, but could not encode the receipt: {e}"),
             }
         }
         if let Err(e) = AuditLog::at(&self.root).record(AuditKind::TranscriptPushed {
@@ -688,7 +691,7 @@ impl GithubExporter {
             path: receipt.path.clone(),
             commit: receipt.commit.clone(),
         }) {
-            eprintln!("  ! pushed, but could not write the audit log: {e}");
+            diag!("  ! pushed, but could not write the audit log: {e}");
         }
 
         let _ = existing; // the old receipt is fully superseded

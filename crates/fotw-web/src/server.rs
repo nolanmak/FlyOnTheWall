@@ -189,6 +189,10 @@ fn routes(state: AppState) -> Router {
         .route("/api/handoff", post(api::handoff))
         .route("/api/launch-url", post(api::launch_url))
         .route("/api/stream", get(stream::stream))
+        // Inside `routes()` like every other API path, so the ingress guard
+        // wraps it: what this answers is a description of the user's library
+        // and machine, and a route added outside would answer without a bearer.
+        .route("/api/health", get(api::health))
         .route("/api/recording/status", get(api::recording_status))
         .route("/api/recording/start", post(api::recording_start))
         .route("/api/recording/stop", post(api::recording_stop))

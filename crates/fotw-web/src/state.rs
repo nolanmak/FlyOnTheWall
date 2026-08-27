@@ -6,9 +6,10 @@
 //! [`AppState::policy`] is the only way to reach the secret, which keeps the
 //! set of places that can compare it to one.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::github::GithubExport;
+use crate::health::DaemonHealth;
 use crate::ingress::IngressPolicy;
 use crate::recorder::RecorderControl;
 use crate::source::MeetingSource;
@@ -33,6 +34,9 @@ struct Inner {
     recorder: Option<Arc<dyn RecorderControl>>,
     github: Option<Arc<dyn GithubExport>>,
     summarize: Option<Arc<dyn SummarizeControl>>,
+    /// Bound after construction, unlike every control above it — see
+    /// [`AppState::set_health`].
+    health: OnceLock<Arc<dyn DaemonHealth>>,
 }
 
 impl std::fmt::Debug for dyn RecorderControl {
@@ -54,6 +58,13 @@ impl std::fmt::Debug for dyn SummarizeControl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // It holds the library handle and reads the keychain.
         f.write_str("SummarizeControl(<redacted>)")
+    }
+}
+
+impl std::fmt::Debug for dyn DaemonHealth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // It holds a library handle of its own, for the queue depth.
+        f.write_str("DaemonHealth(<redacted>)")
     }
 }
 
@@ -124,6 +135,7 @@ impl AppState {
                 recorder,
                 github,
                 summarize,
+                health: OnceLock::new(),
                 tickets: TokenTable::new(WS_TICKET_TTL),
                 handoff: TokenTable::new(HANDOFF_TTL),
                 hub: Arc::new(DeltaHub::new()),
@@ -166,6 +178,36 @@ impl AppState {
     #[must_use]
     pub fn summarize(&self) -> Option<Arc<dyn SummarizeControl>> {
         self.inner.summarize.clone()
+    }
+
+    /// The daemon's health surface, if this daemon has one (#101).
+    ///
+    /// `None` on a read-only server, and the handler answers a bare 404 —
+    /// a build with nothing to report is indistinguishable from one that has
+    /// never heard of the route (ING-09).
+    #[must_use]
+    pub fn health(&self) -> Option<Arc<dyn DaemonHealth>> {
+        self.inner.health.get().map(Arc::clone)
+    }
+
+    /// Bind the health surface, once.
+    ///
+    /// # Why this one is set rather than constructed
+    ///
+    /// Every control above it is an argument to a constructor, and the comment
+    /// on `with_recorder` explains why: `AppState` wraps an `Arc`, so a
+    /// builder would have to unwrap it. This one is different in the way that
+    /// matters — what it reports includes the port that was bound and the path
+    /// of the log the daemon opened, and neither exists until `bind` has
+    /// returned. `serve.rs` late-binds the delta hub through a `OnceLock` for
+    /// exactly the same reason.
+    ///
+    /// The window before it is set cannot be occupied: `bind` returns a
+    /// listener that is not being served yet, and `serve()` is called after.
+    /// A second call is ignored rather than panicking — a health surface is
+    /// not worth taking a daemon down over.
+    pub fn set_health(&self, health: Arc<dyn DaemonHealth>) {
+        let _ = self.inner.health.set(health);
     }
 
     /// The library, for [`tokio::task::spawn_blocking`].

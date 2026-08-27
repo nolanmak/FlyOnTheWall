@@ -13,6 +13,8 @@ pub mod engine;
 pub mod engine_control;
 pub mod enrich;
 pub mod github;
+pub mod health;
+pub mod journal;
 pub mod mcp;
 pub mod okf;
 pub mod onboard;

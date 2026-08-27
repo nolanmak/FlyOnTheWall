@@ -243,6 +243,28 @@ pub enum EngineResolution {
     },
 }
 
+impl EngineResolution {
+    /// A short word for this resolution, for a log line or a status field.
+    ///
+    /// Deliberately free of the API key and of anything transcript-derived, so
+    /// it is safe to write to a file that persists (§10). The unresolvable arm
+    /// names the configured binary, because #74's whole second mechanism is
+    /// the daemon and the shell disagreeing about what `codex` resolves to,
+    /// and a line that will not name it cannot be acted on.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::Engine(Engine::Anthropic { .. }) => "anthropic-api".to_owned(),
+            Self::Engine(Engine::ClaudeCli { binary }) => {
+                format!("claude-cli {}", binary.display())
+            }
+            Self::Engine(Engine::Codex { binary }) => format!("codex-cli {}", binary.display()),
+            Self::NoneConfigured => "none".to_owned(),
+            Self::Unresolvable { configured } => format!("unresolvable ({configured})"),
+        }
+    }
+}
+
 /// Pick the engine for this machine, and say which of the three states it is
 /// in when there is none.
 ///
@@ -620,7 +642,9 @@ impl TokioCliRunner {
                 shield: Some(shield),
             },
             Err(e) => {
-                eprintln!("  ! could not create the codex read shield ({e}); running without it");
+                crate::diag!(
+                    "  ! could not create the codex read shield ({e}); running without it"
+                );
                 Self::new(binary, deadline)
             }
         }

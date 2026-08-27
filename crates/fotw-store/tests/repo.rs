@@ -572,3 +572,45 @@ fn needing_summary_offers_the_oldest_unsummarised_meetings_and_never_a_failed_on
         .unwrap();
     assert_eq!(db.meetings().needing_summary(10).unwrap().len(), 2);
 }
+
+/// The count and the queue must never disagree. It is the number the daemon's
+/// log answers "how much is still waiting" with (#101), and a count derived
+/// from a second, drifting copy of the predicate would be a number that
+/// reassures while the queue stalls.
+#[test]
+fn the_count_of_meetings_awaiting_enrichment_is_the_length_of_the_queue() {
+    let mut db = db();
+    assert_eq!(db.meetings().count_needing_summary().unwrap(), 0);
+
+    let mut with_transcript = |started: i64, status: Option<&str>| {
+        let id = db
+            .meetings()
+            .create(NewMeeting::new("dev-1", "UTC").started_at_ms(started))
+            .unwrap();
+        let t = db
+            .meetings()
+            .create_transcript(&id, "deepgram", "nova-3", true)
+            .unwrap();
+        db.meetings()
+            .append_segments(&t, &[NewSegment::new(0, 0, 900, "the ingress cutover")])
+            .unwrap();
+        if let Some(status) = status {
+            db.meetings().set_enrich_report(&id, status, None).unwrap();
+        }
+        id
+    };
+
+    with_transcript(1_000, None);
+    with_transcript(2_000, Some("no_engine"));
+    with_transcript(3_000, Some("engine_unresolvable"));
+    with_transcript(4_000, Some("failed"));
+    with_transcript(5_000, Some("ok"));
+
+    assert_eq!(db.meetings().count_needing_summary().unwrap(), 3);
+    assert_eq!(
+        usize::try_from(db.meetings().count_needing_summary().unwrap()).unwrap(),
+        // Asked above any cap a pass would apply, so the two are compared over
+        // the whole library rather than over one page of it.
+        db.meetings().needing_summary(10_000).unwrap().len()
+    );
+}
