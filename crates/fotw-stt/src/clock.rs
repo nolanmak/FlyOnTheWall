@@ -28,48 +28,98 @@ pub fn seconds_to_ms(seconds: f64) -> u64 {
 /// The offset between one provider connection's clock and our session clock.
 ///
 /// Cheap to copy; adapters keep one per stream.
+///
+/// # Two offsets, not one (#86)
+///
+/// There are three clocks between a Deepgram word and a session timestamp, and
+/// only collapsing the middle one made this look like a single number:
+///
+/// * the **provider's**, which restarts at zero on every connection;
+/// * this **leg's**, which counts from its own first audio sample. It is what
+///   the STT-09 replay ring counts, and [`reconnected_at`](Self::reconnected_at)
+///   is measured on it;
+/// * the **session's**, shared by both capture legs, whose zero is the earlier
+///   leg's first sample.
+///
+/// The distance from the session's zero to this leg's is the *anchor*. It is a
+/// property of the capture leg — where its device happened to wake up relative
+/// to the other one — so unlike the connection offset it never moves. A
+/// reconnect recomputes the connection offset **on top of** it, which is what
+/// stops one dropped socket from quietly folding a late leg back onto an early
+/// one.
+///
+/// A leg anchored at zero is exactly the clock this type has always been, which
+/// is why #86 extends spec 7.2 rule 1 rather than revising it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SessionClock {
-    /// Session-clock milliseconds corresponding to this connection's zero.
-    offset_ms: u64,
+    /// Session-clock milliseconds at this *leg's* audio zero. Constant for the
+    /// meeting.
+    anchor_ms: u64,
+    /// This leg's own audio-clock milliseconds at the current *connection's*
+    /// zero. Recomputed on every reconnect.
+    connection_ms: u64,
 }
 
 impl SessionClock {
     /// A clock for a connection opened at session t0.
     #[must_use]
     pub fn new() -> Self {
-        Self { offset_ms: 0 }
+        Self {
+            anchor_ms: 0,
+            connection_ms: 0,
+        }
     }
 
     /// A clock for a connection whose first audio sample is at `session_ms`.
     #[must_use]
     pub fn opened_at(session_ms: u64) -> Self {
         Self {
-            offset_ms: session_ms,
+            anchor_ms: 0,
+            connection_ms: session_ms,
         }
     }
 
-    /// Recompute the offset after a reconnect.
+    /// A clock for a leg whose own audio zero is `anchor_ms` into the session.
     ///
-    /// `session_ms` is the session-clock position of the **first audio sample
-    /// fed to the new connection**, not the moment the socket opened. With
-    /// STT-09's gapless replay those differ by the length of the replayed ring,
-    /// and using the wrong one is exactly the off-by-30-seconds this method
-    /// exists to prevent.
-    pub fn reconnected_at(&mut self, session_ms: u64) {
-        self.offset_ms = session_ms;
+    /// `0` is [`new`](Self::new): the earlier leg *is* session t0.
+    #[must_use]
+    pub fn anchored_at(anchor_ms: u64) -> Self {
+        Self {
+            anchor_ms,
+            connection_ms: 0,
+        }
+    }
+
+    /// Where this leg's audio zero sits on the session clock.
+    #[must_use]
+    pub fn anchor_ms(&self) -> u64 {
+        self.anchor_ms
+    }
+
+    /// Recompute the connection offset after a reconnect.
+    ///
+    /// `leg_ms` is the position of the **first audio sample fed to the new
+    /// connection** on *this leg's own* audio clock — the one the replay ring
+    /// counts, which has been running since the leg's first sample. Not the
+    /// moment the socket opened: with STT-09's gapless replay those differ by
+    /// the length of the replayed ring, and using the wrong one is exactly the
+    /// off-by-30-seconds this method exists to prevent.
+    ///
+    /// The leg's [`anchor`](Self::anchor_ms) sits underneath and is preserved.
+    pub fn reconnected_at(&mut self, leg_ms: u64) {
+        self.connection_ms = leg_ms;
     }
 
     /// Session-clock milliseconds corresponding to this connection's zero.
     #[must_use]
     pub fn offset_ms(&self) -> u64 {
-        self.offset_ms
+        self.anchor_ms.saturating_add(self.connection_ms)
     }
 
     /// Rebase a provider-relative millisecond onto the session clock.
     #[must_use]
     pub fn to_session_ms(&self, provider_relative_ms: u64) -> u64 {
-        self.offset_ms.saturating_add(provider_relative_ms)
+        self.offset_ms().saturating_add(provider_relative_ms)
     }
 
     /// Rebase provider-relative seconds straight onto the session clock.

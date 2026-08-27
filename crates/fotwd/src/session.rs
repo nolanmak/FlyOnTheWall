@@ -40,6 +40,16 @@ const RING_SAMPLES: usize = 48_000 * 2 * 10;
 /// How long the pump waits when both rings are empty.
 const IDLE_POLL: Duration = Duration::from_millis(50);
 
+/// How long the session waits for both taps' first buffer before it gives up
+/// on anchoring the two legs to one clock (#86).
+///
+/// See [`anchor_legs`] for why there is a wait here and why it is nearly always
+/// over on the first look. A quarter of a second is far longer than a working
+/// device needs and far shorter than [`crate::recording::READY_DEADLINE`], so
+/// it can only ever delay a session that was already about to be reported as
+/// having a dead leg.
+pub const ANCHOR_DEADLINE: Duration = Duration::from_millis(250);
+
 /// How long the session waits for the taps to close (#85).
 ///
 /// A healthy `stop()` returns in microseconds. This is the point at which the
@@ -244,19 +254,61 @@ pub enum LegAudio {
 /// session read, and the mic leg's was handed a pair constructed inline that
 /// nobody else held. Building the sink *from* the counters leaves nowhere to
 /// spell the orphaned version.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct LegCounters {
     silent: Arc<AtomicU64>,
     total: Arc<AtomicU64>,
+    /// This leg's t0: the host-clock nanosecond of its **first** buffer, and
+    /// [`NO_BUFFER`](Self::NO_BUFFER) until one arrives (#86).
+    ///
+    /// # Why only the first
+    ///
+    /// The ring is `RingBuffer<f32>` — samples, no side channel — so a stamp
+    /// per buffer would need a second queue for the pump to correlate against,
+    /// and nothing downstream would read it. Per-leg t0 is the whole of what
+    /// lining the two legs up requires: within a leg the device's own frame
+    /// counter is the exact measure of how much audio exists, and
+    /// `CaptureTimestamp::is_monotonic_after` already asserts the two clocks
+    /// agree buffer to buffer. Mid-session *drift* between the two devices is
+    /// real and is deliberately not detected here; when something wants to act
+    /// on it, this field grows a companion — the ring does not.
+    first_host_ns: Arc<AtomicU64>,
+}
+
+impl Default for LegCounters {
+    fn default() -> Self {
+        Self {
+            silent: Arc::new(AtomicU64::new(0)),
+            total: Arc::new(AtomicU64::new(0)),
+            first_host_ns: Arc::new(AtomicU64::new(Self::NO_BUFFER)),
+        }
+    }
 }
 
 impl LegCounters {
+    /// [`first_host_ns`](Self::first_host_ns) before the tap has fired.
+    ///
+    /// Not zero: zero is a legitimate reading, taken by any tap that delivers
+    /// its first buffer in the same nanosecond the process-wide epoch was, and
+    /// a sentinel that a real value can collide with is a clock that silently
+    /// un-anchors itself.
+    const NO_BUFFER: u64 = u64::MAX;
+
     /// A sink for `producer` that reports to these counters.
     fn sink(&self, producer: RingProducer) -> Box<dyn FrameSink> {
         Box::new(RingSink {
             producer,
             counters: self.clone(),
         })
+    }
+
+    /// This leg's t0 on the shared host clock, or `None` before its first
+    /// buffer.
+    fn t0_ns(&self) -> Option<u64> {
+        match self.first_host_ns.load(Ordering::Relaxed) {
+            Self::NO_BUFFER => None,
+            ns => Some(ns),
+        }
     }
 
     /// Read both counters. Not atomic *together*, which costs at most one
@@ -277,7 +329,7 @@ struct RingSink {
 }
 
 impl FrameSink for RingSink {
-    fn on_frames(&mut self, pcm: &[f32], _ts: CaptureTimestamp, flags: FrameFlags) {
+    fn on_frames(&mut self, pcm: &[f32], ts: CaptureTimestamp, flags: FrameFlags) {
         // Counted here, at the tap, and nowhere downstream: this is what the
         // *device* delivered. The echo gate's suppression (#79) rewrites what
         // the mic's STT feed is handed, far below this line, so a mic that
@@ -287,6 +339,19 @@ impl FrameSink for RingSink {
         if flags.contains(FrameFlags::SILENT) {
             self.counters.silent.fetch_add(1, Ordering::Relaxed);
         }
+        // This leg's t0 on the process-wide host clock, which is the one thing
+        // in a `CaptureTimestamp` that means anything across two devices —
+        // `frames.rs` calls it "what makes the mic leg and the system leg line
+        // up: seam rule 3". It used to be discarded right here, which is why
+        // the two legs had no shared epoch and any path that withheld audio
+        // from one of them skewed its timeline for good (#86). A predictable
+        // branch and a relaxed store: still no allocation, no lock and no log
+        // on this thread (CAP-04).
+        if self.counters.first_host_ns.load(Ordering::Relaxed) == LegCounters::NO_BUFFER {
+            self.counters
+                .first_host_ns
+                .store(ts.host_ns, Ordering::Relaxed);
+        }
         // The return value is deliberately ignored: a short write means the
         // pump is behind, and retrying on a real-time thread is blocking by
         // another name. The shortfall is counted for the pump to surface.
@@ -294,6 +359,71 @@ impl FrameSink for RingSink {
     }
 
     fn on_error(&mut self, _e: TapError) {}
+}
+
+/// Where each capture leg's own audio zero sits on the session clock (#86).
+///
+/// Both zero is not a missing answer — it is the answer for two taps that woke
+/// together, and the answer whenever the legs cannot be compared at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LegAnchors {
+    /// Milliseconds from session t0 to the system leg's first sample.
+    system_ms: u64,
+    /// Milliseconds from session t0 to the mic leg's first sample.
+    mic_ms: u64,
+}
+
+/// Put the two legs on one epoch: session t0 is the earlier first buffer, and
+/// each leg's anchor is its distance from it.
+///
+/// Both taps are required. A leg with no t0 is a tap that has not delivered a
+/// buffer, and there is nothing to line the other one up against; anchoring the
+/// one we can see would invent a relationship rather than measure one, so the
+/// session falls back to what it did before #86 — both legs on their own
+/// fed-PCM clock. Whichever leg *is* live is unaffected either way: it is
+/// alone, and a single leg's timeline is internally consistent whatever its
+/// epoch.
+fn leg_anchors(system_t0_ns: Option<u64>, mic_t0_ns: Option<u64>) -> LegAnchors {
+    let (Some(system), Some(mic)) = (system_t0_ns, mic_t0_ns) else {
+        return LegAnchors::default();
+    };
+    let session_t0 = system.min(mic);
+    LegAnchors {
+        system_ms: (system - session_t0) / 1_000_000,
+        mic_ms: (mic - session_t0) / 1_000_000,
+    }
+}
+
+/// Wait for both legs' first buffer, then place them on one epoch (#86).
+///
+/// # Why the session waits at all
+///
+/// A leg's anchor has to be in its clock *before* the first PCM reaches its
+/// socket. Deepgram stamps every segment from how much audio that socket has
+/// swallowed, so an anchor applied afterwards leaves a prefix of the meeting on
+/// the old epoch — a race, and a race in a clock is the class of bug this whole
+/// change exists to close. Nothing above the tap can be told when the first
+/// buffer landed except by looking, so the session looks.
+///
+/// It is cheap: `start()` has already returned on both taps, a live device
+/// delivers within one IOProc period, and creating the WAL above this line
+/// usually costs more than that. The deadline is not a budget for the ordinary
+/// case — it is the point at which the session stops waiting for a device that
+/// has not woken up, and records the meeting unanchored rather than making the
+/// user wait on a clock correction.
+async fn anchor_legs(system: &LegCounters, mic: &LegCounters, deadline: Duration) -> LegAnchors {
+    /// How often the session looks. Well under an IOProc period, so in practice
+    /// this loop tests its condition once and returns.
+    const POLL: Duration = Duration::from_millis(1);
+
+    let until = Instant::now() + deadline;
+    loop {
+        let (system_t0_ns, mic_t0_ns) = (system.t0_ns(), mic.t0_ns());
+        if (system_t0_ns.is_some() && mic_t0_ns.is_some()) || Instant::now() >= until {
+            return leg_anchors(system_t0_ns, mic_t0_ns);
+        }
+        tokio::time::sleep(POLL).await;
+    }
 }
 
 /// One Deepgram connection per capture leg.
@@ -1020,17 +1150,38 @@ pub async fn run_with_control(
     let dir = wal.dir().to_path_buf();
     let started_at_ms = wal.manifest().started_at_ms;
 
+    // Both legs on one epoch, settled before either socket exists (#86) — see
+    // `anchor_legs` for why this cannot wait until after they do.
+    //
+    // Only when both are actually being transcribed: a lone leg has nothing to
+    // be lined up with — its timeline is internally consistent whatever its
+    // epoch — so waiting on a tap nobody will read would cost the user
+    // readiness for nothing.
+    let both_legs_transcribed = mic_format.is_some()
+        && matches!(&transcription, Transcription::Deepgram(legs) if legs.mic.is_some());
+    let anchors = if both_legs_transcribed {
+        anchor_legs(&sys_counters, &mic_counters, ANCHOR_DEADLINE).await
+    } else {
+        LegAnchors::default()
+    };
+
     // The STT side, if configured. `write` is non-blocking, so the pump can
     // feed it without ever waiting on the network.
     // One stream per leg. The mic stream is additionally gated on the mic tap
     // having actually started: a paid connection for a device that is not
     // there would be fed nothing and still billed for the socket.
+
     let (sys_stt, sys_events, mic_stt, mic_events) = match transcription {
         Transcription::Disabled => (None, None, None, None),
-        Transcription::Deepgram(legs) => {
+        Transcription::Deepgram(mut legs) => {
+            // The one place a leg's anchor is spelled. From here down it is the
+            // stream's own property, applied at connection zero and carried
+            // across every reconnect.
+            legs.system.session_offset_ms = anchors.system_ms;
             let (s, s_rx) = DeepgramStream::open(*legs.system);
             let (m, m_rx) = match legs.mic {
-                Some(cfg) if mic_format.is_some() => {
+                Some(mut cfg) if mic_format.is_some() => {
+                    cfg.session_offset_ms = anchors.mic_ms;
                     let (m, rx) = DeepgramStream::open(*cfg);
                     (Some(Arc::new(m)), Some(rx))
                 }
@@ -1594,9 +1745,17 @@ mod pump_clock_tests {
     //! unit math, the gate's own suite counts verdicts and stops there, and
     //! `mic_stt.rs` hand-writes `start_ms` — so the one question that mattered,
     //! *what does suppression do to the downstream clock*, was never asked.
+    //!
+    //! #86 generalises the answer. Feeding silence keeps the gate from stealing
+    //! time, but it only works where the pump *has* the audio; a leg that never
+    //! captured it in the first place has nothing to substitute. So the two
+    //! legs now share an epoch taken from the host clock at the tap, and the
+    //! tests below drive audio being withheld from a leg *upstream of the pump*
+    //! and check that the two timelines still meet.
 
     use super::*;
     use fotw_audio::SampleFormat;
+    use fotw_stt::SessionClock;
 
     const CAPTURE_RATE: u32 = 48_000;
     const CHANNELS: u16 = 2;
@@ -1689,6 +1848,22 @@ mod pump_clock_tests {
         mic_writes: u64,
         mic_silent_writes: u64,
         mic_buffers: LegBuffers,
+        /// Each leg's first buffer on the shared host clock, which is where
+        /// its anchor comes from (#86).
+        system_t0_ns: Option<u64>,
+        mic_t0_ns: Option<u64>,
+    }
+
+    impl FedClocks {
+        /// A leg's fed-PCM position at the end of the run, in milliseconds:
+        /// what its provider's clock reads once it has heard everything.
+        fn system_fed_ms(&self) -> u64 {
+            self.system_samples * 1_000 / FEED_RATE
+        }
+
+        fn mic_fed_ms(&self) -> u64 {
+            self.mic_samples * 1_000 / FEED_RATE
+        }
     }
 
     /// A root nobody else in this binary will touch. The counter matters:
@@ -1713,12 +1888,28 @@ mod pump_clock_tests {
     /// the speakers — so `gated` decides whether a third of the mic leg gets
     /// judged echo.
     fn drive_both_legs(gated: bool) -> FedClocks {
+        drive_both_legs_late(gated, 0)
+    }
+
+    /// [`drive_both_legs`], with the mic tap waking up `mic_late_ms` after the
+    /// system tap (#86).
+    ///
+    /// A late tap is the general shape of the #79 class: its first buffer is
+    /// stamped that much later on the shared host clock, and the audio from
+    /// before it never reaches the ring at all. Both legs still stop at the
+    /// same instant, so the last sample each socket swallowed is the same
+    /// moment in the room — which is the thing the two clocks have to agree
+    /// about.
+    fn drive_both_legs_late(gated: bool, mic_late_ms: u64) -> FedClocks {
         let root = tmp_root(if gated { "gated" } else { "open" });
         let wal = SessionWal::create(&root, CAPTURE_RATE, CHANNELS).expect("a session");
 
         let mono = speech_like(3, CAPTURE_RATE as usize * SECONDS);
         let system = interleave(&mono);
-        let mic = interleave(&echoed(&mono, 40 * CAPTURE_RATE as usize / 1_000));
+        let mic_full = interleave(&echoed(&mono, 40 * CAPTURE_RATE as usize / 1_000));
+        // Interleaved samples the mic tap was not yet awake for.
+        let missed = (mic_late_ms as usize * CAPTURE_RATE as usize / 1_000) * CHANNELS as usize;
+        let mic = &mic_full[missed.min(mic_full.len())..];
 
         let (sys_prod, sys_cons) = AudioRing::with_capacity_frames(RING_SAMPLES);
         let (mic_prod, mic_cons) = AudioRing::with_capacity_frames(RING_SAMPLES);
@@ -1729,8 +1920,12 @@ mod pump_clock_tests {
         // gate say anything about them (#81).
         let sys_counters = LegCounters::default();
         let mic_counters = LegCounters::default();
-        deliver(&mut *sys_counters.sink(sys_prod), &system);
-        deliver(&mut *mic_counters.sink(mic_prod), &mic);
+        deliver(&mut *sys_counters.sink(sys_prod), &system, 0);
+        deliver(
+            &mut *mic_counters.sink(mic_prod),
+            mic,
+            mic_late_ms * 1_000_000,
+        );
         // The sink swallows a short write by design, so the fit has to be
         // checked from the other end. Without this the fixture could silently
         // shrink and these tests would measure ring drops instead.
@@ -1770,13 +1965,19 @@ mod pump_clock_tests {
             mic_writes: mic_feed.writes.load(Ordering::Relaxed),
             mic_silent_writes: mic_feed.silent_writes.load(Ordering::Relaxed),
             mic_buffers: mic_counters.snapshot(),
+            system_t0_ns: sys_counters.t0_ns(),
+            mic_t0_ns: mic_counters.t0_ns(),
         }
     }
 
     /// Hand `pcm` to a sink the way a tap does: fixed-size buffers, a clock
     /// that advances, and a `SILENT` flag set from what is actually in the
     /// buffer — which is where the flag comes from on the real path too.
-    fn deliver(sink: &mut dyn FrameSink, pcm: &[f32]) {
+    ///
+    /// `start_ns` is where this tap's first buffer lands on the shared host
+    /// clock. The two legs pass different values for the same reason two real
+    /// taps do: they are started in sequence and wake up when they wake up.
+    fn deliver(sink: &mut dyn FrameSink, pcm: &[f32], start_ns: u64) {
         /// 5 ms of 48 kHz stereo, near the low end of a real IOProc's block.
         const BUFFER: usize = 480 * CHANNELS as usize;
         for (i, chunk) in pcm.chunks(BUFFER).enumerate() {
@@ -1785,7 +1986,10 @@ mod pump_clock_tests {
             flags.set(FrameFlags::SILENT, chunk.iter().all(|s| *s == 0.0));
             sink.on_frames(
                 chunk,
-                CaptureTimestamp::new(frames, frames * 1_000_000_000 / u64::from(CAPTURE_RATE)),
+                CaptureTimestamp::new(
+                    frames,
+                    start_ns + frames * 1_000_000_000 / u64::from(CAPTURE_RATE),
+                ),
                 flags,
             );
         }
@@ -1883,6 +2087,126 @@ mod pump_clock_tests {
              own counters moved with it: {silent:.0}% of {} buffers read as \
              digital silence",
             fed.mic_buffers.total
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The shared host clock (#86)
+    // -----------------------------------------------------------------------
+
+    /// Piece one: the `host_ns` `RingSink` used to throw away.
+    ///
+    /// Only the *first* buffer's, because per-leg t0 is the whole of what
+    /// anchoring needs — see the note on [`LegCounters::first_host_ns`] for why
+    /// per-buffer stamps were not built.
+    #[test]
+    fn a_leg_records_the_host_time_of_its_first_buffer_and_of_no_later_one() {
+        let counters = LegCounters::default();
+        assert_eq!(
+            counters.t0_ns(),
+            None,
+            "a tap that has not delivered a buffer has no t0 to report"
+        );
+
+        let (producer, _consumer) = AudioRing::with_capacity_frames(RING_SAMPLES);
+        let mut sink = counters.sink(producer);
+        sink.on_frames(
+            &[0.5, 0.5],
+            CaptureTimestamp::new(0, 4_000_000),
+            FrameFlags::empty(),
+        );
+        sink.on_frames(
+            &[0.5, 0.5],
+            CaptureTimestamp::new(1, 9_000_000),
+            FrameFlags::empty(),
+        );
+
+        assert_eq!(counters.t0_ns(), Some(4_000_000));
+    }
+
+    /// Piece two: session t0 is the earlier leg's, and each leg's anchor is its
+    /// distance from it.
+    #[test]
+    fn the_later_leg_is_anchored_at_its_distance_from_the_earlier_one() {
+        // The mic tap woke 700 ms after the system tap, which is the ordinary
+        // case: `system.start()` is called first.
+        assert_eq!(
+            leg_anchors(Some(5_000_000), Some(705_000_000)),
+            LegAnchors {
+                system_ms: 0,
+                mic_ms: 700
+            }
+        );
+        // And the other way round, because nothing guarantees it.
+        assert_eq!(
+            leg_anchors(Some(705_000_000), Some(5_000_000)),
+            LegAnchors {
+                system_ms: 700,
+                mic_ms: 0
+            }
+        );
+        // A leg with no t0 has nothing to be lined up against, so neither leg
+        // is anchored: an invented offset is worse than none, and this is
+        // exactly the behaviour of the whole project before #86.
+        assert_eq!(leg_anchors(Some(5_000_000), None), LegAnchors::default());
+        assert_eq!(leg_anchors(None, Some(5_000_000)), LegAnchors::default());
+        assert_eq!(leg_anchors(None, None), LegAnchors::default());
+    }
+
+    /// The payoff, and #86's acceptance test.
+    ///
+    /// The mic tap here wakes up 700 ms after the system tap, so the audio for
+    /// that first 700 ms never reaches the mic's ring at all. That is the
+    /// general shape of what #79 fixed one instance of, and the shape #79's
+    /// own fix cannot reach: feeding suppressed audio as silence works because
+    /// the pump *has* the audio and chooses not to transcribe it. Audio that
+    /// was never captured cannot be substituted for.
+    ///
+    /// Both legs stop at the same instant, so the last sample each socket
+    /// swallowed is the same moment in the room. On one session clock the two
+    /// must name it as the same millisecond, and the whole of #86 is what makes
+    /// that true whatever happened upstream.
+    #[test]
+    fn a_leg_that_missed_the_start_of_the_meeting_still_agrees_about_the_end() {
+        let fed = drive_both_legs_late(true, 700);
+
+        // The provider clocks on their own, which is all that existed before
+        // #86: how much PCM each socket swallowed, and nothing else.
+        let raw_skew = fed.system_fed_ms().abs_diff(fed.mic_fed_ms());
+        assert!(
+            raw_skew >= 600,
+            "the fixture did not withhold audio from the mic leg — {} ms fed \
+             to the system leg against {} ms to the mic — so this proves \
+             nothing",
+            fed.system_fed_ms(),
+            fed.mic_fed_ms()
+        );
+
+        // The same two positions, anchored: the mic leg's zero is 700 ms into
+        // the session because its first buffer was.
+        let anchors = leg_anchors(fed.system_t0_ns, fed.mic_t0_ns);
+        let system_end =
+            SessionClock::anchored_at(anchors.system_ms).to_session_ms(fed.system_fed_ms());
+        let mic_end = SessionClock::anchored_at(anchors.mic_ms).to_session_ms(fed.mic_fed_ms());
+
+        let skew = system_end.abs_diff(mic_end);
+        assert!(
+            skew <= 50,
+            "the legs disagree by {skew} ms about when the meeting ended: \
+             system {system_end} ms against mic {mic_end} ms (anchors \
+             {anchors:?})"
+        );
+    }
+
+    /// The control for the test above: two taps that woke together are anchored
+    /// at the same place, so anchoring changes nothing about today's meetings.
+    #[test]
+    fn two_legs_that_started_together_are_both_anchored_at_session_zero() {
+        let fed = drive_both_legs(true);
+
+        assert_eq!(
+            leg_anchors(fed.system_t0_ns, fed.mic_t0_ns),
+            LegAnchors::default()
         );
     }
 

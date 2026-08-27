@@ -542,6 +542,72 @@ async fn an_abnormal_disconnect_reconnects_and_finishes_the_transcript() {
 }
 
 #[tokio::test]
+async fn a_legs_session_anchor_survives_a_reconnect() {
+    // #86's piece three, through the real driver and the real replay ring.
+    //
+    // The mic leg's audio starts after the system leg's, so its connection is
+    // opened with a constant anchor: everything it reports is that much later
+    // on the session clock. `reconnected_at` recomputes the *connection*
+    // offset from the replay ring, which counts from this leg's own first
+    // sample — so the anchor has to survive underneath it. If it did not, one
+    // dropped socket would drag the mic leg's timeline back onto the system
+    // leg's, and the transcript would look fine while being wrong. That is
+    // exactly the class of failure #79 was.
+    const ANCHOR_MS: u64 = 7_000;
+
+    let script = short_script();
+    let mock = MockDeepgram::builder()
+        // Vanish after the third client frame, i.e. part way through the audio.
+        .connection_modes(vec![MockMode::DisconnectAfter(3)])
+        .script(script.clone())
+        .start()
+        .await;
+    let (stream, mut events) = open(config(&mock).with_session_offset_ms(ANCHOR_MS));
+
+    write_script(&stream, &script);
+
+    let mut collected = Vec::new();
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while finals(&collected).len() < script.utterances.len()
+        && tokio::time::Instant::now() < deadline
+    {
+        match tokio::time::timeout(Duration::from_millis(200), events.recv()).await {
+            Ok(Some(event)) => collected.push(event),
+            _ => break,
+        }
+    }
+    stream.close().await.expect("close succeeds");
+    collected.extend(drain(&mut events).await);
+
+    assert!(
+        mock.connection_count() >= 2,
+        "the stream must have reconnected for this to prove anything"
+    );
+    assert_eq!(
+        transcript(&collected),
+        script.expected_text(),
+        "anchoring must not disturb gapless replay"
+    );
+
+    let finals = finals(&collected);
+    for segment in &finals {
+        assert!(
+            segment.start_ms >= ANCHOR_MS,
+            "a segment landed at {} ms, before this leg's audio exists",
+            segment.start_ms
+        );
+    }
+    let last = finals.last().expect("at least one final");
+    assert!(
+        last.end_ms >= ANCHOR_MS + script.total_ms().saturating_sub(50),
+        "the last final should land near {} ms — the anchor plus the fixture — \
+         got {} ms",
+        ANCHOR_MS + script.total_ms(),
+        last.end_ms
+    );
+}
+
+#[tokio::test]
 async fn the_stream_gives_up_once_the_attempt_budget_is_spent() {
     // Every connection dies immediately, so the budget is the only thing that
     // ends the loop.

@@ -76,6 +76,15 @@ pub struct DeepgramStreamConfig {
     pub backoff: BackoffPolicy,
     /// How much committed transcript to keep for replay deduplication.
     pub tail_tokens: usize,
+    /// Where this leg's own audio zero sits on the session clock (#86).
+    ///
+    /// A session has two capture legs and they do not start together, so a
+    /// leg's provider clock — which counts the PCM this socket has swallowed
+    /// and nothing else — is not the session clock. This is the constant
+    /// between them, applied at connection zero and kept across every
+    /// reconnect. Zero for the earlier leg, and zero for a single-leg session,
+    /// where there is nothing to line up against.
+    pub session_offset_ms: u64,
 }
 
 impl DeepgramStreamConfig {
@@ -96,7 +105,15 @@ impl DeepgramStreamConfig {
             replay_window_ms: crate::replay::DEFAULT_WINDOW_MS,
             backoff: BackoffPolicy::spec(),
             tail_tokens: DEFAULT_TAIL_TOKENS,
+            session_offset_ms: 0,
         }
+    }
+
+    /// Anchor this leg `session_offset_ms` into the session (#86).
+    #[must_use]
+    pub fn with_session_offset_ms(mut self, session_offset_ms: u64) -> Self {
+        self.session_offset_ms = session_offset_ms;
+        self
     }
 
     /// Point this configuration at a local plaintext mock.
@@ -257,8 +274,10 @@ struct Driver {
     tail: TranscriptTail,
     budget: ReconnectBudget,
     jitter: Box<dyn Jitter>,
-    /// End of the last utterance Deepgram finalized normally. The replay
-    /// anchor; see the module docs for why the dangling final must not move it.
+    /// End of the last utterance Deepgram finalized normally, on the **session**
+    /// clock. Where replay resumes from; see the module docs for why the
+    /// dangling final must not move it, and [`Driver::leg_ms`] for the
+    /// conversion the replay ring needs.
     last_final_end_ms: u64,
     /// Whether the next final is expected to restate replayed audio.
     dedupe_armed: bool,
@@ -272,7 +291,8 @@ impl Driver {
         events: mpsc::UnboundedSender<StreamEvent>,
         jitter: Box<dyn Jitter>,
     ) -> Self {
-        let normalizer = DeepgramNormalizer::new(config.normalizer.clone());
+        let normalizer =
+            DeepgramNormalizer::anchored_at(config.normalizer.clone(), config.session_offset_ms);
         let ring = PcmRing::new(config.params.sample_rate, config.replay_window_ms);
         let tail = TranscriptTail::new(config.tail_tokens);
         let budget = config.backoff.budget();
@@ -374,7 +394,10 @@ impl Driver {
         let (mut sink, mut incoming) = socket.split();
 
         // Read the replay position *before* finalizing the dangling partial.
-        let replay = self.ring.replay_from(self.last_final_end_ms);
+        // On this leg's own clock, because that is the one the ring counts:
+        // it has been running since the leg's first sample, while
+        // `last_final_end_ms` is on the session clock the anchor puts it on.
+        let replay = self.ring.replay_from(self.leg_ms(self.last_final_end_ms));
         if !first_connection {
             if let Some(mut dangling) = self.normalizer.reconnected_at(replay.start_ms) {
                 // The dangling partial goes through deduplication too. On a
@@ -596,6 +619,15 @@ impl Driver {
         } else {
             self.emit(StreamEvent::Partial(segment));
         }
+    }
+
+    /// A session-clock position on *this leg's* own audio clock (#86).
+    ///
+    /// The replay ring counts from this leg's first sample; the session clock
+    /// counts from the earlier leg's. Everything the ring is asked about has to
+    /// cross that constant, and this is the only place it does.
+    fn leg_ms(&self, session_ms: u64) -> u64 {
+        session_ms.saturating_sub(self.config.session_offset_ms)
     }
 
     /// Emit a final and remember its text for replay deduplication, without
