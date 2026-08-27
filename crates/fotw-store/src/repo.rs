@@ -182,6 +182,21 @@ impl MeetingRepo<'_> {
     /// possibly successful report with a local failure. The column is derived
     /// state that happens to live on the row.
     ///
+    /// # It also rewrites the title's FTS entry, and that is left alone
+    ///
+    /// `meetings_fts_au` is `AFTER UPDATE ON meetings` for *any* column, so
+    /// this statement — which touches neither `title` nor `rowid` — costs a
+    /// full FTS delete-and-reinsert of an unchanged title. Correct, just
+    /// redundant, and deliberately not fixed (#89): scoping the trigger to
+    /// `AFTER UPDATE OF title` means a migration 0004, and a bumped
+    /// [`LATEST_SCHEMA_VERSION`](crate::LATEST_SCHEMA_VERSION) makes every
+    /// already-shipped binary refuse the library on sight — see
+    /// `migrations::migrate`'s refusal and why it is not optional. Paying that
+    /// to save three redundant index writes an hour is the wrong trade, and a
+    /// mis-scoped trigger on an external-content index desynchronises search
+    /// silently rather than loudly. Worth revisiting only alongside a migration
+    /// that is earning its keep some other way.
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] when there is no such meeting.

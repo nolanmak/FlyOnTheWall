@@ -369,6 +369,12 @@ fn persist_and_promote(root: &Path, outcome: &SessionOutcome, ready: &ReadyTap) 
     // A dated placeholder, not an epoch second: enrichment replaces it within
     // seconds when there is speech to name, and a meeting recorded in silence
     // keeps this forever (#76, and #67's transcript-less acceptance).
+    //
+    // The date it carries is UTC and says so, which reads as wrong to anyone
+    // not on it. That is a constraint, not an oversight: the workspace has no
+    // timezone database at all, so UTC is the only clock it can name honestly,
+    // and rendering true local time is a dependency decision. Read
+    // `dated_fallback_title`'s doc before reaching for a conversion here (#89).
     let title = crate::enrich::dated_fallback_title(fotw_store::now_ms());
 
     match crate::open_library(root) {

@@ -77,6 +77,30 @@ const FALLBACK_PREFIX: &str = "Untitled recording";
 /// A settings row rather than a column, on [`crate::github`]'s push-receipt
 /// precedent: bookkeeping *about* a meeting rather than a property of one, and
 /// it needs no migration.
+///
+/// # What that costs, and the size at which it stops being free (#89)
+///
+/// One row holds one entry per meeting ever enriched, and every writer rewrites
+/// the whole row: [`read_receipts`] parses the map, the caller changes one
+/// entry, `stamp` re-serialises all of them. An entry is a 36-byte UUID plus
+/// two millisecond clocks plus a title capped at
+/// [`TITLE_BUDGET_BYTES`](fotw_summarize::title::TITLE_BUDGET_BYTES) — call it
+/// ~180 bytes of JSON.
+///
+/// So the write amplification is the whole library per write, and the writes
+/// are not rare: [`enrich_meeting_with`] stamps twice per meeting (the started
+/// anchor before the LLM calls, the finished one after), and
+/// [`crate::github::GithubExporter::auto_push_pending`] parses the map once a
+/// minute for as long as the daemon runs.
+///
+/// At the 33 meetings of the first real library that is ~6 KB — genuinely
+/// nothing beside a single LLM call. At 10 000 it is ~1.8 MB parsed and
+/// re-serialised twice per enrichment and once a minute forever, through
+/// SQLCipher, which is no longer nothing. [`crate::github`]'s map has exactly
+/// the same shape and the same ceiling, so whichever way this goes it goes for
+/// both: a `meeting_receipts` table keyed by meeting id, or a column apiece.
+/// Both are migrations, and neither is worth one until the library is an order
+/// of magnitude larger than any that exists.
 pub const RECEIPTS_KEY: &str = "enrich_receipts";
 
 /// What enrichment left behind for one meeting: two clocks and a string, each
@@ -129,11 +153,24 @@ pub fn read_receipts(db: &Db) -> HashMap<String, EnrichReceipt> {
 ///
 /// Dated rather than stamped. `Untitled recording — 1787535722` is what a
 /// speechless recording was actually called in the live library, and an epoch
-/// second is not something a person reads. The clock is UTC and says so:
-/// nothing here can turn an IANA name into an offset — `persist.rs` reads
-/// `/etc/localtime` for the *name*, and there is no timezone database anywhere
-/// in this dependency graph — and a wall-clock time silently hours out is worse
-/// than one that names the clock it is on.
+/// second is not something a person reads.
+///
+/// # Why it says UTC out loud (#89)
+///
+/// Because that is the only clock this workspace can name correctly. Nothing
+/// here can turn an IANA name into an offset: `persist.rs` reads
+/// `/etc/localtime` for the *name* only, `okf::ymd_utc` is the whole
+/// of the workspace's civil-calendar arithmetic, and `Cargo.lock` has no
+/// `chrono`, no `time`, no `jiff` and no tz database of any kind. A wall-clock
+/// time silently hours out is worse than one that names the clock it is on, so
+/// the suffix is not decoration — it is the honest label on a number that is
+/// not local time.
+///
+/// Rendering the user's real local time is therefore a **dependency decision**,
+/// not an oversight and not a small fix: it means taking a tz database into a
+/// binary that currently has none, for a placeholder that enrichment usually
+/// replaces within seconds. Worth doing when something else in the product
+/// needs local civil time; not worth doing for this alone.
 ///
 /// Still [`FALLBACK_PREFIX`]-prefixed, so the replaceability guard is
 /// unaffected and a later pass with a transcript still improves it.

@@ -98,6 +98,19 @@ INSERT INTO segments_fts(segments_fts, rank) VALUES('secure-delete', 1);
 ----------------------------------------------------------------- the triggers
 
 -- meetings.title
+--
+-- `_au` fires on an UPDATE of ANY column, not only `title`. Since #74 that
+-- means every `set_enrich_report` -- three an hour on a live library -- pays a
+-- delete-and-reinsert of an unchanged title. Known, measured and deliberately
+-- left (#89): narrowing it to `AFTER UPDATE OF title` cannot be done in place,
+-- because a released migration is immutable (see `migrations.rs`), and doing it
+-- as a 0004 bumps LATEST_SCHEMA_VERSION, at which point every shipped binary
+-- refuses the library. That is a real behaviour change bought for three
+-- redundant index writes an hour. Note also that the scoped form fires on
+-- `title` appearing in the SET list rather than on its value changing, and
+-- would stop firing on a statement that moved a rowid without naming `title`;
+-- a trigger that under-fires on an external-content index corrupts search
+-- silently, which is why this one is broad on purpose.
 CREATE TRIGGER meetings_fts_ai AFTER INSERT ON meetings BEGIN
   INSERT INTO meetings_fts(rowid, title) VALUES (new.rowid, new.title);
 END;

@@ -43,6 +43,12 @@ pub const SETTINGS_KEY: &str = "github_export";
 
 /// The `settings` key the per-meeting receipts live under: a JSON object of
 /// meeting id → [`GithubReceipt`].
+///
+/// One row for every meeting ever pushed, rewritten whole on every push. The
+/// cost model, the size at which it stops being free, and why both maps move
+/// together or not at all are written up once on
+/// [`crate::enrich::RECEIPTS_KEY`] (#89) — this entry is the older of the two
+/// and set the precedent.
 pub const RECEIPTS_KEY: &str = "github_export_receipts";
 
 /// How long the auto pusher waits for enrichment before pushing anyway (#76).

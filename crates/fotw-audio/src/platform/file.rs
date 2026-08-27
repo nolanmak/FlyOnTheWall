@@ -172,7 +172,11 @@ impl AudioTap for FileAudioSource {
         let divisor = speed.divisor();
 
         self.worker = Some(thread::spawn(move || {
-            let origin = Instant::now();
+            // Pacing only, never stamping. This tap's schedule is relative to
+            // its own start — the fixture begins when the worker does — but its
+            // *timestamps* are not: see the stamp below for what timing them
+            // from here cost (#89).
+            let paced_from = Instant::now();
             let mut device_frames: u64 = 0;
             let mut flags = FrameFlags::empty();
 
@@ -190,7 +194,7 @@ impl AudioTap for FileAudioSource {
                 if let Some(divisor) = divisor {
                     let target_ns = format.frames_to_ns(device_frames) as f64 / divisor;
                     let deadline = Duration::from_nanos(target_ns as u64);
-                    if let Some(wait) = deadline.checked_sub(origin.elapsed())
+                    if let Some(wait) = deadline.checked_sub(paced_from.elapsed())
                         && wait >= MIN_SLEEP
                     {
                         thread::sleep(wait);
@@ -198,9 +202,16 @@ impl AudioTap for FileAudioSource {
                 }
 
                 // Stamp at the boundary from the one process-wide clock, as a
-                // real backend must (seam rule 3). `device_frames` counts what
-                // came BEFORE this buffer, hence the subtraction.
-                let ts = CaptureTimestamp::new(device_frames - frames, clock::ns_since(origin));
+                // real backend must (seam rule 3) — `clock::host_ns`, exactly
+                // what the macOS taps stamp from, and not this worker's own
+                // start. Timing it from `paced_from` read identically within a
+                // tap and was exactly backwards across two: both legs stamped
+                // their first buffer at ≈0 however far apart they really began,
+                // so `fotwd`'s cross-leg anchoring (#86) saw every fixture
+                // session as two taps that woke together and declined to anchor
+                // (#89). `device_frames` counts what came BEFORE this buffer,
+                // hence the subtraction.
+                let ts = CaptureTimestamp::new(device_frames - frames, clock::host_ns());
 
                 // A fixture that is entirely zero is legitimately silent, and
                 // reporting that is how the layer above learns to distinguish

@@ -62,8 +62,13 @@ pub enum SummarizeError {
 
     /// The model emitted something that is not valid against the schema we
     /// sent. Distinct from [`SummarizeError::Decode`] because it is the
-    /// *model's* failure rather than the adapter's, and the pipeline may retry
-    /// it where a decode failure is a bug.
+    /// *model's* failure rather than the adapter's: a decode failure is a bug
+    /// in this crate, this one is a bad answer to a well-formed request.
+    ///
+    /// Not retried. Since #75 `pipeline::extract_all` collects the detail as a
+    /// warning and finishes without that chunk's structured half, because a
+    /// chunked meeting where one chunk answered badly is still a summary the
+    /// user wants.
     #[error("model output did not match the extraction schema: {0}")]
     SchemaViolation(String),
 
@@ -79,9 +84,16 @@ pub enum SummarizeError {
 impl SummarizeError {
     /// Whether retrying the identical request could plausibly succeed.
     ///
-    /// Used by the daemon's retry wrapper. Deliberately conservative: a
-    /// mutually-exclusive-features error is never retryable, because the
-    /// request is wrong and will be wrong again.
+    /// **Nothing calls this yet** (#89). It was written for a daemon-side retry
+    /// wrapper that was never built, and the one variant it would have caught
+    /// most often — [`SchemaViolation`](Self::SchemaViolation) — is handled
+    /// softly by the pipeline instead since #75. It is kept because it is the
+    /// half of the taxonomy that says *what a class means*, the same shape
+    /// `fotw_stt::SttErrorClass::is_retryable` has and does have callers, and
+    /// the tests below are the contract a future caller inherits.
+    ///
+    /// Deliberately conservative: a mutually-exclusive-features error is never
+    /// retryable, because the request is wrong and will be wrong again.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
