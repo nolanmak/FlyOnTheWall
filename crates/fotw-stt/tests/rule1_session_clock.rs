@@ -9,6 +9,16 @@
 //! STT-09 replays the last 30 s of PCM into it. Without recomputing the offset
 //! every timestamp after the reconnect lands back at the start of the meeting,
 //! which silently corrupts every seek, every citation and every export.
+//!
+//! There are therefore *three* clocks stacked here, not two (#86):
+//!
+//! * the **provider's**, which restarts at zero on every connection;
+//! * this **leg's**, which counts from its own first audio sample — it is
+//!   exactly what the STT-09 replay ring counts, and the connection offset is
+//!   measured on it;
+//! * the **session's**, shared by both capture legs, whose zero is the earlier
+//!   of the two legs' first samples. The distance from it to a leg's own zero
+//!   is that leg's *anchor*, and it is a constant for the meeting.
 
 use fotw_stt::{SessionClock, seconds_to_ms};
 
@@ -102,6 +112,85 @@ fn offsets_accumulate_across_repeated_reconnects() {
 
     assert!(timeline.windows(2).all(|w| w[1] >= w[0]), "{timeline:?}");
     assert_eq!(*timeline.last().unwrap(), 3_000_000 + 1_234);
+}
+
+// ---------------------------------------------------------------------------
+// The leg anchor (#86)
+// ---------------------------------------------------------------------------
+//
+// Everything above is about one leg and its provider. A session has two, and
+// their audio does not begin at the same instant: the taps are started in
+// sequence, and a device can take its own time waking up. The anchor is where
+// one leg's audio zero sits on the shared session clock. Unlike the connection
+// offset it never moves — a leg that started 700 ms late started 700 ms late
+// for the whole meeting, reconnects included.
+
+#[test]
+fn an_anchored_leg_starts_at_its_own_offset_into_the_session() {
+    // The mic tap's first buffer landed 700 ms after the system tap's, so the
+    // mic leg's own zero is the session's 700.
+    let clock = SessionClock::anchored_at(700);
+
+    assert_eq!(clock.anchor_ms(), 700);
+    assert_eq!(clock.offset_ms(), 700);
+    assert_eq!(clock.to_session_ms(0), 700);
+    assert_eq!(clock.to_session_ms(1_500), 2_200);
+}
+
+#[test]
+fn an_unanchored_leg_is_exactly_the_clock_every_test_above_pins() {
+    // The earlier leg *is* session t0, so it anchors at zero and nothing about
+    // it may change. This is what makes #86 an extension of rule 1 rather than
+    // a revision of it.
+    assert_eq!(SessionClock::anchored_at(0), SessionClock::new());
+}
+
+#[test]
+fn a_reconnect_adds_to_the_leg_anchor_rather_than_replacing_it() {
+    // `reconnected_at` takes a position on *this leg's* audio clock — what the
+    // replay ring counts, and what it has counted since the leg's first sample
+    // — so the anchor sits underneath it and survives. Overwriting the offset
+    // here would un-anchor the mic leg on the first dropped socket, which is
+    // the shape of the bug #79 fixed: a leg that agrees with the other one
+    // until something goes wrong, and then quietly does not.
+    let mut clock = SessionClock::anchored_at(700);
+
+    clock.reconnected_at(2_370_000);
+
+    assert_eq!(
+        clock.anchor_ms(),
+        700,
+        "the anchor is a property of the leg"
+    );
+    assert_eq!(clock.offset_ms(), 2_370_700);
+    assert_eq!(clock.to_session_ms(30_400), 2_401_100);
+}
+
+#[test]
+fn the_leg_anchor_survives_every_reconnect_of_a_long_meeting() {
+    // The accumulation test above, for an anchored leg: five reconnects must
+    // neither drop the anchor nor apply it twice.
+    let mut clock = SessionClock::anchored_at(700);
+
+    for hop in 1..=5_u64 {
+        clock.reconnected_at(hop * 600_000);
+        assert_eq!(clock.offset_ms(), hop * 600_000 + 700);
+    }
+}
+
+#[test]
+fn two_legs_that_started_apart_agree_about_one_moment() {
+    // The acceptance property, in the small. The system tap fired first; the
+    // mic tap fired 700 ms later, so at the instant both sockets have heard
+    // everything up to the end of the meeting the mic's provider clock reads
+    // 700 ms less than the system's. Anchored, they name the same millisecond.
+    let system = SessionClock::anchored_at(0);
+    let mic = SessionClock::anchored_at(700);
+
+    let system_end = system.to_session_ms(1_830_000);
+    let mic_end = mic.to_session_ms(1_829_300);
+
+    assert_eq!(system_end, mic_end);
 }
 
 #[test]

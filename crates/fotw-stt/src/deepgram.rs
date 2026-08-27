@@ -244,6 +244,20 @@ impl DeepgramNormalizer<UlidFactory> {
         Self::with_id_factory(config, UlidFactory)
     }
 
+    /// [`new`](Self::new), for a capture leg whose own audio zero is
+    /// `anchor_ms` into the session (#86).
+    ///
+    /// The anchor is a property of the leg, not of the connection: it is
+    /// applied at connection zero and survives every reconnect. `0` is
+    /// [`new`](Self::new).
+    #[must_use]
+    pub fn anchored_at(config: DeepgramConfig, anchor_ms: u64) -> Self {
+        let mut normalizer = Self::with_id_factory(config, UlidFactory);
+        normalizer.clock = SessionClock::anchored_at(anchor_ms);
+        normalizer.estimator = ArrivalEstimator::starting_at(anchor_ms);
+        normalizer
+    }
+
     /// A normalizer minting `prefix-0`, `prefix-1`, … instead of ULIDs.
     ///
     /// For fixtures and golden files, where a random id would make the expected
@@ -395,19 +409,23 @@ impl<F: SegmentIdFactory> DeepgramNormalizer<F> {
 
     /// Rebase onto a new connection after a reconnect (spec 7.2 rule 1).
     ///
-    /// `session_ms` is the session-clock position of the first audio sample fed
-    /// to the new connection — with STT-09's gapless replay that is
-    /// `last_final_end_ms`, not the moment the socket opened.
+    /// `leg_ms` is the position of the first audio sample fed to the new
+    /// connection on *this leg's own* audio clock — with STT-09's gapless
+    /// replay that is where the replay ring resumed, not the moment the socket
+    /// opened. This leg's session anchor (#86) sits underneath it and survives.
     ///
     /// Returns a final for whatever utterance was open, because the replayed
     /// audio will be re-transcribed from scratch by the new connection. The
     /// resulting overlap is deduplicated on normalized leading text above this
     /// crate (STT-09); reusing the id here instead would append the replayed
     /// text to the utterance it duplicates.
-    pub fn reconnected_at(&mut self, session_ms: u64) -> Option<TranscriptSegment> {
+    pub fn reconnected_at(&mut self, leg_ms: u64) -> Option<TranscriptSegment> {
         let dangling = self.finish();
-        self.clock.reconnected_at(session_ms);
-        self.estimator.reconnected_at(session_ms);
+        self.clock.reconnected_at(leg_ms);
+        // The estimator works in session milliseconds — everything it is
+        // compared against does — so it takes the anchored position rather than
+        // the leg-relative one it was handed.
+        self.estimator.reconnected_at(self.clock.to_session_ms(0));
         dangling
     }
 
