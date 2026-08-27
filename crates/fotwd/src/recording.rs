@@ -44,6 +44,14 @@
 //! waiting for them held the slot — and the user's clock — for minutes.
 //! [`enrich_and_announce`] therefore runs *after* the slot clears.
 //!
+//! And it ends *within a bounded time*, which it did not until #85. Every
+//! blocking step of a session's wind-down — closing the taps, waiting for the
+//! pump — now runs under [`FinishDeadlines`], because none of them could be
+//! cancelled once entered: a Core Audio HAL blocks in `stop()` for the same
+//! reason it blocks in `start()`, and a `pump.join()` with no clock turned
+//! that into a slot nobody could free. What `Finishing` *means* is unchanged;
+//! what changed is that it stops.
+//!
 //! That is a real concurrency change and this header owns it: enrichment can
 //! now overlap live capture of the next meeting, and one meeting's enrichment
 //! can overlap another's. It is safe for the library — SQLite runs in WAL with
@@ -65,8 +73,8 @@ use crate::audit::{AuditKind, AuditLog};
 use crate::consent::{JurisdictionSignals, Rules};
 use crate::secrets;
 use crate::session::{
-    self, DeepgramLegs, SegmentTap, SessionControl, SessionOutcome, StopSignal, SttErrors,
-    Transcription,
+    self, DeepgramLegs, FinishDeadlines, SegmentTap, SessionControl, SessionOutcome, StopSignal,
+    SttErrors, Transcription,
 };
 
 /// How a session acquires its taps.
@@ -172,6 +180,9 @@ pub struct DaemonRecorder {
     finish: Arc<Finisher>,
     ceiling: Duration,
     ready_deadline: Duration,
+    /// How long a session's wind-down may take before it stops waiting on the
+    /// device — where `Finishing` ends (#85).
+    finish_deadlines: FinishDeadlines,
     /// Handed to every session for the live transcript (#61).
     on_segment: SegmentTap,
     /// Told when a meeting lands in the library, so an open tab can refetch
@@ -266,10 +277,24 @@ impl DaemonRecorder {
             finish: Arc::new(finish),
             ceiling,
             ready_deadline,
+            finish_deadlines: FinishDeadlines::default(),
             on_segment,
             on_ready,
             live: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// The same recorder, finishing on a different clock (#85).
+    ///
+    /// A chained setter rather than a tenth argument to
+    /// [`with_parts`](Self::with_parts): the shipped defaults are the whole
+    /// story for the daemon, and the only caller that needs anything else is a
+    /// test that would otherwise sit out a ten-second drain to watch the slot
+    /// free.
+    #[must_use]
+    pub const fn with_finish_deadlines(mut self, deadlines: FinishDeadlines) -> Self {
+        self.finish_deadlines = deadlines;
+        self
     }
 
     /// Whether this process was launched as the app bundle rather than from a
@@ -411,6 +436,7 @@ impl RecorderControl for DaemonRecorder {
 
         let mut control = SessionControl::new();
         control.on_segment = self.on_segment.clone();
+        control.deadlines = self.finish_deadlines;
         let stop = control.stop.clone();
         let ready = control.ready.clone();
         let started_at_ms = now_ms();
