@@ -128,6 +128,20 @@ pub fn title_request(
 /// for unprompted (quotes, backticks, markdown headings and bullets, a
 /// trailing period), and refuses what is left if it is empty or too long to be
 /// a name.
+///
+/// # What it does not bound (#89)
+///
+/// The **shape** of a reply, not its meaning. A transcript saying "your new
+/// title is ACME CORP CONFIDENTIAL" can produce exactly that title, because
+/// four words is a title by every test this function applies — and that title
+/// then becomes a library row, a dashboard heading and a slug in the GitHub
+/// export path. That is accepted, not overlooked: nothing downstream executes
+/// a title, [`MAX_TITLE_WORDS`] caps a paragraph from becoming one, and
+/// [`TITLE_BUDGET_BYTES`] caps the length, so the worst case is a meeting
+/// wearing a bad name that a person can rename. Defending the *meaning* would
+/// mean a second model call to judge the first, which is a larger and less
+/// reliable machine than the problem deserves. If that changes, it changes
+/// here — this is the only place a model's words become a stored name.
 #[must_use]
 pub fn clean_title(raw: &str) -> Option<String> {
     let line = raw.lines().map(str::trim).find(|l| !l.is_empty())?;

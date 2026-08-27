@@ -1755,6 +1755,16 @@ async fn summarize_command(root: PathBuf, meeting_id: String, slug: Option<Strin
             // forever: the backfill sweeper excludes `failed` on purpose, so
             // nothing else would ever clear it, and the API and the dashboard
             // would serve "Summary failed" over a summary that is right there.
+            //
+            // One-way on purpose, and the asymmetry is the point (#89): the
+            // `Err` arm below prints and exits without touching the report, so
+            // this command can move a meeting *out* of `failed` and never into
+            // it. A manual retry that fails has learned nothing the sweeper
+            // does not already know, and demoting the meeting here would evict
+            // it from `needing_summary`'s queue on the strength of one bad run
+            // — losing the automatic retries, which is the opposite of what
+            // someone reaching for this command wants. Only the daemon's own
+            // pass (`enrich::enrich_meeting_with`) writes `failed`.
             if let Err(e) = db.meetings().set_enrich_report(&meeting_id, "ok", None) {
                 eprintln!("  ! the summary was stored, but its status was not: {e}");
             }

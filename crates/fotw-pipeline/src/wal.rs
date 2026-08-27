@@ -277,9 +277,23 @@ impl Manifest {
 /// overrides the recorded count; anything else keeps it, because reading a
 /// genuinely stereo leg as mono is the same bug pointed the other way and the
 /// two legs' sizes are not guaranteed to match (the mic tap starts second, and
-/// a stalled tap leaves its leg short). A mic that stalled badly enough to
-/// land in the band is misread, and there is nothing on disk that would say
-/// otherwise; that is why the caller logs the choice.
+/// a stalled tap leaves its leg short).
+///
+/// # The two cases it cannot answer (#80, written down by #89)
+///
+/// * **No denominator.** An empty or missing `system.pcm` means there is no
+///   ratio to take, so the guard below hands back the recorded count untouched.
+///   Not hypothetical: one such directory exists in the first real library. It
+///   is the right answer — a count with no evidence against it beats a coin
+///   toss — but it means a pre-schema-4 session whose system leg died is
+///   encoded on the manifest's word alone.
+/// * **A stereo mic that captured half a meeting.** Byte count is the only
+///   evidence on disk, and half a stereo leg is byte-for-byte a whole mono leg.
+///   A mic that stalled badly enough to land in the band is therefore misread,
+///   and nothing on disk would say otherwise. That is precisely why
+///   [`encode_session`] logs the choice rather than making it quietly: the
+///   PCM is unlinked afterwards, so the log line is the only surviving record
+///   of which way the guess went.
 fn infer_mic_channels(global_channels: u16, sys_bytes: u64, mic_bytes: u64) -> u16 {
     if global_channels < 2 || sys_bytes == 0 || mic_bytes == 0 {
         return global_channels.max(1);

@@ -4,8 +4,9 @@
 //!
 //! On speakers, the mic re-transcribes the system audio: the same passage
 //! lands twice, once diarized on the system leg and once labeled `me`, with
-//! ASR wording drift between the copies and multi-second skew between the
-//! legs' clocks. The audio-domain gate (CAP-11 v1) catches the
+//! ASR wording drift between the copies and seconds of offset between the two
+//! spans — segmentation and the room, not clock disagreement, since #86 put
+//! both legs on one epoch (#89). The audio-domain gate (CAP-11 v1) catches the
 //! single-dominant-source case; this text-level pass removes what leaks,
 //! because in the text domain the duplication is trivially visible no matter
 //! what the room did to the waveform. Precedent: Descript's "mic bleed" fix —

@@ -7,7 +7,7 @@
 //! the real seam (docs/REQUIREMENTS.md 5.6). These tests are the guarantee
 //! that the fake is faithful enough to carry that weight.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fotw_audio::platform::file::{FileAudioSource, FilePlatform, ReplaySpeed};
 use fotw_audio::testing::SinkHandle;
@@ -96,6 +96,54 @@ fn timestamps_are_monotonic_on_both_clocks() {
     // equal the total delivered.
     let last = *handle.timestamps().last().unwrap();
     assert!(last.device_frames < src.delivered_frames());
+}
+
+/// Seam rule 3, the half a fixture tap can get wrong on its own: `host_ns` is
+/// the *process-wide* clock, so two taps started apart stamp apart.
+///
+/// This tap used to time its stamps from its own worker's start, which reads
+/// identically inside one tap and is exactly backwards across two: both legs
+/// stamped their first buffer at ≈0 however far apart they really began, so
+/// `fotwd`'s `leg_anchors` (#86) measured every fixture-driven session as two
+/// taps that woke together and silently declined to anchor anything. With ~90%
+/// of this project's coverage riding on this tap, that put #86 out of reach of
+/// almost every test in the suite.
+#[test]
+fn two_taps_started_apart_stamp_their_first_buffers_apart() {
+    /// Long enough that the gap cannot be lost to scheduler granularity, short
+    /// enough to stay a unit test.
+    const APART: Duration = Duration::from_millis(50);
+
+    let first = SinkHandle::new();
+    let mut earlier =
+        FileAudioSource::from_wav(TapId::system_default(), tone(0.05), ReplaySpeed::Unpaced);
+    let before_earlier = fotw_audio::clock::host_ns();
+    earlier.start(first.sink()).unwrap();
+    earlier.wait_for_completion();
+
+    std::thread::sleep(APART);
+
+    let second = SinkHandle::new();
+    let mut later =
+        FileAudioSource::from_wav(TapId::mic("fixture-mic"), tone(0.05), ReplaySpeed::Unpaced);
+    later.start(second.sink()).unwrap();
+    later.wait_for_completion();
+
+    let earlier_t0 = first.timestamps()[0].host_ns;
+    let later_t0 = second.timestamps()[0].host_ns;
+
+    assert!(
+        earlier_t0 >= before_earlier,
+        "the first buffer is stamped on the shared clock, so it cannot predate \
+         a reading taken before start(): {earlier_t0} < {before_earlier}"
+    );
+    assert!(
+        later_t0.saturating_sub(earlier_t0) >= APART.as_nanos() as u64,
+        "two taps started {APART:?} apart stamped their first buffers only \
+         {}ns apart — a tap timing from its own start makes every pair of legs \
+         look simultaneous",
+        later_t0.saturating_sub(earlier_t0)
+    );
 }
 
 /// Buffers are 10 ms, because that is the unit the AEC requires — it panics,

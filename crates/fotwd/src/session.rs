@@ -509,13 +509,14 @@ pub fn text_dedupe_enabled(value: Option<&str>) -> bool {
 /// system leg. Returns how many were dropped.
 ///
 /// On speakers the mic re-transcribes the system audio, so the same passage
-/// lands twice — once diarized on the system leg, once labeled `me` — with
-/// ASR wording drift between the copies and multi-second skew between the
-/// legs. The audio gate (CAP-11 v1) removes what it can before transcription;
-/// this pass removes what leaks, because in the text domain the duplication
-/// is trivially visible no matter what the room did to the waveform.
-/// Precedent: Descript's "mic bleed" fix — text-only removal, audio
-/// untouched. The system copy always wins: it is the clean, diarized feed.
+/// lands twice — once diarized on the system leg, once labeled `me` — with ASR
+/// wording drift between the copies and seconds of offset between the two
+/// spans, for the reasons [`DEDUPE_WINDOW_MS`] sets out. The audio gate
+/// (CAP-11 v1) removes what it can before transcription; this pass removes
+/// what leaks, because in the text domain the duplication is trivially visible
+/// no matter what the room did to the waveform. Precedent: Descript's "mic
+/// bleed" fix — text-only removal, audio untouched. The system copy always
+/// wins: it is the clean, diarized feed.
 ///
 /// # How a mic segment is judged
 ///
@@ -655,8 +656,29 @@ const DEDUPE_VERBATIM: f32 = 0.85;
 /// words appear somewhere in twenty seconds of speech.
 const DEDUPE_MIN_MATCHED: usize = 4;
 
-/// Span padding for the containment window, covering the observed
-/// multi-second skew between the legs' clocks.
+/// Span padding for the containment window.
+///
+/// The number is unchanged since it was measured; what it covers is not
+/// (#89). It was written for a multi-second disagreement between the two legs'
+/// clocks. #79 stopped the echo gate stealing time from the mic leg's, and #86
+/// put both legs on one session epoch — [`anchor_legs`] — so a clock
+/// disagreement is now the thing this padding does *not* have to cover.
+///
+/// What is left is a genuine offset between the two spans carrying the same
+/// words, and it is still seconds:
+///
+/// * **Segmentation.** The legs are two independent Deepgram connections that
+///   each endpoint where they hear a pause, so the same passage is cut
+///   differently on each. The live capture in `tests/cross_leg_dedupe.rs` has
+///   one mic segment at 2 000–17 500 ms against three system segments spanning
+///   0–16 000 ms. This is the dominant term, and it is the reason the window
+///   has to reach *outside* the mic segment's own span at all.
+/// * **The room.** The mic's copy is the system audio after rendering, playout
+///   and flight, so it really did happen later. Tens to a few hundred ms.
+/// * **The unanchored fallback.** [`leg_anchors`] answers `{0, 0}` whenever
+///   either tap has not delivered a buffer by [`ANCHOR_DEADLINE`], which puts
+///   both legs back on their own fed-PCM clocks and hands the sub-second
+///   tap-start offset back.
 const DEDUPE_WINDOW_MS: u64 = 10_000;
 
 /// Span padding for the short-fragment rule — tight, bounded by the audio
@@ -1566,7 +1588,6 @@ fn pump_loop(
         _ => None,
     };
 
-    let mut seq = 0u64;
     // Armed on the pass that first sees the latch, and the only thing that
     // ends this loop. The latch used to be read solely in the idle branch, so
     // a leg still delivering after `stop()` — a HAL that acknowledged a
@@ -1668,9 +1689,7 @@ fn pump_loop(
             }
             Some(_) => {}
         }
-        seq = seq.wrapping_add(1);
     }
-    let _ = seq;
 
     if let Some(gate) = &stt.echo_gate {
         let (assessed, suppressed) = gate.stats();
