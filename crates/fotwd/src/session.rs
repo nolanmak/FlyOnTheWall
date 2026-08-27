@@ -25,7 +25,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fotw_audio::{AudioTap, CaptureTimestamp, FrameFlags, FrameSink, StreamFormat, TapError};
 use fotw_pipeline::resample::{Downmixer, Resampler16k};
@@ -39,6 +39,76 @@ const RING_SAMPLES: usize = 48_000 * 2 * 10;
 
 /// How long the pump waits when both rings are empty.
 const IDLE_POLL: Duration = Duration::from_millis(50);
+
+/// How long the session waits for the taps to close (#85).
+///
+/// A healthy `stop()` returns in microseconds. This is the point at which the
+/// session stops believing the device — the same judgement
+/// [`crate::recording::READY_DEADLINE`] makes about `start()`, and for the
+/// same reason: a Core Audio HAL that still believes a dead client holds the
+/// device blocks rather than failing, and nothing in this process can cancel
+/// the syscall it is stuck in.
+pub const CLOSE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How long the pump keeps draining after the taps have been asked to close
+/// (#85).
+///
+/// A ring holds ten seconds of audio and the pump empties it in milliseconds,
+/// so this is not a budget the ordinary path spends: it is the point at which
+/// the session stops waiting for a tap that never really stopped.
+pub const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How long the session then waits for the pump's counts (#85).
+///
+/// The backstop for the blocking points no latch can reach: a `write(2)` into
+/// a filesystem that has stopped answering, an `fsync` on a disk that has gone
+/// away. Generous, because a long meeting's final flush is real work, and
+/// finite, because `pump.join()` used to have no clock at all.
+pub const PUMP_JOIN_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long the `Finishing` state may last (#85).
+///
+/// #77 named that state and drew it honestly; it did not give it an end. The
+/// tail of [`run_with_control`] is three blocking calls on a tokio worker —
+/// `system.stop()`, `mic.stop()` and the wait on the pump — and a device that
+/// would not close, or a pump that would not come back, held the recorder's
+/// slot until the daemon restarted. These are that state's clock.
+///
+/// One field per step rather than one budget for the lot, because the three
+/// fail differently and only the middle one is repairable in-process:
+/// [`close`](Self::close) gives up on the device, [`drain`](Self::drain) is
+/// what makes the pump *able* to return, and [`join`](Self::join) is what
+/// happens when it does not anyway.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FinishDeadlines {
+    /// How long the session waits for the taps to close.
+    ///
+    /// On expiry the taps are abandoned open and the session says so: only
+    /// the user can clear a wedged HAL.
+    pub close: Duration,
+    /// How long the pump then keeps draining what the rings still hold.
+    ///
+    /// Whatever is left when it expires is audio that will exist nowhere, so
+    /// the session says so on the one degradation channel with a reader on the
+    /// other end (#79). The session is still finalized — that is the point.
+    pub drain: Duration,
+    /// How long the session then waits for the pump to hand back its counts.
+    ///
+    /// Expiry detaches the pump thread and fails the session; see
+    /// [`run_with_control`] for what that leaves behind, and why it is a
+    /// last resort rather than the design.
+    pub join: Duration,
+}
+
+impl Default for FinishDeadlines {
+    fn default() -> Self {
+        Self {
+            close: CLOSE_DEADLINE,
+            drain: DRAIN_DEADLINE,
+            join: PUMP_JOIN_DEADLINE,
+        }
+    }
+}
 
 /// What a session produced.
 #[derive(Debug, Default)]
@@ -818,7 +888,7 @@ impl SegmentTap {
     }
 }
 
-/// The two latches a caller outside the session holds.
+/// The latches a caller outside the session holds, and the clock on its end.
 #[derive(Clone, Debug, Default)]
 pub struct SessionControl {
     /// Trip to end the session early.
@@ -829,6 +899,10 @@ pub struct SessionControl {
     pub errors: SttErrors,
     /// Handed every finalized segment as it arrives, for the live transcript.
     pub on_segment: SegmentTap,
+    /// How long the wind-down may take before the session stops waiting on
+    /// the device (#85). The default is right for a laptop; a test that would
+    /// otherwise sit out a ten-second drain names its own.
+    pub deadlines: FinishDeadlines,
 }
 
 impl SessionControl {
@@ -895,6 +969,7 @@ pub async fn run_with_stop(
             ready: ReadySignal::new(),
             errors: SttErrors::new(),
             on_segment: SegmentTap::default(),
+            deadlines: FinishDeadlines::default(),
         },
     )
     .await
@@ -914,6 +989,7 @@ pub async fn run_with_control(
     control: SessionControl,
 ) -> Result<SessionOutcome, String> {
     let stop_signal = control.stop;
+    let deadlines = control.deadlines;
     // One pair per leg, both held here. The mic's used to be constructed
     // inline inside its sink, so its liveness was unobservable (#81).
     let sys_counters = LegCounters::default();
@@ -976,10 +1052,32 @@ pub async fn run_with_control(
     };
 
     // The pump owns the WAL and does every blocking thing.
-    let pump = std::thread::spawn(move || -> Result<(u64, u64, u64), String> {
-        pump_loop(
-            wal, sys_cons, mic_cons, sys_format, mic_format, feeds, &pump_stop,
-        )
+    //
+    // Its counts come back over a channel rather than off the `JoinHandle`:
+    // `join()` blocks with no deadline, and this is an `async fn` on the
+    // multi-threaded runtime, so a pump that never returned held the
+    // recorder's slot until the daemon restarted — and, because a blocked
+    // worker stops driving the runtime's time source, took every `tokio::time`
+    // future in the process with it (#85). A channel can be waited on with a
+    // clock; the handle is dropped, so a pump still inside a syscall nothing
+    // can cancel is detached rather than waited for.
+    let (pump_done, pump_counts) = tokio::sync::oneshot::channel();
+    let _pump = std::thread::spawn(move || {
+        let counts = pump_loop(
+            wal,
+            sys_cons,
+            mic_cons,
+            sys_format,
+            mic_format,
+            feeds,
+            PumpStop {
+                stopped: &pump_stop,
+                drain: deadlines.drain,
+            },
+        );
+        // A receiver that has gone away is the join deadline having expired.
+        // There is nobody left to tell.
+        let _ = pump_done.send(counts);
     });
 
     // Drain transcript events while the meeting runs, so a long meeting does
@@ -1020,16 +1118,60 @@ pub async fn run_with_control(
     }
 
     // Stop capture first, then let the pump drain what is already buffered.
-    let _ = system.stop();
-    if let Some(t) = mic.as_mut() {
-        let _ = t.stop();
-    }
+    //
+    // Off the runtime and under a deadline (#85): closing a tap is a blocking
+    // call into the platform, and the Core Audio HAL that blocks in `start()`
+    // — the one `recording::READY_DEADLINE` exists for — blocks in `stop()`
+    // for the same reason, with nothing in this process able to cancel it.
+    // When the deadline expires the taps are left to the blocking
+    // pool: a device we cannot close is not a reason to hold the recorder,
+    // and the frames it goes on delivering are the pump's deadline to bound.
+    let closing = tokio::task::spawn_blocking(move || {
+        let _ = system.stop();
+        if let Some(t) = mic.as_mut() {
+            let _ = t.stop();
+        }
+    });
+    let taps_closed = matches!(
+        tokio::time::timeout(deadlines.close, closing).await,
+        Ok(Ok(()))
+    );
     stop.store(true, Ordering::Release);
-    let (system_samples, mic_samples, dropped_samples) =
-        pump.join().map_err(|_| "pump panicked".to_string())??;
+
+    let PumpCounts {
+        system_samples,
+        mic_samples,
+        dropped_samples,
+        abandoned_samples,
+    } = match tokio::time::timeout(deadlines.join, pump_counts).await {
+        Ok(Ok(counts)) => counts?,
+        // The sender went with the thread.
+        Ok(Err(_)) => return Err("pump panicked".to_string()),
+        Err(_) => {
+            // The one path that really does strand a session, and it says so
+            // rather than filing it under "the recovery path will get it".
+            // It will not: `promote::pending` takes a directory only when the
+            // manifest has both `ended_at_ms` and `claim`, and this one has
+            // neither — `finalize` never ran, and `claim` is written by
+            // `retention::promote_session`, which is downstream of here.
+            return Err(format!(
+                "the pump did not hand back its counts within {:?} of being \
+                 told to stop, so the recorder has been freed and the session \
+                 at {} abandoned mid-write. Its manifest has neither \
+                 `ended_at_ms` nor a `claim`, both of which `promote::pending` \
+                 requires, so nothing will collect it: the audio is on disk \
+                 and has to be imported by hand. A pump stuck this long is \
+                 stuck in a write this process cannot cancel — check the disk \
+                 the library lives on.",
+                deadlines.join,
+                dir.display()
+            ));
+        }
+    };
 
     // Read after the taps are stopped, so these are final counts rather than a
-    // snapshot taken mid-meeting.
+    // snapshot taken mid-meeting. A tap the deadline gave up on is the
+    // exception, and it is named below rather than quietly folded in.
     let system_buffers = sys_counters.snapshot();
     let mic_buffers = mic_format.is_some().then(|| mic_counters.snapshot());
 
@@ -1073,6 +1215,34 @@ pub async fn run_with_control(
         control.errors.record(format!(
             "capture: {dropped_samples} samples were dropped at a full ring — \
              the pump could not keep up with the audio thread"
+        ));
+    }
+
+    // The same hole from the other cause: the tap went on delivering after it
+    // was told to stop, and rather than drain it forever the pump gave up and
+    // finalized what it had (#85). Reported for the same reason as a ring
+    // drop — this audio exists nowhere — and the meeting is otherwise intact,
+    // which is precisely why the pump ends itself instead of being abandoned.
+    if abandoned_samples > 0 {
+        control.errors.record(format!(
+            "capture: {abandoned_samples} samples were still in the ring when \
+             the {:?} drain deadline expired — the tap kept delivering after \
+             it was stopped, so the last moments of this meeting are missing",
+            deadlines.drain
+        ));
+    }
+
+    // Last, so it is what `SttErrors::latest()` shows: it is the only entry
+    // here with a remedy the user can carry out, and the device is still open.
+    if !taps_closed {
+        control.errors.record(format!(
+            "capture: the audio device did not close within {:?} and has been \
+             left open. This is usually a Core Audio HAL that still believes a \
+             dead client holds the device; it blocks rather than failing, and \
+             nothing in this process can cancel it. Restart the audio daemon \
+             with `sudo killall coreaudiod` (this briefly interrupts all \
+             audio) before recording again.",
+            deadlines.close
         ));
     }
 
@@ -1177,6 +1347,42 @@ struct SttFeeds {
     echo_gate: Option<fotw_pipeline::echo::EchoGate>,
 }
 
+/// How the pump is told to end, and how long it may take.
+///
+/// One type rather than two parameters, for the reason [`SttFeeds`] is one:
+/// the pump's argument list is at clippy's limit. And because neither half
+/// means anything alone — a latch with nothing bounding it is #85, and a
+/// deadline with no latch is nothing at all.
+struct PumpStop<'a> {
+    /// Tripped by the session once the taps have been asked to close.
+    stopped: &'a AtomicBool,
+    /// How long the pump keeps draining after it *notices*, rather than after
+    /// the store: the session cannot know when the pump will next look, so the
+    /// clock has to start on the pump's side.
+    drain: Duration,
+}
+
+/// A drain deadline the pump's tests are not meant to reach.
+///
+/// Named once so that a bare `Duration::from_secs(30)` beside a prefilled ring
+/// cannot read like a tuning decision: every test that passes it is asking
+/// about the *other* branch, where the rings empty first.
+#[cfg(test)]
+const GENEROUS_DRAIN: Duration = Duration::from_secs(30);
+
+/// What one pump run moved, and what it did not.
+struct PumpCounts {
+    /// Interleaved samples written to the system leg.
+    system_samples: u64,
+    /// Interleaved samples written to the mic leg.
+    mic_samples: u64,
+    /// Samples the rings dropped because the pump fell behind.
+    dropped_samples: u64,
+    /// Samples still in the rings when the drain deadline expired, and zero
+    /// on every clean stop (#85).
+    abandoned_samples: u64,
+}
+
 /// Drain both rings until stopped, writing raw audio and feeding the provider.
 fn pump_loop(
     mut wal: SessionWal,
@@ -1185,8 +1391,8 @@ fn pump_loop(
     sys_format: StreamFormat,
     mic_format: Option<StreamFormat>,
     mut stt: SttFeeds,
-    stop: &AtomicBool,
-) -> Result<(u64, u64, u64), String> {
+    stop: PumpStop<'_>,
+) -> Result<PumpCounts, String> {
     let mut scratch = vec![0.0f32; 48_000];
     let (mut sys_written, mut mic_written) = (0u64, 0u64);
     // What a suppressed mic chunk is fed as. Kept across iterations because
@@ -1210,8 +1416,19 @@ fn pump_loop(
     };
 
     let mut seq = 0u64;
+    // Armed on the pass that first sees the latch, and the only thing that
+    // ends this loop. The latch used to be read solely in the idle branch, so
+    // a leg still delivering after `stop()` — a HAL that acknowledged a
+    // teardown it never performed — left `moved` true on every pass and the
+    // pump never looked at it again (#85).
+    let mut drain_by: Option<Instant> = None;
+    let mut abandoned = 0u64;
 
     loop {
+        if drain_by.is_none() && stop.stopped.load(Ordering::Acquire) {
+            drain_by = Some(Instant::now() + stop.drain);
+        }
+
         let mut moved = false;
 
         let n = sys.pop_into(&mut scratch);
@@ -1283,11 +1500,22 @@ fn pump_loop(
             }
         }
 
-        if !moved {
-            if stop.load(Ordering::Acquire) {
+        match drain_by {
+            // Still recording. Nothing to do but wait for more audio.
+            None if !moved => std::thread::sleep(IDLE_POLL),
+            None => {}
+            // Draining, and there was nothing left to drain: the ordinary end
+            // of every meeting, and the only exit this loop used to have.
+            Some(_) if !moved => break,
+            // Draining, and still behind when the deadline expired. What is
+            // left in the rings is audio nobody will ever write — but the
+            // finalize below still runs, which is the whole point: a session
+            // left unfinalized is one `promote::pending` skips for good.
+            Some(by) if Instant::now() >= by => {
+                abandoned = (sys.slots() + mic.slots()) as u64;
                 break;
             }
-            std::thread::sleep(IDLE_POLL);
+            Some(_) => {}
         }
         seq = seq.wrapping_add(1);
     }
@@ -1315,11 +1543,12 @@ fn pump_loop(
     // taken while the taps were still delivering. Both legs are summed: the
     // caller's field is one number, and either leg falling behind means the
     // same thing about this machine.
-    Ok((
-        sys_written,
-        mic_written,
-        sys.dropped_frames() + mic.dropped_frames(),
-    ))
+    Ok(PumpCounts {
+        system_samples: sys_written,
+        mic_samples: mic_written,
+        dropped_samples: sys.dropped_frames() + mic.dropped_frames(),
+        abandoned_samples: abandoned,
+    })
 }
 
 /// Append finalized segments to the session's `stt.jsonl`.
@@ -1527,7 +1756,10 @@ mod pump_clock_tests {
             capture_format(),
             Some(capture_format()),
             feeds,
-            &stop,
+            PumpStop {
+                stopped: &stop,
+                drain: GENEROUS_DRAIN,
+            },
         )
         .expect("the pump drains cleanly");
         let _ = std::fs::remove_dir_all(&root);
@@ -1673,7 +1905,7 @@ mod pump_clock_tests {
         let expected = 2 * (block.len() - 4_096) as u64;
 
         let stop = AtomicBool::new(true);
-        let (_, _, dropped) = pump_loop(
+        let counts = pump_loop(
             wal,
             sys_cons,
             mic_cons,
@@ -1684,11 +1916,155 @@ mod pump_clock_tests {
                 mic: None,
                 echo_gate: None,
             },
-            &stop,
+            PumpStop {
+                stopped: &stop,
+                drain: GENEROUS_DRAIN,
+            },
         )
         .expect("the pump drains cleanly");
         let _ = std::fs::remove_dir_all(&root);
 
-        assert_eq!(dropped, expected, "the shortfall both rings counted");
+        assert_eq!(
+            counts.dropped_samples, expected,
+            "the shortfall both rings counted"
+        );
+    }
+}
+
+/// The pump's own way out, and what it leaves behind (#85).
+///
+/// `pump.join()` was unbounded, and the reason it could hang is in this loop:
+/// the stop latch was read only on a pass where both rings came up empty, so a
+/// leg that kept delivering after `stop()` kept `moved` true and the pump
+/// never looked at the latch again. These drive the real `pump_loop` with
+/// prefilled rings — no threads, no timers, byte-identical every run.
+#[cfg(test)]
+mod pump_drain_tests {
+    use super::*;
+    use fotw_pipeline::wal::SessionState;
+    use std::path::PathBuf;
+
+    const CAPTURE_RATE: u32 = 48_000;
+    const CHANNELS: u16 = 2;
+
+    fn capture_format() -> StreamFormat {
+        StreamFormat::new(CAPTURE_RATE, CHANNELS, fotw_audio::SampleFormat::F32)
+    }
+
+    fn tmp_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("fotwd-drain-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("a temp root");
+        root
+    }
+
+    fn no_feeds() -> SttFeeds {
+        SttFeeds {
+            system: None,
+            mic: None,
+            echo_gate: None,
+        }
+    }
+
+    /// A ring the pump cannot empty in one pass, so the deadline decides.
+    ///
+    /// One short of capacity: the sink drops what does not fit, and a fixture
+    /// that measured drops instead of the abandoned tail would say nothing
+    /// about the case under test.
+    fn full_rings() -> (RingConsumer, RingConsumer, u64) {
+        let filling = RING_SAMPLES - 1_024;
+        let block = vec![0.25f32; filling];
+        let (mut sys_prod, sys_cons) = AudioRing::with_capacity_frames(RING_SAMPLES);
+        let (mut mic_prod, mic_cons) = AudioRing::with_capacity_frames(RING_SAMPLES);
+        sys_prod.push_block(&block);
+        mic_prod.push_block(&block);
+        assert_eq!(
+            (sys_cons.dropped_frames(), mic_cons.dropped_frames()),
+            (0, 0),
+            "the fixture has to fit the ring or the test measures drops instead"
+        );
+        (sys_cons, mic_cons, filling as u64)
+    }
+
+    /// The exit that did not exist: a pump whose rings are still full when its
+    /// deadline expires stops anyway.
+    #[test]
+    fn a_stopped_pump_gives_up_on_a_ring_it_cannot_drain_in_time() {
+        let root = tmp_root("abandon");
+        let wal = SessionWal::create(&root, CAPTURE_RATE, CHANNELS).expect("a session");
+        let dir = wal.dir().to_path_buf();
+        let (sys, mic, filled) = full_rings();
+
+        let stop = AtomicBool::new(true);
+        let counts = pump_loop(
+            wal,
+            sys,
+            mic,
+            capture_format(),
+            Some(capture_format()),
+            no_feeds(),
+            PumpStop {
+                stopped: &stop,
+                drain: Duration::ZERO,
+            },
+        )
+        .expect("an expired drain is not an error");
+
+        assert!(
+            counts.abandoned_samples > 0,
+            "the pump reported nothing abandoned, so either it drained a full \
+             ring in no time at all or the tail went unreported"
+        );
+        assert!(
+            counts.system_samples < filled,
+            "the deadline was ignored: the whole ring was written ({} of {filled})",
+            counts.system_samples
+        );
+
+        // And the argument for doing it this way rather than abandoning the
+        // thread: the session is finalized, so `promote::pending` will take
+        // it. An unfinalized one is skipped forever (#79).
+        let state = SessionState::read(&dir).expect("the session is readable");
+        assert!(
+            state.manifest.ended_at_ms.is_some(),
+            "an abandoned drain left the session unfinalized, which is the \
+             stranded-directory failure this issue exists to avoid"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// And the deadline stays invisible to every healthy stop: a ring the pump
+    /// has time for is drained to the last sample.
+    #[test]
+    fn a_stopped_pump_drains_a_ring_it_does_have_time_for() {
+        let root = tmp_root("drained");
+        let wal = SessionWal::create(&root, CAPTURE_RATE, CHANNELS).expect("a session");
+        let (sys, mic, filled) = full_rings();
+
+        let stop = AtomicBool::new(true);
+        let counts = pump_loop(
+            wal,
+            sys,
+            mic,
+            capture_format(),
+            Some(capture_format()),
+            no_feeds(),
+            PumpStop {
+                stopped: &stop,
+                drain: GENEROUS_DRAIN,
+            },
+        )
+        .expect("the pump drains cleanly");
+
+        assert_eq!(
+            (counts.system_samples, counts.mic_samples),
+            (filled, filled),
+            "the drain deadline ate audio a healthy stop had time to write"
+        );
+        assert_eq!(
+            counts.abandoned_samples, 0,
+            "a clean drain must not report an abandoned tail"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
