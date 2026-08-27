@@ -1,4 +1,4 @@
-//! What a meeting gets the moment it finalizes — #67, #68, #76.
+//! What a meeting gets the moment it finalizes — #67, #68, #76, #88.
 //!
 //! The jarvis shape: `fotwd serve` stops being a recorder with homework and
 //! becomes the thing that hands you a titled, summarised meeting with its
@@ -26,6 +26,16 @@
 //! The fallback title. Nothing leaves the machine: there is nowhere for it to
 //! go — and a transcriptless meeting (recorded with no provider) is left
 //! entirely alone, because silence is a normal state, not a fault.
+//!
+//! # The meetings that predate the receipt
+//!
+//! The map is the only thing that separates a title this machine minted from a
+//! title a person typed, so a library recorded before it existed has thirty-odd
+//! meetings the guard reads as renames and will never improve. They are
+//! recoverable exactly, without a heuristic: [`adopt_legacy_titles`] recomputes
+//! [`fallback_title`] over each meeting's own segments and adopts the title
+//! only when the bytes match, which is a proof of authorship rather than a
+//! guess at one (#88).
 //!
 //! # Why the report is persisted and not just printed
 //!
@@ -364,6 +374,255 @@ pub async fn backfill_once(db: &mut Db, store: &dyn KeyStore, limit: i64) -> usi
         enrich_meeting_with(db, store, &meeting_id).await;
     }
     attempted
+}
+
+// ------------------------------------------------ the legacy population (#88)
+
+/// The `settings` key the one-shot legacy-title sweep marks itself done under.
+///
+/// A settings row on the same precedent as [`RECEIPTS_KEY`]: bookkeeping about
+/// the library rather than a property of anything in it, and no migration.
+pub const LEGACY_SWEEP_KEY: &str = "legacy_title_sweep";
+
+/// How many meetings one page of the sweep reads.
+///
+/// Paged rather than `list(10_000, 0)` because the sweep loads each candidate's
+/// transcript, and holding a whole library's rows *and* transcripts at once is
+/// a spike a background task on somebody's laptop does not need to take.
+const SWEEP_PAGE: i64 = 500;
+
+/// The one-shot sweep's own receipt: when it ran and what it saw.
+///
+/// Tolerant on the way in like every other settings row here — a missing or
+/// unparseable marker is a library that has never swept, which costs one extra
+/// (idempotent, engine-free) pass and never an error.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct LegacySweep {
+    /// When the sweep finished, epoch milliseconds. Non-zero is what makes it
+    /// done; the number itself is for whoever reads this row in a bug report.
+    finished_at_ms: u64,
+    /// Meetings examined.
+    scanned: u64,
+    /// Meetings adopted.
+    adopted: u64,
+}
+
+/// What one legacy-title sweep found.
+#[derive(Debug, Default)]
+pub struct LegacyTitles {
+    /// How many meetings it looked at.
+    pub scanned: usize,
+    /// Meetings still wearing a title [`fallback_title`] would mint for them
+    /// today, *and* which this machine is allowed to replace. The candidates
+    /// for a re-title, and the number a command must show before it spends.
+    pub wearing: Vec<String>,
+    /// The subset of `wearing` that had no receipt and now has one.
+    pub adopted: Vec<String>,
+    /// Everything that went wrong, in the order it went wrong.
+    pub problems: Vec<String>,
+}
+
+/// Adopt the titles an older build minted into the receipt map — #88.
+///
+/// The thirty-odd meetings in the first real library are named after their
+/// opening sentence, and they predate #76's map. With no receipt to match and
+/// no [`FALLBACK_PREFIX`] to catch, `enrich_meeting_with`'s guard reads them as
+/// human renames and freezes them: correct from what it can see, and wrong.
+///
+/// # Why byte-equality is a proof and not a guess
+///
+/// [`fallback_title`] is deterministic — the first utterance of four or more
+/// words, cut to the title budget at a word boundary. Recomputing it over a
+/// meeting's own stored segments and getting the stored title back *exactly*
+/// means that function wrote it; nothing else in this daemon produces that
+/// string, and a person renaming a meeting does not reproduce their own
+/// transcript's first four-word utterance to the byte. So the classification
+/// needs no heuristic, and there is no threshold to tune: it is `==`, on the
+/// untrimmed, uncased bytes. A near miss — a full stop added, a different
+/// utterance from the same transcript — is a rename and stays one.
+///
+/// # What it deliberately does not touch
+///
+/// * **A receipt that names a *different* title.** #76 already owns that
+///   answer: a stamp saying "this machine minted X" over a title that is now Y
+///   is a record of a rename, and second-guessing it is how the guard would
+///   start losing renames.
+///
+///   A receipt whose `minted_title` is *empty* is not that. It is what every
+///   pass over a legacy meeting has been leaving behind since #76 landed — the
+///   pass stamped its clocks, found the title unreplaceable, and minted
+///   nothing — so it carries no claim about the current title at all, and the
+///   byte match is still the only evidence there is. Those are adopted too,
+///   which matters more than it sounds: #74's sweeper has been running hourly,
+///   and every legacy meeting it reached already has one.
+/// * **A meeting still wearing its persist-time title.** It is already
+///   replaceable through the prefix arm, so adoption buys nothing — and it is
+///   the only way a receiptless *recent* meeting can exist, since a pass in
+///   flight stamps before it does anything. Skipping it is what keeps this
+///   sweep from handing the GitHub exporter a meeting inside its grace
+///   window (#76).
+///
+/// Nothing here reaches an engine and nothing leaves the machine: it is a
+/// transcript read and a string compare, which is why it can run unasked.
+pub fn adopt_legacy_titles(db: &mut Db) -> LegacyTitles {
+    let mut found = LegacyTitles::default();
+    let mut receipts = read_receipts(db);
+    let mut adopted_any = false;
+    let mut offset = 0i64;
+
+    loop {
+        let page = match db.meetings().list(SWEEP_PAGE, offset) {
+            Ok(page) => page,
+            Err(e) => {
+                // A query that failed leaves the sweep unmarked, so the next
+                // one starts over: a half-swept library must not read as done.
+                found.problems.push(format!("legacy titles: {e}"));
+                break;
+            }
+        };
+        let last_page = page.len() < SWEEP_PAGE as usize;
+        for meeting in page {
+            found.scanned += 1;
+            if meeting.title.is_empty() || meeting.title.starts_with(FALLBACK_PREFIX) {
+                continue;
+            }
+            let segments = crate::summarize::stored_segments(db, &meeting.id).unwrap_or_default();
+            if fallback_title(&segments).as_deref() != Some(meeting.title.as_str()) {
+                continue;
+            }
+            // Both clocks stay as they are — zero on a meeting no pass has
+            // ever reached. They mean "when the last enrichment pass ran", and
+            // this is not one. `github::export_ready` reads a clockless stamp
+            // as ancient rather than as a pass in flight, which is the same
+            // answer it already gave a meeting with no stamp at all.
+            let receipt = receipts.entry(meeting.id.clone()).or_default();
+            if receipt.minted_title == meeting.title {
+                // Already classified as this machine's own work, by #76 or by
+                // an earlier sweep. Replaceable, so still a re-title candidate.
+                found.wearing.push(meeting.id);
+            } else if receipt.minted_title.is_empty() {
+                receipt.minted_title = meeting.title.clone();
+                adopted_any = true;
+                found.adopted.push(meeting.id.clone());
+                found.wearing.push(meeting.id);
+            }
+            // Anything else is a receipt naming a *different* title: #76
+            // classified this meeting already, and what it recorded is a
+            // rename. Left alone.
+        }
+        if last_page {
+            break;
+        }
+        offset += SWEEP_PAGE;
+    }
+
+    if adopted_any {
+        match serde_json::to_string(&receipts) {
+            Ok(json) => {
+                if let Err(e) = db.put_setting(RECEIPTS_KEY, &json) {
+                    found.problems.push(format!("legacy titles: {e}"));
+                    found.adopted.clear();
+                }
+            }
+            Err(e) => {
+                found.problems.push(format!("legacy titles: {e}"));
+                found.adopted.clear();
+            }
+        }
+    }
+    found
+}
+
+/// [`adopt_legacy_titles`], the first time a library ever asks — `None` after.
+///
+/// Once per library rather than once per daemon start, because the answer
+/// cannot change on its own: every meeting recorded since #76 is stamped at the
+/// *start* of its enrichment, so a receiptless meeting is by construction one
+/// from before that, and the population only shrinks. Re-reading every
+/// transcript in the library every hour to re-learn that is a cost with no
+/// upside — and the meetings it would keep re-examining are precisely the
+/// renames, which are the ones it must never touch.
+///
+/// A sweep that hit a library error is not marked done: it retries.
+pub fn adopt_legacy_titles_once(db: &mut Db) -> Option<LegacyTitles> {
+    let swept = db
+        .get_setting(LEGACY_SWEEP_KEY)
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_str::<LegacySweep>(&v).ok())
+        .is_some_and(|s| s.finished_at_ms > 0);
+    if swept {
+        return None;
+    }
+
+    let mut found = adopt_legacy_titles(db);
+    if found.problems.is_empty() {
+        let marker = LegacySweep {
+            finished_at_ms: u64::try_from(fotw_store::now_ms()).unwrap_or(0),
+            scanned: found.scanned as u64,
+            adopted: found.adopted.len() as u64,
+        };
+        match serde_json::to_string(&marker) {
+            Ok(json) => {
+                if let Err(e) = db.put_setting(LEGACY_SWEEP_KEY, &json) {
+                    found.problems.push(format!("legacy sweep marker: {e}"));
+                }
+            }
+            Err(e) => found.problems.push(format!("legacy sweep marker: {e}")),
+        }
+    }
+    Some(found)
+}
+
+/// Ask the engine to name each of `ids`, and say what went wrong.
+///
+/// The half of #88 that costs money: one title call per meeting, and nothing
+/// else — not a summary, not a full enrichment pass. It is never reached by a
+/// background loop. `fotwd retitle-legacy` counts the meetings and prints the
+/// price first, and only `--apply` gets here (#34).
+///
+/// Every failure is a line and nothing more, by this module's own rule: a
+/// meeting whose title call failed keeps the title it had, which is the same
+/// place it started.
+pub async fn retitle_meetings(db: &mut Db, store: &dyn KeyStore, ids: &[String]) -> Vec<String> {
+    let mut problems = Vec::new();
+    if ids.is_empty() {
+        return problems;
+    }
+    let Some(engine) = resolve_engine(store, db) else {
+        problems.push(NO_ENGINE.to_owned());
+        return problems;
+    };
+    for meeting_id in ids {
+        let segments = crate::summarize::stored_segments(db, meeting_id).unwrap_or_default();
+        if segments.is_empty() {
+            continue;
+        }
+        // Re-read rather than snapshot: the daemon may be enriching this same
+        // library, and the clocks in its stamp are the exporter's grace anchor.
+        let mut receipt = read_receipts(db).remove(meeting_id).unwrap_or_default();
+        let mut report = EnrichReport::default();
+        title_from_engine(
+            db,
+            &engine,
+            meeting_id,
+            &segments,
+            &mut receipt,
+            &mut report,
+        )
+        .await;
+        if report.title.is_some() {
+            stamp(db, meeting_id, &receipt, &mut report);
+        }
+        problems.extend(
+            report
+                .problems
+                .into_iter()
+                .map(|p| format!("{meeting_id}: {p}")),
+        );
+    }
+    problems
 }
 
 /// Run the pipeline and say how it went, in the two codes a run can produce.
