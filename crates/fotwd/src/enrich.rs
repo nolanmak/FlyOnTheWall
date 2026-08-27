@@ -684,6 +684,22 @@ async fn summarize(
         Ok(set) => set,
         Err(e) => return fail(format!("templates: {e}")),
     };
+    // The meeting's own title column — and since #76 put the title call ahead
+    // of this one, that is the name the engine gave it seconds ago rather than
+    // the epoch stamp persist minted. SUM-08's `default_for` matching
+    // therefore selects a real template here for the first time.
+    //
+    // Which reads like an unrequested behaviour change and is not one (#91).
+    // `for_event_title` is named for a *calendar event* title; calendar
+    // integration (MTG-01, #39) is not built, so the only thing this column
+    // has ever held is a placeholder that matches no glob a template could
+    // write. The function has not started doing something new — it has been
+    // given an input.
+    //
+    // When #39 lands, the calendar title takes precedence over this one. It is
+    // what SUM-08 specifies and it is what the user themselves named the
+    // meeting; a title derived from the transcript is the fallback for a
+    // meeting that had no event, not a rival to one that did.
     let title = db
         .meetings()
         .get(meeting_id)
