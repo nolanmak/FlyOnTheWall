@@ -115,6 +115,11 @@ async fn main() -> ExitCode {
             let slug = flag_value(&args, "--template");
             summarize_command(root, id, slug).await
         }
+        Some("retitle-legacy") => {
+            let pos = positionals(&args[1..], &[]);
+            let root = pos.first().map_or_else(default_root, PathBuf::from);
+            retitle_legacy_command(root, args.iter().any(|a| a == "--apply")).await
+        }
         Some("list") => {
             let root = args.get(1).map_or_else(default_root, PathBuf::from);
             list(root)
@@ -164,6 +169,7 @@ async fn main() -> ExitCode {
                  key <set <provider>|list> | engine [claude-cli|codex-cli|off] | \
                  dedupe <id|--all> [dir] [--revert <transcript-id>] | \
                  recover [dir] [--check] | \
+                 retitle-legacy [dir] [--apply] | \
                  templates <list|install|show <slug>> | \
                  export <id> [dir] [--format md|txt|json] [--out <file>] | \
                  export-all <dest> [dir] [--audio] [--resume] [--yes-plaintext] | \
@@ -1580,6 +1586,82 @@ fn recover_command(data_root: PathBuf, check_only: bool) -> ExitCode {
             eprintln!("fotwd: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// `fotwd retitle-legacy` — recover the meetings an older build named after
+/// their opening sentence (#88).
+///
+/// Two halves, split by what they cost.
+///
+/// The **free** half runs on every invocation and needs no engine: it adopts
+/// every title this daemon can prove it minted into the receipt map, which is
+/// all it takes to make those meetings replaceable again. The daemon does this
+/// unasked at startup, so this exists mainly for a library that is never
+/// served — and because running it twice costs nothing.
+///
+/// The **paid** half is one engine call per meeting, and it does not happen
+/// unless `--apply` says so. The bare command prints the count and the price
+/// first: a command that quietly spends N API calls on somebody's library is
+/// the thing #34 is about, and "N meetings" is exactly the number the user
+/// needs in order to say yes.
+async fn retitle_legacy_command(root: PathBuf, apply: bool) -> ExitCode {
+    let mut db = match open_db(&root) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("fotwd: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let found = fotwd::enrich::adopt_legacy_titles(&mut db);
+    for problem in &found.problems {
+        eprintln!("  ! {problem}");
+    }
+    println!("  scanned    : {} meeting(s)", found.scanned);
+    println!(
+        "  adopted    : {} title(s) this machine can prove it minted",
+        found.adopted.len()
+    );
+
+    if found.wearing.is_empty() {
+        println!("  nothing is still wearing a first-utterance title.");
+        return ExitCode::SUCCESS;
+    }
+    if !apply {
+        println!(
+            "  {} meeting(s) still carry their opening sentence as a title.",
+            found.wearing.len()
+        );
+        println!("  They are replaceable again, so an ordinary enrichment pass will");
+        println!("  improve them for free when one next reaches them. To do it now:");
+        println!(
+            "    fotwd retitle-legacy --apply   ({} engine call(s), one per meeting)",
+            found.wearing.len()
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    let store = match secrets::keystore() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("fotwd: no OS keychain available: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let problems = fotwd::enrich::retitle_meetings(&mut db, store, &found.wearing).await;
+    for problem in &problems {
+        eprintln!("  ! {problem}");
+    }
+    for meeting_id in &found.wearing {
+        if let Ok(m) = db.meetings().get(meeting_id) {
+            println!("  {meeting_id} : {}", m.title);
+        }
+    }
+    if problems.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 

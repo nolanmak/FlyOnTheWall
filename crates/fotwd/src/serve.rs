@@ -515,6 +515,28 @@ fn spawn_enrich_backfill(root: &Path) -> Result<(), String> {
     let store = crate::secrets::keystore().map_err(|e| e.to_string())?;
 
     tokio::spawn(async move {
+        // The legacy-title sweep, before the first tick and never again (#88).
+        //
+        // Here rather than inside the hourly body because it is not a
+        // recurring question: it reads transcripts and compares strings, it
+        // reaches no engine, and it marks the library done. It also has to run
+        // *without* one — `backfill_once` returns immediately when nothing is
+        // configured, and a library whose engine arrives next month still
+        // wants its legacy titles classified today, so that when the engine
+        // does arrive they are already replaceable.
+        if let Some(found) = crate::enrich::adopt_legacy_titles_once(&mut db) {
+            for problem in &found.problems {
+                eprintln!("  ! {problem}");
+            }
+            if !found.adopted.is_empty() {
+                println!(
+                    "  recovered  : {} meeting(s) named by an older build can be re-titled again \
+                     — `fotwd retitle-legacy --apply` to do it now",
+                    found.adopted.len()
+                );
+            }
+        }
+
         let mut schedule = Schedule::hourly();
         loop {
             let now = fotw_store::now_ms().max(0) as u64;

@@ -822,3 +822,366 @@ async fn a_dated_fallback_is_still_replaceable() {
         "Okay so the interconnect bandwidth question"
     );
 }
+
+// ------------------------------------------------- the legacy population (#88)
+
+/// A meeting exactly as a build older than the receipt map left it: titled
+/// after its first substantive utterance, with no entry in `enrich_receipts`.
+///
+/// That absence is the whole problem. #76's guard reads "replaceable if the
+/// prefix matches *or* the receipt does", and a first-utterance title has no
+/// prefix — so with no receipt to match either, the guard classifies thirty-odd
+/// real meetings as human renames and freezes them.
+fn legacy_meeting(db: &mut Db, title: &str) -> String {
+    let meeting = meeting_with_transcript(db);
+    db.meetings().set_title(&meeting, title).unwrap();
+    // The receipt map is what an older build did not have; the fixture must
+    // not accidentally supply one.
+    assert!(
+        !fotwd::enrich::read_receipts(db).contains_key(&meeting),
+        "the fixture must reproduce a library with no receipts at all"
+    );
+    meeting
+}
+
+/// The exact title `fallback_title` mints for [`meeting_with_transcript`]'s
+/// transcript. Spelled out rather than computed, so a change to either the
+/// fixture or the minting rule fails here rather than silently agreeing.
+const LEGACY_TITLE: &str = "Okay so the interconnect bandwidth question";
+
+/// The recovery, in one step: a stored title byte-identical to what
+/// `fallback_title` recomputes from that meeting's own segments today was
+/// minted by that function, and nothing else. The sweep adopts it into the
+/// receipt map, which is all it takes to unfreeze it.
+#[test]
+fn a_title_minted_before_the_receipt_map_existed_is_adopted_into_it() {
+    let mut db = db();
+    let meeting = legacy_meeting(&mut db, LEGACY_TITLE);
+
+    let found = fotwd::enrich::adopt_legacy_titles(&mut db);
+
+    assert_eq!(found.adopted, vec![meeting.clone()]);
+    assert_eq!(found.scanned, 1);
+    assert!(found.problems.is_empty(), "{:?}", found.problems);
+    assert_eq!(
+        fotwd::enrich::read_receipts(&db)[&meeting].minted_title,
+        LEGACY_TITLE,
+        "adoption records the machine as the minter, which is what makes the \
+         title replaceable again"
+    );
+    // The title itself is untouched: adoption is a classification, not a
+    // rename, and it costs nothing.
+    assert_eq!(db.meetings().get(&meeting).unwrap().title, LEGACY_TITLE);
+}
+
+/// The acceptance criterion, and the reason the rule is byte-equality and not
+/// a heuristic: every one of these is a title a person typed, and several of
+/// them look exactly like machine output.
+///
+/// The dangerous one is the first. `"makes sense to me"` is a verbatim
+/// utterance from this very transcript, four words long — the precise shape a
+/// fallback title has. It is still not the one `fallback_title` picks, so it
+/// is still a rename, and any rule loose enough to adopt it would re-title a
+/// meeting somebody named.
+#[test]
+fn a_deliberate_rename_is_never_adopted_however_much_it_looks_like_speech() {
+    let mut db = db();
+    let renamed: Vec<String> = [
+        // A different segment of the same transcript, verbatim.
+        "makes sense to me",
+        // The real fallback with a full stop a person would add.
+        "Okay so the interconnect bandwidth question.",
+        // The real fallback, differently capitalised.
+        "okay so the interconnect bandwidth question",
+        // The real fallback, cut shorter than the budget would cut it.
+        "Okay so the interconnect bandwidth",
+        // The real fallback with trailing whitespace — the case a `trim()`
+        // anywhere in the comparison would wrongly adopt.
+        "Okay so the interconnect bandwidth question ",
+        // And an ordinary rename, for completeness.
+        "Panga kickoff",
+    ]
+    .iter()
+    .map(|title| legacy_meeting(&mut db, title))
+    .collect();
+    // One genuine legacy meeting in the same library, so a sweep that simply
+    // refuses everything cannot pass this test.
+    let genuine = legacy_meeting(&mut db, LEGACY_TITLE);
+
+    let found = fotwd::enrich::adopt_legacy_titles(&mut db);
+
+    assert_eq!(
+        found.adopted,
+        vec![genuine.clone()],
+        "exactly the one meeting whose title this machine can prove it minted"
+    );
+    let receipts = fotwd::enrich::read_receipts(&db);
+    for meeting in &renamed {
+        let title = db.meetings().get(meeting).unwrap().title;
+        assert!(
+            !receipts.contains_key(meeting),
+            "a rename must not gain a receipt: {title:?}"
+        );
+    }
+    assert!(receipts.contains_key(&genuine));
+}
+
+/// A meeting still wearing its persist-time title is not this sweep's
+/// business, and that matters for more than tidiness.
+///
+/// `Untitled recording — …` is already replaceable through the prefix arm of
+/// #76's guard, so adopting it would buy nothing. It would also be the one way
+/// this sweep could reach a meeting whose enrichment has not finished — a pass
+/// in flight stamps a receipt *before* it does anything, so the only
+/// receiptless recent meeting is one still wearing the persist-time name. The
+/// prefix is what keeps the sweep off it, and off the GitHub exporter's
+/// in-flight grace window (#76).
+#[test]
+fn a_meeting_still_wearing_its_persist_time_title_is_left_to_the_prefix_guard() {
+    let mut db = db();
+    let meeting = meeting_with_transcript(&mut db);
+    db.meetings()
+        .set_title(
+            &meeting,
+            &fotwd::enrich::dated_fallback_title(1_787_666_700_000),
+        )
+        .unwrap();
+
+    let found = fotwd::enrich::adopt_legacy_titles(&mut db);
+
+    assert!(found.adopted.is_empty(), "{:?}", found.adopted);
+    assert!(found.wearing.is_empty());
+    assert!(fotwd::enrich::read_receipts(&db).is_empty());
+}
+
+/// The point of the whole exercise: once adopted, the ordinary path does the
+/// rest. #76 upgrades a machine-minted title when an engine is configured, so
+/// a recovered meeting gains a real name with no further mechanism.
+///
+/// The first half of this test is the bug, asserted so it cannot come back:
+/// without adoption the engine is not even asked, and the meeting keeps its
+/// opening sentence forever.
+#[tokio::test]
+async fn an_adopted_legacy_title_is_upgraded_by_the_next_enrichment_pass() {
+    skip_if_engine_live();
+    let mut db = db();
+    let meeting = legacy_meeting(&mut db, LEGACY_TITLE);
+
+    // Without adoption: a title call would consume the prose reply and derail
+    // the summary, so a script of exactly two answers proves it never happens.
+    let frozen = scripted_cli("legacy-frozen", &[PROSE, EXTRACTION]);
+    cli_settings(&mut db, &frozen.binary);
+    enrich_meeting_with(&mut db, &InMemoryKeyStore::new(), &meeting).await;
+    assert_eq!(
+        db.meetings().get(&meeting).unwrap().title,
+        LEGACY_TITLE,
+        "this is #88 itself: with no receipt the guard calls it a human rename"
+    );
+    assert_eq!(
+        frozen.invocations(),
+        2,
+        "the engine was never asked for a name"
+    );
+
+    // The sweep, and then the very same enrichment call.
+    let found = fotwd::enrich::adopt_legacy_titles(&mut db);
+    assert_eq!(found.adopted, vec![meeting.clone()]);
+
+    let thawed = scripted_cli(
+        "legacy-thawed",
+        &["Interconnect Bandwidth Planning", PROSE, EXTRACTION],
+    );
+    cli_settings(&mut db, &thawed.binary);
+    enrich_meeting_with(&mut db, &InMemoryKeyStore::new(), &meeting).await;
+
+    assert_eq!(
+        db.meetings().get(&meeting).unwrap().title,
+        "Interconnect Bandwidth Planning",
+        "an adopted title is machine-minted, and machine titles are upgradeable"
+    );
+}
+
+/// The sweep is one-shot, and the marker that makes it so is a wire shape two
+/// builds have to agree on — pinned here as raw JSON, exactly as the receipt
+/// map's own shape is.
+///
+/// Once-per-library rather than once-per-boot because the answer cannot
+/// change: every meeting recorded from #76 onward is stamped at the start of
+/// its enrichment, so a receiptless meeting is by construction an old one, and
+/// re-reading every transcript in the library every hour to re-learn that is a
+/// cost with no upside.
+#[test]
+fn the_legacy_sweep_runs_once_and_says_so_in_a_pinned_shape() {
+    let mut db = db();
+    let meeting = legacy_meeting(&mut db, LEGACY_TITLE);
+
+    let first = fotwd::enrich::adopt_legacy_titles_once(&mut db)
+        .expect("a library that has never swept must sweep");
+    assert_eq!(first.adopted, vec![meeting]);
+
+    let raw = db
+        .get_setting(fotwd::enrich::LEGACY_SWEEP_KEY)
+        .unwrap()
+        .expect("the sweep marks itself done");
+    let marker: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let mut keys: Vec<&str> = marker
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["adopted", "finished_at_ms", "scanned"]);
+    assert_eq!(marker["adopted"], 1);
+    assert_eq!(marker["scanned"], 1);
+    assert!(marker["finished_at_ms"].as_u64().unwrap() > 0);
+
+    assert!(
+        fotwd::enrich::adopt_legacy_titles_once(&mut db).is_none(),
+        "a swept library is never swept again"
+    );
+
+    // And a marker from a build that wrote something else is a library that
+    // has not swept, never a panic — the same posture as every settings row.
+    db.put_setting(fotwd::enrich::LEGACY_SWEEP_KEY, "not json")
+        .unwrap();
+    assert!(fotwd::enrich::adopt_legacy_titles_once(&mut db).is_some());
+}
+
+/// #34's concern, made structural: the free half runs on its own and the half
+/// that costs money does not run unless it is called.
+///
+/// `adopt_legacy_titles` never touches an engine — the scripted CLI below
+/// records zero invocations across a whole sweep — and `retitle_meetings`
+/// spends exactly one call per meeting it was handed, which is the number the
+/// command prints before anyone opts in.
+#[tokio::test]
+async fn adoption_spends_nothing_and_retitling_spends_one_call_per_meeting() {
+    skip_if_engine_live();
+    let mut db = db();
+    let meeting = legacy_meeting(&mut db, LEGACY_TITLE);
+    let cli = scripted_cli("legacy-optin", &["Interconnect Bandwidth Planning"]);
+    cli_settings(&mut db, &cli.binary);
+
+    let found = fotwd::enrich::adopt_legacy_titles(&mut db);
+    assert_eq!(found.wearing, vec![meeting.clone()]);
+    assert_eq!(
+        cli.invocations(),
+        0,
+        "adoption is local arithmetic and must never reach an engine"
+    );
+
+    let problems =
+        fotwd::enrich::retitle_meetings(&mut db, &InMemoryKeyStore::new(), &found.wearing).await;
+
+    assert!(problems.is_empty(), "{problems:?}");
+    assert_eq!(cli.invocations(), 1, "one title call, and no summary calls");
+    assert_eq!(
+        db.meetings().get(&meeting).unwrap().title,
+        "Interconnect Bandwidth Planning"
+    );
+    // A second sweep finds nothing left to do: the meeting no longer wears a
+    // title `fallback_title` would mint, so the set drains itself.
+    assert!(
+        fotwd::enrich::adopt_legacy_titles(&mut db)
+            .wearing
+            .is_empty(),
+        "the candidate set is defined by the title, so it empties as it is fixed"
+    );
+}
+
+/// The shape most of the real legacy population is actually in, and the one a
+/// literal reading of "meetings with no receipt entry" would miss.
+///
+/// #74's sweeper has been running hourly since #76 landed. Every legacy
+/// meeting it reached got a stamp — clocks written at the start of the pass,
+/// `minted_title` left empty, because the guard found the title unreplaceable
+/// and so nothing was minted. That receipt records no claim about the title
+/// whatever, so the byte match is still the only evidence in play; a receipt
+/// naming a *different* title is the one that means "rename", and that one is
+/// still refused.
+#[test]
+fn a_receipt_that_never_minted_anything_does_not_block_adoption() {
+    let mut db = db();
+    let stamped = legacy_meeting(&mut db, LEGACY_TITLE);
+    let renamed = legacy_meeting(&mut db, "Panga kickoff");
+    db.put_setting(
+        fotwd::enrich::RECEIPTS_KEY,
+        &format!(
+            r#"{{"{stamped}":{{"started_at_ms":17,"finished_at_ms":42,"minted_title":""}},
+                 "{renamed}":{{"started_at_ms":17,"finished_at_ms":42,"minted_title":"Untitled recording — 2026-08-25 14:05 UTC"}}}}"#
+        ),
+    )
+    .unwrap();
+
+    let found = fotwd::enrich::adopt_legacy_titles(&mut db);
+
+    assert_eq!(found.adopted, vec![stamped.clone()]);
+    let receipts = fotwd::enrich::read_receipts(&db);
+    assert_eq!(receipts[&stamped].minted_title, LEGACY_TITLE);
+    assert_eq!(
+        (
+            receipts[&stamped].started_at_ms,
+            receipts[&stamped].finished_at_ms
+        ),
+        (17, 42),
+        "adoption is not an enrichment pass and must not disturb the clocks \
+         the GitHub exporter measures its grace window against (#76)"
+    );
+    assert_eq!(
+        receipts[&renamed].minted_title, "Untitled recording — 2026-08-25 14:05 UTC",
+        "a receipt that names a different title is a record of a rename"
+    );
+}
+
+/// The exact shape #88 was filed about: a title cut to the budget, ending in
+/// the ellipsis `fallback_title` appends.
+///
+/// Worth its own case because the truncation is where a comparison could
+/// plausibly go wrong — the `…` is three bytes, the cut lands at a word
+/// boundary inside a 64-byte budget, and a rule that compared prefixes or
+/// re-truncated at a different width would either miss this meeting or adopt a
+/// rename that merely starts the same way.
+#[tokio::test]
+async fn a_legacy_title_cut_short_at_the_budget_is_adopted_too() {
+    let mut db = db();
+    let mut m = NewMeeting::new("dev-1", "UTC");
+    m.title = "Untitled recording — 1787372240".to_owned();
+    let meeting = db.meetings().create(m).unwrap();
+    let transcript = db
+        .meetings()
+        .create_transcript(&meeting, "deepgram", "nova-3", true)
+        .unwrap();
+    db.meetings()
+        .append_segments(
+            &transcript,
+            &[NewSegment::new(
+                0,
+                0,
+                9_000,
+                "Long time to edit through just because, you know, like, that is \
+                 the whole afternoon gone again",
+            )
+            .channel("system")],
+        )
+        .unwrap();
+    // Pass one with no engine mints the truncated fallback, exactly as the
+    // builds that made this population did.
+    enrich_meeting_with(&mut db, &InMemoryKeyStore::new(), &meeting).await;
+    let minted = db.meetings().get(&meeting).unwrap().title;
+    assert!(
+        minted.ends_with('…'),
+        "the fixture must be truncated: {minted:?}"
+    );
+
+    // Now forget the receipt: that is the whole of what an older build lacked.
+    db.put_setting(fotwd::enrich::RECEIPTS_KEY, "{}").unwrap();
+
+    let found = fotwd::enrich::adopt_legacy_titles(&mut db);
+
+    assert_eq!(found.adopted, vec![meeting.clone()]);
+    assert_eq!(
+        fotwd::enrich::read_receipts(&db)[&meeting].minted_title,
+        minted
+    );
+}
