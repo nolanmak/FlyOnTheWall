@@ -231,6 +231,28 @@ mod tests {
         );
     }
 
+    /// The third pin of the same weak kind, for #90. `renderMarkdown` knew
+    /// bullets, headings and paragraphs, so the daemon's admonitions rendered
+    /// as two lines of `>`-prefixed source at the very top of the pane. The
+    /// *shape* of that parse is tested for real one crate over, on
+    /// `fotw_store`'s clipboard converter, which renders the same subset of
+    /// the same `body_md`; this only catches the client losing the branch.
+    #[test]
+    fn the_spa_renders_admonitions_as_callouts_not_as_source() {
+        let js = Ui::get("app.js").unwrap();
+        let js = String::from_utf8(js.data.into_owned()).unwrap();
+        assert!(
+            js.contains("blockquote"),
+            "the SPA must render `>` lines as a blockquote, or a summary's \
+             warnings read as markdown source"
+        );
+        assert!(
+            js.contains("[!WARNING]"),
+            "the SPA must know the admonition markers the daemon emits, or \
+             the marker line renders as literal text inside the callout"
+        );
+    }
+
     #[test]
     fn an_unknown_extension_is_not_served_as_html() {
         assert_eq!(content_type("x.bin"), "application/octet-stream");

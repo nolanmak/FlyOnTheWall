@@ -138,21 +138,45 @@ function listMeta(m) {
 
 // ------------------------------------------------------------- markdown
 //
-// A deliberately small subset: headings, bullets, and paragraphs. It builds
-// DOM nodes and assigns textContent, exactly like every other renderer here,
-// so ING-11 still holds -- a summary is model output written over
-// attacker-influenced transcript, and handing that to a markdown library that
-// emits HTML is precisely how a transcript becomes script. Rendering it as
-// preformatted text was safe but showed users literal "## " on every heading.
+// A deliberately small subset: headings, bullets, paragraphs and blockquotes.
+// It builds DOM nodes and assigns textContent, exactly like every other
+// renderer here, so ING-11 still holds -- a summary is model output written
+// over attacker-influenced transcript, and handing that to a markdown library
+// that emits HTML is precisely how a transcript becomes script. Rendering it
+// as preformatted text was safe but showed users literal "## " on every
+// heading.
 //
 // Anything unrecognised falls through as a paragraph, verbatim. That is the
 // right failure: unstyled real text beats swallowed text.
+
+// The admonition markers the daemon actually emits, and what each one is
+// called on screen. Both the class and the label are read out of this table;
+// neither is ever built from the parsed token. A summary is model output over
+// an untrusted transcript, so a marker-shaped string somewhere in the prose
+// must not be able to name a CSS class or write its own heading -- an
+// unrecognised `> [!ANYTHING]` stays ordinary quoted text, which is the same
+// failure direction as the paragraph fallback above.
+//
+// A Map rather than an object literal because a lookup keyed by untrusted text
+// must not be able to find `constructor` or `toString` on a prototype.
+//
+// Only [!WARNING] is emitted today, by both of them -- #75's failed extraction
+// and #84's low-grounding banner. [!NOTE] is here because GitHub's other
+// common marker costs one line and one CSS rule, and a future warning worded
+// as an aside should not have to reopen this.
+const ADMONITIONS = new Map([
+  ["[!WARNING]", { className: "callout callout-warning", label: "Warning" }],
+  ["[!NOTE]", { className: "callout callout-note", label: "Note" }],
+]);
+
 function renderMarkdown(md, into) {
   let list = null;
+  let quote = null;
   for (const raw of String(md).split("\n")) {
     const line = raw.trimEnd();
     const bullet = /^\s*[-*+]\s+(.*)$/.exec(line);
     if (bullet) {
+      quote = null;
       if (!list) {
         list = document.createElement("ul");
         into.appendChild(list);
@@ -161,6 +185,32 @@ function renderMarkdown(md, into) {
       continue;
     }
     list = null;
+    // #90. The daemon writes its run warnings into `body_md` as a two-line
+    // `> [!WARNING]` admonition, and #84 puts one of them above the prose --
+    // so the first thing in the pane was a line of markdown source. Grouping
+    // *consecutive* quoted lines matters: rendered one at a time, the marker
+    // and the sentence it labels are two unrelated blocks.
+    const quoted = /^>\s?(.*)$/.exec(line);
+    if (quoted) {
+      const body = quoted[1];
+      if (!quote) {
+        quote = document.createElement("blockquote");
+        into.appendChild(quote);
+        const marker = ADMONITIONS.get(body.trim());
+        if (marker) {
+          quote.className = marker.className;
+          // A real text node rather than a CSS `content:` label, so the word
+          // is selectable, copies with the callout, and is announced.
+          quote.appendChild(text("p", marker.label, "callout-label"));
+          continue;
+        }
+      }
+      // A bare `>` continues the quote without contributing an empty
+      // paragraph to it.
+      if (body.trim()) quote.appendChild(text("p", body));
+      continue;
+    }
+    quote = null;
     if (!line.trim()) continue;
     const heading = /^(#{1,6})\s+(.*)$/.exec(line);
     if (heading) {
