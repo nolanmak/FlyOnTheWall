@@ -1026,7 +1026,8 @@ impl MeetingDoc {
     }
 }
 
-/// A deliberately small Markdown subset: headings, bullets, paragraphs.
+/// A deliberately small Markdown subset: headings, bullets, paragraphs,
+/// blockquotes.
 ///
 /// Not a Markdown library, and not because one would be hard to add. HTML on a
 /// clipboard is *live markup* in whatever application receives it, and the
@@ -1037,6 +1038,7 @@ impl MeetingDoc {
 fn markdown_to_html(md: &str) -> String {
     let mut out = String::new();
     let mut in_list = false;
+    let mut in_quote = false;
     for raw in md.lines() {
         let line = raw.trim_end();
         let (marker, rest) = if let Some(r) = line.strip_prefix("- ") {
@@ -1049,6 +1051,8 @@ fn markdown_to_html(md: &str) -> String {
             ("h2", r)
         } else if let Some(r) = line.strip_prefix("# ") {
             ("h1", r)
+        } else if let Some(r) = line.strip_prefix('>') {
+            ("quote", r.strip_prefix(' ').unwrap_or(r))
         } else if line.trim().is_empty() {
             ("", "")
         } else {
@@ -1059,6 +1063,10 @@ fn markdown_to_html(md: &str) -> String {
             out.push_str("</ul>\n");
             in_list = false;
         }
+        if marker != "quote" && in_quote {
+            out.push_str("</blockquote>\n");
+            in_quote = false;
+        }
         match marker {
             "" => {}
             "li" => {
@@ -1068,13 +1076,58 @@ fn markdown_to_html(md: &str) -> String {
                 }
                 out.push_str(&format!("<li>{}</li>\n", escape_html(rest)));
             }
+            // #90. `body_md` carries the daemon's run warnings as GitHub-style
+            // `> [!WARNING]` admonitions, and consecutive quoted lines are one
+            // quote: rendered a line at a time, the marker and the sentence it
+            // labels paste as two unrelated paragraphs of source.
+            "quote" => {
+                let label = if in_quote {
+                    None
+                } else {
+                    admonition_label(rest)
+                };
+                if !in_quote {
+                    out.push_str("<blockquote>\n");
+                    in_quote = true;
+                }
+                if let Some(label) = label {
+                    // A paste carries no stylesheet, so the marker becomes a
+                    // word. `label` is a literal from the table below, never
+                    // the matched text.
+                    out.push_str(&format!("<p><strong>{label}</strong></p>\n"));
+                } else if !rest.trim().is_empty() {
+                    out.push_str(&format!("<p>{}</p>\n", escape_html(rest)));
+                }
+            }
             tag => out.push_str(&format!("<{tag}>{}</{tag}>\n", escape_html(rest))),
         }
     }
     if in_list {
         out.push_str("</ul>\n");
     }
+    if in_quote {
+        out.push_str("</blockquote>\n");
+    }
     out
+}
+
+/// The label for a recognised admonition marker, or `None` for anything else.
+///
+/// An allowlist, and what it returns is a literal from this table rather than
+/// the text that matched: `body_md` is model output written over an untrusted
+/// transcript, so a marker-shaped string in it must not get to choose what the
+/// paste says. Anything unrecognised stays ordinary quoted text, which is the
+/// same failure direction as the paragraph fallback above.
+///
+/// Only `[!WARNING]` is emitted today — by both `fotwd`'s admonitions, #75's
+/// failed extraction and #84's low-grounding banner. `[!NOTE]` costs one arm
+/// and spares the next warning worded as an aside from reopening this.
+fn admonition_label(line: &str) -> Option<&'static str> {
+    match line.trim() {
+        "[!WARNING]" => Some("Warning"),
+        "[!NOTE]" => Some("Note"),
+        _ => None,
+    }
 }
 
 fn escape_html(s: &str) -> String {
@@ -1220,6 +1273,36 @@ mod tests {
         assert!(html.contains("&amp;"), "{html}");
         assert!(html.contains("<h1>"), "{html}");
         assert!(html.contains("<ul>") && html.contains("</ul>"), "{html}");
+    }
+
+    /// #90. The daemon writes its run warnings into `body_md` as GitHub-style
+    /// admonitions (#75's failed extraction, #84's grounding banner), and a
+    /// converter that knows only headings, bullets and paragraphs pastes them
+    /// into Slack as their own source text — `> [!WARNING]` and all.
+    #[test]
+    fn an_admonition_pastes_as_a_callout_rather_than_as_its_own_source() {
+        let html = markdown_to_html("> [!WARNING]\n> Low grounding.\n\nBody.");
+        assert!(!html.contains("[!WARNING]"), "the marker is source: {html}");
+        assert!(!html.contains("&gt;"), "the quote prefix is source: {html}");
+        assert!(html.contains("<blockquote>"), "{html}");
+        assert!(html.contains("Warning"), "the alert lost its label: {html}");
+        assert!(html.contains("Low grounding."), "{html}");
+        assert!(html.contains("<p>Body.</p>"), "{html}");
+    }
+
+    /// The other half of #90's acceptance: an ordinary quoted line is still a
+    /// quote, and consecutive ones are one quote rather than one each.
+    #[test]
+    fn consecutive_quoted_lines_become_a_single_unmarked_blockquote() {
+        let html = markdown_to_html("> plain quote\n> second line\n\nafter");
+        assert_eq!(html.matches("<blockquote>").count(), 1, "{html}");
+        assert_eq!(html.matches("</blockquote>").count(), 1, "{html}");
+        assert!(html.contains("plain quote"), "{html}");
+        assert!(html.contains("second line"), "{html}");
+        assert!(
+            html.contains("<p>after</p>"),
+            "the quote never closed: {html}"
+        );
     }
 
     #[test]

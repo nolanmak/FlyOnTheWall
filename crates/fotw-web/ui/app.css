@@ -9,6 +9,11 @@
   --muted: #6a6f7a;
   --line: #e3e5ea;
   --accent: #2f6bd8;
+  /* Deliberately NOT the recording indicator's #d2453d. CON-02 reserves that
+     red for one meaning — audio is being captured right now — and a second
+     red on screen dilutes the one that must never be missed. Amber is the
+     caveat colour: read this before you act on it. */
+  --caution: #a1620a;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -18,6 +23,7 @@
     --muted: #9aa0ac;
     --line: #2b2f37;
     --accent: #6ea0ff;
+    --caution: #e0a54a;
   }
 }
 
@@ -187,6 +193,68 @@ section {
 .note-body h4 {
   margin: 16px 0 6px;
   font-size: 0.95rem;
+}
+
+/* An ordinary quoted line — someone quoting a doc in their notes. The same
+   left rule as `.segment.mic`, in the neutral line colour, because a quote is
+   a change of voice and not a warning about anything. */
+.summary-body blockquote,
+.note-body blockquote {
+  margin: 12px 0;
+  padding: 6px 12px;
+  border-left: 3px solid var(--line);
+  border-radius: 0 6px 6px 0;
+  color: var(--muted);
+}
+
+.summary-body blockquote p,
+.note-body blockquote p {
+  margin: 0 0 6px;
+}
+
+.summary-body blockquote > :last-child,
+.note-body blockquote > :last-child {
+  margin-bottom: 0;
+}
+
+/* The daemon's own admonitions (#90): a caveat about the run, which #84
+   places above the prose precisely so it is read first. Tinted and ruled
+   rather than merely indented — a grounding warning that looked like a pull
+   quote would be skipped by exactly the reader it is for. The body returns to
+   --fg: this is text to read, not to skim past.
+
+   In --caution, which is not the recording indicator's red. See the token. */
+.summary-body .callout-warning,
+.note-body .callout-warning {
+  border-left-color: var(--caution);
+  background: color-mix(in srgb, var(--caution) 12%, transparent);
+  color: var(--fg);
+}
+
+.summary-body .callout-note,
+.note-body .callout-note {
+  border-left-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  color: var(--fg);
+}
+
+/* Real text, not a CSS `content:` label, so it is selectable, copies with the
+   callout and is announced. Set like `.live` and `.recording`, which is what
+   a badge looks like here. */
+.callout-label {
+  margin: 0 0 4px;
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.callout-warning > .callout-label {
+  color: var(--caution);
+}
+
+.callout-note > .callout-label {
+  color: var(--accent);
 }
 
 /* Three columns rather than three inline spans: without this the offset, the
