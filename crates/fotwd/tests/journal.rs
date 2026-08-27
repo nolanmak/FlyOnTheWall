@@ -6,15 +6,19 @@
 //! daemon and relaunch it in a terminal — and three wrong conclusions were
 //! drawn from outside before anyone did.
 //!
-//! These pin the two halves of the fix that can be tested without a daemon:
-//! the file's shape, and §10's never-log rule at the two call sites that
-//! handle transcript-derived text.
+//! These pin the parts of the fix that can be tested without a daemon: the
+//! file's shape, §10's never-log rule at the two call sites that handle
+//! transcript-derived text, and the wording of the daemon's own start and exit
+//! lines (#102). `tests/serve_exit.rs` drives that last pair through a real
+//! journal, in a process of its own.
 
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt as _;
 
-use fotwd::journal::{Journal, Pulse, meeting_problems, meeting_titled};
+use fotwd::journal::{
+    Journal, Pulse, meeting_problems, meeting_titled, serve_exit, serve_starting,
+};
 
 fn tmpdir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("fotw-journal-{name}-{}", std::process::id()));
@@ -194,6 +198,80 @@ fn the_line_written_when_enrichment_fails_never_quotes_the_problem() {
 fn a_meeting_with_no_problems_says_so_rather_than_saying_nothing() {
     let note = meeting_problems("2f8c1a4e-0000-4000-8000-000000000001", &[]);
     assert!(note.contains("no problems"), "{note}");
+}
+
+// ----------------------------------------- the daemon's own exit — issue #102
+
+#[test]
+fn the_starting_line_names_the_process_and_the_library_it_is_opening() {
+    // Both halves of "which daemon was this": the pid is what `kill` takes and
+    // what tells two launches apart in a rolled log, and the sessions root is
+    // which library it opened on a machine that has more than one.
+    let line = serve_starting(34_369, std::path::Path::new("/tmp/fotw/sessions"));
+    assert!(line.contains("34369"), "{line}");
+    assert!(line.contains("/tmp/fotw/sessions"), "{line}");
+}
+
+#[test]
+fn the_line_written_when_serve_dies_carries_the_reason_it_died_of() {
+    // The whole of #102 in one assertion. #101 recorded that the daemon
+    // started and never that it failed to, so two fatal startups left four
+    // lines that said only that they had begun.
+    let line = serve_exit(&Err(
+        "could not bind 127.0.0.1: Address already in use (os error 48)".to_owned(),
+    ));
+
+    assert!(
+        line.contains("Address already in use"),
+        "the reason is the entire point of the line: {line}"
+    );
+    assert!(
+        line.contains("could not bind"),
+        "and the stage it died at, so the reader knows how far it got: {line}"
+    );
+    assert!(line.contains('!'), "a fatal exit reads as trouble: {line}");
+}
+
+#[test]
+fn a_serve_that_stopped_without_an_error_says_that_rather_than_nothing() {
+    // "It stopped on its own" and "it was killed from outside" are different
+    // facts about a daemon, and a Ctrl-C never reaches this seam — so a log
+    // whose last line is `listening` was ended from outside, and one whose
+    // last line is this one was not. That only works if the clean exit says
+    // something.
+    let line = serve_exit(&Ok(()));
+    assert!(line.contains("exited"), "{line}");
+    assert!(
+        !line.contains('!'),
+        "and is not dressed up as a failure: {line}"
+    );
+}
+
+#[test]
+fn a_refusal_written_across_eight_lines_still_costs_the_log_one_record() {
+    // `lost_key_message` is a paragraph with blank lines and an indented
+    // command in it. Through the journal that must stay one record: a reader
+    // counting startup attempts would otherwise count eight.
+    let root = tmpdir("exit-multiline");
+    let journal = Journal::at(&root);
+    journal
+        .record_at(
+            1_700_000_000_000,
+            &serve_exit(&Err("could not open the library: there is a library at \
+                 /tmp/fotw/db.sqlite3 but its master key is not in this machine's \
+                 keychain.\n\n  Your library is recoverable. Run:\n\n      fotwd \
+                 recover\n"
+                .to_owned())),
+        )
+        .expect("write");
+
+    let lines = lines(journal.path());
+    assert_eq!(lines.len(), 1, "one exit is one record: {lines:?}");
+    assert!(
+        lines[0].contains("fotwd recover"),
+        "and the command that fixes it survives the flattening: {}",
+        lines[0]
+    );
 }
 
 // ------------------------------------------------------------------ the pulse

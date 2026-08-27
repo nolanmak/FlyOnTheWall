@@ -209,7 +209,48 @@ async fn reopen_running_ui(root: &Path) -> Option<String> {
 }
 
 /// Run the loopback server until the process is stopped.
+///
+/// Every return from here — the fatal startup, the clean stop, the second
+/// click that found a daemon already running — passes through
+/// [`record_exit`], which is the whole of #102.
 pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), String> {
+    record_exit(serve_until_stopped(root, launch, port).await)
+}
+
+/// Journal why `serve` is returning, and hand the outcome back untouched.
+///
+/// # Why the record is made here and not at the `main.rs` call site (#102)
+///
+/// #101 drew a boundary at `main.rs` — what it prints is CLI command output,
+/// not daemon diagnostics — and that reasoning is right for `fotwd list` and
+/// wrong for the daemon's own fatal exit. It is still not a reason to move the
+/// boundary. `serve` has *two* call sites in `main.rs`: the subcommand, and
+/// the bare double-click, which is the LaunchServices path with no stderr at
+/// all and therefore the one that most needs this. A record written at one
+/// call site is a record the other silently lacks, and the next caller lacks
+/// it too. Written here, every caller has it and `main.rs` keeps its job:
+/// print to stderr, exit non-zero.
+///
+/// One function rather than three lines inlined into `serve`, because this is
+/// the seam a test can drive — `serve` itself cannot be called without reading
+/// `db:masterkey` from the OS keychain.
+///
+/// The already-running path returns before the journal is installed, so
+/// nothing is written for it. That is correct rather than a gap: the log
+/// beside that library belongs to the daemon still living, and this process
+/// did not open one.
+///
+/// # Errors
+///
+/// Whatever `serve` was about to return. This only records it.
+pub fn record_exit(outcome: Result<(), String>) -> Result<(), String> {
+    crate::journal::record(&crate::journal::serve_exit(&outcome));
+    outcome
+}
+
+/// [`serve`]'s body: everything that can fail, in one place, so that one
+/// wrapper sees every way it can end.
+async fn serve_until_stopped(root: PathBuf, launch: Launch, port: u16) -> Result<(), String> {
     // Second click, not second daemon: if one is already serving, every tab
     // problem is solved by a fresh one-time link from it — no keychain read,
     // no bind, no new process. This is also what makes the app icon behave
@@ -247,13 +288,13 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
             None
         }
     };
-    crate::journal::record(&format!(
-        "daemon   : serve starting — pid {}, sessions {}",
-        std::process::id(),
-        root.display()
-    ));
+    crate::journal::record(&crate::journal::serve_starting(std::process::id(), &root));
 
-    let db = crate::open_library(&root)?;
+    // Named rather than propagated bare, because the message that comes back
+    // is about a keychain or a recovery file and never says which of the
+    // daemon's steps was asking. In the journal this is the difference between
+    // "it died before the library" and "it died after" (#102).
+    let db = crate::open_library(&root).map_err(|e| format!("could not open the library: {e}"))?;
     let source = Arc::new(StoreSource::new(db));
 
     // 0 — the default — means the OS picks. A fixed port is guessable by a
@@ -522,14 +563,9 @@ pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), Strin
     println!();
     println!("  Ctrl-C to stop.");
     // A daemon that stopped serving stopped for a reason, and the reason is
-    // the last thing the log should hold. A `Ctrl-C` or a `kill` never reaches
-    // here, which is itself informative: a journal whose last line is
-    // `listening` was ended from outside, not by a failure.
-    let outcome = server.serve().await.map_err(|e| format!("server: {e}"));
-    if let Err(e) = &outcome {
-        crate::journal::record(&format!("daemon   : ! the server stopped: {e}"));
-    }
-    outcome
+    // the last thing the log should hold — `record_exit` writes it, here as at
+    // every other way out of this function.
+    server.serve().await.map_err(|e| format!("server: {e}"))
 }
 
 /// Start the auto-push worker on its own thread.
