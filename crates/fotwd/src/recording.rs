@@ -76,6 +76,11 @@ use crate::session::{
     self, DeepgramLegs, FinishDeadlines, SegmentTap, SessionControl, SessionOutcome, StopSignal,
     SttErrors, Transcription,
 };
+// This module runs entirely inside the daemon, where stderr is discarded, so
+// every diagnostic below is also written to the daemon's log (#101). The two
+// that handle transcript-derived text deliberately do NOT use `diag!` — see
+// `enrich_and_announce`.
+use crate::{diag, journal};
 
 /// How a session acquires its taps.
 ///
@@ -362,7 +367,7 @@ fn persist_and_promote(root: &Path, outcome: &SessionOutcome, ready: &ReadyTap) 
     if !outcome.segments.is_empty()
         && let Err(e) = session::append_segments(&outcome.dir, &outcome.segments)
     {
-        eprintln!("  ! could not append the transcript: {e}");
+        diag!("  ! could not append the transcript: {e}");
     }
 
     let data_root = root.parent().unwrap_or(root).to_path_buf();
@@ -379,15 +384,19 @@ fn persist_and_promote(root: &Path, outcome: &SessionOutcome, ready: &ReadyTap) 
 
     match crate::open_library(root) {
         Err(e) => {
-            eprintln!("  ! could not open the library: {e}");
+            diag!("  ! could not open the library: {e}");
             None
         }
         Ok(mut db) => match crate::persist::persist_session(&mut db, outcome, &title) {
             Err(e) => {
-                eprintln!("  ! could not add to the library: {e}");
+                diag!("  ! could not add to the library: {e}");
                 None
             }
             Ok(id) => {
+                // The id and nothing else: it is what `fotwd summarize <id>`
+                // and every follow-up question take, and it is the only part
+                // of a meeting §10 lets a durable file hold.
+                journal::record(&format!("recording: meeting {id} persisted"));
                 // Before promotion, on purpose — see this function's header.
                 ready.emit(&id, MeetingReadyReason::Persisted);
                 if let Err(e) = crate::retention::promote_session(
@@ -397,7 +406,7 @@ fn persist_and_promote(root: &Path, outcome: &SessionOutcome, ready: &ReadyTap) 
                     &id,
                     outcome.started_at_ms,
                 ) {
-                    eprintln!("  ! could not archive the session: {e}");
+                    diag!("  ! could not archive the session: {e}");
                 }
                 Some(id)
             }
@@ -553,15 +562,27 @@ async fn spawn_session(
             // and since #79 they are not all transcription failures — a ring
             // drop rides this channel too, because it is the only one anybody
             // reads.
+            journal::record(&format!(
+                "recording: session ended — {} segment(s), {} degradation(s)",
+                outcome.segments.len(),
+                outcome.stt_errors.len()
+            ));
+            // Logged verbatim, and that is a §10 decision rather than an
+            // oversight. Every producer of an `stt_errors` entry builds it
+            // from buffer counts, device state and deadlines (#79/#81/#85);
+            // the one string that comes from outside is `SttError`'s
+            // `{provider}: {message}`, which describes the connection, not
+            // what was said over it. Its `detail` field — the one documented
+            // as diagnostic — is not in that `Display` and does not reach here.
             for e in &outcome.stt_errors {
-                eprintln!("  ! this meeting was degraded: {e}");
+                diag!("  ! this meeting was degraded: {e}");
             }
             let audit = AuditLog::at(&root);
             if let Err(e) = audit.record(AuditKind::SessionEnd {
                 session: outcome.dir.display().to_string(),
                 duration_ms: now_ms().saturating_sub(started_at_ms),
             }) {
-                eprintln!("  ! could not write the audit log: {e}");
+                diag!("  ! could not write the audit log: {e}");
             }
             // Blocking work — Opus encoding and SQLite — off the runtime.
             let root2 = root.clone();
@@ -571,7 +592,7 @@ async fn spawn_session(
                 .flatten()
         }
         Err(e) => {
-            eprintln!("  ! the recording failed: {e}");
+            diag!("  ! the recording failed: {e}");
             None
         }
     };
@@ -610,13 +631,35 @@ async fn spawn_session(
 /// does, it is a dashboard that lists the meeting under its epoch title and
 /// only shows the real one after a reload.
 async fn enrich_and_announce(root: &Path, meeting_id: &str, ready: &ReadyTap) {
+    // Announced before the call, not after it: the two LLM calls below take
+    // one to three minutes, and #101's whole complaint is that a working
+    // enrichment and a dead one both looked like silence for that whole time.
+    journal::record(&format!("enrich   : meeting {meeting_id} starting"));
+    let started = fotw_store::now_ms();
+
     let report = crate::enrich::enrich_meeting(root, meeting_id).await;
+
+    // The title goes to stderr and stops there. §10 puts meeting titles on the
+    // never-log list beside the transcript they are written from, and this
+    // line — `meeting titled: {title}` — was fine only for as long as its
+    // destination was a stream nobody keeps. The durable copy gets the id and
+    // the length instead; see `journal::meeting_titled`.
     if let Some(title) = &report.title {
         eprintln!("  meeting titled: {title}");
+        journal::record(&journal::meeting_titled(meeting_id, title));
     }
+    // The same split, for the same reason: a `problems` entry can carry a
+    // child process's stderr over a prompt built from the transcript. The text
+    // is already stored in `meetings.enrich_detail`, which the API serves and
+    // the dashboard renders (#74), so the log names the count and points there.
     for problem in &report.problems {
         eprintln!("  ! enrichment: {problem}");
     }
+    journal::record(&journal::meeting_problems(meeting_id, &report.problems));
+    journal::record(&format!(
+        "enrich   : meeting {meeting_id} finished in {}s",
+        (fotw_store::now_ms() - started).max(0) / 1_000
+    ));
     // Unconditional: `problems` is non-fatal and a partial enrichment — a
     // title but no summary — is still something the open tab should be shown.
     ready.emit(meeting_id, MeetingReadyReason::Enriched);

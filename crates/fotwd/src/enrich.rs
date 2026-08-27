@@ -377,40 +377,175 @@ fn stamp(db: &mut Db, meeting_id: &str, receipt: &EnrichReceipt, report: &mut En
     }
 }
 
+/// What one backfill pass did — #101.
+///
+/// It used to be a `usize`, and a `usize` cannot tell the three states apart
+/// that matter to somebody asking whether enrichment is working: a pass that
+/// ran and found nothing, a pass still working through its selection, and a
+/// task that has died. All three read as `0`, and the caller printed nothing
+/// for `0`, so all three were the same observation — silence — which is how
+/// three wrong conclusions were drawn in a row on 2026-08-25.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackfillPass {
+    /// What the engine resolved to, from
+    /// [`EngineResolution::label`] — `none` when there is nothing configured.
+    pub engine: String,
+    /// Meetings awaiting enrichment when the pass began, across the whole
+    /// library rather than this pass's page of it. The depth of the queue.
+    pub pending: usize,
+    /// How many of them this pass took, capped by `limit`.
+    pub attempted: usize,
+    /// How many came out of it with a stored summary.
+    pub summarised: usize,
+    /// How many did not. Each has its own reason in `enrich_status` /
+    /// `enrich_detail`, which is where the reason belongs — §10 keeps engine
+    /// output out of anything durable this module writes.
+    pub failed: usize,
+    /// Meetings still awaiting enrichment when the pass ended.
+    ///
+    /// **Counted again, never subtracted.** `pending - summarised` looks
+    /// equivalent and is not: a meeting the engine ran and failed on also
+    /// leaves the queue — `needing_summary` excludes `failed` on purpose, so
+    /// an hourly sweeper cannot retry a usage limit forever — and so would any
+    /// status a future arm introduces. A drift here would be a backlog figure
+    /// that never reaches zero, which is the kind of number that gets ignored.
+    pub remaining: usize,
+}
+
+impl BackfillPass {
+    /// The line written when the pass starts work.
+    ///
+    /// Written *before* the LLM calls, which is the point: a pass takes three
+    /// meetings at one to three minutes each, so without this line a working
+    /// six-minute pass is six minutes of silence, and silence is the symptom
+    /// of the failure it has to be distinguishable from.
+    #[must_use]
+    pub fn opening_note(&self) -> String {
+        format!(
+            "backfill : pass starting — engine {}, {} awaiting enrichment, taking {}",
+            self.engine, self.pending, self.attempted
+        )
+    }
+
+    /// What the pass amounted to, in one clause.
+    ///
+    /// Shared by [`BackfillPass::closing_note`] and the daemon's health
+    /// surface so the log and the API cannot come to disagree about what the
+    /// same pass did.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        format!(
+            "{} attempted, {} summarised, {} not, {} still awaiting",
+            self.attempted, self.summarised, self.failed, self.remaining
+        )
+    }
+
+    /// The line written when the pass is over.
+    #[must_use]
+    pub fn closing_note(&self) -> String {
+        format!("backfill : pass finished — {}", self.summary())
+    }
+}
+
 /// Enrich up to `limit` meetings that have a transcript and no summary.
 ///
-/// Returns how many were attempted. The backfill pass behind #74: a meeting
-/// that missed its one enrichment window used to stay unsummarised forever,
-/// because `insert_summary` has a single production caller and nothing ever
-/// looked back. Thirty-three meetings were in that state on the first real
-/// library, and `fotwd summarize <id>` — which existed the whole time — is not
-/// something anyone runs thirty-three times.
+/// The backfill pass behind #74: a meeting that missed its one enrichment
+/// window used to stay unsummarised forever, because `insert_summary` has a
+/// single production caller and nothing ever looked back. Thirty-three
+/// meetings were in that state on the first real library, and `fotwd summarize
+/// <id>` — which existed the whole time — is not something anyone runs
+/// thirty-three times.
 ///
 /// Timid on purpose:
 ///
 /// * **Nothing at all without an engine.** Not even a report: re-stamping
 ///   `no_engine` every hour on every stranded meeting is a write per meeting
-///   per hour that tells nobody anything new.
+///   per hour that tells nobody anything new. It still *counts* the backlog
+///   and says so — "no engine, 18 waiting" is the most useful sentence this
+///   pass can produce, and it was the one it never said.
 /// * **The oldest first, capped**, so one pass cannot fire off a run of CLI
 ///   invocations on a laptop that is also doing something else.
 /// * **Never a `failed` meeting** — that exclusion lives in
 ///   [`needing_summary`](fotw_store::MeetingRepo::needing_summary), where the
 ///   reasoning is written down: retrying a usage limit hourly is how a
 ///   subscription burns in a loop.
-pub async fn backfill_once(db: &mut Db, store: &dyn KeyStore, limit: i64) -> usize {
-    if resolve_engine(store, db).is_none() {
-        return 0;
-    }
-    let Ok(candidates) = db.meetings().needing_summary(limit) else {
-        // A query that failed is a library problem, and this is a background
-        // pass — the next one tries again.
-        return 0;
+///
+/// # Why the pass narrates itself rather than returning a script
+///
+/// The per-meeting lines have to land *as each meeting finishes*, or they are
+/// not progress, they are a summary that arrives with the summary. Only this
+/// function is inside the loop. The aggregate goes back to the caller as well,
+/// for the daemon's health surface. Outside a daemon —
+/// [`crate::journal::record`] before `install` — every line here is a no-op,
+/// so `fotwd summarize` looks exactly as it always has.
+pub async fn backfill_once(db: &mut Db, store: &dyn KeyStore, limit: i64) -> BackfillPass {
+    let resolution = resolve_engine_detailed(store, db);
+    let mut pass = BackfillPass {
+        engine: resolution.label(),
+        pending: count_awaiting(db),
+        ..BackfillPass::default()
     };
-    let attempted = candidates.len();
+
+    let candidates = match resolution {
+        EngineResolution::NoneConfigured | EngineResolution::Unresolvable { .. } => Vec::new(),
+        EngineResolution::Engine(_) => db.meetings().needing_summary(limit).unwrap_or_else(|_| {
+            // A query that failed is a library problem, and this is a
+            // background pass — the next one tries again.
+            crate::journal::record("backfill : ! could not read the queue; retrying next pass");
+            Vec::new()
+        }),
+    };
+    pass.attempted = candidates.len();
+    crate::journal::record(&pass.opening_note());
+
     for meeting_id in candidates {
-        enrich_meeting_with(db, store, &meeting_id).await;
+        let started = fotw_store::now_ms();
+        crate::journal::record(&format!("backfill : meeting {meeting_id} started"));
+        let report = enrich_meeting_with(db, store, &meeting_id).await;
+
+        // The stored status rather than anything the report carries: it is the
+        // word the dashboard shows, so a log that disagreed with it would send
+        // whoever read it hunting the wrong thing.
+        let status = db
+            .meetings()
+            .get(&meeting_id)
+            .ok()
+            .and_then(|m| m.enrich_status)
+            .unwrap_or_else(|| "unknown".to_owned());
+        let secs = (fotw_store::now_ms() - started).max(0) / 1_000;
+        if report.summary_version.is_some() {
+            pass.summarised += 1;
+            crate::journal::record(&format!(
+                "backfill : meeting {meeting_id} summarised in {secs}s ({status})"
+            ));
+        } else {
+            pass.failed += 1;
+            crate::journal::record(&format!(
+                "backfill : meeting {meeting_id} not summarised after {secs}s ({status})"
+            ));
+        }
+        crate::journal::record(&crate::journal::meeting_problems(
+            &meeting_id,
+            &report.problems,
+        ));
     }
-    attempted
+
+    pass.remaining = count_awaiting(db);
+    crate::journal::record(&pass.closing_note());
+    pass
+}
+
+/// How many meetings are waiting for enrichment, or zero if the count failed.
+///
+/// Zero on failure rather than an error, on this module's standing rule: a
+/// number that could not be read is one more thing the report does not know,
+/// never a reason to fail a pass whose real work has already been done.
+fn count_awaiting(db: &mut Db) -> usize {
+    db.meetings()
+        .count_needing_summary()
+        .ok()
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or_default()
 }
 
 // ------------------------------------------------ the legacy population (#88)

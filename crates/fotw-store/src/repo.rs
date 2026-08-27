@@ -14,6 +14,22 @@ use crate::models::{
     Meeting, NewMeeting, NewSegment, NewSummary, NoteAnchor, StoredSegment, Summary,
 };
 
+/// What "still awaiting enrichment" means, as a `WHERE` clause over `meetings
+/// m` — the one definition [`MeetingRepo::needing_summary`] and
+/// [`MeetingRepo::count_needing_summary`] both read.
+///
+/// A meeting qualifies when it has something to summarise, has no current
+/// summary, and has not already had an engine run and fail on it. That last
+/// exclusion is the one worth stating twice: retrying a usage limit hourly is
+/// how a laptop burns a subscription in a loop, so `failed` waits for a person
+/// and is not part of the backlog a background pass is measured against.
+const AWAITING_ENRICHMENT: &str = "EXISTS (SELECT 1 FROM segments s WHERE s.meeting_id = m.id)
+     AND NOT EXISTS (
+           SELECT 1 FROM summaries su
+            WHERE su.meeting_id = m.id AND su.is_current = 1)
+     AND (m.enrich_status IS NULL
+          OR m.enrich_status IN ('no_engine', 'engine_unresolvable'))";
+
 /// Meeting-scoped reads and writes.
 ///
 /// Obtained from [`Db::meetings`]. Holds the connection mutably because most
@@ -221,6 +237,11 @@ impl MeetingRepo<'_> {
 
     /// Meetings that have something to summarise and no summary, oldest first.
     ///
+    /// The predicate is shared with
+    /// [`count_needing_summary`](Self::count_needing_summary) rather than
+    /// written twice: a count that drifts from the queue is a number that
+    /// reassures while the queue stalls.
+    ///
     /// The backfill sweeper's query (#74). `insert_summary` has one production
     /// caller, so a meeting that missed its single enrichment window — the
     /// daemon was restarting, the engine was not installed yet — stayed
@@ -236,23 +257,39 @@ impl MeetingRepo<'_> {
     /// Propagates SQLite failures.
     pub fn needing_summary(&self, limit: i64) -> Result<Vec<String>> {
         let conn = self.db.conn();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT m.id FROM meetings m
-              WHERE EXISTS (SELECT 1 FROM segments s WHERE s.meeting_id = m.id)
-                AND NOT EXISTS (
-                      SELECT 1 FROM summaries su
-                       WHERE su.meeting_id = m.id AND su.is_current = 1)
-                AND (m.enrich_status IS NULL
-                     OR m.enrich_status IN ('no_engine', 'engine_unresolvable'))
+              WHERE {AWAITING_ENRICHMENT}
               ORDER BY m.started_at_ms ASC, m.id ASC
-              LIMIT ?1",
-        )?;
+              LIMIT ?1"
+        ))?;
         let rows = stmt.query_map(params![limit], |r| r.get::<_, String>(0))?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// How many meetings [`needing_summary`](Self::needing_summary) would
+    /// offer if it had no cap.
+    ///
+    /// The number the daemon's log answers "how much is still waiting" with
+    /// (#101). The cap on the queue is what makes it necessary: a pass that
+    /// takes three meetings and reports "3 selected" cannot distinguish a
+    /// library with three left from one with thirty — and thirty was the real
+    /// case, drained three an hour while nobody could see the depth.
+    ///
+    /// # Errors
+    ///
+    /// Propagates SQLite failures.
+    pub fn count_needing_summary(&self) -> Result<i64> {
+        let conn = self.db.conn();
+        Ok(conn.query_row(
+            &format!("SELECT COUNT(*) FROM meetings m WHERE {AWAITING_ENRICHMENT}"),
+            [],
+            |r| r.get(0),
+        )?)
     }
 
     // ---------------------------------------------------------- transcripts

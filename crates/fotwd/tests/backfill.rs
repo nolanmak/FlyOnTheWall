@@ -121,9 +121,14 @@ async fn the_backfill_takes_the_oldest_stranded_meetings_up_to_the_cap() {
     let newest = stranded(&mut db, 3_000, None);
     enable_cli(&mut db, &working_cli("cap"));
 
-    let done = backfill_once(&mut db, &InMemoryKeyStore::new(), 2).await;
+    let pass = backfill_once(&mut db, &InMemoryKeyStore::new(), 2).await;
 
-    assert_eq!(done, 2, "the cap must hold");
+    assert_eq!(pass.attempted, 2, "the cap must hold");
+    assert_eq!(pass.summarised, 2);
+    assert_eq!(
+        pass.pending, 3,
+        "what the pass was looking at when it began"
+    );
     assert!(has_summary(&mut db, &oldest));
     assert!(has_summary(&mut db, &middle));
     assert!(
@@ -137,9 +142,22 @@ async fn the_backfill_takes_the_oldest_stranded_meetings_up_to_the_cap() {
     );
 
     // The next pass picks up exactly where this one left off.
-    assert_eq!(backfill_once(&mut db, &InMemoryKeyStore::new(), 2).await, 1);
+    let pass = backfill_once(&mut db, &InMemoryKeyStore::new(), 2).await;
+    assert_eq!(pass.attempted, 1);
+    assert_eq!(pass.pending, 1);
     assert!(has_summary(&mut db, &newest));
-    assert_eq!(backfill_once(&mut db, &InMemoryKeyStore::new(), 2).await, 0);
+
+    // The pass that found nothing. This is the observation #101 is about: it
+    // used to be indistinguishable from a task that had died.
+    let pass = backfill_once(&mut db, &InMemoryKeyStore::new(), 2).await;
+    assert_eq!(pass.attempted, 0);
+    assert_eq!(pass.pending, 0);
+    assert_eq!(pass.remaining, 0);
+    assert!(
+        pass.opening_note().contains("0 awaiting"),
+        "a pass that ran and found nothing has to say so: {}",
+        pass.opening_note()
+    );
 }
 
 /// A meeting whose engine ran and errored is never retried automatically.
@@ -151,7 +169,12 @@ async fn a_failed_meeting_is_never_retried_automatically() {
     let failed = stranded(&mut db, 1_000, Some("failed"));
     enable_cli(&mut db, &working_cli("failed"));
 
-    assert_eq!(backfill_once(&mut db, &InMemoryKeyStore::new(), 5).await, 0);
+    let pass = backfill_once(&mut db, &InMemoryKeyStore::new(), 5).await;
+    assert_eq!(pass.attempted, 0);
+    assert_eq!(
+        pass.pending, 0,
+        "a failed meeting is not awaiting enrichment — it is awaiting a person"
+    );
     assert!(!has_summary(&mut db, &failed));
 }
 
@@ -163,7 +186,17 @@ async fn with_no_engine_the_backfill_is_a_complete_no_op() {
     let mut db = db();
     let meeting = stranded(&mut db, 1_000, None);
 
-    assert_eq!(backfill_once(&mut db, &InMemoryKeyStore::new(), 5).await, 0);
+    let pass = backfill_once(&mut db, &InMemoryKeyStore::new(), 5).await;
+    assert_eq!(pass.attempted, 0);
+    assert_eq!(
+        pass.engine, "none",
+        "\"no engine\" and \"nothing to do\" are different answers to the \
+         question, and the pass has to distinguish them"
+    );
+    assert_eq!(
+        pass.pending, 1,
+        "with no engine the pass still has to be able to say how much is waiting"
+    );
 
     let row = db.meetings().get(&meeting).unwrap();
     assert!(!has_summary(&mut db, &meeting));
@@ -181,12 +214,56 @@ async fn a_meeting_that_already_has_a_summary_is_left_alone() {
     let meeting = stranded(&mut db, 1_000, None);
     enable_cli(&mut db, &working_cli("already"));
 
-    assert_eq!(backfill_once(&mut db, &InMemoryKeyStore::new(), 5).await, 1);
+    assert_eq!(
+        backfill_once(&mut db, &InMemoryKeyStore::new(), 5)
+            .await
+            .attempted,
+        1
+    );
     assert!(has_summary(&mut db, &meeting));
 
     assert_eq!(
-        backfill_once(&mut db, &InMemoryKeyStore::new(), 5).await,
+        backfill_once(&mut db, &InMemoryKeyStore::new(), 5)
+            .await
+            .attempted,
         0,
         "a summarised meeting must not be summarised again on the next pass"
+    );
+}
+
+/// A CLI that refuses both calls, the way a hit usage limit refuses them.
+fn failing_cli(name: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("fotw-backfill-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join(STUB_ENGINE_NAME);
+    std::fs::write(&bin, "#!/bin/sh\ncat > /dev/null\nexit 3\n").unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin.to_string_lossy().into_owned()
+}
+
+/// The backlog a pass reports is **counted at the end, never subtracted**.
+///
+/// A meeting the engine ran and failed on also leaves the queue —
+/// `needing_summary` excludes `failed` so an hourly sweeper cannot retry a
+/// usage limit forever — so `pending - summarised` would report a backlog that
+/// never drains, on exactly the machine where enrichment is most broken (#101).
+#[tokio::test]
+async fn the_backlog_a_pass_reports_is_counted_rather_than_subtracted() {
+    let mut db = db();
+    stranded(&mut db, 1_000, None);
+    stranded(&mut db, 2_000, None);
+    enable_cli(&mut db, &failing_cli("counted"));
+
+    let pass = backfill_once(&mut db, &InMemoryKeyStore::new(), 1).await;
+    assert_eq!(pass.attempted, 1);
+    assert_eq!(pass.summarised, 0);
+    assert_eq!(pass.failed, 1, "the engine ran and refused");
+    assert_eq!(pass.pending, 2, "what was waiting when the pass began");
+    assert_eq!(
+        pass.remaining, 1,
+        "the failed meeting is out of the queue, so one is left — \
+         `pending - summarised` would say two forever"
     );
 }
