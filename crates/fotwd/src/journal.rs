@@ -353,6 +353,61 @@ pub fn meeting_problems(meeting_id: &str, problems: &[String]) -> String {
     }
 }
 
+// ------------------------------------------------------ the daemon's own life
+
+/// What the journal is told when `serve` begins.
+///
+/// The pid is what `kill` takes, and what tells two launches apart in a log
+/// that outlives both. The sessions root is which library this daemon opened,
+/// which is the first question on a machine that has more than one.
+///
+/// §10 leaves both alone: a sessions root is a directory a person named or the
+/// default under Application Support, not text written from a transcript.
+#[must_use]
+pub fn serve_starting(pid: u32, sessions_root: &Path) -> String {
+    format!(
+        "daemon   : serve starting — pid {pid}, sessions {}",
+        sessions_root.display()
+    )
+}
+
+/// What the journal is told when `serve` returns — issue #102.
+///
+/// #101 recorded the attempt and not the outcome. On the first rebuild after
+/// it landed, a keychain ACL that had never been approved (#53) produced two
+/// fatal startups and four log lines that said only that they had begun — the
+/// reason went to the stderr of a LaunchServices-launched `.app`, which is the
+/// thing macOS discards and the whole premise of the journal.
+///
+/// The clean arm matters as much as the fatal one, for a reason that is easy
+/// to miss: a `Ctrl-C` or a `kill` never reaches this seam at all. So a
+/// journal whose last line is `listening` was ended from outside, one whose
+/// last line is this one stopped serving on its own, and one whose last line
+/// names a reason never got up. Three different endings, told apart only
+/// because the middle one says something.
+///
+/// # Why the reason is written out in full, under §10
+///
+/// Every string that can arrive here is a startup failure, and there are four
+/// producers: the library open — a platform error and a keychain item
+/// *account*, `db:masterkey`, never material, and
+/// [`fotw_secrets::SecretsError`] is built so that no variant of it can carry
+/// credential bytes; the bind — an `io::Error` and a port; the state-file
+/// write — a path and an `io::Error`; and the server itself. None of them can
+/// reach a transcript, a title or an attendee.
+///
+/// That is what separates this from [`meeting_problems`], which is handed the
+/// engine's own output over a prompt built from the transcript and may not
+/// persist a word of it. The test is what a string can carry, not which file
+/// it happens to be written in.
+#[must_use]
+pub fn serve_exit(outcome: &Result<(), String>) -> String {
+    match outcome {
+        Ok(()) => "daemon   : serve exited — the server stopped without an error".to_owned(),
+        Err(why) => format!("daemon   : ! serve exited: {why}"),
+    }
+}
+
 // ------------------------------------------------------------------ the pulse
 
 /// A line worth writing when it changes, and once in a while regardless.
