@@ -512,10 +512,19 @@ async function connectStream() {
 
 // Section 5.5 budgets ~50 rows in the DOM; a two-hour meeting is ~20k words.
 const MAX_ROWS = 200;
+// Keep following the live transcript while the reader is at the bottom, but
+// leave a deliberate manual scroll alone. The slop accounts for fractional
+// layout pixels and makes it easy to resume following by scrolling back down.
+const LIVE_SCROLL_SLOP_PX = 48;
+
+function isNearBottom(node) {
+  return node.scrollHeight - node.scrollTop - node.clientHeight <= LIVE_SCROLL_SLOP_PX;
+}
 
 function appendDeltas(deltas) {
   const body = document.getElementById("segments");
   if (!body) return;
+  const follow = isNearBottom(el.detail);
   for (const d of deltas) {
     // Deltas carry no diarisation label; the channel is the truth here, and
     // "me" is what the mic leg means (§7.5). The far end's labels arrive
@@ -548,6 +557,7 @@ function appendDeltas(deltas) {
   while (body.childElementCount > MAX_ROWS) {
     body.removeChild(body.firstChild);
   }
+  if (follow) el.detail.scrollTop = el.detail.scrollHeight;
 }
 
 // -------------------------------------------------- CON-01, recording state

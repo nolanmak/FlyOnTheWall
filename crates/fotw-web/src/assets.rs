@@ -341,6 +341,28 @@ mod tests {
         );
     }
 
+    /// The live transcript should follow new words only while the reader is
+    /// at the bottom. This is a client interaction, so the asset test pins
+    /// the small contract that protects it until the project has a browser
+    /// harness: measure before appending, then restore the bottom only when
+    /// that measurement says the reader was already following.
+    #[test]
+    fn the_live_transcript_follows_the_bottom_without_fighting_manual_scroll() {
+        let js = asset_text("app.js");
+        assert!(
+            js.contains("const LIVE_SCROLL_SLOP_PX = 48"),
+            "live follow mode needs a small bottom tolerance for layout pixels"
+        );
+        assert!(
+            js.contains("const follow = isNearBottom(el.detail)"),
+            "the client must decide whether to follow before it changes the DOM"
+        );
+        assert!(
+            js.contains("if (follow) el.detail.scrollTop = el.detail.scrollHeight"),
+            "new deltas must reach the bottom only when the reader was already there"
+        );
+    }
+
     #[test]
     fn an_unknown_extension_is_not_served_as_html() {
         assert_eq!(content_type("x.bin"), "application/octet-stream");
