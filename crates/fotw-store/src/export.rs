@@ -988,6 +988,20 @@ impl MeetingDoc {
     }
 
     /// Both clipboard flavors (EXP-02).
+    ///
+    /// The export side of it: `fotwd`'s own surfaces, and anything else holding
+    /// a [`MeetingDoc`]. The dashboard does **not** call this. It builds its two
+    /// flavors in `app.js` from the meeting it already has, because the live
+    /// pane it also copies from has no row here at all, and because a browser
+    /// that fetched a payload before writing it would lose the user gesture in
+    /// Safari.
+    ///
+    /// The two agree on the parts they share — an `<h1>` title, then the summary
+    /// through the same small Markdown subset — and differ in two named ways.
+    /// This one renders the action items `MeetingDetail` does not carry. And the
+    /// browser's transcript lines name the capture leg (`me`/`them`) where
+    /// [`MeetingDoc::transcript_lines`] has no channel to consult and says
+    /// `Speaker`.
     #[must_use]
     pub fn to_clipboard(&self) -> Clipboard {
         let m = &self.meeting;

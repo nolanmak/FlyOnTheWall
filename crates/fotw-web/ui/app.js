@@ -169,7 +169,7 @@ const ADMONITIONS = new Map([
   ["[!NOTE]", { className: "callout callout-note", label: "Note" }],
 ]);
 
-function renderMarkdown(md, into) {
+function renderMarkdown(md, into, headingBase = 3) {
   let list = null;
   let quote = null;
   for (const raw of String(md).split("\n")) {
@@ -214,9 +214,12 @@ function renderMarkdown(md, into) {
     if (!line.trim()) continue;
     const heading = /^(#{1,6})\s+(.*)$/.exec(line);
     if (heading) {
-      // Offset by one: the pane already has an h3, and a document whose
-      // headings outrank their own section is wrong for a screen reader.
-      const level = Math.min(6, heading[1].length + 3);
+      // Offset by the caller's base. The pane takes the default 3, because a
+      // summary sits under the section's own h3 and a document whose headings
+      // outrank their own section is wrong for a screen reader. The clipboard
+      // passes 1: a paste is its own document under an h1 of the title, and
+      // Slack, Notion and Docs map h2/h3 to real heading blocks.
+      const level = Math.min(6, heading[1].length + headingBase);
       into.appendChild(text("h" + level, heading[2]));
     } else {
       into.appendChild(text("p", line));
@@ -247,7 +250,7 @@ function renderDetail(detail) {
   el.detail.appendChild(text("h2", detail.meeting.title || "Untitled meeting"));
   el.detail.appendChild(text("p", when(detail.meeting.started_at_ms), "meta"));
 
-  const actions = githubActions(detail.meeting.id);
+  const actions = actionsRow(detail);
   if (actions) el.detail.appendChild(actions);
 
   // Notes first, and above the summary, because they are the user's own words
@@ -512,6 +515,16 @@ async function connectStream() {
 
 // Section 5.5 budgets ~50 rows in the DOM; a two-hour meeting is ~20k words.
 const MAX_ROWS = 200;
+// The live pane's finals, kept beside the DOM so that copying them is not
+// limited to what the pane still happens to be showing.
+//
+// Deliberately NOT capped at MAX_ROWS. That constant is a layout budget, and
+// an array is not the layout: a four-hour meeting is a few hundred kilobytes
+// here, while trimming it would mean a copy that quietly returned the last 200
+// lines of a 2,000-line meeting under a status line claiming the transcript.
+// Finals only -- a still-revising partial pasted as something somebody said is
+// worse than not pasting it.
+let liveSegments = [];
 // Keep following the live transcript while the reader is at the bottom, but
 // leave a deliberate manual scroll alone. The slop accounts for fractional
 // layout pixels and makes it easy to resume following by scrolling back down.
@@ -525,6 +538,11 @@ function appendDeltas(deltas) {
   const body = document.getElementById("segments");
   if (!body) return;
   const follow = isNearBottom(el.detail);
+  // Deltas land in whatever `#segments` is on screen, and that is a stored
+  // meeting's transcript when someone clicks into an old meeting mid-capture.
+  // Only the live pane's own rows belong in `liveSegments`, which is what its
+  // copy button reads.
+  const live = liveIsShowing();
   for (const d of deltas) {
     // Deltas carry no diarisation label; the channel is the truth here, and
     // "me" is what the mic leg means (§7.5). The far end's labels arrive
@@ -553,10 +571,23 @@ function appendDeltas(deltas) {
     const pending = document.getElementById("pending-" + d.channel);
     if (pending) pending.remove();
     body.appendChild(segmentRow(d.channel, d.start_ms, speaker, d.text, null));
+    if (live) {
+      liveSegments.push({
+        start_ms: d.start_ms,
+        channel: d.channel,
+        speaker: speaker,
+        text: d.text,
+      });
+    }
   }
   while (body.childElementCount > MAX_ROWS) {
     body.removeChild(body.firstChild);
   }
+  // Revealed by the first final, so a button offering to copy nothing is never
+  // on screen (#74's rule). The row rather than the button, so its margin
+  // leaves the layout with it.
+  const copyRow = document.getElementById("live-copy");
+  if (copyRow && liveSegments.length) copyRow.hidden = false;
   if (follow) el.detail.scrollTop = el.detail.scrollHeight;
 }
 
@@ -764,11 +795,21 @@ function renderRecording(body) {
 // of state left able to outlive the thing it describes.
 function showLive() {
   currentDetail = null;
+  liveSegments = [];
   clear(el.detail);
   el.detail.appendChild(text("h2", "Recording"));
   el.detail.appendChild(
     text("p", "Words appear here as the provider finalizes them.", "meta"),
   );
+  const copyRow = document.createElement("p");
+  copyRow.className = "actions";
+  // A marker in the DOM rather than a flag beside it, for the same reason
+  // `live-pane` is one: `clear(el.detail)` destroys it in the same breath as
+  // the pane it belongs to, so no state outlives the thing it describes.
+  copyRow.id = "live-copy";
+  copyRow.hidden = true;
+  copyRow.appendChild(copyButton("Copy transcript", livePayload));
+  el.detail.appendChild(copyRow);
   const transcript = document.createElement("section");
   transcript.className = "transcript";
   transcript.id = "live-pane";
@@ -1057,19 +1098,288 @@ async function onGithubPush(meetingId, button) {
   button.disabled = false;
 }
 
-// The per-meeting button, appended into the detail pane when the feature is
-// present and switched on.
-function githubActions(meetingId) {
+// The per-meeting push button, or null when this build has no GitHub export or
+// it is switched off. The row it goes in belongs to `actionsRow` now — it is
+// shared with the copy buttons, and a wrapper each would have stacked them.
+function githubButton(meetingId) {
   if (!githubPresent || !githubSettings || !githubSettings.enabled) return null;
-  const row = document.createElement("p");
-  row.className = "gh-actions";
   const button = document.createElement("button");
   button.type = "button";
   button.className = "gh-push";
   button.textContent = "Push to GitHub";
   button.addEventListener("click", () => onGithubPush(meetingId, button));
-  row.appendChild(button);
-  return row;
+  return button;
+}
+
+// ----------------------------------------------------- EXP-02, copy to clipboard
+//
+// EXP-02: "Clipboard writes both text and HTML flavors so a paste lands rich in
+// Slack/Notion and plain in an editor." Until now that P0 was satisfied only by
+// `MeetingDoc::to_clipboard` over in fotw-store, which nothing outside its own
+// tests calls -- the product itself had no way to copy anything, and a user who
+// wanted their summary in a message retyped it or dragged a selection across a
+// three-column grid.
+//
+// The payload is built here rather than fetched, for three reasons that point
+// the same way:
+//
+//   * `currentDetail` already holds every byte -- title, summary, segments --
+//     so a click needs no request at all.
+//   * Safari treats the user gesture as spent at the first suspension point,
+//     and a refused write is what a fetch-then-write handler earns there. It
+//     works in Chrome, which is exactly the trap §10.1 means when it says all
+//     the adversarial testing happens in Safari.
+//   * The live pane has no meeting row. Its words are socket deltas that reach
+//     the store only after Stop, so no endpoint could serve them -- a
+//     server-rendered copy would be a second renderer beside this one rather
+//     than a reuse of the Rust one.
+//
+// Nothing here needs a CSP change: no directive governs the async clipboard
+// API, `http://127.0.0.1:<port>` is a secure context (loopback is
+// potentially-trustworthy in every engine, and `IngressPolicy` allows no other
+// authority), and `require-trusted-types-for 'script'` guards DOM sink
+// *assignment* -- not a Blob, not a ClipboardItem, not the serializer below.
+// Do not relax the policy for this.
+//
+// One thing worth saying beside the `no-store` argument in `assets.rs`: the
+// clipboard is a wider boundary than this origin. It is system-wide and, with
+// Universal Clipboard on, it leaves the machine. That is why every copy here is
+// a button a person pressed, and why nothing copies on its own.
+
+const COPY_REFUSED =
+  "Could not copy — the browser refused the clipboard. Click this page, then press the button again.";
+
+// `[00:12:34]`, the shape `fotwd export --format txt` writes, rather than the
+// pane's `m:ss`. That column is for scanning a transcript beside its audio; a
+// line pasted into a document is read on its own, hours later, among other
+// people's text.
+function hms(ms) {
+  const total = Math.max(0, Math.floor((ms || 0) / 1000));
+  const pad = (n) => String(n).padStart(2, "0");
+  return (
+    pad(Math.floor(total / 3600)) +
+    ":" +
+    pad(Math.floor((total % 3600) / 60)) +
+    ":" +
+    pad(total % 60)
+  );
+}
+
+// Who said it, for a copy.
+//
+// Every copied line carries a name, where the pane prints one only when it
+// changes: an unattributed line in somebody else's document is a quote from
+// nobody. When diarisation gave us no label the channel is the answer -- that
+// is #64's signal, the one §7.5 calls the most valuable structural fact capture
+// hands us, and the one the pane makes visible with a tinted band. Deliberately
+// not `transcript_lines`' "Speaker" fallback, which has no channel to consult.
+function speakerFor(speaker, channel) {
+  if (speaker) return speaker;
+  return channel === "mic" ? "me" : "them";
+}
+
+function lineCount(n) {
+  return n + (n === 1 ? " line" : " lines");
+}
+
+function plainHead(title, date) {
+  return date ? title + "\n" + date + "\n\n" : title + "\n\n";
+}
+
+// The detached root every rich flavor is built into: an h1 of the title with
+// the date under it, so a paste is a document rather than a fragment of one.
+function copyDoc(title, startedAtMs) {
+  const root = document.createElement("div");
+  root.appendChild(text("h1", title));
+  const date = when(startedAtMs);
+  if (date) root.appendChild(text("p", date));
+  return root;
+}
+
+// The rich flavor, as a string.
+//
+// The serializer rather than reading the markup off the node: `assets.rs` greps
+// this file for the markup-assigning property names, and the ordinary read-only
+// way to ask an element for its markup is one of them -- so it would fail
+// `cargo test --workspace` with a message about XSS that points nowhere near
+// serialization. `DOMParser` is out for the opposite reason: it is a real
+// Trusted Types sink under this page's policy.
+//
+// The serializer is the better tool anyway. It escapes by construction, so no
+// second escaper joins `fotw_store`'s `escape_html`, and ING-11 follows the
+// words onto the clipboard -- `text/html` is *live markup* in whatever
+// application receives the paste, and that may be a native app with a parser of
+// its own, so a browser's write-time sanitizer is not the defence.
+//
+// Detached and purpose-built, never the pane itself. Safari sanitizes a written
+// `text/html` by re-parsing it with scripting off and keeping only what is
+// *visible*, so serializing what is on screen would paste one thing in Safari
+// and another in Chrome -- and could carry a hidden row, or these very buttons,
+// into somebody's message.
+//
+// One `xmlns` lands on the outermost element. Every HTML parser ignores an
+// attribute it does not know; stripping it would mean string surgery on markup,
+// which is the thing this approach exists to avoid.
+function serialize(root) {
+  return new XMLSerializer().serializeToString(root);
+}
+
+// Fills `root` with one paragraph per utterance and returns the matching plain
+// text, so both flavors come out of one loop and cannot drift apart.
+function transcriptBody(root, segments) {
+  let plain = "";
+  for (const seg of segments) {
+    const head =
+      "[" + hms(seg.start_ms) + "] " + speakerFor(seg.speaker, seg.channel) + ":";
+    // One line in, one line out. Providers emit newlines inside a segment: in
+    // the plain flavor a stray one hides the next timestamp, and in the rich one
+    // it collapses to a space anyway. `transcript_lines` flattens for the same
+    // reason.
+    const words = String(
+      seg.text === null || seg.text === undefined ? "" : seg.text,
+    ).replace(/[\r\n]+/g, " ");
+    // Its own block element per line. One text node with newlines in it pastes
+    // into Slack as a single run-on paragraph.
+    const line = document.createElement("p");
+    // Bold is the timestamp and the name -- strings we built. The words are a
+    // sibling text node, so nothing attacker-influenced ever decides what a tag
+    // is.
+    line.appendChild(text("strong", head));
+    line.appendChild(text("span", " " + words));
+    root.appendChild(line);
+    plain += head + " " + words + "\n";
+  }
+  return plain;
+}
+
+function summaryPayload(detail) {
+  const title = detail.meeting.title || "Untitled meeting";
+  const root = copyDoc(title, detail.meeting.started_at_ms);
+  // The pane's own renderer, one level down from the h1 above. The clipboard and
+  // the screen therefore cannot disagree about what a summary looks like: it is
+  // the same parse of the same string.
+  renderMarkdown(detail.summary_md, root, 1);
+  return {
+    // The markdown source, verbatim. The plain flavor is the only place markdown
+    // can ride -- a `text/markdown` flavor is refused by the browser outright.
+    text:
+      plainHead(title, when(detail.meeting.started_at_ms)) +
+      String(detail.summary_md).trimEnd() +
+      "\n",
+    html: serialize(root),
+    said: "Copied the summary.",
+  };
+}
+
+function storedTranscriptPayload(detail) {
+  const title = detail.meeting.title || "Untitled meeting";
+  const root = copyDoc(title, detail.meeting.started_at_ms);
+  const plain = transcriptBody(root, detail.segments);
+  return {
+    text: plainHead(title, when(detail.meeting.started_at_ms)) + plain,
+    html: serialize(root),
+    said: "Copied the transcript — " + lineCount(detail.segments.length) + ".",
+  };
+}
+
+// The live pane's own words, from `liveSegments` rather than from the rendered
+// rows: the pane is trimmed to MAX_ROWS and holds a still-revising partial, so a
+// copy taken off the screen would drop the top of a long meeting and paste half
+// a sentence at the bottom. No title -- there is no meeting row yet, and a
+// heading invented for one would be the only line in the paste nobody said.
+// "so far" is what says the meeting is still running.
+function livePayload() {
+  const root = document.createElement("div");
+  const plain = transcriptBody(root, liveSegments);
+  return {
+    text: plain,
+    html: serialize(root),
+    said: "Copied the transcript so far — " + lineCount(liveSegments.length) + ".",
+  };
+}
+
+// The one place anything touches the clipboard.
+//
+// Not `async`, and it reaches the write with nothing suspended before it: Safari
+// treats the user gesture as spent at the first suspension point and Firefox
+// requires transient activation. Everything needed is already in memory, so the
+// handler is straight-line.
+//
+// There is deliberately no single-flavor retry in the rejection handler. It
+// would run in a promise reaction job, after the gesture is gone, so in Safari
+// it would fail too -- and it would drop the HTML flavor EXP-02 exists for. One
+// write, one sentence.
+//
+// Feature detection rather than a try/catch: off a secure context the whole
+// `navigator.clipboard` object is absent rather than a rejecting stub, so the
+// call is a TypeError that no `.catch` on the promise would ever see. This
+// daemon cannot serve such an origin -- `IngressPolicy::for_loopback_port`
+// allows the single authority `127.0.0.1:<port>` and `check_host` compares the
+// whole string, so a request by hostname or LAN address is refused before this
+// file loads. The guard is belt and braces against a future bind, not a
+// supported path, which is why there is no fallback behind it.
+function copyNow(payload) {
+  if (!(navigator.clipboard && navigator.clipboard.write && window.ClipboardItem)) {
+    say(COPY_REFUSED);
+    return;
+  }
+  // ONE item with two keys, never two items: the macOS pasteboard keeps only the
+  // first, so a second would drop the rich flavor with no error anywhere. Blobs
+  // rather than bare strings, each typed to match the key it is filed under -- a
+  // string value only became universal in Chrome 133, and a Blob whose type
+  // disagrees with its key is refused outright.
+  const item = new ClipboardItem({
+    "text/plain": new Blob([payload.text], { type: "text/plain" }),
+    "text/html": new Blob([payload.html], { type: "text/html" }),
+  });
+  navigator.clipboard.write([item]).then(
+    () => say(payload.said),
+    // Chrome grants this to a focused page and refuses an unfocused one
+    // ("Document is not focused"), which is what clicking into devtools
+    // mid-copy looks like. Said out loud: a copy that quietly did not happen is
+    // discovered at the paste, in front of other people.
+    () => say(COPY_REFUSED),
+  );
+}
+
+function copyButton(label, build) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "copy";
+  // The accessible name never changes -- no "Copied!" flip -- and the button is
+  // never disabled. `#detail` is itself aria-live="polite" and `renderDetail`
+  // rewrites all of it, so a label that changed in place would be announced as
+  // part of a region that re-announces on every meeting somebody opens; and
+  // disabling a focused button takes focus off the person who just pressed it.
+  // The outcome is said once, through `say()`, whose role="status" line lives
+  // outside the pane.
+  button.textContent = label;
+  button.addEventListener("click", () => copyNow(build()));
+  return button;
+}
+
+// The per-meeting controls, in one row: the copies, then the push.
+//
+// Copy first because it is what someone does after every meeting; push last
+// because it is the configured occasional one and the only one that writes
+// somewhere else. Each control is drawn only when it can do something -- no
+// summary, no "Copy summary"; no segments, no "Copy transcript" -- and the row
+// is not appended when it would be empty. That is `githubActions`' old rule,
+// applied to all three.
+function actionsRow(detail) {
+  const row = document.createElement("p");
+  row.className = "actions";
+  if (detail.summary_md) {
+    row.appendChild(copyButton("Copy summary", () => summaryPayload(detail)));
+  }
+  if (detail.segments.length) {
+    row.appendChild(
+      copyButton("Copy transcript", () => storedTranscriptPayload(detail)),
+    );
+  }
+  const push = githubButton(detail.meeting.id);
+  if (push) row.appendChild(push);
+  return row.firstChild ? row : null;
 }
 
 // ------------------------------------------------------------------ start

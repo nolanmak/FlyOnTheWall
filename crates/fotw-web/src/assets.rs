@@ -363,6 +363,135 @@ mod tests {
         );
     }
 
+    /// EXP-02's whole point, and the one thing a refactor loses in silence.
+    /// The single-flavor call is the tempting one-liner: it writes `text/plain`
+    /// alone, and the summary that was meant to arrive formatted in Slack
+    /// arrives as a wall of markdown source instead. Both flavors must also ride
+    /// in *one* `ClipboardItem` — the macOS pasteboard keeps only the first item
+    /// of a multi-item write, so a second degrades to plain text on the only
+    /// platform this ships on, with no error anywhere and only on a user's
+    /// machine.
+    #[test]
+    fn a_copy_puts_both_flavors_on_one_clipboard_item() {
+        let js = asset_text("app.js");
+        assert!(
+            js.contains("navigator.clipboard.write([item])"),
+            "both flavors go in one ClipboardItem: macOS keeps only the first \
+             item of a multi-item write, so a second is dropped in silence"
+        );
+        assert!(
+            !js.contains("writeText"),
+            "writeText carries no HTML flavor, and EXP-02 is about both"
+        );
+        for flavor in ["\"text/plain\"", "\"text/html\""] {
+            assert!(
+                js.contains(flavor),
+                "EXP-02's {flavor} flavor must be written"
+            );
+        }
+    }
+
+    /// Safari treats the user gesture as spent at the first suspension point, so
+    /// the write has to be reached with none — which is possible only because
+    /// `currentDetail` already holds the meeting and the live pane keeps its own
+    /// finals. The version that fetches its payload first works in Chrome, and
+    /// Chrome is the trap: §10.1 says "it was blocked in Chrome" closes no
+    /// ticket.
+    ///
+    /// Asserting the negative *and* the body, because a `contains("function
+    /// copyNow(")` is satisfied by `async function copyNow(` — the exact
+    /// refactor this is written to catch.
+    #[test]
+    fn the_copy_handler_reaches_the_clipboard_without_suspending() {
+        let js = asset_text("app.js");
+        assert!(
+            !js.contains("async function copyNow"),
+            "a suspension before the write loses the gesture, and Safari \
+             refuses it"
+        );
+        let head = "function copyNow(payload) {";
+        let start = js.find(head).expect("app.js must define copyNow");
+        let rest = &js[start..];
+        let body = &rest[..rest.find("\n}\n").expect("copyNow must be closed")];
+        assert!(
+            !body.contains("await"),
+            "the copy handler must reach the clipboard with nothing suspended \
+             before it, or the button works in Chrome and is dead in Safari: \
+             {body}"
+        );
+    }
+
+    /// ING-11 follows the words onto the clipboard: `text/html` is *live markup*
+    /// in whatever application receives the paste, and a transcript is whatever
+    /// anyone in the room said. The rich flavor is built as DOM nodes through
+    /// the same `text()` helper the pane uses and handed to `XMLSerializer`,
+    /// which escapes by construction — so no second escaper joins
+    /// `fotw_store`'s `escape_html`. What a refactor reaches for instead is
+    /// string concatenation, and `the_renderer_never_assigns_html` above would
+    /// not notice.
+    #[test]
+    fn the_clipboards_html_is_serialized_rather_than_concatenated() {
+        let js = asset_text("app.js");
+        assert!(
+            js.contains("new XMLSerializer().serializeToString"),
+            "the HTML flavor must come from the serializer: a participant can \
+             say anything, and a paste target parses what it is given"
+        );
+    }
+
+    /// The reason this feature is client-side at all. The live pane's words are
+    /// in no meeting row — the hub's deltas reach the store only after Stop — so
+    /// copying a meeting *while it is recording* exists only here. And it reads
+    /// a list kept beside the DOM rather than the rendered rows: the pane is
+    /// trimmed to `MAX_ROWS` and holds a still-revising partial, so a copy taken
+    /// off the screen would drop the top of a long meeting under a status line
+    /// claiming the transcript.
+    #[test]
+    fn the_live_transcript_can_be_copied_before_the_meeting_is_saved() {
+        let js = asset_text("app.js");
+        assert!(
+            js.contains("liveSegments.push("),
+            "the live pane must keep its own finals, or its copy button has \
+             nothing to read"
+        );
+        assert!(
+            js.contains("transcriptBody(root, liveSegments)"),
+            "the live copy reads the kept finals, not the trimmed rows on screen"
+        );
+        assert!(
+            js.contains("\"live-copy\""),
+            "the live copy row needs a marker `appendDeltas` can find, so it \
+             appears only once there is a word to copy"
+        );
+    }
+
+    /// A copy button is ordinary chrome. CON-02 reserves the indicator's red for
+    /// one meaning and `--caution` is the caveat colour; a harmless local action
+    /// must borrow neither. `.copy` is appended as the *last* selector of the
+    /// shared button group because `css_rule` finds only a group's final
+    /// selector — which is also why a future pin on `.gh-push` would need to
+    /// give it its own rule. The row needs a gap: script-appended siblings carry
+    /// no whitespace between them, so without one the buttons render as a single
+    /// slab.
+    #[test]
+    fn the_copy_buttons_are_ordinary_chrome_in_a_spaced_row() {
+        let css = asset_text("app.css");
+        let rule = css_rule(&css, ".copy");
+        assert!(
+            rule.contains("var(--fg)") && rule.contains("var(--line)"),
+            "a copy button looks like Save and Push: {rule}"
+        );
+        assert!(
+            !rule.contains(INDICATOR_RED) && !rule.contains("var(--caution)"),
+            "copying is neither a live capture nor a caution: {rule}"
+        );
+        let row = css_rule(&css, ".actions");
+        assert!(
+            row.contains("gap"),
+            "without a gap the actions row renders as one slab of buttons: {row}"
+        );
+    }
+
     #[test]
     fn an_unknown_extension_is_not_served_as_html() {
         assert_eq!(content_type("x.bin"), "application/octet-stream");

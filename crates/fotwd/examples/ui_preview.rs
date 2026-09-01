@@ -107,6 +107,14 @@ async fn main() -> Result<(), String> {
                     "So we ask at first record, in context, and we explain what we do with it.",
                 ),
                 ("S1", "Agreed. I'll redo the second screen."),
+                // ING-11, with something to click. A participant can say
+                // anything, and a copy puts what they said on a system-wide
+                // clipboard as `text/html`. This line must paste into Slack,
+                // Notion and Docs as literal visible text.
+                (
+                    "S0",
+                    "Someone pasted <b>bold</b> and a <script>alert(1)</script> into the doc, so we need to say what happens to that text.",
+                ),
             ],
         ),
         (
