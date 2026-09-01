@@ -375,7 +375,8 @@ section {
 
 #gh-save,
 #sum-save,
-.gh-push {
+.gh-push,
+.copy {
   font: inherit;
   font-size: 12px;
   padding: 4px 10px;
@@ -387,11 +388,36 @@ section {
   cursor: pointer;
 }
 
+/* `.copy` is deliberately absent: nothing disables a copy button, and a rule
+   for a state that cannot happen is a claim the code does not make. */
 #gh-save:disabled,
 #sum-save:disabled,
 .gh-push:disabled {
   color: var(--muted);
   cursor: not-allowed;
+}
+
+/* The per-meeting controls, in one row. `.gh-actions` needed no rule when it
+   wrapped a single button; a row of three does, because `appendChild` leaves no
+   whitespace between siblings and the buttons would butt into one slab.
+
+   Wrapping is what keeps this off the 700px breakpoint: the row lives in the
+   detail pane, so #66's header-wrap ordering is untouched. Neutral chrome — in
+   --fg on --bg with a --line border, like every other button here — because
+   copying is harmless: --caution is the caveat colour and CON-02 reserves
+   #d2453d for "audio is being captured right now". */
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+/* An explicit `display` outranks the UA sheet's `[hidden] { display: none }`.
+   Without this the live pane's copy row would be on screen while it is still
+   `hidden`, offering to copy words nobody has said yet. */
+.actions[hidden] {
+  display: none;
 }
 
 /* A still-revising utterance in the live view. Muted rather than faded by
