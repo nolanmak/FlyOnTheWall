@@ -71,6 +71,7 @@
 
 pub mod api;
 pub mod assets;
+pub mod documents;
 pub mod github;
 pub mod health;
 pub mod ingress;

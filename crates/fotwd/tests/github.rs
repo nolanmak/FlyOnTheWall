@@ -832,3 +832,135 @@ fn sync_bundle_is_refused_when_export_is_disabled() {
     );
     assert!(r.gh.calls().is_empty());
 }
+
+#[test]
+fn companion_files_sync_latest_versions_without_republishing_unchanged_drafts() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("library.db");
+    let key = DbKey::from_bytes([0x01; 32]);
+    let mut writer = Db::open(&path, &key).unwrap();
+    let id = enriched_meeting(&mut writer, "Planning", 1_755_734_400_000);
+    store_settings(&mut writer, AUTO_SINCE_EPOCH);
+    writer
+        .meetings()
+        .insert_summary(
+            &id,
+            fotw_store::NewSummary::new("dev-1", "test", "model", "hash", "# Summary v1"),
+        )
+        .unwrap();
+    let mut draft = fotw_web::documents::SharingDocument {
+        title: "Brief".into(),
+        name_corrections: Vec::new(),
+        purpose: "Plan".into(),
+        audience: "Team".into(),
+        markdown: "# Saved brief v1".into(),
+        review_notes: vec!["PRIVATE REVIEW".into()],
+        excerpts: vec![],
+        source_segments: 1,
+        started_at_ms: 1_755_734_400_000,
+    };
+    writer
+        .save_sharing_document(&id, 0, &serde_json::to_string(&draft).unwrap())
+        .unwrap();
+    let batch = || {
+        let mut steps = create_script();
+        steps.extend([http_err(404), ok(PUT_OK), http_err(404), ok(PUT_OK)]);
+        steps
+    };
+    let gh = ScriptedGh::scripted(batch());
+    let exporter = GithubExporter::new(
+        Db::open(&path, &key).unwrap(),
+        dir.path().join("sessions"),
+        gh.clone(),
+    );
+    assert_eq!(exporter.auto_push_pending(), 1);
+    let calls = gh.calls();
+    let puts: Vec<_> = calls
+        .iter()
+        .filter(|(args, _)| args.iter().any(|a| a == "PUT"))
+        .collect();
+    assert_eq!(puts.len(), 3);
+    assert!(puts[1].0.iter().any(|a| a.ends_with(".summary.md")));
+    assert!(puts[2].0.iter().any(|a| a.ends_with(".document.md")));
+    let body: serde_json::Value = serde_json::from_slice(puts[2].1.as_ref().unwrap()).unwrap();
+    let content =
+        String::from_utf8(B64.decode(body["content"].as_str().unwrap()).unwrap()).unwrap();
+    assert_eq!(content, "# Saved brief v1");
+    assert!(!content.contains("PRIVATE REVIEW"));
+    assert_eq!(exporter.auto_push_pending(), 0);
+    assert_eq!(gh.calls().len(), calls.len());
+
+    draft.markdown = "# Corrected brief v2".into();
+    writer
+        .save_sharing_document(&id, 1, &serde_json::to_string(&draft).unwrap())
+        .unwrap();
+    gh.script.lock().unwrap().extend(batch());
+    assert_eq!(exporter.auto_push_pending(), 1, "saved edits synchronize");
+    assert_eq!(exporter.auto_push_pending(), 0);
+
+    writer
+        .meetings()
+        .insert_summary(
+            &id,
+            fotw_store::NewSummary::new("dev-1", "test", "model", "hash", "# Summary v2"),
+        )
+        .unwrap();
+    gh.script.lock().unwrap().extend(batch());
+    assert_eq!(
+        exporter.auto_push_pending(),
+        1,
+        "new summary versions synchronize"
+    );
+    assert_eq!(exporter.auto_push_pending(), 0);
+
+    // A companion failure must not claim the new version landed. Manual retry
+    // remains possible, while the worker parks it instead of hammering GitHub.
+    draft.markdown = "# Corrected brief v3".into();
+    writer
+        .save_sharing_document(&id, 2, &serde_json::to_string(&draft).unwrap())
+        .unwrap();
+    let mut failed = create_script();
+    failed.push(http_err(500));
+    gh.script.lock().unwrap().extend(failed);
+    assert_eq!(exporter.auto_push_pending(), 0);
+    let failed_count = gh.calls().len();
+    assert_eq!(exporter.auto_push_pending(), 0);
+    assert_eq!(gh.calls().len(), failed_count);
+    gh.script.lock().unwrap().extend(batch());
+    exporter.push(&id).unwrap();
+    draft.markdown = "# Corrected brief v4".into();
+    writer
+        .save_sharing_document(&id, 3, &serde_json::to_string(&draft).unwrap())
+        .unwrap();
+    gh.script.lock().unwrap().extend(batch());
+    assert_eq!(
+        exporter.auto_push_pending(),
+        1,
+        "successful retry un-parks future edits"
+    );
+}
+
+#[test]
+fn a_branch_conflict_reprobes_and_retries_without_looping_forever() {
+    let mut script = create_script();
+    script.pop();
+    script.extend([http_err(409), ok("new-blob-sha"), ok(PUT_OK)]);
+    let r = rig(MANUAL, script);
+    r.exporter.push(&r.meeting).unwrap();
+    let calls = r.gh.calls();
+    let body: serde_json::Value =
+        serde_json::from_slice(calls.last().unwrap().1.as_ref().unwrap()).unwrap();
+    assert_eq!(body["sha"], "new-blob-sha");
+    let mut script = create_script();
+    script.pop();
+    script.extend([
+        http_err(409),
+        ok("new-sha"),
+        http_err(409),
+        ok("newer-sha"),
+        http_err(409),
+    ]);
+    let r = rig(MANUAL, script);
+    assert!(r.exporter.push(&r.meeting).is_err());
+    assert_eq!(r.gh.calls().len(), 8, "three bounded PUT attempts");
+}

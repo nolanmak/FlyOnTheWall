@@ -31,6 +31,7 @@ build:
 
 test:
     CARGO_BUILD_JOBS={{jobs}} cargo test --workspace
+    node --test crates/fotw-web/tests/ui/*.cjs
 
 lint:
     cargo fmt --all --check

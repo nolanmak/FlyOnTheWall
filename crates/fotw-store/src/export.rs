@@ -457,6 +457,18 @@ row_type!(
 );
 
 row_type!(
+    /// A version of a purpose-aware sharing draft.
+    DocumentRow, "meeting_documents",
+    pk = ["id"], exclusive = [], {
+        id: String,
+        meeting_id: String,
+        version: i64,
+        document_json: String,
+        created_at: i64,
+    }
+);
+
+row_type!(
     /// A row of `action_items`.
     ActionItemRow, "action_items",
     pk = ["id"], exclusive = [], {
@@ -548,6 +560,9 @@ pub struct MeetingDoc {
     pub note_anchors: Vec<NoteAnchorRow>,
     /// Every summary version.
     pub summaries: Vec<SummaryRow>,
+    /// Every sharing draft and saved revision. Absent in older archives.
+    #[serde(default)]
+    pub documents: Vec<DocumentRow>,
     /// Extracted items.
     pub action_items: Vec<ActionItemRow>,
     /// Audio metadata.
@@ -600,6 +615,7 @@ impl Db {
             notes: self.fetch_by_meeting("ORDER BY id", meeting_id)?,
             note_anchors: self.fetch_by_meeting("ORDER BY note_id, block_idx", meeting_id)?,
             summaries: self.fetch_by_meeting("ORDER BY version", meeting_id)?,
+            documents: self.fetch_by_meeting("ORDER BY version", meeting_id)?,
             action_items: self.fetch_by_meeting("ORDER BY id", meeting_id)?,
             recordings: self.fetch_by_meeting("ORDER BY channel", meeting_id)?,
         })
@@ -718,6 +734,7 @@ impl_table_row!(
     NoteRow,
     NoteAnchorRow,
     SummaryRow,
+    DocumentRow,
     ActionItemRow,
     RecordingRow,
 );

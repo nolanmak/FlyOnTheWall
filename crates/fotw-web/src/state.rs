@@ -37,6 +37,7 @@ struct Inner {
     /// Bound after construction, unlike every control above it — see
     /// [`AppState::set_health`].
     health: OnceLock<Arc<dyn DaemonHealth>>,
+    documents: OnceLock<Arc<dyn crate::documents::DocumentControl>>,
 }
 
 impl std::fmt::Debug for dyn RecorderControl {
@@ -77,6 +78,16 @@ impl std::fmt::Debug for dyn MeetingSource {
 }
 
 impl AppState {
+    /// Attach the document generator before serving requests.
+    pub fn set_documents(&self, control: Arc<dyn crate::documents::DocumentControl>) {
+        let _ = self.inner.documents.set(control);
+    }
+
+    /// The document generator, absent on read-only preview servers.
+    pub fn documents(&self) -> Option<Arc<dyn crate::documents::DocumentControl>> {
+        self.inner.documents.get().cloned()
+    }
+
     /// Assemble the state for a server whose policy is already fixed to a
     /// port.
     #[must_use]
@@ -136,6 +147,7 @@ impl AppState {
                 github,
                 summarize,
                 health: OnceLock::new(),
+                documents: OnceLock::new(),
                 tickets: TokenTable::new(WS_TICKET_TTL),
                 handoff: TokenTable::new(HANDOFF_TTL),
                 hub: Arc::new(DeltaHub::new()),

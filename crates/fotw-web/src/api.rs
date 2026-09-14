@@ -621,6 +621,33 @@ fn number(query: &str, key: &str) -> Option<u32> {
     query_param(query, key)?.parse().ok()
 }
 
+/// Authenticated document operations. Invalid input never reaches an engine.
+pub async fn document(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Result<
+        axum::Json<crate::documents::DocumentRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> Response {
+    let Some(control) = state.documents() else {
+        return not_found();
+    };
+    let Ok(axum::Json(request)) = body else {
+        return not_found();
+    };
+    if !request.valid() {
+        return json(
+            &state,
+            &serde_json::json!({"error":"Document preferences or text are invalid or too long."}),
+        );
+    }
+    match control.run(id, request).await {
+        Ok(doc) => json(&state, &doc),
+        Err(error) => json(&state, &serde_json::json!({"error":error})),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

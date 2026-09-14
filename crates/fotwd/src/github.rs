@@ -171,6 +171,8 @@ pub struct GithubExporter {
     /// without a sha, and the loser gets a spurious 422 for a transcript
     /// that in fact landed.
     in_flight: Mutex<HashSet<String>>,
+    // GitHub updates a shared branch even when two files differ.
+    writes: Mutex<()>,
 }
 
 impl std::fmt::Debug for GithubExporter {
@@ -178,6 +180,37 @@ impl std::fmt::Debug for GithubExporter {
         // Never the root: it names the directory the meetings are in.
         f.write_str("GithubExporter(<redacted>)")
     }
+}
+
+/// Versions of the companion files at the configured destination.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ArtifactVersion {
+    summary: Option<String>,
+    document: Option<i64>,
+    repo: String,
+    branch: String,
+}
+const ARTIFACT_RECEIPTS_KEY: &str = "github_artifact_receipts";
+
+impl ArtifactVersion {
+    fn from_doc(doc: &fotw_store::export::MeetingDoc, settings: &GithubSettings) -> Self {
+        Self {
+            summary: doc.current_summary().map(|s| s.id.clone()),
+            document: doc.documents.iter().map(|d| d.version).max(),
+            repo: settings.repo.clone(),
+            branch: settings.branch.clone(),
+        }
+    }
+    fn has_files(&self) -> bool {
+        self.summary.is_some() || self.document.is_some()
+    }
+}
+fn read_artifact_receipts(db: &Db) -> HashMap<String, ArtifactVersion> {
+    db.get_setting(ARTIFACT_RECEIPTS_KEY)
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or_default()
 }
 
 impl GithubExporter {
@@ -190,6 +223,7 @@ impl GithubExporter {
             runner,
             failed_auto: Mutex::new(HashSet::new()),
             in_flight: Mutex::new(HashSet::new()),
+            writes: Mutex::new(()),
         }
     }
 
@@ -228,6 +262,7 @@ impl GithubExporter {
         let candidates: Vec<String> = {
             let mut db = self.lock_db();
             let receipts = read_receipts(&db);
+            let artifacts = read_artifact_receipts(&db);
             // Read once per round, beside the push receipts and for the same
             // reason: it is one settings row answering for every meeting.
             let enriched = crate::enrich::read_receipts(&db);
@@ -248,11 +283,18 @@ impl GithubExporter {
                     if u64::try_from(m.started_at_ms).unwrap_or(0) < since {
                         break 'pages;
                     }
-                    if m.state == "ready"
-                        && !receipts.contains_key(&m.id)
-                        && !skip.contains(&m.id)
-                        && export_ready(enriched.get(&m.id), m.updated_at, now)
+                    if m.state != "ready"
+                        || skip.contains(&m.id)
+                        || !export_ready(enriched.get(&m.id), m.updated_at, now)
                     {
+                        continue;
+                    }
+                    let changed = receipts.contains_key(&m.id)
+                        && db.export_meeting(&m.id).ok().is_some_and(|doc| {
+                            let version = ArtifactVersion::from_doc(&doc, &settings);
+                            version.has_files() && artifacts.get(&m.id) != Some(&version)
+                        });
+                    if !receipts.contains_key(&m.id) || changed {
                         owed.push(m.id);
                     }
                 }
@@ -412,7 +454,7 @@ impl GithubExport for GithubExporter {
     fn push(&self, meeting_id: &str) -> Result<GithubReceipt, GithubError> {
         // Snapshot under the lock, then let it go: the gh calls below take
         // seconds, and the auto worker shares this exporter with the UI.
-        let (settings, markdown, path, title, started_at_ms, existing) = {
+        let (settings, markdown, path, title, started_at_ms, existing, companions, version) = {
             let mut db = self.lock_db();
             let settings = read_settings(&db);
             if !settings.enabled {
@@ -440,6 +482,20 @@ impl GithubExport for GithubExporter {
                 },
                 |r| r.path.clone(),
             );
+            let version = ArtifactVersion::from_doc(&doc, &settings);
+            let stem = path.strip_suffix(".md").unwrap_or(&path);
+            let mut companions = Vec::new();
+            if let Some(summary) = doc.current_summary() {
+                companions.push((format!("{stem}.summary.md"), summary.body_md.clone()));
+            }
+            if let Some(row) = doc.documents.iter().max_by_key(|d| d.version) {
+                let draft: fotw_web::documents::SharingDocument =
+                    serde_json::from_str(&row.document_json).map_err(|_| {
+                        GithubError::Failed("the saved meeting document could not be read".into())
+                    })?;
+                // Only the latest saved brief, never private review notes or revision history.
+                companions.push((format!("{stem}.document.md"), draft.markdown));
+            }
             // Claimed before the Db lock is released: from here to the
             // receipt write the meeting belongs to this call, and a second
             // push — the worker and the button racing — answers immediately
@@ -455,13 +511,27 @@ impl GithubExport for GithubExporter {
             }
             drop(in_flight);
             let started = u64::try_from(meeting.started_at_ms).unwrap_or(0);
+            let mut markdown = doc.to_markdown();
+            if !companions.is_empty() {
+                markdown.push_str("\n## Meeting documents\n\n");
+                for (companion_path, _) in &companions {
+                    let label = if companion_path.ends_with(".summary.md") {
+                        "Summary"
+                    } else {
+                        "Saved document brief"
+                    };
+                    markdown.push_str(&format!("- [{label}]({})\n", basename(companion_path)));
+                }
+            }
             (
                 settings,
-                doc.to_markdown(),
+                markdown,
                 path,
                 meeting.title,
                 started,
                 existing,
+                companions,
+                version,
             )
         };
         // Everything below must release the claim on every exit.
@@ -473,11 +543,19 @@ impl GithubExport for GithubExporter {
             &title,
             started_at_ms,
             existing,
+            &companions,
+            &version,
         );
         self.in_flight
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(meeting_id);
+        if result.is_ok() {
+            self.failed_auto
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(meeting_id);
+        }
         result
     }
 
@@ -517,6 +595,10 @@ impl GithubExport for GithubExporter {
             })
             .collect();
 
+        let _write = self
+            .writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.preflight(&settings)?;
         let prefix = &settings.path_prefix;
         self.put_file(
@@ -580,6 +662,23 @@ impl GithubExporter {
         content: &str,
         subject: &str,
     ) -> Result<String, GithubError> {
+        for attempt in 0..3 {
+            match self.put_file_attempt(settings, path, content, subject) {
+                Err(GithubError::Failed(message))
+                    if attempt < 2 && mentions_http(&message, 409) => {}
+                result => return result,
+            }
+        }
+        unreachable!("the final attempt always returns")
+    }
+
+    fn put_file_attempt(
+        &self,
+        settings: &GithubSettings,
+        path: &str,
+        content: &str,
+        subject: &str,
+    ) -> Result<String, GithubError> {
         // Create or update? The Contents API wants the old blob's sha for an
         // update and refuses one for a create, so ask first.
         let probe_url = if settings.branch.is_empty() {
@@ -635,7 +734,13 @@ impl GithubExporter {
         title: &str,
         started_at_ms: u64,
         existing: Option<GithubReceipt>,
+        companions: &[(String, String)],
+        version: &ArtifactVersion,
     ) -> Result<GithubReceipt, GithubError> {
+        let _write = self
+            .writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.preflight(settings)?;
 
         let display_title = if title.trim().is_empty() {
@@ -649,6 +754,10 @@ impl GithubExporter {
             markdown,
             &format!("meeting transcript: {display_title}"),
         )?;
+
+        for (companion_path, content) in companions {
+            self.put_file(settings, companion_path, content, "meeting document")?;
+        }
 
         let receipt = GithubReceipt {
             repo: settings.repo.clone(),
@@ -666,6 +775,16 @@ impl GithubExporter {
         // what already happened, so both are loud rather than fatal.
         {
             let mut db = self.lock_db();
+            let mut artifacts = read_artifact_receipts(&db);
+            artifacts.insert(meeting_id.to_owned(), version.clone());
+            let artifact_json = serde_json::to_string(&artifacts)
+                .map_err(|_| GithubError::Failed("could not encode document receipts".into()))?;
+            db.put_setting(ARTIFACT_RECEIPTS_KEY, &artifact_json)
+                .map_err(|_| {
+                    GithubError::Failed(
+                        "files pushed but document receipt could not be saved".into(),
+                    )
+                })?;
             let mut receipts = read_receipts(&db);
             receipts.insert(meeting_id.to_owned(), receipt.clone());
             match serde_json::to_string(&receipts) {

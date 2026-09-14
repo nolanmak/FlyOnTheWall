@@ -36,6 +36,7 @@
 mod archive;
 mod db;
 mod delete;
+mod documents;
 mod error;
 pub mod export;
 mod ids;

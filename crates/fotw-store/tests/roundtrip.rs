@@ -46,6 +46,7 @@ const ALL_TABLES: &[&str] = &[
     "app_meta",
     "devices",
     "folders",
+    "meeting_documents",
     "meeting_participants",
     "meeting_tags",
     "meetings",
@@ -306,6 +307,10 @@ VALUES
   ('sum-1', 'mtg-1', 1, 'tpl-1', 'tr-1', 'anthropic', 'claude-opus-5', 'aa00', '# v1', 0.7, 100, 200, 300, 0, 90, 'dev-1'),
   ('sum-2', 'mtg-1', 2, NULL, NULL, 'ollama', 'llama3', 'bb11', '# v2', NULL, NULL, NULL, NULL, 0, 91, 'dev-1'),
   ('sum-3', 'mtg-1', 3, 'tpl-2', 'tr-2', 'anthropic', 'claude-sonnet-5', 'cc22', '# v3 café', 0.9999999999999999, 0, 0, 0, 1, 92, 'dev-2');
+
+INSERT INTO meeting_documents (id, meeting_id, version, document_json, created_at)
+VALUES ('doc-1', 'mtg-1', 1, '{"markdown":"draft café"}', 92),
+       ('doc-2', 'mtg-1', 2, '{"markdown":"edited draft"}', 93);
 
 INSERT INTO action_items (id, meeting_id, summary_id, kind, text, owner_person_id, owner_label, due_ms, due_raw, confidence, evidence_segment_ids, evidence_quote, status, created_at, updated_at, lamport, origin_device_id)
 VALUES ('ai-1', 'mtg-1', 'sum-3', 'action_item', 'Ship the exporter', 'per-1', 'Speaker 0', 1700100000000, 'end of next sprint', 'explicit', '["seg-2","seg-3"]', 'Let''s start.', 'open', 100, 101, 0, 'dev-1'),
@@ -1089,6 +1094,7 @@ fn every_column_of_every_table_appears_in_the_archive() {
         ("notes", &meeting, "notes"),
         ("note_anchors", &meeting, "note_anchors"),
         ("summaries", &meeting, "summaries"),
+        ("meeting_documents", &meeting, "documents"),
         ("action_items", &meeting, "action_items"),
         ("recordings", &meeting, "recordings"),
     ];

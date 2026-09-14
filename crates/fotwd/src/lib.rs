@@ -9,6 +9,7 @@
 pub mod audit;
 pub mod consent;
 pub mod detect;
+pub mod documents;
 pub mod engine;
 pub mod engine_control;
 pub mod enrich;
@@ -20,6 +21,7 @@ pub mod okf;
 pub mod onboard;
 pub mod persist;
 pub mod recording;
+mod recording_limit;
 pub mod recovery;
 pub mod retention;
 pub mod secrets;

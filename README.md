@@ -37,6 +37,12 @@ just run        # launches the .app via LaunchServices
 
 **Never run `./target/debug/fotwd` directly.** macOS attributes the TCC grant to the *responsible process*, so a binary launched from a terminal records under Ghostty/iTerm/Terminal's identity, not ours — and an unsigned binary can silently inherit the terminal's existing grant and appear to work while producing nothing for your users. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
+UI recordings automatically stop after two hours, with a visible countdown
+and a warning in the final five minutes. The deadline is enforced by the
+daemon even when the browser is closed, and checked again after laptop sleep.
+See [recording guardrails](docs/RECORDING_GUARDRAILS.md) for behavior and the
+proposed end-of-call detection policy.
+
 ### Your Recovery Key
 
 The meeting library is SQLCipher-encrypted with a 32-byte key that lives in the OS keychain. On first run FlyOnTheWall shows you a **Recovery Key** — `fotw1-` followed by eight groups of four — and will not create the library until you have typed two of those groups back. It is not a formality:
@@ -57,3 +63,14 @@ Automation with no terminal refuses to create a library rather than mint one who
 ## License
 
 Apache-2.0 (planned) — permissive, compatible with every identified dependency, with a patent grant and a NOTICE mechanism for vendored attribution. No GPL/AGPL code enters the tree.
+
+### Shareable meeting documents
+
+Finished meetings can prepare an editable document shaped by the conversation's
+purpose: a video brief, client recap, project plan, or another suitable format.
+Click **Create & download .md** to generate and automatically download a document.
+Use **Customize** for purpose and audience, **Review or edit** for changes, or
+**Print / PDF** to save a PDF. Automatic
+drafts use your configured summary engine and can be turned off in that panel.
+Original recordings stay intact. Downloads are explicit; configured GitHub auto-export also syncs saved briefs and summaries. See
+[Sharing documents](docs/SHARING_DOCUMENTS.md) for behavior and limits.

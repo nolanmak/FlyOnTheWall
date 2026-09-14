@@ -37,6 +37,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "app_meta",
     "devices",
     "folders",
+    "meeting_documents",
     "meeting_participants",
     "meeting_tags",
     "meetings",

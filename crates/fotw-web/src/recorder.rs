@@ -44,6 +44,10 @@ pub enum RecordingState {
 /// What the recorder is doing, with the timings the UI renders.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingStatus {
+    /// Scheduled automatic stop, in epoch milliseconds; absent for older
+    /// recorders and while idle. Enforced by the daemon, not the browser.
+    #[serde(default)]
+    pub auto_stop_at_ms: Option<u64>,
     /// Idle, recording or finishing. Never absent: the UI switches on this
     /// word and has no fourth case to guess.
     pub state: RecordingState,
@@ -84,6 +88,7 @@ impl RecordingStatus {
     pub fn idle() -> Self {
         Self {
             state: RecordingState::Idle,
+            auto_stop_at_ms: None,
             started_at_ms: None,
             elapsed_ms: None,
             ended_at_ms: None,
@@ -96,6 +101,7 @@ impl RecordingStatus {
     pub fn recording(started_at_ms: u64, elapsed_ms: u64) -> Self {
         Self {
             state: RecordingState::Recording,
+            auto_stop_at_ms: None,
             started_at_ms: Some(started_at_ms),
             elapsed_ms: Some(elapsed_ms),
             ended_at_ms: None,
@@ -112,11 +118,19 @@ impl RecordingStatus {
     pub fn finishing(started_at_ms: u64, ended_at_ms: u64) -> Self {
         Self {
             state: RecordingState::Finishing,
+            auto_stop_at_ms: None,
             started_at_ms: Some(started_at_ms),
             elapsed_ms: Some(ended_at_ms.saturating_sub(started_at_ms)),
             ended_at_ms: Some(ended_at_ms),
             transcription_error: None,
         }
+    }
+
+    /// Attach the daemon's recording deadline.
+    #[must_use]
+    pub fn with_auto_stop_at_ms(mut self, deadline: u64) -> Self {
+        self.auto_stop_at_ms = Some(deadline);
+        self
     }
 
     /// Attach the provider's last failure, if there is one.

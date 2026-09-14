@@ -477,6 +477,12 @@ async fn serve_until_stopped(root: PathBuf, launch: Launch, port: u16) -> Result
     .await
     .map_err(|e| format!("could not bind 127.0.0.1: {e}"))?;
 
+    if let (Ok(db), Ok(store)) = (crate::open_library(&root), crate::secrets::keystore()) {
+        server
+            .state()
+            .set_documents(Arc::new(crate::documents::Documents::new(db, store)));
+    }
+
     let addr = server.addr();
     let state = server.state().clone();
 

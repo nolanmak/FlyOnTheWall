@@ -1,0 +1,105 @@
+# Purpose-aware sharing documents
+
+Open a finished meeting and use **Meeting document**. The configured summary
+engine reads the transcript and notes to infer the meeting's purpose and audience.
+For example, a creative call can produce a production brief, a client call a recap,
+and a design meeting a decision record. Optional purpose and audience fields let
+reviewers steer a new draft. New creative proposals are labeled as suggestions;
+uncertain owners, dates, and decisions should remain open questions.
+
+Automatic drafts are enabled by default for meeting enrichment, using the existing
+approved summary engine. The checkbox in this panel turns that off globally.
+There is no new provider or login. With no engine configured, no document is sent
+for generation; an older meeting can be processed with **Create & download .md** after
+configuring an engine. Existing drafts are never automatically replaced. This
+adds one model call per eligible meeting, with one repair attempt for invalid output.
+Both calls share a five-minute deadline. Failed
+automatic attempts can be retried manually; there is no separate retry queue.
+
+## Create and download
+
+**Create & download .md** generates the draft, saves it in the meeting, and starts
+one Markdown download automatically when generation succeeds. The file goes to
+the browser's configured download folder (normally Downloads). A failed generation
+never downloads an empty file. If a download cannot start, the saved draft stays
+available and **Download .md** retries without another model call.
+
+For a meeting with a saved draft, the main button is **Download .md**. After editing,
+it becomes **Save & download .md**, saving a revision before downloading the edited
+copy. Reopening a meeting or finishing automatic background generation does not
+trigger unsolicited or duplicate downloads.
+
+**Customize** contains optional purpose, audience, transcript inclusion, automatic
+draft settings, and **Create new draft & download .md**. **Review or edit** contains
+the Markdown editor, review notes, and transcript excerpt checkboxes. Uncheck
+additional excerpts to leave them out; the original meeting remains intact.
+**Remember name correction** stores a meeting-specific spelling correction and
+updates the summary and saved brief. Regeneration keeps the correction. Source
+names in browser sharing copies appear in brackets; the original transcript is
+unchanged. See [attendee context and name repair](MEETING_CONTEXT.md).
+
+**Print / PDF** opens the browser print dialog; choose **Save as PDF**. Only the
+reviewed document prints; navigation, the full source transcript, and review-only
+notes are excluded. PDF uses the browser print dialog, not an automatic PDF file
+download. Browser print headers/footers can be disabled in that dialog.
+
+Exports use elapsed `HH:MM:SS` and actual Eastern time (`America/New_York`, EST or
+EDT according to the timestamp), calculated from capture start plus segment offset.
+The full date is included so midnight and repeated DST hours remain unambiguous.
+For mic-only meetings, excerpts are labeled **Call audio**, since that microphone
+may have captured multiple people.
+
+The model proposes an end boundary and ranges of unrelated/private conversation
+to omit. Those indices are validated before exact source wording is copied. This
+is a reviewable sharing edition, not a guarantee of perfect redaction or an edit
+to the original recording. Omitted spans are explicitly marked. No document is emailed automatically.
+
+## GitHub sync
+
+When GitHub export is enabled, a push also writes the current summary to
+`<meeting>.summary.md` and the latest saved document brief to
+`<meeting>.document.md`, alongside the existing full transcript Markdown.
+The document companion contains the brief only; selected transcript excerpts are
+included in browser downloads when selected. Review notes, unsaved edits, and old
+document revisions are never included in companion files.
+
+In auto mode, saved document revisions and new summary versions are synchronized
+on the next worker pass (normally within a minute). Existing eligible meetings
+receive missing companion files. The original auto-start cutoff still applies:
+enabling auto does not publish the older archive. Manual mode only syncs when
+**Push to GitHub** is clicked. Files keep stable paths; failed pushes can be retried
+manually. GitHub export is an archive, so its original transcript file still
+contains the full recording even when a sharing draft omits private tangents.
+
+## Implementation and boundaries
+
+- `fotwd::documents` shares the existing engine adapters, transport allowlist and
+  CLI read shield. Provider error content is not exposed by document errors.
+- `POST /api/meetings/{id}/document` supports `load`, `generate`, `save`, and
+  `configure`, behind the same bearer/origin/host ingress guard as meetings.
+- Manual generation is limited to one simultaneous request per daemon controller.
+  It never holds the database mutex during model work. Optimistic revisions reject
+  stale saves or a racing generation result. Enrichment independently refuses to
+  replace a document another window created while its model ran.
+- Migration 0004 stores append-only JSON snapshots in `meeting_documents`, with a
+  meeting foreign key and cascade deletion. A snapshot contains the prose and
+  selected source excerpts, so later source changes do not alter an existing draft.
+  All revisions travel in JSON/library archives. The UI shows the newest revision;
+  previous revisions are retained in the library/archive, not a history picker.
+- Transcripts above 200 KB of text or 4,000 segments are refused explicitly; they
+  are never silently truncated. Model JSON, source indices, ranges, factual-section
+  evidence and output completeness are validated. Evidence-index validation does
+  not prove every generated claim; the human review remains necessary.
+- Drafts and unsaved edits remain available while navigating meetings in the same
+  page. Save before refreshing or closing the tab. Interrupted generation can be
+  retried; the last saved revision remains available.
+
+## Verification
+
+Rust tests cover request validation and authentication, intact source wording,
+invalid and excluded evidence, truncated output, automatic-generation skips,
+revision conflicts, cascade deletion, and lossless library archive round-trips.
+`node --test crates/fotw-web/tests/ui/*.cjs` checks Eastern timestamps through DST,
+omission markers, reviewer exclusions, and Markdown escaping for source excerpts.
+Browser QA exercises edit/selection/save and reviews a multi-page printed document,
+including Unicode and exclusion of surrounding library content.

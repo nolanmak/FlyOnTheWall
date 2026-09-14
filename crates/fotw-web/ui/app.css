@@ -480,3 +480,70 @@ section {
     margin-right: 8px;
   }
 }
+/* The automatic stop is always visible while recording; the last five
+   minutes are emphasized without relying on browser notifications. */
+.recording-limit {
+  margin: 0;
+  padding: 0.6rem 1rem;
+  background: #fff4d6;
+  color: #493100;
+}
+.recording-limit.ending-soon {
+  background: #ffdf8c;
+  color: #493100;
+  font-weight: 600;
+}
+
+/* Purpose-aware sharing drafts and a dedicated, transcript-safe print surface. */
+.sharing-panel { margin: 1.5rem 0; padding: 1.25rem; border: 1px solid var(--border, #d9dde4); border-radius: 12px; }
+.sharing-panel h3 { margin-top: 0; }
+.document-preferences { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1rem 0; }
+.document-field { display: flex; flex-direction: column; gap: .4rem; font-size: .85rem; }
+.document-field input { padding: .65rem; width: 100%; box-sizing: border-box; }
+.document-check { display: flex; align-items: flex-start; gap: .65rem; margin: .7rem 0; line-height: 1.45; }
+.document-check input { flex: 0 0 auto; margin-top: .25rem; }
+.document-actions { display: flex; flex-wrap: wrap; gap: .6rem; margin: 1rem 0; }
+.document-status { font-size: .9rem; }
+.document-review { padding: .8rem 1rem; border-left: 3px solid #b38427; background: rgba(190,150,45,.08); }
+.document-edit, .document-selection { margin: 1rem 0; }
+.document-edit textarea { display: block; width: 100%; height: 24rem; padding: .8rem; box-sizing: border-box; font: 13px/1.6 ui-monospace, monospace; margin: 1rem 0; }
+.document-selection[open] { max-height: 26rem; overflow-y: auto; padding-right: .5rem; }
+.document-selection .document-check { font-size: .85rem; padding: .5rem 0; border-bottom: 1px solid #d9dde4; }
+.sharing-preview { color: #162239; background: white; padding: 2rem; border: 1px solid #d9dde4; line-height: 1.65; overflow-wrap: anywhere; }
+.sharing-preview h1, #sharing-print h1 { font-size: 1.9rem; line-height: 1.2; margin-top: 0; }
+.sharing-preview h2, #sharing-print h2 { font-size: 1.25rem; margin: 1.8rem 0 .6rem; }
+.document-date, .document-stamp, .document-omission { color: #536176; font-size: .8rem; }
+.document-excerpt { margin: 1.2rem 0; }
+.document-excerpt p { margin: .2rem 0; white-space: pre-wrap; }
+#sharing-print { display: none; }
+@media (max-width: 700px) {
+  .document-preferences { grid-template-columns: 1fr; }
+  .sharing-preview { padding: 1rem; }
+}
+@media print {
+  @page { size: auto; margin: 18mm 18mm 20mm; }
+  html, body { display: block !important; height: auto !important; overflow: visible !important; background: white !important; color: #162239 !important; }
+  body > *:not(#sharing-print) { display: none !important; }
+  #sharing-print { display: block !important; font: 10.5pt/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; overflow-wrap: anywhere; }
+  #sharing-print h1, #sharing-print h2, #sharing-print h3, #sharing-print .document-stamp { break-after: avoid; }
+  #sharing-print p, #sharing-print li { orphans: 3; widows: 3; }
+  #sharing-print li { margin: .35em 0; }
+  #sharing-print .document-transcript { break-before: page; }
+  #sharing-print .document-omission { font-style: italic; }
+}
+.sharing-panel button { padding: .55rem .85rem; border: 1px solid #606e81; border-radius: 6px; cursor: pointer; font: inherit; font-size: .85rem; background: #253449; color: #f4f7fb; }
+.sharing-panel button:hover:not(:disabled) { background: #344963; }
+.sharing-panel button:disabled { opacity: .5; cursor: default; }
+.sharing-panel input:focus-visible, .sharing-panel button:focus-visible, .sharing-panel textarea:focus-visible { outline: 2px solid #74baff; outline-offset: 2px; }
+.sharing-preview h1, #sharing-print h1 { white-space: normal; }
+.sharing-preview .document-transcript { padding: 0; overflow: visible; }
+@media print {
+  html, body { padding: 0 !important; margin: 0 !important; max-width: none !important; color-scheme: light; }
+  #sharing-print section { padding: 0; margin: 0; overflow: visible; }
+}
+.document-options { margin: 1rem 0; }
+.document-options > summary, .document-edit > summary { cursor: pointer; font-weight: 600; }
+.document-options[open] { padding-bottom: .8rem; }
+.sharing-panel .document-primary { background: var(--accent); color: var(--bg); border-color: var(--accent); font-weight: 600; }
+.sharing-panel .document-primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent); }
+.document-review { margin-top: 1rem; }

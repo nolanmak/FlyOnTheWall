@@ -243,6 +243,11 @@ where
         outcome.coverage.cited_claims as f64 / outcome.coverage.total_claims as f64
     };
 
+    markdown = fotw_web::documents::corrected_names(
+        &markdown,
+        &crate::documents::name_corrections(db, meeting_id),
+    );
+
     // Versioned, never overwritten. A user regenerating with a different
     // template must be able to compare, and losing the previous version to do
     // that would make the feature actively worse than not having it.
@@ -283,15 +288,15 @@ where
 /// one place: the title call (#76) needs the same construction with a
 /// different deadline, and a second copy of it is a second place for the codex
 /// read shield to be forgotten.
-struct EngineAdapters {
+pub(crate) struct EngineAdapters {
     /// Call A's adapter, and the whole of the title call's.
-    prose: Box<dyn fotw_summarize::adapter::LlmAdapter>,
+    pub(crate) prose: Box<dyn fotw_summarize::adapter::LlmAdapter>,
     /// Call B's.
     extraction: Box<dyn fotw_summarize::adapter::LlmAdapter>,
     /// What the summary row records as its provider.
     provider: &'static str,
     /// What the summary row records as its model.
-    model: String,
+    pub(crate) model: String,
 }
 
 /// Build both adapters for `engine`, giving any subprocess `deadline`.
@@ -301,7 +306,7 @@ struct EngineAdapters {
 /// and the subscription's own configured default model: the plan's model
 /// choice belongs to the user, and hardcoding a tier here would fight their
 /// settings.
-fn engine_adapters<T>(
+pub(crate) fn engine_adapters<T>(
     engine: &crate::engine::Engine,
     transport: &Arc<T>,
     prose_model: &str,

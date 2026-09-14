@@ -207,9 +207,9 @@ impl std::fmt::Debug for DaemonRecorder {
 ///
 /// Not unbounded: `retention::recording_in_flight` vetoes the sweeper while a
 /// session is alive, so a browser tab closed and forgotten would disable
-/// retention indefinitely as well as fill the disk. Eight hours is longer than
-/// any meeting and shorter than a weekend.
-pub const UI_CEILING: Duration = Duration::from_secs(8 * 60 * 60);
+/// retention indefinitely as well as fill the disk. Two hours bounds an
+/// unattended meeting; the session also checks wall time across laptop sleep.
+pub const UI_CEILING: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// How long `start()` waits for capture to actually begin before calling it a
 /// failure.
@@ -498,7 +498,7 @@ impl RecorderControl for DaemonRecorder {
             ));
         }
 
-        Ok(RecordingStatus::recording(started_at_ms, 0))
+        Ok(self.status())
     }
 
     fn stop(&self) -> Result<RecordingStatus, RecorderError> {
@@ -533,6 +533,10 @@ impl RecorderControl for DaemonRecorder {
             // indistinguishable from a quiet meeting exactly when someone goes
             // looking for the words.
             .with_transcription_error(live.errors.latest())
+            .with_auto_stop_at_ms(
+                live.started_at_ms
+                    .saturating_add(u64::try_from(self.ceiling.as_millis()).unwrap_or(u64::MAX)),
+            )
         })
     }
 }
@@ -553,6 +557,14 @@ async fn spawn_session(
 ) {
     let outcome =
         session::run_with_control(&root, system, mic, transcription, ceiling, control).await;
+
+    // A timer stop needs the same frozen clock as pressing Stop. Otherwise
+    // encoding a long recording keeps showing a live microphone and timer.
+    if let Some(session) = live.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+        && session.started_at_ms == started_at_ms
+    {
+        session.stopped_at_ms.get_or_insert(now_ms());
+    }
 
     // The meeting's id once it is genuinely in the library. `None` covers a
     // recording that failed and a session that persisted nothing.

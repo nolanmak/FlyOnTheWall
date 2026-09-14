@@ -274,7 +274,13 @@ pub async fn enrich_meeting_with(
                     )
                     .await;
                 }
-                summarize(db, &engine, meeting_id, &mut report).await
+                let outcome = summarize(db, &engine, meeting_id, &mut report).await;
+                if let Err(error) =
+                    crate::documents::prepare_automatic(db, &engine, meeting_id).await
+                {
+                    report.problems.push(format!("sharing document: {error}"));
+                }
+                outcome
             }
         };
         // Best-effort, per the module docs: a report that could not be stored

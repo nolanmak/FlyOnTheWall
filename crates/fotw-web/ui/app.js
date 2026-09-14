@@ -36,6 +36,7 @@ const el = {
   consentLabel: document.getElementById("consent-label"),
   record: document.getElementById("record"),
   recording: document.getElementById("recording"),
+  recordingLimit: document.getElementById("recording-limit"),
   ghSettings: document.getElementById("gh-settings"),
   ghRepo: document.getElementById("gh-repo"),
   ghBranch: document.getElementById("gh-branch"),
@@ -252,6 +253,8 @@ function renderDetail(detail) {
 
   const actions = actionsRow(detail);
   if (actions) el.detail.appendChild(actions);
+
+  mountSharingDocument(detail, el.detail);
 
   // Notes first, and above the summary, because they are the user's own words
   // and the summary is a derived artifact. Search has always indexed notes, so
@@ -614,6 +617,7 @@ const FINISHING_POLL_MS = 1000;
 // with anything else.
 let recState = "idle";
 let recordingSince = null;
+let autoStopAt = null;
 let clockTimer = null;
 let finishingTimer = null;
 // How long the last meeting ran. Kept after the state falls back to idle: the
@@ -635,6 +639,18 @@ function formatElapsed(ms) {
 function paintClock() {
   if (!recordingSince) return;
   el.elapsed.textContent = formatElapsed(Date.now() - recordingSince);
+  paintRecordingLimit();
+}
+
+function paintRecordingLimit() {
+  const visible = recState === "recording" && typeof autoStopAt === "number";
+  el.recordingLimit.hidden = !visible;
+  if (!visible) return;
+  const remaining = Math.max(0, autoStopAt - Date.now());
+  el.recordingLimit.classList.toggle("ending-soon", remaining <= 5 * 60 * 1000);
+  el.recordingLimit.textContent = remaining === 0
+    ? "Recording limit reached — waiting for the recorder to stop."
+    : "Auto-stop in " + formatElapsed(remaining) + ". If your call has ended, press Stop now.";
 }
 
 function stopClock() {
@@ -679,6 +695,7 @@ function showRecordingControls(visible) {
   el.consentLabel.hidden = !visible;
   if (!visible) {
     el.recording.hidden = true;
+    el.recordingLimit.hidden = true;
     // Nothing left to poll for: a build with no recorder answers 404 forever.
     stopFinishingPoll();
   }
@@ -704,6 +721,8 @@ function renderRecording(body) {
   // word must never be the one that leaves a clock running.
   recState =
     body.state === "recording" || body.state === "finishing" ? body.state : "idle";
+  autoStopAt = body.auto_stop_at_ms ?? null;
+  paintRecordingLimit();
   showRecordingControls(true);
 
   el.recording.hidden = recState === "idle";

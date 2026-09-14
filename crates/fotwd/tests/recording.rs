@@ -166,6 +166,28 @@ async fn a_fresh_recorder_is_idle() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_unattended_recording_stops_and_freezes_while_saving() {
+    let root = tmpdir("automatic-stop");
+    let gate = Arc::new(Gate::default());
+    let rec = gated_recorder(&root.join("sessions"), Arc::clone(&gate));
+    let started = rec.start().expect("start");
+    assert_eq!(
+        started.auto_stop_at_ms,
+        started.started_at_ms.map(|t| t + 5000)
+    );
+    let reached = until(|| gate.reached()).await;
+    let finishing = rec.status();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let later = rec.status();
+    gate.open();
+    assert!(reached, "the deadline must finalize without pressing Stop");
+    assert_eq!(finishing.state, RecordingState::Finishing);
+    assert_eq!(finishing.elapsed_ms, later.elapsed_ms);
+    assert!(finishing.ended_at_ms.is_some());
+    assert!(until(|| !rec.status().is_active()).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn starting_reports_recording_and_writes_the_audit_entry() {
     let root = tmpdir("start");
     let rec = recorder(&root.join("sessions"), Arc::new(AtomicU64::new(0)));

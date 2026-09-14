@@ -26,8 +26,8 @@ fn a_fresh_database_lands_on_the_latest_version() {
     let db = Db::open(&path, &test_key()).unwrap();
     assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
     assert_eq!(
-        LATEST_SCHEMA_VERSION, 3,
-        "0001 initial schema, 0002 fts5 search indexes, 0003 enrich report"
+        LATEST_SCHEMA_VERSION, 4,
+        "0001 initial schema, 0002 fts5 search indexes, 0003 enrich report, 0004 sharing documents"
     );
 }
 

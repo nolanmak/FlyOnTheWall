@@ -27,6 +27,7 @@
       <span id="elapsed" class="elapsed" hidden>0:00</span>
       <span id="live" class="live" hidden>live</span>
     </header>
+    <p id="recording-limit" class="recording-limit" hidden></p>
     <main>
       <nav id="list" aria-label="Meetings"></nav>
       <section id="detail" aria-live="polite"></section>
@@ -34,7 +35,7 @@
     <details id="gh-settings" class="gh-settings" hidden>
       <summary>GitHub export</summary>
       <p class="gh-note">
-        Commits a finished meeting's Markdown export to a repository of yours,
+        Commits the full transcript, summary, and saved document brief as Markdown to a repository of yours,
         using your own <code>gh</code> login. Nothing is sent until this is
         enabled.
       </p>
@@ -116,6 +117,7 @@
       <p id="sum-status" class="gh-note"></p>
     </details>
     <p id="status" role="status"></p>
+    <script src="/assets/documents.js"></script>
     <script src="/assets/app.js"></script>
   </body>
 </html>

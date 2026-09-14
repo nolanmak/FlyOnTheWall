@@ -33,6 +33,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # The pipeline must be provable with no audio device and no GUI.
       - run: cargo test --workspace
+      - run: node --test crates/fotw-web/tests/ui/*.cjs
 
   deny:
     runs-on: ubuntu-latest

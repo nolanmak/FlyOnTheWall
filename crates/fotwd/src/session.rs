@@ -1286,7 +1286,9 @@ pub async fn run_with_control(
     // cancel-safe: a dropped `sleep` is a dropped timer, and a dropped
     // `wait()` is a dropped `Notified` registration.
     tokio::select! {
-        () = tokio::time::sleep(duration) => {}
+        () = crate::recording_limit::wait(duration, started_at_ms) => {
+            crate::journal::record("recording: automatically stopped at the session time limit");
+        }
         () = stop_signal.wait() => {}
     }
 

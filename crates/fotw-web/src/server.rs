@@ -193,6 +193,10 @@ fn routes(state: AppState) -> Router {
         // wraps it: what this answers is a description of the user's library
         // and machine, and a route added outside would answer without a bearer.
         .route("/api/health", get(api::health))
+        .route(
+            "/api/meetings/{id}/document",
+            axum::routing::post(api::document),
+        )
         .route("/api/recording/status", get(api::recording_status))
         .route("/api/recording/start", post(api::recording_start))
         .route("/api/recording/stop", post(api::recording_stop))
