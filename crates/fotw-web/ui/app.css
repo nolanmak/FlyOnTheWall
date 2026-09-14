@@ -546,4 +546,17 @@ section {
 .document-options[open] { padding-bottom: .8rem; }
 .sharing-panel .document-primary { background: var(--accent); color: var(--bg); border-color: var(--accent); font-weight: 600; }
 .sharing-panel .document-primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent); }
+/* The wait between Create and the file arriving is a model call, so it gets motion,
+   not just a line of text. Drawn in currentColor so it follows both themes. */
+.document-status.is-busy { display: flex; align-items: center; gap: .5rem; }
+.document-spinner, .sharing-panel .document-primary.is-busy::before { flex: 0 0 auto; width: .9em; height: .9em; box-sizing: border-box; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: document-spin .8s linear infinite; }
+.sharing-panel .document-primary.is-busy { display: inline-flex; align-items: center; gap: .5rem; cursor: progress; }
+.sharing-panel .document-primary.is-busy::before { content: ""; }
+/* Disabled while working, but it is the thing working: don't fade it to "unavailable". */
+.sharing-panel .document-primary.is-busy:disabled { opacity: .85; }
+@keyframes document-spin { to { transform: rotate(360deg); } }
+@keyframes document-pulse { 50% { opacity: .3; } }
+@media (prefers-reduced-motion: reduce) {
+  .document-spinner, .sharing-panel .document-primary.is-busy::before { border-right-color: currentColor; animation: document-pulse 1.6s ease-in-out infinite; }
+}
 .document-review { margin-top: 1rem; }

@@ -109,6 +109,22 @@ test('create downloads exactly once after generation succeeds, never merely on l
   w.mount('meeting'); await flush();
   assert.equal(w.downloads.length, 1, 'reopening a meeting must not download again');
 });
+test('a spinner shows while the document is being made and stops once the download starts', async () => {
+  const w = workflow(); w.mount('meeting');
+  assert.equal(w.find('span')?.className, 'document-spinner', 'loading the saved draft shows the status spinner');
+  assert.doesNotMatch(w.button('Create & download .md').className, /is-busy/, 'a load is not a download');
+  await flush();
+  assert.equal(w.find('span'), undefined, 'an idle panel has no spinner');
+  let finish;
+  w.respond(req => req.action === 'generate' ? new Promise(resolve => {finish = resolve;}) : savedState());
+  const creating = w.button('Create & download .md').click();
+  assert.equal(w.find('span')?.className, 'document-spinner');
+  assert.match(w.button('Create & download .md').className, /\bis-busy\b/);
+  finish(savedState()); await creating;
+  assert.equal(w.downloads.length, 1);
+  assert.equal(w.find('span'), undefined, 'the spinner stops once the file is handed to the browser');
+  assert.doesNotMatch(w.button('Download .md').className, /is-busy/);
+});
 test('failed generation downloads nothing; retry uses the same simple button', async () => {
   const w = workflow();w.mount('meeting');await flush();
   w.respond(() => ({error:'Generation failed'}));

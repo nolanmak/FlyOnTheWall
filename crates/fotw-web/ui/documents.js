@@ -126,7 +126,7 @@ function mountSharingDocument(detail, host) {
   }
   async function run(body, label, download = false) {
     if (editor.busy) return;
-    editor.busy = true; editor.message = label; editor.render();
+    editor.busy = true; editor.downloading = download; editor.message = label; editor.render();
     try {
       const state = await sharingRequest(id, body);
       if (body.action === "configure") editor.automatic = state.automatic;
@@ -138,7 +138,7 @@ function mountSharingDocument(detail, host) {
         await openMeeting(id);
       }
     } catch (e) { editor.message = e.message === "request failed" ? "Could not load or save the document. Check the connection and retry." : e.message; }
-    editor.busy = false; editor.render();
+    editor.busy = false; editor.downloading = false; editor.render();
   }
   function button(label, handler, disabled = false) {
     const b = text("button", label); b.type = "button"; b.disabled = disabled;
@@ -180,7 +180,8 @@ function mountSharingDocument(detail, host) {
         excluded_indices: Array.from(editor.excluded)}, "Saving your changes…", true);
       startDownload(); editor.render();
     });
-    primary.className = "document-primary";
+    // The spinner is CSS on the button itself, so the label stays the button's whole text.
+    primary.className = editor.busy && editor.downloading ? "document-primary is-busy" : "document-primary";
     const updatePrimary = () => {
       primary.textContent = !editor.document ? "Create & download .md"
         : editor.dirty ? "Save & download .md" : "Download .md";
@@ -190,7 +191,13 @@ function mountSharingDocument(detail, host) {
     if (editor.document) actions.appendChild(button("Print / PDF", () => printSharingDocument(editor), editor.busy));
     if (!editor.loaded && !editor.busy) actions.appendChild(button("Retry", () => run({action: "load"}, "Loading document…"), editor.busy));
     panel.appendChild(actions);
-    const status = text("p", editor.message, "document-status"); status.setAttribute("role", "status"); panel.appendChild(status);
+    const status = document.createElement("p"); status.className = editor.busy ? "document-status is-busy" : "document-status";
+    status.setAttribute("role", "status");
+    if (editor.busy) {
+      const spinner = document.createElement("span"); spinner.className = "document-spinner";
+      spinner.setAttribute("aria-hidden", "true"); status.appendChild(spinner);
+    }
+    status.appendChild(document.createTextNode(editor.message)); panel.appendChild(status);
 
     const options = document.createElement("details"); options.className = "document-options";
     options.open = Boolean(editor.optionsOpen);
