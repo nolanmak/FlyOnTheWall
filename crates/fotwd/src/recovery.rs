@@ -218,15 +218,25 @@ fn preamble(ceremony: &mut dyn Ceremony, first_run: bool) {
     ceremony.tell("");
     ceremony.tell("  ─── Your Recovery Key ─────────────────────────────────────────");
     ceremony.tell("");
+    // The audio sentences are not optional hedging. This copy once said the
+    // audio was encrypted, and it is not (#56): only the SQLCipher database
+    // is. Someone who believes otherwise backs up or syncs the folder and
+    // hands other people's voices to whoever can read the copy.
     if first_run {
-        ceremony.tell("  FlyOnTheWall has just created your meeting library. Everything in");
-        ceremony.tell("  it — transcripts, notes, summaries, audio — is encrypted with a key");
-        ceremony.tell("  stored in your keychain.");
+        ceremony.tell("  FlyOnTheWall has just created your meeting library. Its database —");
+        ceremony.tell("  transcripts, notes, summaries — is encrypted with a key stored in");
+        ceremony.tell("  your keychain.");
+        ceremony.tell("");
+        ceremony.tell("  Recorded audio is NOT encrypted yet. Until a meeting is archived,");
+        ceremony.tell("  its raw audio and transcript sit in sessions/; after that its audio");
+        ceremony.tell("  is stored as .opus files in media/. Anyone who can read the library");
+        ceremony.tell("  folder, or a backup of it, can play those recordings.");
     } else {
-        ceremony.tell("  Your library already exists and is already encrypted. It has never");
-        ceremony.tell("  had a Recovery Key, so it is one lost keychain entry away from being");
-        ceremony.tell("  unreadable forever. This fixes that, and does not re-encrypt or move");
-        ceremony.tell("  a single byte of your data.");
+        ceremony.tell("  Your library database already exists and is already encrypted. It");
+        ceremony.tell("  has never had a Recovery Key, so it is one lost keychain entry away");
+        ceremony.tell("  from being unreadable forever. This fixes that, and does not");
+        ceremony.tell("  re-encrypt or move a single byte of your data. Recorded audio in");
+        ceremony.tell("  sessions/ and media/ stays unencrypted; this does not change that.");
     }
     ceremony.tell("");
     ceremony.tell("  If that keychain entry is ever lost — a wiped machine, a restore onto");
@@ -599,6 +609,44 @@ mod tests {
         assert_ne!(UNATTENDED_VALUE, "1");
         assert_ne!(UNATTENDED_VALUE, "true");
         assert!(UNATTENDED_VALUE.len() > 10);
+    }
+
+    /// Both branches of the preamble, because both are a user's first sight of
+    /// what the library protects. See the comment in [`preamble`] for why the
+    /// audio has to be named as unencrypted rather than left unmentioned.
+    #[test]
+    fn the_ceremony_copy_never_claims_the_audio_is_encrypted() {
+        #[derive(Default)]
+        struct Said(Vec<String>);
+        impl Ceremony for Said {
+            fn is_interactive(&self) -> bool {
+                true
+            }
+            fn tell(&mut self, text: &str) {
+                self.0.push(text.to_lowercase());
+            }
+            fn reveal(&mut self, _: &SecretString) {}
+            fn ask_group(&mut self, _: usize, _: usize) -> std::io::Result<String> {
+                Ok(String::new())
+            }
+            fn ask_acknowledgement(&mut self, _: &str) -> std::io::Result<String> {
+                Ok(String::new())
+            }
+        }
+
+        for first_run in [true, false] {
+            let mut said = Said::default();
+            preamble(&mut said, first_run);
+            let text = said.0.join(" ");
+            assert!(
+                text.contains("not encrypted") || text.contains("unencrypted"),
+                "first_run={first_run}: the copy never says the audio is unencrypted:\n{text}"
+            );
+            assert!(
+                !text.contains("audio is encrypted") && !text.contains("summaries, audio"),
+                "first_run={first_run}: the copy claims the audio is encrypted:\n{text}"
+            );
+        }
     }
 
     #[test]
