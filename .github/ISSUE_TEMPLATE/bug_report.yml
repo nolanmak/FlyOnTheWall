@@ -1,0 +1,124 @@
+name: Bug report
+description: Something in FlyOnTheWall does not work the way it is documented to.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## This issue is public. Keep meeting data and secrets out of it.
+
+        **Never paste transcripts, recordings, meeting titles, attendee names, API keys, Recovery Keys, or unredacted `fotwd.log` / `audit.jsonl` content.** The people in your meetings did not agree to be published. Describe the problem with made-up examples instead, and redact any log line before pasting it.
+
+        **Security vulnerabilities do not belong here.** Report them privately as described in [SECURITY.md](https://github.com/nolanmak/FlyOnTheWall/blob/main/SECURITY.md).
+
+  - type: checkboxes
+    id: data-check
+    attributes:
+      label: Before you submit
+      options:
+        - label: This report contains no transcripts, recordings, meeting titles, attendee names, API keys, Recovery Keys, or unredacted log content.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, including any error message shown in the dashboard or the terminal (redacted).
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence that shows the problem. Use synthetic meetings where you can.
+      placeholder: |
+        1. Start the app with `just run`
+        2. Start a recording from the dashboard
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: false
+
+  - type: input
+    id: macos-version
+    attributes:
+      label: macOS version
+      description: From Apple menu > About This Mac. Include the build number and whether it is Apple silicon or Intel.
+      placeholder: macOS 15.6 (24G84), Apple silicon
+    validations:
+      required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: There are no releases yet. Paste the output of `git rev-parse --short HEAD` from your checkout.
+      placeholder: 38480be
+    validations:
+      required: false
+
+  - type: dropdown
+    id: how-started
+    attributes:
+      label: How was the app started?
+      description: >-
+        This matters for anything involving capture. macOS attributes the audio
+        permission to whatever launched the process, so the same build can
+        behave differently depending on how it was started (see CONTRIBUTING.md).
+      options:
+        - just run
+        - Double-clicked FlyOnTheWall.app
+        - fotwd serve, run from a terminal
+        - fotwd record, run from a terminal
+        - fotw doctor or fotw record
+        - Another fotwd subcommand (say which below)
+        - fotwd mcp, started by an MCP client
+        - Other (say how below)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Capture (system audio or microphone)
+        - Transcription
+        - Titles, summaries or meeting documents
+        - Dashboard (web UI)
+        - Library, keychain or Recovery Key
+        - Export or import (including GitHub export)
+        - Consent, detection or the recording time limit
+        - Build, signing or packaging
+        - Other
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines (redacted)
+      description: |
+        Only the lines around the problem, not the whole file. `fotwd.log` and `audit.jsonl` are in `~/Library/Application Support/com.flyonthewall.fotw/`.
+        Before pasting, replace with `<redacted>` anything that came from a meeting or an account: error bodies returned by a provider or a CLI engine, repository names, and file paths that contain your user name.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: Audio setup (built-in speakers, AirPods, an interface), the meeting app involved, or anything that seems related.
+    validations:
+      required: false

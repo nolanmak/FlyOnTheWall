@@ -1,0 +1,10 @@
+# Blank issues are off so that every issue opened from the web passes the
+# meeting-data warning at the top of the issue forms in this directory.
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/nolanmak/FlyOnTheWall/security/advisories/new
+    about: Report privately through GitHub. Never open a public issue for a vulnerability.
+  - name: Security policy
+    url: https://github.com/nolanmak/FlyOnTheWall/blob/main/SECURITY.md
+    about: What is in scope, what is a known limitation, and what to expect after reporting.

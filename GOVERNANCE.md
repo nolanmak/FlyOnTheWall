@@ -40,3 +40,8 @@ the rejected alternatives, not just the conclusion.
 Report vulnerabilities privately, never in a public issue.
 [SECURITY.md](SECURITY.md) has the reporting link, what is in scope, and what to
 expect.
+
+## Conduct
+
+Participation in this project is governed by the
+[Code of Conduct](CODE_OF_CONDUCT.md).
