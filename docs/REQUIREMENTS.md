@@ -454,7 +454,7 @@ Keep writing to the same output file across the rebuild; record a gap marker. Ac
 
 **3. Unsigned builds capture silence and never prompt.** TCC keys its record off the code's Designated Requirement; ad-hoc signatures mint a new identity every build. For an open-source project this means **every contributor who runs `cargo build` gets a binary that records nothing, with no error**. Worse still, *verified in testing:* an **unsigned, ad-hoc-signed binary captured real system audio with no prompt at all**, because it inherited the grant from the responsible terminal process. **Your dev machine will lie to you about permissions** — a developer concludes capture works, ships, and users get silence.
 
-*Mitigation:* ship a dev-signing step (it shipped as the `just dev-sign` recipe in the `justfile`; there is no `scripts/dev-sign.sh`) that creates or reuses a stable self-signed identity, signs with `--options runtime --entitlements`, and prints the `tccutil reset AudioCapture <bundle-id>` recovery command. Document this loudly in CONTRIBUTING.md. Consider a signed nightly for contributors — otherwise every self-builder files the same "it records nothing" issue.
+*Mitigation:* ship a dev-signing step (it shipped as the `just dev-sign` recipe in the `justfile`) that creates or reuses a stable self-signed identity, signs with `--options runtime --entitlements`, and prints the `tccutil reset AudioCapture <bundle-id>` recovery command. Document this loudly in CONTRIBUTING.md. Consider a signed nightly for contributors — otherwise every self-builder files the same "it records nothing" issue.
 
 ### 6.5 The platform abstraction
 
@@ -1143,7 +1143,7 @@ Per meeting-hour, at 2026-08-09 prices. **Verify before publishing — see the w
 
 **Breakeven vs. Granola Business ($14/user/month): ~16 meeting-hours/month at defaults, ~34 at economy settings.**
 
-> **Say this out loud in the README:** for anyone with more than roughly four meeting-hours a week, BYO-key at default settings **costs more than Granola**. The pitch is ownership, control, model choice, editable transcripts, retained audio, no 30-day amnesia, and no training-by-default — **not price**. Claiming a cost win would be false for exactly the heavy users most likely to try this.
+> **Not in the README (2026-09).** The README deliberately has no cost comparison, with Granola or any other product. Cost figures, including the breakeven above, stay here in §12. They do not support a price pitch: above roughly four meeting-hours a week, BYO-key at default settings costs more than Granola Business, and claiming a cost win would be false for exactly the heavy users most likely to try this.
 
 Cost transparency cuts both ways: showing a per-meeting dollar figure makes BYO-key feel expensive against a flat subscription. Mitigate by showing the **monthly running total with a comparison line** ("$8.40 this month vs $14 flat-rate"), and by defaulting to `balanced` rather than `quality`.
 
