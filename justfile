@@ -7,8 +7,9 @@
 #   - cargo-packager works but shells out to the same Apple tools anyway
 # Assembly is ~40 lines. See docs/REQUIREMENTS.md section 5.1.
 #
-# Everything here uses Command Line Tools, not Xcode.app. `xcode-select --install`
-# is sufficient.
+# Everything here uses Command Line Tools, not Xcode.app: `xcode-select --install`
+# is sufficient for the Apple tools. The other prerequisites (rustup, just,
+# cmake, Node for the UI tests) are listed in CONTRIBUTING.md.
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
@@ -37,19 +38,51 @@ lint:
     cargo fmt --all --check
     CARGO_BUILD_JOBS={{jobs}} cargo clippy --workspace --all-targets -- -D warnings
 
-# Everything CI runs, locally, in CI's order.
-ci: lint test seam
+# Dependency licenses, bans and sources, exactly as CI's `deny` job checks them
+# (.github/workflows/ci.yml; keep the two commands in step). cargo-deny is
+# optional locally, so without it this says so and leaves the gate to CI.
+deny:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v cargo-deny >/dev/null 2>&1; then
+        cargo deny check licenses bans sources
+    else
+        echo "⚠ skipped cargo deny: not installed (cargo install --locked cargo-deny); CI still runs it"
+    fi
+
+# Everything CI runs, locally, in CI's order. Where a local run still differs:
+#   - CI runs the tests on both ubuntu-latest and macos-15; this runs them here.
+#   - CI sets RUSTFLAGS=-D warnings on every job. Locally `lint` runs clippy
+#     with -D warnings over every target instead, which fails on the same
+#     compiler warnings without giving the other recipes a separate build cache.
+#   - `deny` and the Windows half of `seam` print a "skipped" line instead of
+#     running when cargo-deny or the x86_64-pc-windows-msvc target is missing.
+ci: lint test deny seam
     @echo "✓ ci green"
 
-# The platform seam must not rot into macOS-shaped code.
+# The platform seam must not rot into macOS-shaped code. Mirrors CI's `seam`
+# job: fotw-audio has to compile for Windows, and no macOS type may appear
+# outside fotw-audio/src/platform/macos/.
 seam:
-    @if grep -rn 'CMSampleBuffer\|AudioBufferList\|SCStream\|AudioDeviceID\|AudioObjectID' \
-         crates/ --include='*.rs' \
-         | grep -v 'crates/fotw-audio/src/platform/macos/'; then \
-        echo "error: macOS types leaked outside fotw-audio/src/platform/macos/" >&2; \
-        exit 1; \
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target=x86_64-pc-windows-msvc
+    installed=$(rustup target list --installed 2>/dev/null || true)
+    if grep -qx "$target" <<<"$installed"; then
+        # CI's RUSTFLAGS=-D warnings, applied here too. With --target set, cargo
+        # passes RUSTFLAGS only to the Windows artifacts, which no other recipe
+        # builds, so the host build cache is untouched.
+        RUSTFLAGS="-D warnings" CARGO_BUILD_JOBS={{jobs}} cargo check -p fotw-audio --target "$target"
+    else
+        echo "⚠ skipped the Windows cross-check: target not installed (rustup target add $target); CI still runs it"
     fi
-    @echo "✓ seam intact"
+    if grep -rn 'CMSampleBuffer\|AudioBufferList\|SCStream\|AudioDeviceID\|AudioObjectID' \
+         crates/ --include='*.rs' \
+         | grep -v 'crates/fotw-audio/src/platform/macos/'; then
+        echo "error: macOS types leaked outside fotw-audio/src/platform/macos/" >&2
+        exit 1
+    fi
+    echo "✓ seam intact"
 
 # ---------------------------------------------------------------- bundle
 
@@ -117,42 +150,132 @@ verify-bundle:
 # grant. Worse: an unsigned binary run from a terminal can INHERIT the terminal's
 # grant and capture real audio with no prompt — your machine reports success
 # while users get silence.
+#
+# What this changes outside the repository, all of it undone by `just
+# dev-unsign`: a folder, ~/.fotw-dev-cert unless FOTW_DEV_CERT_DIR says
+# otherwise, holding a keychain with the identity in it; that keychain's entry
+# in your user keychain search list; and a user-domain trust setting that
+# accepts the certificate for code signing. CONTRIBUTING.md has the details.
+#
+# Works with the openssl macOS ships (/usr/bin/openssl, LibreSSL) and with
+# OpenSSL 3; see the pkcs12 step.
 dev-sign: (bundle "debug")
     #!/usr/bin/env bash
     set -euo pipefail
-    kc="{{dev_cert}}/fotw-dev.keychain-db"
-    mkdir -p "{{dev_cert}}"
+    # Owner-only. The folder holds the identity's private key, in a keychain
+    # whose password is published below, so these permissions are what keep
+    # other accounts on this Mac out of it. chmod as well as umask, so a folder
+    # an earlier version of this recipe created world-readable is tightened too.
+    (umask 077 && mkdir -p {{quote(dev_cert)}})
+    chmod 700 {{quote(dev_cert)}}
+    dir=$(cd {{quote(dev_cert)}} && pwd)
+    kc="$dir/fotw-dev.keychain-db"
+    # The keychain password, `fotw`, is deliberately not a secret. This recipe
+    # has to unlock the keychain with no prompt on every run, so whatever the
+    # password were, it would be written here in a public repository. It is not
+    # what protects the key: the owner-only folder is. The identity is minted
+    # on this machine, trusted by this user account only, and never signs a
+    # release, which `release-sign` does with a Developer ID identity.
+
+    # Whether the keychain holds a "FlyOnTheWall Dev" certificate together with
+    # its private key, trusted or not. Captured before matching; see the
+    # pipefail NOTE in verify-bundle.
+    has_identity() {
+        local out
+        out=$(security find-identity -p codesigning "$kc" 2>/dev/null || true)
+        [[ "$out" == *"\"{{dev_ident}}\""* ]]
+    }
+
+    # A keychain with no identity in it is what a run that stopped partway
+    # leaves behind (an earlier version of this recipe created the keychain
+    # first, then failed on the openssl macOS ships). Keeping it would make
+    # every later run skip setup and fail at codesign with "no identity found",
+    # so it is rebuilt.
+    if [[ -f "$kc" ]]; then
+        if ! security unlock-keychain -p fotw "$kc"; then
+            echo "error: $kc exists but does not unlock with this recipe's password." >&2
+            echo "  Remove it with \`just dev-unsign\`, then run \`just dev-sign\` again." >&2
+            exit 1
+        fi
+        if ! has_identity; then
+            echo "→ $kc has no \"{{dev_ident}}\" identity (an earlier run stopped partway); rebuilding it"
+            security delete-keychain "$kc"
+        fi
+    fi
+
     if [[ ! -f "$kc" ]]; then
-        echo "→ creating persisted dev signing identity in {{dev_cert}}"
-        security create-keychain -p fotw "$kc"
-        security set-keychain-settings -lut 21600 "$kc"
-        security unlock-keychain -p fotw "$kc"
-        openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
-            -keyout "{{dev_cert}}/key.pem" -out "{{dev_cert}}/cert.pem" \
+        echo "→ creating persisted dev signing identity in $dir"
+        # The key, certificate and .p12 are made before the keychain exists, in
+        # a scratch folder removed however this run ends. A failure here leaves
+        # nothing behind; a failure after create-keychain leaves a keychain with
+        # no identity, which the check above rebuilds on the next run.
+        stage=$(mktemp -d "$dir/.new.XXXXXX")
+        trap 'rm -rf "$stage"' EXIT
+        if ! (umask 077 && openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+            -keyout "$stage/key.pem" -out "$stage/cert.pem" \
             -subj "/CN={{dev_ident}}" \
             -addext "basicConstraints=critical,CA:false" \
             -addext "keyUsage=critical,digitalSignature" \
-            -addext "extendedKeyUsage=critical,codeSigning" 2>/dev/null
-        # -legacy is REQUIRED: OpenSSL 3 defaults to AES-256-CBC + SHA-256 PBKDF2,
-        # which `security import` rejects with "MAC verification failed ... (wrong
-        # password?)" — an error that sends you hunting a password bug that does
-        # not exist.
-        openssl pkcs12 -export -legacy \
-            -inkey "{{dev_cert}}/key.pem" -in "{{dev_cert}}/cert.pem" \
-            -out "{{dev_cert}}/dev.p12" -passout pass:fotw
-        security import "{{dev_cert}}/dev.p12" -k "$kc" -P fotw \
+            -addext "extendedKeyUsage=critical,codeSigning" 2>"$stage/req.log"); then
+            cat "$stage/req.log" >&2
+            exit 1
+        fi
+        # -legacy for OpenSSL 3, and only there. OpenSSL 3 defaults to
+        # AES-256-CBC + SHA-256 PBKDF2, which `security import` rejects with "MAC
+        # verification failed ... (wrong password?)" — an error that sends you
+        # hunting a password bug that does not exist. LibreSSL, which is what
+        # /usr/bin/openssl is on macOS, has no -legacy and exits on "unknown
+        # option"; its default is already the older format (an RC2-40
+        # certificate bag, a 3DES key bag and a SHA-1 MAC), and that imports.
+        legacy=""
+        case "$(openssl version)" in
+            "OpenSSL 3"*) legacy="-legacy" ;;
+        esac
+        # $legacy is unquoted on purpose: empty must mean no argument at all.
+        (umask 077 && openssl pkcs12 -export $legacy \
+            -inkey "$stage/key.pem" -in "$stage/cert.pem" \
+            -out "$stage/dev.p12" -passout pass:fotw)
+        security create-keychain -p fotw "$kc"
+        security set-keychain-settings -lut 21600 "$kc"
+        security unlock-keychain -p fotw "$kc"
+        security import "$stage/dev.p12" -k "$kc" -P fotw \
             -T /usr/bin/codesign -T /usr/bin/security
         security set-key-partition-list -S apple-tool:,apple: -s -k fotw "$kc" >/dev/null
-        # An imported-but-untrusted cert is invisible to codesign, and the error
-        # ("no identity found") never mentions trust.
-        security add-trusted-cert -r trustRoot -p codeSign -k "$kc" "{{dev_cert}}/cert.pem"
+        # The private key lives in the keychain from here on. The plaintext
+        # key.pem and the .p12 go with the scratch folder rather than sitting
+        # beside it as a second copy.
+        rm -rf "$stage"
+        trap - EXIT
     fi
+
+    # An imported-but-untrusted cert is invisible to codesign, and the error
+    # ("no identity found") never mentions trust. Checked on every run, not only
+    # after creating the keychain, so a run that stopped before this point is
+    # finished by the next one. verify-cert only evaluates; it changes nothing.
+    # The certificate is read back out of the keychain, so the one checked is
+    # the one codesign will use, and cert.pem stays for dev-unsign.
+    pem=$(security find-certificate -c "{{dev_ident}}" -p "$kc")
+    printf '%s\n' "$pem" > "$dir/cert.pem"
+    if ! security verify-cert -c "$dir/cert.pem" -p codeSign -L -N -q; then
+        security add-trusted-cert -r trustRoot -p codeSign -k "$kc" "$dir/cert.pem"
+    fi
+
     security unlock-keychain -p fotw "$kc"
     # codesign resolves identities from the keychain SEARCH LIST, not --keychain.
-    # Preserve the existing entries or the login keychain gets unhooked.
-    current=$(security list-keychains -d user | sed 's/[[:space:]]*"//g;s/"//g')
-    if ! grep -qF "$kc" <<< "$current"; then
-        security list-keychains -d user -s $current "$kc"
+    # Preserve the existing entries or the login keychain gets unhooked. One
+    # entry per array element, so a path with a space in it stays one argument;
+    # and the listing is captured first, so a failed `list-keychains` stops the
+    # recipe instead of reading as an empty list.
+    listing=$(security list-keychains -d user | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//')
+    search=()
+    listed=0
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        search+=("$entry")
+        if [[ "$entry" == "$kc" || "$entry" -ef "$kc" ]]; then listed=1; fi
+    done <<<"$listing"
+    if [[ $listed -eq 0 ]]; then
+        security list-keychains -d user -s ${search[@]+"${search[@]}"} "$kc"
     fi
     # --timestamp=none in dev only: Apple's timestamp server is a needless
     # network dependency and point of failure for contributors.
@@ -195,10 +318,120 @@ dev-sign: (bundle "debug")
     echo "(the service is AudioCapture — 'SystemAudioCaptureRequests', which several"
     echo " 2026 blog posts cite, does not exist)"
 
+# Undo what `just dev-sign` changed outside this repository: the code-signing
+# trust setting, the keychain search list entry, the dev keychain, and its
+# folder (FOTW_DEV_CERT_DIR is honored). Only files dev-sign writes are deleted;
+# the folder goes only if that leaves it empty.
+#
+# Left alone: bundles and binaries already signed with the identity (`just
+# clean`), TCC grants macOS recorded for the dev build (the tccutil commands
+# dev-sign prints), and your meeting library with its `db:masterkey` item in
+# the login keychain. A later `just dev-sign` mints a new identity, and so a new
+# designated requirement: macOS asks for audio permission again, and asks you
+# to approve the app's access to that keychain item.
+dev-unsign:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir={{quote(dev_cert)}}
+    if [[ -d "$dir" ]]; then dir=$(cd "$dir" && pwd); fi
+    kc="$dir/fotw-dev.keychain-db"
+    cert="$dir/cert.pem"
+
+    # 1. Trust, first, because it is the one step that can stop: removing the
+    # setting needs the certificate, so nothing else is deleted until the
+    # setting is gone. The certificate comes out of the keychain when there is
+    # one, so the setting removed is the one codesign has been relying on.
+    if [[ -f "$kc" ]]; then
+        if pem=$(security find-certificate -c "{{dev_ident}}" -p "$kc" 2>/dev/null) && [[ -n "$pem" ]]; then
+            printf '%s\n' "$pem" > "$cert"
+        fi
+    fi
+    trust=$(security dump-trust-settings 2>/dev/null || true)
+    if grep -qxE "Cert [0-9]+: {{dev_ident}}" <<<"$trust"; then
+        if [[ -s "$cert" ]] && security verify-cert -c "$cert" -p codeSign -L -N -q; then
+            # remove-trusted-cert raises an authentication dialog on the Mac's
+            # own screen (`man security`). Over SSH nobody can answer it and the
+            # command waits forever (issue #46), so stop before changing anything.
+            if [[ -n "${SSH_CONNECTION:-}" || -n "${SSH_TTY:-}" ]]; then
+                echo "error: removing the trust setting needs an authentication dialog on the Mac's screen," >&2
+                echo "  which an SSH session cannot answer. Nothing was changed; run this on the Mac itself." >&2
+                exit 1
+            fi
+            echo "→ removing the code-signing trust setting for \"{{dev_ident}}\" (macOS asks you to authenticate)"
+            if ! security remove-trusted-cert "$cert"; then
+                echo "error: the trust setting was not removed, so nothing else was either." >&2
+                echo "  Run \`just dev-unsign\` again and approve the dialog." >&2
+                exit 1
+            fi
+        else
+            echo "⚠ a code-signing trust setting named \"{{dev_ident}}\" is for a certificate this recipe"
+            echo "  does not have, so it cannot remove it. \`security dump-trust-settings\` lists it."
+        fi
+    fi
+
+    # 2. The search list: every other entry kept, in its order. Parsed the same
+    # way dev-sign parses it.
+    listing=$(security list-keychains -d user | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//')
+    keep=()
+    listed=0
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        if [[ "$entry" == "$kc" || "$entry" -ef "$kc" ]]; then listed=1; else keep+=("$entry"); fi
+    done <<<"$listing"
+    if [[ $listed -eq 1 ]]; then
+        echo "→ removing $kc from the keychain search list"
+        security list-keychains -d user -s ${keep[@]+"${keep[@]}"}
+    fi
+
+    # 3. The keychain, and with it the private key.
+    if [[ -f "$kc" ]]; then
+        echo "→ deleting $kc"
+        security delete-keychain "$kc"
+    fi
+
+    # 4. The folder. Only names dev-sign creates are removed: key.pem and
+    # dev.p12 come from earlier versions of it, .new.* from an interrupted run,
+    # and .fl followed by eight hex digits is the empty lock file the Security
+    # framework leaves beside a keychain. A FOTW_DEV_CERT_DIR that holds
+    # anything else keeps it, and keeps the folder.
+    if [[ -d "$dir" ]]; then
+        rm -f "$dir/cert.pem" "$dir/key.pem" "$dir/dev.p12"
+        rm -f "$dir"/.fl[0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F]
+        rm -rf "$dir"/.new.*
+        if rmdir "$dir" 2>/dev/null; then
+            echo "→ removed $dir"
+        else
+            echo "⚠ left $dir in place: it holds files dev-sign did not create"
+        fi
+    fi
+    echo "✓ dev signing identity removed"
+
 # Run the locally-signed app the way a user would. NEVER run the bare binary:
 # launching Contents/MacOS/fotwd from a shell makes the TERMINAL the responsible
 # process, so the grant attaches to Ghostty/iTerm/Terminal instead of us.
+#
+# The one exception is the first run, and nothing is captured during it. The
+# daemon will not create a meeting library until a person has seen the Recovery
+# Key and typed part of it back (crates/fotwd/src/recovery.rs), which needs a
+# terminal. A LaunchServices launch has none, so on a first run `serve` refuses,
+# and says so only in fotwd.log. So while there is no db.sqlite3, this first
+# runs `fotwd list` from inside the bundle, in this terminal. `list` opens the
+# library, here creating it behind the ceremony, and prints its meetings; it
+# records no audio and asks for no TCC permission, so there is no grant for the
+# terminal to lend or to take. It is the same dev-signed binary the app runs,
+# so the `db:masterkey` keychain item it creates is one the app can read without
+# an approval dialog. A ceremony that is abandoned creates nothing, exits
+# non-zero, and stops the recipe before the launch.
 run: dev-sign
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # The daemon's default data root: `default_root()`'s parent in
+    # crates/fotwd/src/main.rs.
+    library="$HOME/Library/Application Support/{{bundle_id}}/db.sqlite3"
+    if [[ ! -e "$library" ]]; then
+        echo "→ no meeting library yet: creating it in this terminal, where the Recovery Key can be shown"
+        "{{app}}/Contents/MacOS/fotwd" list
+    fi
     open -a "$(pwd)/{{app}}" --args serve
 
 # ---------------------------------------------------------------- release
