@@ -24,6 +24,10 @@ multiple-versions = "warn"
 # docs/REQUIREMENTS.md 5.5 (the cacao rejection).
 deny = [{ name = "cacao" }]
 
+# Enforced by the `advisories` job in .github/workflows/ci.yml, not by the
+# `deny` job. That job runs on push to main, on pull requests and weekly, so a
+# RustSec advisory or a yank against an unchanged Cargo.lock turns it red
+# without failing the licenses/bans/sources gate on unrelated PRs.
 [advisories]
 yanked = "deny"
 
