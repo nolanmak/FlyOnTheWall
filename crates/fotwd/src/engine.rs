@@ -743,9 +743,19 @@ impl fotw_summarize::claude_cli::CliTransport for TokioCliRunner {
             // Write-then-close, so a CLI that reads to EOF gets its EOF.
             if let Some(mut handle) = child.stdin.take() {
                 use tokio::io::AsyncWriteExt as _;
-                handle.write_all(stdin.as_bytes()).await.map_err(|e| {
-                    SummarizeError::Transport(format!("writing the prompt failed: {e}"))
-                })?;
+                match handle.write_all(stdin.as_bytes()).await {
+                    Ok(()) => {}
+                    // A CLI that refuses before reading (a usage limit, an
+                    // expired login) exits with the prompt still unwritten.
+                    // The broken pipe that leaves is not the story; its exit
+                    // status and stderr, collected below, are.
+                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                    Err(e) => {
+                        return Err(SummarizeError::Transport(format!(
+                            "writing the prompt failed: {e}"
+                        )));
+                    }
+                }
                 drop(handle);
             }
 

@@ -36,6 +36,31 @@ async fn a_nonzero_exit_is_reported_not_hidden() {
     assert_eq!(out.status, 3);
 }
 
+/// A CLI that refuses up front (a usage limit, an expired login) exits without
+/// reading its stdin. Writing the prompt then hits a broken pipe, and that must
+/// not replace what the CLI said: the enrichment report and the dashboard need
+/// "usage limit reached", not "Broken pipe (os error 32)".
+///
+/// The prompt is far bigger than any pipe buffer, so the write cannot finish
+/// before the child exits and the pipe breaks on every run. With a small prompt
+/// it broke only when the child happened to exit first, which is why
+/// `tests/enrich.rs` failed on Linux some of the time.
+#[tokio::test]
+async fn a_cli_that_exits_before_reading_its_prompt_still_says_why() {
+    let runner = TokioCliRunner::new("/bin/sh".into(), Duration::from_secs(10));
+    let prompt = "x".repeat(1024 * 1024);
+    let out = runner
+        .run(&argv("echo 'usage limit reached' >&2; exit 1"), &prompt)
+        .await
+        .expect("an early exit is the CLI's answer, not a transport failure");
+    assert_eq!(out.status, 1);
+    assert!(
+        out.stderr.contains("usage limit reached"),
+        "the CLI's own explanation must survive: {:?}",
+        out.stderr
+    );
+}
+
 #[tokio::test]
 async fn an_unshielded_runner_leaves_home_alone() {
     let runner = TokioCliRunner::new("/bin/sh".into(), Duration::from_secs(10));
