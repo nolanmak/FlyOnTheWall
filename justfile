@@ -220,7 +220,7 @@ dev-sign: (bundle "debug")
             cat "$stage/req.log" >&2
             exit 1
         fi
-        # -legacy for OpenSSL 3, and only there. OpenSSL 3 defaults to
+        # -legacy for OpenSSL 3 and later, and only there. OpenSSL 3 defaults to
         # AES-256-CBC + SHA-256 PBKDF2, which `security import` rejects with "MAC
         # verification failed ... (wrong password?)" — an error that sends you
         # hunting a password bug that does not exist. LibreSSL, which is what
@@ -229,7 +229,7 @@ dev-sign: (bundle "debug")
         # certificate bag, a 3DES key bag and a SHA-1 MAC), and that imports.
         legacy=""
         case "$(openssl version)" in
-            "OpenSSL 3"*) legacy="-legacy" ;;
+            "OpenSSL "[3-9]*) legacy="-legacy" ;;
         esac
         # $legacy is unquoted on purpose: empty must mean no argument at all.
         (umask 077 && openssl pkcs12 -export $legacy \

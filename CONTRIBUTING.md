@@ -65,8 +65,12 @@ That runs what CI runs (`.github/workflows/ci.yml`), in CI's order:
 Where CI still differs from a local `just ci`:
 
 - CI runs the tests on both `ubuntu-latest` and `macos-15`.
-- CI sets `RUSTFLAGS=-D warnings` on every job. Locally, `just lint` fails on
-  the same compiler warnings through clippy.
+- CI sets `RUSTFLAGS=-D warnings` on every job, and its lint job runs on
+  Ubuntu. Code compiled only off macOS (`cfg(not(target_os = "macos"))`) is
+  therefore linted in CI but not by `just lint` on a Mac.
+- CI also runs `cargo deny check advisories` as a separate job on every push,
+  every pull request and once a week, so a newly published RustSec advisory
+  turns only that check red. Run it locally with `cargo deny check advisories`.
 - A check that is skipped locally still runs in CI. Install cargo-deny and the
   Windows target (see [Prerequisites](#prerequisites)) to see those failures
   before you push.
@@ -127,7 +131,8 @@ So:
 
 1. **A folder**: `~/.fotw-dev-cert`, or the path in `FOTW_DEV_CERT_DIR`. Give
    that variable a folder of its own, because dev-sign makes it owner-only
-   (mode 700) and dev-unsign deletes it. It holds:
+   (mode 700), and dev-unsign removes the files dev-sign put there and then the
+   folder itself if nothing else is in it. It holds:
    - `fotw-dev.keychain-db`, a keychain containing a self-signed code-signing
      certificate named "FlyOnTheWall Dev" (RSA 2048, valid for 10 years) and
      its private key. It locks after six hours and when the Mac sleeps;
@@ -197,9 +202,10 @@ just run
 1. Runs `just dev-sign`, which builds a debug bundle and signs it.
 2. If there is no meeting library yet, meaning no
    `~/Library/Application Support/com.flyonthewall.fotw/db.sqlite3`, it runs
-   the bundle's own `fotwd list` in your terminal. The library is encrypted
-   with a key kept in your login keychain, and FlyOnTheWall will not create it
-   until you have seen its Recovery Key: the key is printed, you type two of its
+   the bundle's own `fotwd list` in your terminal. The library database is
+   encrypted with a key kept in your login keychain (recorded audio is not; see
+   [README.md](README.md#privacy)), and FlyOnTheWall will not create it until
+   you have seen its Recovery Key: the key is printed, you type two of its
    groups back, and then you type the phrase `i have written it down`. Write
    the key on paper. If you stop partway, nothing is created and `just run`
    stops there too.
@@ -301,8 +307,9 @@ FOTW_GH_LIVE=owner/scratch-repo cargo test -p fotwd --test github_live -- --noca
 
 Commits a fixture transcript to that repository with the real `gh`, then
 commits it again, which checks the create and the update paths against GitHub
-itself. Use a scratch repository you own, with `gh` signed in to an account that
-can push to it. Run it when you change `crates/fotwd/src/github.rs`.
+itself. It also commits `fotw-qa/index.md` and `fotw-qa/log.md`. Use a private
+scratch repository you own, with `gh` signed in to an account that can push to
+it: export refuses a repository GitHub does not report as private. Run it when you change `crates/fotwd/src/github.rs`.
 
 ## Real meeting data never goes in the repository
 
