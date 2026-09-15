@@ -31,14 +31,16 @@
 //!
 //! # This directory is not encrypted
 //!
-//! The library is SQLCipher-encrypted; **this is not**, and cannot be if other
-//! tools are to read it. A bulk archive is therefore a plaintext copy of every
-//! meeting the user has ever recorded. It is outside the reach of §9.6's
-//! byte-level delete, it inherits whatever permissions its parent directory
-//! has, and it will be picked up by whatever backs that directory up. The
-//! README written into the archive root says exactly this, the manifest carries
-//! `"encryption": "none"`, and the CLI makes the user acknowledge it before a
-//! bulk export runs.
+//! The library database is SQLCipher-encrypted; **this directory is not**, and
+//! cannot be if other tools are to read it. A bulk archive is therefore a
+//! plaintext copy of every meeting the user has ever recorded. It is outside
+//! the reach of §9.6's byte-level delete, it inherits whatever permissions its
+//! parent directory has, and it will be picked up by whatever backs that
+//! directory up. The README written into the archive root says exactly this,
+//! the manifest carries `"encryption": "none"`, and the CLI makes the user
+//! acknowledge it before a bulk export runs. Audio is not encrypted in the
+//! data root either (#56), so [`ArchiveOptions::include_audio`] copies those
+//! files unchanged.
 //!
 //! # Conflict policy, and why not `INSERT OR IGNORE`
 //!
@@ -87,17 +89,18 @@ pub const LIBRARY_SCHEMA: &str = "flyonthewall/library@1";
 pub const PLAINTEXT_WARNING: &str = "\
 This archive is NOT ENCRYPTED.
 
-Your FlyOnTheWall library is stored in an encrypted database. This directory is
-plain text: every transcript, every note and every summary in it can be read by
-anyone — or any program — that can read these files. That is deliberate, because
-an export another tool cannot open is not an export. It is also the thing to
-understand before you copy this directory to a shared drive, a synced folder or
-a backup service.
+Your FlyOnTheWall library database is encrypted; the audio files beside it are
+not. This directory is plain text: every transcript, every note and every
+summary in it can be read by anyone — or any program — that can read these
+files. That is deliberate, because an export another tool cannot open is not an
+export. It is also the thing to understand before you copy this directory to a
+shared drive, a synced folder or a backup service.
 
 Two consequences worth stating outright:
 
   * Deleting a meeting inside FlyOnTheWall does not reach into this directory.
-  * If you asked for audio, the recordings here are decrypted too.
+  * If you asked for audio, the recordings here are unchanged copies of the
+    audio files FlyOnTheWall keeps on disk, which are not encrypted either.
 
 library.json         the manifest, and the tables shared across meetings
 meetings/<id>.json   one meeting each, complete: segments, word timings,
@@ -114,7 +117,7 @@ media/...            audio, only if you asked for it
 pub struct ArchiveOptions {
     /// Copy the audio too. **Off by default** — audio is the overwhelming
     /// majority of the bytes (§9.5: ~20 GB/year for a heavy user) and it is
-    /// the part a user is most likely not to want lying around in the clear.
+    /// the part a user is least likely to want a second plaintext copy of.
     pub include_audio: bool,
     /// The app data root that `*_rel_path` columns are relative to (§9.7
     /// invariant 5). Required for any file copying; without it the archive is
@@ -787,6 +790,20 @@ mod tests {
         assert!(lowered.contains("not encrypted"));
         assert!(lowered.contains("plain text"));
         assert!(lowered.contains("deleting a meeting"));
+    }
+
+    #[test]
+    fn the_readme_never_implies_the_stored_audio_is_encrypted() {
+        // Only the database is encrypted; the audio beside it is not (#56).
+        // Calling the archived recordings "decrypted" would tell the user the
+        // originals were protected.
+        let flat = PLAINTEXT_WARNING
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!flat.contains("decrypted"));
+        assert!(flat.contains("library database is encrypted; the audio files beside it are not"));
     }
 
     #[test]

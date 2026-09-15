@@ -191,9 +191,9 @@ async fn main() -> ExitCode {
                  import <dest> [dir]>"
             );
             eprintln!();
-            eprintln!("  Set DEEPGRAM_API_KEY to transcribe as well as record.");
-            eprintln!("  Without it the meeting is still recorded and can be");
-            eprintln!("  transcribed later from the audio on disk.");
+            eprintln!("  Run `fotwd key set deepgram` to transcribe as well as record.");
+            eprintln!("  Without a key the meeting is still recorded, but not transcribed,");
+            eprintln!("  and no command transcribes the saved audio afterwards.");
             ExitCode::FAILURE
         }
     }
@@ -436,10 +436,12 @@ fn export_command(args: &[String]) -> ExitCode {
 
 /// `fotwd export-all <dest> [dir] [--audio] [--resume] [--yes-plaintext]`.
 ///
-/// The acknowledgement is not a formality. The library is SQLCipher-encrypted
-/// and this writes every meeting the user has ever recorded into an ordinary
-/// directory in plain text; somebody who has not registered that has just
-/// undone the encryption without meaning to.
+/// The acknowledgement is not a formality. The library database is
+/// SQLCipher-encrypted and this writes every meeting the user has ever recorded
+/// into an ordinary directory in plain text; somebody who has not registered
+/// that has just undone the encryption without meaning to. With `--audio` the
+/// audio files are copied as they are; they are unencrypted on disk already
+/// (#56), so the copies are too.
 fn export_all_command(args: &[String]) -> ExitCode {
     let pos = positionals(args, &[]);
     let Some(dest) = pos.first().map(PathBuf::from) else {
@@ -483,11 +485,13 @@ fn export_all_command(args: &[String]) -> ExitCode {
     println!("  destination: {}", dest.display());
     println!();
     println!("  ⚠  THIS ARCHIVE WILL NOT BE ENCRYPTED.");
-    println!("     Your library is stored encrypted. This is not: every transcript,");
-    println!("     note and summary will be readable by anyone who can read these");
-    println!("     files. Deleting a meeting in FlyOnTheWall will not reach into it.");
+    println!("     Your library database is stored encrypted. This archive is not:");
+    println!("     every transcript, note and summary will be readable by anyone who");
+    println!("     can read these files. Deleting a meeting in FlyOnTheWall will not");
+    println!("     reach into it.");
     if include_audio {
-        println!("     The audio will be written decrypted too.");
+        println!("     The audio files are copied as they are on disk, where they are");
+        println!("     not encrypted either.");
     }
     println!();
 

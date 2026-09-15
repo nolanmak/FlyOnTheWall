@@ -323,11 +323,13 @@ fn now_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-/// Look the Deepgram key up in the OS keychain, as `fotwd record` does.
+/// Look the Deepgram key up in the OS keychain, with `DEEPGRAM_API_KEY` as the
+/// fallback, as `fotwd record` does.
 ///
-/// Only the system leg is transcribed: the mic leg needs its own connection
-/// and doubles the bill, which is the explicit decision in spec 7.5 rather
-/// than a default.
+/// Both legs are transcribed unless `FOTW_MIC_STT` turns the mic leg off
+/// ([`session::mic_stt_enabled`]; unset means on). The mic leg needs its own
+/// Deepgram connection and doubles the bill (#60), and it is opened only if
+/// the session's mic actually starts.
 fn keychain_transcription() -> Transcription {
     let store = secrets::keystore().ok();
     match store

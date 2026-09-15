@@ -2,7 +2,7 @@
 
 An open-source, local-first meeting recorder for macOS. It captures system audio and your microphone as two separate streams with **no bot joining the call**, transcribes them live through **Deepgram with your own API key**, and turns each finished meeting into a title, a summary that cites the transcript, and action items whose evidence is checked, using a summary engine you choose. The meeting library is a SQLCipher-encrypted database on your own disk. **The recorded audio beside it is not encrypted yet** — see [Privacy](#privacy).
 
-> **Status: pre-release.** macOS only (14.4 or later), built from source. There are no signed or prebuilt releases. Capture, live Deepgram transcription, the encrypted library, summaries, exports and the web dashboard are implemented and wired together; the largest gaps are listed under [Known gaps](#known-gaps). Requirements and technical design are in **[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)**; work is tracked in [issues](https://github.com/nolanmak/FlyOnTheWall/issues).
+> **Status: pre-release.** macOS only (14.4 or later), built from source. There are no signed or prebuilt releases. Capture, live Deepgram transcription, the encrypted library, summaries, exports and the web dashboard are implemented and wired together; the largest gaps are listed under [Known gaps](#known-gaps). **[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)** is the 2026-08 design record, not a description of the current code; work is tracked in [issues](https://github.com/nolanmak/FlyOnTheWall/issues).
 
 ### Known gaps
 
@@ -61,7 +61,7 @@ proposed end-of-call detection policy.
 | `audit.jsonl`, `fotwd.log` | the recording audit trail and the daemon's diagnostics | no |
 | anything `export`, `export-all` or `export-okf` writes | the meetings you exported | no, by design; the commands that write files say so |
 
-Paths are relative to the data folder under [Where your data lives](#where-your-data-lives). FileVault encrypts the whole disk while the Mac is off. It does not cover a backup or sync copy of that folder, or another app running as you. Those are the cases the database encryption exists for, and today they expose the audio.
+Nothing marked no needs a key to read: the transcript text in `sessions/<id>/stt.jsonl`, `audit.jsonl`, `fotwd.log` and every export are plain text, and `export-all --audio` copies the audio files unchanged. Paths are relative to the data folder under [Where your data lives](#where-your-data-lives). FileVault encrypts the whole disk while the Mac is off. It does not cover a backup or sync copy of that folder, or another app running as you. Those are the cases the database encryption exists for, and today they expose the audio.
 
 ### What leaves your machine
 
@@ -69,7 +69,7 @@ There is no FlyOnTheWall server. Data leaves only for services you configure, un
 
 - **Audio, to Deepgram** — only while recording, and only when a Deepgram key is configured. Both streams go straight to `api.deepgram.com`, and every request carries `mip_opt_out=true`, Deepgram's opt-out from model training.
 - **Transcripts and notes, to your summary engine** — for each finished meeting, once an engine is configured. That is the Anthropic API when an Anthropic key is stored, otherwise the `claude` or `codex` CLI you enabled, which sends it to Anthropic or OpenAI through that CLI's own login. Meeting documents use the same engine. With no engine configured nothing is sent, and meetings get a local fallback title.
-- **Transcripts, to GitHub** — only if you turn GitHub export on; it is off by default. It uses your `gh` login to commit each meeting's full transcript, its summary and its saved document brief as Markdown to the repository you choose, when you press a meeting's push button or, in auto mode, after each meeting.
+- **Transcripts, to GitHub** — only if you turn GitHub export on; it is off by default. It uses your `gh` login to commit each meeting's full transcript and notes, its summary and its saved document brief as Markdown to the repository you choose, when you press a meeting's push button or, in auto mode, after each meeting. It refuses any repository GitHub does not confirm is private, unless the export settings store your acknowledgement that it may be public; see [GitHub sync](docs/SHARING_DOCUMENTS.md#github-sync).
 - **Library contents, to an agent** — only if you point an agent at `fotwd mcp`. The reading is local; what that agent then sends to its own model is up to the agent.
 
 ## Install
@@ -196,6 +196,8 @@ macOS 14.4+ first (Core Audio process taps, Developer ID, no Mac App Store). The
 
 ## License
 
-FlyOnTheWall is licensed under the Apache License 2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). Licenses and notices for third-party dependencies are collected in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). No GPL/AGPL code enters the tree, and `cargo deny check licenses` enforces the dependency license allowlist in CI.
+FlyOnTheWall is licensed under the Apache License 2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). No GPL/AGPL code enters the tree, and `cargo deny check licenses` enforces the dependency license allowlist in CI.
 
 The app icon (`packaging/AppIcon.svg`, `packaging/AppIcon.icns`) and the dashboard favicon (`crates/fotw-web/ui/favicon.svg`) are derived from ["Fly"](https://game-icons.net/1x1/delapouite/fly.html) by Delapouite, licensed under [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/). The fly is recoloured green and set on a transparent background for the favicon, and on a rounded dark tile for the app icon.
+
+Notices and license texts for the third-party Rust crates and the C libraries compiled into the app (SQLCipher, SQLite, OpenSSL and libopus) are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), which `just licenses` regenerates.
