@@ -1,5 +1,7 @@
 # FlyOnTheWall — Requirements & Scoping
 
+> **This is the design record from 2026-08, not a description of the current code.** It is the requirements and design document FlyOnTheWall was planned from, with corrections added inline as parts were built. Where it differs from the code or the [README](../README.md), the code and the README are authoritative. The two differences that matter most: speech-to-text is Deepgram only today, and recorded audio (session `.pcm` files while recording, `media/…/*.opus` afterwards) is not yet encrypted at rest. Only the library database is encrypted.
+
 **Status:** Draft v1 · **Date:** 2026-08-09 · **Owner:** nolanmak
 
 An open-source, local-first desktop meeting recorder. Captures system audio + microphone with no bot joining the call, streams to a speech-to-text provider using **the user's own API key**, stores a full transcript per meeting, and generates an AI summary that augments the sparse notes the user typed during the call.
@@ -31,7 +33,7 @@ An open-source, local-first desktop meeting recorder. Captures system audio + mi
 
 ## 1. What this is
 
-FlyOnTheWall is a macOS menu-bar app that records both sides of a meeting — the microphone (you) and the system audio output (everyone else) — as two independent streams, with no bot joining the call and no vendor backend in the audio path. It transcribes with a provider the user chooses and pays for directly (Deepgram, ElevenLabs, OpenAI, or fully on-device), then produces a document that fuses the transcript with the sparse notes the user typed during the call. Everything lives in an encrypted SQLite database on the user's own disk.
+FlyOnTheWall is a macOS menu-bar app that records both sides of a meeting — the microphone (you) and the system audio output (everyone else) — as two independent streams, with no bot joining the call and no vendor backend in the audio path. It transcribes with a provider the user chooses and pays for directly (Deepgram, ElevenLabs, OpenAI, or fully on-device), then produces a document that fuses the transcript with the sparse notes the user typed during the call. Transcripts, notes and summaries live in an encrypted SQLite database on the user's own disk. *(2026-09: recorded audio sits beside that database and is not yet encrypted at rest, see §9.5 correction 6; Deepgram is the only speech-to-text provider implemented so far.)*
 
 ### Why not just use Granola, Otter, or a bot?
 
@@ -252,7 +254,7 @@ graph TB
         LLM["LlmAdapter<br/>anthropic · openai · ollama"]
         VAL["Evidence + citation validator"]
         DB[("SQLCipher SQLite<br/>WAL · FTS5")]
-        MEDIA["media/ · age-encrypted Opus"]
+        MEDIA["media/ · Opus (age encryption not yet implemented)"]
     end
 
     subgraph UI["WKWebView UI"]
@@ -312,7 +314,7 @@ sessions/<ulid>/
   notes.json      debounce-saved at 500 ms and on blur
 ```
 
-All appends via `BufWriter` with `flush()` + `sync_data()` at least every 5 s. SQLite is an **index over these files**, not the source of truth. On startup, any session directory lacking `ended_at` surfaces a *Recover meeting from &lt;time&gt;* action. Readers must tolerate a torn final JSONL line and a PCM file truncated mid-frame. Panic hooks and signal handlers flush, but **correctness must not depend on them** — acceptance is `SIGKILL` at a random offset in a 90-minute run, then `fotw recover` yielding audio ≥ (kill_time − 5 s).
+All appends via `BufWriter` with `flush()` + `sync_data()` at least every 5 s. SQLite is an **index over these files**, not the source of truth. On startup, any session directory lacking `ended_at` surfaces a *Recover meeting from &lt;time&gt;* action. Readers must tolerate a torn final JSONL line and a PCM file truncated mid-frame. Panic hooks and signal handlers flush, but **correctness must not depend on them** — acceptance is `SIGKILL` at a random offset in a 90-minute run, then recovery yielding audio ≥ (kill_time − 5 s). *(2026-09: no `fotw recover` command exists. Resumable promotion of session directories into `media/` is in `fotw-pipeline/src/promote.rs`, run by the retention sweeper that `fotwd serve` starts; `fotwd recover` is the unrelated Recovery Key path in §10.)*
 
 ### 5.5 The AppKit shell
 
@@ -344,22 +346,27 @@ This detail is the whole ballgame: **the mask is only honored if set at init.** 
 
 ```
 crates/
-  fotwd           the daemon binary: axum server, lifecycle, AppKit shell
-  fotw            CLI client
-  fotw-audio      AudioTap/AudioPlatform traits + platform/{macos,windows,linux,file}
-  fotw-pipeline   rings, resampler, AEC, WAL, muxer, backpressure state machine
-  fotw-stt        provider adapters
-  fotw-summarize  LlmAdapter, prompts, validators
-  fotw-store      SQLCipher schema, migrations, FTS, export/import
-  fotw-secrets    keychain; no other crate may depend on a telemetry crate
-ui/               plain SPA, embedded via rust-embed (debug-embed feature ON)
-packaging/        Info.plist, entitlements, justfile targets for bundle/sign/notarize
-  fotw-cli        `fotw` headless binary
-packages/ui, packages/ts-bindings
-fixtures/         golden audio + transcripts
+  fotwd           the daemon binary and its subcommands (serve, record, recover, export, mcp, …)
+  fotw            CLI: doctor, record
+  fotw-audio      AudioPlatform seam + platform/{macos,windows,linux,file}
+  fotw-pipeline   real-time ring, resampler, echo gate, WAL, Opus encoding, session promotion, retention
+  fotw-stt        canonical transcript format, Deepgram streaming client, cross-leg dedupe
+  fotw-summarize  engine adapters (Anthropic API, claude and codex CLIs), prompts, templates, validators
+  fotw-store      SQLCipher schema, migrations, FTS5, export/import
+  fotw-secrets    keychain, redaction, Recovery Key cryptography
+  fotw-web        loopback HTTP/WS server and its ingress controls
+    ui/           plain SPA, embedded via rust-embed (debug-embed feature ON)
+  fotw-shell      AppKit shell: menu-bar item, recording pill, global hotkeys
+  <crate>/tests/fixtures   test fixtures live beside the tests that use them
+packaging/        Info.plist, entitlements, app icon
+justfile          bundle, dev-sign, verify-bundle, release-sign, notarize
 ```
 
-The **`fotw` CLI is both the recovery tool and the primary test surface**: `fotw recover`, `fotw transcribe`, `fotw record --backend file --input fixtures/meeting.wav --speed 50x`, `fotw doctor` (prints macOS version, TCC probe result, default output device, tap creation result). It makes the entire pipeline testable in CI with no GUI and no audio device, and gives users a manual escape hatch.
+> **Correction (2026-09).** The block above is the layout on `main`. The original listed a top-level `ui/`, a `fotw-cli` crate, `packages/ui`, `packages/ts-bindings` and a top-level `fixtures/`; none of them exist. The SPA lives in `crates/fotw-web/ui/`, and the web server and the AppKit shell are crates of their own rather than part of `fotwd`.
+
+The **`fotw` CLI is both the recovery tool and the primary test surface**: ~~`fotw recover`, `fotw transcribe`, `fotw record --backend file --input fixtures/meeting.wav --speed 50x`~~, `fotw doctor` (prints macOS version, TCC probe result, default output device, tap creation result). It makes the entire pipeline testable in CI with no GUI and no audio device, and gives users a manual escape hatch.
+
+> **Correction (2026-09).** The struck commands were never built. `fotw` has two commands, `doctor` and `record [seconds] [dir]`. Everything else is a subcommand of the daemon binary, and `fotwd` run from a terminal with no arguments lists them. `fotwd recover` restores the library key from the Recovery Key (§10) and has nothing to do with crash recovery. The device-free tests drive `FileAudioSource` directly from Rust (`crates/fotw-audio/tests/file_source.rs` and the session tests in `crates/fotwd/tests/`), not through a CLI flag.
 
 **Testing strategy.** Device-dependent CI is close to unachievable — GitHub macOS runners have recurring null-audio-device regressions, and taps additionally require a signed binary plus a TCC grant that cannot be given non-interactively. So:
 
@@ -447,7 +454,7 @@ Keep writing to the same output file across the rebuild; record a gap marker. Ac
 
 **3. Unsigned builds capture silence and never prompt.** TCC keys its record off the code's Designated Requirement; ad-hoc signatures mint a new identity every build. For an open-source project this means **every contributor who runs `cargo build` gets a binary that records nothing, with no error**. Worse still, *verified in testing:* an **unsigned, ad-hoc-signed binary captured real system audio with no prompt at all**, because it inherited the grant from the responsible terminal process. **Your dev machine will lie to you about permissions** — a developer concludes capture works, ships, and users get silence.
 
-*Mitigation:* ship `scripts/dev-sign.sh` that creates or reuses a stable self-signed identity, signs with `--options runtime --entitlements`, and prints the `tccutil reset AudioCapture <bundle-id>` recovery command. Document this loudly in CONTRIBUTING.md. Consider a signed nightly for contributors — otherwise every self-builder files the same "it records nothing" issue.
+*Mitigation:* ship a dev-signing step (it shipped as the `just dev-sign` recipe in the `justfile`; there is no `scripts/dev-sign.sh`) that creates or reuses a stable self-signed identity, signs with `--options runtime --entitlements`, and prints the `tccutil reset AudioCapture <bundle-id>` recovery command. Document this loudly in CONTRIBUTING.md. Consider a signed nightly for contributors — otherwise every self-builder files the same "it records nothing" issue.
 
 ### 6.5 The platform abstraction
 
@@ -803,6 +810,7 @@ Root is the app-local data dir — macOS `~/Library/Application Support/com.flyo
 <root>/db.sqlite3 (+ -wal, -shm)
 <root>/sessions/<ulid>/            # live WAL session dirs (§5.4)
 <root>/media/<yyyy>/<mm>/<meeting_id>/{mic.opus.age, system.opus.age, raw-<provider>.json.zst}
+                                   # .age is not implemented: audio ships as mic.opus / system.opus, unencrypted (§9.5 correction 6)
 <root>/backups/{auto-<ts>.db, pre-migration-<n>-<ts>.db}
 <root>/plugins/<plugin-id>/
 ~/.flyonthewall/templates/<slug>.md   # NOT under <root> — see below
@@ -1000,7 +1008,7 @@ Sync is a non-goal, but these keep the door open at ~2 weeks instead of a rewrit
 
 **Never-log rules, each with a test.** A `tracing` layer holds live key fingerprints and redacts any log field containing a registered secret. The HTTP wrapper strips `Authorization`, `xi-api-key`, `Token`, `x-api-key` before any request/response is logged. Transcript text, note text, meeting titles and attendee names are unreachable from the logging subsystem — enforced by a wrapper type whose `Debug`/`Display` redacts, plus a CI lint.
 
-**Encryption at rest, default on.** 32-byte master key from the OS CSPRNG stored as a keychain binary secret; HKDF-SHA256 subkeys for `db` and `media`; raw-key `PRAGMA key` so no PBKDF2 runs per open; media encrypted with `age` (STREAM/ChaCha20-Poly1305). Because FTS5 lives *inside* the encrypted DB, encryption leaks no index. **A Recovery Key is mandatory and unskippable at first run** — losing the keychain entry without it is permanent data loss. Note the threat model: FileVault already covers a stolen powered-off laptop; what this defends is unencrypted backups (Time Machine to a NAS, folder-sync tools) and other user-space apps reading the file.
+**Encryption at rest, default on.** 32-byte master key from the OS CSPRNG stored as a keychain binary secret; HKDF-SHA256 subkeys for `db` and `media`; raw-key `PRAGMA key` so no PBKDF2 runs per open; media encrypted with `age` (STREAM/ChaCha20-Poly1305) — **not yet implemented: recorded audio is stored unencrypted today, see §9.5 correction 6**. Because FTS5 lives *inside* the encrypted DB, encryption leaks no index. **A Recovery Key is mandatory and unskippable at first run** — losing the keychain entry without it is permanent data loss. Note the threat model: FileVault already covers a stolen powered-off laptop; what this defends is unencrypted backups (Time Machine to a NAS, folder-sync tools) and other user-space apps reading the file.
 
 > **Correction (2026-08-13), from building the Recovery Key (issue #38).** Four things in the paragraph above are wrong or missing, and three of them are load-bearing.
 >
@@ -1149,7 +1157,7 @@ Estimates are engineer-weeks for one experienced engineer. They assume the macOS
 |---|---|---|
 | **M0 — Skeleton & seam** | Cargo workspace builds on macOS; the `.app` bundle + signing + notarization pipeline works end to end and `just dev-sign` gives contributors a stable identity; `fotw-audio` traits defined with **zero platform types in the public API**; Windows/Linux stubs compile in CI; SQLCipher schema migration 0001 applies; loopback ingress controls (§10.1) in place; `fotw doctor` prints environment; `cargo deny` license allowlist green; LICENSE (Apache-2.0), NOTICE, GOVERNANCE.md with the no-open-core commitment. | **4–5** |
 | **M1 — Thin slice that a real person can use daily** | Record a real meeting end to end: system tap + mic as two streams → WAL to disk → Deepgram streaming → live two-color transcript → typed notes with anchors → Opus 5 augment pass with citations → summary on screen → Markdown export. Recording HUD is non-dismissable. Keys in Keychain. Signed, notarized DMG. **Also in M1:** run `count_tokens` against five real transcripts to validate §8.1, and test the purple-dot behavior on a real macOS 26 machine — both are one-hour tests that determine headline claims. | **6–8** |
-| **M2 — Trustworthy** | Zero-buffer watchdog, device-change rebuild, sleep/wake, AEC, level normalization; reconnect with gapless replay; failover chain terminating in the local engine; crash recovery via `fotw recover`; evidence + citation validators; provenance rendering and the source inspector; QA matrix passing on 14.4 / 15 / 26. | **6–8** |
+| **M2 — Trustworthy** | Zero-buffer watchdog, device-change rebuild, sleep/wake, AEC, level normalization; reconnect with gapless replay; failover chain terminating in the local engine; crash recovery of interrupted sessions; evidence + citation validators; provenance rendering and the source inspector; QA matrix passing on 14.4 / 15 / 26. | **6–8** |
 | **M3 — Complete product** | Calendar integration + conference-URL parser + detection + event matching; jurisdiction engine and full Disclosure Kit; templates; FTS5 search, folders, tags; audio retention engine; bulk export/import round-trip; Obsidian target; chat over meetings; zero-key local path (Apple + whisper.cpp + Ollama); auto-update. | **8–10** |
 | **M4 — Reach** | Windows (endpoint loopback → process loopback), then Linux (PipeWire); plugin interface; Notion/Slack; MCP server; Granola importer; PDF export. | **10–14** |
 
@@ -1170,7 +1178,7 @@ That went **up**, not down, after the Rust ground-truthing. The five infrastruct
 | 3 | **CIPA exposure follows the product, not the vendor.** § 637.2(a) is $5,000 per violation, per participant. | **High** | §11 in full. Never market invisibility. Keep it a pure BYO-key local tool with no vendor-held corpus to certify a class around. Lawyer review of all public copy. | Any launch-post draft containing the word "invisible" or "won't know." |
 | 4 | **Provider defaults are not privacy-safe.** Deepgram's published rates opt into training; ElevenLabs retains by default. A user assuming "local-first" means "nothing retained" is wrong. | **High** | KEY-03 transport-layer injection with no bypass; integration test asserting 100% flag presence; per-provider retention card with live doc links. | An outbound request captured without `mip_opt_out`. |
 | 5 | **AEC is underestimated** and the product ships double-transcribing remote speech — the visible failure mode in most sub-10-star clones. | **High** | Vendor a real AEC3 implementation rather than a naive spectral subtraction; integration test asserting single-occurrence transcription of a known far-end phrase. | Speaker-mode test transcript containing any duplicated phrase. |
-| 6 | **TCC grants keyed to an unstable signing identity** — every contributor build records silence with no error — and worse, a dev machine can *inherit its terminal’s* grant and appear to work. | **High** | `scripts/dev-sign.sh` with a stable self-signed identity; signed nightlies for contributors; loud CONTRIBUTING.md. | The first "it records nothing" issue from a self-builder. |
+| 6 | **TCC grants keyed to an unstable signing identity** — every contributor build records silence with no error — and worse, a dev machine can *inherit its terminal’s* grant and appear to work. | **High** | `just dev-sign` with a stable self-signed identity; signed nightlies for contributors; loud CONTRIBUTING.md. | The first "it records nothing" issue from a self-builder. |
 | 7 | **The overlay cannot be hidden from screen sharing on macOS 15+** and `setContentProtected` is ignored. | **High** | Collapsed-pill default, instant hide hotkey, persistent "presenting" toggle, no invisibility copy. Partially mitigated by `NSWindowSharingNone` on the panel (deprecated in favour of ScreenCaptureKit content filters, so re-test on our floor). | A user screenshot of the overlay in a shared screen. |
 | 8 | **Feature-surface trap.** Granola exposes ~40 documented surfaces. Chasing parity means never shipping. | **High** | Hold the non-goals list in §2. Parity is capture → notes → enhance → provenance → search → export, plus templates and chat. | Any P0 added after M0 that is not on that list. |
 | 9 | **Deepgram's streaming rate is promotional** and could revert above its batch rate, inverting the default. | Med | Never hardcode prices; dated price table; nightly cost-regression test; failover chain makes the default a config change. | The pricing page losing the "limited-time" label. |
@@ -1178,7 +1186,7 @@ That went **up**, not down, after the Rust ground-truthing. The five infrastruct
 | 11 | **Vendored third-party audio code may not be cleanly licensed.** anarlog has one root MIT LICENSE and no per-file SPDX headers. | Med | Run scancode/FOSSology over any vendored subtree before shipping; treat as a release blocker; pin the commit SHA in `vendor/MANIFEST.toml` (MIT grants are irrevocable for already-published versions). | Scanner flagging any WebRTC- or Apple-sample-derived file. |
 | 12 | **ElevenLabs session time limit** is undocumented; a 2-hour meeting will likely hit it and a naive adapter drops the remainder. | Med | Treat `session_time_limit_exceeded` as routine and retryable; test with a 2-hour fixture before shipping ElevenLabs streaming. | Any streaming session ending without our close. |
 | 13 | **Per-device tap attenuation** silently degrades STT for users on multi-channel interfaces. | Med | CAP-08 normalization; WER regression test across built-in-speaker and multi-channel configs. | WER delta > 2 points between device configs. |
-| 14 | **Rust narrows the OSS contributor pool**, and the audio core is the least approachable part. | Low | UI is a plain SPA served over HTTP with no Rust toolchain needed; audio/STT/storage in small crates with a `FileAudioSource` fake so contributors can run the pipeline without a Mac or a device; `fotw` CLI as a non-GUI entry point. | PRs clustering entirely in `ui/`. |
+| 14 | **Rust narrows the OSS contributor pool**, and the audio core is the least approachable part. | Low | UI is a plain SPA served over HTTP with no Rust toolchain needed; audio/STT/storage in small crates with a `FileAudioSource` fake so contributors can run the pipeline without a Mac or a device; `fotw` CLI as a non-GUI entry point. | PRs clustering entirely in `crates/fotw-web/ui/`. |
 
 ---
 

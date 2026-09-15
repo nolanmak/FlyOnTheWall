@@ -1,0 +1,58 @@
+name: Feature request
+description: Suggest a new capability or a change to an existing one.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## This issue is public. Keep meeting data and secrets out of it.
+
+        **Never paste transcripts, recordings, meeting titles, attendee names, API keys, Recovery Keys, or unredacted `fotwd.log` / `audit.jsonl` content.** If an example helps, make one up.
+
+        **Security vulnerabilities do not belong here.** Report them privately as described in [SECURITY.md](https://github.com/nolanmak/FlyOnTheWall/blob/main/SECURITY.md).
+
+  - type: checkboxes
+    id: data-check
+    attributes:
+      label: Before you submit
+      options:
+        - label: This request contains no transcripts, recordings, meeting titles, attendee names, API keys, Recovery Keys, or unredacted log content.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like to happen
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+    validations:
+      required: false
+
+  - type: dropdown
+    id: data-flow
+    attributes:
+      label: Would this send meeting content somewhere new?
+      description: >-
+        Audio and transcripts leave the machine only for services the user has
+        configured. A feature that adds a new destination needs that
+        discussion up front.
+      options:
+        - No, everything stays on this Mac
+        - Yes, to a service the user would configure
+        - Not sure
+    validations:
+      required: true
