@@ -28,9 +28,13 @@ fn zoom() -> DetectedMeeting {
 /// what every prompt looks like on a fresh install.
 fn california() -> DetectedMeeting {
     zoom().with_consent_notice(
-        "These jurisdictions require every participant's consent:\n  \
-         • California — Cal. Penal Code § 632 (https://leginfo.legislature.ca.gov/faces/\
-         codes_displaySection.xhtml?lawCode=PEN&sectionNum=632)\nThis is not legal advice.",
+        "Recording laws that may apply to this call:\n  \
+         • California: every participant must consent. \
+         Recording without that consent is a CRIMINAL offence.\n    \
+         Cal. Penal Code § 632 (https://leginfo.legislature.ca.gov/faces/\
+         codes_displaySection.xhtml?lawCode=PEN&sectionNum=632)\n    \
+         Punishable by a fine, imprisonment, or both (§ 632(a)).\n\
+         This is not legal advice.",
         true,
     )
 }

@@ -1,5 +1,5 @@
 {
- "version": 1,
+ "version": 2,
  "jurisdictions": [
   {
    "code": "US-CA",
@@ -7,8 +7,8 @@
    "regime": "all_party",
    "statute": "Cal. Penal Code \u00a7 632",
    "citation_url": "https://leginfo.legislature.ca.gov/faces/codes_displaySection.xhtml?lawCode=PEN&sectionNum=632",
-   "criminal": false,
-   "note": "",
+   "criminal": true,
+   "note": "Punishable by a fine, imprisonment, or both (\u00a7 632(a)).",
    "cctld": null
   },
   {
@@ -17,8 +17,8 @@
    "regime": "all_party",
    "statute": "Fla. Stat. \u00a7 934.03",
    "citation_url": "https://www.flsenate.gov/Laws/Statutes/2023/934.03",
-   "criminal": false,
-   "note": "",
+   "criminal": true,
+   "note": "A violation is a third-degree felony (\u00a7 934.03(4)(a)).",
    "cctld": null
   },
   {
@@ -27,8 +27,8 @@
    "regime": "all_party",
    "statute": "720 ILCS 5/14-2",
    "citation_url": "https://www.ilga.gov/legislation/ilcs/fulltext.asp?DocName=072000050K14-2",
-   "criminal": false,
-   "note": "",
+   "criminal": true,
+   "note": "Applies to a party who records surreptitiously (\u00a7 14-2(a)(2)). A first offence is a Class 4 felony (\u00a7 14-4(a)).",
    "cctld": null
   },
   {
@@ -37,8 +37,8 @@
    "regime": "all_party",
    "statute": "Md. Code, Cts. & Jud. Proc. \u00a7 10-402",
    "citation_url": "https://mgaleg.maryland.gov/mgawebsite/Laws/StatuteText?article=gcj&section=10-402",
-   "criminal": false,
-   "note": "",
+   "criminal": true,
+   "note": "A violation is a felony (\u00a7 10-402(b)).",
    "cctld": null
   },
   {
@@ -47,8 +47,8 @@
    "regime": "all_party",
    "statute": "Mass. Gen. Laws ch. 272, \u00a7 99",
    "citation_url": "https://malegislature.gov/Laws/GeneralLaws/PartIV/TitleI/Chapter272/Section99",
-   "criminal": false,
-   "note": "",
+   "criminal": true,
+   "note": "Applies to secret recording (\u00a7 99 B.4). Punishable by a fine, imprisonment, or both (\u00a7 99 C.1).",
    "cctld": null
   },
   {
@@ -57,8 +57,8 @@
    "regime": "all_party",
    "statute": "Mont. Code Ann. \u00a7 45-8-213",
    "citation_url": "https://leg.mt.gov/bills/mca/title_0450/chapter_0080/part_0020/section_0130/0450-0080-0020-0130.html",
-   "criminal": false,
-   "note": "",
+   "criminal": true,
+   "note": "Applies to recording with a hidden device without the knowledge of all parties (\u00a7 45-8-213(1)(c)). Punishable by a fine, county jail, or both.",
    "cctld": null
   },
   {
@@ -66,9 +66,9 @@
    "name": "New Hampshire",
    "regime": "all_party",
    "statute": "N.H. Rev. Stat. \u00a7 570-A:2",
-   "citation_url": "https://www.gencourt.state.nh.us/rsa/html/lxii/570-a/570-a-2.htm",
-   "criminal": false,
-   "note": "",
+   "citation_url": "https://gc.nh.gov/rsa/html/lviii/570-a/570-a-2.htm",
+   "criminal": true,
+   "note": "A party to the conversation who records without everyone's consent commits a misdemeanor (RSA 570-A:2, I-a); other unconsented interception is a class B felony (I).",
    "cctld": null
   },
   {
@@ -77,8 +77,8 @@
    "regime": "all_party",
    "statute": "18 Pa. C.S. \u00a7 5703",
    "citation_url": "https://www.legis.state.pa.us/cfdocs/legis/LI/consCheck.cfm?txtType=HTM&ttl=18&div=0&chpt=57",
-   "criminal": false,
-   "note": "",
+   "criminal": true,
+   "note": "A violation is a third-degree felony (\u00a7 5703). Lawful when all parties have consented (\u00a7 5704(4)).",
    "cctld": null
   },
   {
@@ -87,8 +87,8 @@
    "regime": "all_party",
    "statute": "Wash. Rev. Code \u00a7 9.73.030",
    "citation_url": "https://app.leg.wa.gov/rcw/default.aspx?cite=9.73.030",
-   "criminal": false,
-   "note": "",
+   "criminal": true,
+   "note": "A violation is a gross misdemeanor (RCW 9.73.080).",
    "cctld": null
   },
   {
@@ -96,9 +96,9 @@
    "name": "Delaware",
    "regime": "all_party",
    "statute": "Del. Code tit. 11, \u00a7 2402",
-   "citation_url": "https://delcode.delaware.gov/title11/c020/sc02/index.html",
+   "citation_url": "https://delcode.delaware.gov/title11/c024/sc01/index.html",
    "criminal": false,
-   "note": "",
+   "note": "\u00a7 2402(c)(4) lets a party record, but \u00a7 1335(a)(4) makes intercepting a private conversation without the consent of all parties the crime of violation of privacy.",
    "cctld": null
   },
   {
@@ -107,8 +107,8 @@
    "regime": "contested",
    "statute": "Nev. Rev. Stat. \u00a7 200.620",
    "citation_url": "https://www.leg.state.nv.us/nrs/nrs-200.html",
-   "criminal": false,
-   "note": "Present in the RCFP list and absent from several other 2026 compilations. Nevada case law distinguishes telephone from in-person. Treat as all-party.",
+   "criminal": true,
+   "note": "Present in the RCFP list and absent from several other 2026 compilations. Nevada case law distinguishes telephone from in-person. Treat as all-party. A violation is a category D felony (NRS 200.690).",
    "cctld": null
   },
   {
@@ -116,7 +116,7 @@
    "name": "Connecticut",
    "regime": "contested",
    "statute": "Conn. Gen. Stat. \u00a7 52-570d",
-   "citation_url": "https://www.cga.ct.gov/current/pub/chap_899.htm",
+   "citation_url": "https://www.cga.ct.gov/current/pub/chap_925.htm#sec_52-570d",
    "criminal": false,
    "note": "All-party for telephone recordings but one-party in person under criminal law. Treat as all-party.",
    "cctld": null
@@ -127,8 +127,8 @@
    "regime": "contested",
    "statute": "Or. Rev. Stat. \u00a7 165.540",
    "citation_url": "https://www.oregonlegislature.gov/bills_laws/ors/ors165.html",
-   "criminal": false,
-   "note": "All-party for in-person oral communications, one-party for electronic. The distinction does not map cleanly onto a video call.",
+   "criminal": true,
+   "note": "All-party for in-person oral communications, one-party for electronic. The distinction does not map cleanly onto a video call. A violation is a Class A misdemeanor (ORS 165.540).",
    "cctld": null
   },
   {
@@ -138,7 +138,7 @@
    "statute": "Mich. Comp. Laws \u00a7 750.539c",
    "citation_url": "https://www.legislature.mi.gov/Laws/MCL?objectName=MCL-750-539C",
    "criminal": false,
-   "note": "The statute reads all-party but Michigan courts have held a participant may record. Unsettled.",
+   "note": "The statute reads all-party but Michigan courts have held a participant may record. Unsettled. The statute makes a violation a felony.",
    "cctld": null
   },
   {
@@ -146,9 +146,9 @@
    "name": "Hawaii",
    "regime": "contested",
    "statute": "Haw. Rev. Stat. \u00a7 803-42",
-   "citation_url": "https://www.capitol.hawaii.gov/hrscurrent/Vol15_Ch0701-0853/HRS0803/HRS_0803-0042.htm",
-   "criminal": false,
-   "note": "One-party generally, all-party for recordings in a private place. Treat as all-party.",
+   "citation_url": "https://www.capitol.hawaii.gov/hrscurrent/vol14_ch0701-0853/hrs0803/hrs_0803-0042.htm",
+   "criminal": true,
+   "note": "One-party generally, all-party for recordings in a private place. Treat as all-party. A violation is a class C felony (\u00a7 803-42(a)).",
    "cctld": null
   },
   {
@@ -508,7 +508,7 @@
    "statute": "\u00a7 201 StGB (Verletzung der Vertraulichkeit des Wortes)",
    "citation_url": "https://www.gesetze-im-internet.de/stgb/__201.html",
    "criminal": true,
-   "note": "Criminal. Applies to participants as well as third parties; fines or up to three years' imprisonment.",
+   "note": "Applies to participants as well as third parties; fines or up to three years' imprisonment.",
    "cctld": "de"
   },
   {
@@ -518,7 +518,7 @@
    "statute": "Code p\u00e9nal art. 226-1",
    "citation_url": "https://www.legifrance.gouv.fr/codes/article_lc/LEGIARTI000006417929",
    "criminal": true,
-   "note": "Criminal. Up to one year and a EUR 45,000 fine.",
+   "note": "Up to one year and a EUR 45,000 fine.",
    "cctld": "fr"
   },
   {

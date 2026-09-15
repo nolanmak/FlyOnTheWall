@@ -640,7 +640,8 @@ fn wrapping_label(mtm: MainThreadMarker, size: f64, bold: bool) -> Retained<NSTe
         cell.setWraps(true);
         // Without this, a line too long to fit is silently replaced by an
         // ellipsis -- which, on the jurisdiction warning, means the user reads
-        // "Recording without every participant's consent is a…".
+        // "California: every participant must consent. Recording without that
+        // consent is a…".
         cell.setTruncatesLastVisibleLine(false);
     }
     field

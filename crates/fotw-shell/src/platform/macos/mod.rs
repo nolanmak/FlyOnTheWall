@@ -258,9 +258,12 @@ fn probe_meeting() -> DetectedMeeting {
     DetectedMeeting::new("us.zoom.xos", "Zoom", "Zoom is using the microphone")
         .with_title("Weekly design review with the platform team")
         .with_consent_notice(
-            "These jurisdictions require every participant's consent:\n  \
-             • California — Cal. Penal Code § 632 (https://leginfo.legislature.ca.gov/faces/\
-             codes_displaySection.xhtml?lawCode=PEN&sectionNum=632)\n\
+            "Recording laws that may apply to this call:\n  \
+             • California: every participant must consent. \
+             Recording without that consent is a CRIMINAL offence.\n    \
+             Cal. Penal Code § 632 (https://leginfo.legislature.ca.gov/faces/\
+             codes_displaySection.xhtml?lawCode=PEN&sectionNum=632)\n    \
+             Punishable by a fine, imprisonment, or both (§ 632(a)).\n\
              This is not legal advice.",
             true,
         )
