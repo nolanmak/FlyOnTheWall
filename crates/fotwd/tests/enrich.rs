@@ -166,11 +166,16 @@ async fn a_fixture_that_names_a_dead_claude_is_stopped_before_it_can_spawn_one()
 async fn a_human_title_is_never_replaced() {
     let mut db = db();
     let meeting = meeting_with_transcript(&mut db);
-    db.meetings().set_title(&meeting, "Quarterly planning").unwrap();
+    db.meetings()
+        .set_title(&meeting, "Quarterly planning")
+        .unwrap();
 
     enrich_meeting_with(&mut db, &InMemoryKeyStore::new(), &meeting).await;
 
-    assert_eq!(db.meetings().get(&meeting).unwrap().title, "Quarterly planning");
+    assert_eq!(
+        db.meetings().get(&meeting).unwrap().title,
+        "Quarterly planning"
+    );
 }
 
 /// A configured engine that fails at run time degrades to exactly the
@@ -476,13 +481,18 @@ async fn a_later_pass_upgrades_the_fallback_title_it_minted_itself() {
 async fn a_human_rename_is_never_offered_to_the_engine() {
     let mut db = db();
     let meeting = meeting_with_transcript(&mut db);
-    db.meetings().set_title(&meeting, "Quarterly planning").unwrap();
+    db.meetings()
+        .set_title(&meeting, "Quarterly planning")
+        .unwrap();
     let cli = scripted_cli("renamed", &[PROSE, EXTRACTION]);
     cli_settings(&mut db, &cli.binary);
 
     let report = enrich_meeting_with(&mut db, &InMemoryKeyStore::new(), &meeting).await;
 
-    assert_eq!(db.meetings().get(&meeting).unwrap().title, "Quarterly planning");
+    assert_eq!(
+        db.meetings().get(&meeting).unwrap().title,
+        "Quarterly planning"
+    );
     assert_eq!(
         cli.invocations(),
         2,
