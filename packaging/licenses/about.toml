@@ -1,0 +1,65 @@
+# cargo-about configuration for THIRD_PARTY_NOTICES.md. Run `just licenses`
+# rather than cargo-about directly: the recipe pins the cargo-about version,
+# points it at crates/fotwd/Cargo.toml, keeps it offline and fails on any
+# warning.
+#
+# Scope is what FlyOnTheWall.app ships, which is the fotwd binary. Build and
+# dev dependencies run on the build machine and are not linked into it.
+# cargo-about resolves features for fotwd alone, so its crate list matches
+# `cargo tree -p fotwd -e normal --target <triple>`. A walk over the raw
+# `cargo metadata` resolve would add crates such as rustls and ring that only
+# appear through workspace-wide feature unification and are not in the binary.
+
+# deny.toml's allowlist, in the same order. A crate offered under a choice of
+# licenses is listed under the first one here that it offers.
+accepted = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "Zlib",
+  "Unlicense",
+  "ISC",
+  "MPL-2.0",
+  "Unicode-3.0",
+]
+
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# libsqlite3-sys declares MIT, which covers its Rust bindings. With
+# `bundled-sqlcipher-vendored-openssl` (crates/fotw-store/Cargo.toml) it also
+# compiles the SQLCipher amalgamation in its sqlcipher/ directory, which is
+# under Zetetic's BSD 3-clause license, and that license's binary clause is
+# why this file has to ship. The template prints that text in its SQLCipher
+# section by looking up this crate's BSD-3-Clause entry.
+#
+# If an update changes either file, its checksum stops matching. cargo-about
+# only warns about that and falls back to its own scan, which is why
+# `just licenses` fails on any warning.
+[libsqlite3-sys.clarify]
+license = "MIT AND BSD-3-Clause"
+
+[[libsqlite3-sys.clarify.files]]
+path = "LICENSE"
+license = "MIT"
+checksum = "c10c1f27337546471e5f7e4e97fdd398b35b9d4e126115dcd22de8d8e65abf6f"
+
+[[libsqlite3-sys.clarify.files]]
+path = "sqlcipher/LICENSE"
+license = "BSD-3-Clause"
+checksum = "ea4fcb309f14a22065e1ea45362d494d320012249ed865fe9c7c0946db754131"
+
+# opusic-sys compiles libopus from its opus/ directory (the default `bundled`
+# feature). Left to scan that tree, cargo-about reports fourteen BSD headers
+# from individual libopus source files as separate license texts. opus/COPYING
+# is the license libopus distributes, and opusic-sys's own LICENSE is a
+# byte-identical copy of it. The template's libopus section prints this entry.
+[opusic-sys.clarify]
+license = "BSD-3-Clause"
+
+[[opusic-sys.clarify.files]]
+path = "opus/COPYING"
+checksum = "01e1167d54a096d123cf6dfbbeb19587278845c6481d2d66d545669846079551"
