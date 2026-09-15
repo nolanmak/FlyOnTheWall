@@ -37,5 +37,6 @@ the rejected alternatives, not just the conclusion.
 
 ## Security
 
-Report vulnerabilities privately via GitHub Security Advisories rather than a
-public issue.
+Report vulnerabilities privately, never in a public issue.
+[SECURITY.md](SECURITY.md) has the reporting link, what is in scope, and what to
+expect.
