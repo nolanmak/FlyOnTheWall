@@ -96,9 +96,84 @@ bundle profile="release":
     cp "target/{{profile}}/fotwd" "{{app}}/Contents/MacOS/fotwd"
     cp packaging/Info.plist "{{app}}/Contents/Info.plist"
     cp packaging/AppIcon.icns "{{app}}/Contents/Resources/AppIcon.icns"
+    cp THIRD_PARTY_NOTICES.md "{{app}}/Contents/Resources/THIRD_PARTY_NOTICES.md"
     printf 'APPL????' > "{{app}}/Contents/PkgInfo"
     plutil -lint "{{app}}/Contents/Info.plist"
     echo "✓ assembled {{app}}"
+
+# THIRD_PARTY_NOTICES.md holds the notices and license texts for what fotwd
+# links, plus the icon credit, and `bundle` copies it into the app. Run this
+# after any Cargo.lock change and commit the result. The cargo-about config
+# and template live in packaging/licenses/.
+# Regenerate THIRD_PARTY_NOTICES.md from Cargo.lock.
+licenses:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Pinned so the committed file changes only when the dependencies do.
+    # cargo-about 0.9 builds its binary only with the `cli` feature.
+    version=0.9.2
+    have=$(cargo about --version 2>/dev/null || true)
+    if [[ -z "$have" ]]; then
+        echo "→ installing cargo-about $version"
+        cargo install cargo-about --locked --version "$version" --features cli
+    elif [[ "$have" != "cargo-about $version" ]]; then
+        echo "error: found $have, but THIRD_PARTY_NOTICES.md is generated with cargo-about $version:" >&2
+        echo "    cargo install cargo-about --locked --version $version --features cli" >&2
+        exit 1
+    fi
+    # Offline from here on. Online, cargo-about fetches license files that a
+    # crate's package lacks from the crate's git repository, so the output
+    # would depend on the network. Offline it uses the standard SPDX text.
+    cargo fetch --locked --quiet
+    tmp=$(mktemp)
+    log=$(mktemp)
+    trap 'rm -f "$tmp" "$log"' EXIT
+    # A clarification whose checksum no longer matches is only a warning, after
+    # which cargo-about falls back to its own scan, so anything on stderr fails,
+    # as does a non-zero exit.
+    status=0
+    cargo about generate --frozen --fail \
+        --manifest-path crates/fotwd/Cargo.toml \
+        --config packaging/licenses/about.toml \
+        --output-file "$tmp" packaging/licenses/about.hbs 2>"$log" || status=$?
+    if [[ $status -ne 0 || -s "$log" || ! -s "$tmp" ]]; then
+        cat "$log" >&2
+        echo "error: cargo-about did not run cleanly (exit status $status)" >&2
+        exit 1
+    fi
+    # about.hbs describes the C libraries these crates compile, as of the crate
+    # versions it names. When Cargo.lock moves one, or fotwd stops reaching one,
+    # stop so that section is re-checked instead of going stale.
+    for krate in libsqlite3-sys openssl-src opusic-sys; do
+        # A non-zero exit means the crate is gone from Cargo.lock, or that two
+        # versions of it are locked and `-i "$krate"` is ambiguous. cargo's
+        # stderr says which.
+        if ! resolved=$(cargo tree --frozen -p fotwd -e normal,build \
+                --target aarch64-apple-darwin -i "$krate" --depth 0 2>"$log"); then
+            cat "$log" >&2
+            echo "error: cargo tree could not look up $krate in fotwd's dependency graph; re-check its section in packaging/licenses/about.hbs" >&2
+            exit 1
+        fi
+        # A crate still in Cargo.lock that fotwd no longer reaches, for example
+        # one that only another workspace member uses, exits 0 with nothing on
+        # stdout. Treat that as missing too.
+        if [[ -z "$resolved" ]]; then
+            echo "error: $krate is no longer in fotwd's dependency graph; update its section in packaging/licenses/about.hbs" >&2
+            exit 1
+        fi
+        resolved=${resolved%%$'\n'*}
+        # -w: the match has to end at a non-word character, so a template that
+        # names 0.38.20 does not pass for 0.38.2.
+        if ! grep -qwF -- "${resolved/ v/ }" packaging/licenses/about.hbs; then
+            echo "error: Cargo.lock resolves $resolved, which packaging/licenses/about.hbs does not name." >&2
+            echo "  Check the version and license of the C library it compiles, then update about.hbs." >&2
+            exit 1
+        fi
+    done
+    # Not cp: the mktemp file is 0600, and the copy in the app should be
+    # readable by every user.
+    install -m 0644 "$tmp" THIRD_PARTY_NOTICES.md
+    echo "✓ wrote THIRD_PARTY_NOTICES.md"
 
 # Assert the bundle carries everything TCC needs. Run in CI and before release:
 # each of these failing produces silent capture rather than an error.
