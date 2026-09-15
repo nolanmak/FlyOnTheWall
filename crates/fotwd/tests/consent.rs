@@ -145,6 +145,8 @@ fn escalation_is_never_silent_about_not_being_legal_advice() {
     for signals in [
         JurisdictionSignals::home("US-NY"),
         JurisdictionSignals::home("US-CA"),
+        JurisdictionSignals::home("DE").with_attendee_domains(["colleague@example.co.uk"]),
+        JurisdictionSignals::home("XX-ZZ"),
     ] {
         let text = rules().escalate(&signals).user_text();
         assert!(
@@ -164,6 +166,101 @@ fn an_unknown_home_jurisdiction_escalates_rather_than_assuming_the_permissive_ca
         matches!(e, Escalation::Blocking { .. }),
         "an unknown jurisdiction must bias toward over-warning"
     );
+    // And it says why it blocks, rather than a heading with nothing under it.
+    let text = e.user_text();
+    assert!(text.contains("not in the rules table"), "{text}");
+}
+
+// ---------------------------------------------------------- criminal exposure
+
+/// The warning's bullet for one jurisdiction: its first line and the indented
+/// lines under it, up to the next bullet.
+fn bullet(text: &str, name: &str) -> String {
+    let head = format!("{name}:");
+    text.split("\n  • ")
+        .skip(1)
+        .find(|b| b.starts_with(&head))
+        .unwrap_or_else(|| panic!("no bullet for {name} in:\n{text}"))
+        .to_owned()
+}
+
+/// Each of these punishes a participant's recording without the consent its
+/// rule requires as a crime, by the penalty in the statute text; each entry's
+/// note says what the statute penalises. Marked civil, the warning understated
+/// exposure in exactly the states it exists for.
+#[test]
+fn statutes_with_criminal_penalties_are_marked_criminal() {
+    let r = rules();
+    for code in [
+        "US-CA", "US-FL", "US-IL", "US-MD", "US-MA", "US-MT", "US-NH", "US-PA", "US-WA", "US-DE",
+        "US-NV", "US-OR", "US-MI", "US-HI", "DE", "FR",
+    ] {
+        assert!(
+            r.get(code).unwrap().criminal,
+            "{code}'s statute text makes a breach a crime"
+        );
+    }
+    // Connecticut's all-party rule for calls is § 52-570d, a civil action. Its
+    // criminal eavesdropping statute (§ 53a-189) only reaches non-parties.
+    assert!(!r.get("US-CT").unwrap().criminal);
+}
+
+#[test]
+fn a_one_party_entry_is_never_marked_criminal() {
+    // The flag is about a participant who records. Where one participant's
+    // consent is enough, that recording breaks no rule, so there is no
+    // offence for it to be.
+    for j in rules()
+        .all()
+        .filter(|j| j.regime == ConsentRegime::OneParty)
+    {
+        assert!(!j.criminal, "{} is one-party and marked criminal", j.code);
+    }
+}
+
+#[test]
+fn california_is_labelled_criminal() {
+    let text = rules()
+        .escalate(&JurisdictionSignals::home("US-CA"))
+        .user_text();
+    let ca = bullet(&text, "California");
+    assert!(ca.contains("CRIMINAL"), "{text}");
+    assert!(ca.contains("§ 632"), "{text}");
+}
+
+/// One criminal jurisdiction must not make the others read as criminal. A
+/// single heading did exactly that: home Germany plus a `.co.uk` attendee
+/// listed the UK under "a CRIMINAL offence in:".
+#[test]
+fn a_criminal_label_stays_with_the_jurisdiction_it_belongs_to() {
+    let signals =
+        JurisdictionSignals::home("DE").with_attendee_domains(["colleague@example.co.uk"]);
+    let text = rules().escalate(&signals).user_text();
+
+    assert!(bullet(&text, "Germany").contains("CRIMINAL"), "{text}");
+    let gb = bullet(&text, "United Kingdom");
+    assert!(
+        !gb.contains("CRIMINAL"),
+        "the UK was labelled criminal:\n{text}"
+    );
+    assert!(
+        gb.contains("lawful basis"),
+        "a GDPR-style regime is not all-party consent:\n{text}"
+    );
+    assert!(
+        !text.lines().next().unwrap_or_default().contains("CRIMINAL"),
+        "no heading may label every listed jurisdiction criminal:\n{text}"
+    );
+}
+
+#[test]
+fn a_contested_civil_jurisdiction_is_not_labelled_criminal() {
+    let text = rules()
+        .escalate(&JurisdictionSignals::home("US-CT"))
+        .user_text();
+    let ct = bullet(&text, "Connecticut");
+    assert!(!ct.contains("CRIMINAL"), "{text}");
+    assert!(ct.contains("sources disagree"), "{text}");
 }
 
 // ------------------------------------------------------------ disclosure kit

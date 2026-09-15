@@ -63,15 +63,62 @@ pub struct Jurisdiction {
     pub statute: String,
     /// Where to read it.
     pub citation_url: String,
-    /// Whether violation is a **criminal** matter rather than only civil.
-    /// Germany and France are; most US states are civil for a participant.
+    /// Whether a participant who records in breach of this entry's rule
+    /// commits a **criminal** offence, rather than only a civil wrong or a
+    /// regulatory breach.
+    ///
+    /// Set from the penalty in the statute text, not inferred from the
+    /// regime. True for Germany, France and every all-party or contested US
+    /// state in the table except Connecticut, whose all-party rule
+    /// (§ 52-570d) is enforced by civil action. False for the one-party
+    /// entries, where a participant's own recording breaks no rule; for the
+    /// `mixed` entries, whose stricter layer is privacy or data-protection law
+    /// and which have not been checked against national penal codes; and for
+    /// Australia, whose state acts differ.
     pub criminal: bool,
-    /// What is disputed, for contested entries.
+    /// What is disputed, for contested entries, and otherwise what the
+    /// statute penalises. Printed under the entry in the warning.
     #[serde(default)]
     pub note: String,
     /// ccTLD used to infer this jurisdiction from an attendee's email domain.
     #[serde(default)]
     pub cctld: Option<String>,
+}
+
+impl Jurisdiction {
+    /// The rule this entry puts on a participant who records, and whether
+    /// breaking it is a crime, as the sentence the warning prints beside the
+    /// jurisdiction's name.
+    ///
+    /// Criminal exposure comes from this entry's own flag and no other. It
+    /// never says a breach is *not* a crime: a `false` flag means the table
+    /// has no criminal penalty for it, which is weaker than there being none.
+    #[must_use]
+    pub fn requirement(&self) -> String {
+        let rule = match self.regime {
+            ConsentRegime::OneParty => "one participant's consent is enough.",
+            ConsentRegime::AllParty => "every participant must consent.",
+            ConsentRegime::Mixed => {
+                "recording needs a lawful basis under privacy or data-protection law; \
+                 one participant's consent is not enough on its own."
+            }
+            ConsentRegime::Contested => {
+                "sources disagree, so this is treated as requiring every participant's consent."
+            }
+        };
+        if !self.criminal {
+            return rule.to_owned();
+        }
+        let crime = match self.regime {
+            ConsentRegime::OneParty => "Recording without it is a CRIMINAL offence.",
+            ConsentRegime::AllParty => "Recording without that consent is a CRIMINAL offence.",
+            ConsentRegime::Mixed => "Recording without a lawful basis is a CRIMINAL offence.",
+            ConsentRegime::Contested => {
+                "Under the stricter reading, recording without that consent is a CRIMINAL offence."
+            }
+        };
+        format!("{rule} {crime}")
+    }
 }
 
 /// What we know about where the participants are.
@@ -129,6 +176,10 @@ pub enum Escalation {
         /// The jurisdictions that triggered it.
         jurisdictions: Vec<Jurisdiction>,
         /// True when any of them is criminal rather than civil.
+        ///
+        /// Only an aggregate. [`Escalation::user_text`] labels each
+        /// jurisdiction from its own flag, because one criminal statute says
+        /// nothing about the others on the same call.
         criminal: bool,
     },
 }
@@ -139,29 +190,32 @@ impl Escalation {
     /// Always ends with the disclaimer. A tool that tells someone their
     /// recording is lawful, and is wrong, has done them real harm — so it
     /// never says that, in either branch.
+    ///
+    /// A blocking warning labels each jurisdiction on its own line with its
+    /// own rule and its own criminal exposure. One heading over the whole
+    /// list would attribute Germany's criminal statute to a UK attendee.
     #[must_use]
     pub fn user_text(&self) -> String {
         match self {
             Self::Reminder { .. } => "Everyone on this call should know they're being recorded. \
                  This is not legal advice."
                 .to_owned(),
-            Self::Blocking {
-                jurisdictions,
-                criminal,
-            } => {
+            Self::Blocking { jurisdictions, .. } => {
                 let mut s = String::new();
-                if *criminal {
+                if jurisdictions.is_empty() {
+                    // `Rules::escalate` blocks with nothing listed only when the
+                    // home jurisdiction is not in the table and no other signal
+                    // resolved. Say that, rather than a heading over nothing.
                     s.push_str(
-                        "Recording without every participant's consent is a CRIMINAL offence in:\n",
+                        "Your home jurisdiction is not in the rules table, so this is treated \
+                         as requiring every participant's consent.\n",
                     );
                 } else {
-                    s.push_str("These jurisdictions require every participant's consent:\n");
+                    s.push_str("Recording laws that may apply to this call:\n");
                 }
                 for j in jurisdictions {
-                    s.push_str(&format!(
-                        "  • {} — {} ({})\n",
-                        j.name, j.statute, j.citation_url
-                    ));
+                    s.push_str(&format!("  • {}: {}\n", j.name, j.requirement()));
+                    s.push_str(&format!("    {} ({})\n", j.statute, j.citation_url));
                     if !j.note.is_empty() {
                         s.push_str(&format!("    {}\n", j.note));
                     }
