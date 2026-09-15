@@ -1,0 +1,23 @@
+# Dependabot version updates: routine weekly bumps for crates and for the
+# GitHub Actions used in .github/workflows. Dependabot alerts and security
+# update pull requests are repository settings, not something this file turns
+# on.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    ignore:
+      # ci.yml pins this action to a commit on its `1.95.0` branch, which is how
+      # that action selects a toolchain. The repository's only tag is `v1`, so
+      # there is no release for Dependabot to move the pin along. Bump it by hand,
+      # together with the channel in rust-toolchain.toml.
+      - dependency-name: dtolnay/rust-toolchain
