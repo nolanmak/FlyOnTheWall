@@ -606,8 +606,14 @@ pub fn fallback_title(segments: &[TranscriptSegment]) -> Option<String> {
 /// and reflect the bytes into the summary. When [`TokioCliRunner::shielded`]
 /// built this runner, the child gets an **empty `$HOME`** (a fresh temp dir)
 /// so every `~`-relative secret path resolves to nothing, while `CODEX_HOME`
-/// is pinned to the real `~/.codex` so the subscription login still works. The
-/// `claude -p` path is not agentic and does not need this.
+/// is pinned to the real `~/.codex` so the subscription login still works.
+///
+/// The `claude -p` path gets no shield because it has no tools to steer: the
+/// adapter passes `--tools ""` (no built-in tools) and `--strict-mcp-config`
+/// (no MCP servers), pinned by `fotw-summarize`'s `tests/claude_cli.rs`. Left
+/// at its defaults, print mode would offer the model Claude Code's shell, file
+/// and web tools and the user's MCP servers. It keeps the real `$HOME` on
+/// purpose: its login lives there and in the login keychain.
 pub struct TokioCliRunner {
     binary: PathBuf,
     deadline: std::time::Duration,

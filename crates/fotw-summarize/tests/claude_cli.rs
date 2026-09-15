@@ -94,6 +94,19 @@ const SYSTEM: &str = "SYSTEM-PROMPT-SENTINEL";
 const NOTES: &str = "NOTES-SENTINEL decide on the rebinding guard";
 const INSTRUCTION: &str = "INSTRUCTION-SENTINEL produce the summary";
 
+/// The argv of every invocation without a model choice. Everything after
+/// `json` takes the agent out of Claude Code; see
+/// [`the_cli_runs_with_no_tools_no_mcp_servers_and_no_saved_session`].
+const BASE_ARGV: [&str; 7] = [
+    "-p",
+    "--output-format",
+    "json",
+    "--tools",
+    "",
+    "--strict-mcp-config",
+    "--no-session-persistence",
+];
+
 fn request() -> LlmRequest {
     let document = TranscriptDocument::from_segments(&sample_meeting());
     let indices = document.all_indices();
@@ -148,7 +161,7 @@ fn content_travels_on_stdin_and_never_in_argv() {
     block_on(adapter.complete(&request())).expect("complete");
     let (argv, stdin) = cli.only_call();
 
-    assert_eq!(argv, ["-p", "--output-format", "json"]);
+    assert_eq!(argv, BASE_ARGV);
 
     for sentinel in [SYSTEM, NOTES, INSTRUCTION] {
         assert!(stdin.contains(sentinel), "{sentinel} missing from stdin");
@@ -195,17 +208,63 @@ fn a_model_choice_is_argv_because_it_is_not_content() {
     block_on(adapter.complete(&request())).expect("complete");
     let (argv, _) = cli.only_call();
 
-    assert_eq!(
-        argv,
-        [
-            "-p",
-            "--output-format",
-            "json",
-            "--model",
-            "claude-haiku-4-5"
-        ]
-    );
+    let expected: Vec<&str> = BASE_ARGV
+        .iter()
+        .copied()
+        .chain(["--model", "claude-haiku-4-5"])
+        .collect();
+    assert_eq!(argv, expected);
     assert_eq!(adapter.model_id(), "claude-haiku-4-5");
+}
+
+/// `claude -p` left at its defaults is an agent: Claude Code's built-in tools
+/// (shell, file reads and edits, web fetch) plus whatever MCP servers the
+/// user configured, over a transcript anyone in the meeting could have
+/// written a line of (ING-11). These are the flags that take all of that
+/// away, pinned the way `tests/codex_cli.rs` pins codex's read-only sandbox,
+/// so losing one fails a test instead of quietly handing the transcript tools.
+#[test]
+fn the_cli_runs_with_no_tools_no_mcp_servers_and_no_saved_session() {
+    for model in [None, Some("claude-haiku-4-5".to_owned())] {
+        let cli = FakeCli::ok(&result_json("fine"));
+        let adapter = ClaudeCliAdapter::new(Arc::clone(&cli), model);
+        block_on(adapter.complete(&request())).expect("complete");
+        let (argv, _) = cli.only_call();
+
+        let tools: Vec<usize> = argv
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--tools")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(tools.len(), 1, "exactly one --tools: {argv:?}");
+        assert_eq!(
+            argv.get(tools[0] + 1).map(String::as_str),
+            Some(""),
+            "the empty list is what disables every built-in tool; a name there \
+             would enable that tool: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a == "--strict-mcp-config"),
+            "without it the user's configured MCP servers load: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a == "--no-session-persistence"),
+            "without it the transcript is saved as a resumable session: {argv:?}"
+        );
+        for widening in [
+            "--mcp-config",
+            "--allowedTools",
+            "--allowed-tools",
+            "--dangerously-skip-permissions",
+            "default",
+        ] {
+            assert!(
+                !argv.iter().any(|a| a == widening),
+                "{widening} would widen what the model can reach: {argv:?}"
+            );
+        }
+    }
 }
 
 // -------------------------------------------------------------- the answers

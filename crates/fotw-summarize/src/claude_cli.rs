@@ -17,6 +17,36 @@
 //! notes, instruction — goes over stdin, in spec 8.4's block order; argv
 //! carries only flags and a model id.
 //!
+//! # No tools, no MCP servers, no session file
+//!
+//! `claude -p` is Claude Code in print mode, and print mode keeps Claude
+//! Code's default tool set — shell, file reads and edits, web fetch — plus
+//! whatever MCP servers the user's own configuration names. Which of those run
+//! without asking is up to that user's permission settings. The transcript
+//! this adapter sends is untrusted (ING-11: a participant can say anything),
+//! so left at those defaults a sentence spoken in a meeting could steer an
+//! agent. [`ClaudeCliAdapter::argv`] turns that off:
+//!
+//! * `--tools ""` disables every built-in tool, so the model has nothing to
+//!   run, read, write or fetch with;
+//! * `--strict-mcp-config` loads MCP servers only from `--mcp-config`, which
+//!   this adapter never passes, so no MCP server's tools are offered either;
+//! * `--no-session-persistence` stops the CLI saving the conversation, the
+//!   transcript included, as a resumable session under `~/.claude/projects`
+//!   — the same reason the codex adapter passes `--ephemeral`.
+//!
+//! What remains is a model answering one prompt with no tools: text in, text
+//! out. The flags are spelled as `claude --help` documents them (checked
+//! against 2.1.272), and a test pins them, as the codex adapter's sandbox
+//! flags are pinned.
+//!
+//! `$HOME` is deliberately **not** shielded for this CLI, unlike codex (see
+//! `fotwd`'s `TokioCliRunner::shielded`). The shield narrows what an agent's
+//! tools can read, and this child has no tools. It does need the real home:
+//! its sign-in is kept in the macOS login keychain and its account and
+//! settings files under the real home directory (`~/.claude.json`,
+//! `~/.claude/`), none of which an empty temp dir would give it.
+//!
 //! # Why a transport seam instead of `std::process`
 //!
 //! This crate does no IO of its own — HTTP arrives through an injected
@@ -89,6 +119,16 @@ impl<T: CliTransport> ClaudeCliAdapter<T> {
             "-p".to_owned(),
             "--output-format".to_owned(),
             "json".to_owned(),
+            // The empty list: no built-in tool at all. Two elements, not
+            // `--tools=`, because that is the spelling `claude --help`
+            // documents. See the module docs, "No tools".
+            "--tools".to_owned(),
+            String::new(),
+            // MCP servers only from `--mcp-config`, which is never passed:
+            // none of the user's configured servers is loaded.
+            "--strict-mcp-config".to_owned(),
+            // No resumable session file holding the transcript.
+            "--no-session-persistence".to_owned(),
         ];
         if let Some(model) = &self.model {
             // The model id is a flag, not content: it names a tier, and it is

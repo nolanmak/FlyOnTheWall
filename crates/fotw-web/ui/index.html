@@ -51,6 +51,16 @@
         />
         <datalist id="gh-repo-list"></datalist>
       </label>
+      <p class="gh-note">
+        A public repository is refused: everything pushed there, down to the
+        meeting titles in commit messages, is readable by anyone and stays in
+        the repository's history. The suggestions leave public repositories
+        out.
+      </p>
+      <label id="gh-public-row" class="gh-check" hidden>
+        <input id="gh-public" type="checkbox" />
+        push to a public repository anyway
+      </label>
       <label class="gh-field">
         branch
         <input

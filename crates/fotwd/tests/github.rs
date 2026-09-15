@@ -14,7 +14,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 
 use fotw_store::{Db, DbKey, NewMeeting, NewSegment};
 use fotw_web::{GithubError, GithubExport, GithubMode, GithubSettings};
-use fotwd::github::{GhOutput, GhRunner, GithubExporter, SETTINGS_KEY};
+use fotwd::github::{GhOutput, GhRunner, GithubExporter, REPO_IS_PUBLIC, SETTINGS_KEY};
 
 // ------------------------------------------------------------------ fixtures
 
@@ -160,14 +160,16 @@ fn http_err(code: u16) -> Result<GhOutput, String> {
 
 const PUT_OK: &str = r#"{"content":{"path":"x"},"commit":{"sha":"abc123def"}}"#;
 
-/// auth ok → repo ok → no existing file → PUT lands.
+/// What `gh api repos/{repo}` answers for a private repository: the two fields
+/// the preflight reads, beside one it does not.
+const PRIVATE_REPO: &str = r#"{"default_branch":"main","private":true,"visibility":"private"}"#;
+
+/// The same answer for a public repository, in the shape GitHub gives it.
+const PUBLIC_REPO: &str = r#"{"default_branch":"main","private":false,"visibility":"public"}"#;
+
+/// auth ok → private repo → no existing file → PUT lands.
 fn create_script() -> Vec<Result<GhOutput, String>> {
-    vec![
-        ok(""),
-        ok(r#"{"default_branch":"main"}"#),
-        http_err(404),
-        ok(PUT_OK),
-    ]
+    vec![ok(""), ok(PRIVATE_REPO), http_err(404), ok(PUT_OK)]
 }
 
 struct Rig {
@@ -334,12 +336,10 @@ fn a_repush_reuses_the_path_and_sends_the_sha() {
     let first = r.exporter.push(&r.meeting).unwrap();
 
     // Second run: the file exists now, so the probe answers a sha.
-    r.gh.script.lock().unwrap().extend([
-        ok(""),
-        ok(r#"{"default_branch":"main"}"#),
-        ok("oldsha42\n"),
-        ok(PUT_OK),
-    ]);
+    r.gh.script
+        .lock()
+        .unwrap()
+        .extend([ok(""), ok(PRIVATE_REPO), ok("oldsha42\n"), ok(PUT_OK)]);
     let second = r.exporter.push(&r.meeting).unwrap();
     assert_eq!(
         second.path, first.path,
@@ -415,6 +415,144 @@ fn each_failure_maps_to_its_own_error() {
         Err(GithubError::NoSuchMeeting)
     );
     assert!(r.gh.calls().is_empty(), "no meeting, no process");
+}
+
+// ----------------------------------------------------- public repositories
+
+/// [`MANUAL`] plus the user's acknowledgement that the repository may be
+/// public, written raw like every settings fixture here.
+const MANUAL_PUBLIC_ALLOWED: &str = r#"{"enabled":true,"repo":"octocat/notes","branch":"","path_prefix":"meetings/","mode":"manual","allow_public_repo":true}"#;
+
+/// A push to a public repository publishes the transcript, its summary and the
+/// meeting title to anyone, and git history keeps them. Without the user's
+/// acknowledgement the preflight refuses before a single file is probed.
+#[test]
+fn a_public_repository_is_refused_before_anything_is_written() {
+    let r = rig(MANUAL, vec![ok(""), ok(PUBLIC_REPO)]);
+
+    let err = r.exporter.push(&r.meeting).expect_err("a public repo");
+    assert_eq!(err, GithubError::Failed(REPO_IS_PUBLIC.to_owned()));
+    assert_eq!(
+        err.to_string(),
+        "repo_is_public",
+        "the wire code the UI explains"
+    );
+
+    let calls = r.gh.calls();
+    assert_eq!(calls.len(), 2, "auth and the repo lookup, then nothing");
+    assert_eq!(calls[1].0, ["api", "repos/octocat/notes"]);
+    assert!(r.exporter.receipt_for(&r.meeting).is_none());
+    assert!(
+        !r.dir.path().join("audit.jsonl").exists(),
+        "nothing left the machine, so there is no egress to record"
+    );
+}
+
+/// Only an unambiguous "private" lets a push through. An answer with no
+/// visibility, a contradictory one, or one that is not JSON reads as public.
+#[test]
+fn a_repository_not_confirmed_private_is_refused_too() {
+    for answer in [
+        r#"{"default_branch":"main"}"#,
+        r#"{"private":true,"visibility":"public"}"#,
+        "not json",
+    ] {
+        let r = rig(MANUAL, vec![ok(""), ok(answer)]);
+        assert_eq!(
+            r.exporter.push(&r.meeting),
+            Err(GithubError::Failed(REPO_IS_PUBLIC.to_owned())),
+            "answer {answer:?}"
+        );
+        assert_eq!(r.gh.calls().len(), 2, "answer {answer:?}");
+    }
+}
+
+#[test]
+fn a_private_repository_is_pushed_to() {
+    let r = rig(MANUAL, create_script());
+    let receipt = r
+        .exporter
+        .push(&r.meeting)
+        .expect("a private repo is the ordinary case");
+    assert_eq!(receipt.repo, "octocat/notes");
+    assert_eq!(r.gh.calls().len(), 4, "auth, repo, probe, PUT");
+}
+
+/// Publishing to a public repository stays possible, as a choice the user
+/// made rather than one a dropdown made for them.
+#[test]
+fn a_public_repository_is_pushed_to_once_the_user_acknowledged_it() {
+    let r = rig(
+        MANUAL_PUBLIC_ALLOWED,
+        vec![ok(""), ok(PUBLIC_REPO), http_err(404), ok(PUT_OK)],
+    );
+    let receipt = r
+        .exporter
+        .push(&r.meeting)
+        .expect("an acknowledged public repo is pushed to");
+    assert_eq!(receipt.repo, "octocat/notes");
+    assert_eq!(r.gh.calls().len(), 4, "auth, repo, probe, PUT");
+}
+
+/// A repository can be made public after it was configured, so the question
+/// is asked on every write, the bundle's index and log included.
+#[test]
+fn a_repository_made_public_after_a_push_refuses_the_next_write() {
+    let r = rig(MANUAL, create_script());
+    r.exporter.push(&r.meeting).expect("private at first");
+    let after_push = r.gh.calls().len();
+
+    r.gh.script
+        .lock()
+        .unwrap()
+        .extend([ok(""), ok(PUBLIC_REPO), ok(""), ok(PUBLIC_REPO)]);
+    assert_eq!(
+        GithubExport::sync_bundle(&r.exporter),
+        Err(GithubError::Failed(REPO_IS_PUBLIC.to_owned()))
+    );
+    assert_eq!(
+        r.exporter.push(&r.meeting),
+        Err(GithubError::Failed(REPO_IS_PUBLIC.to_owned()))
+    );
+    assert_eq!(
+        r.gh.calls().len(),
+        after_push + 4,
+        "two preflights, and no write after either"
+    );
+}
+
+/// A public repository is the target's problem, not any one meeting's: the
+/// round stops at the first refusal, nothing is parked, and once the
+/// repository is private again the backlog drains on the next poll.
+#[test]
+fn a_public_repository_stops_the_auto_round_without_parking_meetings() {
+    let mut db = library();
+    let first = ready_meeting(&mut db, "First", 1_755_734_400_000);
+    let second = ready_meeting(&mut db, "Second", 1_755_734_500_000);
+    mark_enriched(&mut db, &[&first, &second]);
+    store_settings(&mut db, AUTO_SINCE_EPOCH);
+    let gh = ScriptedGh::scripted(vec![ok(""), ok(PUBLIC_REPO)]);
+    let dir = tempfile::TempDir::new().unwrap();
+    let exporter = GithubExporter::new(
+        db,
+        dir.path().join("sessions"),
+        Arc::clone(&gh) as Arc<dyn GhRunner>,
+    );
+
+    assert_eq!(exporter.auto_push_pending(), 0);
+    assert_eq!(
+        gh.calls().len(),
+        2,
+        "one refusal answers for every meeting in the round"
+    );
+
+    gh.script.lock().unwrap().extend(create_script());
+    gh.script.lock().unwrap().extend(create_script());
+    assert_eq!(
+        exporter.auto_push_pending(),
+        2,
+        "meetings {first} and {second} must not be parked by a public repository"
+    );
 }
 
 // -------------------------------------------------------------------- auto
@@ -571,12 +709,7 @@ fn a_meeting_that_fails_on_its_own_is_parked_until_restart() {
     // The PUT itself is refused — something about *this* meeting.
     let r = rig(
         AUTO_SINCE_EPOCH,
-        vec![
-            ok(""),
-            ok(r#"{"default_branch":"main"}"#),
-            http_err(404),
-            http_err(422),
-        ],
+        vec![ok(""), ok(PRIVATE_REPO), http_err(404), http_err(422)],
     );
     assert_eq!(r.exporter.auto_push_pending(), 0);
     let after_first = r.gh.calls().len();
@@ -648,12 +781,7 @@ fn auto_mode_with_no_stamp_pushes_nothing() {
 fn a_manual_push_retries_a_parked_meeting() {
     let r = rig(
         AUTO_SINCE_EPOCH,
-        vec![
-            ok(""),
-            ok(r#"{"default_branch":"main"}"#),
-            http_err(404),
-            http_err(422),
-        ],
+        vec![ok(""), ok(PRIVATE_REPO), http_err(404), http_err(422)],
     );
     assert_eq!(r.exporter.auto_push_pending(), 0, "parked");
 
@@ -677,6 +805,7 @@ impl GhRunner for TirelessGh {
         let mut n = self.calls.lock().unwrap();
         *n += 1;
         match (*n - 1) % 4 {
+            1 => ok(PRIVATE_REPO),
             2 => http_err(404),
             _ => ok(PUT_OK),
         }
@@ -715,9 +844,14 @@ fn manual_mode_never_pushes_on_its_own() {
 // -------------------------------------------------------------------- repos
 
 /// The settings form's picker: one `gh api` call, only repos this login can
-/// push to, most recently active first — the order GitHub already answers in.
+/// push to that are not public, most recently active first — the order GitHub
+/// already answers in.
+///
+/// The filter runs inside gh's own jq, so a scripted gh can only pin the
+/// expression. It is the preflight's rule (`private` true, `visibility` not
+/// `public`), so the picker never offers a repository a push would refuse.
 #[test]
-fn the_repo_picker_asks_gh_for_pushable_repos() {
+fn the_repo_picker_asks_gh_for_pushable_repos_that_are_not_public() {
     let r = rig(MANUAL, vec![ok(r#"["octocat/notes","work-org/minutes"]"#)]);
     let repos = r.exporter.repos().expect("the scripted listing answers");
     assert_eq!(repos, ["octocat/notes", "work-org/minutes"]);
@@ -730,7 +864,7 @@ fn the_repo_picker_asks_gh_for_pushable_repos() {
             "api",
             "user/repos?per_page=100&sort=pushed",
             "--jq",
-            "[.[] | select(.permissions.push) | .full_name]"
+            r#"[.[] | select(.permissions.push and .private == true and .visibility != "public") | .full_name]"#
         ]
     );
 }
@@ -755,7 +889,7 @@ fn the_repo_picker_maps_failures_like_a_push_does() {
 fn sync_script() -> Vec<Result<GhOutput, String>> {
     vec![
         ok(""),
-        ok(r#"{"default_branch":"main"}"#),
+        ok(PRIVATE_REPO),
         http_err(404),
         ok(PUT_OK),
         http_err(404),
