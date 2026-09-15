@@ -332,6 +332,9 @@ where
             model: prose_model.to_owned(),
         },
         crate::engine::Engine::ClaudeCli { binary } => {
+            // No read shield: the adapter runs claude with no built-in tools
+            // and no MCP servers, so the transcript has nothing to steer, and
+            // its login needs the real $HOME (see TokioCliRunner's docs).
             let runner = Arc::new(crate::engine::TokioCliRunner::new(binary.clone(), deadline));
             EngineAdapters {
                 prose: Box::new(fotw_summarize::claude_cli::ClaudeCliAdapter::new(
