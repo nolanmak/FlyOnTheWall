@@ -36,8 +36,9 @@
 //! giving the child an empty `$HOME` (see `fotwd`'s `TokioCliRunner::shielded`)
 //! so `~`-relative secrets resolve to nothing. That is defence-in-depth, not a
 //! proof: the honest posture is that `claude -p` is non-agentic and strictly
-//! safer over untrusted input, which the `fotwd engine` disclosure says out
-//! loud.
+//! safer over untrusted input, because the claude adapter runs it with no
+//! built-in tools and no MCP servers (`--tools "" --strict-mcp-config`; see
+//! [`crate::claude_cli`]). The `fotwd engine` disclosure says so out loud.
 
 use std::sync::Arc;
 
