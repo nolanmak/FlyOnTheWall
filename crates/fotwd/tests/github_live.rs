@@ -2,11 +2,18 @@
 //!
 //! Self-skipping, exactly as the real-keychain tests in `fotw-secrets` are:
 //! CI has no GitHub login, and a test that pushes to somebody's repository
-//! must never run by accident. Opt in with a scratch repository you own:
+//! must never run by accident. Opt in with a **private** scratch repository
+//! you own:
 //!
 //! ```sh
-//! FOTW_GH_LIVE=owner/scratch-repo cargo test -p fotwd --test github_live -- --nocapture
+//! FOTW_GH_LIVE=owner/private-scratch-repo cargo test -p fotwd --test github_live -- --nocapture
 //! ```
+//!
+//! It has to be private. The exporter's preflight refuses a repository GitHub
+//! does not confirm is private, and this test deliberately stores no
+//! `allow_public_repo` acknowledgement to lift that: pointed at a public
+//! repository, the first push is refused with `GithubError::RepoIsPublic`
+//! before anything is written, and the test fails there.
 //!
 //! It commits a fixture transcript, then commits it again, proving the
 //! create path, the sha probe, and the update path against GitHub's actual

@@ -14,7 +14,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 
 use fotw_store::{Db, DbKey, NewMeeting, NewSegment};
 use fotw_web::{GithubError, GithubExport, GithubMode, GithubSettings};
-use fotwd::github::{GhOutput, GhRunner, GithubExporter, REPO_IS_PUBLIC, SETTINGS_KEY};
+use fotwd::github::{GhOutput, GhRunner, GithubExporter, SETTINGS_KEY};
 
 // ------------------------------------------------------------------ fixtures
 
@@ -431,7 +431,7 @@ fn a_public_repository_is_refused_before_anything_is_written() {
     let r = rig(MANUAL, vec![ok(""), ok(PUBLIC_REPO)]);
 
     let err = r.exporter.push(&r.meeting).expect_err("a public repo");
-    assert_eq!(err, GithubError::Failed(REPO_IS_PUBLIC.to_owned()));
+    assert_eq!(err, GithubError::RepoIsPublic);
     assert_eq!(
         err.to_string(),
         "repo_is_public",
@@ -460,7 +460,7 @@ fn a_repository_not_confirmed_private_is_refused_too() {
         let r = rig(MANUAL, vec![ok(""), ok(answer)]);
         assert_eq!(
             r.exporter.push(&r.meeting),
-            Err(GithubError::Failed(REPO_IS_PUBLIC.to_owned())),
+            Err(GithubError::RepoIsPublic),
             "answer {answer:?}"
         );
         assert_eq!(r.gh.calls().len(), 2, "answer {answer:?}");
@@ -494,6 +494,63 @@ fn a_public_repository_is_pushed_to_once_the_user_acknowledged_it() {
     assert_eq!(r.gh.calls().len(), 4, "auth, repo, probe, PUT");
 }
 
+/// Every row stored before `allow_public_repo` existed lacks the key. It reads
+/// as no acknowledgement, so an old library pointed at a public repository is
+/// refused rather than grandfathered in.
+#[test]
+fn a_settings_row_from_before_the_acknowledgement_reads_as_not_given() {
+    let r = rig(MANUAL, vec![ok(""), ok(PUBLIC_REPO)]);
+    assert!(!r.exporter.settings().allow_public_repo);
+    assert_eq!(r.exporter.push(&r.meeting), Err(GithubError::RepoIsPublic));
+    assert_eq!(
+        r.gh.calls().len(),
+        2,
+        "auth and the repo lookup, then nothing"
+    );
+}
+
+/// The acknowledgement the settings form saves is the one the preflight reads:
+/// `set_settings` stores it, `settings` reads it back, and a push honours it,
+/// in both directions.
+#[test]
+fn the_acknowledgement_saved_through_set_settings_is_what_a_push_honours() {
+    let r = rig(MANUAL, Vec::new());
+    let target = |allow_public_repo: bool| GithubSettings {
+        enabled: true,
+        repo: "octocat/notes".to_owned(),
+        allow_public_repo,
+        ..GithubSettings::default()
+    };
+
+    let stored = r.exporter.set_settings(target(true)).unwrap();
+    assert!(stored.allow_public_repo);
+    assert!(
+        r.exporter.settings().allow_public_repo,
+        "the stored row carries the acknowledgement"
+    );
+    r.gh.script
+        .lock()
+        .unwrap()
+        .extend([ok(""), ok(PUBLIC_REPO), http_err(404), ok(PUT_OK)]);
+    r.exporter
+        .push(&r.meeting)
+        .expect("acknowledged: the public repo is pushed to");
+
+    r.exporter.set_settings(target(false)).unwrap();
+    assert!(!r.exporter.settings().allow_public_repo);
+    let before = r.gh.calls().len();
+    r.gh.script
+        .lock()
+        .unwrap()
+        .extend([ok(""), ok(PUBLIC_REPO)]);
+    assert_eq!(r.exporter.push(&r.meeting), Err(GithubError::RepoIsPublic));
+    assert_eq!(
+        r.gh.calls().len(),
+        before + 2,
+        "withdrawn: auth and the repo lookup, then nothing"
+    );
+}
+
 /// A repository can be made public after it was configured, so the question
 /// is asked on every write, the bundle's index and log included.
 #[test]
@@ -508,12 +565,9 @@ fn a_repository_made_public_after_a_push_refuses_the_next_write() {
         .extend([ok(""), ok(PUBLIC_REPO), ok(""), ok(PUBLIC_REPO)]);
     assert_eq!(
         GithubExport::sync_bundle(&r.exporter),
-        Err(GithubError::Failed(REPO_IS_PUBLIC.to_owned()))
+        Err(GithubError::RepoIsPublic)
     );
-    assert_eq!(
-        r.exporter.push(&r.meeting),
-        Err(GithubError::Failed(REPO_IS_PUBLIC.to_owned()))
-    );
+    assert_eq!(r.exporter.push(&r.meeting), Err(GithubError::RepoIsPublic));
     assert_eq!(
         r.gh.calls().len(),
         after_push + 4,

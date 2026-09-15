@@ -58,6 +58,15 @@ pub struct GithubSettings {
     pub path_prefix: String,
     /// When a push happens.
     pub mode: GithubMode,
+    /// The user's acknowledgement that `repo` may be public. Off by default:
+    /// without it, the daemon refuses to push to a repository GitHub does not
+    /// confirm is private ([`GithubError::RepoIsPublic`]). Anything pushed to
+    /// a public repository is readable by anyone, and its history keeps it
+    /// after the file is deleted.
+    ///
+    /// A row stored before this field existed has no such key and reads as
+    /// `false`, through the struct's `#[serde(default)]`.
+    pub allow_public_repo: bool,
     /// When auto mode was switched on, epoch milliseconds.
     ///
     /// Server-owned: the daemon stamps it so that enabling auto on an old
@@ -74,6 +83,7 @@ impl Default for GithubSettings {
             branch: String::new(),
             path_prefix: "meetings/".to_owned(),
             mode: GithubMode::Manual,
+            allow_public_repo: false,
             auto_since_ms: None,
         }
     }
@@ -219,6 +229,11 @@ pub enum GithubError {
     /// The configured repository is not reachable with this login.
     #[error("repo_not_found")]
     RepoNotFound,
+    /// The repository is public, or GitHub did not confirm it is private, and
+    /// [`GithubSettings::allow_public_repo`] is off. Refused before anything
+    /// was written.
+    #[error("repo_is_public")]
+    RepoIsPublic,
     /// The settings were refused; the string says why.
     #[error("invalid_settings: {0}")]
     Invalid(String),
@@ -247,8 +262,10 @@ pub trait GithubExport: Send + Sync + 'static {
     /// [`GithubError::Failed`] if the store refused the write.
     fn set_settings(&self, settings: GithubSettings) -> Result<GithubSettings, GithubError>;
 
-    /// The repositories this login may push to, `owner/name`, most recently
+    /// Repositories this login may push to, `owner/name`, most recently
     /// active first — what the settings form offers instead of a blank field.
+    /// Not necessarily all of them: the daemon's implementation leaves public
+    /// repositories out, because this list has no field to label one with.
     ///
     /// # Errors
     ///
@@ -379,6 +396,38 @@ mod tests {
     }
 
     #[test]
+    fn a_row_stored_before_the_acknowledgement_existed_reads_as_not_given() {
+        // The shape every library stored before `allow_public_repo` was added.
+        let old: GithubSettings = serde_json::from_str(
+            r#"{"enabled":true,"repo":"octocat/notes","branch":"","path_prefix":"meetings/","mode":"auto","auto_since_ms":1}"#,
+        )
+        .unwrap();
+        assert!(!old.allow_public_repo);
+        assert_eq!(
+            old.repo, "octocat/notes",
+            "the rest of the row still parses"
+        );
+        assert!(!GithubSettings::default().allow_public_repo);
+    }
+
+    #[test]
+    fn the_acknowledgement_survives_validation_and_serialization() {
+        let s = GithubSettings {
+            allow_public_repo: true,
+            ..enabled("octocat/notes", "m/")
+        };
+        let normalized = s.normalized().unwrap();
+        assert!(normalized.allow_public_repo, "normalized() must keep it");
+        let json = serde_json::to_value(&normalized).unwrap();
+        assert_eq!(
+            json["allow_public_repo"], true,
+            "the wire name the settings form reads and writes"
+        );
+        let back: GithubSettings = serde_json::from_value(json).unwrap();
+        assert_eq!(back, normalized);
+    }
+
+    #[test]
     fn error_codes_are_stable_wire_strings() {
         assert_eq!(GithubError::GhMissing.to_string(), "gh_missing");
         assert_eq!(
@@ -386,6 +435,8 @@ mod tests {
             "gh_not_authenticated"
         );
         assert_eq!(GithubError::RepoNotFound.to_string(), "repo_not_found");
+        // The UI's GH_ERRORS table is keyed by this exact string.
+        assert_eq!(GithubError::RepoIsPublic.to_string(), "repo_is_public");
         assert_eq!(GithubError::Disabled.to_string(), "github_export_disabled");
         assert_eq!(
             GithubError::Invalid("why".to_owned()).to_string(),

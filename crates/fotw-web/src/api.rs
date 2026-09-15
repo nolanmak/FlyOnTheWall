@@ -667,4 +667,100 @@ mod tests {
         assert_eq!(number("limit=abc", "limit"), None);
         assert_eq!(number("", "limit"), None);
     }
+
+    /// A GitHub control that stores exactly what the handler hands it.
+    #[derive(Default)]
+    struct StoringGithub(std::sync::Mutex<GithubSettings>);
+
+    impl crate::github::GithubExport for StoringGithub {
+        fn settings(&self) -> GithubSettings {
+            self.0.lock().unwrap().clone()
+        }
+        fn set_settings(&self, s: GithubSettings) -> Result<GithubSettings, GithubError> {
+            *self.0.lock().unwrap() = s.clone();
+            Ok(s)
+        }
+        fn repos(&self) -> Result<Vec<String>, GithubError> {
+            Ok(Vec::new())
+        }
+        fn push(&self, _meeting_id: &str) -> Result<GithubReceipt, GithubError> {
+            Err(GithubError::Disabled)
+        }
+        fn sync_bundle(&self) -> Result<(), GithubError> {
+            Ok(())
+        }
+    }
+
+    /// The public-repository acknowledgement goes in through `POST
+    /// /api/settings/github` and comes back out of `GET`, under the name the
+    /// settings form reads and writes. A save that omits the key, as a client
+    /// from before it existed would send, stores it off.
+    #[tokio::test]
+    async fn the_public_repo_acknowledgement_round_trips_through_the_settings_api() {
+        use crate::github::GithubExport as _;
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+
+        let github = Arc::new(StoringGithub::default());
+        let state = AppState::with_controls(
+            crate::ingress::IngressPolicy::for_loopback_port(51234),
+            Arc::new(crate::source::MemorySource::new()),
+            None,
+            Some(Arc::clone(&github) as Arc<dyn crate::github::GithubExport>),
+        );
+        let app = crate::server::router(state.clone());
+        let call = |method: &str, body: Option<&str>| {
+            let policy = state.policy();
+            let mut req = axum::http::Request::builder()
+                .method(method)
+                .uri("/api/settings/github")
+                .header("host", policy.authority())
+                .header("origin", policy.origin())
+                .header(
+                    "authorization",
+                    format!("Bearer {}", policy.secret().expose_hex()),
+                );
+            if body.is_some() {
+                req = req.header("content-type", "application/json");
+            }
+            let req = req
+                .body(Body::from(body.unwrap_or_default().to_owned()))
+                .unwrap();
+            let app = app.clone();
+            async move {
+                let res = app.oneshot(req).await.unwrap();
+                assert_eq!(res.status(), StatusCode::OK);
+                let bytes = res.into_body().collect().await.unwrap().to_bytes();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            }
+        };
+
+        let saved = call(
+            "POST",
+            Some(
+                r#"{"enabled":true,"repo":"octocat/notes","branch":"","path_prefix":"meetings/","mode":"manual","allow_public_repo":true}"#,
+            ),
+        )
+        .await;
+        assert!(saved["error"].is_null(), "{saved}");
+        assert_eq!(saved["settings"]["allow_public_repo"], true);
+        assert!(
+            github.settings().allow_public_repo,
+            "the control behind the trait received the acknowledgement"
+        );
+        let read = call("GET", None).await;
+        assert_eq!(read["settings"]["allow_public_repo"], true);
+
+        let without = call(
+            "POST",
+            Some(
+                r#"{"enabled":true,"repo":"octocat/notes","branch":"","path_prefix":"meetings/","mode":"manual"}"#,
+            ),
+        )
+        .await;
+        assert!(without["error"].is_null(), "{without}");
+        assert_eq!(without["settings"]["allow_public_repo"], false);
+        let read = call("GET", None).await;
+        assert_eq!(read["settings"]["allow_public_repo"], false);
+    }
 }

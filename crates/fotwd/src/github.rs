@@ -34,11 +34,12 @@
 //! summary and brief companions, and the title in the commit message and the
 //! file name. So every write reads the repository's visibility from the same
 //! `gh api repos/{repo}` answer the preflight already fetches, and refuses
-//! with [`REPO_IS_PUBLIC`] unless GitHub says, unambiguously, that it is
-//! private, or the stored target carries the user's `allow_public_repo`
-//! acknowledgement. It is asked on every write rather than once at save time
-//! because a repository can be made public after it was configured. The repo
-//! picker leaves public repositories out, so a misclick there cannot pick one.
+//! with [`GithubError::RepoIsPublic`] unless GitHub says, unambiguously, that
+//! it is private, or the stored target carries the user's acknowledgement,
+//! [`GithubSettings::allow_public_repo`]. It is asked on every write rather
+//! than once at save time because a repository can be made public after it
+//! was configured. The repo picker leaves public repositories out, so a
+//! misclick there cannot pick one.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -57,14 +58,6 @@ use crate::{diag, note};
 
 /// The `settings` key the target lives under, as `"retention"` does for §9.3.
 pub const SETTINGS_KEY: &str = "github_export";
-
-/// The error code a push or bundle sync answers with when the repository is
-/// public, or not confirmed private, and the user has not acknowledged that.
-///
-/// Carried in [`GithubError::Failed`], which renders it verbatim, so it reaches
-/// the UI as the same kind of stable code the named variants produce; the
-/// error enum in `fotw-web` has no variant of its own for it.
-pub const REPO_IS_PUBLIC: &str = "repo_is_public";
 
 /// The `settings` key the per-meeting receipts live under: a JSON object of
 /// meeting id → [`GithubReceipt`].
@@ -401,34 +394,6 @@ fn read_settings(db: &Db) -> GithubSettings {
         .unwrap_or_default()
 }
 
-/// [`read_settings`], plus whether the user acknowledged that the repository
-/// may be public, from one read of the row.
-///
-/// One read, so a push checks the repository it snapshotted against the
-/// acknowledgement stored beside that repository, not one saved a moment later
-/// for a different one.
-///
-/// `allow_public_repo` is read from the stored JSON directly because
-/// [`GithubSettings`], the UI's wire type in `fotw-web`, has no field for it.
-/// Until it does, nothing the settings form saves can set the flag, and
-/// [`GithubExport::set_settings`] rewrites the row without it, so a public
-/// repository is refused outright. A value that is not a JSON `true` reads as
-/// no acknowledgement.
-fn read_target(db: &Db) -> (GithubSettings, bool) {
-    #[derive(serde::Deserialize, Default)]
-    #[serde(default)]
-    struct Acknowledgement {
-        allow_public_repo: bool,
-    }
-    let Some(raw) = db.get_setting(SETTINGS_KEY).ok().flatten() else {
-        return (GithubSettings::default(), false);
-    };
-    let settings = serde_json::from_str(&raw).unwrap_or_default();
-    let allow_public_repo =
-        serde_json::from_str::<Acknowledgement>(&raw).is_ok_and(|a| a.allow_public_repo);
-    (settings, allow_public_repo)
-}
-
 fn read_receipts(db: &Db) -> HashMap<String, GithubReceipt> {
     db.get_setting(RECEIPTS_KEY)
         .ok()
@@ -508,18 +473,9 @@ impl GithubExport for GithubExporter {
     fn push(&self, meeting_id: &str) -> Result<GithubReceipt, GithubError> {
         // Snapshot under the lock, then let it go: the gh calls below take
         // seconds, and the auto worker shares this exporter with the UI.
-        let (
-            (settings, allow_public_repo),
-            markdown,
-            path,
-            title,
-            started_at_ms,
-            existing,
-            companions,
-            version,
-        ) = {
+        let (settings, markdown, path, title, started_at_ms, existing, companions, version) = {
             let mut db = self.lock_db();
-            let (settings, allow_public_repo) = read_target(&db);
+            let settings = read_settings(&db);
             if !settings.enabled {
                 return Err(GithubError::Disabled);
             }
@@ -587,7 +543,7 @@ impl GithubExport for GithubExporter {
                 }
             }
             (
-                (settings, allow_public_repo),
+                settings,
                 markdown,
                 path,
                 meeting.title,
@@ -601,7 +557,6 @@ impl GithubExport for GithubExporter {
         let result = self.push_claimed(
             meeting_id,
             &settings,
-            allow_public_repo,
             &markdown,
             &path,
             &title,
@@ -624,9 +579,9 @@ impl GithubExport for GithubExporter {
     }
 
     fn sync_bundle(&self) -> Result<(), GithubError> {
-        let ((settings, allow_public_repo), receipts) = {
+        let (settings, receipts) = {
             let db = self.lock_db();
-            (read_target(&db), read_receipts(&db))
+            (read_settings(&db), read_receipts(&db))
         };
         if !settings.enabled {
             return Err(GithubError::Disabled);
@@ -663,7 +618,7 @@ impl GithubExport for GithubExporter {
             .writes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.preflight(&settings, allow_public_repo)?;
+        self.preflight(&settings)?;
         let prefix = &settings.path_prefix;
         self.put_file(
             &settings,
@@ -700,13 +655,12 @@ impl GithubExporter {
     /// a bundle sync and a meeting push ask them the same way.
     ///
     /// The third is the module docs' "Never a public repository by accident":
-    /// unless `allow_public_repo`, a repository GitHub does not confirm is
-    /// private is refused with [`REPO_IS_PUBLIC`] before anything is written.
-    fn preflight(
-        &self,
-        settings: &GithubSettings,
-        allow_public_repo: bool,
-    ) -> Result<(), GithubError> {
+    /// unless `settings.allow_public_repo`, a repository GitHub does not
+    /// confirm is private is refused with [`GithubError::RepoIsPublic`] before
+    /// anything is written. `settings` is the caller's one snapshot of the row,
+    /// so the acknowledgement checked is the one stored beside the repository
+    /// being written to, not one saved a moment later for a different one.
+    fn preflight(&self, settings: &GithubSettings) -> Result<(), GithubError> {
         let auth = self.run_gh(&["auth", "status", "--hostname", "github.com"], None)?;
         if auth.status != 0 {
             return Err(GithubError::NotAuthenticated);
@@ -719,8 +673,8 @@ impl GithubExporter {
             }
             return Err(classify(&repo));
         }
-        if !allow_public_repo && !confirmed_private(&repo.stdout) {
-            return Err(GithubError::Failed(REPO_IS_PUBLIC.to_owned()));
+        if !settings.allow_public_repo && !confirmed_private(&repo.stdout) {
+            return Err(GithubError::RepoIsPublic);
         }
         Ok(())
     }
@@ -804,7 +758,6 @@ impl GithubExporter {
         &self,
         meeting_id: &str,
         settings: &GithubSettings,
-        allow_public_repo: bool,
         markdown: &str,
         path: &str,
         title: &str,
@@ -817,7 +770,7 @@ impl GithubExporter {
             .writes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.preflight(settings, allow_public_repo)?;
+        self.preflight(settings)?;
 
         let display_title = if title.trim().is_empty() {
             "Untitled meeting"
@@ -926,9 +879,9 @@ fn stalls_every_push(e: &GithubError) -> bool {
         GithubError::GhMissing
         | GithubError::NotAuthenticated
         | GithubError::RepoNotFound
-        | GithubError::Disabled => true,
-        GithubError::Failed(code) => code == REPO_IS_PUBLIC,
-        GithubError::NoSuchMeeting | GithubError::Invalid(_) => false,
+        | GithubError::Disabled
+        | GithubError::RepoIsPublic => true,
+        GithubError::NoSuchMeeting | GithubError::Invalid(_) | GithubError::Failed(_) => false,
     }
 }
 
@@ -986,9 +939,7 @@ mod tests {
 
     #[test]
     fn a_public_refusal_stalls_the_round_and_a_meeting_failure_does_not() {
-        assert!(stalls_every_push(&GithubError::Failed(
-            REPO_IS_PUBLIC.to_owned()
-        )));
+        assert!(stalls_every_push(&GithubError::RepoIsPublic));
         assert!(stalls_every_push(&GithubError::NotAuthenticated));
         assert!(!stalls_every_push(&GithubError::Failed(
             "gh: Validation Failed (HTTP 422)".to_owned()

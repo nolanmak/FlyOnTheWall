@@ -46,7 +46,6 @@ const el = {
   ghSave: document.getElementById("gh-save"),
   ghRepoList: document.getElementById("gh-repo-list"),
   ghPublic: document.getElementById("gh-public"),
-  ghPublicRow: document.getElementById("gh-public-row"),
   sumSettings: document.getElementById("sum-settings"),
   sumKind: document.getElementById("sum-kind"),
   sumBinary: document.getElementById("sum-binary"),
@@ -901,7 +900,7 @@ const GH_ERRORS = {
   gh_not_authenticated: "gh has no login. Run gh auth login in a terminal, then try again.",
   repo_not_found: "That repository is not reachable with your gh login. Check the name and your access.",
   github_export_disabled: "GitHub export is switched off. Enable it in the GitHub export section first.",
-  repo_is_public: "Nothing was pushed: that repository is public, or GitHub did not confirm it is private. Choose a private repository in the GitHub export section.",
+  repo_is_public: "Nothing was pushed: that repository is public, or GitHub did not confirm it is private. Choose a private repository, or tick 'push to a public repository anyway' and save, in the GitHub export section.",
 };
 
 function ghExplain(code) {
@@ -915,12 +914,7 @@ function renderGithubForm(s) {
   el.ghPrefix.value = s.path_prefix || "";
   el.ghAuto.checked = s.mode === "auto";
   el.ghEnabled.checked = Boolean(s.enabled);
-  // The public-repository acknowledgement is offered only when the stored
-  // settings carry the field. A daemon whose settings do not would drop the
-  // tick on save, and its preflight refuses a public repository regardless.
-  const canAllowPublic = "allow_public_repo" in s;
-  el.ghPublicRow.hidden = !canAllowPublic;
-  el.ghPublic.checked = canAllowPublic && Boolean(s.allow_public_repo);
+  el.ghPublic.checked = Boolean(s.allow_public_repo);
   el.ghSettings.hidden = false;
 }
 
