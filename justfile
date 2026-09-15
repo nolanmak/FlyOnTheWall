@@ -107,12 +107,23 @@ licenses:
         exit 1
     fi
     # about.hbs describes the C libraries these crates compile, as of the crate
-    # versions it names. When Cargo.lock moves one, stop so that section is
-    # re-checked instead of going stale.
+    # versions it names. When Cargo.lock moves one, or fotwd stops reaching one,
+    # stop so that section is re-checked instead of going stale.
     for krate in libsqlite3-sys openssl-src opusic-sys; do
+        # A non-zero exit means the crate is gone from Cargo.lock, or that two
+        # versions of it are locked and `-i "$krate"` is ambiguous. cargo's
+        # stderr says which.
         if ! resolved=$(cargo tree --frozen -p fotwd -e normal,build \
-                --target aarch64-apple-darwin -i "$krate" --depth 0 2>/dev/null); then
-            echo "error: $krate is no longer in fotwd's dependency graph; update packaging/licenses/about.hbs" >&2
+                --target aarch64-apple-darwin -i "$krate" --depth 0 2>"$log"); then
+            cat "$log" >&2
+            echo "error: cargo tree could not look up $krate in fotwd's dependency graph; re-check its section in packaging/licenses/about.hbs" >&2
+            exit 1
+        fi
+        # A crate still in Cargo.lock that fotwd no longer reaches, for example
+        # one that only another workspace member uses, exits 0 with nothing on
+        # stdout. Treat that as missing too.
+        if [[ -z "$resolved" ]]; then
+            echo "error: $krate is no longer in fotwd's dependency graph; update its section in packaging/licenses/about.hbs" >&2
             exit 1
         fi
         resolved=${resolved%%$'\n'*}
