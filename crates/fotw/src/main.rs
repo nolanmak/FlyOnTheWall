@@ -1,4 +1,9 @@
-//! `fotw` — the CLI. Recovery tool, and the primary test surface.
+//! `fotw` — a small capture-diagnostics CLI, separate from `fotwd`.
+//!
+//! It has two commands: `doctor`, below, and `record [seconds] [dir]`, which
+//! captures system audio into a session directory (`record.rs`). Everything a
+//! user configures or recovers — provider keys, the summary engine, the
+//! Recovery Key, exports — is a `fotwd` subcommand.
 //!
 //! `doctor` matters more than it looks. There is **no public API** to query
 //! the macOS system-audio permission, and a denial delivers silence that is

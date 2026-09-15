@@ -1,14 +1,27 @@
-//! `fotwd` — the FlyOnTheWall daemon.
+//! `fotwd` — the FlyOnTheWall daemon, and the command line for its library.
 //!
-//! Today it records one meeting and exits. The loopback HTTP/WS server and
-//! the AppKit shell land on top of this same session machinery.
+//! `fotwd serve` is what the app bundle runs: the loopback web dashboard,
+//! recordings started from it, Deepgram transcription when a key is
+//! configured, the SQLCipher library, and the background retention sweeper,
+//! summary backfill and GitHub export worker. A bare launch with no arguments
+//! and no terminal (a Finder double-click) does the same. Every other
+//! subcommand works on that same library from a terminal: `key` and `engine`
+//! configure it, `recover` opens it with the Recovery Key, `export`,
+//! `export-all`, `export-okf` and `import` move meetings out and in, `mcp`
+//! serves it to a local agent, and `record` captures one meeting without the
+//! dashboard. The usage text in `main`'s fallback arm lists them all.
 //!
-//! # The key never touches disk or argv
+//! Nothing here starts the AppKit shell (`fotw-shell`) yet (#58).
 //!
-//! It is read from `DEEPGRAM_API_KEY` and used in place. Passing it as a
-//! command-line argument would put it in the process argument vector, where
-//! any same-user process can read it; writing it to a config file is what
-//! `fotw-secrets` and the OS keychain exist to prevent.
+//! # Provider keys never touch disk or argv
+//!
+//! `fotwd key set <provider>` reads the key from stdin into the OS keychain.
+//! An argument would put it in the process argument vector, where any
+//! same-user process can read it, and in the shell history file; a config
+//! file is what `fotw-secrets` and the keychain exist to prevent.
+//! `DEEPGRAM_API_KEY` is still read as a fallback when the keychain yields no
+//! Deepgram key, and `fotwd record` says so when it uses it, because an
+//! environment variable is readable by every child process.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
