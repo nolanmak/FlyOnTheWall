@@ -96,14 +96,16 @@ licenses:
     log=$(mktemp)
     trap 'rm -f "$tmp" "$log"' EXIT
     # A clarification whose checksum no longer matches is only a warning, after
-    # which cargo-about falls back to its own scan, so anything on stderr fails.
+    # which cargo-about falls back to its own scan, so anything on stderr fails,
+    # as does a non-zero exit.
+    status=0
     cargo about generate --frozen --fail \
         --manifest-path crates/fotwd/Cargo.toml \
         --config packaging/licenses/about.toml \
-        --output-file "$tmp" packaging/licenses/about.hbs 2>"$log" || true
-    if [[ -s "$log" || ! -s "$tmp" ]]; then
+        --output-file "$tmp" packaging/licenses/about.hbs 2>"$log" || status=$?
+    if [[ $status -ne 0 || -s "$log" || ! -s "$tmp" ]]; then
         cat "$log" >&2
-        echo "error: cargo-about did not run cleanly" >&2
+        echo "error: cargo-about did not run cleanly (exit status $status)" >&2
         exit 1
     fi
     # about.hbs describes the C libraries these crates compile, as of the crate
@@ -127,7 +129,9 @@ licenses:
             exit 1
         fi
         resolved=${resolved%%$'\n'*}
-        if ! grep -qF -- "${resolved/ v/ }" packaging/licenses/about.hbs; then
+        # -w: the match has to end at a non-word character, so a template that
+        # names 0.38.20 does not pass for 0.38.2.
+        if ! grep -qwF -- "${resolved/ v/ }" packaging/licenses/about.hbs; then
             echo "error: Cargo.lock resolves $resolved, which packaging/licenses/about.hbs does not name." >&2
             echo "  Check the version and license of the C library it compiles, then update about.hbs." >&2
             exit 1
