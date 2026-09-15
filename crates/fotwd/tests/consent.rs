@@ -192,8 +192,8 @@ fn bullet(text: &str, name: &str) -> String {
 fn statutes_with_criminal_penalties_are_marked_criminal() {
     let r = rules();
     for code in [
-        "US-CA", "US-FL", "US-IL", "US-MD", "US-MA", "US-MT", "US-NH", "US-PA", "US-WA", "US-DE",
-        "US-NV", "US-OR", "US-MI", "US-HI", "DE", "FR",
+        "US-CA", "US-FL", "US-IL", "US-MD", "US-MA", "US-MT", "US-NH", "US-PA", "US-WA", "US-NV",
+        "US-OR", "US-HI", "DE", "FR",
     ] {
         assert!(
             r.get(code).unwrap().criminal,
@@ -203,6 +203,27 @@ fn statutes_with_criminal_penalties_are_marked_criminal() {
     // Connecticut's all-party rule for calls is § 52-570d, a civil action. Its
     // criminal eavesdropping statute (§ 53a-189) only reaches non-parties.
     assert!(!r.get("US-CT").unwrap().criminal);
+
+    // Delaware and Michigan both have a criminal penalty on the books, but the
+    // sources conflict on whether it reaches a participant who records.
+    // Delaware's § 2402(c)(4) lets a party record, while § 1335(a)(4) makes
+    // intercepting without the consent of all parties a crime. Michigan's
+    // § 750.539c is a felony and reads all-party, but its courts have held
+    // that a participant may record. A CRIMINAL label would settle a question
+    // the sources leave open, so the flag stays false and the note, which the
+    // warning prints, carries both the penalty and the conflict.
+    for (code, penalty) in [("US-DE", "§ 1335(a)(4)"), ("US-MI", "felony")] {
+        let j = r.get(code).unwrap();
+        assert!(
+            !j.criminal,
+            "{code}: the sources conflict on whether a participant's recording is a crime"
+        );
+        assert!(
+            j.note.contains(penalty),
+            "{code}'s note must still name the penalty: {}",
+            j.note
+        );
+    }
 }
 
 #[test]

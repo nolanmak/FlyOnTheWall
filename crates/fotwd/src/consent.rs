@@ -69,12 +69,18 @@ pub struct Jurisdiction {
     ///
     /// Set from the penalty in the statute text, not inferred from the
     /// regime. True for Germany, France and every all-party or contested US
-    /// state in the table except Connecticut, whose all-party rule
-    /// (§ 52-570d) is enforced by civil action. False for the one-party
-    /// entries, where a participant's own recording breaks no rule; for the
-    /// `mixed` entries, whose stricter layer is privacy or data-protection law
-    /// and which have not been checked against national penal codes; and for
-    /// Australia, whose state acts differ.
+    /// state in the table except three. Connecticut's all-party rule
+    /// (§ 52-570d) is enforced by civil action. Delaware and Michigan stay
+    /// false because the sources conflict on whether a participant's
+    /// recording is a crime there: Delaware's § 2402(c)(4) lets a party
+    /// record while § 1335(a)(4) makes intercepting without every party's
+    /// consent a crime, and Michigan's § 750.539c is a felony that reads
+    /// all-party while its courts have held a participant may record. Their
+    /// notes give the penalty and the conflict. False as well for the
+    /// one-party entries, where a participant's own recording breaks no rule;
+    /// for the `mixed` entries, whose stricter layer is privacy or
+    /// data-protection law and which have not been checked against national
+    /// penal codes; and for Australia, whose state acts differ.
     pub criminal: bool,
     /// What is disputed, for contested entries, and otherwise what the
     /// statute penalises. Printed under the entry in the warning.
@@ -91,8 +97,9 @@ impl Jurisdiction {
     /// jurisdiction's name.
     ///
     /// Criminal exposure comes from this entry's own flag and no other. It
-    /// never says a breach is *not* a crime: a `false` flag means the table
-    /// has no criminal penalty for it, which is weaker than there being none.
+    /// never says a breach is *not* a crime: a `false` flag means only that
+    /// the table does not claim a criminal penalty, which is weaker than there
+    /// being none.
     #[must_use]
     pub fn requirement(&self) -> String {
         let rule = match self.regime {

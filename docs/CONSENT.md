@@ -45,14 +45,21 @@ civil and criminal treatment.
 
 Whether a breach is a *crime* is set per jurisdiction from the penalty in the
 statute text, not assumed from the regime. Every state named above except
-Connecticut makes recording in breach of its all-party rule a criminal offence
-(for the contested ones, under the stricter reading): a third-degree felony in
-Florida and Pennsylvania, a Class 4 felony for a first offence in Illinois, a
-gross misdemeanor in Washington. Connecticut's all-party rule for telephone
-calls, § 52-570d, is enforced by civil action, and its criminal eavesdropping
-statute reaches only someone who is not a party to the conversation. The
-warning labels each jurisdiction on its own line, so a criminal statute in one
-place is never attributed to another.
+Connecticut, Delaware and Michigan makes recording in breach of its all-party
+rule a criminal offence (for the contested ones, under the stricter reading): a
+third-degree felony in Florida and Pennsylvania, a Class 4 felony for a first
+offence in Illinois, a gross misdemeanor in Washington. Connecticut's all-party
+rule for telephone calls, § 52-570d, is enforced by civil action, and its
+criminal eavesdropping statute reaches only someone who is not a party to the
+conversation. Delaware and Michigan are not labelled criminal because the
+sources conflict on whether a participant's recording is a crime there.
+Delaware's § 2402(c)(4) lets a party record, while § 1335(a)(4) makes
+intercepting a private conversation without the consent of all parties a crime.
+Michigan's § 750.539c is a felony and reads all-party, but its courts have held
+that a participant may record. The notes on both entries, which the warning
+prints, give the penalty and the conflict. The warning labels each jurisdiction
+on its own line, so a criminal statute in one place is never attributed to
+another.
 
 **This is why the app ships statute citations rather than a colour-coded map.**
 `crates/fotwd/data/jurisdictions.json` carries 64 jurisdictions, each with the

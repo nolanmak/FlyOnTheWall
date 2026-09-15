@@ -97,7 +97,7 @@
    "regime": "all_party",
    "statute": "Del. Code tit. 11, \u00a7 2402",
    "citation_url": "https://delcode.delaware.gov/title11/c024/sc01/index.html",
-   "criminal": true,
+   "criminal": false,
    "note": "\u00a7 2402(c)(4) lets a party record, but \u00a7 1335(a)(4) makes intercepting a private conversation without the consent of all parties the crime of violation of privacy.",
    "cctld": null
   },
@@ -137,7 +137,7 @@
    "regime": "contested",
    "statute": "Mich. Comp. Laws \u00a7 750.539c",
    "citation_url": "https://www.legislature.mi.gov/Laws/MCL?objectName=MCL-750-539C",
-   "criminal": true,
+   "criminal": false,
    "note": "The statute reads all-party but Michigan courts have held a participant may record. Unsettled. The statute makes a violation a felony.",
    "cctld": null
   },
