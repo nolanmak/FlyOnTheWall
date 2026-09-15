@@ -373,14 +373,6 @@ section {
   color: var(--muted);
 }
 
-/* The same trap as `.actions[hidden]` below: the `display` above outranks the
-   UA sheet's `[hidden]`. The public-repository box has to stay off screen when
-   the daemon's settings cannot carry the answer, or it would offer a choice a
-   save silently drops. */
-.gh-check[hidden] {
-  display: none;
-}
-
 #gh-save,
 #sum-save,
 .gh-push,

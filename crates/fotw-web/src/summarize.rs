@@ -84,7 +84,8 @@ const CODEX_DISCLOSURE: &[&str] = &[
     "https://help.openai.com/en/articles/7730893-data-controls-faq",
     "codex is also an agentic CLI: it can run shell over the transcript,",
     "so FlyOnTheWall runs it read-only with an empty HOME to shield your",
-    "files. Prefer claude-cli if you want a non-agentic engine.",
+    "files. Prefer claude-cli if you want a non-agentic engine: it runs",
+    "with its tools and MCP servers turned off.",
 ];
 
 /// The engine choice, as the UI reads and writes it.
