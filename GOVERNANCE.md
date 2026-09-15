@@ -18,15 +18,36 @@ writing down:
 - `screenpipe` relicensed away from open source mid-life to a proprietary
   commercial license.
 
-If a future maintainer wants to change this, that is a relicensing decision, and
-relicensing requires the consent of contributors — see below.
+This commitment is a pledge by the maintainers. The license does not enforce
+it, and the next section says exactly what the license does and does not
+guarantee.
 
-## Relicensing
+## Licensing
 
-The project is Apache-2.0. Changing the license requires the explicit consent of
-every contributor holding copyright in code still present in the tree. There is
-no CLA and no copyright assignment, precisely so that no single party can
-relicense unilaterally.
+FlyOnTheWall is licensed under Apache-2.0.
+
+**What the license guarantees.** Anyone who has received a version of this code
+keeps the rights Apache-2.0 gives them for that version. The copyright grant in
+section 2 is perpetual and irrevocable, so nobody, the maintainers included, can
+take back code that has already been released under it.
+
+**What the license does not guarantee.** Apache-2.0 is permissive. Section 2
+lets every recipient sublicense the work, and section 4 lets anyone distribute
+their modifications, or a derivative work as a whole, under additional or
+different terms as long as the license's notice conditions are met. So a
+maintainer or a fork could legally ship future versions under proprietary terms
+without asking past contributors. The project has no CLA and no copyright
+assignment, but that absence does not prevent this.
+
+**What the maintainers pledge instead:**
+
+- The maintainers will not ship a proprietary or open-core edition of
+  FlyOnTheWall, and will not reserve any feature for a paid tier or a hosted
+  service.
+- Contributions are accepted under Apache-2.0 itself, as section 5 of the
+  license provides, with no CLA and no copyright assignment.
+- If this pledge is ever broken, every version released before that point stays
+  under Apache-2.0, and anyone may fork from it.
 
 ## Decision making
 
