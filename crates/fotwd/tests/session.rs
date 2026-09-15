@@ -118,7 +118,7 @@ async fn recording_works_with_no_provider_configured() {
         "no provider means no transcript, not a failure"
     );
 
-    // The audio is on disk and can be transcribed later.
+    // The audio is still on disk.
     let pcm = std::fs::metadata(outcome.dir.join("system.pcm")).unwrap();
     assert!(pcm.len() > 0);
 }

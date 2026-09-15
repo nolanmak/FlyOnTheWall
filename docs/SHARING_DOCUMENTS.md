@@ -73,9 +73,9 @@ contains the full recording even when a sharing draft omits private tangents.
 
 ### Private repositories only, unless acknowledged
 
-Every push, and every sync of the `index.md` and `log.md` index files, first asks
-GitHub about the repository and writes nothing (error `repo_is_public`) unless the
-answer confirms it is private: `private` must be `true`, and `visibility`, when
+Every push, and every sync of the `index.md` and `log.md` index files that would
+write to the repository, first asks GitHub about the repository and writes nothing
+(error `repo_is_public`) unless the answer confirms it is private: `private` must be `true`, and `visibility`, when
 present, must not be `public`. A missing `private` field or an answer that is not
 JSON counts as public. The check runs on every write, not once when the settings
 are saved, because a repository can be made public after it was configured, and
@@ -85,9 +85,9 @@ and commit messages. The repository suggestions leave public repositories out.
 
 The only exception is an acknowledgement stored with the GitHub export settings
 (`allow_public_repo`). The dashboard offers it as **push to a public repository
-anyway**, shown only when the daemon's settings include that field and unticked
-when the repository name is edited; where the settings do not include it, a public
-repository is always refused. In auto mode a refusal ends that pass and is written
+anyway** in the GitHub export settings. Editing the repository name clears the
+tick, so an acknowledgement given for one repository does not carry over to
+another. In auto mode a refusal ends that pass and is written
 to `fotwd.log`. No meeting is set aside as failed, so owed meetings are pushed on a
 later pass once the repository is private or the acknowledgement is stored.
 

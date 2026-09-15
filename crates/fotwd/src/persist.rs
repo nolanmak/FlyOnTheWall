@@ -21,9 +21,9 @@ use crate::session::SessionOutcome;
 /// Write a finished session into the library, returning the meeting id.
 ///
 /// A session with no segments still becomes a meeting: recording without a
-/// provider configured is a supported, normal state, and the audio can be
-/// transcribed later. Dropping it here would make the library quietly lossy
-/// in exactly the case where the user most needs to find the recording.
+/// provider configured is a supported, normal state, and the audio is still on
+/// disk. Dropping it here would make the library quietly lossy in exactly the
+/// case where the user most needs to find the recording.
 pub fn persist_session(db: &mut Db, outcome: &SessionOutcome, title: &str) -> StoreResult<String> {
     // Cross-leg dedupe happens HERE, not at session end: `stt.jsonl` is the
     // crash-recovery record and stays raw, so a matcher misfire is always

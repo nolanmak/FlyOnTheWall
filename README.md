@@ -61,7 +61,7 @@ proposed end-of-call detection policy.
 | `audit.jsonl`, `fotwd.log` | the recording audit trail and the daemon's diagnostics | no |
 | anything `export`, `export-all` or `export-okf` writes | the meetings you exported | no, by design; the commands that write files say so |
 
-Nothing marked no needs a key to read: the transcript text in `sessions/<id>/stt.jsonl`, `audit.jsonl`, `fotwd.log` and every export are plain text, and `export-all --audio` copies the audio files unchanged. Paths are relative to the data folder under [Where your data lives](#where-your-data-lives). FileVault encrypts the whole disk while the Mac is off. It does not cover a backup or sync copy of that folder, or another app running as you. Those are the cases the database encryption exists for, and today they expose the audio.
+Nothing marked no needs a key to read: the transcript text in `sessions/<id>/stt.jsonl` and in every export is plain text, `audit.jsonl` and `fotwd.log` are plain-text logs that identify meetings by id (`audit.jsonl` also records export paths, which include meeting titles), and `export-all --audio` copies the audio files unchanged. Paths are relative to the data folder under [Where your data lives](#where-your-data-lives). FileVault encrypts the whole disk while the Mac is off. It does not cover a backup or sync copy of that folder, or another app running as you. Those are the cases the database encryption exists for, and today they expose the audio.
 
 ### What leaves your machine
 
@@ -92,7 +92,7 @@ There are no prebuilt or signed releases yet. The only way to run FlyOnTheWall i
 git clone https://github.com/nolanmak/FlyOnTheWall.git
 cd FlyOnTheWall
 rustup toolchain install 1.95.0   # the version pinned in rust-toolchain.toml
-just ci                           # fmt + clippy + tests + the platform-seam guard
+just ci                           # fmt, clippy, tests, cargo-deny and the platform-seam checks
 ```
 
 ## First run

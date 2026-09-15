@@ -148,8 +148,8 @@ fn the_channel_survives_into_the_database() {
 #[test]
 fn a_session_with_no_transcript_still_becomes_a_meeting() {
     // Recording without a provider configured is a supported, normal state —
-    // the audio is on disk and can be transcribed later. It must still show
-    // up in the library rather than vanishing.
+    // the audio is still on disk. It must still show up in the library rather
+    // than vanishing.
     let dir = tmpdir("notranscript");
     let mut db = db_at(&dir);
 

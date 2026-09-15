@@ -3967,7 +3967,7 @@ Used by:
 - percent-encoding 2.3.2
 - png 0.18.1
 - primal-check 0.3.4
-- rtrb 0.3.4
+- rtrb 0.3.5
 - rustix 1.1.4
 - security-framework-sys 2.17.0
 - security-framework 3.7.0
@@ -4403,7 +4403,7 @@ Used by:
 - blake2 0.10.6
 - block-buffer 0.10.4
 - block-buffer 0.12.1
-- chacha20 0.10.1
+- chacha20 0.10.2
 - chacha20poly1305 0.11.0
 - cipher 0.5.2
 - const-oid 0.10.2
@@ -6701,7 +6701,7 @@ THE SOFTWARE.
 
 Used by:
 
-- h2 0.4.15
+- h2 0.4.19
 
 ````text
 Copyright (c) 2017 h2 authors

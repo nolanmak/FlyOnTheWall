@@ -1024,6 +1024,8 @@ Sync is a non-goal, but these keep the door open at ~2 weeks instead of a rewrit
 
 **Egress.** A hard allowlist in the HTTP/WS layer: `api.deepgram.com`, `api.elevenlabs.io` (+ the four regional residency hosts), `api.openai.com`, `api.anthropic.com`, plus the GitHub update endpoint. A startup assertion and a CI test fail the build if any audio-carrying request targets anything else. **This is the technical backing for "no vendor backend relays your audio" — without it, that claim is marketing.**
 
+> **Correction (2026-09).** Not built as described. `is_allowed` in `crates/fotwd/src/transport.rs` has no callers outside that file, and the Deepgram WebSocket in `crates/fotw-stt/src/deepgram_stream.rs` connects with `connect_async` directly, so no allowlist, startup assertion or CI test gates the audio-carrying connection today. Audio still goes straight to the provider, with no FlyOnTheWall server in between.
+
 **Provider privacy flags, injected at transport with no bypass.** See KEY-03. Per-provider posture as of 2026-08-09:
 
 | Provider | Default | Our flag | Residual risk |

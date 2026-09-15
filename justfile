@@ -194,6 +194,10 @@ verify-bundle:
         v=$(/usr/libexec/PlistBuddy -c "Print :$key" "$plist" 2>/dev/null || true)
         if [[ -z "${v// }" ]]; then echo "✗ $key is empty" >&2; fail=1; fi
     done
+    # The notices the binary's BSD/MIT/Apache dependencies require must ship with it.
+    if [[ ! -s "{{app}}/Contents/Resources/THIRD_PARTY_NOTICES.md" ]]; then
+        echo "✗ bundle lacks Contents/Resources/THIRD_PARTY_NOTICES.md" >&2; fail=1
+    fi
     # Every embedded Mach-O must carry the entitlement, not just the outer app.
     # The classic failure is the entitlement on the app but missing on a helper,
     # which suppresses the TCC prompt entirely.

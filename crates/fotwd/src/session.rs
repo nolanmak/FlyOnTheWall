@@ -793,7 +793,7 @@ pub fn order_segments(segments: &mut [TranscriptSegment]) {
 
 /// How to transcribe, if at all.
 pub enum Transcription {
-    /// Record only. Still fully useful — the audio can be transcribed later.
+    /// Record only: the meeting and its audio are kept; nothing shipped transcribes it later.
     Disabled,
     /// Stream to Deepgram as the meeting runs, one connection per leg.
     Deepgram(DeepgramLegs),

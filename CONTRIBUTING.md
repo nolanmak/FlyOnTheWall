@@ -78,6 +78,17 @@ Where CI still differs from a local `just ci`:
 The recipes build with 3 parallel cargo jobs so the machine stays usable; set
 `CARGO_BUILD_JOBS` to change that.
 
+### Dependency changes and third-party notices
+
+`THIRD_PARTY_NOTICES.md` carries the license texts for everything compiled into
+the app, and `just bundle` copies it into the `.app`. If your change touches
+`Cargo.lock`, including a Dependabot update, run `just licenses` and commit the
+regenerated file. The recipe installs cargo-about 0.9.2 if it is missing and
+fails if a different cargo-about version is installed. It also fails when a
+libsqlite3-sys, openssl-src or opusic-sys bump, or fotwd no longer depending on
+one of them, means the C library section in `packaging/licenses/about.hbs` needs
+re-checking.
+
 The whole pipeline is testable with no Mac-specific hardware and no audio device
 via `FileAudioSource` and the mock STT server. If your change is in
 `fotw-audio/src/platform/macos`, it is not covered by CI — say so in the PR and
