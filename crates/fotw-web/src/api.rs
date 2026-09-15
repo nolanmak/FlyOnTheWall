@@ -229,6 +229,10 @@ pub struct LaunchUrlResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GithubReposResponse {
     /// `owner/name`, most recently active first. Empty when `error` says why.
+    ///
+    /// The daemon's implementation lists only repositories GitHub reports as
+    /// private: a public one is left out rather than offered unlabelled, since
+    /// this list has no field to label it with.
     pub repos: Vec<String>,
     /// Why the listing failed, when it did — the same stable codes a push
     /// answers with.
