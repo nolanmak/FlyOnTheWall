@@ -596,7 +596,10 @@ mod tests {
         let saved = js
             .find("body.settings.enabled")
             .expect("the settings form must branch on an enabled target");
-        let arm = &js[saved..js[saved..].find("GitHub export is off").map_or(js.len(), |i| saved + i)];
+        let arm = &js[saved
+            ..js[saved..]
+                .find("GitHub export is off")
+                .map_or(js.len(), |i| saved + i)];
         assert!(
             arm.contains("Sync now"),
             "the manual-mode toast must name the control that pushes a meeting: {arm}"

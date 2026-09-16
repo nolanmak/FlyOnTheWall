@@ -403,6 +403,42 @@ impl GithubExporter {
         }
     }
 
+    /// Record a failed push, whatever kind of failure it was.
+    ///
+    /// The one place that decision is made, because every exit of [`push`]
+    /// routes through here: the tail that owns the attempts gh answered, and the
+    /// error sites above the claim that used to return recording nothing at all
+    /// — no backoff, no stall, and so no state for the pane to show. A meeting
+    /// whose saved brief could not be read failed silently, once a minute.
+    ///
+    /// `gh_answered` says whether this failure came back from GitHub rather than
+    /// from the library: a refusal GitHub itself gave disproves an
+    /// environment-wide stall, while a failure raised before gh was ever run
+    /// says nothing about the environment either way.
+    fn record_failure(&self, meeting_id: &str, e: &GithubError, now: u64, gh_answered: bool) {
+        if stalls_every_push(e) {
+            // Nothing that answers for every meeting is one meeting's fault, so
+            // no meeting is parked for it: it is remembered once, for all of them.
+            self.note_stall(&e.to_string(), now);
+            return;
+        }
+        if gh_answered {
+            self.clear_stall();
+        }
+        self.enter_backoff(meeting_id, now, &e.to_string());
+    }
+
+    /// Record a failure raised before gh ran, and hand it back unchanged.
+    ///
+    /// Written as a wrapper around the error so each early exit stays one
+    /// expression: the alternative was a second copy of the classifier, which is
+    /// how the two halves drifted apart in the first place.
+    fn recorded(&self, meeting_id: &str, e: GithubError) -> GithubError {
+        let now = u64::try_from(fotw_store::now_ms()).unwrap_or(0);
+        self.record_failure(meeting_id, &e, now, false);
+        e
+    }
+
     /// Remember the refusal that answers for every meeting (see [`Stall`]), so
     /// that the meetings the round could not push can say why.
     fn note_stall(&self, code: &str, now: u64) {
@@ -729,17 +765,23 @@ impl GithubExport for GithubExporter {
             let mut db = self.lock_db();
             let settings = read_settings(&db);
             if !settings.enabled {
-                return Err(GithubError::Disabled);
+                return Err(self.recorded(meeting_id, GithubError::Disabled));
             }
             // The store's own error text can quote the row it choked on, and
             // this string reaches the UI and the daemon log — the same
             // reasoning that keeps api.rs's server_error() a bare 500.
             let meeting = db.meetings().get(meeting_id).map_err(|e| match e {
                 StoreError::NotFound { .. } => GithubError::NoSuchMeeting,
-                _ => GithubError::Failed("the library refused to read the meeting".to_owned()),
+                _ => self.recorded(
+                    meeting_id,
+                    GithubError::Failed("the library refused to read the meeting".to_owned()),
+                ),
             })?;
             let doc = db.export_meeting(meeting_id).map_err(|_| {
-                GithubError::Failed("the library refused to export the meeting".to_owned())
+                self.recorded(
+                    meeting_id,
+                    GithubError::Failed("the library refused to export the meeting".to_owned()),
+                )
             })?;
             let existing = read_receipts(&db).remove(meeting_id);
             let path = existing.as_ref().map_or_else(
@@ -762,7 +804,12 @@ impl GithubExport for GithubExporter {
             if let Some(row) = doc.documents.iter().max_by_key(|d| d.version) {
                 let draft: fotw_web::documents::SharingDocument =
                     serde_json::from_str(&row.document_json).map_err(|_| {
-                        GithubError::Failed("the saved meeting document could not be read".into())
+                        self.recorded(
+                            meeting_id,
+                            GithubError::Failed(
+                                "the saved meeting document could not be read".into(),
+                            ),
+                        )
                     })?;
                 // Only the latest saved brief, never private review notes or revision history.
                 companions.push((format!("{stem}.document.md"), draft.markdown));
@@ -866,11 +913,11 @@ impl GithubExport for GithubExporter {
                     note!("{}", left_backoff_line(meeting_id, previous.failures));
                 }
             }
-            // Nothing that answers for every meeting is one meeting's fault, so
-            // no meeting is parked for it: it is remembered once, for all of
-            // them.
-            Err(e) if stalls_every_push(e) => self.note_stall(&e.to_string(), now),
-            Err(e) => self.enter_backoff(meeting_id, now, &e.to_string()),
+            // gh answered, so whatever it said disproves a refusal that was
+            // said to answer for every meeting: a stall cleared only by a push
+            // that *landed* went on telling the user to fix a login that had
+            // already started working.
+            Err(e) => self.record_failure(meeting_id, e, now, true),
         }
         result
     }
@@ -935,12 +982,20 @@ impl GithubExport for GithubExporter {
             // the two apart would confirm a guessed id (ING-09).
             //
             // An environment-wide refusal belongs on exactly this meeting: one
-            // the worker owes and cannot push. It is not this meeting's failure,
-            // so it carries no retry time — nothing is scheduled to retry it,
-            // and fixing the environment drains the backlog on the next poll.
-            let stall = stall.filter(|_| scheduled);
+            // that is not in the repository and cannot be put there. It is not
+            // this meeting's failure, so it carries no retry time — nothing is
+            // scheduled to retry it, and fixing the environment drains the
+            // backlog on the next poll.
+            //
+            // Said whether or not a pass covers the meeting: in manual mode, and
+            // for a meeting recorded before automatic pushes were switched on,
+            // the person reading this is the only one who can push it, so they
+            // are the one who needs to know gh is broken.
             return GithubSyncStatus {
                 state: GithubSyncState::Never,
+                // The repository a Sync now would send it to, so the line can
+                // name it rather than saying "GitHub".
+                repo: Some(settings.repo.clone()),
                 scheduled,
                 blocked: stall.as_ref().map(|s| s.code.clone()),
                 blocked_at_ms: stall.map(|s| s.at_ms),
@@ -957,7 +1012,7 @@ impl GithubExport for GithubExporter {
         });
         // A meeting already in the repository is waiting on nothing, so it is
         // told nothing about a stall.
-        let stall = stall.filter(|_| scheduled && changed);
+        let stall = stall.filter(|_| changed);
         GithubSyncStatus {
             state: if changed {
                 GithubSyncState::Changed

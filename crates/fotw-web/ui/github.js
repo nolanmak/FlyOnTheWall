@@ -37,8 +37,11 @@ const GH_ERRORS = {
   gh_missing: "The gh CLI is not installed. brew install gh, then try again.",
   gh_not_authenticated: "gh has no login. Run gh auth login in a terminal, then try again.",
   repo_not_found: "That repository is not reachable with your gh login. Check the name and your access.",
+  // Neither of these two opens with its own verdict. Both are composed into a
+  // sentence that already has one — "No meeting can be pushed right now: …" —
+  // and a second verdict there read as two stapled together.
   github_export_disabled: "GitHub export is switched off. Enable it in the GitHub export section first.",
-  repo_is_public: "Nothing was pushed: that repository is public, or GitHub did not confirm it is private. Choose a private repository, or tick 'push to a public repository anyway' and save, in the GitHub export section.",
+  repo_is_public: "that repository is public, or GitHub did not confirm it is private. Choose a private repository, or tick 'push to a public repository anyway' and save, in the GitHub export section.",
 };
 
 function ghExplain(code) {
@@ -119,22 +122,24 @@ function syncLine(status) {
 
 // The control this state offers, or null for the states that need none.
 //
-// The accessible name is not the visible label: out of context "Retry" says
-// nothing about what is being retried, and the pane is one of several in a
-// meeting.
+// The accessible name says more than the visible label — out of context "Retry"
+// says nothing about what is being retried, and the pane is one of several in a
+// meeting — but it *begins* with that label. WCAG 2.5.3 (Label in Name): a
+// speech-input user saying "click Sync now" has to be able to activate the one
+// control a meeting outside every pass has.
 function syncControl(status) {
   if (status.state === "failed") {
     return {
       label: "Retry",
       className: "gh-retry",
-      name: "Retry the GitHub push for this meeting",
+      name: "Retry: push this meeting to GitHub again",
     };
   }
   if (syncOwed(status) && !syncScheduled(status)) {
     return {
       label: "Sync now",
       className: "gh-sync-now",
-      name: "Sync this meeting to GitHub now",
+      name: "Sync now: push this meeting to GitHub",
     };
   }
   return null;

@@ -1876,7 +1876,9 @@ fn a_failure_before_the_claim_is_recorded_like_any_other() {
         Arc::clone(&gh) as Arc<dyn GhRunner>,
     );
 
-    let failed = exporter.push(&meeting).expect_err("the brief cannot be read");
+    let failed = exporter
+        .push(&meeting)
+        .expect_err("the brief cannot be read");
     assert!(
         failed.to_string().contains("document could not be read"),
         "the pre-claim error itself: {failed}"
@@ -1895,7 +1897,10 @@ fn a_failure_before_the_claim_is_recorded_like_any_other() {
          never synced while nothing is coming"
     );
     assert!(
-        state.error.unwrap_or_default().contains("document could not be read"),
+        state
+            .error
+            .unwrap_or_default()
+            .contains("document could not be read"),
         "and it says why"
     );
     assert!(

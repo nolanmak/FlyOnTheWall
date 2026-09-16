@@ -1000,8 +1000,11 @@ async function onGithubSave() {
     } else if (auto) {
       say("Saved. Meetings will be synced to " + body.settings.repo + " as they finish.");
     } else if (body.settings.enabled) {
+      // Not a dead end since #112: a meeting no automatic pass covers offers
+      // Sync now, which is the only thing that pushes anything in this mode.
       say(
-        "Saved, but nothing will be synced: tick 'push automatically when a meeting finishes' for that.",
+        "Saved. Nothing is pushed automatically — each finished meeting offers Sync now. " +
+          "Tick 'push automatically when a meeting finishes' to have the daemon do it.",
       );
     } else {
       say("Saved. GitHub export is off.");
