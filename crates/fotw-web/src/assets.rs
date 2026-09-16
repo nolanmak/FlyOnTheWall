@@ -550,6 +550,38 @@ mod tests {
     /// status `api()` attaches to the error it throws, so a 500, an expired
     /// token or a daemon restart stops hiding a meeting's state behind "there is
     /// no such feature".
+    /// #112. The whole-library switch publishes an archive, and a commit cannot
+    /// be taken back, so the warning above it has to name what a push actually
+    /// sends — the same list the README and `docs/SHARING_DOCUMENTS.md` give.
+    /// It said "transcript, summary and title", while a push also commits the
+    /// user's own notes (they are part of `MeetingDoc::to_markdown`) and the
+    /// latest saved document brief.
+    ///
+    /// Only the paragraph directly above the switch counts: the section's
+    /// opening note names some of the same things, so a search of the whole form
+    /// would pass while the warning itself understated it.
+    #[test]
+    fn the_whole_library_warning_names_everything_a_push_publishes() {
+        let html = asset_text("index.html");
+        let switch = html
+            .find(r#"id="gh-whole-library""#)
+            .expect("the whole-library switch must be in the shell");
+        let above = &html[..switch];
+        let warning = &above[above
+            .rfind(r#"<p class="gh-note">"#)
+            .expect("the switch must carry a note above it")..];
+        for published in ["transcript", "notes", "summary", "brief", "title"] {
+            assert!(
+                warning.contains(published),
+                "a push publishes {published}, and the warning must say so: {warning}"
+            );
+        }
+        assert!(
+            warning.contains("history"),
+            "and that a commit stays in the repository's history: {warning}"
+        );
+    }
+
     #[test]
     fn a_failed_request_carries_its_status_to_the_caller() {
         let js = asset_text("app.js");
