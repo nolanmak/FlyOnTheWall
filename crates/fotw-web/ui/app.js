@@ -46,6 +46,7 @@ const el = {
   ghSave: document.getElementById("gh-save"),
   ghRepoList: document.getElementById("gh-repo-list"),
   ghPublic: document.getElementById("gh-public"),
+  ghWholeLibrary: document.getElementById("gh-whole-library"),
   sumSettings: document.getElementById("sum-settings"),
   sumKind: document.getElementById("sum-kind"),
   sumBinary: document.getElementById("sum-binary"),
@@ -254,6 +255,10 @@ function renderDetail(detail) {
 
   const actions = actionsRow(detail);
   if (actions) el.detail.appendChild(actions);
+
+  // Where this meeting stands with GitHub, in place of the push button #112
+  // removed. Draws nothing at all when export is off or absent.
+  mountGithubSync(detail, el.detail);
 
   mountSharingDocument(detail, el.detail);
 
@@ -893,19 +898,9 @@ async function onRecord() {
 let githubPresent = true;
 let githubSettings = null;
 
-// The stable machine codes from the API, spelled for a person. Anything not
-// listed renders verbatim — GitHub's own error text beats a shrug.
-const GH_ERRORS = {
-  gh_missing: "The gh CLI is not installed. brew install gh, then try again.",
-  gh_not_authenticated: "gh has no login. Run gh auth login in a terminal, then try again.",
-  repo_not_found: "That repository is not reachable with your gh login. Check the name and your access.",
-  github_export_disabled: "GitHub export is switched off. Enable it in the GitHub export section first.",
-  repo_is_public: "Nothing was pushed: that repository is public, or GitHub did not confirm it is private. Choose a private repository, or tick 'push to a public repository anyway' and save, in the GitHub export section.",
-};
-
-function ghExplain(code) {
-  return GH_ERRORS[code] || code;
-}
+// `GH_ERRORS` and `ghExplain` live in github.js, which the shell loads before
+// this file: they are the GitHub module's vocabulary, and the per-meeting sync
+// line needs them to explain a failed push (#112).
 
 function renderGithubForm(s) {
   githubSettings = s;
@@ -915,6 +910,7 @@ function renderGithubForm(s) {
   el.ghAuto.checked = s.mode === "auto";
   el.ghEnabled.checked = Boolean(s.enabled);
   el.ghPublic.checked = Boolean(s.allow_public_repo);
+  el.ghWholeLibrary.checked = Boolean(s.sync_whole_library);
   el.ghSettings.hidden = false;
 }
 
@@ -969,6 +965,7 @@ async function onGithubSave() {
         path_prefix: el.ghPrefix.value,
         mode: el.ghAuto.checked ? "auto" : "manual",
         allow_public_repo: el.ghPublic.checked,
+        sync_whole_library: el.ghWholeLibrary.checked,
       }),
     });
     if (body.error) {
@@ -978,15 +975,23 @@ async function onGithubSave() {
       el.ghSave.disabled = false;
       return;
     }
-    // Accepted: re-render from the reply (the normalized spelling), and
-    // redraw the open meeting so its push button appears or disappears with
-    // the setting it depends on.
+    // Accepted: re-render from the reply (the normalized spelling), and redraw
+    // the open meeting so its sync line follows the setting that decides it.
     renderGithubForm(body.settings);
     if (currentDetail) renderDetail(currentDetail);
-    if (body.settings.enabled && body.settings.mode === "auto") {
-      say("Saved. New meetings will be pushed to " + body.settings.repo + " when they finish.");
+    const auto = body.settings.enabled && body.settings.mode === "auto";
+    if (auto && body.settings.sync_whole_library) {
+      say(
+        "Saved. Every meeting in your library will be synced to " +
+          body.settings.repo +
+          ", oldest first, about ten a minute.",
+      );
+    } else if (auto) {
+      say("Saved. Meetings will be synced to " + body.settings.repo + " as they finish.");
     } else if (body.settings.enabled) {
-      say("Saved. Use the button on a meeting to push it to " + body.settings.repo + ".");
+      say(
+        "Saved, but nothing will be synced: tick 'push automatically when a meeting finishes' for that.",
+      );
     } else {
       say("Saved. GitHub export is off.");
     }
@@ -1102,37 +1107,11 @@ async function onSummarizeSave() {
   el.sumSave.disabled = false;
 }
 
-async function onGithubPush(meetingId, button) {
-  button.disabled = true;
-  say("Pushing to " + (githubSettings ? githubSettings.repo : "GitHub") + "…");
-  try {
-    const body = await api(
-      "/api/meetings/" + encodeURIComponent(meetingId) + "/github-push",
-      { method: "POST" },
-    );
-    if (body.error) {
-      say(ghExplain(body.error));
-    } else {
-      say("Pushed: " + body.receipt.repo + "/" + body.receipt.path);
-    }
-  } catch (e) {
-    say("Could not push that meeting.");
-  }
-  button.disabled = false;
-}
-
-// The per-meeting push button, or null when this build has no GitHub export or
-// it is switched off. The row it goes in belongs to `actionsRow` now — it is
-// shared with the copy buttons, and a wrapper each would have stacked them.
-function githubButton(meetingId) {
-  if (!githubPresent || !githubSettings || !githubSettings.enabled) return null;
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = "gh-push";
-  button.textContent = "Push to GitHub";
-  button.addEventListener("click", () => onGithubPush(meetingId, button));
-  return button;
-}
+// The per-meeting push button used to live here. It is gone (#112): the worker
+// owns every push, so a button drawn from the settings alone appeared on
+// meetings that were already in the repository and invited a second commit of
+// them. `mountGithubSync` in github.js shows each meeting's sync state instead,
+// and offers a control only for a meeting whose last attempt failed.
 
 // ----------------------------------------------------- EXP-02, copy to clipboard
 //
@@ -1381,14 +1360,14 @@ function copyButton(label, build) {
   return button;
 }
 
-// The per-meeting controls, in one row: the copies, then the push.
+// The per-meeting controls, in one row: the copies.
 //
-// Copy first because it is what someone does after every meeting; push last
-// because it is the configured occasional one and the only one that writes
-// somewhere else. Each control is drawn only when it can do something -- no
-// summary, no "Copy summary"; no segments, no "Copy transcript" -- and the row
-// is not appended when it would be empty. That is `githubActions`' old rule,
-// applied to all three.
+// Each control is drawn only when it can do something -- no summary, no "Copy
+// summary"; no segments, no "Copy transcript" -- and the row is not appended
+// when it would be empty. That was `githubActions`' old rule, and it is the
+// rule #112 applied to the export as well: the push button that was drawn here
+// whenever export was enabled is gone, because "enabled" was never the same
+// question as "is there anything to do for this meeting".
 function actionsRow(detail) {
   const row = document.createElement("p");
   row.className = "actions";
@@ -1400,8 +1379,6 @@ function actionsRow(detail) {
       copyButton("Copy transcript", () => storedTranscriptPayload(detail)),
     );
   }
-  const push = githubButton(detail.meeting.id);
-  if (push) row.appendChild(push);
   return row.firstChild ? row : null;
 }
 

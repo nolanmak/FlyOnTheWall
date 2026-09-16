@@ -85,6 +85,17 @@
         <input id="gh-auto" type="checkbox" />
         push automatically when a meeting finishes
       </label>
+      <p class="gh-note">
+        Automatic pushes cover meetings recorded from the moment you switch them
+        on. The box below also sends everything already in your library, oldest
+        first, about ten a minute: every meeting you have ever recorded, with its
+        transcript, summary and title. A commit cannot be taken back — it stays
+        in the repository's history even after the file is deleted.
+      </p>
+      <label class="gh-check">
+        <input id="gh-whole-library" type="checkbox" />
+        sync every meeting in the library, not only new ones
+      </label>
       <label class="gh-check">
         <input id="gh-enabled" type="checkbox" />
         enabled
@@ -127,6 +138,7 @@
       <p id="sum-status" class="gh-note"></p>
     </details>
     <p id="status" role="status"></p>
+    <script src="/assets/github.js"></script>
     <script src="/assets/documents.js"></script>
     <script src="/assets/app.js"></script>
   </body>

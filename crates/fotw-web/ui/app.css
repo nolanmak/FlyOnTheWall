@@ -375,7 +375,7 @@ section {
 
 #gh-save,
 #sum-save,
-.gh-push,
+.gh-retry,
 .copy {
   font: inherit;
   font-size: 12px;
@@ -392,7 +392,7 @@ section {
    for a state that cannot happen is a claim the code does not make. */
 #gh-save:disabled,
 #sum-save:disabled,
-.gh-push:disabled {
+.gh-retry:disabled {
   color: var(--muted);
   cursor: not-allowed;
 }
@@ -418,6 +418,30 @@ section {
    `hidden`, offering to copy words nobody has said yet. */
 .actions[hidden] {
   display: none;
+}
+
+/* Where a meeting stands with GitHub (#112), in place of the push button that
+   used to sit in `.actions`. A row rather than a bare line because the failed
+   state puts a Retry beside the sentence, and script-appended siblings carry no
+   whitespace between them.
+
+   Muted, like every other line here that reports rather than asks: this is the
+   answer to "is this in the repository", not a control. The failed state is not
+   coloured differently -- CON-02 reserves #d2453d for live capture and
+   --caution is the caveat colour, and a meeting that will be retried on its own
+   is neither. The sentence carries the weight. */
+.gh-sync-panel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.gh-sync {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 0;
 }
 
 /* A still-revising utterance in the live view. Muted rather than faded by
