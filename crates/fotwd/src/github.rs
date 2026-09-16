@@ -186,6 +186,20 @@ fn resolve_gh() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
+/// What the worker remembers about a meeting whose own push failed (#112).
+#[derive(Debug, Clone)]
+struct Backoff {
+    /// How many attempts in a row have failed. Drives the wait, and is worth
+    /// saying out loud on the round the meeting finally lands.
+    failures: u32,
+    /// The earliest moment the worker may try again, epoch milliseconds.
+    retry_at_ms: u64,
+    /// Why the last attempt failed, in words safe to show — `gh`'s own first
+    /// line about a repository, already bounded by [`classify`]. This is the
+    /// string the dashboard puts on the meeting.
+    reason: String,
+}
+
 /// Stores the target, pushes transcripts, remembers what it pushed.
 ///
 /// Owns its own library connection (the sweeper precedent — §9.1's
@@ -196,13 +210,28 @@ pub struct GithubExporter {
     /// The sessions root, which is where the audit log lives beside.
     root: PathBuf,
     runner: Arc<dyn GhRunner>,
-    /// Meetings whose push failed for a reason of their own. Not retried by
-    /// the worker until the daemon restarts: retrying a hard failure once a
-    /// minute is how a laptop on hotel wifi makes a rate limiter's
-    /// acquaintance. Environment-wide failures — no gh, no login, no repo, a
-    /// repo refused as public — never land here, so fixing the environment
-    /// drains the backlog on the next poll. A manual push always tries afresh.
-    failed_auto: Mutex<HashSet<String>>,
+    /// Meetings whose push failed for a reason of their own, and when to try
+    /// each of them again.
+    ///
+    /// This used to be a set, and a meeting in it was skipped until the daemon
+    /// restarted — with the per-meeting push button as the only way back.
+    /// #112 removed that button, so the wait had to become something that
+    /// ends by itself: a bounded, escalating window ([`BACKOFF_MS`]). The two
+    /// failures it sits between are retrying a hard failure once a minute,
+    /// which is how a laptop on hotel wifi makes a rate limiter's
+    /// acquaintance, and never retrying at all, which is a meeting silently
+    /// missing from the repository.
+    ///
+    /// Environment-wide failures — no gh, no login, no repo, a repo refused as
+    /// public — never land here, so fixing the environment drains the backlog
+    /// on the next poll. A retry asked for by hand ignores the window.
+    failed_auto: Mutex<HashMap<String, Backoff>>,
+    /// The retry schedule, in milliseconds by consecutive failure count.
+    ///
+    /// [`BACKOFF_MS`] in production. A test names a shorter one through
+    /// [`GithubExporter::with_retry_schedule`], because a test that waited out
+    /// the real first step would take five minutes.
+    retry_after_ms: Vec<u64>,
     /// Meetings with a push in progress right now. The Db lock is released
     /// for the whole gh sequence, so without this the worker and the UI
     /// button could push one meeting concurrently: both probe 404, both PUT
@@ -259,7 +288,8 @@ impl GithubExporter {
             db: Mutex::new(db),
             root: sessions_root,
             runner,
-            failed_auto: Mutex::new(HashSet::new()),
+            failed_auto: Mutex::new(HashMap::new()),
+            retry_after_ms: BACKOFF_MS.to_vec(),
             in_flight: Mutex::new(HashSet::new()),
             writes: Mutex::new(()),
         }
@@ -277,10 +307,37 @@ impl GithubExporter {
         runner: Arc<dyn GhRunner>,
         retry_after_ms: Vec<u64>,
     ) -> Self {
-        // The schedule is honoured once the retry behaviour lands; until then
-        // this is `new` with the seam in place.
-        drop(retry_after_ms);
-        Self::new(db, sessions_root, runner)
+        Self {
+            retry_after_ms,
+            ..Self::new(db, sessions_root, runner)
+        }
+    }
+
+    /// Record a failed push, and say when the worker will try again (#112).
+    ///
+    /// One line per *attempt*, which is at most one per window — five minutes,
+    /// then fifteen, then hourly. Deliberately **not** one line per round: the
+    /// rounds in between skip the meeting in silence, which is the difference
+    /// between a log that says what happened and 1,440 lines a day saying that
+    /// a meeting is still broken.
+    fn enter_backoff(&self, meeting_id: &str, now: u64, reason: &str) {
+        let wait = {
+            let mut failed = self
+                .failed_auto
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = failed.entry(meeting_id.to_owned()).or_insert(Backoff {
+                failures: 0,
+                retry_at_ms: 0,
+                reason: String::new(),
+            });
+            entry.failures = entry.failures.saturating_add(1);
+            let wait = backoff_ms(&self.retry_after_ms, entry.failures);
+            entry.retry_at_ms = now.saturating_add(wait);
+            entry.reason = reason.to_owned();
+            wait
+        };
+        diag!("{}", entered_backoff_line(meeting_id, wait, reason));
     }
 
     fn lock_db(&self) -> MutexGuard<'_, Db> {
@@ -296,11 +353,14 @@ impl GithubExporter {
         read_receipts(&self.lock_db()).remove(meeting_id)
     }
 
-    /// Push every finished meeting auto mode owes and has not pushed yet.
+    /// Push the finished meetings auto mode owes, oldest first, up to
+    /// [`MAX_PER_ROUND`].
     ///
-    /// Returns how many landed. Failures are said out loud, remembered, and
-    /// not retried until restart; a meeting from before the auto stamp is
-    /// not owed at all — enabling auto must never export the archive.
+    /// Returns how many landed. A meeting from before the auto stamp is not
+    /// owed at all — enabling auto must never export the archive — **unless**
+    /// [`GithubSettings::sync_whole_library`] says the user asked for exactly
+    /// that. A meeting whose own push failed is inside a retry window and is
+    /// not owed this round; see [`GithubExporter::enter_backoff`].
     ///
     /// **`ready` alone does not make a meeting owed** — see [`export_ready`].
     /// `persist.rs` sets that state before enrichment runs, and this worker is
@@ -310,9 +370,15 @@ impl GithubExporter {
         if !settings.enabled || settings.mode != GithubMode::Auto {
             return 0;
         }
-        let Some(since) = settings.auto_since_ms else {
-            // Auto with no stamp would mean "everything, ever" — refuse.
-            return 0;
+        // The stamp is what keeps "switch auto on" meaning "meetings from now
+        // on" rather than "my entire archive, tonight". `sync_whole_library` is
+        // the user asking for the archive deliberately, so it is the one thing
+        // allowed to ignore the stamp. Auto with neither is still refused: it
+        // would mean "everything, ever" by accident.
+        let since = match settings.auto_since_ms {
+            Some(stamp) => stamp,
+            None if settings.sync_whole_library => 0,
+            None => return 0,
         };
 
         let candidates: Vec<String> = {
@@ -323,24 +389,32 @@ impl GithubExporter {
             // reason: it is one settings row answering for every meeting.
             let enriched = crate::enrich::read_receipts(&db);
             let now = u64::try_from(fotw_store::now_ms()).unwrap_or(0);
-            let skip = self
+            let backoff = self
                 .failed_auto
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Paged, newest first, stopping at the first meeting older than
-            // the stamp: one page of 200 would silently strand an owed
-            // meeting the moment a busy library outgrew it.
-            let mut owed = Vec::new();
+            // Paged, newest first. Without the whole-library switch the scan
+            // stops at the first meeting older than the stamp; with it there is
+            // no floor and every page is read, because the oldest meeting in
+            // the library is exactly the one a backfill has to reach first.
+            // One page of 200 would silently strand an owed meeting the moment
+            // a busy library outgrew it.
+            let mut owed: Vec<(i64, String)> = Vec::new();
             let mut offset = 0;
             'pages: loop {
                 let page = db.meetings().list(200, offset).unwrap_or_default();
                 let full = page.len() == 200;
                 for m in page {
-                    if u64::try_from(m.started_at_ms).unwrap_or(0) < since {
+                    if !settings.sync_whole_library
+                        && u64::try_from(m.started_at_ms).unwrap_or(0) < since
+                    {
                         break 'pages;
                     }
+                    // A meeting inside its retry window is not owed *this*
+                    // round — and skipping it here rather than at push time is
+                    // what stops it consuming one of the round's slots.
                     if m.state != "ready"
-                        || skip.contains(&m.id)
+                        || backoff.get(&m.id).is_some_and(|b| b.retry_at_ms > now)
                         || !export_ready(enriched.get(&m.id), m.updated_at, now)
                     {
                         continue;
@@ -351,7 +425,7 @@ impl GithubExporter {
                             version.has_files() && artifacts.get(&m.id) != Some(&version)
                         });
                     if !receipts.contains_key(&m.id) || changed {
-                        owed.push(m.id);
+                        owed.push((m.started_at_ms, m.id));
                     }
                 }
                 if !full {
@@ -359,7 +433,24 @@ impl GithubExporter {
                 }
                 offset += 200;
             }
-            owed
+            drop(backoff);
+            // Oldest first, and deterministic on a tie. A backfill that took
+            // the newest first would leave the oldest meetings for last and,
+            // on a library that keeps recording, possibly forever — the
+            // starvation `BACKFILL_PER_PASS` avoids the same way.
+            owed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            let total = owed.len();
+            owed.truncate(MAX_PER_ROUND);
+            if total > owed.len() {
+                // Counts only: a meeting id would be fine, and a title would
+                // not, so the line carries neither.
+                note!(
+                    "  github     : {} of {total} owed meeting(s) this round, \
+                     the rest on later rounds",
+                    owed.len()
+                );
+            }
+            owed.into_iter().map(|(_, id)| id).collect()
         };
 
         let mut pushed = 0;
@@ -372,19 +463,16 @@ impl GithubExporter {
                     note!("  pushed     : {} -> {}", id, receipt.repo);
                     pushed += 1;
                 }
-                // The environment's fault, not this meeting's. Nothing is
-                // parked, and the round ends: the same broken gh would answer
+                // The environment's fault, not this meeting's. Nothing enters
+                // backoff, and the round ends: the same broken gh would answer
                 // identically for every remaining meeting, once a minute.
                 Err(e) if stalls_every_push(&e) => {
                     diag!("  ! GitHub pushes are stalled: {e}");
                     break;
                 }
                 Err(e) => {
-                    diag!("  ! could not push meeting {id} to GitHub: {e}");
-                    self.failed_auto
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(id);
+                    let now = u64::try_from(fotw_store::now_ms()).unwrap_or(0);
+                    self.enter_backoff(&id, now, &e.to_string());
                 }
             }
         }
@@ -594,6 +682,18 @@ impl GithubExport for GithubExporter {
                 version,
             )
         };
+        // What the worker already knew about this meeting, before this attempt.
+        // Compared afterwards rather than simply cleared, because a push that
+        // landed but could not save its receipt enters backoff *inside*
+        // `push_claimed` and still returns `Ok`: clearing that here would let
+        // the next round commit the same meeting again, and the round after
+        // that, forever.
+        let failures_before = self
+            .failed_auto
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(meeting_id)
+            .map(|b| b.failures);
         // Everything below must release the claim on every exit.
         let result = self.push_claimed(
             meeting_id,
@@ -611,19 +711,81 @@ impl GithubExport for GithubExporter {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(meeting_id);
         if result.is_ok() {
-            self.failed_auto
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(meeting_id);
+            let recovered = {
+                let mut failed = self
+                    .failed_auto
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if failed.get(meeting_id).map(|b| b.failures) == failures_before {
+                    failed.remove(meeting_id)
+                } else {
+                    None
+                }
+            };
+            // Said on the round it recovers, and not on any of the rounds it
+            // was skipped: leaving backoff is the event worth reading.
+            if let Some(previous) = recovered {
+                note!("{}", left_backoff_line(meeting_id, previous.failures));
+            }
         }
         result
     }
 
     fn sync_status(&self, meeting_id: &str) -> GithubSyncStatus {
-        // Answered from the receipts, the companion versions and the retry
-        // table once #112's states land; until then it says nothing.
-        let _ = meeting_id;
-        GithubSyncStatus::off()
+        let settings = read_settings(&self.lock_db());
+        if !settings.enabled {
+            // Nothing is true of a meeting while the target is off, and
+            // "never synced" would read as a promise that it will be.
+            return GithubSyncStatus::off();
+        }
+        // A recorded failure is the state even when an older push left a
+        // receipt: what a reader needs to know is that the newest attempt
+        // failed, why, and that the worker will try again without being asked.
+        let failure = self
+            .failed_auto
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(meeting_id)
+            .map(|b| (b.reason.clone(), b.retry_at_ms));
+
+        let db = self.lock_db();
+        let receipt = read_receipts(&db).remove(meeting_id);
+        if let Some((reason, retry_at_ms)) = failure {
+            return GithubSyncStatus {
+                state: GithubSyncState::Failed,
+                repo: Some(settings.repo),
+                pushed_at_ms: receipt.map(|r| r.pushed_at_ms),
+                error: Some(reason),
+                retry_at_ms: Some(retry_at_ms),
+            };
+        }
+        let Some(receipt) = receipt else {
+            // Including for a meeting id that names nothing: a route that told
+            // the two apart would confirm a guessed id (ING-09).
+            return GithubSyncStatus {
+                state: GithubSyncState::Never,
+                ..GithubSyncStatus::off()
+            };
+        };
+        // The same question the round asks: does the library hold a companion
+        // version the repository does not? Read before `export_meeting`, which
+        // needs the connection mutably.
+        let artifacts = read_artifact_receipts(&db);
+        let changed = db.export_meeting(meeting_id).ok().is_some_and(|doc| {
+            let version = ArtifactVersion::from_doc(&doc, &settings);
+            version.has_files() && artifacts.get(meeting_id) != Some(&version)
+        });
+        GithubSyncStatus {
+            state: if changed {
+                GithubSyncState::Changed
+            } else {
+                GithubSyncState::Synced
+            },
+            repo: Some(receipt.repo),
+            pushed_at_ms: Some(receipt.pushed_at_ms),
+            error: None,
+            retry_at_ms: None,
+        }
     }
 
     fn sync_bundle(&self) -> Result<(), GithubError> {
@@ -870,12 +1032,15 @@ impl GithubExporter {
                         diag!("  ! pushed, but could not save the receipt: {e}");
                         // Without the receipt, the worker would see this
                         // meeting as owed again next minute and commit it
-                        // again, forever. Parking it caps the damage at one
-                        // push; a restart (or a manual push) tries afresh.
-                        self.failed_auto
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .insert(meeting_id.to_owned());
+                        // again, forever. A backoff window caps the damage at
+                        // one push per window instead, and `push` deliberately
+                        // does not clear a window this call opened.
+                        let now = u64::try_from(fotw_store::now_ms()).unwrap_or(0);
+                        self.enter_backoff(
+                            meeting_id,
+                            now,
+                            "pushed, but the receipt could not be saved",
+                        );
                     }
                 }
                 Err(e) => diag!("  ! pushed, but could not encode the receipt: {e}"),
@@ -923,9 +1088,11 @@ fn confirmed_private(repo_json: &str) -> bool {
 /// zero, because "no wait at all" is the one answer that would turn a retry
 /// into the once-a-minute hammering this exists to stop.
 fn backoff_ms(schedule: &[u64], failures: u32) -> u64 {
-    // Implemented in the commit that adds the retry behaviour.
-    let _ = (schedule, failures);
-    0
+    if schedule.is_empty() {
+        return 0;
+    }
+    let step = usize::try_from(failures.max(1)).unwrap_or(usize::MAX) - 1;
+    schedule[step.min(schedule.len() - 1)]
 }
 
 /// The log line for a meeting entering backoff (#112).
@@ -936,15 +1103,16 @@ fn backoff_ms(schedule: &[u64], failures: u32) -> u64 {
 /// `gh`'s own first line about a repository, which [`classify`] has already
 /// bounded.
 fn entered_backoff_line(meeting_id: &str, wait_ms: u64, reason: &str) -> String {
-    let _ = (meeting_id, wait_ms, reason);
-    String::new()
+    format!(
+        "  ! meeting {meeting_id} did not push, retrying in {} min — {reason}",
+        wait_ms / 60_000
+    )
 }
 
 /// The log line for a meeting leaving backoff, for [`entered_backoff_line`]'s
 /// reasons and with the same no-title guarantee.
 fn left_backoff_line(meeting_id: &str, failures: u32) -> String {
-    let _ = (meeting_id, failures);
-    String::new()
+    format!("  recovered  : meeting {meeting_id} pushed after {failures} failed attempt(s)")
 }
 
 /// A failure that would repeat identically for every meeting in an auto round:

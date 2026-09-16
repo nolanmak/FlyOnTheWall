@@ -953,7 +953,11 @@ fn the_whole_library_switch_owes_meetings_from_before_the_stamp() {
 fn a_backfill_takes_the_oldest_first_ten_a_round_and_finishes_on_later_rounds() {
     let (exporter, gh, ids, _dir) = backfill_rig(25, AUTO_WHOLE_LIBRARY);
 
-    assert_eq!(exporter.auto_push_pending(), 10, "the round stops at the cap");
+    assert_eq!(
+        exporter.auto_push_pending(),
+        10,
+        "the round stops at the cap"
+    );
     for (i, id) in ids.iter().enumerate() {
         assert_eq!(
             exporter.receipt_for(id).is_some(),
@@ -963,7 +967,11 @@ fn a_backfill_takes_the_oldest_first_ten_a_round_and_finishes_on_later_rounds() 
     }
 
     assert_eq!(exporter.auto_push_pending(), 10);
-    assert_eq!(exporter.auto_push_pending(), 5, "the remainder, and no more");
+    assert_eq!(
+        exporter.auto_push_pending(),
+        5,
+        "the remainder, and no more"
+    );
     assert_eq!(
         exporter.auto_push_pending(),
         0,
@@ -1007,12 +1015,7 @@ fn a_failed_push_becomes_eligible_again_after_backoff_with_no_restart() {
     let meeting = enriched_meeting(&mut db, "Weekly Standup", 1_755_734_400_000);
     store_settings(&mut db, AUTO_SINCE_EPOCH);
     // The PUT itself is refused — something about *this* meeting.
-    let gh = ScriptedGh::scripted(vec![
-        ok(""),
-        ok(PRIVATE_REPO),
-        http_err(404),
-        http_err(422),
-    ]);
+    let gh = ScriptedGh::scripted(vec![ok(""), ok(PRIVATE_REPO), http_err(404), http_err(422)]);
     let dir = tempfile::TempDir::new().unwrap();
     // A zero-length first window, so the next round is "after the backoff".
     let exporter = GithubExporter::with_retry_schedule(
@@ -1134,7 +1137,10 @@ fn a_meeting_reports_never_then_synced_then_changed_then_failed() {
 fn a_disabled_target_reports_no_state_for_any_meeting() {
     let disabled = r#"{"enabled":false,"repo":"octocat/notes","branch":"","path_prefix":"meetings/","mode":"manual"}"#;
     let r = rig(disabled, Vec::new());
-    assert_eq!(r.exporter.sync_status(&r.meeting).state, GithubSyncState::Off);
+    assert_eq!(
+        r.exporter.sync_status(&r.meeting).state,
+        GithubSyncState::Off
+    );
     assert!(r.gh.calls().is_empty(), "a state is read, never fetched");
 }
 
@@ -1213,7 +1219,11 @@ fn a_public_repository_is_refused_on_a_backfill_and_on_a_retry() {
         Err(GithubError::RepoIsPublic),
         "a retry is a push, and a push asks about the repository every time"
     );
-    assert_eq!(r.gh.calls().len(), before + 2, "auth and the lookup, no write");
+    assert_eq!(
+        r.gh.calls().len(),
+        before + 2,
+        "auth and the lookup, no write"
+    );
 }
 
 /// One `list` page is 200 meetings. A backlog deeper than that must still
