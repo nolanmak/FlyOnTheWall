@@ -88,8 +88,11 @@ Windows, but neither captures anything.
   OKF folder (`fotwd export-okf`); and pushes to a GitHub repository through the
   user's `gh` CLI, syncing each meeting as it finishes and again when its summary
   or saved brief changes. Every meeting shows its own sync state in the
-  dashboard, a failed push is retried on a bounded schedule, and a setting syncs
-  the whole existing library rather than only new meetings
+  dashboard, including whether an automatic pass covers it at all — one that
+  does not, such as any meeting while the mode is manual, offers **Sync now**
+  instead of waiting for a pass that is not coming. A failed push is retried on a
+  bounded schedule that survives a restart, and a setting syncs the whole
+  existing library rather than only new meetings
   ([docs/SHARING_DOCUMENTS.md](docs/SHARING_DOCUMENTS.md#github-sync)).
 - `fotw doctor` and `fotwd onboard`, which check capture permissions by
   actually capturing.

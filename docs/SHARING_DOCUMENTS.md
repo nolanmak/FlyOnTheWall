@@ -72,22 +72,40 @@ draft omits private tangents.
 
 ### What each meeting shows
 
-There is no per-meeting push button. The worker owns every push, so a button on a
-meeting already in the repository had nothing to do and invited a second commit
-of it. Each finished meeting shows exactly one sync state instead:
+There is no per-meeting push button. The automatic pass owns every push it
+covers, so a button on a meeting already in the repository had nothing to do and
+invited a second commit of it. Each finished meeting shows exactly one sync state
+instead:
 
 - **Not synced to GitHub yet** — export is on, and this meeting has not been sent.
 - **Synced to `owner/name`**, with the date and time the commit landed.
 - **Changed since** that sync — its summary or saved brief is newer than the copy
-  in the repository, and the next pass sends it again.
-- **Did not sync**, with the reason `gh` reported. This is the only state that
-  offers a control: **Retry** attempts the push immediately, without waiting for
-  the automatic retry below.
+  in the repository.
+- **Did not sync**, with the reason `gh` reported, and the date of the last
+  successful sync where there was one.
+
+Each line also says who will act next, which is a different question from what
+the state is. The automatic pass covers a meeting only in auto mode, and only if
+the meeting started after auto was switched on or **sync every meeting in the
+library** is on. A meeting it covers says that the next pass will sync it and
+offers nothing to click. A meeting it does not cover — every meeting while the
+mode is manual, and anything recorded before auto was switched on — says so and
+offers **Sync now**, which is the only way one of those reaches the repository. A
+failed meeting offers **Retry** either way, and says whether an automatic retry
+is coming as well.
 
 A meeting whose push failed is retried on its own, after five minutes, then
-fifteen, then once an hour for as long as it keeps failing. Neither a daemon
-restart nor a button press is needed. `fotwd.log` records a meeting entering and
-leaving that wait rather than repeating a line on every pass in between.
+fifteen, then once an hour for as long as it keeps failing — as long as the
+automatic pass covers it. Neither a daemon restart nor a button press is needed:
+the wait is stored in the library, so a restart resumes it instead of losing both
+the wait and the reason. `fotwd.log` records a meeting entering and leaving that
+wait rather than repeating a line on every pass in between.
+
+When `gh` itself is the problem — not installed, not logged in, the repository
+gone or refused as public — no meeting is set aside for it, because one broken
+login would otherwise park the whole library. The pass stops, writes the reason
+to `fotwd.log`, and every meeting it still owes shows that reason in place of a
+promise that the next pass will sync it. The first push that lands clears it.
 
 One pass sends at most ten meetings, oldest first, and takes the remainder on
 later passes; when it stops at that limit it writes how many of the owed meetings
@@ -157,8 +175,11 @@ revision conflicts, cascade deletion, and lossless library archive round-trips.
 `node --test crates/fotw-web/tests/ui/*.cjs` checks Eastern timestamps through DST,
 omission markers, reviewer exclusions, and Markdown escaping for source excerpts.
 It also drives every GitHub sync state through a DOM, asserting that no state
-offers a push button and that only a failed one offers **Retry**. Rust tests cover
-the whole-library switch defaulting to off, the ten-per-pass limit taking the
-oldest first, and a failed push becoming eligible again after its wait.
+offers a push button, that a control appears only where no automatic pass will
+act, and that switching meetings mid-load leaves one sync line rather than two.
+Rust tests cover the whole-library switch defaulting to off, the ten-per-pass
+limit taking the oldest first, a failed push becoming eligible again after its
+wait and still reporting its reason after a restart, and the state agreeing with
+the pass about which meetings it covers.
 Browser QA exercises edit/selection/save and reviews a multi-page printed document,
 including Unicode and exclusion of surrounding library content.
