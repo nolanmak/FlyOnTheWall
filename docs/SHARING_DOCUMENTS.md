@@ -65,11 +65,46 @@ document revisions are never included in companion files.
 
 In auto mode, saved document revisions and new summary versions are synchronized
 on the next worker pass (normally within a minute). Existing eligible meetings
-receive missing companion files. The original auto-start cutoff still applies:
-enabling auto does not publish the older archive. Manual mode only syncs when
-**Push to GitHub** is clicked. Files keep stable paths; failed pushes can be retried
-manually. GitHub export is an archive, so its original transcript file still
-contains the full recording even when a sharing draft omits private tangents.
+receive missing companion files. Files keep stable paths, so a later sync updates
+the same file instead of adding another. GitHub export is an archive, so its
+original transcript file still contains the full recording even when a sharing
+draft omits private tangents.
+
+### What each meeting shows
+
+There is no per-meeting push button. The worker owns every push, so a button on a
+meeting already in the repository had nothing to do and invited a second commit
+of it. Each finished meeting shows exactly one sync state instead:
+
+- **Not synced to GitHub yet** — export is on, and this meeting has not been sent.
+- **Synced to `owner/name`**, with the date and time the commit landed.
+- **Changed since** that sync — its summary or saved brief is newer than the copy
+  in the repository, and the next pass sends it again.
+- **Did not sync**, with the reason `gh` reported. This is the only state that
+  offers a control: **Retry** attempts the push immediately, without waiting for
+  the automatic retry below.
+
+A meeting whose push failed is retried on its own, after five minutes, then
+fifteen, then once an hour for as long as it keeps failing. Neither a daemon
+restart nor a button press is needed. `fotwd.log` records a meeting entering and
+leaving that wait rather than repeating a line on every pass in between.
+
+One pass sends at most ten meetings, oldest first, and takes the remainder on
+later passes; when it stops at that limit it writes how many of the owed meetings
+it sent. Nothing is skipped and nothing is sent twice.
+
+### Syncing meetings recorded before auto was switched on
+
+By default auto mode sends only meetings that started after auto was enabled, so
+turning it on never publishes an existing archive. **Sync every meeting in the
+library**, in the GitHub export settings, removes that cutoff: every finished
+meeting becomes owed, oldest first, ten a pass, until the library is in the
+repository.
+
+It is off by default, and a settings row saved before it existed reads as off, so
+no upgrade turns it on. Publishing cannot be undone — a commit stays in the
+repository's history even after the file is deleted — which is why it is a
+separate switch rather than part of auto mode.
 
 ### Private repositories only, unless acknowledged
 
@@ -121,5 +156,9 @@ invalid and excluded evidence, truncated output, automatic-generation skips,
 revision conflicts, cascade deletion, and lossless library archive round-trips.
 `node --test crates/fotw-web/tests/ui/*.cjs` checks Eastern timestamps through DST,
 omission markers, reviewer exclusions, and Markdown escaping for source excerpts.
+It also drives every GitHub sync state through a DOM, asserting that no state
+offers a push button and that only a failed one offers **Retry**. Rust tests cover
+the whole-library switch defaulting to off, the ten-per-pass limit taking the
+oldest first, and a failed push becoming eligible again after its wait.
 Browser QA exercises edit/selection/save and reviews a multi-page printed document,
 including Unicode and exclusion of surrounding library content.

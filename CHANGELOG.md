@@ -86,7 +86,11 @@ Windows, but neither captures anything.
 - Exports: one meeting as Markdown, text or JSON (`fotwd export`); a lossless
   library archive and its import (`fotwd export-all`, `fotwd import`); a local
   OKF folder (`fotwd export-okf`); and pushes to a GitHub repository through the
-  user's `gh` CLI, manually or when a meeting finishes.
+  user's `gh` CLI, syncing each meeting as it finishes and again when its summary
+  or saved brief changes. Every meeting shows its own sync state in the
+  dashboard, a failed push is retried on a bounded schedule, and a setting syncs
+  the whole existing library rather than only new meetings
+  ([docs/SHARING_DOCUMENTS.md](docs/SHARING_DOCUMENTS.md#github-sync)).
 - `fotw doctor` and `fotwd onboard`, which check capture permissions by
   actually capturing.
 - `fotwd.log`, a size-capped diagnostics log beside the library.
