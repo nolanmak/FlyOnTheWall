@@ -456,9 +456,7 @@ async fn a_failed_sync_state_carries_the_reason_and_when_the_worker_retries() {
 #[tokio::test]
 async fn the_sync_state_route_is_invisible_without_the_control() {
     let h = common::start().await;
-    let absent = h
-        .get("/api/meetings/m1/github-sync", &h.authorised())
-        .await;
+    let absent = h.get("/api/meetings/m1/github-sync", &h.authorised()).await;
     let unknown = h.get("/api/no-such-path", &h.authorised()).await;
     assert_eq!(absent.status, 404);
     assert_eq!(absent.bytes_without_date(), unknown.bytes_without_date());
@@ -518,7 +516,13 @@ async fn the_whole_library_switch_round_trips_and_defaults_off_when_omitted() {
     let r = rig().await;
     let save = |body: &'static str| {
         let h = &r.h;
-        async move { body_json(&h.post("/api/settings/github", &h.authorised(), Some(body)).await.body) }
+        async move {
+            body_json(
+                &h.post("/api/settings/github", &h.authorised(), Some(body))
+                    .await
+                    .body,
+            )
+        }
     };
 
     let on = save(
@@ -527,7 +531,11 @@ async fn the_whole_library_switch_round_trips_and_defaults_off_when_omitted() {
     .await;
     assert!(on["error"].is_null(), "{on}");
     assert_eq!(on["settings"]["sync_whole_library"], true);
-    let read = body_json(&r.h.get("/api/settings/github", &r.h.authorised()).await.body);
+    let read = body_json(
+        &r.h.get("/api/settings/github", &r.h.authorised())
+            .await
+            .body,
+    );
     assert_eq!(read["settings"]["sync_whole_library"], true);
 
     let without = save(

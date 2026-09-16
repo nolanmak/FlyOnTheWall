@@ -212,6 +212,9 @@ fn routes(state: AppState) -> Router {
             get(api::summarize_settings).post(api::summarize_set_settings),
         )
         .route("/api/meetings/{id}/github-push", post(api::github_push))
+        // A read, and the dashboard's replacement for the per-meeting push
+        // button (#112): it asks this once for each meeting somebody opens.
+        .route("/api/meetings/{id}/github-sync", get(api::github_sync))
         // Both of these are ING-09. The fallback is the same bare 404 the
         // guard returns, so "wrong token" and "no such path" are one response.
         // The method fallback replaces axum's `405 Method Not Allowed` with an

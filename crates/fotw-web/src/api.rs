@@ -462,6 +462,35 @@ pub async fn github_push(
     }
 }
 
+/// `GET /api/meetings/{id}/github-sync`
+///
+/// Where one meeting stands with the target (#112) — what the dashboard draws
+/// in place of the push button it used to draw from the settings alone.
+///
+/// The body is the state itself rather than a wrapper with an `error` beside
+/// it, because there is no failure here that is not already one of the states:
+/// a target that is off is `off`, and a failed push is `failed` with its
+/// reason. A meeting id that names nothing answers `never` rather than a 404,
+/// so this route cannot be used to confirm a guessed id (ING-09).
+pub async fn github_sync(
+    State(state): State<AppState>,
+    id: Result<Path<String>, PathErr>,
+) -> Response {
+    let Some(github) = state.github() else {
+        return not_found();
+    };
+    let Ok(Path(id)) = id else {
+        return not_found();
+    };
+    // Reading the receipts is a library read, and rusqlite blocks. Nothing
+    // here spawns a subprocess: the dashboard asks this once per meeting
+    // somebody opens.
+    let Ok(status) = tokio::task::spawn_blocking(move || github.sync_status(&id)).await else {
+        return server_error();
+    };
+    json(&state, &status)
+}
+
 /// `GET /api/meetings`
 pub async fn list_meetings(State(state): State<AppState>, uri: Uri) -> Response {
     let query = uri.query().unwrap_or_default();
