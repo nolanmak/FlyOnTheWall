@@ -419,3 +419,53 @@ test('the panel and its control have accessible names that say what they are', a
   assert.match(label, /GitHub/, 'the control names what it acts on: ' + label);
   assert.notEqual(label, 'Retry');
 });
+
+// WCAG 2.5.3 Label in Name: the accessible name has to *contain* the visible
+// label, or a speech-input user saying "click Sync now" cannot activate the one
+// control an out-of-scope meeting has.
+test('every control accessible name contains its visible label', async () => {
+  for (const status of [
+    { state: 'failed', repo: 'octocat/notes', error: 'HTTP 422' },
+    { state: 'never', scheduled: false },
+  ]) {
+    const w = harness();
+    w.status(status);
+    w.mount();
+    await flush();
+    const button = w.buttons()[0];
+    const label = button.attributes['aria-label'] || '';
+    assert.ok(
+      label.includes(button.textContent),
+      'state ' + status.state + ': "' + label + '" must contain "' + button.textContent + '"',
+    );
+    assert.notEqual(label, button.textContent, 'and say more than the label alone');
+    assert.match(label, /GitHub/);
+  }
+});
+
+// A broken environment on a meeting no pass covers: the person looking at it is
+// the only one who can push it, so the reason has to be on screen *and* the
+// control has to stay.
+test('a blocked meeting outside every pass names the reason and keeps Sync now', async () => {
+  const w = harness();
+  w.status({ state: 'never', scheduled: false, blocked: 'gh_not_authenticated', blocked_at_ms: PUSHED_AT });
+  w.mount();
+  await flush();
+  assert.match(w.lines()[0], /gh auth login/);
+  assert.deepEqual(w.buttons().map(b => b.textContent), ['Sync now']);
+});
+
+// The blocked line composes the code's explanation into its own sentence, so an
+// explanation that opens with its own "Nothing was pushed" read as two verdicts
+// stapled together.
+test('the blocked line reads as one sentence for every code', async () => {
+  for (const code of ['gh_missing', 'gh_not_authenticated', 'repo_not_found', 'repo_is_public', 'github_export_disabled']) {
+    const w = harness();
+    w.status({ state: 'never', scheduled: true, blocked: code });
+    w.mount();
+    await flush();
+    const line = w.lines()[0];
+    assert.doesNotMatch(line, /Nothing was pushed/, code + ': ' + line);
+    assert.doesNotMatch(line, /:\s*[A-Z][a-z]+ was/, code + ' reads as two verdicts: ' + line);
+  }
+});

@@ -1849,3 +1849,151 @@ fn a_branch_conflict_reprobes_and_retries_without_looping_forever() {
     assert!(r.exporter.push(&r.meeting).is_err());
     assert_eq!(r.gh.calls().len(), 8, "three bounded PUT attempts");
 }
+
+/// R1. Moving every failure record into `push`'s tail left the errors raised
+/// *before* the in-flight claim recording nothing at all: no backoff, no stall,
+/// and so no state for the pane to show. A meeting whose saved document cannot
+/// be read failed silently, once a minute, forever.
+#[test]
+fn a_failure_before_the_claim_is_recorded_like_any_other() {
+    let mut db = library();
+    let meeting = enriched_meeting(&mut db, "Unreadable brief", 1_755_734_400_000);
+    // A document row the exporter cannot parse: the failure `push` raises for it
+    // returns from inside the snapshot block, before the claim.
+    db.conn()
+        .execute(
+            "INSERT INTO meeting_documents (id, meeting_id, version, document_json, created_at) \
+             VALUES ('doc-bad', ?1, 1, 'not json at all', 1)",
+            [&meeting],
+        )
+        .unwrap();
+    store_settings(&mut db, AUTO_SINCE_EPOCH);
+    let gh = ScriptedGh::scripted(create_script());
+    let dir = tempfile::TempDir::new().unwrap();
+    let exporter = GithubExporter::new(
+        db,
+        dir.path().join("sessions"),
+        Arc::clone(&gh) as Arc<dyn GhRunner>,
+    );
+
+    let failed = exporter.push(&meeting).expect_err("the brief cannot be read");
+    assert!(
+        failed.to_string().contains("document could not be read"),
+        "the pre-claim error itself: {failed}"
+    );
+    assert_eq!(
+        gh.calls.lock().unwrap().len(),
+        0,
+        "nothing reached gh, so this is not an environment-wide refusal"
+    );
+
+    let state = exporter.sync_status(&meeting);
+    assert_eq!(
+        state.state,
+        GithubSyncState::Failed,
+        "a failure the daemon recorded nowhere is a meeting that says it was \
+         never synced while nothing is coming"
+    );
+    assert!(
+        state.error.unwrap_or_default().contains("document could not be read"),
+        "and it says why"
+    );
+    assert!(
+        state.retry_at_ms.is_some(),
+        "auto covers this meeting, so the worker will try it again"
+    );
+    assert_eq!(
+        state.blocked, None,
+        "one meeting's broken brief says nothing about the environment"
+    );
+}
+
+/// R2. The stall was cleared only by a push that landed, so one meeting failing
+/// on its own merits — gh reached, GitHub answered, 422 — left every other
+/// meeting still telling the user to fix a login that already works.
+#[test]
+fn an_environment_wide_refusal_is_forgotten_once_gh_answers_again() {
+    let mut db = library();
+    let owed = ready_meeting(&mut db, "Still owed", 1_755_734_500_000);
+    // A second owed meeting, and the one the assertions read: a meeting that
+    // failed on its own merits reports Failed, and the Failed state carries no
+    // environment-wide reason at all, so it cannot answer whether the stall was
+    // forgotten. This one stays in Never, which does.
+    let other = ready_meeting(&mut db, "Also owed", 1_755_734_600_000);
+    mark_enriched(&mut db, &[&owed, &other]);
+    store_settings(&mut db, AUTO_SINCE_EPOCH);
+    let gh = ScriptedGh::scripted(vec![Ok(GhOutput {
+        status: 1,
+        stdout: String::new(),
+        stderr: "You are not logged into any GitHub hosts.".to_owned(),
+    })]);
+    let dir = tempfile::TempDir::new().unwrap();
+    let exporter = GithubExporter::new(
+        db,
+        dir.path().join("sessions"),
+        Arc::clone(&gh) as Arc<dyn GhRunner>,
+    );
+    assert_eq!(exporter.auto_push_pending(), 0);
+    assert_eq!(
+        exporter.sync_status(&owed).blocked.as_deref(),
+        Some("gh_not_authenticated"),
+        "the round could not reach gh at all"
+    );
+
+    // Logged in again, and this meeting fails for its own reason.
+    gh.script
+        .lock()
+        .unwrap()
+        .extend([ok(""), ok(PRIVATE_REPO), http_err(404), http_err(422)]);
+    assert!(exporter.push(&owed).is_err());
+    assert!(
+        exporter
+            .sync_status(&owed)
+            .error
+            .unwrap_or_default()
+            .contains("422"),
+        "the meeting that failed reports its own reason"
+    );
+    assert_eq!(
+        exporter.sync_status(&other).blocked,
+        None,
+        "gh answering at all disproves an environment-wide refusal, so no other \
+         meeting should still be telling the user to fix a login that works"
+    );
+}
+
+/// R2b. The stall was attached only to meetings an automatic pass covers, so a
+/// manual library with no gh login — the case where the user is the only one who
+/// can push — showed nothing wrong anywhere.
+#[test]
+fn a_meeting_no_pass_covers_still_says_the_environment_is_broken() {
+    let r = rig(
+        MANUAL,
+        vec![Ok(GhOutput {
+            status: 1,
+            stdout: String::new(),
+            stderr: "You are not logged into any GitHub hosts.".to_owned(),
+        })],
+    );
+    assert!(r.exporter.push(&r.meeting).is_err());
+    let state = r.exporter.sync_status(&r.meeting);
+    assert!(
+        !state.scheduled,
+        "manual mode: no automatic pass covers this meeting"
+    );
+    assert_eq!(
+        state.blocked.as_deref(),
+        Some("gh_not_authenticated"),
+        "the one person who can push it is the one who needs to know gh is broken"
+    );
+}
+
+/// The repository a Sync now would send to is part of the state, so the line can
+/// name it instead of saying "GitHub".
+#[test]
+fn a_never_synced_meeting_names_the_repository_it_would_go_to() {
+    let r = rig(MANUAL, Vec::new());
+    let state = r.exporter.sync_status(&r.meeting);
+    assert_eq!(state.state, GithubSyncState::Never);
+    assert_eq!(state.repo.as_deref(), Some("octocat/notes"));
+}

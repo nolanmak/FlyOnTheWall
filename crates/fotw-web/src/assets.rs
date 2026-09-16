@@ -582,6 +582,27 @@ mod tests {
         );
     }
 
+    /// Saving with export on and automatic pushes off used to say "nothing will
+    /// be synced", which stopped being true when #112 gave an out-of-scope
+    /// meeting a Sync now control. The toast is the only place that tells a
+    /// manual-mode user what to do next.
+    #[test]
+    fn the_manual_mode_toast_points_at_the_control_that_does_the_work() {
+        let js = asset_text("app.js");
+        assert!(
+            !js.contains("Saved, but nothing will be synced"),
+            "manual mode is not a dead end any more: each meeting offers Sync now"
+        );
+        let saved = js
+            .find("body.settings.enabled")
+            .expect("the settings form must branch on an enabled target");
+        let arm = &js[saved..js[saved..].find("GitHub export is off").map_or(js.len(), |i| saved + i)];
+        assert!(
+            arm.contains("Sync now"),
+            "the manual-mode toast must name the control that pushes a meeting: {arm}"
+        );
+    }
+
     #[test]
     fn a_failed_request_carries_its_status_to_the_caller() {
         let js = asset_text("app.js");
