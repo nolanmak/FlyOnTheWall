@@ -428,17 +428,6 @@ impl GithubExporter {
         self.enter_backoff(meeting_id, now, &e.to_string());
     }
 
-    /// Record a failure raised before gh ran, and hand it back unchanged.
-    ///
-    /// Written as a wrapper around the error so each early exit stays one
-    /// expression: the alternative was a second copy of the classifier, which is
-    /// how the two halves drifted apart in the first place.
-    fn recorded(&self, meeting_id: &str, e: GithubError) -> GithubError {
-        let now = u64::try_from(fotw_store::now_ms()).unwrap_or(0);
-        self.record_failure(meeting_id, &e, now, false);
-        e
-    }
-
     /// Remember the refusal that answers for every meeting (see [`Stall`]), so
     /// that the meetings the round could not push can say why.
     fn note_stall(&self, code: &str, now: u64) {
@@ -761,27 +750,48 @@ impl GithubExport for GithubExporter {
     fn push(&self, meeting_id: &str) -> Result<GithubReceipt, GithubError> {
         // Snapshot under the lock, then let it go: the gh calls below take
         // seconds, and the auto worker shares this exporter with the UI.
-        let (settings, markdown, path, title, started_at_ms, existing, companions, version) = {
+        //
+        // A closure rather than a bare block because every failure raised in
+        // here has to be recorded *after* the guard is dropped: recording writes
+        // the retry table, which takes this same Db lock, and `Mutex` is not
+        // reentrant — recording inline deadlocked the push against itself.
+        enum Prepare {
+            /// Another push of this meeting is already running and about to land
+            /// it. The one exit that records nothing, because nothing is wrong
+            /// with the meeting. A variant rather than a match on the message,
+            /// so a reworded error cannot quietly start parking meetings.
+            AlreadyRunning,
+            Failed(GithubError),
+        }
+        type Prepared = (
+            GithubSettings,
+            String,
+            String,
+            String,
+            u64,
+            Option<GithubReceipt>,
+            Vec<(String, String)>,
+            ArtifactVersion,
+        );
+        let prepared: Result<Prepared, Prepare> = (|| {
             let mut db = self.lock_db();
             let settings = read_settings(&db);
             if !settings.enabled {
-                return Err(self.recorded(meeting_id, GithubError::Disabled));
+                return Err(Prepare::Failed(GithubError::Disabled));
             }
             // The store's own error text can quote the row it choked on, and
             // this string reaches the UI and the daemon log — the same
             // reasoning that keeps api.rs's server_error() a bare 500.
             let meeting = db.meetings().get(meeting_id).map_err(|e| match e {
-                StoreError::NotFound { .. } => GithubError::NoSuchMeeting,
-                _ => self.recorded(
-                    meeting_id,
-                    GithubError::Failed("the library refused to read the meeting".to_owned()),
-                ),
+                StoreError::NotFound { .. } => Prepare::Failed(GithubError::NoSuchMeeting),
+                _ => Prepare::Failed(GithubError::Failed(
+                    "the library refused to read the meeting".to_owned(),
+                )),
             })?;
             let doc = db.export_meeting(meeting_id).map_err(|_| {
-                self.recorded(
-                    meeting_id,
-                    GithubError::Failed("the library refused to export the meeting".to_owned()),
-                )
+                Prepare::Failed(GithubError::Failed(
+                    "the library refused to export the meeting".to_owned(),
+                ))
             })?;
             let existing = read_receipts(&db).remove(meeting_id);
             let path = existing.as_ref().map_or_else(
@@ -804,12 +814,9 @@ impl GithubExport for GithubExporter {
             if let Some(row) = doc.documents.iter().max_by_key(|d| d.version) {
                 let draft: fotw_web::documents::SharingDocument =
                     serde_json::from_str(&row.document_json).map_err(|_| {
-                        self.recorded(
-                            meeting_id,
-                            GithubError::Failed(
-                                "the saved meeting document could not be read".into(),
-                            ),
-                        )
+                        Prepare::Failed(GithubError::Failed(
+                            "the saved meeting document could not be read".into(),
+                        ))
                     })?;
                 // Only the latest saved brief, never private review notes or revision history.
                 companions.push((format!("{stem}.document.md"), draft.markdown));
@@ -823,9 +830,7 @@ impl GithubExport for GithubExporter {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !in_flight.insert(meeting_id.to_owned()) {
-                return Err(GithubError::Failed(
-                    "a push for this meeting is already running".to_owned(),
-                ));
+                return Err(Prepare::AlreadyRunning);
             }
             drop(in_flight);
             let started = u64::try_from(meeting.started_at_ms).unwrap_or(0);
@@ -841,7 +846,7 @@ impl GithubExport for GithubExporter {
                     markdown.push_str(&format!("- [{label}]({})\n", basename(companion_path)));
                 }
             }
-            (
+            Ok((
                 settings,
                 markdown,
                 path,
@@ -850,8 +855,23 @@ impl GithubExport for GithubExporter {
                 existing,
                 companions,
                 version,
-            )
-        };
+            ))
+        })();
+        // The guard is gone by here, so recording is free to take the Db lock.
+        let (settings, markdown, path, title, started_at_ms, existing, companions, version) =
+            match prepared {
+                Ok(ready) => ready,
+                Err(Prepare::AlreadyRunning) => {
+                    return Err(GithubError::Failed(
+                        "a push for this meeting is already running".to_owned(),
+                    ));
+                }
+                Err(Prepare::Failed(e)) => {
+                    let now = u64::try_from(fotw_store::now_ms()).unwrap_or(0);
+                    self.record_failure(meeting_id, &e, now, false);
+                    return Err(e);
+                }
+            };
         // What the worker already knew about this meeting, before this attempt.
         // Compared afterwards rather than simply cleared, because a push that
         // landed but could not save its receipt enters backoff *inside*

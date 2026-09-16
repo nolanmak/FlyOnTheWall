@@ -2002,3 +2002,44 @@ fn a_never_synced_meeting_names_the_repository_it_would_go_to() {
     assert_eq!(state.state, GithubSyncState::Never);
     assert_eq!(state.repo.as_deref(), Some("octocat/notes"));
 }
+
+/// A pre-claim failure must *return*, not hang.
+///
+/// Recording a failure writes the retry table, which takes the same Db lock the
+/// snapshot block holds, and `Mutex` is not reentrant: recording inline
+/// deadlocked the push against itself, and a deadlocked test hangs the suite
+/// rather than failing it — which is exactly how it reached CI. This answers
+/// within seconds or fails.
+#[test]
+fn a_failure_before_the_claim_does_not_deadlock_against_the_library() {
+    let mut db = library();
+    let meeting = enriched_meeting(&mut db, "Unreadable brief", 1_755_734_400_000);
+    db.conn()
+        .execute(
+            "INSERT INTO meeting_documents (id, meeting_id, version, document_json, created_at) \
+             VALUES ('doc-bad', ?1, 1, 'not json at all', 1)",
+            [&meeting],
+        )
+        .unwrap();
+    store_settings(&mut db, AUTO_SINCE_EPOCH);
+    let dir = tempfile::TempDir::new().unwrap();
+    let exporter = GithubExporter::new(
+        db,
+        dir.path().join("sessions"),
+        ScriptedGh::scripted(create_script()) as Arc<dyn GhRunner>,
+    );
+
+    let (done, waiting) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let failed = exporter.push(&meeting).is_err();
+        // Read on the same thread, because recording the failure is what takes
+        // the lock a second time.
+        let reported = exporter.sync_status(&meeting).state;
+        let _ = done.send((failed, reported));
+    });
+    let (failed, reported) = waiting
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("push deadlocked instead of recording the failure");
+    assert!(failed, "the brief cannot be read");
+    assert_eq!(reported, GithubSyncState::Failed);
+}
