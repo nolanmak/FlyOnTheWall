@@ -171,6 +171,13 @@ pub struct GithubSyncStatus {
     /// pushed and one that will never be touched — and the dashboard turned that
     /// into a promise the daemon does not keep. The one control the pane offers
     /// is drawn for exactly the meetings this is false for.
+    ///
+    /// Reads as **true** when the key is absent, so a status written before this
+    /// field existed still says "the worker has this" — the answer that offers
+    /// no control, rather than one that invites a click duplicating a push the
+    /// worker is already about to make. [`GithubSyncStatus::off`] is the
+    /// deliberate exception: a switched-off target pushes nothing at all.
+    #[serde(default = "scheduled_when_absent")]
     pub scheduled: bool,
     /// The last refusal that answers for *every* meeting, as the stable code
     /// from [`GithubError`] — `gh_missing`, `gh_not_authenticated`,
@@ -188,6 +195,12 @@ pub struct GithubSyncStatus {
     /// reason beside it is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked_at_ms: Option<u64>,
+}
+
+/// See [`GithubSyncStatus::scheduled`]: a status with no such key was written by
+/// a build whose worker owned every push, so it reads as scheduled.
+fn scheduled_when_absent() -> bool {
+    true
 }
 
 impl GithubSyncStatus {

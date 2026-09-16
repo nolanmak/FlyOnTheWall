@@ -90,7 +90,18 @@ async function api(path, options) {
     authorization: "Bearer " + token(),
   });
   const res = await fetch(path, Object.assign({}, opts, { headers }));
-  if (!res.ok) throw new Error("request failed");
+  if (!res.ok) {
+    // The message stays what every caller already switches on. The status rides
+    // beside it because "this build has no such control" and "the request
+    // failed" are different facts and only the code tells them apart: a 404 is
+    // the convention the recorder and the settings form use for an absent
+    // feature, while a 500, an expired token or a daemon mid-restart is a
+    // problem worth reporting. github.js draws a different thing for each
+    // (#112); the rest ignore the extra property.
+    const failed = new Error("request failed");
+    failed.status = res.status;
+    throw failed;
+  }
   return res.json();
 }
 

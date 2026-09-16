@@ -376,6 +376,7 @@ section {
 #gh-save,
 #sum-save,
 .gh-retry,
+.gh-sync-now,
 .copy {
   font: inherit;
   font-size: 12px;
@@ -392,7 +393,8 @@ section {
    for a state that cannot happen is a claim the code does not make. */
 #gh-save:disabled,
 #sum-save:disabled,
-.gh-retry:disabled {
+.gh-retry:disabled,
+.gh-sync-now:disabled {
   color: var(--muted);
   cursor: not-allowed;
 }
@@ -438,10 +440,23 @@ section {
   margin: 12px 0;
 }
 
+/* The panel is created with the meeting and stays empty until the daemon
+   answers, so that a load which arrives after the reader moved on has a node of
+   its own to be ignored in. An explicit `display` outranks the UA sheet's
+   `[hidden] { display: none }`, exactly as it does for `.actions` above -- so
+   without this the margin of an empty panel would sit under every meeting. */
+.gh-sync-panel[hidden] {
+  display: none;
+}
+
 .gh-sync {
   color: var(--muted);
   font-size: 12px;
   margin: 0;
+  /* The failed state's message is `gh`'s own stderr, and it can carry a long
+     unbroken token -- a URL, a base64 fragment, a header name. One of those
+     widens the whole detail pane unless it is allowed to fold. */
+  overflow-wrap: anywhere;
 }
 
 /* A still-revising utterance in the live view. Muted rather than faded by

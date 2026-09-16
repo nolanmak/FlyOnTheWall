@@ -72,6 +72,16 @@ pub const SETTINGS_KEY: &str = "github_export";
 /// and set the precedent.
 pub const RECEIPTS_KEY: &str = "github_export_receipts";
 
+/// The `settings` key the retry table lives under: meeting id → [`Backoff`].
+///
+/// This used to be memory only, and a daemon restart was enough to lose it. The
+/// meeting then reported `never` — "not synced to GitHub yet" — with the reason
+/// it had failed for nowhere on screen, which is the silence #112 exists to end;
+/// and the window it was waiting out went with it, so a restart loop could
+/// attempt the same doomed push once a minute. Written beside the push receipts,
+/// on the same terms: one settings row, rewritten whole, best-effort.
+pub const RETRIES_KEY: &str = "github_export_retries";
+
 /// How long the auto pusher waits for enrichment before pushing anyway (#76).
 ///
 /// The never-held-back-forever valve. Enrichment can die anywhere before it
@@ -187,7 +197,12 @@ fn resolve_gh() -> Option<PathBuf> {
 }
 
 /// What the worker remembers about a meeting whose own push failed (#112).
-#[derive(Debug, Clone)]
+///
+/// Serialized into [`RETRIES_KEY`], so every field is defaulted and a row from
+/// an older shape is read as far as it parses rather than dropped: a partial
+/// answer about a failure beats no answer at all.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 struct Backoff {
     /// How many attempts in a row have failed. Drives the wait, and is worth
     /// saying out loud on the round the meeting finally lands.
@@ -198,6 +213,31 @@ struct Backoff {
     /// line about a repository, already bounded by [`classify`]. This is the
     /// string the dashboard puts on the meeting.
     reason: String,
+}
+
+/// The last refusal that answered for *every* meeting rather than for one of
+/// them (#112): no gh, no login, the repository gone, or a repository the
+/// preflight refuses as public.
+///
+/// None of these parks a meeting, by design — fixing the environment has to
+/// drain the backlog on the next poll. But nothing recorded them anywhere the
+/// per-meeting state could see either, so every owed meeting went on saying "not
+/// synced to GitHub yet" for as long as it lasted, and `fotwd.log` was the only
+/// place that knew why.
+///
+/// Memory only, unlike the retry table beside it, for three reasons that point
+/// the same way: it is a fact about this machine now rather than about a meeting,
+/// the pusher re-establishes it within one poll of starting, and a stale one
+/// would be worse than none — it would name a login or a repository that may well
+/// have been fixed while the daemon was down.
+#[derive(Debug, Clone)]
+struct Stall {
+    /// The stable [`GithubError`] code — `gh_missing`, `gh_not_authenticated`,
+    /// `repo_not_found`, `repo_is_public` — which is exactly the vocabulary the
+    /// dashboard's error table is already keyed by.
+    code: String,
+    /// When it was last seen, epoch milliseconds: how fresh the reason is.
+    at_ms: u64,
 }
 
 /// Stores the target, pushes transcripts, remembers what it pushed.
@@ -238,6 +278,9 @@ pub struct GithubExporter {
     /// without a sha, and the loser gets a spurious 422 for a transcript
     /// that in fact landed.
     in_flight: Mutex<HashSet<String>>,
+    /// The last environment-wide refusal, or `None` while pushes are working.
+    /// See [`Stall`]: it is what lets an owed meeting say why it is not moving.
+    stall: Mutex<Option<Stall>>,
     // GitHub updates a shared branch even when two files differ.
     writes: Mutex<()>,
 }
@@ -284,13 +327,18 @@ impl GithubExporter {
     /// An exporter over its own library connection.
     #[must_use]
     pub fn new(db: Db, sessions_root: PathBuf, runner: Arc<dyn GhRunner>) -> Self {
+        // Read back rather than started empty: see [`RETRIES_KEY`]. A restart
+        // that forgot a failure reported the meeting as never synced, with no
+        // reason anywhere, and handed it a fresh window to fail in.
+        let failed_auto = read_retries(&db);
         Self {
             db: Mutex::new(db),
             root: sessions_root,
             runner,
-            failed_auto: Mutex::new(HashMap::new()),
+            failed_auto: Mutex::new(failed_auto),
             retry_after_ms: BACKOFF_MS.to_vec(),
             in_flight: Mutex::new(HashSet::new()),
+            stall: Mutex::new(None),
             writes: Mutex::new(()),
         }
     }
@@ -321,23 +369,59 @@ impl GithubExporter {
     /// between a log that says what happened and 1,440 lines a day saying that
     /// a meeting is still broken.
     fn enter_backoff(&self, meeting_id: &str, now: u64, reason: &str) {
-        let wait = {
+        let (wait, table) = {
             let mut failed = self
                 .failed_auto
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let entry = failed.entry(meeting_id.to_owned()).or_insert(Backoff {
-                failures: 0,
-                retry_at_ms: 0,
-                reason: String::new(),
-            });
+            let entry = failed.entry(meeting_id.to_owned()).or_default();
             entry.failures = entry.failures.saturating_add(1);
             let wait = backoff_ms(&self.retry_after_ms, entry.failures);
             entry.retry_at_ms = now.saturating_add(wait);
             entry.reason = reason.to_owned();
-            wait
+            (wait, failed.clone())
         };
+        // Outside the lock above, and never while the Db lock is held: this
+        // takes it.
+        self.persist_retries(&table);
         diag!("{}", entered_backoff_line(meeting_id, wait, reason));
+    }
+
+    /// Write the retry table back to the library.
+    ///
+    /// Loud rather than fatal, exactly like the push receipt beside it: the
+    /// failure it records has already happened, and losing the note of it costs
+    /// one early attempt after a restart, never a duplicate commit.
+    fn persist_retries(&self, table: &HashMap<String, Backoff>) {
+        match serde_json::to_string(table) {
+            Ok(json) => {
+                if let Err(e) = self.lock_db().put_setting(RETRIES_KEY, &json) {
+                    diag!("  ! could not save the retry table: {e}");
+                }
+            }
+            Err(e) => diag!("  ! could not encode the retry table: {e}"),
+        }
+    }
+
+    /// Remember the refusal that answers for every meeting (see [`Stall`]), so
+    /// that the meetings the round could not push can say why.
+    fn note_stall(&self, code: &str, now: u64) {
+        *self
+            .stall
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Stall {
+            code: code.to_owned(),
+            at_ms: now,
+        });
+    }
+
+    /// Forget it. A push that landed has answered the environment's question
+    /// more recently, and more convincingly, than the refusal did.
+    fn clear_stall(&self) {
+        *self
+            .stall
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     fn lock_db(&self) -> MutexGuard<'_, Db> {
@@ -367,18 +451,11 @@ impl GithubExporter {
     /// an independent thread polling for it every sixty seconds.
     pub fn auto_push_pending(&self) -> usize {
         let settings = read_settings(&self.lock_db());
-        if !settings.enabled || settings.mode != GithubMode::Auto {
+        // The moment this round owes meetings from, or nothing to do at all.
+        // Asked through the same function the per-meeting state asks, so the two
+        // cannot disagree about which meetings the worker will take.
+        let Some(since) = worker_scope(&settings) else {
             return 0;
-        }
-        // The stamp is what keeps "switch auto on" meaning "meetings from now
-        // on" rather than "my entire archive, tonight". `sync_whole_library` is
-        // the user asking for the archive deliberately, so it is the one thing
-        // allowed to ignore the stamp. Auto with neither is still refused: it
-        // would mean "everything, ever" by accident.
-        let since = match settings.auto_since_ms {
-            Some(stamp) => stamp,
-            None if settings.sync_whole_library => 0,
-            None => return 0,
         };
 
         let candidates: Vec<String> = {
@@ -405,9 +482,9 @@ impl GithubExporter {
                 let page = db.meetings().list(200, offset).unwrap_or_default();
                 let full = page.len() == 200;
                 for m in page {
-                    if !settings.sync_whole_library
-                        && u64::try_from(m.started_at_ms).unwrap_or(0) < since
-                    {
+                    // The whole-library switch answers `0` above, and no meeting
+                    // started before that, so one rule covers both cases.
+                    if u64::try_from(m.started_at_ms).unwrap_or(0) < since {
                         break 'pages;
                     }
                     // A meeting inside its retry window is not owed *this*
@@ -465,15 +542,20 @@ impl GithubExporter {
                 }
                 // The environment's fault, not this meeting's. Nothing enters
                 // backoff, and the round ends: the same broken gh would answer
-                // identically for every remaining meeting, once a minute.
+                // identically for every remaining meeting, once a minute. The
+                // reason itself is recorded by `push`, so the meetings this
+                // round could not reach can say what is wrong.
                 Err(e) if stalls_every_push(&e) => {
                     diag!("  ! GitHub pushes are stalled: {e}");
                     break;
                 }
-                Err(e) => {
-                    let now = u64::try_from(fotw_store::now_ms()).unwrap_or(0);
-                    self.enter_backoff(&id, now, &e.to_string());
-                }
+                // Recorded by `push` too, which is the only caller that knows
+                // whether a failure belongs to this meeting at all. Parking
+                // everything here is what made a push refused because another
+                // push of the same meeting was already running — nothing wrong
+                // with the meeting, and the other push about to land it — report
+                // itself as this meeting's failure for five minutes.
+                Err(_) => {}
             }
         }
         pushed
@@ -529,6 +611,42 @@ fn read_receipts(db: &Db) -> HashMap<String, GithubReceipt> {
         .flatten()
         .and_then(|v| serde_json::from_str(&v).ok())
         .unwrap_or_default()
+}
+
+/// The retry table as the last daemon left it; empty for a library that has
+/// never failed a push. See [`RETRIES_KEY`].
+fn read_retries(db: &Db) -> HashMap<String, Backoff> {
+    db.get_setting(RETRIES_KEY)
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or_default()
+}
+
+/// The moment an automatic pass owes meetings from, or `None` when no pass owes
+/// anything at all (#112).
+///
+/// The one place the three questions are asked — export on, mode auto, and the
+/// stamp unless [`GithubSettings::sync_whole_library`] waives it — so that the
+/// round which pushes a meeting and the state that meeting reports cannot
+/// disagree about which meetings the worker will take. They did disagree: the
+/// state consulted none of the three, so a meeting nothing would ever push said
+/// exactly what a meeting about to be pushed said, and the dashboard turned that
+/// into a promise the daemon does not keep.
+///
+/// The stamp is what keeps "switch auto on" meaning "meetings from now on"
+/// rather than "my entire archive, tonight". `sync_whole_library` is the user
+/// asking for the archive deliberately, so it is the one thing allowed to ignore
+/// the stamp. Auto with neither is still refused: it would mean "everything,
+/// ever" by accident.
+fn worker_scope(settings: &GithubSettings) -> Option<u64> {
+    if !settings.enabled || settings.mode != GithubMode::Auto {
+        return None;
+    }
+    if settings.sync_whole_library {
+        return Some(0);
+    }
+    settings.auto_since_ms
 }
 
 impl GithubExport for GithubExporter {
@@ -596,6 +714,11 @@ impl GithubExport for GithubExporter {
             .map_err(|e| GithubError::Failed(format!("could not encode the settings: {e}")))?;
         db.put_setting(SETTINGS_KEY, &json)
             .map_err(|e| GithubError::Failed(format!("could not store the settings: {e}")))?;
+        drop(db);
+        // A different repository, branch or mode makes the last environment-wide
+        // refusal a fact about a target that is no longer configured, so the next
+        // round asks again instead of reporting the old answer.
+        self.clear_stall();
         Ok(next)
     }
 
@@ -710,23 +833,44 @@ impl GithubExport for GithubExporter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(meeting_id);
-        if result.is_ok() {
-            let recovered = {
-                let mut failed = self
-                    .failed_auto
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if failed.get(meeting_id).map(|b| b.failures) == failures_before {
-                    failed.remove(meeting_id)
-                } else {
-                    None
+        // Every outcome is recorded here rather than in the auto round, because
+        // this is the only place that knows which kind of failure it was — and
+        // because a push by hand that failed used to record nothing at all, so
+        // the pane went on saying "not synced to GitHub yet" and a second,
+        // different failure still showed the first one's reason.
+        let now = u64::try_from(fotw_store::now_ms()).unwrap_or(0);
+        match &result {
+            Ok(_) => {
+                let (recovered, table) = {
+                    let mut failed = self
+                        .failed_auto
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let recovered = if failed.get(meeting_id).map(|b| b.failures) == failures_before
+                    {
+                        failed.remove(meeting_id)
+                    } else {
+                        None
+                    };
+                    (recovered, failed.clone())
+                };
+                if recovered.is_some() {
+                    self.persist_retries(&table);
                 }
-            };
-            // Said on the round it recovers, and not on any of the rounds it
-            // was skipped: leaving backoff is the event worth reading.
-            if let Some(previous) = recovered {
-                note!("{}", left_backoff_line(meeting_id, previous.failures));
+                // A push that landed has answered the environment's question
+                // more recently than any refusal did.
+                self.clear_stall();
+                // Said on the round it recovers, and not on any of the rounds it
+                // was skipped: leaving backoff is the event worth reading.
+                if let Some(previous) = recovered {
+                    note!("{}", left_backoff_line(meeting_id, previous.failures));
+                }
             }
+            // Nothing that answers for every meeting is one meeting's fault, so
+            // no meeting is parked for it: it is remembered once, for all of
+            // them.
+            Err(e) if stalls_every_push(e) => self.note_stall(&e.to_string(), now),
+            Err(e) => self.enter_backoff(meeting_id, now, &e.to_string()),
         }
         result
     }
@@ -747,24 +891,59 @@ impl GithubExport for GithubExporter {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(meeting_id)
             .map(|b| (b.reason.clone(), b.retry_at_ms));
+        let stall = self
+            .stall
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
 
-        let db = self.lock_db();
+        let mut db = self.lock_db();
+        // Whether any automatic pass will ever reach this meeting — the same
+        // question `auto_push_pending` asks before it owes anything, asked
+        // through the same function so the two cannot disagree.
+        //
+        // A meeting id that names nothing answers `u64::MAX`, which is in scope
+        // wherever auto owes anything at all: it stays indistinguishable from a
+        // meeting recorded a moment ago, rather than answering something only a
+        // real row could (ING-09).
+        let started = db
+            .meetings()
+            .get(meeting_id)
+            .map_or(u64::MAX, |m| u64::try_from(m.started_at_ms).unwrap_or(0));
+        let scheduled = worker_scope(&settings).is_some_and(|since| started >= since);
         let receipt = read_receipts(&db).remove(meeting_id);
         if let Some((reason, retry_at_ms)) = failure {
             return GithubSyncStatus {
                 state: GithubSyncState::Failed,
                 repo: Some(settings.repo),
+                // The older push, where there was one: dropping it made a
+                // meeting that synced before and failed on a later change read
+                // as one that had never synced at all.
                 pushed_at_ms: receipt.map(|r| r.pushed_at_ms),
                 error: Some(reason),
-                retry_at_ms: Some(retry_at_ms),
+                // Only where the worker will actually act. `auto_push_pending`
+                // returns before it looks at a single meeting in manual mode and
+                // never reaches one from outside what auto owes, so a retry time
+                // for either promises a pass that does not happen.
+                retry_at_ms: scheduled.then_some(retry_at_ms),
+                scheduled,
                 ..GithubSyncStatus::off()
             };
         }
         let Some(receipt) = receipt else {
             // Including for a meeting id that names nothing: a route that told
             // the two apart would confirm a guessed id (ING-09).
+            //
+            // An environment-wide refusal belongs on exactly this meeting: one
+            // the worker owes and cannot push. It is not this meeting's failure,
+            // so it carries no retry time — nothing is scheduled to retry it,
+            // and fixing the environment drains the backlog on the next poll.
+            let stall = stall.filter(|_| scheduled);
             return GithubSyncStatus {
                 state: GithubSyncState::Never,
+                scheduled,
+                blocked: stall.as_ref().map(|s| s.code.clone()),
+                blocked_at_ms: stall.map(|s| s.at_ms),
                 ..GithubSyncStatus::off()
             };
         };
@@ -776,6 +955,9 @@ impl GithubExport for GithubExporter {
             let version = ArtifactVersion::from_doc(&doc, &settings);
             version.has_files() && artifacts.get(meeting_id) != Some(&version)
         });
+        // A meeting already in the repository is waiting on nothing, so it is
+        // told nothing about a stall.
+        let stall = stall.filter(|_| scheduled && changed);
         GithubSyncStatus {
             state: if changed {
                 GithubSyncState::Changed
@@ -786,7 +968,9 @@ impl GithubExport for GithubExporter {
             pushed_at_ms: Some(receipt.pushed_at_ms),
             error: None,
             retry_at_ms: None,
-            ..GithubSyncStatus::off()
+            scheduled,
+            blocked: stall.as_ref().map(|s| s.code.clone()),
+            blocked_at_ms: stall.map(|s| s.at_ms),
         }
     }
 
@@ -1014,6 +1198,7 @@ impl GithubExporter {
         // what routes a re-push to the same file; the audit line is CON-08's
         // record that this provider was contacted. Neither failing changes
         // what already happened, so both are loud rather than fatal.
+        let mut receipt_lost = false;
         {
             let mut db = self.lock_db();
             let mut artifacts = read_artifact_receipts(&db);
@@ -1032,21 +1217,26 @@ impl GithubExporter {
                 Ok(json) => {
                     if let Err(e) = db.put_setting(RECEIPTS_KEY, &json) {
                         diag!("  ! pushed, but could not save the receipt: {e}");
-                        // Without the receipt, the worker would see this
-                        // meeting as owed again next minute and commit it
-                        // again, forever. A backoff window caps the damage at
-                        // one push per window instead, and `push` deliberately
-                        // does not clear a window this call opened.
-                        let now = u64::try_from(fotw_store::now_ms()).unwrap_or(0);
-                        self.enter_backoff(
-                            meeting_id,
-                            now,
-                            "pushed, but the receipt could not be saved",
-                        );
+                        receipt_lost = true;
                     }
                 }
                 Err(e) => diag!("  ! pushed, but could not encode the receipt: {e}"),
             }
+        }
+        // Acted on after that block and never inside it: the retry table is
+        // written to this same library, and `enter_backoff` takes the lock the
+        // block holds.
+        if receipt_lost {
+            // Without the receipt, the worker would see this meeting as owed
+            // again next minute and commit it again, forever. A backoff window
+            // caps the damage at one push per window instead, and `push`
+            // deliberately does not clear a window this call opened.
+            let now = u64::try_from(fotw_store::now_ms()).unwrap_or(0);
+            self.enter_backoff(
+                meeting_id,
+                now,
+                "pushed, but the receipt could not be saved",
+            );
         }
         if let Err(e) = AuditLog::at(&self.root).record(AuditKind::TranscriptPushed {
             meeting: meeting_id.to_owned(),

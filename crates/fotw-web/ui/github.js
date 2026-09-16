@@ -4,10 +4,17 @@
 // push, so a button on a synced meeting had nothing to do and invited a second
 // commit of a meeting already in the repository. What a meeting shows instead is
 // the state the daemon reports: never synced, synced and when, changed since
-// that sync, or failed and why. Only the failed state offers a control, because
-// only a failed meeting has something a person can usefully ask for — and even
-// then the worker is already going to retry on its own, so the control is a
-// shortcut rather than the way back.
+// that sync, or failed and why.
+//
+// A control appears exactly where the worker will *not* do the job. The daemon
+// bounds what its automatic pass owes by the mode, the auto stamp and the
+// whole-library switch, and says so in `scheduled`: a meeting in manual mode, or
+// one recorded before automatic pushes were switched on, is reached by no pass
+// at all and would otherwise sit there forever with nothing on screen able to
+// change it. So that meeting gets **Sync now**, a failed meeting keeps
+// **Retry**, and a meeting the worker is going to take gets no control and says
+// that it is coming — which is the distinction the pane could not express while
+// every state read the same.
 //
 // Its own file rather than another section of app.js for the reason documents.js
 // is its own file: app.js reaches for `document.getElementById` at load and
@@ -45,32 +52,92 @@ function syncWhen(ms) {
   return new Date(ms).toLocaleString();
 }
 
+// Will an automatic pass push this meeting on its own?
+//
+// An absent field means yes: a daemon that answers without it is one whose
+// worker owed every meeting it could see. That is also the safe way round — the
+// answer that draws no control — because a control offered beside a worker that
+// is already about to push is the duplicate commit this issue exists to stop.
+function syncScheduled(status) {
+  return status.scheduled !== false;
+}
+
+// Is the repository's copy of this meeting missing or out of date?
+function syncOwed(status) {
+  return status.state === "never" || status.state === "changed";
+}
+
 // One sentence per state, and never more than one on screen at a time: the
 // whole complaint in #112 was that "already in the repository" and "never
 // pushed" were indistinguishable.
 function syncLine(status) {
-  if (status.state === "never") {
-    return "Not synced to GitHub yet.";
-  }
   if (status.state === "synced") {
     return "Synced to " + status.repo + " on " + syncWhen(status.pushed_at_ms) + ".";
   }
-  if (status.state === "changed") {
+  if (syncOwed(status)) {
+    const line =
+      status.state === "never"
+        ? "Not synced to GitHub yet."
+        : "Changed since it was synced to " +
+          status.repo +
+          " on " +
+          syncWhen(status.pushed_at_ms) +
+          ".";
+    // A refusal that answers for every meeting — no gh, no login, the
+    // repository gone or public. Nothing is parked for it and nothing retries
+    // it on a schedule, so this says what is wrong rather than promising a pass
+    // that will fail the same way.
+    if (status.blocked) {
+      let stalled = line + " No meeting can be pushed right now: " + ghExplain(status.blocked);
+      if (status.blocked_at_ms) stalled += " Last tried " + syncWhen(status.blocked_at_ms) + ".";
+      return stalled;
+    }
+    if (syncScheduled(status)) {
+      return line + (status.state === "never" ? " The next pass will sync it." : " The next pass will sync it again.");
+    }
     return (
-      "Changed since it was synced to " +
-      status.repo +
-      " on " +
-      syncWhen(status.pushed_at_ms) +
-      ". The next pass will sync it again."
+      line +
+      " No automatic pass covers this meeting, so " +
+      (status.state === "never"
+        ? "use Sync now to send it."
+        : "use Sync now to send the new version.")
     );
   }
   // Failed. The reason is `gh`'s, so it is shown rather than summarised.
   let line = "This meeting did not sync: " + (status.error || "no reason was recorded") + ".";
-  // Only when the daemon actually said it will try again. Promising an
+  // An earlier push is still in the repository. Dropping this read as a meeting
+  // that had never synced at all, which is a different and worse fact.
+  if (status.pushed_at_ms) line += " It was last synced on " + syncWhen(status.pushed_at_ms) + ".";
+  // Only when the daemon actually said it will try again — it sends a retry
+  // time for the meetings its pass covers and for no others. Promising an
   // automatic retry that is not scheduled would be the same kind of lie as the
   // button that had nothing to do.
   if (status.retry_at_ms) line += " The daemon will try again on its own.";
+  else line += " No automatic pass covers this meeting, so it will not be retried on its own.";
   return line;
+}
+
+// The control this state offers, or null for the states that need none.
+//
+// The accessible name is not the visible label: out of context "Retry" says
+// nothing about what is being retried, and the pane is one of several in a
+// meeting.
+function syncControl(status) {
+  if (status.state === "failed") {
+    return {
+      label: "Retry",
+      className: "gh-retry",
+      name: "Retry the GitHub push for this meeting",
+    };
+  }
+  if (syncOwed(status) && !syncScheduled(status)) {
+    return {
+      label: "Sync now",
+      className: "gh-sync-now",
+      name: "Sync this meeting to GitHub now",
+    };
+  }
+  return null;
 }
 
 function mountGithubSync(detail, host) {
@@ -78,65 +145,84 @@ function mountGithubSync(detail, host) {
   // cannot would be a request per row of a live pane.
   if (detail.meeting.state !== "ready") return;
   const id = detail.meeting.id;
-  let panel = null;
-  let busy = false;
 
-  // Created on the first state worth showing rather than up front, so a build
-  // with no GitHub export — and a switched-off target — adds nothing to the
-  // meeting at all.
-  function surface() {
-    if (!panel) {
-      panel = document.createElement("section");
-      panel.className = "gh-sync-panel";
-      host.appendChild(panel);
-    }
+  // Owned before the first await, and appended to the host this call was given.
+  // `#detail` is a single node that renderDetail clears and reuses, so a panel
+  // created after the GET resolved was appended to whatever pane was on screen
+  // by then — switching meetings mid-flight left two sync lines in it. Hidden
+  // until there is a state worth showing, so a build with no GitHub export, and
+  // a switched-off target, still add nothing to the meeting.
+  const panel = document.createElement("section");
+  panel.className = "gh-sync-panel";
+  panel.setAttribute("aria-label", "GitHub sync");
+  panel.hidden = true;
+  host.appendChild(panel);
+
+  let busy = false;
+  // The state on screen, so the control can be redrawn without re-reading it.
+  let current = null;
+
+  // Draw into this pane's own panel, unless the reader has moved on: a load
+  // whose panel left the document has nothing to say about the meeting that
+  // replaced it.
+  function paint(line, control) {
+    if (!panel.isConnected) return;
     clear(panel);
-    return panel;
+    panel.hidden = false;
+    panel.appendChild(text("p", line, "gh-sync"));
+    if (!control) return;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = control.className;
+    button.textContent = control.label;
+    button.setAttribute("aria-label", control.name);
+    button.disabled = busy;
+    button.addEventListener("click", sync);
+    panel.appendChild(button);
   }
 
   function render(status) {
+    current = status;
     if (!status || status.state === "off") {
-      if (panel) {
-        panel.remove();
-        panel = null;
-      }
+      panel.remove();
       return;
     }
-    const root = surface();
-    root.appendChild(text("p", syncLine(status), "gh-sync"));
-    if (status.state !== "failed") return;
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "gh-retry";
-    button.textContent = "Retry";
-    button.disabled = busy;
-    button.addEventListener("click", retry);
-    root.appendChild(button);
+    paint(syncLine(status), syncControl(status));
   }
 
   async function load() {
     try {
       render(await api("/api/meetings/" + encodeURIComponent(id) + "/github-sync"));
     } catch (e) {
-      // Not "the request failed" — this build has no GitHub export at all, and
-      // the same 404 convention the recorder and the settings form use applies.
-      render(null);
+      // A 404 is this build having no GitHub export at all — the same
+      // convention the recorder and the settings form use — and the panel goes
+      // with it. Anything else is a problem worth reporting: rendering a 500,
+      // an expired token or a daemon mid-restart as "there is no such feature"
+      // took the meeting's state off screen and said nothing was wrong.
+      if (e && e.status === 404) {
+        render(null);
+        return;
+      }
+      current = null;
+      paint("This meeting's GitHub sync state could not be read. Reopen the meeting to try again.", null);
     }
   }
 
-  // The retry is a push of this meeting, now. The outcome is said out loud and
+  // The control is a push of this meeting, now. The outcome is said out loud and
   // then the state is re-read, so what stays on screen is what the daemon
   // reports rather than what this handler hoped for.
-  async function retry() {
+  async function sync() {
     if (busy) return;
     busy = true;
-    // `githubSettings` belongs to app.js, and this module is loaded before it
-    // and exercised on its own by tests/ui/github.cjs — so it is reached the
-    // way documents.js reaches it, through a `typeof` guard rather than a bare
-    // read that would throw a ReferenceError.
-    const target =
-      typeof githubSettings !== "undefined" && githubSettings ? githubSettings.repo : "GitHub";
-    say("Retrying the push to " + target + "…");
+    // Redrawn immediately. The disabled state is decided where the button is
+    // built, so without this the control stayed live for the whole length of the
+    // push and a second click asked for a second commit of the same meeting.
+    render(current);
+    // The repository the state is about. Reading it from the settings form
+    // instead named whatever is configured *now*, which is not necessarily the
+    // repository this meeting failed against.
+    const target = (current && current.repo) || "GitHub";
+    say("Syncing this meeting to " + target + "…");
     try {
       const body = await api("/api/meetings/" + encodeURIComponent(id) + "/github-push", {
         method: "POST",
@@ -144,7 +230,7 @@ function mountGithubSync(detail, host) {
       if (body.error) say(ghExplain(body.error));
       else say("Synced: " + body.receipt.repo + "/" + body.receipt.path);
     } catch (e) {
-      say("Could not reach the daemon to retry that push.");
+      say("Could not reach the daemon to sync that meeting.");
     }
     busy = false;
     await load();
