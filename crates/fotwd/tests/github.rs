@@ -13,7 +13,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 
 use fotw_store::{Db, DbKey, NewMeeting, NewSegment};
-use fotw_web::{GithubError, GithubExport, GithubMode, GithubSettings};
+use fotw_web::{GithubError, GithubExport, GithubMode, GithubSettings, GithubSyncState};
 use fotwd::github::{GhOutput, GhRunner, GithubExporter, SETTINGS_KEY};
 
 // ------------------------------------------------------------------ fixtures
@@ -758,25 +758,6 @@ fn auto_push_skips_meetings_from_before_the_stamp() {
     assert!(r.gh.calls().is_empty());
 }
 
-#[test]
-fn a_meeting_that_fails_on_its_own_is_parked_until_restart() {
-    // The PUT itself is refused — something about *this* meeting.
-    let r = rig(
-        AUTO_SINCE_EPOCH,
-        vec![ok(""), ok(PRIVATE_REPO), http_err(404), http_err(422)],
-    );
-    assert_eq!(r.exporter.auto_push_pending(), 0);
-    let after_first = r.gh.calls().len();
-    assert_eq!(after_first, 4);
-
-    assert_eq!(r.exporter.auto_push_pending(), 0);
-    assert_eq!(
-        r.gh.calls().len(),
-        after_first,
-        "a meeting that keeps failing must not hammer gh once a minute"
-    );
-}
-
 /// gh missing, nobody logged in, repo unreachable — none of these are the
 /// meeting's fault. Fixing the environment must drain the backlog without a
 /// daemon restart, which is the promise `SystemGh` re-resolving per call
@@ -829,22 +810,32 @@ fn auto_mode_with_no_stamp_pushes_nothing() {
     assert!(r.gh.calls().is_empty());
 }
 
-/// The park list gates the *worker*, never the person: a manual push is a
-/// human saying "try again now", and it must actually try.
+/// The backoff gates the *worker*, never the person. A retry pressed in the
+/// dashboard is a human saying "try again now", and it must actually try rather
+/// than wait out a window it cannot see.
 #[test]
-fn a_manual_push_retries_a_parked_meeting() {
+fn a_manual_retry_ignores_the_backoff_window() {
     let r = rig(
         AUTO_SINCE_EPOCH,
         vec![ok(""), ok(PRIVATE_REPO), http_err(404), http_err(422)],
     );
-    assert_eq!(r.exporter.auto_push_pending(), 0, "parked");
+    assert_eq!(
+        r.exporter.auto_push_pending(),
+        0,
+        "the meeting is now waiting out a backoff"
+    );
 
     r.gh.script.lock().unwrap().extend(create_script());
     let receipt = r
         .exporter
         .push(&r.meeting)
-        .expect("a manual push ignores the park list");
+        .expect("a retry by hand does not wait for the window");
     assert_eq!(receipt.repo, "octocat/notes");
+    assert_eq!(
+        r.exporter.sync_status(&r.meeting).state,
+        GithubSyncState::Synced,
+        "and the meeting stops reporting a failure it has recovered from"
+    );
 }
 
 /// A `gh` that answers the create sequence forever, for tests whose point is
@@ -852,6 +843,15 @@ fn a_manual_push_retries_a_parked_meeting() {
 #[derive(Debug, Default)]
 struct TirelessGh {
     calls: Mutex<usize>,
+}
+
+impl TirelessGh {
+    /// How many invocations it has answered. A push of a meeting with no
+    /// companion files is exactly four, so this counts pushes times four —
+    /// which is how a test proves nothing was pushed twice.
+    fn count(&self) -> usize {
+        *self.calls.lock().unwrap()
+    }
 }
 
 impl GhRunner for TirelessGh {
@@ -866,26 +866,373 @@ impl GhRunner for TirelessGh {
     }
 }
 
-/// One `list` page is 200 meetings. A backlog deeper than that must still
-/// drain — the busiest imaginable library must not silently strand its
-/// oldest owed meeting.
-#[test]
-fn auto_push_reaches_meetings_beyond_the_first_page() {
+// ------------------------------------------- the whole library, and the cap
+
+/// Auto, with the stamp far in the future of every fixture meeting, plus the
+/// whole-library switch: what the owner turns on to publish an archive that was
+/// recorded before auto was ever enabled.
+const AUTO_WHOLE_LIBRARY: &str = r#"{"enabled":true,"repo":"octocat/notes","branch":"","path_prefix":"meetings/","mode":"auto","auto_since_ms":9999999999999,"sync_whole_library":true}"#;
+
+/// The same stamp in the future, and **no** whole-library key at all — the
+/// shape of every settings row stored before #112.
+const AUTO_STAMP_IN_FUTURE: &str = r#"{"enabled":true,"repo":"octocat/notes","branch":"","path_prefix":"meetings/","mode":"auto","auto_since_ms":9999999999999}"#;
+
+/// `n` finished, enriched meetings, oldest first in start order, and a `gh`
+/// that answers the create sequence forever.
+fn backfill_rig(
+    n: usize,
+    settings_json: &str,
+) -> (
+    GithubExporter,
+    Arc<TirelessGh>,
+    Vec<String>,
+    tempfile::TempDir,
+) {
     let mut db = library();
-    let ids: Vec<String> = (0..201)
-        .map(|i| ready_meeting(&mut db, &format!("m{i}"), 1_755_734_400_000 + i))
+    let ids: Vec<String> = (0..n)
+        .map(|i| {
+            ready_meeting(
+                &mut db,
+                &format!("m{i}"),
+                1_700_000_000_000 + i64::try_from(i).unwrap_or(0) * 1_000,
+            )
+        })
         .collect();
-    // One write for all 201: the map is a single settings row, and stamping it
-    // per meeting would be 201 read-modify-writes of a growing JSON object.
+    // One write for all of them: the map is a single settings row, and stamping
+    // it per meeting would be n read-modify-writes of a growing JSON object.
     mark_enriched(&mut db, &ids.iter().map(String::as_str).collect::<Vec<_>>());
-    store_settings(&mut db, AUTO_SINCE_EPOCH);
+    store_settings(&mut db, settings_json);
+    let gh = Arc::new(TirelessGh::default());
     let dir = tempfile::TempDir::new().unwrap();
     let exporter = GithubExporter::new(
         db,
         dir.path().join("sessions"),
-        Arc::new(TirelessGh::default()) as Arc<dyn GhRunner>,
+        Arc::clone(&gh) as Arc<dyn GhRunner>,
     );
-    assert_eq!(exporter.auto_push_pending(), 201);
+    (exporter, gh, ids, dir)
+}
+
+/// A4. The default, and the promise that has to survive this whole issue:
+/// without the new switch, auto is still bounded by the stamp, so upgrading
+/// never publishes an archive.
+#[test]
+fn a_settings_row_without_the_whole_library_switch_still_bounds_auto_by_the_stamp() {
+    let (exporter, gh, ids, _dir) = backfill_rig(3, AUTO_STAMP_IN_FUTURE);
+    assert_eq!(
+        exporter.auto_push_pending(),
+        0,
+        "enabling auto must never export the archive"
+    );
+    assert_eq!(gh.count(), 0, "and must not reach a process at all");
+    for id in &ids {
+        assert!(exporter.receipt_for(id).is_none());
+    }
+}
+
+/// A5. The switch on: every ready meeting is owed, stamp or no stamp.
+#[test]
+fn the_whole_library_switch_owes_meetings_from_before_the_stamp() {
+    let (exporter, gh, ids, _dir) = backfill_rig(3, AUTO_WHOLE_LIBRARY);
+    assert_eq!(exporter.auto_push_pending(), 3);
+    assert_eq!(gh.count(), 3 * 4, "auth, repo, probe and PUT apiece");
+    for id in &ids {
+        assert!(
+            exporter.receipt_for(id).is_some(),
+            "every meeting in the library is owed, not only the ones after the stamp"
+        );
+    }
+}
+
+/// A5, the whole of it: oldest first, ten at a time, the remainder on later
+/// rounds, nothing skipped and nothing pushed twice.
+///
+/// Oldest first because a backfill that took the newest first would leave the
+/// oldest meetings for last and, on a library that keeps recording, possibly
+/// forever — the same starvation the enrichment backfill avoids.
+#[test]
+fn a_backfill_takes_the_oldest_first_ten_a_round_and_finishes_on_later_rounds() {
+    let (exporter, gh, ids, _dir) = backfill_rig(25, AUTO_WHOLE_LIBRARY);
+
+    assert_eq!(exporter.auto_push_pending(), 10, "the round stops at the cap");
+    for (i, id) in ids.iter().enumerate() {
+        assert_eq!(
+            exporter.receipt_for(id).is_some(),
+            i < 10,
+            "meeting {i} is in the wrong round: the ten oldest go first"
+        );
+    }
+
+    assert_eq!(exporter.auto_push_pending(), 10);
+    assert_eq!(exporter.auto_push_pending(), 5, "the remainder, and no more");
+    assert_eq!(
+        exporter.auto_push_pending(),
+        0,
+        "a drained backlog owes nothing"
+    );
+
+    for (i, id) in ids.iter().enumerate() {
+        assert!(
+            exporter.receipt_for(id).is_some(),
+            "meeting {i} was skipped by the backfill"
+        );
+    }
+    assert_eq!(
+        gh.count(),
+        25 * 4,
+        "twenty-five pushes and not one repeat: a second push of a meeting \
+         would be four more calls"
+    );
+}
+
+/// The cap is the round's, not the backfill's: a busy library that has been in
+/// auto mode all along must not send fifty meetings in one minute either.
+#[test]
+fn the_cap_applies_to_an_ordinary_auto_round_too() {
+    let (exporter, _gh, ids, _dir) = backfill_rig(12, AUTO_SINCE_EPOCH);
+    assert_eq!(exporter.auto_push_pending(), 10);
+    assert_eq!(exporter.auto_push_pending(), 2);
+    assert_eq!(exporter.auto_push_pending(), 0);
+    for id in &ids {
+        assert!(exporter.receipt_for(id).is_some());
+    }
+}
+
+// --------------------------------------------------- backoff, not a restart
+
+/// A6. The failure that used to need a daemon restart — or the button that no
+/// longer exists — becomes eligible again on its own.
+#[test]
+fn a_failed_push_becomes_eligible_again_after_backoff_with_no_restart() {
+    let mut db = library();
+    let meeting = enriched_meeting(&mut db, "Weekly Standup", 1_755_734_400_000);
+    store_settings(&mut db, AUTO_SINCE_EPOCH);
+    // The PUT itself is refused — something about *this* meeting.
+    let gh = ScriptedGh::scripted(vec![
+        ok(""),
+        ok(PRIVATE_REPO),
+        http_err(404),
+        http_err(422),
+    ]);
+    let dir = tempfile::TempDir::new().unwrap();
+    // A zero-length first window, so the next round is "after the backoff".
+    let exporter = GithubExporter::with_retry_schedule(
+        db,
+        dir.path().join("sessions"),
+        Arc::clone(&gh) as Arc<dyn GhRunner>,
+        vec![0],
+    );
+
+    assert_eq!(exporter.auto_push_pending(), 0, "the PUT was refused");
+    let after_failure = gh.calls().len();
+    assert_eq!(after_failure, 4);
+
+    gh.script.lock().unwrap().extend(create_script());
+    assert_eq!(
+        exporter.auto_push_pending(),
+        1,
+        "the same exporter, the same process, the next round"
+    );
+    assert!(exporter.receipt_for(&meeting).is_some());
+}
+
+/// The other half of A6, and the reason the window exists at all: between the
+/// failure and the retry the worker leaves the meeting alone, so a meeting that
+/// keeps failing does not spend a `gh` invocation every sixty seconds.
+#[test]
+fn a_failed_push_is_left_alone_until_its_backoff_expires() {
+    let r = rig(
+        AUTO_SINCE_EPOCH,
+        vec![ok(""), ok(PRIVATE_REPO), http_err(404), http_err(422)],
+    );
+    assert_eq!(r.exporter.auto_push_pending(), 0);
+    let after_first = r.gh.calls().len();
+    assert_eq!(after_first, 4);
+
+    // The default schedule's first window is five minutes, so the next several
+    // rounds have nothing to do.
+    for _ in 0..3 {
+        assert_eq!(r.exporter.auto_push_pending(), 0);
+    }
+    assert_eq!(
+        r.gh.calls().len(),
+        after_first,
+        "a meeting inside its backoff window must not reach gh at all"
+    );
+}
+
+// ---------------------------------------------- the state a meeting reports
+
+/// A2, from the daemon's side: one state per meeting, and the facts that state
+/// has. This is what the dashboard renders instead of a push button.
+#[test]
+fn a_meeting_reports_never_then_synced_then_changed_then_failed() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("library.db");
+    let key = DbKey::from_bytes([0x01; 32]);
+    let mut writer = Db::open(&path, &key).unwrap();
+    let id = enriched_meeting(&mut writer, "Planning", 1_755_734_400_000);
+    store_settings(&mut writer, AUTO_SINCE_EPOCH);
+    let gh = ScriptedGh::scripted(create_script());
+    let exporter = GithubExporter::new(
+        Db::open(&path, &key).unwrap(),
+        dir.path().join("sessions"),
+        Arc::clone(&gh) as Arc<dyn GhRunner>,
+    );
+
+    let never = exporter.sync_status(&id);
+    assert_eq!(never.state, GithubSyncState::Never);
+    assert!(never.pushed_at_ms.is_none());
+    assert!(never.error.is_none());
+
+    assert_eq!(exporter.auto_push_pending(), 1);
+    let synced = exporter.sync_status(&id);
+    assert_eq!(synced.state, GithubSyncState::Synced);
+    assert_eq!(synced.repo.as_deref(), Some("octocat/notes"));
+    assert!(
+        synced.pushed_at_ms.unwrap_or(0) > 0,
+        "a synced meeting says when"
+    );
+    assert!(synced.error.is_none());
+
+    // A7's state, from the reader's side: a new summary version means the copy
+    // in the repository is older than the library's.
+    writer
+        .meetings()
+        .insert_summary(
+            &id,
+            fotw_store::NewSummary::new("dev-1", "test", "model", "hash", "# Summary v1"),
+        )
+        .unwrap();
+    let changed = exporter.sync_status(&id);
+    assert_eq!(changed.state, GithubSyncState::Changed);
+    assert!(
+        changed.pushed_at_ms.unwrap_or(0) > 0,
+        "it still says when the older copy landed"
+    );
+
+    // And a failed attempt reports itself, with the reason and the retry time.
+    gh.script
+        .lock()
+        .unwrap()
+        .extend([ok(""), ok(PRIVATE_REPO), http_err(404), http_err(422)]);
+    assert_eq!(exporter.auto_push_pending(), 0);
+    let failed = exporter.sync_status(&id);
+    assert_eq!(failed.state, GithubSyncState::Failed);
+    assert!(
+        failed.error.unwrap_or_default().contains("422"),
+        "the reason is on screen, not only in the log"
+    );
+    assert!(
+        failed.retry_at_ms.unwrap_or(0) > 0,
+        "and when the worker will try again by itself"
+    );
+}
+
+/// A switched-off target says nothing about a meeting, rather than claiming it
+/// has never been synced — the UI draws no section at all for this.
+#[test]
+fn a_disabled_target_reports_no_state_for_any_meeting() {
+    let disabled = r#"{"enabled":false,"repo":"octocat/notes","branch":"","path_prefix":"meetings/","mode":"manual"}"#;
+    let r = rig(disabled, Vec::new());
+    assert_eq!(r.exporter.sync_status(&r.meeting).state, GithubSyncState::Off);
+    assert!(r.gh.calls().is_empty(), "a state is read, never fetched");
+}
+
+/// The state is bookkeeping, not a network call: asking must never spawn `gh`,
+/// because the dashboard asks once per meeting somebody opens.
+#[test]
+fn reading_a_sync_state_contacts_nothing() {
+    let r = rig(AUTO_SINCE_EPOCH, create_script());
+    for _ in 0..5 {
+        let _ = r.exporter.sync_status(&r.meeting);
+    }
+    assert!(r.gh.calls().is_empty());
+    // And an id that names nothing is "never synced", not an error: a route
+    // that distinguished the two would confirm a guessed id (ING-09).
+    assert_eq!(
+        r.exporter
+            .sync_status("01890000-0000-7000-8000-000000000000")
+            .state,
+        GithubSyncState::Never
+    );
+}
+
+// ------------------------------------------------ A8 on the new paths (#112)
+
+/// A8. The private-repository refusal is not something the backfill or the
+/// retry can route around: both go through the same preflight, and both write
+/// nothing.
+#[test]
+fn a_public_repository_is_refused_on_a_backfill_and_on_a_retry() {
+    // The backfill: the switch is on, the repository answers public.
+    let mut db = library();
+    let ids: Vec<String> = (0..3)
+        .map(|i| ready_meeting(&mut db, &format!("m{i}"), 1_700_000_000_000 + i))
+        .collect();
+    mark_enriched(&mut db, &ids.iter().map(String::as_str).collect::<Vec<_>>());
+    store_settings(&mut db, AUTO_WHOLE_LIBRARY);
+    let gh = ScriptedGh::scripted(vec![ok(""), ok(PUBLIC_REPO)]);
+    let dir = tempfile::TempDir::new().unwrap();
+    let exporter = GithubExporter::new(
+        db,
+        dir.path().join("sessions"),
+        Arc::clone(&gh) as Arc<dyn GhRunner>,
+    );
+
+    assert_eq!(exporter.auto_push_pending(), 0);
+    assert_eq!(
+        gh.calls().len(),
+        2,
+        "one refusal answers for every meeting in the round"
+    );
+    for id in &ids {
+        assert!(
+            exporter.receipt_for(id).is_none(),
+            "a whole-library backfill must not publish to a public repository"
+        );
+    }
+    assert!(
+        !dir.path().join("audit.jsonl").exists(),
+        "nothing left the machine, so there is no egress to record"
+    );
+
+    // The retry: a meeting whose push failed, tried again by hand against a
+    // repository that has since been made public.
+    let r = rig(
+        MANUAL,
+        vec![ok(""), ok(PRIVATE_REPO), http_err(404), http_err(422)],
+    );
+    assert!(r.exporter.push(&r.meeting).is_err());
+    let before = r.gh.calls().len();
+    r.gh.script
+        .lock()
+        .unwrap()
+        .extend([ok(""), ok(PUBLIC_REPO)]);
+    assert_eq!(
+        r.exporter.push(&r.meeting),
+        Err(GithubError::RepoIsPublic),
+        "a retry is a push, and a push asks about the repository every time"
+    );
+    assert_eq!(r.gh.calls().len(), before + 2, "auth and the lookup, no write");
+}
+
+/// One `list` page is 200 meetings. A backlog deeper than that must still
+/// drain — the busiest imaginable library must not silently strand its oldest
+/// owed meeting.
+///
+/// Sharper since #112 than it was before it: the round takes the ten *oldest*
+/// owed meetings, and on a 201-meeting library those are exactly the ones a
+/// single page of a newest-first listing cannot see.
+#[test]
+fn auto_push_reaches_meetings_beyond_the_first_page() {
+    let (exporter, gh, ids, _dir) = backfill_rig(201, AUTO_SINCE_EPOCH);
+    assert_eq!(exporter.auto_push_pending(), 10);
+    assert!(
+        exporter.receipt_for(&ids[0]).is_some(),
+        "the oldest meeting sits at offset 200 of a newest-first listing, so a \
+         pusher that read one page would have stranded it forever"
+    );
+    assert_eq!(gh.count(), 10 * 4, "ten pushes, four calls apiece");
 }
 
 #[test]
@@ -1101,8 +1448,9 @@ fn companion_files_sync_latest_versions_without_republishing_unchanged_drafts() 
     );
     assert_eq!(exporter.auto_push_pending(), 0);
 
-    // A companion failure must not claim the new version landed. Manual retry
-    // remains possible, while the worker parks it instead of hammering GitHub.
+    // A companion failure must not claim the new version landed. A retry by
+    // hand remains possible, and the worker waits out a backoff window instead
+    // of hammering GitHub once a minute (#112).
     draft.markdown = "# Corrected brief v3".into();
     writer
         .save_sharing_document(&id, 2, &serde_json::to_string(&draft).unwrap())

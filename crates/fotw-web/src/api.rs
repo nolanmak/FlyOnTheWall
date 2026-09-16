@@ -686,6 +686,9 @@ mod tests {
         fn push(&self, _meeting_id: &str) -> Result<GithubReceipt, GithubError> {
             Err(GithubError::Disabled)
         }
+        fn sync_status(&self, _meeting_id: &str) -> crate::github::GithubSyncStatus {
+            crate::github::GithubSyncStatus::off()
+        }
         fn sync_bundle(&self) -> Result<(), GithubError> {
             Ok(())
         }

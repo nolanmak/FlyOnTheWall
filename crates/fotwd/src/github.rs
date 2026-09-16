@@ -49,7 +49,10 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 
 use fotw_store::{Db, StoreError};
-use fotw_web::{GithubError, GithubExport, GithubMode, GithubReceipt, GithubSettings};
+use fotw_web::{
+    GithubError, GithubExport, GithubMode, GithubReceipt, GithubSettings, GithubSyncState,
+    GithubSyncStatus,
+};
 
 use crate::audit::{AuditKind, AuditLog};
 // The auto-push worker runs inside the daemon, whose stderr is discarded, so
@@ -80,6 +83,26 @@ pub const RECEIPTS_KEY: &str = "github_export_receipts";
 /// Call A plus one Call B per chunk of a three-hour meeting; bounded, because
 /// the whole point is that the wait ends.
 const ENRICH_GRACE_MS: u64 = 30 * 60 * 1_000;
+
+/// How long a meeting whose own push failed waits before the worker tries it
+/// again (#112), by consecutive failure count; the last step repeats forever.
+///
+/// Before this, a failed push went into a set and was skipped until the daemon
+/// restarted, and the per-meeting button was the only way back. Retrying once a
+/// minute instead is how a laptop on hotel wifi meets a rate limiter, so the
+/// wait escalates — and it is **bounded** at an hour, because a window that
+/// doubled forever would park a meeting for a week and call it a retry.
+const BACKOFF_MS: [u64; 3] = [5 * 60 * 1_000, 15 * 60 * 1_000, 60 * 60 * 1_000];
+
+/// How many meetings one auto round may push (#112).
+///
+/// The whole-library switch can make thousands of meetings owed at once. Each
+/// push is four `gh` calls and a commit on a shared branch, so a round that
+/// tried to drain the lot would hold the write lock for an hour and introduce
+/// the user's token to a secondary rate limit. Ten a minute drains six hundred
+/// an hour, which finishes any real library overnight without the machine ever
+/// looking busy — the same reasoning as `BACKFILL_PER_PASS` in `serve.rs`.
+const MAX_PER_ROUND: usize = 10;
 
 /// What one `gh` invocation came back with.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,6 +263,24 @@ impl GithubExporter {
             in_flight: Mutex::new(HashSet::new()),
             writes: Mutex::new(()),
         }
+    }
+
+    /// [`GithubExporter::new`] with the retry schedule named, in milliseconds.
+    ///
+    /// For tests, and honest about it: the real schedule is [`BACKOFF_MS`],
+    /// whose first step is five minutes, and a test that had to wait five
+    /// minutes to prove that a retry happens is a test nobody runs.
+    #[must_use]
+    pub fn with_retry_schedule(
+        db: Db,
+        sessions_root: PathBuf,
+        runner: Arc<dyn GhRunner>,
+        retry_after_ms: Vec<u64>,
+    ) -> Self {
+        // The schedule is honoured once the retry behaviour lands; until then
+        // this is `new` with the seam in place.
+        drop(retry_after_ms);
+        Self::new(db, sessions_root, runner)
     }
 
     fn lock_db(&self) -> MutexGuard<'_, Db> {
@@ -578,6 +619,13 @@ impl GithubExport for GithubExporter {
         result
     }
 
+    fn sync_status(&self, meeting_id: &str) -> GithubSyncStatus {
+        // Answered from the receipts, the companion versions and the retry
+        // table once #112's states land; until then it says nothing.
+        let _ = meeting_id;
+        GithubSyncStatus::off()
+    }
+
     fn sync_bundle(&self) -> Result<(), GithubError> {
         let (settings, receipts) = {
             let db = self.lock_db();
@@ -866,6 +914,39 @@ fn confirmed_private(repo_json: &str) -> bool {
     repo["private"] == true && repo["visibility"] != "public"
 }
 
+/// How long to wait before retrying a meeting that has now failed `failures`
+/// times in a row (#112).
+///
+/// The last step of `schedule` repeats rather than growing, which is what makes
+/// the backoff bounded. A `failures` of zero cannot happen — the count is
+/// incremented before this is asked — and answers the first step rather than
+/// zero, because "no wait at all" is the one answer that would turn a retry
+/// into the once-a-minute hammering this exists to stop.
+fn backoff_ms(schedule: &[u64], failures: u32) -> u64 {
+    // Implemented in the commit that adds the retry behaviour.
+    let _ = (schedule, failures);
+    0
+}
+
+/// The log line for a meeting entering backoff (#112).
+///
+/// Its own function so that a test can assert what reaches `fotwd.log` without
+/// running a daemon. **It takes no title, by construction**: §10 keeps meeting
+/// titles out of the log and the audit journal, and the only free text here is
+/// `gh`'s own first line about a repository, which [`classify`] has already
+/// bounded.
+fn entered_backoff_line(meeting_id: &str, wait_ms: u64, reason: &str) -> String {
+    let _ = (meeting_id, wait_ms, reason);
+    String::new()
+}
+
+/// The log line for a meeting leaving backoff, for [`entered_backoff_line`]'s
+/// reasons and with the same no-title guarantee.
+fn left_backoff_line(meeting_id: &str, failures: u32) -> String {
+    let _ = (meeting_id, failures);
+    String::new()
+}
+
 /// A failure that would repeat identically for every meeting in an auto round:
 /// no gh, no login, no repository, export switched off, or a repository the
 /// preflight refuses as public. None is one meeting's fault, so the round
@@ -935,6 +1016,51 @@ mod tests {
         ] {
             assert!(!confirmed_private(public), "{public:?} must read as public");
         }
+    }
+
+    /// A6. Bounded *and* escalating. Escalating, because retrying a hard
+    /// failure once a minute is how a laptop meets a rate limiter; bounded,
+    /// because a window that doubled forever would park a meeting for a week
+    /// and still call itself a retry.
+    #[test]
+    fn the_retry_schedule_escalates_and_then_settles_at_an_hour() {
+        assert_eq!(backoff_ms(&BACKOFF_MS, 1), 5 * 60 * 1_000);
+        assert_eq!(backoff_ms(&BACKOFF_MS, 2), 15 * 60 * 1_000);
+        assert_eq!(backoff_ms(&BACKOFF_MS, 3), 60 * 60 * 1_000);
+        for failures in [4, 12, 500] {
+            assert_eq!(
+                backoff_ms(&BACKOFF_MS, failures),
+                60 * 60 * 1_000,
+                "the last step repeats rather than growing without bound"
+            );
+        }
+        assert_eq!(
+            backoff_ms(&BACKOFF_MS, 0),
+            5 * 60 * 1_000,
+            "a zero-th failure cannot happen, and must not read as no wait"
+        );
+        assert_eq!(
+            backoff_ms(&[], 3),
+            0,
+            "an empty schedule retries on the next round rather than panicking"
+        );
+    }
+
+    /// A6 and A9 together. The log says which meeting, for how long and why,
+    /// and the meeting is named by id: neither of these functions takes a
+    /// title, which is what keeps §10's never-log rule true by construction
+    /// rather than by review.
+    #[test]
+    fn the_backoff_log_lines_name_the_meeting_by_id_and_carry_no_title() {
+        let id = "01926f5a-0000-7000-8000-000000000001";
+        let entered = entered_backoff_line(id, 15 * 60 * 1_000, "gh: Validation Failed (HTTP 422)");
+        assert!(entered.contains(id), "which meeting: {entered}");
+        assert!(entered.contains("15 min"), "how long it waits: {entered}");
+        assert!(entered.contains("HTTP 422"), "and why: {entered}");
+
+        let left = left_backoff_line(id, 3);
+        assert!(left.contains(id), "which meeting: {left}");
+        assert!(left.contains('3'), "how many attempts it took: {left}");
     }
 
     #[test]

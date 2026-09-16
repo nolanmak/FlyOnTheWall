@@ -89,7 +89,10 @@ pub mod tokens;
 #[cfg(feature = "store")]
 pub mod store_source;
 
-pub use crate::github::{GithubError, GithubExport, GithubMode, GithubReceipt, GithubSettings};
+pub use crate::github::{
+    GithubError, GithubExport, GithubMode, GithubReceipt, GithubSettings, GithubSyncState,
+    GithubSyncStatus,
+};
 pub use crate::health::{Activity, DaemonHealth, HealthReport};
 pub use crate::ingress::{Deny, IngressPolicy, not_found};
 pub use crate::recorder::{RecorderControl, RecorderError, RecordingState, RecordingStatus};

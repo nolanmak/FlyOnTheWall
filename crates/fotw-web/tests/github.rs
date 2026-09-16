@@ -21,7 +21,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fotw_web::{
-    GithubError, GithubExport, GithubMode, GithubReceipt, GithubSettings, MemorySource, WebServer,
+    GithubError, GithubExport, GithubMode, GithubReceipt, GithubSettings, GithubSyncState,
+    GithubSyncStatus, MemorySource, WebServer,
 };
 
 /// A control that stores settings and answers pushes without running anything.
@@ -35,6 +36,11 @@ struct FakeGithub {
     outcome: Mutex<Option<GithubError>>,
     /// The error the next repo listing should fail with, if any.
     repos_outcome: Mutex<Option<GithubError>>,
+    /// What the per-meeting sync state should answer (#112).
+    sync: Mutex<GithubSyncStatus>,
+    /// Which meeting ids were asked about, so a test can prove the handler
+    /// passed the one from the path rather than a fixed string.
+    sync_asked: Mutex<Vec<String>>,
 }
 
 impl GithubExport for FakeGithub {
@@ -70,6 +76,11 @@ impl GithubExport for FakeGithub {
             title: "Standup".to_owned(),
             started_at_ms: 1_755_734_400_000,
         })
+    }
+
+    fn sync_status(&self, meeting_id: &str) -> GithubSyncStatus {
+        self.sync_asked.lock().unwrap().push(meeting_id.to_owned());
+        self.sync.lock().unwrap().clone()
     }
 
     fn sync_bundle(&self) -> Result<(), GithubError> {
@@ -133,6 +144,9 @@ async fn every_github_route_needs_the_bearer() {
         r.h.post("/api/settings/github", &anon, Some(&good_settings()))
             .await,
         r.h.post("/api/meetings/m1/github-push", &anon, None).await,
+        // #112's read. It says whether a named meeting is in a repository,
+        // which is a fact about the user's library and their account.
+        r.h.get("/api/meetings/m1/github-sync", &anon).await,
     ];
     for res in responses {
         assert_eq!(
@@ -382,6 +396,87 @@ async fn a_push_failure_rides_in_the_body() {
     }
 }
 
+// -------------------------------------------------------- sync state (#112)
+
+/// The read the dashboard makes instead of drawing a push button: where this
+/// meeting stands with the target, as one state plus the facts that state has.
+#[tokio::test]
+async fn the_sync_state_route_answers_the_state_for_the_meeting_it_was_asked_about() {
+    let r = rig().await;
+    *r.github.sync.lock().unwrap() = GithubSyncStatus {
+        state: GithubSyncState::Synced,
+        repo: Some("octocat/notes".to_owned()),
+        pushed_at_ms: Some(1_787_372_196_265),
+        ..GithubSyncStatus::off()
+    };
+
+    let res =
+        r.h.get("/api/meetings/m1/github-sync", &r.h.authorised())
+            .await;
+    assert_eq!(res.status, 200);
+    let v = body_json(&res.body);
+    assert_eq!(v["state"], "synced");
+    assert_eq!(v["repo"], "octocat/notes");
+    assert_eq!(v["pushed_at_ms"], 1_787_372_196_265_u64);
+    assert!(
+        v.get("error").is_none(),
+        "a synced meeting has no failure to report"
+    );
+    assert_eq!(
+        r.github.sync_asked.lock().unwrap().as_slice(),
+        ["m1"],
+        "the handler must pass the id from the path"
+    );
+}
+
+/// A failed meeting is the one state that carries a reason and a retry time,
+/// and the UI needs both: the reason to say what happened, the time to say that
+/// the worker will try again by itself.
+#[tokio::test]
+async fn a_failed_sync_state_carries_the_reason_and_when_the_worker_retries() {
+    let r = rig().await;
+    *r.github.sync.lock().unwrap() = GithubSyncStatus {
+        state: GithubSyncState::Failed,
+        repo: Some("octocat/notes".to_owned()),
+        error: Some("gh: Validation Failed (HTTP 422)".to_owned()),
+        retry_at_ms: Some(1_787_372_496_265),
+        pushed_at_ms: None,
+    };
+    let res =
+        r.h.get("/api/meetings/m1/github-sync", &r.h.authorised())
+            .await;
+    let v = body_json(&res.body);
+    assert_eq!(v["state"], "failed");
+    assert_eq!(v["error"], "gh: Validation Failed (HTTP 422)");
+    assert_eq!(v["retry_at_ms"], 1_787_372_496_265_u64);
+}
+
+/// ING-09, as for every other control: a build with no GitHub export answers
+/// the same bare 404 as a path that does not exist.
+#[tokio::test]
+async fn the_sync_state_route_is_invisible_without_the_control() {
+    let h = common::start().await;
+    let absent = h
+        .get("/api/meetings/m1/github-sync", &h.authorised())
+        .await;
+    let unknown = h.get("/api/no-such-path", &h.authorised()).await;
+    assert_eq!(absent.status, 404);
+    assert_eq!(absent.bytes_without_date(), unknown.bytes_without_date());
+}
+
+/// A read, so POST is the wrong method — and the refusal must not carry an
+/// `Allow` header that confirms the path exists.
+#[tokio::test]
+async fn the_wrong_method_on_the_sync_state_route_is_a_bare_404() {
+    let r = rig().await;
+    let wrong =
+        r.h.post("/api/meetings/m1/github-sync", &r.h.authorised(), None)
+            .await;
+    assert_eq!(wrong.status, 404);
+    assert!(wrong.header("allow").is_none());
+    assert!(wrong.body.is_empty());
+}
+
 // ------------------------------------------------------------- wire format
 
 /// The mode's wire spelling is part of the UI contract, as the recorder's
@@ -408,4 +503,40 @@ fn the_default_settings_are_off_and_manual() {
     assert_eq!(s.path_prefix, "meetings/");
     assert_eq!(s.mode, GithubMode::Manual);
     assert_eq!(s.auto_since_ms, None);
+    assert!(
+        !s.sync_whole_library,
+        "a fresh library does not publish an archive it does not have yet, and \
+         an existing one does not publish its own by being upgraded"
+    );
+}
+
+/// The whole-library switch travels through `POST`/`GET /api/settings/github`
+/// under the name the form reads and writes, and a client that does not send
+/// the key at all — every build before #112 — leaves it off.
+#[tokio::test]
+async fn the_whole_library_switch_round_trips_and_defaults_off_when_omitted() {
+    let r = rig().await;
+    let save = |body: &'static str| {
+        let h = &r.h;
+        async move { body_json(&h.post("/api/settings/github", &h.authorised(), Some(body)).await.body) }
+    };
+
+    let on = save(
+        r#"{"enabled":true,"repo":"octocat/notes","branch":"","path_prefix":"meetings/","mode":"auto","sync_whole_library":true}"#,
+    )
+    .await;
+    assert!(on["error"].is_null(), "{on}");
+    assert_eq!(on["settings"]["sync_whole_library"], true);
+    let read = body_json(&r.h.get("/api/settings/github", &r.h.authorised()).await.body);
+    assert_eq!(read["settings"]["sync_whole_library"], true);
+
+    let without = save(
+        r#"{"enabled":true,"repo":"octocat/notes","branch":"","path_prefix":"meetings/","mode":"auto"}"#,
+    )
+    .await;
+    assert!(without["error"].is_null(), "{without}");
+    assert_eq!(
+        without["settings"]["sync_whole_library"], false,
+        "an omitted key is off, never the previous value"
+    );
 }

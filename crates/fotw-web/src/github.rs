@@ -67,6 +67,25 @@ pub struct GithubSettings {
     /// A row stored before this field existed has no such key and reads as
     /// `false`, through the struct's `#[serde(default)]`.
     pub allow_public_repo: bool,
+    /// Whether auto mode owes **every** ready meeting, rather than only those
+    /// that started after [`GithubSettings::auto_since_ms`].
+    ///
+    /// Off by default, and a row stored before this field existed reads as
+    /// `false` through the struct's `#[serde(default)]` — so the stamp keeps
+    /// bounding auto for every library that has one, and nobody publishes an
+    /// archive by upgrading.
+    ///
+    /// On, it publishes the whole library: every meeting already recorded, not
+    /// just the ones recorded from now on. That is why it is a second switch
+    /// beside `mode` rather than a widening of it — "push new meetings" and
+    /// "push everything I have ever recorded" are different decisions, and the
+    /// second one cannot be taken back, because a commit stays in the
+    /// repository's history.
+    ///
+    /// The stamp is still stored and still honoured the moment this goes back
+    /// off, so turning it off returns auto to "meetings from now on" rather
+    /// than to "nothing".
+    pub sync_whole_library: bool,
     /// When auto mode was switched on, epoch milliseconds.
     ///
     /// Server-owned: the daemon stamps it so that enabling auto on an old
@@ -84,8 +103,71 @@ impl Default for GithubSettings {
             path_prefix: "meetings/".to_owned(),
             mode: GithubMode::Manual,
             allow_public_repo: false,
+            sync_whole_library: false,
             auto_since_ms: None,
         }
+    }
+}
+
+/// Where one meeting stands with the GitHub target (issue #112).
+///
+/// Exactly one of these is true of a meeting at any moment, and that is the
+/// point. The dashboard used to draw a push button from the settings alone, so
+/// "already in the repository" and "never pushed" looked identical on screen
+/// and the button invited a second commit of a meeting that had already landed.
+///
+/// The wire spelling is part of the UI contract, as [`GithubMode`]'s is, and a
+/// test pins it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubSyncState {
+    /// Export is switched off, or this build has no GitHub control at all.
+    /// Nothing is said about the meeting, because nothing is true of it.
+    #[default]
+    Off,
+    /// Enabled, and this meeting has never been pushed.
+    Never,
+    /// Pushed, and nothing has changed since.
+    Synced,
+    /// Pushed, and then the summary or the saved document brief changed, so the
+    /// copy in the repository is older than the library's. The worker will send
+    /// it again on a later pass.
+    Changed,
+    /// The last attempt failed. The only state that offers a control.
+    Failed,
+}
+
+/// A [`GithubSyncState`] with the facts that make the line worth reading.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GithubSyncStatus {
+    /// Which state this meeting is in.
+    pub state: GithubSyncState,
+    /// `owner/name` it was last pushed to, when it has been.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// When that push landed, epoch milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pushed_at_ms: Option<u64>,
+    /// Why the last attempt failed, in words safe to show — `gh`'s own first
+    /// line about a repository, never transcript text. Present only for
+    /// [`GithubSyncState::Failed`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// When the worker will try this meeting again on its own, epoch
+    /// milliseconds. Present only for [`GithubSyncState::Failed`]: the retry is
+    /// automatic, so the line can say so rather than implying that pressing
+    /// something is the only way back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_at_ms: Option<u64>,
+}
+
+impl GithubSyncStatus {
+    /// The answer for a target that is switched off — and, being the default,
+    /// the base every other state is built from.
+    #[must_use]
+    pub fn off() -> Self {
+        Self::default()
     }
 }
 
@@ -282,6 +364,16 @@ pub trait GithubExport: Send + Sync + 'static {
     /// in the UI.
     fn push(&self, meeting_id: &str) -> Result<GithubReceipt, GithubError>;
 
+    /// Where `meeting_id` stands with the target right now (issue #112).
+    ///
+    /// Infallible on purpose: it answers from bookkeeping the implementation
+    /// already holds — the push receipts, the companion versions and the
+    /// worker's retry table — and contacts nothing. A meeting id that names
+    /// nothing answers [`GithubSyncState::Never`] rather than an error, because
+    /// a route that distinguished the two would let a caller confirm a guessed
+    /// id (ING-09).
+    fn sync_status(&self, meeting_id: &str) -> GithubSyncStatus;
+
     /// Regenerate the OKF bundle's `index.md` and `log.md` from what has been
     /// pushed and commit them, so the repo is a navigable bundle rather than a
     /// flat pile of files. Called after a push, not inside it: a manual push
@@ -425,6 +517,89 @@ mod tests {
         );
         let back: GithubSettings = serde_json::from_value(json).unwrap();
         assert_eq!(back, normalized);
+    }
+
+    /// A4, at the type level: nothing about upgrading turns the whole-library
+    /// switch on, and the stamp that bounds auto is still there beside it.
+    #[test]
+    fn the_whole_library_switch_is_off_by_default_and_in_every_older_row() {
+        assert!(!GithubSettings::default().sync_whole_library);
+        // The shape every library stored before this field was added.
+        let old: GithubSettings = serde_json::from_str(
+            r#"{"enabled":true,"repo":"octocat/notes","branch":"","path_prefix":"meetings/","mode":"auto","auto_since_ms":1787372196265}"#,
+        )
+        .unwrap();
+        assert!(
+            !old.sync_whole_library,
+            "an upgrade must never publish an existing archive"
+        );
+        assert_eq!(
+            old.auto_since_ms,
+            Some(1_787_372_196_265),
+            "and the stamp that bounds auto is untouched"
+        );
+    }
+
+    #[test]
+    fn the_whole_library_switch_survives_validation_and_serialization() {
+        let s = GithubSettings {
+            sync_whole_library: true,
+            ..enabled("octocat/notes", "m/")
+        };
+        let normalized = s.clone().normalized().unwrap();
+        assert!(normalized.sync_whole_library, "normalized() must keep it");
+        let json = serde_json::to_value(&normalized).unwrap();
+        assert_eq!(
+            json["sync_whole_library"], true,
+            "the wire name the settings form reads and writes"
+        );
+        let back: GithubSettings = serde_json::from_value(json).unwrap();
+        assert_eq!(back, normalized);
+    }
+
+    #[test]
+    fn the_sync_state_spellings_are_pinned() {
+        for (state, wire) in [
+            (GithubSyncState::Off, r#""off""#),
+            (GithubSyncState::Never, r#""never""#),
+            (GithubSyncState::Synced, r#""synced""#),
+            (GithubSyncState::Changed, r#""changed""#),
+            (GithubSyncState::Failed, r#""failed""#),
+        ] {
+            assert_eq!(serde_json::to_string(&state).unwrap(), wire);
+        }
+        assert_eq!(
+            GithubSyncState::default(),
+            GithubSyncState::Off,
+            "a control that says nothing yet must not claim a meeting is synced"
+        );
+    }
+
+    /// A field that is absent means "this state has no such fact", and the UI
+    /// branches on presence. A serialized `null` would read as present.
+    #[test]
+    fn a_sync_status_omits_the_fields_its_state_does_not_have() {
+        let off = serde_json::to_value(GithubSyncStatus::off()).unwrap();
+        assert_eq!(off["state"], "off");
+        for absent in ["repo", "pushed_at_ms", "error", "retry_at_ms"] {
+            assert!(
+                off.get(absent).is_none(),
+                "{absent} must be omitted rather than null"
+            );
+        }
+
+        let failed = GithubSyncStatus {
+            state: GithubSyncState::Failed,
+            repo: Some("octocat/notes".to_owned()),
+            pushed_at_ms: None,
+            error: Some("gh: Validation Failed (HTTP 422)".to_owned()),
+            retry_at_ms: Some(1_787_372_496_265),
+        };
+        let json = serde_json::to_value(&failed).unwrap();
+        assert_eq!(json["state"], "failed");
+        assert_eq!(json["error"], "gh: Validation Failed (HTTP 422)");
+        assert_eq!(json["retry_at_ms"], 1_787_372_496_265_u64);
+        assert!(json.get("pushed_at_ms").is_none());
     }
 
     #[test]

@@ -187,7 +187,13 @@ mod tests {
     /// is the assertion that would fail.
     #[test]
     fn the_shell_and_its_assets_are_embedded() {
-        for name in ["index.html", "app.js", "app.css"] {
+        for name in [
+            "index.html",
+            "app.js",
+            "app.css",
+            "documents.js",
+            "github.js",
+        ] {
             assert!(Ui::get(name).is_some(), "{name} must be in the binary");
         }
     }
@@ -208,15 +214,45 @@ mod tests {
     /// `innerHTML`; this catches it earlier, in review.
     #[test]
     fn the_renderer_never_assigns_html() {
-        let js = Ui::get("app.js").unwrap();
-        let js = String::from_utf8(js.data.into_owned()).unwrap();
-        for forbidden in ["innerHTML", "outerHTML", "insertAdjacentHTML", "eval("] {
+        for name in ["app.js", "documents.js", "github.js"] {
+            let js = asset_text(name);
+            for forbidden in ["innerHTML", "outerHTML", "insertAdjacentHTML", "eval("] {
+                assert!(
+                    !js.contains(forbidden),
+                    "transcript text is attacker-influenced; {forbidden} must not \
+                     appear in {name}"
+                );
+            }
+        }
+    }
+
+    /// #112. The per-meeting push button is gone: the worker owns every push,
+    /// so a button drawn from the settings alone appeared on meetings that were
+    /// already in the repository and invited a second commit of them.
+    ///
+    /// The real assertions are in `tests/ui/github.cjs`, which drives every
+    /// state through a DOM. These two catch the module falling out of the
+    /// bundle, and the button coming back.
+    #[test]
+    fn no_meeting_carries_a_push_button_and_every_sync_state_is_rendered() {
+        let js = asset_text("app.js");
+        assert!(
+            !js.contains("Push to GitHub"),
+            "the worker owns every push; a per-meeting button invited a second \
+             commit of a meeting that had already landed (#112)"
+        );
+        let sync = asset_text("github.js");
+        for state in ["\"never\"", "\"synced\"", "\"changed\"", "\"failed\""] {
             assert!(
-                !js.contains(forbidden),
-                "transcript text is attacker-influenced; {forbidden} must not \
-                 appear in the SPA"
+                sync.contains(state),
+                "github.js must render the {state} sync state, or a meeting \
+                 says nothing about where it stands"
             );
         }
+        assert!(
+            asset_text("index.html").contains("/assets/github.js"),
+            "the shell must load the sync module, or no meeting shows a state"
+        );
     }
 
     /// The one pin `app.js` can have: there is no JS harness in this project,
