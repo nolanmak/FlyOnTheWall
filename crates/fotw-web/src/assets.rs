@@ -505,7 +505,7 @@ mod tests {
     /// one meaning and `--caution` is the caveat colour; a harmless local action
     /// must borrow neither. `.copy` is appended as the *last* selector of the
     /// shared button group because `css_rule` finds only a group's final
-    /// selector — which is also why a future pin on `.gh-push` would need to
+    /// selector — which is also why a future pin on `.gh-retry` would need to
     /// give it its own rule. The row needs a gap: script-appended siblings carry
     /// no whitespace between them, so without one the buttons render as a single
     /// slab.
