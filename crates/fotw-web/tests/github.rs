@@ -441,6 +441,7 @@ async fn a_failed_sync_state_carries_the_reason_and_when_the_worker_retries() {
         error: Some("gh: Validation Failed (HTTP 422)".to_owned()),
         retry_at_ms: Some(1_787_372_496_265),
         pushed_at_ms: None,
+        ..GithubSyncStatus::off()
     };
     let res =
         r.h.get("/api/meetings/m1/github-sync", &r.h.authorised())

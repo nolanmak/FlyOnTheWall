@@ -1245,6 +1245,345 @@ fn auto_push_reaches_meetings_beyond_the_first_page() {
     assert_eq!(gh.count(), 10 * 4, "ten pushes, four calls apiece");
 }
 
+// ------------------------------------- the scope the state has to know (#112)
+
+/// F1. `auto_push_pending` bounds what it owes by three things — `mode`, the
+/// stamp, and `sync_whole_library` — and the state a meeting reports used to
+/// consult none of them. So a meeting the worker will never touch said exactly
+/// what a meeting about to be pushed says, and the dashboard turned that into a
+/// promise the daemon does not keep.
+///
+/// Both cases are live in the library that reported the issue: meetings recorded
+/// before the stamp, and every meeting the moment auto is switched off.
+#[test]
+fn the_state_says_whether_any_automatic_pass_will_sync_the_meeting() {
+    let scheduled = |settings: &str| {
+        let r = rig(settings, Vec::new());
+        let status = r.exporter.sync_status(&r.meeting);
+        assert_eq!(status.state, GithubSyncState::Never, "for {settings}");
+        assert!(r.gh.calls().is_empty(), "a state is read, never fetched");
+        status.scheduled
+    };
+
+    assert!(
+        scheduled(AUTO_SINCE_EPOCH),
+        "auto, and the meeting started after the stamp: the worker owes it"
+    );
+    assert!(
+        scheduled(AUTO_WHOLE_LIBRARY),
+        "the whole-library switch owes every meeting, stamp or no stamp"
+    );
+    assert!(
+        !scheduled(MANUAL),
+        "manual mode pushes nothing on its own, so nothing is coming for this \
+         meeting and the pane must not imply that something is"
+    );
+    assert!(
+        !scheduled(AUTO_STAMP_IN_FUTURE),
+        "a meeting recorded before the stamp is never picked up by a pass"
+    );
+    let stampless = r#"{"enabled":true,"repo":"octocat/notes","branch":"","path_prefix":"meetings/","mode":"auto"}"#;
+    assert!(
+        !scheduled(stampless),
+        "auto with no stamp pushes nothing at all — the guard against \
+         `everything, ever` — so no meeting is waiting on a pass"
+    );
+}
+
+/// ING-09 on the new field. A meeting id that names nothing must stay
+/// indistinguishable from a real one, so it answers the scope question the way
+/// some real meeting in the same library does: in scope wherever auto owes
+/// anything, out of scope where auto owes nothing at all.
+#[test]
+fn an_id_that_names_nothing_reports_a_scope_a_real_meeting_could_have() {
+    let unknown = "01890000-0000-7000-8000-000000000000";
+
+    let r = rig(AUTO_SINCE_EPOCH, Vec::new());
+    assert!(
+        r.exporter.sync_status(unknown).scheduled,
+        "indistinguishable from a meeting recorded a minute ago"
+    );
+
+    let r = rig(MANUAL, Vec::new());
+    assert!(
+        !r.exporter.sync_status(unknown).scheduled,
+        "and from every meeting in a library that only pushes by hand"
+    );
+}
+
+/// F2. `retry_at_ms` is the pane's only authority for "the daemon will try again
+/// on its own". In manual mode nobody will: `auto_push_pending` returns before
+/// it looks at a single meeting.
+#[test]
+fn only_a_failure_the_worker_will_retry_carries_a_retry_time() {
+    // Auto, in scope: the round failed this meeting and will have another go
+    // once the window expires.
+    let r = rig(
+        AUTO_SINCE_EPOCH,
+        vec![ok(""), ok(PRIVATE_REPO), http_err(404), http_err(422)],
+    );
+    assert_eq!(r.exporter.auto_push_pending(), 0);
+    let failed = r.exporter.sync_status(&r.meeting);
+    assert_eq!(failed.state, GithubSyncState::Failed);
+    assert!(failed.scheduled);
+    assert!(
+        failed.retry_at_ms.unwrap_or(0) > 0,
+        "the worker owes this meeting, so the line may say it will try again"
+    );
+
+    // Manual: the same failure, and nothing will ever retry it.
+    let r = rig(
+        MANUAL,
+        vec![ok(""), ok(PRIVATE_REPO), http_err(404), http_err(422)],
+    );
+    assert!(r.exporter.push(&r.meeting).is_err());
+    let failed = r.exporter.sync_status(&r.meeting);
+    assert_eq!(failed.state, GithubSyncState::Failed);
+    assert!(failed.error.is_some(), "the reason is still reported");
+    assert_eq!(
+        failed.retry_at_ms, None,
+        "manual mode retries nothing on its own, and promising otherwise is \
+         the same lie as a button with nothing to do"
+    );
+}
+
+/// A push by hand that failed used to update nothing at all — `push` never
+/// recorded the failure — so the pane went on saying "not synced to GitHub yet",
+/// and a second, different failure still showed the first one's reason.
+#[test]
+fn a_push_by_hand_that_failed_is_reported_with_the_reason_it_failed_for() {
+    let r = rig(MANUAL, create_script());
+    r.exporter.push(&r.meeting).expect("the first push lands");
+    let synced = r.exporter.sync_status(&r.meeting);
+    assert_eq!(synced.state, GithubSyncState::Synced);
+    let landed_at = synced.pushed_at_ms.expect("a synced meeting says when");
+
+    r.gh.script
+        .lock()
+        .unwrap()
+        .extend([ok(""), ok(PRIVATE_REPO), ok("oldsha42"), http_err(422)]);
+    assert!(r.exporter.push(&r.meeting).is_err());
+    let failed = r.exporter.sync_status(&r.meeting);
+    assert_eq!(failed.state, GithubSyncState::Failed);
+    assert!(
+        failed.error.unwrap_or_default().contains("422"),
+        "the reason the newest attempt gave, rather than silence"
+    );
+    assert_eq!(
+        failed.pushed_at_ms,
+        Some(landed_at),
+        "a meeting that synced before and failed on a later change must not \
+         read as one that was never synced"
+    );
+
+    r.gh.script
+        .lock()
+        .unwrap()
+        .extend([ok(""), ok(PRIVATE_REPO), ok("oldsha42"), http_err(500)]);
+    assert!(r.exporter.push(&r.meeting).is_err());
+    assert!(
+        r.exporter
+            .sync_status(&r.meeting)
+            .error
+            .unwrap_or_default()
+            .contains("500"),
+        "a second, different failure must not keep showing the first one's reason"
+    );
+}
+
+/// F4. An environment-wide refusal — no gh, no login, the repository gone or
+/// public — stops the round and was recorded nowhere the state could see it, so
+/// every meeting said "not synced to GitHub yet" forever while `fotwd.log` alone
+/// knew why.
+#[test]
+fn an_environment_wide_refusal_is_reported_on_the_meetings_it_blocks() {
+    let mut db = library();
+    let synced = ready_meeting(&mut db, "Already there", 1_755_734_400_000);
+    let owed = ready_meeting(&mut db, "Still owed", 1_755_734_500_000);
+    mark_enriched(&mut db, &[&synced, &owed]);
+    store_settings(&mut db, AUTO_SINCE_EPOCH);
+    let gh = ScriptedGh::scripted(create_script());
+    let dir = tempfile::TempDir::new().unwrap();
+    let exporter = GithubExporter::new(
+        db,
+        dir.path().join("sessions"),
+        Arc::clone(&gh) as Arc<dyn GhRunner>,
+    );
+    exporter
+        .push(&synced)
+        .expect("one meeting is already in the repository");
+
+    // And now nobody is logged in: the round refuses before it writes anything.
+    gh.script.lock().unwrap().push_back(Ok(GhOutput {
+        status: 1,
+        stdout: String::new(),
+        stderr: "You are not logged into any GitHub hosts.".to_owned(),
+    }));
+    assert_eq!(exporter.auto_push_pending(), 0);
+
+    let blocked = exporter.sync_status(&owed);
+    assert_eq!(
+        blocked.state,
+        GithubSyncState::Never,
+        "the meeting is still unpushed; what changed is that we can say why"
+    );
+    assert_eq!(
+        blocked.blocked.as_deref(),
+        Some("gh_not_authenticated"),
+        "the same stable code the dashboard's error table is keyed by"
+    );
+    assert!(
+        blocked.blocked_at_ms.unwrap_or(0) > 0,
+        "and when it was last tried"
+    );
+    assert_eq!(
+        blocked.retry_at_ms, None,
+        "no meeting enters a retry window for a failure that is not its own"
+    );
+    assert_eq!(
+        exporter.sync_status(&synced).blocked,
+        None,
+        "a meeting the worker does not owe is not waiting on anything"
+    );
+
+    // Fixed: the first push that lands clears it.
+    gh.script.lock().unwrap().extend(create_script());
+    assert_eq!(exporter.auto_push_pending(), 1);
+    assert_eq!(
+        exporter.sync_status(&owed).blocked,
+        None,
+        "a stall that has been pushed through is over"
+    );
+}
+
+/// A `gh` that stops inside its first invocation until it is released, so a
+/// second push can collide with a first that is genuinely in flight.
+struct BlockingGh {
+    calls: Mutex<usize>,
+    entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl GhRunner for BlockingGh {
+    fn run(&self, _args: &[String], _stdin: Option<&[u8]>) -> Result<GhOutput, String> {
+        let n = {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            *calls
+        };
+        if n == 1 {
+            if let Some(tx) = self.entered.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            let _ = self.release.lock().unwrap().recv();
+        }
+        match (n - 1) % 4 {
+            1 => ok(PRIVATE_REPO),
+            2 => http_err(404),
+            _ => ok(PUT_OK),
+        }
+    }
+}
+
+/// The in-flight claim exists so the worker and a person cannot commit one
+/// meeting twice. Its refusal is not a failure *of the meeting*: the push it
+/// collided with is still running, and will land. Parking the meeting for five
+/// minutes over it — and showing "this meeting did not sync" while the push that
+/// did sync it was in flight — is the opposite of what the claim is for.
+#[test]
+fn a_push_refused_because_another_is_already_running_parks_nothing() {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let gh = Arc::new(BlockingGh {
+        calls: Mutex::new(0),
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(release_rx),
+    });
+
+    let mut db = library();
+    let meeting = enriched_meeting(&mut db, "Weekly Standup", 1_755_734_400_000);
+    store_settings(&mut db, AUTO_SINCE_EPOCH);
+    let dir = tempfile::TempDir::new().unwrap();
+    let exporter = Arc::new(GithubExporter::new(
+        db,
+        dir.path().join("sessions"),
+        Arc::clone(&gh) as Arc<dyn GhRunner>,
+    ));
+
+    // A push from the dashboard, stopped inside its first gh call.
+    let by_hand = {
+        let exporter = Arc::clone(&exporter);
+        let id = meeting.clone();
+        std::thread::spawn(move || exporter.push(&id))
+    };
+    entered_rx.recv().expect("the push by hand reached gh");
+
+    // The worker's round comes round while that push is still in flight, and is
+    // refused by the claim.
+    assert_eq!(exporter.auto_push_pending(), 0);
+    release_tx.send(()).unwrap();
+    by_hand
+        .join()
+        .unwrap()
+        .expect("the push that held the claim lands");
+
+    let status = exporter.sync_status(&meeting);
+    assert_eq!(
+        status.state,
+        GithubSyncState::Synced,
+        "the push that landed is the state of this meeting: {status:?}"
+    );
+    assert!(
+        status.error.is_none(),
+        "nothing was wrong with this meeting"
+    );
+}
+
+/// The retry table used to live only in memory, so a daemon restart turned a
+/// failed meeting back into "not synced to GitHub yet" with the reason nowhere
+/// on screen — the same silence #112 exists to end. It is written beside the
+/// push receipts instead, which also means a restart loop cannot walk around the
+/// backoff window and hammer GitHub once a minute.
+#[test]
+fn a_failed_meeting_still_reports_its_reason_after_a_restart() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("library.db");
+    let key = DbKey::from_bytes([0x01; 32]);
+    let mut writer = Db::open(&path, &key).unwrap();
+    let id = enriched_meeting(&mut writer, "Planning", 1_755_734_400_000);
+    store_settings(&mut writer, AUTO_SINCE_EPOCH);
+    drop(writer);
+
+    let before = GithubExporter::new(
+        Db::open(&path, &key).unwrap(),
+        dir.path().join("sessions"),
+        ScriptedGh::scripted(vec![ok(""), ok(PRIVATE_REPO), http_err(404), http_err(422)])
+            as Arc<dyn GhRunner>,
+    );
+    assert_eq!(before.auto_push_pending(), 0, "the PUT was refused");
+    let failed = before.sync_status(&id);
+    assert_eq!(failed.state, GithubSyncState::Failed);
+    drop(before);
+
+    // A new daemon over the same library: the same answer, not a shrug.
+    let after = GithubExporter::new(
+        Db::open(&path, &key).unwrap(),
+        dir.path().join("sessions"),
+        ScriptedGh::scripted(Vec::new()) as Arc<dyn GhRunner>,
+    );
+    let restarted = after.sync_status(&id);
+    assert_eq!(
+        restarted.state,
+        GithubSyncState::Failed,
+        "a restart is not a recovery"
+    );
+    assert_eq!(restarted.error, failed.error, "and it still says why");
+    assert_eq!(
+        restarted.retry_at_ms, failed.retry_at_ms,
+        "including the window it is already waiting out"
+    );
+}
+
 #[test]
 fn manual_mode_never_pushes_on_its_own() {
     let r = rig(MANUAL, create_script());

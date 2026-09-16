@@ -155,11 +155,39 @@ pub struct GithubSyncStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// When the worker will try this meeting again on its own, epoch
-    /// milliseconds. Present only for [`GithubSyncState::Failed`]: the retry is
-    /// automatic, so the line can say so rather than implying that pressing
-    /// something is the only way back.
+    /// milliseconds. Present only for [`GithubSyncState::Failed`] **and only
+    /// when the worker will in fact act**: an automatic retry belongs to auto
+    /// mode, and a meeting outside what auto mode owes is retried by nobody.
+    /// Promising otherwise is the same lie as the button that had nothing to do.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_at_ms: Option<u64>,
+    /// Whether the auto worker will push this meeting on its own (#112).
+    ///
+    /// False for a meeting no automatic pass will ever reach: manual mode, or a
+    /// meeting that started before [`GithubSettings::auto_since_ms`] while
+    /// [`GithubSettings::sync_whole_library`] is off. The worker bounds what it
+    /// owes by all three of `mode`, the stamp and the switch, so a state that
+    /// consulted none of them reported the same thing for a meeting about to be
+    /// pushed and one that will never be touched — and the dashboard turned that
+    /// into a promise the daemon does not keep. The one control the pane offers
+    /// is drawn for exactly the meetings this is false for.
+    pub scheduled: bool,
+    /// The last refusal that answers for *every* meeting, as the stable code
+    /// from [`GithubError`] — `gh_missing`, `gh_not_authenticated`,
+    /// `repo_not_found`, `github_export_disabled` or `repo_is_public` (#112).
+    ///
+    /// Present only for a meeting the worker owes and cannot push. None of these
+    /// is one meeting's fault, so no meeting enters a retry window for them;
+    /// before this the round logged the reason and every meeting went on saying
+    /// "not synced yet" forever, with the log the only place that knew why.
+    /// Nothing here promises an automatic retry, and the first push that lands
+    /// clears it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<String>,
+    /// When that refusal was last seen, epoch milliseconds — how fresh the
+    /// reason beside it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_at_ms: Option<u64>,
 }
 
 impl GithubSyncStatus {
@@ -594,12 +622,73 @@ mod tests {
             pushed_at_ms: None,
             error: Some("gh: Validation Failed (HTTP 422)".to_owned()),
             retry_at_ms: Some(1_787_372_496_265),
+            ..GithubSyncStatus::off()
         };
         let json = serde_json::to_value(&failed).unwrap();
         assert_eq!(json["state"], "failed");
         assert_eq!(json["error"], "gh: Validation Failed (HTTP 422)");
         assert_eq!(json["retry_at_ms"], 1_787_372_496_265_u64);
         assert!(json.get("pushed_at_ms").is_none());
+    }
+
+    /// F1, at the wire level. A status written by a build that had no such key
+    /// described a worker that owed every meeting, so the absent key has to read
+    /// as `true`: the false answer is the one that draws a control, and a
+    /// control drawn beside a worker that is already going to push is the
+    /// duplicate commit this issue exists to stop.
+    #[test]
+    fn a_status_with_no_scheduled_key_reads_as_scheduled() {
+        let old: GithubSyncStatus = serde_json::from_str(r#"{"state":"never"}"#).unwrap();
+        assert!(
+            old.scheduled,
+            "a status from before the field existed must not sprout a control"
+        );
+        assert_eq!(old.state, GithubSyncState::Never);
+        assert!(
+            !GithubSyncStatus::off().scheduled,
+            "the deliberate exception: a switched-off target pushes nothing at all"
+        );
+
+        // And the key is always written, so a `false` cannot read back as true.
+        let by_hand = GithubSyncStatus {
+            state: GithubSyncState::Never,
+            scheduled: false,
+            ..GithubSyncStatus::off()
+        };
+        let json = serde_json::to_value(&by_hand).unwrap();
+        assert_eq!(json["scheduled"], false);
+        assert_eq!(
+            serde_json::from_value::<GithubSyncStatus>(json).unwrap(),
+            by_hand
+        );
+    }
+
+    /// F4, at the wire level. The refusal that answers for every meeting travels
+    /// as the same stable code the dashboard's error table is already keyed by,
+    /// and carries no retry time: nothing is scheduled to retry it.
+    #[test]
+    fn a_blocked_status_carries_an_error_code_and_no_retry_time() {
+        let blocked = GithubSyncStatus {
+            state: GithubSyncState::Never,
+            blocked: Some(GithubError::NotAuthenticated.to_string()),
+            blocked_at_ms: Some(1_787_372_196_265),
+            ..GithubSyncStatus::off()
+        };
+        let json = serde_json::to_value(&blocked).unwrap();
+        assert_eq!(json["blocked"], "gh_not_authenticated");
+        assert_eq!(json["blocked_at_ms"], 1_787_372_196_265_u64);
+        assert!(
+            json.get("retry_at_ms").is_none(),
+            "an environment failure parks no meeting, so nothing will retry it"
+        );
+
+        let off = serde_json::to_value(GithubSyncStatus::off()).unwrap();
+        for absent in ["blocked", "blocked_at_ms"] {
+            assert!(
+                off.get(absent).is_none(),
+                "{absent} must be omitted rather than null"
+            );
+        }
     }
 
     #[test]

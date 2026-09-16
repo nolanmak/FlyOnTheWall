@@ -757,6 +757,7 @@ impl GithubExport for GithubExporter {
                 pushed_at_ms: receipt.map(|r| r.pushed_at_ms),
                 error: Some(reason),
                 retry_at_ms: Some(retry_at_ms),
+                ..GithubSyncStatus::off()
             };
         }
         let Some(receipt) = receipt else {
@@ -785,6 +786,7 @@ impl GithubExport for GithubExporter {
             pushed_at_ms: Some(receipt.pushed_at_ms),
             error: None,
             retry_at_ms: None,
+            ..GithubSyncStatus::off()
         }
     }
 

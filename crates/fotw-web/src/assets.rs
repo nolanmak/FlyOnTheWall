@@ -528,6 +528,37 @@ mod tests {
         );
     }
 
+    /// #112. The failed state's message is `gh`'s own stderr, which can carry a
+    /// long unbroken token — a URL, a base64 fragment, a header name. Without a
+    /// wrap rule one of those widens the detail pane instead of folding inside
+    /// it. `.gh-sync` is its own rule rather than the last selector of a group,
+    /// which is what `css_rule` needs to find it.
+    #[test]
+    fn a_sync_line_folds_a_long_unbroken_error_instead_of_widening_the_pane() {
+        let css = asset_text("app.css");
+        let rule = css_rule(&css, ".gh-sync");
+        assert!(
+            rule.contains("overflow-wrap"),
+            "gh's stderr reaches this line verbatim: {rule}"
+        );
+    }
+
+    /// #112. `github.js` draws two different things for a request that did not
+    /// answer: a 404 is this build having no GitHub export at all — the
+    /// convention the recorder and the settings form use — and anything else is
+    /// a problem worth reporting. The only thing that can tell them apart is the
+    /// status `api()` attaches to the error it throws, so a 500, an expired
+    /// token or a daemon restart stops hiding a meeting's state behind "there is
+    /// no such feature".
+    #[test]
+    fn a_failed_request_carries_its_status_to_the_caller() {
+        let js = asset_text("app.js");
+        assert!(
+            js.contains("failed.status = res.status"),
+            "without the status, every failure reads as a missing control"
+        );
+    }
+
     #[test]
     fn an_unknown_extension_is_not_served_as_html() {
         assert_eq!(content_type("x.bin"), "application/octet-stream");

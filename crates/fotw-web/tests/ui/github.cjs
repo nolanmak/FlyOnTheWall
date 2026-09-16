@@ -4,7 +4,9 @@
 // push button any more, in any state, because the worker owns every push and a
 // button on a synced meeting invited a second commit of a meeting already in
 // the repository. The positive half is that each state says one true thing, and
-// that exactly one of them — failed — offers a control.
+// that a control appears exactly where the worker will *not* do the job — so a
+// reader can tell "nothing to do, it is coming" from "nothing happens unless
+// you click".
 //
 // The same shape as documents.cjs: a small hand-rolled DOM, because the point
 // is which nodes get built and what they say, and neither jsdom nor a browser
@@ -25,6 +27,9 @@ function harness() {
       this.listeners = {};
       this.attributes = {};
     }
+    // The pane is reused for every meeting, so a node's own answer to "am I
+    // still on screen" is what a load that arrived late has to consult.
+    get isConnected() { return this === body || Boolean(this.parent?.isConnected); }
     get firstChild() { return this.children[0]; }
     get textContent() { return (this.ownText || '') + this.children.map(c => c.textContent).join(''); }
     set textContent(v) { this.ownText = String(v); this.children = []; }
@@ -39,10 +44,12 @@ function harness() {
   const body = new Element('body');
   const requests = [];
   const said = [];
-  // What `GET /api/meetings/{id}/github-sync` answers, per test.
+  // What `GET /api/meetings/{id}/github-sync` answers, per test. A function may
+  // stand in for the value, so a test can hold a response open or throw.
   let status = { state: 'off' };
-  // What a retry's POST answers.
+  // What a push answers, under the same rule.
   let pushResult = { receipt: { repo: 'octocat/notes', path: 'meetings/x.md' } };
+  const answer = (value, requested) => (typeof value === 'function' ? value(requested) : value);
   const ctx = vm.createContext({
     Date, Set, Map, Intl,
     document: {
@@ -56,7 +63,7 @@ function harness() {
     api: async (requested, opts) => {
       const method = (opts && opts.method) || 'GET';
       requests.push({ path: requested, method });
-      return method === 'POST' ? pushResult : status;
+      return method === 'POST' ? answer(pushResult, requested) : answer(status, requested);
     },
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../../ui/github.js'), 'utf8'), ctx);
@@ -72,7 +79,13 @@ function harness() {
       ctx.mountGithubSync({ meeting }, host);
       return host;
     },
+    // The pane `renderDetail` reuses for every meeting, and what it does to it
+    // before drawing the next one.
+    host: () => body.appendChild(new Element('div')),
+    mountInto: (host, meeting) => ctx.mountGithubSync({ meeting }, host),
+    clearHost: host => { while (host.firstChild) host.removeChild(host.firstChild); },
     buttons: () => all().filter(n => n.tagName === 'button'),
+    panels: () => all().filter(n => n.className === 'gh-sync-panel'),
     lines: () => all().filter(n => n.className === 'gh-sync').map(n => n.textContent),
   };
 }
@@ -84,12 +97,12 @@ const PUSHED_AT = Date.parse('2026-08-22T04:16:36Z');
 // A1. The whole point of the issue: the dashboard has no always-present push
 // button. Every state is checked, because the button used to be drawn from the
 // settings alone and so appeared in all of them.
-test('no meeting state offers a push button', async () => {
+test('no meeting the worker will sync offers a push button', async () => {
   for (const state of [
     { state: 'off' },
-    { state: 'never' },
-    { state: 'synced', repo: 'octocat/notes', pushed_at_ms: PUSHED_AT },
-    { state: 'changed', repo: 'octocat/notes', pushed_at_ms: PUSHED_AT },
+    { state: 'never', scheduled: true },
+    { state: 'synced', repo: 'octocat/notes', pushed_at_ms: PUSHED_AT, scheduled: true },
+    { state: 'changed', repo: 'octocat/notes', pushed_at_ms: PUSHED_AT, scheduled: true },
   ]) {
     const w = harness();
     w.status(state);
@@ -216,4 +229,193 @@ test('a meeting that is not ready is not asked about at all', async () => {
   await flush();
   assert.deepEqual(w.requests, []);
   assert.equal(host.children.length, 0);
+});
+
+// ------------------------------------------------- the scope of a pass (#112)
+
+// F3. A meeting no automatic pass will reach is the one case where a person has
+// to be able to act: manual mode, or a meeting recorded before automatic pushes
+// were switched on. The control exists exactly there, and the line says plainly
+// that nothing is coming — the difference the pane could not express while
+// every state read the same.
+test('a meeting no pass will sync offers Sync now and says nothing is coming', async () => {
+  const w = harness();
+  w.status({ state: 'never', scheduled: false });
+  w.mount();
+  await flush();
+  assert.deepEqual(w.buttons().map(b => b.textContent), ['Sync now']);
+  assert.match(w.lines()[0], /No automatic pass/);
+
+  w.status({ state: 'synced', repo: 'octocat/notes', pushed_at_ms: PUSHED_AT, scheduled: false });
+  await w.buttons()[0].click();
+  await flush();
+  assert.deepEqual(
+    w.requests.filter(r => r.method === 'POST').map(r => r.path),
+    ['/api/meetings/m1/github-push'],
+    'Sync now is a push of this meeting, now',
+  );
+  assert.deepEqual(w.buttons(), [], 'a meeting that is now in the repository offers nothing');
+});
+
+// The other half of the same distinction: a meeting the worker will take needs
+// no control, and says that it is coming rather than saying nothing.
+test('a meeting a pass will sync offers nothing and says it is coming', async () => {
+  const w = harness();
+  w.status({ state: 'never', scheduled: true });
+  w.mount();
+  await flush();
+  assert.deepEqual(w.buttons(), [], 'the worker owns this push; a control would duplicate it');
+  assert.match(w.lines()[0], /next pass/);
+});
+
+test('a changed meeting outside every pass offers Sync now', async () => {
+  const w = harness();
+  w.status({ state: 'changed', repo: 'octocat/notes', pushed_at_ms: PUSHED_AT, scheduled: false });
+  w.mount();
+  await flush();
+  assert.deepEqual(w.buttons().map(b => b.textContent), ['Sync now']);
+  assert.match(w.lines()[0], /No automatic pass/);
+  assert.doesNotMatch(w.lines()[0], /next pass will sync it again/);
+});
+
+// F2. The promise of an automatic retry belongs to the daemon, and it makes it
+// by sending a retry time. Without one, nothing is going to happen on its own,
+// and the line must not suggest otherwise.
+test('a failure nobody will retry says so, and still offers Retry', async () => {
+  const w = harness();
+  w.status({ state: 'failed', repo: 'octocat/notes', error: 'HTTP 422', scheduled: false });
+  w.mount();
+  await flush();
+  assert.deepEqual(w.buttons().map(b => b.textContent), ['Retry']);
+  assert.match(w.lines()[0], /not be retried/i);
+  assert.doesNotMatch(w.lines()[0], /will try again on its own/);
+});
+
+// A meeting that synced before and failed on a later change is not a meeting
+// that was never synced, and the older copy in the repository is still there.
+test('a meeting that synced before and failed later says when it last synced', async () => {
+  const w = harness();
+  w.status({
+    state: 'failed', repo: 'octocat/notes', error: 'HTTP 422',
+    pushed_at_ms: PUSHED_AT, retry_at_ms: PUSHED_AT + 5 * 60 * 1000,
+  });
+  w.mount();
+  await flush();
+  const line = w.lines()[0];
+  assert.match(line, /HTTP 422/);
+  assert.match(line, /last synced/i);
+  assert.match(line, new RegExp(String(new Date(PUSHED_AT).getFullYear())));
+});
+
+// F4. The refusals that answer for every meeting — no gh, no login, the
+// repository gone or public — are not this meeting's fault, and nothing retries
+// them on a schedule. The pane says what is wrong instead of "not synced to
+// GitHub yet" forever.
+test('a meeting blocked by the environment names the reason and promises no retry', async () => {
+  const w = harness();
+  w.status({
+    state: 'never', scheduled: true,
+    blocked: 'gh_not_authenticated', blocked_at_ms: PUSHED_AT,
+  });
+  w.mount();
+  await flush();
+  const line = w.lines()[0];
+  assert.match(line, /gh auth login/, 'the machine code is explained, as a push failure is');
+  assert.doesNotMatch(line, /will try again on its own/);
+  assert.deepEqual(w.buttons(), [], 'nothing a click could do while gh has no login');
+});
+
+// ------------------------------------------------ the pane it lives in (#112)
+
+// F5. `#detail` is one node, reused for every meeting, and `renderDetail`
+// clears it. The panel is owned before the first await, so a response that
+// arrives after the reader moved on has nothing on screen to append to. Two
+// overlapping loads used to leave two sync lines in the pane.
+test('switching meetings mid-load leaves exactly one sync line', async () => {
+  const w = harness();
+  const pending = [];
+  w.status(() => new Promise(resolve => { pending.push(resolve); }));
+  const host = w.host();
+  w.mountInto(host, { id: 'm1', state: 'ready' });
+  // What renderDetail does before drawing the next meeting: same node, emptied.
+  w.clearHost(host);
+  w.mountInto(host, { id: 'm2', state: 'ready' });
+
+  pending[0]({ state: 'never', scheduled: true });
+  pending[1]({ state: 'synced', repo: 'octocat/notes', pushed_at_ms: PUSHED_AT, scheduled: true });
+  await flush();
+  await flush();
+
+  assert.equal(w.lines().length, 1, 'the abandoned load must not add a second line');
+  assert.match(w.lines()[0], /Synced to octocat\/notes/, 'and the one left is the meeting on screen');
+});
+
+// A control whose push is in flight must not take a second click: that is the
+// double commit the claim in the daemon exists to refuse, arriving from the one
+// place that can avoid making the request at all.
+test('the control is disabled while its push is in flight', async () => {
+  const w = harness();
+  w.status({ state: 'failed', repo: 'octocat/notes', error: 'HTTP 422', retry_at_ms: PUSHED_AT });
+  w.mount();
+  await flush();
+  let finish;
+  w.pushResult(() => new Promise(resolve => { finish = resolve; }));
+  const retrying = w.buttons()[0].click();
+  assert.equal(w.buttons()[0].disabled, true, 'a second click would push the same meeting twice');
+  finish({ receipt: { repo: 'octocat/notes', path: 'meetings/x.md' } });
+  await retrying;
+  await flush();
+  assert.equal(
+    w.requests.filter(r => r.method === 'POST').length, 1,
+    'one click, one push',
+  );
+});
+
+// The repository a retry is aimed at is the one the failure is about, and the
+// state carries it. Reading it from the settings form instead names whatever is
+// configured right now, which is not necessarily the same repository.
+test('a retry names the repository the failure is about', async () => {
+  const w = harness();
+  w.status({ state: 'failed', repo: 'work-org/minutes', error: 'HTTP 422' });
+  w.mount();
+  await flush();
+  await w.buttons()[0].click();
+  await flush();
+  assert.ok(
+    w.said.some(m => /work-org\/minutes/.test(m)),
+    'the state names the repository the push failed against: ' + w.said.join(' | '),
+  );
+});
+
+// A 404 is this build having no GitHub export at all — the convention the
+// recorder and the settings form use. Anything else is a problem worth saying:
+// a 500, an expired token or a daemon restart must not render as "there is no
+// such feature" and take the meeting's state off screen.
+test('a 404 removes the panel and any other failure reports a problem', async () => {
+  const absent = harness();
+  absent.status(() => { const e = new Error('request failed'); e.status = 404; throw e; });
+  const host = absent.mount();
+  await flush();
+  assert.equal(host.children.length, 0, 'no GitHub export, no section');
+
+  const broken = harness();
+  broken.status(() => { const e = new Error('request failed'); e.status = 500; throw e; });
+  broken.mount();
+  await flush();
+  assert.equal(broken.lines().length, 1);
+  assert.match(broken.lines()[0], /could not be read|Could not/i);
+});
+
+// Out of context "Retry" says nothing about what is being retried, and an
+// unnamed <section> is one more anonymous group in a pane that already has
+// several.
+test('the panel and its control have accessible names that say what they are', async () => {
+  const w = harness();
+  w.status({ state: 'failed', repo: 'octocat/notes', error: 'HTTP 422' });
+  w.mount();
+  await flush();
+  assert.match(w.panels()[0].attributes['aria-label'] || '', /GitHub/);
+  const label = w.buttons()[0].attributes['aria-label'] || '';
+  assert.match(label, /GitHub/, 'the control names what it acts on: ' + label);
+  assert.notEqual(label, 'Retry');
 });
