@@ -617,6 +617,28 @@ impl CaptureSupervisor {
         result
     }
 
+    /// Hand the running tap out **without stopping it**, leaving the supervisor
+    /// idle.
+    ///
+    /// [`stop`](Self::stop) calls `tap.stop()` inline, which is fine on a
+    /// thread that may block: the CLI's pump owns its supervisors and stops
+    /// them itself. The daemon cannot. A wedged Core Audio device blocks in
+    /// `stop()`, and the daemon's finalize path (#85) is built to close taps on
+    /// a `spawn_blocking` thread under its own deadline so that a stuck device
+    /// strands one background task rather than the pump. This hands the live tap
+    /// out so the caller can close it there; the supervisor keeps none of it.
+    ///
+    /// In every other respect this is [`stop`](Self::stop): the supervisor goes
+    /// [`State::Idle`], will not rebuild, and clears its debounce. Returns
+    /// `None` if no tap was running. The returned tap is still delivering into
+    /// its sink until the caller stops or drops it.
+    pub fn take_running_tap(&mut self) -> Option<Box<dyn AudioTap>> {
+        let tap = self.tap.take();
+        self.state = State::Idle;
+        self.debounce.clear();
+        tap
+    }
+
     /// The current authoritative format, if a tap is running.
     #[must_use]
     pub const fn format(&self) -> Option<StreamFormat> {
@@ -1004,6 +1026,62 @@ mod tests {
             quiet
                 .user_message()
                 .contains("Screen & System Audio Recording")
+        );
+    }
+
+    #[test]
+    fn take_running_tap_releases_the_tap_without_stopping_it() {
+        use crate::testing::{FakeTap, ManualClock, SinkHandle, TapEvent, TapLog};
+
+        let clock = ManualClock::new();
+        let log = TapLog::new();
+        let sink = SinkHandle::new();
+        let id = TapId::system_default();
+        let hint = StreamFormat::new(48_000, 2, crate::SampleFormat::F32);
+
+        let open_log = log.clone();
+        let open_id = id.clone();
+        let mut sup = CaptureSupervisor::new(
+            SupervisorConfig {
+                id,
+                ..SupervisorConfig::default()
+            },
+            clock as Arc<dyn Clock>,
+            move || {
+                Ok(Box::new(FakeTap::new(open_id.clone(), hint).with_log(open_log.clone()))
+                    as Box<dyn AudioTap>)
+            },
+            move || sink.sink(),
+        );
+        sup.start().unwrap();
+        // Ignore the Opened/Started noise from bringing the tap up.
+        log.clear();
+
+        let tap = sup
+            .take_running_tap()
+            .expect("a running tap is handed back out");
+
+        // The point of the method: the supervisor let go of the tap but never
+        // stopped it. The caller now owns closing it — on the daemon that is a
+        // deadline-bounded spawn_blocking, so a wedged device cannot block here.
+        assert!(
+            !log.events().contains(&TapEvent::Stopped),
+            "take_running_tap must not stop the tap; log was {:?}",
+            log.events()
+        );
+        // Idle and idempotent: a stopped/emptied supervisor never rebuilds and
+        // has nothing more to give.
+        assert!(
+            sup.take_running_tap().is_none(),
+            "there is only one tap to take"
+        );
+
+        // Dropping the returned tap is what actually closes it, and only now.
+        drop(tap);
+        assert!(
+            log.events().contains(&TapEvent::Dropped),
+            "the caller's drop is the close; log was {:?}",
+            log.events()
         );
     }
 

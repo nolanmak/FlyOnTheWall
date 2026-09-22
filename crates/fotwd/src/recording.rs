@@ -63,7 +63,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use fotw_audio::{AudioPlatform, AudioTap, DeviceId, FormatRequest, SystemScope, platform};
+use fotw_audio::clock::{Clock, HostClock};
+use fotw_audio::{AudioPlatform, AudioTap, platform};
 use fotw_secrets::KeyStore;
 use fotw_shell::StartOrigin;
 
@@ -89,6 +90,45 @@ use crate::{diag, journal};
 /// same `FileAudioSource` the session tests use.
 pub type TapOpener =
     Box<dyn Fn() -> Result<(Box<dyn AudioTap>, Option<Box<dyn AudioTap>>), String> + Send + Sync>;
+
+/// How this recorder captures audio.
+///
+/// The daemon and its tests take different paths through the *same* session
+/// machinery. Production ([`DaemonRecorder::new`]) supervises taps it opens
+/// itself, so a Core Audio process tap that stalls mid-meeting is rebuilt in
+/// place rather than recording silence to the end (docs/REQUIREMENTS.md 6.4,
+/// #101) — the recovery the CLI (`fotw::record`) has always had and the daemon
+/// never wired. The tests ([`DaemonRecorder::with_parts`]) hand the session
+/// pre-started taps over a `FileAudioSource`, which never stalls and needs no
+/// supervisor; keeping that path is what lets the daemon's state machine run on
+/// a CI box with no audio device.
+enum CaptureMode {
+    /// Taps opened once, up front, and handed to the session pre-started. No
+    /// live rebuild.
+    Prebuilt(TapOpener),
+    /// The backend and clock the session builds a [`fotw_audio::supervisor::CaptureSupervisor`]
+    /// per leg from, rebuilding a stalled tap for the life of the meeting.
+    Supervised {
+        plat: Arc<dyn AudioPlatform>,
+        clock: Arc<dyn Clock>,
+    },
+}
+
+/// One session's capture payload, resolved from [`CaptureMode`] at `start()` and
+/// moved onto the session task. The prebuilt taps are opened before the task is
+/// spawned so an open failure is reported synchronously; the supervised backend
+/// opens its taps inside the task, where a failure surfaces through the ready
+/// deadline exactly as a wedged prebuilt tap's would.
+enum SessionCapture {
+    Prebuilt {
+        system: Box<dyn AudioTap>,
+        mic: Option<Box<dyn AudioTap>>,
+    },
+    Supervised {
+        plat: Arc<dyn AudioPlatform>,
+        clock: Arc<dyn Clock>,
+    },
+}
 
 /// What to do with a finished session. Injectable for the same reason.
 ///
@@ -180,7 +220,7 @@ struct Live {
 pub struct DaemonRecorder {
     root: PathBuf,
     handle: tokio::runtime::Handle,
-    open_taps: TapOpener,
+    capture: CaptureMode,
     transcription: TranscriptionFactory,
     finish: Arc<Finisher>,
     ceiling: Duration,
@@ -236,23 +276,21 @@ impl DaemonRecorder {
         // test that injects its own gets no announcements — which is right:
         // there is no hub behind them.
         let finish_ready = on_ready.clone();
-        Self::with_parts(
+        // The real daemon supervises the taps it opens itself, so a stalled
+        // Core Audio process tap is rebuilt mid-meeting instead of recording
+        // silence to the end (docs/REQUIREMENTS.md 6.4, #101). The session
+        // builds the per-leg supervisors from this backend and clock, opening
+        // the taps inside its own task; a machine with no input device still
+        // records the far end because the mic leg is optional there too.
+        Self::assemble(
             root,
             handle,
             on_segment,
             on_ready,
-            Box::new(|| {
-                let plat = platform::host();
-                let system = plat
-                    .open_system(SystemScope::DefaultOutputMix, FormatRequest::any())
-                    .map_err(|e| format!("could not open the system tap: {e}"))?;
-                // Optional on purpose: a machine with no input device should
-                // still record the far end rather than refuse to start.
-                let mic = plat
-                    .open_mic(&DeviceId::new("default"), FormatRequest::any())
-                    .ok();
-                Ok((system, mic))
-            }),
+            CaptureMode::Supervised {
+                plat: Arc::new(platform::host()),
+                clock: Arc::new(HostClock),
+            },
             Box::new(keychain_transcription),
             Box::new(move |root, outcome| persist_and_promote(root, outcome, &finish_ready)),
             UI_CEILING,
@@ -261,6 +299,10 @@ impl DaemonRecorder {
     }
 
     /// [`DaemonRecorder::new`] with every dependency named, for tests.
+    ///
+    /// The taps are handed in pre-startable rather than supervised: a
+    /// `FileAudioSource` never stalls, so there is nothing to rebuild, and the
+    /// daemon's state machine can run on a CI box with no audio device.
     #[must_use]
     #[allow(clippy::too_many_arguments)] // every dependency named, as the tests require
     pub fn with_parts(
@@ -274,10 +316,38 @@ impl DaemonRecorder {
         ceiling: Duration,
         ready_deadline: Duration,
     ) -> Self {
+        Self::assemble(
+            root,
+            handle,
+            on_segment,
+            on_ready,
+            CaptureMode::Prebuilt(open_taps),
+            transcription,
+            finish,
+            ceiling,
+            ready_deadline,
+        )
+    }
+
+    /// The shared body of [`new`](Self::new) and [`with_parts`](Self::with_parts):
+    /// they differ only in how audio is captured, so the one field that varies
+    /// is passed in and everything else is built the same way.
+    #[allow(clippy::too_many_arguments)] // the union of both public constructors
+    fn assemble(
+        root: PathBuf,
+        handle: tokio::runtime::Handle,
+        on_segment: SegmentTap,
+        on_ready: ReadyTap,
+        capture: CaptureMode,
+        transcription: TranscriptionFactory,
+        finish: Finisher,
+        ceiling: Duration,
+        ready_deadline: Duration,
+    ) -> Self {
         Self {
             root,
             handle,
-            open_taps,
+            capture,
             transcription,
             finish: Arc::new(finish),
             ceiling,
@@ -447,7 +517,20 @@ impl RecorderControl for DaemonRecorder {
                 RecorderError::Failed(format!("could not write the audit log: {e}"))
             })?;
 
-        let (system, mic) = (self.open_taps)().map_err(RecorderError::Failed)?;
+        // Prebuilt taps open here so an open failure is reported synchronously,
+        // before a slot is taken; the supervised backend opens its taps inside
+        // the session task, where a start failure surfaces through the same
+        // ready deadline a wedged prebuilt tap would (below).
+        let capture = match &self.capture {
+            CaptureMode::Prebuilt(open_taps) => {
+                let (system, mic) = open_taps().map_err(RecorderError::Failed)?;
+                SessionCapture::Prebuilt { system, mic }
+            }
+            CaptureMode::Supervised { plat, clock } => SessionCapture::Supervised {
+                plat: Arc::clone(plat),
+                clock: Arc::clone(clock),
+            },
+        };
 
         let transcription = (self.transcription)();
 
@@ -474,8 +557,7 @@ impl RecorderControl for DaemonRecorder {
 
         self.handle.spawn(spawn_session(
             root,
-            system,
-            mic,
+            capture,
             transcription,
             ceiling,
             control,
@@ -547,8 +629,7 @@ impl RecorderControl for DaemonRecorder {
 #[allow(clippy::too_many_arguments)]
 async fn spawn_session(
     root: PathBuf,
-    system: Box<dyn AudioTap>,
-    mic: Option<Box<dyn AudioTap>>,
+    capture: SessionCapture,
     transcription: Transcription,
     ceiling: Duration,
     control: SessionControl,
@@ -557,8 +638,18 @@ async fn spawn_session(
     finish: Arc<Finisher>,
     on_ready: ReadyTap,
 ) {
-    let outcome =
-        session::run_with_control(&root, system, mic, transcription, ceiling, control).await;
+    // Prebuilt taps run the session that hands them over pre-started; the
+    // supervised backend runs the one that builds a per-leg supervisor and
+    // rebuilds a stalled tap in place (#101). The finishing tail below is
+    // identical, so only the capture call differs.
+    let outcome = match capture {
+        SessionCapture::Prebuilt { system, mic } => {
+            session::run_with_control(&root, system, mic, transcription, ceiling, control).await
+        }
+        SessionCapture::Supervised { plat, clock } => {
+            session::run_supervised(&root, plat, clock, transcription, ceiling, control).await
+        }
+    };
 
     // A timer stop needs the same frozen clock as pressing Stop. Otherwise
     // encoding a long recording keeps showing a live microphone and timer.
