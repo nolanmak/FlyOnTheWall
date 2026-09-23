@@ -21,13 +21,13 @@
 //! [`DaemonRecorder::launched_as_app`] reports which of the two happened, so
 //! the UI can say so rather than producing a silent recording.
 //!
-//! # Why the slot stays occupied while a session finalizes
+//! # The finishing window, and why it is short
 //!
-//! `stop()` trips the signal and returns immediately: finalizing encodes the
-//! whole meeting to Opus, and an HTTP handler that waited for that would hang
-//! for minutes on a long call. But the slot is not cleared until the meeting
-//! is genuinely on disk, so a second Start during finalization is refused
-//! rather than opening a second tap on the same device.
+//! `stop()` trips the signal and returns immediately: an HTTP handler that
+//! waited for the wind-down would hang. The slot then stays occupied for as
+//! long as the wind-down takes — draining the ring and closing the taps — and
+//! a second Start during that window is refused rather than opening a second
+//! tap on the same device.
 //!
 //! What that window is *called* was the bug. It used to read `recording`,
 //! which is true of the slot and false of everything the user can see: the tap
@@ -36,28 +36,33 @@
 //! `finishing` there, with the clock frozen at the length the meeting ended on
 //! (#77). The guard is unchanged — `Finishing` is not `Idle`.
 //!
-//! # Where finishing ends
+//! # Why the slot frees before persist
 //!
-//! At persist-and-promote, not at the end of enrichment. Titles and summaries
-//! are derived work over a meeting that is already safe on disk, and the CLI
-//! deadline is 300 s per call with several calls for a chunked meeting, so
-//! waiting for them held the slot — and the user's clock — for minutes.
-//! [`enrich_and_announce`] therefore runs *after* the slot clears.
+//! The window closes the moment capture is safe on disk — before the meeting
+//! is encoded to Opus and written to the library, not after. `run_…` does not
+//! return until the WAL is written and the taps are closed-or-abandoned, both
+//! bounded by [`FinishDeadlines`] (#85), so by the time the session task can
+//! run its tail the recorder owes nothing to a device or a buffer. It frees
+//! the slot there, and persist-and-promote plus [`enrich_and_announce`] run
+//! afterward as pure background work over a file that is already safe. That is
+//! what lets the *next* meeting start while this one finalizes: persist alone
+//! is minutes on a long call, and holding the slot across it meant a user who
+//! stopped one meeting and reached for the next was refused for those minutes.
 //!
-//! And it ends *within a bounded time*, which it did not until #85. Every
-//! blocking step of a session's wind-down — closing the taps, waiting for the
-//! pump — now runs under [`FinishDeadlines`], because none of them could be
-//! cancelled once entered: a Core Audio HAL blocks in `stop()` for the same
-//! reason it blocks in `start()`, and a `pump.join()` with no clock turned
-//! that into a slot nobody could free. What `Finishing` *means* is unchanged;
-//! what changed is that it stops.
+//! That the wind-down ends *within a bounded time* is what makes freeing there
+//! safe, and it did not until #85. Every blocking step — closing the taps,
+//! waiting for the pump — now runs under [`FinishDeadlines`], because none of
+//! them could be cancelled once entered: a Core Audio HAL blocks in `stop()`
+//! for the same reason it blocks in `start()`, and a `pump.join()` with no
+//! clock turned that into a slot nobody could free.
 //!
-//! That is a real concurrency change and this header owns it: enrichment can
-//! now overlap live capture of the next meeting, and one meeting's enrichment
-//! can overlap another's. It is safe for the library — SQLite runs in WAL with
-//! a busy timeout (`fotw-store/src/db.rs`) and enrichment only writes the
-//! title and summary rows of a meeting that is already persisted — but it is
-//! real CPU beside live Opus encoding and streaming transcription.
+//! That is a real concurrency change and this header owns it: persist and
+//! enrichment can now overlap live capture of the next meeting, and one
+//! meeting's persist or enrichment can overlap another's. It is safe for the
+//! library — SQLite runs in WAL with a busy timeout (`fotw-store/src/db.rs`),
+//! each meeting writes its own session directory and rows, and retention keys
+//! off session-dir mtime rather than the slot — but it is real CPU beside live
+//! Opus encoding and streaming transcription.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -625,7 +630,8 @@ impl RecorderControl for DaemonRecorder {
     }
 }
 
-/// Run one session and clear the slot when it is genuinely finished.
+/// Run one session, free the slot the moment capture is safe on disk, then
+/// persist and enrich in the background with the slot already open.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_session(
     root: PathBuf,
@@ -651,12 +657,23 @@ async fn spawn_session(
         }
     };
 
-    // A timer stop needs the same frozen clock as pressing Stop. Otherwise
-    // encoding a long recording keeps showing a live microphone and timer.
-    if let Some(session) = live.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
-        && session.started_at_ms == started_at_ms
+    // Free the slot here — the moment capture is safe on disk, before persist.
+    // `run_…` does not return until the WAL is written and the taps are
+    // closed-or-abandoned (both backends bound the wind-down with
+    // `FinishDeadlines`, #85), so the recorder owes nothing to a device or a
+    // buffer by this point. Freeing it now is the whole change: persist (Opus +
+    // SQLite, minutes on a long call) and enrichment run below with the slot
+    // already open, so the next meeting can start while this one finalizes.
+    //
+    // The `started_at_ms` guard keeps this from clearing a *newer* session: once
+    // the slot is free a second Start may take it, and only the task that owns
+    // the current entry may retire it. Nothing frees the slot but this line, so
+    // until here it still holds our entry.
     {
-        session.stopped_at_ms.get_or_insert(now_ms());
+        let mut slot = live.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref().is_some_and(|s| s.started_at_ms == started_at_ms) {
+            *slot = None;
+        }
     }
 
     // The meeting's id once it is genuinely in the library. `None` covers a
@@ -702,11 +719,9 @@ async fn spawn_session(
         }
     };
 
-    // Finishing ends here. The meeting is persisted and promoted, so the slot
-    // can free and the dashboard can stop saying "finishing…" — everything
-    // below is derived work over a file that is already safe (#77).
-    *live.lock().unwrap_or_else(|e| e.into_inner()) = None;
-
+    // The slot is already free (above), so persist and enrichment run here as
+    // pure background work over a file that is safe on disk — the next meeting
+    // may already be recording in the slot we let go.
     if let Some(meeting_id) = persisted {
         enrich_and_announce(&root, &meeting_id, &on_ready).await;
     }

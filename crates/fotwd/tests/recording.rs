@@ -166,7 +166,7 @@ async fn a_fresh_recorder_is_idle() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unattended_recording_stops_and_freezes_while_saving() {
+async fn an_unattended_recording_finalizes_on_its_own() {
     let root = tmpdir("automatic-stop");
     let gate = Arc::new(Gate::default());
     let rec = gated_recorder(&root.join("sessions"), Arc::clone(&gate));
@@ -175,16 +175,23 @@ async fn an_unattended_recording_stops_and_freezes_while_saving() {
         started.auto_stop_at_ms,
         started.started_at_ms.map(|t| t + 5000)
     );
-    let reached = until(|| gate.reached()).await;
-    let finishing = rec.status();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let later = rec.status();
+
+    // Nobody presses Stop: the ceiling ends capture, the session winds down,
+    // and the finisher parks. Under Option A that parking happens only after
+    // the slot is freed, so reaching it proves the deadline finalized the
+    // meeting *and* freed the recorder without any help from the UI.
+    assert!(
+        until(|| gate.reached()).await,
+        "the deadline must finalize without pressing Stop"
+    );
+    assert_eq!(
+        rec.status().state,
+        RecordingState::Idle,
+        "the slot frees when capture is safe, before background persist"
+    );
+
     gate.open();
-    assert!(reached, "the deadline must finalize without pressing Stop");
-    assert_eq!(finishing.state, RecordingState::Finishing);
-    assert_eq!(finishing.elapsed_ms, later.elapsed_ms);
-    assert!(finishing.ended_at_ms.is_some());
-    assert!(until(|| !rec.status().is_active()).await);
+    assert!(until(|| rec.status().state == RecordingState::Idle).await);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -240,8 +247,9 @@ async fn stopping_when_idle_says_so() {
     assert!(matches!(rec.stop(), Err(RecorderError::NotRecording)));
 }
 
-/// The slot stays occupied until the meeting is genuinely on disk, so a Start
-/// arriving during finalization is refused rather than opening a second tap.
+/// Stop trips the finishing signal, the slot frees when capture is safe, and
+/// the finisher still runs to completion in the background — the counter is the
+/// proof that persist happened after the slot was already let go.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stopped_session_finishes_and_frees_the_slot() {
     let root = tmpdir("finish");
@@ -301,8 +309,14 @@ async fn a_second_meeting_can_start_after_the_first_finishes() {
 /// The clock the dashboard draws stops with capture. It used to keep climbing
 /// for as long as finalization took — measured at 23 seconds on a real
 /// session, and unbounded once enrichment was in the path.
+///
+/// `stop()` is the deterministic finishing signal: it returns the frozen length
+/// and end time the instant capture ends, never a climbing clock. Under Option
+/// A the slot then frees before persist, so the meeting "lands" in the
+/// background; the numbers `stop()` reported are the meeting's final ones and
+/// nothing after capture can grow them (the second-stop test pins that).
 #[tokio::test(flavor = "multi_thread")]
-async fn stopping_freezes_the_clock_until_the_meeting_lands() {
+async fn stopping_freezes_the_clock_it_reports() {
     let root = tmpdir("frozen-clock");
     let gate = Arc::new(Gate::default());
     let rec = gated_recorder(&root.join("sessions"), Arc::clone(&gate));
@@ -312,64 +326,84 @@ async fn stopping_freezes_the_clock_until_the_meeting_lands() {
     let stopping = rec.stop().expect("stop");
 
     assert_eq!(stopping.state, RecordingState::Finishing);
-    let frozen = stopping
-        .elapsed_ms
-        .expect("a finished meeting has a length");
-    let ended = stopping.ended_at_ms.expect("and an end time");
+    assert!(
+        stopping.elapsed_ms.is_some(),
+        "a finished meeting has a length"
+    );
+    assert!(stopping.ended_at_ms.is_some(), "and an end time");
+    assert!(
+        !stopping.is_recording(),
+        "the clock stops with capture, not with the file"
+    );
 
+    // The finisher parks only after the slot frees, so reaching it proves the
+    // meeting is finalizing in the background with the recorder already idle.
     assert!(
         until(|| gate.reached()).await,
         "the session never reached the finisher"
     );
-    let first = rec.status();
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let second = rec.status();
-
-    for status in [&first, &second] {
-        assert_eq!(status.state, RecordingState::Finishing);
-        assert_eq!(
-            status.elapsed_ms,
-            Some(frozen),
-            "the clock moved after capture stopped"
-        );
-        assert_eq!(status.ended_at_ms, Some(ended));
-    }
+    assert_eq!(
+        rec.status().state,
+        RecordingState::Idle,
+        "the slot must free before persist, not after"
+    );
 
     gate.open();
     assert!(until(|| rec.status().state == RecordingState::Idle).await);
 }
 
-/// The guard the module header argues for, restated for the new word: a Start
-/// during finalization is still refused, because `Finishing` is not `Idle`.
+/// Option A, the contract this change turns on: the slot frees the moment
+/// capture is safe on disk — before persist — so a Start arriving while the
+/// previous meeting is still finalizing in the background is *accepted*, not
+/// refused. The gate parks inside the finisher, which under Option A runs only
+/// after the slot is freed, so `gate.reached()` proves the slot is already open.
 #[tokio::test(flavor = "multi_thread")]
-async fn starting_during_finalization_is_refused_while_status_reads_finishing() {
-    let root = tmpdir("start-while-finishing");
+async fn starting_while_the_previous_meeting_finalizes_is_allowed() {
+    let root = tmpdir("start-while-finalizing");
     let gate = Arc::new(Gate::default());
     let rec = gated_recorder(&root.join("sessions"), Arc::clone(&gate));
 
     rec.start().expect("start");
     tokio::time::sleep(Duration::from_millis(300)).await;
     rec.stop().expect("stop");
-    assert!(until(|| gate.reached()).await);
 
+    // The finisher is parked. Under Option A that only happens after the slot is
+    // freed: persist runs in the background, not while holding the recorder.
     assert!(
-        matches!(rec.start(), Err(RecorderError::AlreadyRecording)),
-        "a second tap was opened while the first meeting was still being written"
+        until(|| gate.reached()).await,
+        "the session never reached the finisher"
     );
-    assert_eq!(rec.status().state, RecordingState::Finishing);
+    assert_eq!(
+        rec.status().state,
+        RecordingState::Idle,
+        "the slot must free before persist, not after"
+    );
 
-    // CON-01: the refused start must not have written a second audit entry.
+    // The point of the change: a second meeting starts while the first one is
+    // still being written to disk.
+    let second = rec.start();
+    assert!(
+        second.is_ok(),
+        "a Start during background finalization must be accepted: {second:?}"
+    );
+    assert!(rec.status().is_recording());
+
+    // CON-01: the accepted Start wrote its own audit entry — two starts, two rows.
     let log = std::fs::read_to_string(root.join("audit.jsonl")).unwrap();
-    assert_eq!(log.matches("session_start").count(), 1);
+    assert_eq!(log.matches("session_start").count(), 2);
 
+    rec.stop().ok();
     gate.open();
     assert!(until(|| rec.status().state == RecordingState::Idle).await);
 }
 
-/// A reloaded tab presses Stop again. The frozen clock must not move — a
-/// meeting that grows after it ended is a meeting nobody can trust.
+/// A reloaded tab presses Stop again. The end time is set once and never
+/// moves — a meeting that grows after it ended is one nobody can trust. Under
+/// Option A the slot frees as soon as capture is safe, so a later Stop may
+/// instead find the meeting already gone; either way it never reports a *new*
+/// end time.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_second_stop_keeps_the_first_end_time() {
+async fn a_second_stop_never_moves_the_end_time() {
     let root = tmpdir("second-stop");
     let gate = Arc::new(Gate::default());
     let rec = gated_recorder(&root.join("sessions"), Arc::clone(&gate));
@@ -377,12 +411,20 @@ async fn a_second_stop_keeps_the_first_end_time() {
     rec.start().expect("start");
     tokio::time::sleep(Duration::from_millis(300)).await;
     let first = rec.stop().expect("stop");
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    let second = rec.stop().expect("a second stop is not an error");
-
-    assert_eq!(second.state, RecordingState::Finishing);
-    assert_eq!(second.ended_at_ms, first.ended_at_ms);
-    assert_eq!(second.elapsed_ms, first.elapsed_ms);
+    // No await between the two Stops: the second lands in the same finishing
+    // window, while the slot is still occupied, so the idempotent end time is
+    // observable rather than raced away by the background finalize.
+    match rec.stop() {
+        Ok(second) => {
+            assert_eq!(second.state, RecordingState::Finishing);
+            assert_eq!(second.ended_at_ms, first.ended_at_ms);
+            assert_eq!(second.elapsed_ms, first.elapsed_ms);
+        }
+        // The background finalize already freed the slot — also correct: the
+        // meeting ended at `first`'s time and cannot grow.
+        Err(RecorderError::NotRecording) => {}
+        other => panic!("a second stop reported something new: {other:?}"),
+    }
 
     gate.open();
     assert!(until(|| rec.status().state == RecordingState::Idle).await);
@@ -406,10 +448,15 @@ async fn a_full_cycle_spells_recording_then_finishing_then_idle() {
     assert_eq!(word(&rec.status()), "recording");
 
     tokio::time::sleep(Duration::from_millis(300)).await;
+    // `stop()` is the finishing signal — the wire word the dashboard renders
+    // the instant capture ends, however long the background finalize runs.
     let stopping = rec.stop().expect("stop");
     assert_eq!(word(&stopping), "finishing");
+
+    // Under Option A the slot frees before persist, so once the finisher parks
+    // the recorder already reads idle: persist is running in the background.
     assert!(until(|| gate.reached()).await);
-    assert_eq!(word(&rec.status()), "finishing");
+    assert_eq!(word(&rec.status()), "idle");
 
     gate.open();
     assert!(until(|| rec.status().state == RecordingState::Idle).await);
