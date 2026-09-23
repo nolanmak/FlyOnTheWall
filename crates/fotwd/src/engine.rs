@@ -724,6 +724,21 @@ impl fotw_summarize::claude_cli::CliTransport for TokioCliRunner {
                 .env_remove("DEEPGRAM_API_KEY")
                 .env_remove("ANTHROPIC_API_KEY")
                 .env_remove("OPENAI_API_KEY")
+                // The Anthropic CLI overrides, for the same reason. A proxy in
+                // front of the daemon — a local model router, a gateway —
+                // exports these to point `claude` at itself; inherited by the
+                // child they redirect summarisation to that endpoint, with a
+                // model name only the proxy knows, so every meeting run through
+                // such a wrapper silently gets no summary. Removing them gives
+                // the child the clean Anthropic environment a bare `claude`
+                // would see, and is a no-op when nothing set them.
+                .env_remove("ANTHROPIC_BASE_URL")
+                .env_remove("ANTHROPIC_AUTH_TOKEN")
+                .env_remove("ANTHROPIC_MODEL")
+                .env_remove("ANTHROPIC_DEFAULT_OPUS_MODEL")
+                .env_remove("ANTHROPIC_DEFAULT_SONNET_MODEL")
+                .env_remove("ANTHROPIC_DEFAULT_HAIKU_MODEL")
+                .env_remove("ANTHROPIC_SMALL_FAST_MODEL")
                 // …and a `PATH` the child can actually work with. Applied to
                 // both arms: the shield below replaces `HOME`, never this.
                 .env("PATH", child_path(&self.binary))

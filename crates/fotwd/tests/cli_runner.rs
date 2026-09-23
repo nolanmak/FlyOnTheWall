@@ -203,32 +203,59 @@ async fn the_child_path_puts_the_binary_beside_the_inherited_path() {
     );
 }
 
-/// The three provider keys are still removed. The `PATH` the child gained is
-/// not a licence to hand it the rest of the environment — `OPENAI_API_KEY` in
-/// particular, which codex prefers over the subscription login and which would
-/// silently bill the per-token API the CLI engine exists to avoid.
+/// The provider keys are still removed, and so is anything that redirects the
+/// Anthropic CLI away from its own subscription login. The `PATH` the child
+/// gained is not a licence to hand it the rest of the environment:
+///
+/// - `OPENAI_API_KEY` — codex prefers it over the subscription login, silently
+///   billing the per-token API the CLI engine exists to avoid.
+/// - `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` and the `ANTHROPIC_*_MODEL`
+///   overrides — a proxy in front of the daemon (a local model router, a
+///   gateway) sets these to point `claude` at itself. Inherited by the child,
+///   they send summarisation to that endpoint instead of Anthropic, with a
+///   model name only the proxy knows — so the meeting silently gets no summary
+///   on every machine that runs the daemon through such a wrapper. The child
+///   must see the same clean Anthropic environment a bare `claude` would.
 #[tokio::test]
-async fn the_provider_keys_are_still_stripped_from_the_child() {
+async fn the_provider_keys_and_router_overrides_are_stripped_from_the_child() {
+    const SCRUBBED: &[&str] = &[
+        "DEEPGRAM_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+    ];
+
     // Deliberately set here so the assertion is not vacuous on a machine that
     // has none of them. Nothing else in this file reads these.
-    for key in ["DEEPGRAM_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"] {
+    for key in SCRUBBED {
         // SAFETY: single-threaded at this point in the test, and no other test
         // in this binary reads these variables.
         unsafe { std::env::set_var(key, "leaked") };
     }
 
+    // Concatenate every scrubbed var with no separator: a clean child prints
+    // the empty string, and any survivor prints "leaked".
+    let script = SCRUBBED
+        .iter()
+        .map(|k| format!("\"${{{k}-}}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
     let runner = TokioCliRunner::new("/bin/sh".into(), Duration::from_secs(10));
     let out = runner
-        .run(
-            &argv(
-                "printf '%s|%s|%s' \"${DEEPGRAM_API_KEY-}\" \"${ANTHROPIC_API_KEY-}\" \
-                 \"${OPENAI_API_KEY-}\"",
-            ),
-            "",
-        )
+        .run(&argv(&format!("printf '%s' {script}")), "")
         .await
         .expect("sh runs");
-    assert_eq!(out.stdout, "||", "a provider key reached the child engine");
+    assert_eq!(
+        out.stdout, "",
+        "a provider key or router override reached the child engine: {:?}",
+        out.stdout
+    );
 }
 
 /// A `binary` that resolves under a directory, plus a bare-named sibling it
