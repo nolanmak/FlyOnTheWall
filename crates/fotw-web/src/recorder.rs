@@ -44,6 +44,9 @@ pub enum RecordingState {
 /// What the recorder is doing, with the timings the UI renders.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingStatus {
+    /// Capture session identity (also carried by live deltas), not a saved meeting ID.
+    #[serde(default)]
+    pub session_id: Option<String>,
     /// Scheduled automatic stop, in epoch milliseconds; absent for older
     /// recorders and while idle. Enforced by the daemon, not the browser.
     #[serde(default)]
@@ -89,6 +92,7 @@ impl RecordingStatus {
         Self {
             state: RecordingState::Idle,
             auto_stop_at_ms: None,
+            session_id: None,
             started_at_ms: None,
             elapsed_ms: None,
             ended_at_ms: None,
@@ -102,6 +106,7 @@ impl RecordingStatus {
         Self {
             state: RecordingState::Recording,
             auto_stop_at_ms: None,
+            session_id: None,
             started_at_ms: Some(started_at_ms),
             elapsed_ms: Some(elapsed_ms),
             ended_at_ms: None,
@@ -119,11 +124,19 @@ impl RecordingStatus {
         Self {
             state: RecordingState::Finishing,
             auto_stop_at_ms: None,
+            session_id: None,
             started_at_ms: Some(started_at_ms),
             elapsed_ms: Some(ended_at_ms.saturating_sub(started_at_ms)),
             ended_at_ms: Some(ended_at_ms),
             transcription_error: None,
         }
+    }
+
+    /// Attach the capture identity once the taps are ready.
+    #[must_use]
+    pub fn with_session_id(mut self, id: Option<String>) -> Self {
+        self.session_id = id;
+        self
     }
 
     /// Attach the daemon's recording deadline.

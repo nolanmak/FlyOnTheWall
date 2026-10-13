@@ -170,3 +170,14 @@ test('name corrections mark source edits without changing stored excerpts or mat
   assert.match(md, /Martas and ÉMarta/);
   assert.equal(e.document.excerpts[0].text, "Marta Lopez's notes. Martas and ÉMarta are unchanged.");
 });
+
+test('sharing excerpts retain the full transcript speech origin after trimming', () => {
+  const e=editor();
+  e.document.speech_origin_ms=17000;
+  e.document.excerpts=[{index:2,offset_ms:36000,at_ms:Date.parse('2026-07-14T14:05:48Z'),speaker:'Call audio',text:'later speech'}];
+  const md=context.sharingMarkdown(e);
+  assert.match(md,/00:00:19/);
+  assert.match(md,/10:05:48 AM EDT/);
+  assert.match(md,/Time since first speech/);
+  assert.equal(e.document.excerpts[0].offset_ms,36000);
+});

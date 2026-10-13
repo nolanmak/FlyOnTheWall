@@ -198,6 +198,7 @@ fn routes(state: AppState) -> Router {
             axum::routing::post(api::document),
         )
         .route("/api/recording/status", get(api::recording_status))
+        .route("/api/recording/transcript", get(api::recording_transcript))
         .route("/api/recording/start", post(api::recording_start))
         .route("/api/recording/stop", post(api::recording_stop))
         .route(

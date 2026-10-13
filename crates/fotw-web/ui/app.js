@@ -35,6 +35,7 @@ const el = {
   consent: document.getElementById("consent"),
   consentLabel: document.getElementById("consent-label"),
   record: document.getElementById("record"),
+  returnLive: document.getElementById("return-live"),
   recording: document.getElementById("recording"),
   recordingLimit: document.getElementById("recording-limit"),
   ghSettings: document.getElementById("gh-settings"),
@@ -440,15 +441,18 @@ function renderDetail(detail) {
   const transcript = document.createElement("section");
   transcript.className = "transcript";
   transcript.appendChild(text("h3", "Transcript"));
+  transcript.appendChild(text("p", "Time since first speech", "meta"));
   const body = document.createElement("div");
   body.id = "segments";
   let lastSpeaker = null;
-  for (const seg of detail.segments) {
-    body.appendChild(segmentRow(seg.channel, seg.start_ms, seg.speaker, seg.text, lastSpeaker));
+  const origin = speechOrigin(detail.segments);
+  for (const seg of orderedSegments(detail.segments)) {
+    body.appendChild(segmentRow(seg.channel, seg.start_ms - origin, seg.speaker, seg.text, lastSpeaker));
     lastSpeaker = seg.speaker || lastSpeaker;
   }
   transcript.appendChild(body);
   el.detail.appendChild(transcript);
+  paintLiveNavigation();
 }
 
 // Why this meeting has no summary, in words, or null to stay silent.
@@ -505,7 +509,7 @@ function say(message) {
 function segmentRow(channel, startMs, speaker, words, lastSpeaker) {
   const line = document.createElement("p");
   line.className = "segment " + (channel || "");
-  line.appendChild(text("span", offset(startMs), "at"));
+  line.appendChild(text("span", startMs === null ? "…" : offset(startMs), "at"));
   // Only when it changes. Repeating "S0" on ten consecutive lines is noise
   // that makes the actual turn-taking harder to see, not easier.
   if (speaker && speaker !== lastSpeaker) {
@@ -530,14 +534,19 @@ async function loadMeetings() {
 // the per-meeting actions row without refetching. Cleared when the live view
 // replaces the pane.
 let currentDetail = null;
+let detailRequest = 0;
+let selectedMeetingId = null;
 
 async function openMeeting(id) {
+  selectedMeetingId = id;
+  const request = ++detailRequest;
   try {
     const detail = await api("/api/meetings/" + encodeURIComponent(id));
+    if (request !== detailRequest) return;
     currentDetail = detail;
     renderDetail(detail);
   } catch (e) {
-    say("Could not open that meeting.");
+    if (request === detailRequest) say("Could not open that meeting.");
   }
 }
 
@@ -555,7 +564,7 @@ async function openMeeting(id) {
 // they are standing in for would have named a meeting.
 function refreshLibrary(meetingId) {
   if (el.search.value.trim() === "") loadMeetings();
-  if (currentDetail && (!meetingId || currentDetail.meeting.id === meetingId)) {
+  if (currentDetail && selectedMeetingId === currentDetail.meeting.id && (!meetingId || currentDetail.meeting.id === meetingId)) {
     // Not `renderDetail(currentDetail)`: the point is the title and summary
     // that landed on the server since this pane was drawn.
     openMeeting(currentDetail.meeting.id);
@@ -601,60 +610,39 @@ async function connectStream() {
 
   socket.addEventListener("open", () => {
     el.live.hidden = false;
+    pollRecording().then(recoverLiveHistory);
   });
-  socket.addEventListener("message", (event) => {
-    const frame = JSON.parse(event.data);
-    if (frame.kind === "resync") {
-      // Lag, not a library event: the client fell more than BACKLOG frames
-      // behind and everything it missed is already in the store. A
-      // meeting_ready lost in that overflow is recovered here, so the pane
-      // gets the same redraw it would have got from the frame itself.
-      refreshLibrary();
-      return;
-    }
-    // #78: a meeting reached the library, or its title and summary landed.
-    // Both mean the same thing on this side — what is on screen is older
-    // than what the daemon has.
-    if (frame.kind === "meeting_ready") {
-      // #91: and one of them means more than that. Stopping a recording
-      // started here left the pane showing its "Recording" header over a
-      // meeting already in the library — `showLive` nulls `currentDetail`, so
-      // the re-open in `refreshLibrary` below never has an id to match. Adopt
-      // the meeting the frame names instead.
-      //
-      // On "persisted", the first of the two frames: the row is queryable
-      // from that instant, minutes before promotion finishes, and the
-      // "enriched" frame that follows then finds the pane open and lands the
-      // real title and summary through the very branch that could not match
-      // before. Matching one named reason also means a reason added later
-      // cannot quietly inherit the right to replace what is on screen.
-      //
-      // Only while this tab's own capture is over, and only over the live
-      // pane. Nothing in the frame says whose meeting it is, so a meeting
-      // finishing elsewhere must not take down a view with words still
-      // arriving in it — nothing can announce from elsewhere today, since
-      // `fotwd record` is a separate process with no hub, but the cost of
-      // being right about it is one comparison. And someone who clicked into
-      // an older meeting mid-recording is reading it: `showLive` is right
-      // that taking a pane away unasked is rude, and the live pane is the
-      // only one this is allowed to replace.
-      if (
-        frame.reason === "persisted" &&
-        recState !== "recording" &&
-        liveIsShowing()
-      ) {
-        openMeeting(frame.meeting_id);
-      }
-      refreshLibrary(frame.meeting_id);
-      return;
-    }
-    appendDeltas(frame.deltas || []);
-  });
+  socket.addEventListener("message", (event) => handleStreamFrame(JSON.parse(event.data)));
   socket.addEventListener("close", () => {
     el.live.hidden = true;
     // One ticket, one connection: reconnecting means minting another.
     setTimeout(connectStream, 2000);
   });
+}
+
+function handleStreamFrame(frame) {
+  if (frame.kind === "resync") {
+    recoverLiveHistory();
+    refreshLibrary();
+  } else if (frame.kind === "meeting_ready") {
+    if (frame.reason === "persisted" && frame.session_id === liveSessionId) {
+      liveSavedMeetingId = frame.meeting_id;
+      adoptSavedLive();
+    }
+    refreshLibrary(frame.meeting_id);
+  } else {
+    appendDeltas(frame.deltas || []);
+  }
+}
+function paintLiveNavigation() {
+  if (!el.returnLive) return;
+  el.returnLive.hidden = !liveSessionId || liveIsShowing();
+  el.returnLive.textContent = recState === "recording" ? "Return to recording" : "View last recording";
+}
+function adoptSavedLive() {
+  if (liveSavedMeetingId && recState !== "recording" && liveIsShowing() && selectedMeetingId === null) {
+    openMeeting(liveSavedMeetingId);
+  }
 }
 
 // Section 5.5 budgets ~50 rows in the DOM; a two-hour meeting is ~20k words.
@@ -678,61 +666,94 @@ function isNearBottom(node) {
   return node.scrollHeight - node.scrollTop - node.clientHeight <= LIVE_SCROLL_SLOP_PX;
 }
 
+// Canonical offsets never change. The origin belongs to the full transcript,
+// not its visible tail, a speaker, or a selected excerpt.
+function orderedSegments(segments) {
+  return segments.filter(s => String(s.text || "").trim()).slice().sort((a, b) => a.start_ms - b.start_ms || (a.idx ?? 0) - (b.idx ?? 0));
+}
+function speechOrigin(segments) {
+  return orderedSegments(segments)[0]?.start_ms ?? null;
+}
+let liveSessionId = null;
+let liveFinals = new Map();
+let livePartials = new Map();
+let liveHistoryMissing = false;
+let liveSnapshotOrigin = null;
+let liveSavedMeetingId = null;
+function selectLiveSession(id) {
+  if (!id || id === liveSessionId) return;
+  liveSessionId = id;
+  liveFinals = new Map();
+  livePartials = new Map();
+  liveSegments = [];
+  liveHistoryMissing = false;
+  liveSnapshotOrigin = null;
+  liveSavedMeetingId = null;
+  recoverLiveHistory();
+  if (liveIsShowing()) renderLiveTranscript();
+}
+async function recoverLiveHistory() {
+  const id = liveSessionId;
+  if (!id) return;
+  try {
+    const snapshot = await api("/api/recording/transcript?session_id=" + encodeURIComponent(id));
+    if (liveSessionId !== id || snapshot.session_id !== id) return;
+    liveHistoryMissing = snapshot.truncated;
+    liveSavedMeetingId = snapshot.saved_meeting_id || liveSavedMeetingId;
+    if (typeof snapshot.speech_origin_ms === "number") {
+      liveSnapshotOrigin = liveSnapshotOrigin === null ? snapshot.speech_origin_ms
+        : Math.min(liveSnapshotOrigin, snapshot.speech_origin_ms);
+    }
+    // Merge: events may have arrived while this request was in flight.
+    appendDeltas(snapshot.deltas);
+    adoptSavedLive();
+  } catch (_) {
+    if (liveSessionId === id) { liveHistoryMissing = true; renderLiveTranscript(); }
+  }
+}
+function liveOrigin() {
+  const current = speechOrigin(liveSegments);
+  if (liveSnapshotOrigin === null) return current;
+  return current === null ? liveSnapshotOrigin : Math.min(current, liveSnapshotOrigin);
+}
 function appendDeltas(deltas) {
-  const body = document.getElementById("segments");
-  if (!body) return;
-  const follow = isNearBottom(el.detail);
-  // Deltas land in whatever `#segments` is on screen, and that is a stored
-  // meeting's transcript when someone clicks into an old meeting mid-capture.
-  // Only the live pane's own rows belong in `liveSegments`, which is what its
-  // copy button reads.
-  const live = liveIsShowing();
   for (const d of deltas) {
-    // Deltas carry no diarisation label; the channel is the truth here, and
-    // "me" is what the mic leg means (§7.5). The far end's labels arrive
-    // with the stored transcript after Stop.
-    const speaker = d.channel === "mic" ? "me" : null;
+    if (!liveSessionId || d.meeting_id !== liveSessionId) continue;
     if (d.is_final === false) {
-      // A revision, not a row: one in-progress line per channel, replaced on
-      // every partial. An EMPTY partial is the server retracting the line —
-      // sent when a mic final was suppressed as speaker echo, so the last
-      // echo partial does not sit on screen as "me" for the rest of the
-      // meeting.
-      const id = "pending-" + d.channel;
-      if (!d.text) {
-        const old = document.getElementById(id);
-        if (old) old.remove();
-        continue;
-      }
-      const fresh = segmentRow(d.channel, d.start_ms, speaker, d.text, null);
-      fresh.id = id;
-      fresh.classList.add("pending");
-      const old = document.getElementById(id);
-      if (old) old.replaceWith(fresh);
-      else body.appendChild(fresh);
-      continue;
-    }
-    const pending = document.getElementById("pending-" + d.channel);
-    if (pending) pending.remove();
-    body.appendChild(segmentRow(d.channel, d.start_ms, speaker, d.text, null));
-    if (live) {
-      liveSegments.push({
-        start_ms: d.start_ms,
-        channel: d.channel,
-        speaker: speaker,
-        text: d.text,
-      });
+      if (d.text) livePartials.set(d.channel, d);
+      else livePartials.delete(d.channel);
+    } else {
+      const partial = livePartials.get(d.channel);
+      if (!partial || partial.start_ms < d.end_ms) livePartials.delete(d.channel);
+      if (d.text.trim()) liveFinals.set(d.idx, { ...d, speaker: d.channel === "mic" ? "me" : null });
     }
   }
-  while (body.childElementCount > MAX_ROWS) {
-    body.removeChild(body.firstChild);
+  liveSegments = orderedSegments(Array.from(liveFinals.values()));
+  renderLiveTranscript();
+}
+function renderLiveTranscript() {
+  if (!liveIsShowing()) return;
+  const body = document.getElementById("segments");
+  const follow = isNearBottom(el.detail);
+  const scrollTop = el.detail.scrollTop;
+  const origin = liveOrigin();
+  clear(body);
+  for (const d of liveSegments.slice(-(MAX_ROWS - livePartials.size))) {
+    body.appendChild(segmentRow(d.channel, d.start_ms - origin, d.speaker, d.text, null));
   }
-  // Revealed by the first final, so a button offering to copy nothing is never
-  // on screen (#74's rule). The row rather than the button, so its margin
-  // leaves the layout with it.
+  for (const d of livePartials.values()) {
+    const at = origin !== null && d.start_ms >= origin ? d.start_ms - origin : null;
+    const row = segmentRow(d.channel, at, d.channel === "mic" ? "me" : null, d.text, null);
+    row.classList.add("pending");
+    body.appendChild(row);
+  }
   const copyRow = document.getElementById("live-copy");
-  if (copyRow && liveSegments.length) copyRow.hidden = false;
-  if (follow) el.detail.scrollTop = el.detail.scrollHeight;
+  if (copyRow) copyRow.hidden = liveSegments.length === 0;
+  const history = document.getElementById("live-history");
+  if (history) history.textContent = liveHistoryMissing
+    ? "Some live history is unavailable. The saved transcript may contain more after Stop."
+    : "Time since first speech. Times may adjust as earlier speech is finalized.";
+  el.detail.scrollTop = follow ? el.detail.scrollHeight : scrollTop;
 }
 
 // -------------------------------------------------- CON-01, recording state
@@ -819,15 +840,18 @@ function stopFinishingPoll() {
 // indistinguishable from a server that never had them. Once we learn that,
 // stop asking and leave the controls hidden.
 let recorderPresent = true;
+let recordingRequest = 0;
 
 async function pollRecording() {
   if (!recorderPresent) return;
+  const request = ++recordingRequest;
   try {
-    renderRecording(await api("/api/recording/status"));
+    const status = await api("/api/recording/status");
+    if (request === recordingRequest) renderRecording(status);
   } catch (e) {
     // Not "the request failed" — this build has no recorder at all.
-    recorderPresent = false;
-    showRecordingControls(false);
+    if (request !== recordingRequest) return;
+    if (e.status === 404) { recorderPresent = false; showRecordingControls(false); }
   }
 }
 
@@ -857,11 +881,14 @@ function paintRecordButton() {
 }
 
 function renderRecording(body) {
+  if (body.session_id) selectLiveSession(body.session_id);
   const was = recState;
   // Anything the daemon does not name is treated as idle. An unrecognised
   // word must never be the one that leaves a clock running.
   recState =
     body.state === "recording" || body.state === "finishing" ? body.state : "idle";
+  paintLiveNavigation();
+  adoptSavedLive();
   autoStopAt = body.auto_stop_at_ms ?? null;
   paintRecordingLimit();
   showRecordingControls(true);
@@ -941,26 +968,20 @@ function renderRecording(body) {
   }
 }
 
-// Give the live transcript somewhere to land. `appendDeltas` targets
-// `#segments`, which until now existed only inside an opened meeting's detail
-// view — so live words had a working socket and no element to render into.
-// Only called from the Start click, never from the poll: replacing the detail
-// pane is acceptable as the direct result of an action, and rude as a side
-// effect of a timer while someone is reading an old meeting.
-//
-// The pane it draws carries an id, and that marker is the whole of what lets
-// the `meeting_ready` handler replace *this* pane and no other (#91). A
-// marker in the DOM rather than a flag beside it: `clear(el.detail)` destroys
-// it in the same breath as the pane it belongs to, so there is no second piece
-// of state left able to outlive the thing it describes.
+// Navigation only: the session model survives showing another meeting.
+// Starting a new capture resets the model via status.session_id, never here.
 function showLive() {
+  ++detailRequest;
   currentDetail = null;
-  liveSegments = [];
+  selectedMeetingId = null;
   clear(el.detail);
   el.detail.appendChild(text("h2", "Recording"));
   el.detail.appendChild(
     text("p", "Words appear here as the provider finalizes them.", "meta"),
   );
+  const history = text("p", "Time since first speech", "meta");
+  history.id = "live-history";
+  el.detail.appendChild(history);
   const copyRow = document.createElement("p");
   copyRow.className = "actions";
   // A marker in the DOM rather than a flag beside it, for the same reason
@@ -973,10 +994,14 @@ function showLive() {
   const transcript = document.createElement("section");
   transcript.className = "transcript";
   transcript.id = "live-pane";
+  transcript.dataset.sessionId = liveSessionId;
   const body = document.createElement("div");
   body.id = "segments";
   transcript.appendChild(body);
   el.detail.appendChild(transcript);
+  renderLiveTranscript();
+  paintLiveNavigation();
+  adoptSavedLive();
 }
 
 // Is the live view the thing on screen?
@@ -998,6 +1023,7 @@ async function onRecord() {
       ? "/api/recording/stop"
       : "/api/recording/start?ack=all-party";
   el.record.disabled = true;
+  ++recordingRequest;
   try {
     const body = await api(path, { method: "POST" });
     renderRecording(body);
@@ -1366,11 +1392,12 @@ function serialize(root) {
 
 // Fills `root` with one paragraph per utterance and returns the matching plain
 // text, so both flavors come out of one loop and cannot drift apart.
-function transcriptBody(root, segments) {
-  let plain = "";
-  for (const seg of segments) {
+function transcriptBody(root, segments, origin = speechOrigin(segments)) {
+  root.appendChild(text("p", "Time since first speech"));
+  let plain = "Time since first speech\n\n";
+  for (const seg of orderedSegments(segments)) {
     const head =
-      "[" + hms(seg.start_ms) + "] " + speakerFor(seg.speaker, seg.channel) + ":";
+      "[" + hms(seg.start_ms - origin) + "] " + speakerFor(seg.speaker, seg.channel) + ":";
     // One line in, one line out. Providers emit newlines inside a segment: in
     // the plain flavor a stray one hides the next timestamp, and in the rich one
     // it collapses to a space anyway. `transcript_lines` flattens for the same
@@ -1430,9 +1457,10 @@ function storedTranscriptPayload(detail) {
 // "so far" is what says the meeting is still running.
 function livePayload() {
   const root = document.createElement("div");
-  const plain = transcriptBody(root, liveSegments);
+  if (liveHistoryMissing) root.appendChild(text("p", "Some live history is unavailable; this copy may be incomplete."));
+  const plain = transcriptBody(root, liveSegments, liveOrigin());
   return {
-    text: plain,
+    text: (liveHistoryMissing ? "Some live history is unavailable; this copy may be incomplete.\n\n" : "") + plain,
     html: serialize(root),
     said: "Copied the transcript so far — " + lineCount(liveSegments.length) + ".",
   };
@@ -1530,6 +1558,7 @@ async function main() {
   }
   el.search.addEventListener("input", onSearch);
   el.record.addEventListener("click", onRecord);
+  el.returnLive.addEventListener("click", showLive);
   // Re-evaluates the disabled state; the box gates Start and nothing else.
   // Through `paintRecordButton` so it is state-aware: ticking the box while a
   // meeting is being written must not re-enable a button with nothing to do.

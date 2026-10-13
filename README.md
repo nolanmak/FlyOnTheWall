@@ -41,6 +41,25 @@ drafts use your configured summary engine and can be turned off in that panel.
 Original recordings stay intact. Downloads are explicit; configured GitHub auto-export also syncs saved briefs and summaries. See
 [Sharing documents](docs/SHARING_DOCUMENTS.md) for behavior and limits.
 
+### Transcript timing and browsing while recording
+
+Transcript timestamps start at the first recognized speech, with one shared zero
+for your microphone and the call audio. Lines are shown chronologically, even
+when one speaker's transcription arrives later. Live timestamps can adjust when
+an earlier utterance finishes transcribing. The recording-duration indicator
+still measures time since capture started.
+
+You can open older meetings while recording; their transcripts stay separate.
+Use **Return to recording** to resume the live view without losing its history.
+After a connection interruption, the dashboard recovers available live history
+and warns if its bounded replay cannot recover everything. The saved transcript
+remains authoritative after Stop.
+
+Original recording offsets and audio are unchanged. Structured exports preserve
+those offsets plus `speech_origin_ms`; human-readable transcripts show time since
+first speech. Trimmed sharing documents keep the full transcript's origin, and
+actual clock times still come from recording start plus the original offset.
+
 ### Recording guardrails
 
 UI recordings automatically stop after two hours, with a visible countdown

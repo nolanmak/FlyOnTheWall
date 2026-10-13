@@ -13,6 +13,15 @@ function sharingOffset(ms) {
   return [Math.floor(seconds / 3600), Math.floor(seconds / 60) % 60, seconds % 60]
     .map(n => String(n).padStart(2, "0")).join(":");
 }
+function sharingTranscriptOffset(doc, offsetMs) {
+  // Legacy drafts with no origin remain explicitly capture-relative until
+  // the server can hydrate them from the full authoritative transcript.
+  return sharingOffset(offsetMs - (doc.speech_origin_ms ?? 0));
+}
+function sharingTimeBasis(doc) {
+  return doc.speech_origin_ms === null || doc.speech_origin_ms === undefined
+    ? "Time since recording started" : "Time since first speech";
+}
 function sharingEscaped(value) {
   return String(value).replace(/[\\`*_{}\[\]<>#!|]/g, "\\$&");
 }
@@ -35,10 +44,11 @@ function sharingMarkdown(editor) {
   if (!editor.includeTranscript) return md;
   if (doc.name_corrections?.length) md += "\nUser-confirmed name corrections appear in brackets. The original transcript is unchanged.\n";
   md += "\n## Selected meeting transcript\n\nSharing edition; omissions are marked. Source wording is preserved. Speaker labels may be incomplete.\n";
+  md += "\n" + sharingTimeBasis(doc) + ".\n";
   let next = 0;
   for (const e of sharingSelection(editor)) {
     if (e.index > next) md += "\n[Conversation omitted from sharing copy.]\n";
-    md += "\n> [" + sharingOffset(e.offset_ms) + " | " + sharingTime(e.at_ms) + "] "
+    md += "\n> [" + sharingTranscriptOffset(doc, e.offset_ms) + " | " + sharingTime(e.at_ms) + "] "
       + sharingEscaped(e.speaker) + ": " + sharingEscaped(sharingCorrectedSource(doc, e.text)).replace(/\n/g, "\n> ") + "\n";
     next = e.index + 1;
   }
@@ -75,12 +85,13 @@ function sharingPreview(editor, root) {
   section.className = "document-transcript";
   section.appendChild(text("h2", "Selected meeting transcript"));
   section.appendChild(text("p", "Sharing edition; omissions are marked. Source wording is preserved. Speaker labels may be incomplete.", "document-date"));
+  section.appendChild(text("p", sharingTimeBasis(editor.document), "meta"));
   let next = 0;
   for (const e of sharingSelection(editor)) {
     if (e.index > next) section.appendChild(text("p", "[Conversation omitted from sharing copy.]", "document-omission"));
     const row = document.createElement("div");
     row.className = "document-excerpt";
-    row.appendChild(text("p", sharingOffset(e.offset_ms) + " | " + sharingTime(e.at_ms) + " · " + e.speaker, "document-stamp"));
+    row.appendChild(text("p", sharingTranscriptOffset(editor.document, e.offset_ms) + " | " + sharingTime(e.at_ms) + " · " + e.speaker, "document-stamp"));
     row.appendChild(text("p", sharingCorrectedSource(editor.document, e.text)));
     section.appendChild(row);
     next = e.index + 1;
@@ -268,7 +279,7 @@ function mountSharingDocument(detail, host) {
     selection.appendChild(selectionTitle);
     selection.appendChild(text("p", "Uncheck anything you don’t want in the file. The original meeting stays intact.", "meta"));
     for (const e of editor.document.excerpts) {
-      selection.appendChild(checkbox(sharingOffset(e.offset_ms) + " · " + e.text, !editor.excluded.has(e.index), keep => {
+      selection.appendChild(checkbox(sharingTranscriptOffset(editor.document, e.offset_ms) + " · " + e.text, !editor.excluded.has(e.index), keep => {
         if (keep) editor.excluded.delete(e.index); else editor.excluded.add(e.index);
         selectionTitle.textContent = "Selected transcript · " + sharingSelection(editor).length + " excerpts";
         markDirty();

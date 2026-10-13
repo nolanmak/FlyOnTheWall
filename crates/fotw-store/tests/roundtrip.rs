@@ -1163,3 +1163,62 @@ fn the_import_works_against_a_library_opened_with_a_different_key() {
     dest.import_library(&f.archive).unwrap();
     assert_same_library(&source, &dest);
 }
+
+#[test]
+fn speech_relative_exports_preserve_recording_offsets() {
+    let (_f, db) = fixture();
+    let mut doc = db.export_meeting("mtg-1").unwrap();
+    let primary = doc
+        .transcripts
+        .iter()
+        .find(|t| t.is_primary != 0)
+        .unwrap()
+        .id
+        .clone();
+    doc.segments.retain(|s| s.transcript_id == primary);
+    doc.segments.truncate(2);
+    doc.segments[0].start_ms = 36000;
+    doc.segments[0].text = "later".into();
+    doc.segments[1].start_ms = 17000;
+    doc.segments[1].text = "first".into();
+    let text = doc.to_plain_text();
+    assert!(text.contains("[00:00:00]"), "{text}");
+    assert!(text.contains("[00:00:19]"), "{text}");
+    assert!(text.find("first").unwrap() < text.find("later").unwrap());
+    assert!(doc.to_markdown().contains("speech_origin_ms: 17000"));
+    let json: serde_json::Value = serde_json::from_str(&doc.to_json_pretty()).unwrap();
+    assert_eq!(json["speech_origin_ms"], 17000);
+    assert_eq!(json["segments"][0]["start_ms"], 36000);
+    assert_eq!(json["segments"][1]["start_ms"], 17000);
+}
+
+#[test]
+fn rust_and_ui_share_speech_relative_timestamp_fixtures() {
+    let cases: serde_json::Value = serde_json::from_str(include_str!(
+        "../../fotw-web/tests/fixtures/transcript-timing.json"
+    ))
+    .unwrap();
+    let (_f, db) = fixture();
+    for case in cases.as_array().unwrap() {
+        let mut doc = db.export_meeting("mtg-1").unwrap();
+        let primary = doc
+            .transcripts
+            .iter()
+            .find(|t| t.is_primary != 0)
+            .unwrap()
+            .id
+            .clone();
+        doc.segments.retain(|s| s.transcript_id == primary);
+        doc.segments.truncate(2);
+        for (i, s) in doc.segments.iter_mut().enumerate() {
+            s.start_ms = case["offsets"][i].as_i64().unwrap();
+            s.text = format!("word{i}");
+        }
+        assert_eq!(doc.speech_origin_ms(), case["origin"].as_i64());
+        for label in case["labels"].as_array().unwrap() {
+            let stamp = format!("[{}]", label.as_str().unwrap());
+            assert!(doc.to_plain_text().contains(&stamp));
+            assert!(doc.to_markdown().contains(&stamp));
+        }
+    }
+}

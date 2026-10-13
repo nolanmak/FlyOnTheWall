@@ -465,3 +465,21 @@ async fn a_full_cycle_spells_recording_then_finishing_then_idle() {
     assert!(idle["started_at_ms"].is_null());
     assert!(idle["ended_at_ms"].is_null());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_status_names_the_capture_session_not_the_saved_meeting() {
+    let root = tmpdir("session-identity");
+    let rec = recorder(&root.join("sessions"), Arc::new(AtomicU64::new(0)));
+    let started = rec.start().expect("start");
+    let id = started.session_id.as_deref().expect("capture identity");
+    assert!(
+        root.join("sessions")
+            .join(id)
+            .join("manifest.json")
+            .exists()
+    );
+    assert_eq!(rec.status().session_id, started.session_id);
+    assert_eq!(rec.stop().unwrap().session_id, started.session_id);
+    assert!(until(|| !rec.status().is_active()).await);
+    assert!(rec.status().session_id.is_none());
+}

@@ -957,12 +957,14 @@ dependencies = [
  "fotw-summarize",
  "fotw-web",
  "fotwd",
+ "futures-util",
  "reqwest",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

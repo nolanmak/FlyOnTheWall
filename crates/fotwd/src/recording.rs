@@ -152,7 +152,7 @@ pub type Finisher = Box<dyn Fn(&Path, &SessionOutcome) -> Option<String> + Send 
 pub type TranscriptionFactory = Box<dyn Fn() -> Transcription + Send + Sync>;
 
 /// The closure shape a [`ReadyTap`] holds.
-type ReadyFn = dyn Fn(&str, MeetingReadyReason) + Send + Sync;
+type ReadyFn = dyn Fn(&str, MeetingReadyReason, Option<&str>) + Send + Sync;
 
 /// A callback told when a meeting becomes worth fetching (#78).
 ///
@@ -194,19 +194,38 @@ impl ReadyTap {
     /// A tap that hands each announcement to `f`.
     #[must_use]
     pub fn new(f: impl Fn(&str, MeetingReadyReason) + Send + Sync + 'static) -> Self {
+        Self::with_session(move |id, reason, _session| f(id, reason))
+    }
+
+    /// Subscribe with the capture identity, for navigation-safe UI handoff.
+    #[must_use]
+    pub fn with_session(
+        f: impl Fn(&str, MeetingReadyReason, Option<&str>) + Send + Sync + 'static,
+    ) -> Self {
         Self(Some(Arc::new(f)))
     }
 
     /// Announce one meeting, or do nothing when no tap was set.
     pub fn emit(&self, meeting_id: &str, reason: MeetingReadyReason) {
+        self.emit_session(meeting_id, reason, None);
+    }
+
+    /// Announce the saved meeting together with its source capture identity.
+    pub fn emit_session(
+        &self,
+        meeting_id: &str,
+        reason: MeetingReadyReason,
+        session_id: Option<&str>,
+    ) {
         if let Some(f) = &self.0 {
-            f(meeting_id, reason);
+            f(meeting_id, reason, session_id);
         }
     }
 }
 
 /// A recording in flight, or one still writing itself to disk.
 struct Live {
+    ready: crate::session::ReadySignal,
     stop: StopSignal,
     started_at_ms: u64,
     /// When Stop was pressed, once it has been. `Some` is what separates
@@ -475,7 +494,11 @@ fn persist_and_promote(root: &Path, outcome: &SessionOutcome, ready: &ReadyTap) 
                 // of a meeting §10 lets a durable file hold.
                 journal::record(&format!("recording: meeting {id} persisted"));
                 // Before promotion, on purpose — see this function's header.
-                ready.emit(&id, MeetingReadyReason::Persisted);
+                ready.emit_session(
+                    &id,
+                    MeetingReadyReason::Persisted,
+                    outcome.dir.file_name().and_then(|s| s.to_str()),
+                );
                 if let Err(e) = crate::retention::promote_session(
                     &mut db,
                     &data_root,
@@ -546,6 +569,7 @@ impl RecorderControl for DaemonRecorder {
         let ready = control.ready.clone();
         let started_at_ms = now_ms();
         *slot = Some(Live {
+            ready: ready.clone(),
             stop: stop.clone(),
             started_at_ms,
             stopped_at_ms: None,
@@ -603,7 +627,8 @@ impl RecorderControl for DaemonRecorder {
         // disk; until then status reads `finishing`.
         live.stop.stop();
         Ok(RecordingStatus::finishing(live.started_at_ms, ended_at_ms)
-            .with_transcription_error(live.errors.latest()))
+            .with_transcription_error(live.errors.latest())
+            .with_session_id(live.ready.session_id()))
     }
 
     fn status(&self) -> RecordingStatus {
@@ -622,6 +647,7 @@ impl RecorderControl for DaemonRecorder {
             // indistinguishable from a quiet meeting exactly when someone goes
             // looking for the words.
             .with_transcription_error(live.errors.latest())
+            .with_session_id(live.ready.session_id())
             .with_auto_stop_at_ms(
                 live.started_at_ms
                     .saturating_add(u64::try_from(self.ceiling.as_millis()).unwrap_or(u64::MAX)),

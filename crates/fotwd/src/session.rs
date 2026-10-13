@@ -1228,6 +1228,7 @@ pub struct ReadySignal(Arc<ReadyInner>);
 
 #[derive(Debug, Default)]
 struct ReadyInner {
+    session_id: std::sync::OnceLock<String>,
     ready: std::sync::Mutex<bool>,
     woke: std::sync::Condvar,
 }
@@ -1237,6 +1238,18 @@ impl ReadySignal {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The WAL identity shared by status and live transcript deltas.
+    #[must_use]
+    pub fn session_id(&self) -> Option<String> {
+        self.0.session_id.get().cloned()
+    }
+
+    /// Publish identity before releasing callers waiting for live capture.
+    pub fn signal_session(&self, session_id: String) {
+        let _ = self.0.session_id.set(session_id);
+        self.signal();
     }
 
     /// Announce that capture is live. Idempotent.
@@ -1543,10 +1556,19 @@ pub async fn run_with_control(
             // The one place a leg's anchor is spelled. From here down it is the
             // stream's own property, applied at connection zero and carried
             // across every reconnect.
+            // The WAL owns capture identity. Factory placeholders predate tap
+            // startup and must not escape into deltas, status, or saved handoff.
+            let session_id = dir
+                .file_name()
+                .expect("session directory")
+                .to_string_lossy()
+                .into_owned();
+            legs.system.normalizer.session_id = session_id.clone();
             legs.system.session_offset_ms = anchors.system_ms;
             let (s, s_rx) = DeepgramStream::open(*legs.system);
             let (m, m_rx) = match legs.mic {
                 Some(mut cfg) if mic_format.is_some() => {
+                    cfg.normalizer.session_id = session_id.clone();
                     cfg.session_offset_ms = anchors.mic_ms;
                     let (m, rx) = DeepgramStream::open(*cfg);
                     (Some(Arc::new(m)), Some(rx))
@@ -1624,7 +1646,12 @@ pub async fn run_with_control(
     // exists and the pump is draining. Announced here rather than at the top
     // of the function because a tap that blocks in `start` never reaches this
     // line — which is the whole point.
-    control.ready.signal();
+    control.ready.signal_session(
+        dir.file_name()
+            .expect("session directory")
+            .to_string_lossy()
+            .into_owned(),
+    );
 
     // Whichever comes first. `select!` drops the loser, and both branches are
     // cancel-safe: a dropped `sleep` is a dropped timer, and a dropped
@@ -1918,10 +1945,19 @@ pub async fn run_supervised(
     let (sys_stt, sys_events, mic_stt, mic_events) = match transcription {
         Transcription::Disabled => (None, None, None, None),
         Transcription::Deepgram(mut legs) => {
+            // The WAL owns capture identity. Factory placeholders predate tap
+            // startup and must not escape into deltas, status, or saved handoff.
+            let session_id = dir
+                .file_name()
+                .expect("session directory")
+                .to_string_lossy()
+                .into_owned();
+            legs.system.normalizer.session_id = session_id.clone();
             legs.system.session_offset_ms = anchors.system_ms;
             let (s, s_rx) = DeepgramStream::open(*legs.system);
             let (m, m_rx) = match legs.mic {
                 Some(mut cfg) if mic_format.is_some() => {
+                    cfg.normalizer.session_id = session_id.clone();
                     cfg.session_offset_ms = anchors.mic_ms;
                     let (m, rx) = DeepgramStream::open(*cfg);
                     (Some(Arc::new(m)), Some(rx))
@@ -2012,7 +2048,12 @@ pub async fn run_supervised(
 
     // Capture is live: both supervisors returned from `start`, the WAL exists
     // and the pump is draining and polling the watchdogs.
-    control.ready.signal();
+    control.ready.signal_session(
+        dir.file_name()
+            .expect("session directory")
+            .to_string_lossy()
+            .into_owned(),
+    );
 
     tokio::select! {
         () = crate::recording_limit::wait(duration, started_at_ms) => {

@@ -35,13 +35,22 @@ fn read(db: &mut Db, id: &str) -> Result<DocumentState, String> {
         .get(id)
         .map_err(|_| "Meeting not found.".to_owned())?;
     let stored = db.sharing_document(id).map_err(|_| FAILED.to_owned())?;
-    let (revision, document) = match stored {
+    let (revision, mut document): (_, Option<SharingDocument>) = match stored {
         Some((version, json)) => (
             version,
             Some(serde_json::from_str(&json).map_err(|_| FAILED.to_owned())?),
         ),
         None => (0, None),
     };
+    if let Some(doc) = document.as_mut()
+        && doc.speech_origin_ms.is_none()
+    {
+        doc.speech_origin_ms = db
+            .export_meeting(id)
+            .map_err(|_| FAILED.to_owned())?
+            .speech_origin_ms()
+            .and_then(|ms| u64::try_from(ms).ok());
+    }
     Ok(DocumentState {
         document,
         revision,
@@ -313,6 +322,13 @@ fn decode(raw: &str, input: &Input) -> Result<SharingDocument, String> {
         })
         .collect();
     Ok(SharingDocument {
+        speech_origin_ms: input
+            .transcript
+            .segments()
+            .iter()
+            .filter(|s| !s.text.trim().is_empty())
+            .map(|s| s.start_ms)
+            .min(),
         title,
         purpose: draft.purpose,
         audience: draft.audience,

@@ -1733,6 +1733,7 @@ fn companion_files_sync_latest_versions_without_republishing_unchanged_drafts() 
         )
         .unwrap();
     let mut draft = fotw_web::documents::SharingDocument {
+        speech_origin_ms: Some(0),
         title: "Brief".into(),
         name_corrections: Vec::new(),
         purpose: "Plan".into(),

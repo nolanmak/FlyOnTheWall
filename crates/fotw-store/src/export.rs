@@ -781,7 +781,9 @@ impl MeetingDoc {
     /// is NaN — neither of which SQLite can produce here.
     #[must_use]
     pub fn to_json_pretty(&self) -> String {
-        serde_json::to_string_pretty(self).expect("meeting@1 is always serializable")
+        let mut value = serde_json::to_value(self).expect("meeting@1 is always serializable");
+        value["speech_origin_ms"] = serde_json::json!(self.speech_origin_ms());
+        serde_json::to_string_pretty(&value).expect("meeting@1 is always serializable")
     }
 
     /// Parse a `meeting@1` document.
@@ -802,6 +804,30 @@ impl MeetingDoc {
             )));
         }
         Ok(doc)
+    }
+
+    /// Earliest recognized speech in the authoritative transcript. Canonical
+    /// offsets stay capture-relative; this origin is presentation metadata.
+    #[must_use]
+    pub fn speech_origin_ms(&self) -> Option<i64> {
+        self.primary_segments().first().map(|s| s.start_ms)
+    }
+
+    fn primary_segments(&self) -> Vec<&SegmentRow> {
+        let primary = self
+            .transcripts
+            .iter()
+            .find(|t| t.is_primary != 0)
+            .or_else(|| self.transcripts.first());
+        let mut rows: Vec<_> = self
+            .segments
+            .iter()
+            .filter(|s| {
+                primary.is_some_and(|p| s.transcript_id == p.id) && !s.text.trim().is_empty()
+            })
+            .collect();
+        rows.sort_by_key(|s| (s.start_ms, s.idx));
+        rows
     }
 
     /// The summary the UI shows, if there is one.
@@ -844,6 +870,11 @@ impl MeetingDoc {
     pub fn to_markdown(&self) -> String {
         let m = &self.meeting;
         let mut out = String::from("---\n");
+        if let Some(origin) = self.speech_origin_ms() {
+            out.push_str(&format!(
+                "speech_origin_ms: {origin}\ntimestamp_basis: first_speech\n"
+            ));
+        }
         // `type` is the one field OKF (Google's Open Knowledge Format) requires
         // on every concept, so a repo of these files is an agent-consumable
         // bundle rather than a pile of notes. It is additive YAML that Obsidian
@@ -971,25 +1002,12 @@ impl MeetingDoc {
     /// single wall of text with the timestamps buried mid-sentence. List items
     /// are the only form that survives every renderer.
     fn transcript_lines(&self, prefix: &str) -> String {
-        // Only the primary transcript is rendered for humans -- the others are
-        // alternative takes on the same audio and interleaving them would read
-        // as the meeting having happened twice. Every one of them is still in
-        // the JSON, which is where losslessness lives.
-        let primary = self
-            .transcripts
-            .iter()
-            .find(|t| t.is_primary != 0)
-            .or_else(|| self.transcripts.first());
-        let Some(primary) = primary else {
+        let rows = self.primary_segments();
+        let Some(origin) = rows.first().map(|s| s.start_ms) else {
             return String::new();
         };
-
-        let mut lines = String::new();
-        for s in self
-            .segments
-            .iter()
-            .filter(|s| s.transcript_id == primary.id)
-        {
+        let mut lines = String::from("Time since first speech\n\n");
+        for s in rows {
             let who = s
                 .speaker_label
                 .as_deref()
@@ -999,7 +1017,10 @@ impl MeetingDoc {
             // emit them), which would break out of the list item. One line in,
             // one line out.
             let text = s.text.replace(['\n', '\r'], " ");
-            lines.push_str(&format!("{prefix}[{}] {who}: {text}\n", hms(s.start_ms)));
+            lines.push_str(&format!(
+                "{prefix}[{}] {who}: {text}\n",
+                hms(s.start_ms.saturating_sub(origin))
+            ));
         }
         lines
     }

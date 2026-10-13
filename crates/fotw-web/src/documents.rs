@@ -70,6 +70,10 @@ pub fn corrected_names(text: &str, corrections: &[NameCorrection]) -> String {
 /// The editable draft and its selected source material.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SharingDocument {
+    /// Full source transcript's first speech offset; retained when excerpts are removed.
+    /// None on old saved drafts, which are hydrated from their source on load.
+    #[serde(default)]
+    pub speech_origin_ms: Option<u64>,
     /// Document title. Follows the meeting's own title (the name shown in the
     /// library list and detail header), so the same client's two calls read
     /// differently and a share matches what the left menu calls it. Only a

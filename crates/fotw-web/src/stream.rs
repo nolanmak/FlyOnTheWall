@@ -31,6 +31,7 @@
 //! a 10 Hz tick drains the buffer into exactly one frame. The frame is
 //! serialised once and shared by every subscriber rather than once per socket.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -117,6 +118,9 @@ pub enum MeetingReadyReason {
 /// on an empty array.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeetingReady {
+    /// Source capture identity, when announced by the recording finisher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     /// Always `meeting_ready`.
     pub kind: String,
     /// The meeting to fetch — the library id, not the session id the live
@@ -127,9 +131,37 @@ pub struct MeetingReady {
 }
 
 /// The fan-out point between the pipeline and every open WebSocket.
+/// A bounded replay of one capture session. Offsets remain recording-relative.
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveSnapshot {
+    /// Whether this session is still represented in the replay cache.
+    pub available: bool,
+    /// Capture session ID, matching Delta.meeting_id (not a library meeting ID).
+    pub session_id: String,
+    /// Finalized segments, keyed uniquely by their publication index.
+    pub deltas: Vec<Delta>,
+    /// Earliest recognized speech, retained even if the history cap is reached.
+    pub speech_origin_ms: Option<i64>,
+    /// Some finalized history was evicted; clients must disclose this.
+    pub truncated: bool,
+    /// Saved meeting produced by this capture, if persistence has finished.
+    pub saved_meeting_id: Option<String>,
+}
+#[derive(Debug, Default)]
+struct SessionHistory {
+    id: String,
+    finals: BTreeMap<i64, Delta>,
+    bytes: usize,
+    origin: Option<i64>,
+    truncated: bool,
+    saved_meeting_id: Option<String>,
+}
+
+/// Broadcasts live updates and retains bounded, session-scoped final history.
 #[derive(Debug)]
 pub struct DeltaHub {
     pending: Mutex<Vec<Delta>>,
+    history: Mutex<VecDeque<SessionHistory>>,
     tx: broadcast::Sender<Arc<str>>,
 }
 
@@ -146,6 +178,7 @@ impl DeltaHub {
         let (tx, _rx) = broadcast::channel(BACKLOG);
         Self {
             pending: Mutex::new(Vec::new()),
+            history: Mutex::new(VecDeque::new()),
             tx,
         }
     }
@@ -156,7 +189,56 @@ impl DeltaHub {
     /// which must not be made to wait on a browser. This function does not
     /// send anything — [`DeltaHub::flush`] does, at most ten times a second.
     pub fn publish(&self, delta: Delta) {
+        if delta.is_final && !delta.text.trim().is_empty() {
+            let mut history = self.history.lock().unwrap_or_else(|e| e.into_inner());
+            if !history.iter().any(|h| h.id == delta.meeting_id) {
+                if history.len() == 2 {
+                    history.pop_front();
+                }
+                history.push_back(SessionHistory {
+                    id: delta.meeting_id.clone(),
+                    ..SessionHistory::default()
+                });
+            }
+            let h = history
+                .iter_mut()
+                .find(|h| h.id == delta.meeting_id)
+                .expect("inserted session");
+            h.origin = Some(
+                h.origin
+                    .map_or(delta.start_ms, |old| old.min(delta.start_ms)),
+            );
+            if let Some(old) = h.finals.insert(delta.idx, delta.clone()) {
+                h.bytes -= old.text.len();
+            }
+            h.bytes += delta.text.len();
+            // Two recent sessions, each at most 20k finals / 8 MiB text. Audio
+            // and the authoritative transcript remain owned by the session.
+            while h.finals.len() > 20_000 || h.bytes > 8 * 1024 * 1024 {
+                if let Some((_, old)) = h.finals.pop_first() {
+                    h.bytes -= old.text.len();
+                }
+                h.truncated = true;
+            }
+        }
         self.lock().push(delta);
+    }
+
+    /// Read a session snapshot without consuming the live broadcast stream.
+    #[must_use]
+    pub fn snapshot(&self, session_id: &str) -> LiveSnapshot {
+        let history = self.history.lock().unwrap_or_else(|e| e.into_inner());
+        let h = history.iter().find(|h| h.id == session_id);
+        LiveSnapshot {
+            available: h.is_some(),
+            session_id: session_id.to_owned(),
+            deltas: h
+                .map(|h| h.finals.values().cloned().collect())
+                .unwrap_or_default(),
+            speech_origin_ms: h.and_then(|h| h.origin),
+            truncated: h.is_some_and(|h| h.truncated),
+            saved_meeting_id: h.and_then(|h| h.saved_meeting_id.clone()),
+        }
     }
 
     /// Drain the buffer into one frame and broadcast it.
@@ -206,8 +288,34 @@ impl DeltaHub {
     /// non-blocking, because the caller is the `spawn_blocking` thread the
     /// session finisher runs on and must not be made to wait on a browser.
     pub fn announce_meeting_ready(&self, meeting_id: &str, reason: MeetingReadyReason) {
+        self.announce_session_ready(meeting_id, reason, None);
+    }
+
+    /// Announce a persisted capture without confusing it with a newer session.
+    pub fn announce_session_ready(
+        &self,
+        meeting_id: &str,
+        reason: MeetingReadyReason,
+        session_id: Option<&str>,
+    ) {
+        if let Some(session) = session_id {
+            let mut history = self.history.lock().unwrap_or_else(|e| e.into_inner());
+            if !history.iter().any(|h| h.id == session) {
+                if history.len() == 2 {
+                    history.pop_front();
+                }
+                history.push_back(SessionHistory {
+                    id: session.to_owned(),
+                    ..SessionHistory::default()
+                });
+            }
+            if let Some(h) = history.iter_mut().find(|h| h.id == session) {
+                h.saved_meeting_id = Some(meeting_id.to_owned());
+            }
+        }
         self.flush();
         let frame = MeetingReady {
+            session_id: session_id.map(str::to_owned),
             kind: "meeting_ready".to_owned(),
             meeting_id: meeting_id.to_owned(),
             reason,
@@ -332,8 +440,8 @@ async fn pump(socket: WebSocket, state: AppState) {
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     // The client fell behind by more than BACKLOG frames.
-                    // Everything it missed is already in the store, so tell it
-                    // to re-fetch rather than trying to replay from memory.
+                    // In-flight finals may not be in the store yet. The client
+                    // recovers them from the session snapshot endpoint.
                     if sink
                         .send(Message::Text(r#"{"kind":"resync"}"#.into()))
                         .await

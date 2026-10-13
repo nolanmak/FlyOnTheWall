@@ -345,59 +345,9 @@ mod tests {
         );
     }
 
-    /// The fifth, for #91's other half. Stopping a recording started on the
-    /// dashboard left the pane showing a "Recording" header over a meeting
-    /// that was already in the library: `showLive` sets `currentDetail =
-    /// null`, so #78's re-open — which matches the frame's id against the
-    /// open pane — had nothing to match against.
-    ///
-    /// The guard is the half worth pinning. `currentDetail` is null both when
-    /// the live pane is up and when nothing has been opened at all, so the
-    /// client needs some other way to know it is replacing its own live pane
-    /// rather than a meeting someone chose to read.
-    #[test]
-    fn the_spa_opens_the_meeting_a_finished_recording_became() {
-        let js = asset_text("app.js");
-        assert!(
-            js.contains("openMeeting(frame.meeting_id)"),
-            "the SPA must open the meeting the frame names, or the pane keeps \
-             the live header until the user clicks something"
-        );
-        assert!(
-            js.contains("\"persisted\""),
-            "the SPA must branch on which of the two meeting_ready moments \
-             this is, or a later frame reopens a pane the user has moved on \
-             from"
-        );
-        assert!(
-            js.contains("live-pane"),
-            "the live pane needs a marker the client can look for: \
-             `currentDetail` is null both when it is showing and when nothing \
-             has been opened at all"
-        );
-    }
+    // Live transcript behavior is exercised through the DOM in tests/ui/live-transcript.cjs.
 
-    /// The live transcript should follow new words only while the reader is
-    /// at the bottom. This is a client interaction, so the asset test pins
-    /// the small contract that protects it until the project has a browser
-    /// harness: measure before appending, then restore the bottom only when
-    /// that measurement says the reader was already following.
-    #[test]
-    fn the_live_transcript_follows_the_bottom_without_fighting_manual_scroll() {
-        let js = asset_text("app.js");
-        assert!(
-            js.contains("const LIVE_SCROLL_SLOP_PX = 48"),
-            "live follow mode needs a small bottom tolerance for layout pixels"
-        );
-        assert!(
-            js.contains("const follow = isNearBottom(el.detail)"),
-            "the client must decide whether to follow before it changes the DOM"
-        );
-        assert!(
-            js.contains("if (follow) el.detail.scrollTop = el.detail.scrollHeight"),
-            "new deltas must reach the bottom only when the reader was already there"
-        );
-    }
+    // Live transcript behavior is exercised through the DOM in tests/ui/live-transcript.cjs.
 
     /// EXP-02's whole point, and the one thing a refactor loses in silence.
     /// The single-flavor call is the tempting one-liner: it writes `text/plain`
@@ -475,31 +425,7 @@ mod tests {
         );
     }
 
-    /// The reason this feature is client-side at all. The live pane's words are
-    /// in no meeting row — the hub's deltas reach the store only after Stop — so
-    /// copying a meeting *while it is recording* exists only here. And it reads
-    /// a list kept beside the DOM rather than the rendered rows: the pane is
-    /// trimmed to `MAX_ROWS` and holds a still-revising partial, so a copy taken
-    /// off the screen would drop the top of a long meeting under a status line
-    /// claiming the transcript.
-    #[test]
-    fn the_live_transcript_can_be_copied_before_the_meeting_is_saved() {
-        let js = asset_text("app.js");
-        assert!(
-            js.contains("liveSegments.push("),
-            "the live pane must keep its own finals, or its copy button has \
-             nothing to read"
-        );
-        assert!(
-            js.contains("transcriptBody(root, liveSegments)"),
-            "the live copy reads the kept finals, not the trimmed rows on screen"
-        );
-        assert!(
-            js.contains("\"live-copy\""),
-            "the live copy row needs a marker `appendDeltas` can find, so it \
-             appears only once there is a word to copy"
-        );
-    }
+    // Live transcript behavior is exercised through the DOM in tests/ui/live-transcript.cjs.
 
     /// A copy button is ordinary chrome. CON-02 reserves the indicator's red for
     /// one meaning and `--caution` is the caveat colour; a harmless local action

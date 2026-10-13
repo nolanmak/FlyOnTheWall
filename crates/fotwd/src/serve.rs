@@ -322,12 +322,13 @@ async fn serve_until_stopped(root: PathBuf, launch: Launch, port: u16) -> Result
     // finished, so the list stayed stale until the tab was reloaded: three of
     // `loadMeetings()`'s four call sites cannot fire on a stop, and `resync`
     // fires only when a client is more than `BACKLOG` frames behind.
-    let on_ready = crate::recording::ReadyTap::new(move |meeting_id, reason| {
-        let Some(hub) = hub_for_ready.get() else {
-            return;
-        };
-        hub.announce_meeting_ready(meeting_id, reason);
-    });
+    let on_ready =
+        crate::recording::ReadyTap::with_session(move |meeting_id, reason, session_id| {
+            let Some(hub) = hub_for_ready.get() else {
+                return;
+            };
+            hub.announce_session_ready(meeting_id, reason, session_id);
+        });
     // `Delta.idx` is documented as the index within *the* transcript, so the
     // counter resets when the session changes — a daemon-lifetime counter
     // would leak how many segments earlier meetings produced.

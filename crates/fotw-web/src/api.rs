@@ -137,6 +137,23 @@ pub async fn recording_status(State(state): State<AppState>) -> Response {
     )
 }
 
+/// Read live finalized history. Covered by the same bearer/origin guard as status.
+pub async fn recording_transcript(State(state): State<AppState>, uri: Uri) -> Response {
+    let Some(id) = uri.query().and_then(|q| query_param(q, "session_id")) else {
+        return not_found();
+    };
+    let snapshot = state.hub().snapshot(&id);
+    // Before first speech there is nothing to cache. An evicted, finished
+    // session is different: a successful empty replay would conceal a gap.
+    let active = state
+        .recorder()
+        .is_some_and(|r| r.status().session_id.as_deref() == Some(id.as_str()));
+    if !snapshot.available && !active {
+        return not_found();
+    }
+    json(&state, &snapshot)
+}
+
 /// `POST /api/recording/start`
 ///
 /// Requires `?ack=all-party`. The acknowledgement is read with
