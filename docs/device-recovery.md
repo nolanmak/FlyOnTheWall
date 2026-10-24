@@ -69,7 +69,7 @@ tests; the final embedded-web unit suite also passes.
 ## Dashboard and API verification
 
 The extracted workflow passed 46 watchdog, 22 recording API and 2 session-monitor
-tests, all 77 browser unit tests, and full local `just ci`. Source-branch RED
+tests, all 80 browser unit tests, and full local `just ci`. Source-branch RED
 regressions showed an immediate “recovered” announcement before health and a
 missing exhausted-microphone UI. Strict Clippy and the synthetic preview build
 also passed after the fixture was corrected to reset its episode budget.
@@ -90,3 +90,11 @@ only the source-health toolbar in that synthetic preview.
 ![One exhausted source offers a retry while the other stays healthy](capture-health/exhausted.png)
 
 ![Sustained delivery restores healthy status and the recovery budget](capture-health/healthy.png)
+
+Review regressions reproduced two retry races: a poll discarded a current-session
+retry error, and a queued-but-unconsumed retry became clickable again. The UI
+now reports errors for the still-active recording independently of poll ordering.
+An accepted retry stays disabled through old exhausted snapshots until delivery
+state advances; a later exhausted episode can be retried again. A transition
+observed before the POST reply also counts as acknowledgement. Stop and session
+replacement still discard the old request.

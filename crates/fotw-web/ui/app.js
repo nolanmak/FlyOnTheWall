@@ -1045,6 +1045,11 @@ function renderCaptureHealth(body) {
       captureHealthRows.set(source, row);
     }
     const state = status?.state;
+    const pending = captureRetryPending.get(source);
+    if (pending && state !== "exhausted") {
+      pending.observedTransition = true;
+      if (pending.accepted) captureRetryPending.delete(source);
+    }
     row.container.setAttribute("data-state", state || "unavailable");
     const message = labels[source] + ": " + (messages[state] || "Status unavailable");
     if (row.message.textContent !== message) row.message.textContent = message;
@@ -1064,21 +1069,24 @@ async function retryCapture(source, button) {
   const id = captureHealthSession;
   if (!id || recState !== "recording" || captureRetryPending.has(source)) return;
   const request = ++recordingRequest;
-  captureRetryPending.set(source, request);
+  const pending = { accepted: false, observedTransition: false };
+  captureRetryPending.set(source, pending);
+  const active = () => liveSessionId === id && captureHealthSession === id
+    && recState === "recording" && !captureStopPending;
   button.disabled = true;
   try {
     const body = await api("/api/recording/retry?session_id=" + encodeURIComponent(id)
       + "&source=" + encodeURIComponent(source), { method: "POST" });
-    if (liveSessionId !== id || recState !== "recording" || request !== recordingRequest) return;
-    renderRecording(body);
+    if (!active()) return;
+    pending.accepted = !body.error;
+    if (request === recordingRequest) renderRecording(body);
     if (body.error) say(body.error);
   } catch (e) {
-    if (liveSessionId === id && recState === "recording" && request === recordingRequest)
-      say("Could not request audio recovery. Try again.");
+    if (active()) say("Could not request audio recovery. Try again.");
   } finally {
-    if (captureRetryPending.get(source) === request) {
-      captureRetryPending.delete(source);
-      button.disabled = false;
+    if (captureRetryPending.get(source) === pending) {
+      if (!pending.accepted || pending.observedTransition) captureRetryPending.delete(source);
+      button.disabled = captureRetryPending.has(source);
     }
   }
 }
