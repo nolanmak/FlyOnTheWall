@@ -32,6 +32,7 @@
 //! is undocumented and its own users report it unreliable.
 
 mod activity;
+pub(crate) mod capture_clock;
 mod listeners;
 mod mic;
 mod tap;

@@ -1,20 +1,8 @@
 //! The one host clock every tap stamps from (seam rule 3).
 //!
-//! docs/REQUIREMENTS.md 6.5 specifies "ONE process-wide monotonic clock shared
-//! by every tap: `mach_continuous_time` (macOS), QPC (Windows),
-//! `CLOCK_MONOTONIC`/`pw_time` (Linux)". [`std::time::Instant`] is exactly
-//! those primitives on each target, so the seam needs no platform code and no
-//! dependency to satisfy the rule.
-//!
-//! **Known deviation, to be resolved when the macOS tap lands (CAP-09).**
-//! `Instant` on Apple platforms reads `CLOCK_UPTIME_RAW` — the
-//! `mach_absolute_time` family — which *pauses while the machine is asleep*,
-//! whereas `mach_continuous_time` keeps counting. Both are monotonic, so
-//! nothing here breaks, but the sleep/wake gap marker will understate the gap
-//! by the sleep duration if it is derived from this clock alone. The macOS
-//! backend should stamp from `mach_continuous_time` and, at that point, this
-//! module grows a platform-specific body rather than every tap growing its own
-//! clock.
+//! macOS capture uses a process-relative continuous clock that includes sleep.
+//! Other platforms retain their monotonic `Instant` clock. Native clock types
+//! stay below the platform boundary; taps and supervisors use [`host_ns`].
 //!
 //! # Why there is a trait as well as a function
 //!
@@ -46,8 +34,8 @@ impl Clock for HostClock {
     }
 }
 
-/// The process-wide epoch. Fixed at the first call so every tap in the process
-/// shares one zero point and cross-stream alignment is a subtraction.
+/// The legacy Instant stopwatch epoch. On macOS this is not the capture
+/// epoch; it remains available for callers measuring awake-time intervals.
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 
 /// Nanoseconds on the process-wide monotonic host clock.
@@ -56,20 +44,27 @@ static EPOCH: OnceLock<Instant> = OnceLock::new();
 /// value is meaningless on its own; only differences between two readings are.
 #[must_use]
 pub fn host_ns() -> u64 {
-    let epoch = *EPOCH.get_or_init(Instant::now);
-    ns_since(epoch)
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::macos::capture_clock::host_ns()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        ns_since(*EPOCH.get_or_init(Instant::now))
+    }
 }
 
-/// Nanoseconds elapsed on the host clock since `origin`, saturating.
+/// Nanoseconds elapsed on an Instant stopwatch since `origin`, saturating.
+/// This compatibility helper excludes macOS sleep. For capture elapsed time,
+/// subtract two [`host_ns`] readings instead.
 #[must_use]
 pub fn ns_since(origin: Instant) -> u64 {
     u64::try_from(Instant::now().saturating_duration_since(origin).as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// The process-wide epoch, initialising it if this is the first call.
-///
-/// Useful when a backend wants to convert its own device clock into the shared
-/// timeline without re-reading [`host_ns`] per callback.
+/// The legacy Instant stopwatch epoch, initialized on first use.
+/// This is not the macOS capture epoch and must not convert native capture
+/// timestamps. Use [`host_ns`] for the shared capture timeline.
 #[must_use]
 pub fn epoch() -> Instant {
     *EPOCH.get_or_init(Instant::now)

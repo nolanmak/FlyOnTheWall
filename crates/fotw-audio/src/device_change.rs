@@ -88,14 +88,9 @@ pub enum DeviceChangeKind {
     /// The HAL topology is not guaranteed valid across sleep, so this is a
     /// rebuild trigger in its own right and not merely a hint.
     ///
-    /// Not raised here yet either — see [`DeviceChangeKind::WillSleep`] — and
-    /// there is a second problem waiting when it is. The gap a wake produces
-    /// is measured on [`crate::clock`], and on Apple platforms that clock
-    /// *pauses while the machine is asleep* (`CLOCK_UPTIME_RAW`, the
-    /// documented CAP-09 deviation). A five-minute lid-close would therefore
-    /// be recorded as a gap of a few milliseconds and every timestamp after it
-    /// would be five minutes early. Whoever wires the notification must also
-    /// give the gap a wall-clock length.
+    /// Not raised here yet either — see [`DeviceChangeKind::WillSleep`]. The
+    /// macOS capture clock now includes sleep, but notification wiring must
+    /// still retain the suspend boundary and preserve the full wake gap.
     DidWake,
 }
 
