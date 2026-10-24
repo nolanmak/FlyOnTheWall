@@ -53,7 +53,7 @@ pub struct DeepgramResult {
     pub duration: Option<f64>,
     /// The `Results` channel object, or `None` on any other frame.
     ///
-    /// Read through [`channel_object_only`] because `channel` is not one
+    /// Read through `channel_object_only` because `channel` is not one
     /// shape: `Results` sends the object holding `alternatives`, while
     /// `SpeechStarted` and `UtteranceEnd` send an array of channel indices,
     /// `[0,1]`.
@@ -341,7 +341,7 @@ impl<F: SegmentIdFactory> DeepgramNormalizer<F> {
     ///
     /// `arrival_session_ms` is a fallback, not the normal path: Deepgram reports
     /// real timings, and a synthesized time is always marked
-    /// [`TimestampSource::Estimated`] so the UI can tell the difference.
+    /// [`crate::TimestampSource::Estimated`] so the UI can tell the difference.
     pub fn push_message_at(
         &mut self,
         message: &DeepgramResult,

@@ -20,7 +20,7 @@ fotw-pipeline = { path = "../fotw-pipeline" }
 # duplicating `DetectedMeeting` is what makes `tests/detect.rs` able to drive
 # the real state machine and prove that no detection reaches `StartCapture`.
 fotw-shell = { path = "../fotw-shell" }
-fotw-stt = { path = "../fotw-stt" }
+fotw-stt = { path = "../fotw-stt", features = ["local-whisper"] }
 fotw-summarize = { path = "../fotw-summarize" }
 fotw-web = { path = "../fotw-web" }
 fotw-secrets = { path = "../fotw-secrets" }

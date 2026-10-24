@@ -88,3 +88,6 @@ pub use crate::tap::{AudioPlatform, AudioTap, BoxFuture, DeviceWatch, PlatformPr
 pub use crate::watchdog::{
     ActivityCounters, OutputActivity, TapActivity, Watchdog, WatchdogConfig,
 };
+
+#[cfg(any(test, feature = "conformance"))]
+pub mod conformance;
