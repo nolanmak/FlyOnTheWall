@@ -144,3 +144,15 @@ test('live notes mount once per session, keep their original clock, and link to 
  h.ctx.handleStreamFrame({kind:'meeting_ready',reason:'persisted',session_id:'B',meeting_id:'saved-B'});
  assert.deepEqual(links.at(-1),['B','saved-B']);
 });
+
+test('recovery navigation opens the selected draft and a late saved alias cannot steal a newer view',async()=>{
+ let selected,alias;const recovered=[],opened=[];
+ const notes={RecordingClock:require('../../ui/notes.js').RecordingClock,flushAll:()=>Promise.resolve(),mount(){},finishSession(){},
+  mountRecovery:(parent,api,onOpen)=>{selected=onOpen;},mountRecovered:(id,parent,api,options)=>{recovered.push(id);alias=options.onSaved;}};
+ const h=harness(notes);h.ctx.openMeeting=id=>opened.push(id);
+ await h.ctx.showNoteDrafts();assert.equal(typeof selected,'function');selected('orphan-A');
+ assert.deepEqual(recovered,['orphan-A']);h.ctx.showLive();alias('late-saved');assert.deepEqual(opened,[]);
+ h.ctx.renderRecording({state:'recording',session_id:'live-A',started_at_ms:1000,elapsed_ms:100});
+ h.ctx.showRecoveredNote('live-A');assert.ok(h.document.getElementById('live-pane'));
+ assert.equal(recovered.length,1,'active draft returns to the live editor');
+});

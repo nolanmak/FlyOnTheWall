@@ -69,6 +69,25 @@ impl MeetingSource for StoreSource {
         Ok(wire_note(doc))
     }
 
+    fn note_drafts(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<crate::notes::DraftSummary>, crate::notes::NoteError> {
+        self.lock()
+            .session_note_drafts(limit, offset)
+            .map_err(note_error)
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|d| crate::notes::DraftSummary {
+                        session_id: d.session_id,
+                        started_at_ms: d.started_at_ms,
+                        updated_at_ms: d.updated_at_ms,
+                    })
+                    .collect()
+            })
+    }
+
     fn session_note(
         &self,
         id: &str,

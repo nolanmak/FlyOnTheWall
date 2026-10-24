@@ -46,6 +46,15 @@ pub trait MeetingSource: Send + Sync + 'static {
         Err(crate::notes::NoteError::NotFound)
     }
 
+    /// Discover unfinished encrypted note drafts without returning their contents.
+    fn note_drafts(
+        &self,
+        _limit: u32,
+        _offset: u32,
+    ) -> Result<Vec<crate::notes::DraftSummary>, crate::notes::NoteError> {
+        Err(crate::notes::NoteError::NotFound)
+    }
+
     /// Read a live or recovered draft using an optional recorder-owned clock.
     fn session_note(
         &self,

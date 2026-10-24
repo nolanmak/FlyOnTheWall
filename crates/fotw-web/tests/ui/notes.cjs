@@ -235,3 +235,47 @@ test('late final clock removes only beyond-end anchors and retains text on retry
  assert.equal(d.body,'text typed after unknown stop');assert.equal(writes.at(-1).anchors.length,0);
  d.edit(d.body+'\n\nMore after stop');assert.equal(d.anchors.length,0);
 });
+
+function recoveryDOM() {
+ class Element {
+  constructor(tag){this.tag=tag;this.children=[];this.listeners={};this.value='';this.ownText='';this.dataset={};}
+  appendChild(n){this.children.push(n);return n;}
+  set textContent(v){this.ownText=String(v);this.children=[];}
+  get textContent(){return this.ownText+this.children.map(c=>c.textContent).join('');}
+  setAttribute(k,v){this[k]=v;}addEventListener(k,f){this.listeners[k]=f;}
+ }
+ const parent=new Element('div');global.document={createElement:tag=>new Element(tag)};
+ const all=(n=parent)=>[n,...n.children.flatMap(all)];
+ return {parent,all};
+}
+test('recovery index pages metadata and retries a failed page without losing earlier rows',async()=>{
+ const h=recoveryDOM();try {
+  const calls=[],opened=[];let failed=false;
+  require('../../ui/notes.js').mountRecovery(h.parent,async(path)=>{
+   calls.push(path);if(path.includes('offset=50') && !failed){failed=true;throw new Error('temporary');}
+   return {drafts:Array.from({length:path.includes('offset=50')?1:50},(_,i)=>({session_id:`draft-${calls.length}-${i}`,started_at_ms:1000+i,updated_at_ms:2000}))};
+  },id=>opened.push(id));await new Promise(setImmediate);
+  const row=()=>h.all().filter(n=>n.tag==='button' && n.dataset?.sessionId);
+  assert.equal(row().length,50);row()[0].listeners.click();assert.deepEqual(opened,['draft-1-0']);
+  const more=h.all().find(n=>n.textContent==='Load more');await more.listeners.click();
+  assert.equal(row().length,50);assert.match(h.parent.textContent,/Could not load/);
+  await more.listeners.click();assert.equal(row().length,51);assert.equal(more.hidden,true);
+  assert.equal(calls[1],calls[2]);
+ }finally{delete global.document;}
+});
+test('recovered text stays literal and read-only, with explicit copy and metadata-preserving download',async()=>{
+ const h=recoveryDOM();try {
+  const copied=[],downloads=[],calls=[];
+  const doc={session_id:'orphan',meeting_id:null,started_at_ms:1000,elapsed_ms:null,note:{revision:2,body_md:'<script>literal fixture</script>\nCafé',anchors:[{id:'original',block_idx:0,block_text:'fixture',typed_at_ms:250}]}};
+  require('../../ui/notes.js').mountRecovered('orphan',h.parent,async(path)=>{calls.push(path);return doc;},
+   {copy:async text=>copied.push(text),download:(...args)=>downloads.push(args)});
+  await new Promise(setImmediate);
+  const input=h.all().find(n=>n.tag==='textarea');assert.equal(input?.value,doc.note.body_md);assert.equal(input.readOnly,true);
+  assert.equal(downloads.length,0);assert.equal(copied.length,0);
+  await h.all().find(n=>n.textContent==='Copy notes').listeners.click();assert.equal(copied[0],doc.note.body_md);
+  h.all().find(n=>n.textContent==='Download JSON').listeners.click();
+  assert.equal(JSON.parse(downloads[0][1]).note.anchors[0].id,'original');
+  assert.equal(JSON.parse(downloads[0][1]).elapsed_ms,null);
+  assert.deepEqual(calls,['/api/sessions/orphan/notes']);
+ }finally{delete global.document;}
+});

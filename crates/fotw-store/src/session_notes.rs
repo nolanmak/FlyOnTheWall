@@ -13,7 +13,38 @@ pub struct SessionNoteDocument {
     pub note: NoteDocument,
 }
 
+/// Metadata for discovering unfinished notes without loading their contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionNoteDraftSummary {
+    /// Original capture identity.
+    pub session_id: String,
+    /// Capture start, in epoch milliseconds.
+    pub started_at_ms: i64,
+    /// Last durable edit, in epoch milliseconds.
+    pub updated_at_ms: i64,
+}
+
 impl Db {
+    /// Discover durable drafts, newest capture first; at most 100 rows per page.
+    pub fn session_note_drafts(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SessionNoteDraftSummary>> {
+        let mut stmt=self.conn().prepare("SELECT session_id,started_at_ms,updated_at_ms FROM session_notes ORDER BY started_at_ms DESC,session_id ASC LIMIT ?1 OFFSET ?2")?;
+        let rows = stmt.query_map(
+            params![i64::from(limit.min(100)), i64::from(offset)],
+            |row| {
+                Ok(SessionNoteDraftSummary {
+                    session_id: row.get(0)?,
+                    started_at_ms: row.get(1)?,
+                    updated_at_ms: row.get(2)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     /// Save one completed capture and transfer its draft in one transaction.
     /// Retrying the same session and clock returns the original meeting, preserving edits.
     /// A changed clock is rejected rather than attaching notes to another recording.

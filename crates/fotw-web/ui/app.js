@@ -36,6 +36,7 @@ const el = {
   consentLabel: document.getElementById("consent-label"),
   record: document.getElementById("record"),
   returnLive: document.getElementById("return-live"),
+  noteDrafts: document.getElementById("note-drafts"),
   recording: document.getElementById("recording"),
   recordingLimit: document.getElementById("recording-limit"),
   ghSettings: document.getElementById("gh-settings"),
@@ -1035,6 +1036,30 @@ function showLive() {
   adoptSavedLive();
 }
 
+async function showNoteDrafts() {
+  if (typeof FOTWNotes === "undefined") return;
+  const request=++detailRequest;currentDetail=null;selectedMeetingId=null;
+  updateMeetingSelection();clear(el.detail);paintLiveNavigation();
+  el.detail.appendChild(text("p","Saving pending notes…","meta"));
+  await FOTWNotes.flushAll();
+  if(request!==detailRequest)return;
+  clear(el.detail);FOTWNotes.mountRecovery(el.detail,api,showRecoveredNote);
+}
+function showRecoveredNote(id) {
+  if (id===liveSessionId && recState==="recording") {showLive();return;}
+  if (typeof FOTWNotes === "undefined") return;
+  FOTWNotes.flushAll();const request=++detailRequest;currentDetail=null;selectedMeetingId=null;
+  updateMeetingSelection();clear(el.detail);paintLiveNavigation();
+  FOTWNotes.mountRecovered(id,el.detail,api,{onSaved:meetingId=>{
+    if(request===detailRequest)openMeeting(meetingId);
+  }});
+}
+async function loadNoteDraftControl() {
+  if (!el.noteDrafts || typeof FOTWNotes === "undefined") return;
+  try {await api("/api/note-drafts?limit=1");el.noteDrafts.hidden=false;}
+  catch(e) {el.noteDrafts.hidden=e.status===404;}
+}
+
 function mountLiveNotes() {
   if (typeof FOTWNotes === "undefined" || !liveSessionId || !liveIsShowing()) return;
   const parent = document.getElementById("live-notes");
@@ -1606,6 +1631,7 @@ async function main() {
   el.search.addEventListener("input", onSearch);
   el.record.addEventListener("click", onRecord);
   el.returnLive.addEventListener("click", showLive);
+  el.noteDrafts?.addEventListener("click", showNoteDrafts);
   // Re-evaluates the disabled state; the box gates Start and nothing else.
   // Through `paintRecordButton` so it is state-aware: ticking the box while a
   // meeting is being written must not re-enable a button with nothing to do.
@@ -1627,6 +1653,7 @@ async function main() {
     if (el.ghSettings.open) loadGithubRepos();
   });
   await loadMeetings();
+  await loadNoteDraftControl();
   await loadGithub();
   await loadSummarize();
   await pollRecording();

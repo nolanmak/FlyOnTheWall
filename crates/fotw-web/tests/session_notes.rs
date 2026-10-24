@@ -40,6 +40,9 @@ async fn session_notes_require_auth_and_follow_the_original_clock_through_stop()
         state,
     };
     let task = tokio::spawn(server.serve());
+    let index = "/api/note-drafts";
+    assert_eq!(h.get(index, &h.anonymous()).await.status, 404);
+    assert_eq!(h.get(index, &h.authorised()).await.status, 200);
     let route = "/api/sessions/session-A/notes";
     let body = r#"{"revision":0,"body_md":"fixture decision","anchors":[{"id":"block-A","block_idx":0,"block_text":"fixture decision","typed_at_ms":250}]}"#;
     assert_eq!(h.get(route, &h.anonymous()).await.status, 404);
@@ -59,6 +62,16 @@ async fn session_notes_require_auth_and_follow_the_original_clock_through_stop()
     );
     assert_eq!(h.post(route, &h.authorised(), Some(body)).await.status, 200);
     assert_eq!(h.post(route, &h.authorised(), Some(body)).await.status, 409);
+    let listed = h.get(index, &h.authorised()).await;
+    let listed: serde_json::Value = serde_json::from_str(&listed.body).unwrap();
+    assert_eq!(listed["drafts"][0]["session_id"], "session-A");
+    assert!(listed["drafts"][0].get("body_md").is_none());
+    assert_eq!(
+        h.get("/api/note-drafts?limit=0", &h.authorised())
+            .await
+            .body,
+        "{\"drafts\":[]}"
+    );
     *recorder.0.lock().unwrap() = RecordingStatus::idle();
     // During the persistence gap, durable drafts remain readable; no new clock is guessed.
     assert_eq!(h.get(route, &h.authorised()).await.status, 200);
@@ -76,6 +89,11 @@ async fn session_notes_require_auth_and_follow_the_original_clock_through_stop()
         .unwrap();
     *recorder.0.lock().unwrap() =
         RecordingStatus::recording(9000, 9999).with_session_id(Some("session-B".into()));
+    let index_after = h.get(index, &h.authorised()).await;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&index_after.body).unwrap()["drafts"],
+        serde_json::json!([])
+    );
     let saved = h.post(route, &h.authorised(), Some(&edited)).await;
     assert_eq!(saved.status, 200);
     let value: serde_json::Value = serde_json::from_str(&saved.body).unwrap();
