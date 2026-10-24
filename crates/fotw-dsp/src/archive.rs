@@ -164,3 +164,91 @@ impl ArchiveConverter {
         }
     }
 }
+
+/// Capture boundary policy around the strict converter. Invalid driver samples
+/// become silence in place; an incomplete final interleaved frame is discarded.
+/// A backend failure ends conversion for this generation, while the caller can
+/// still finalize the audio already written. Warnings are bounded per generation.
+pub struct CaptureArchive {
+    converter: ArchiveConverter,
+    replaced_samples: u64,
+    incomplete_samples: u64,
+    failure: Option<String>,
+}
+impl CaptureArchive {
+    pub fn new(
+        input_rate: u32,
+        input_channels: u16,
+        output_rate: u32,
+        output_channels: u16,
+    ) -> Result<Self, ResampleError> {
+        Ok(Self {
+            converter: ArchiveConverter::new(
+                input_rate,
+                input_channels,
+                output_rate,
+                output_channels,
+            )?,
+            replaced_samples: 0,
+            incomplete_samples: 0,
+            failure: None,
+        })
+    }
+    pub fn process(&mut self, pcm: &mut [f32]) -> Vec<f32> {
+        for sample in pcm.iter_mut().filter(|sample| !sample.is_finite()) {
+            *sample = 0.0;
+            self.replaced_samples = self.replaced_samples.saturating_add(1);
+        }
+        if self.failure.is_some() {
+            return Vec::new();
+        }
+        match self.converter.process(pcm) {
+            Ok(pcm) => pcm,
+            Err(error) => {
+                self.failure = Some(error.to_string());
+                Vec::new()
+            }
+        }
+    }
+    pub fn finish(&mut self) -> Vec<f32> {
+        if self.failure.is_some() {
+            return Vec::new();
+        }
+        // The strict converter keeps partial frames in pending until complete.
+        // Remove only that partial frame, retaining all complete buffered frames
+        // (including the FFT tail), and keep the strict public finish unchanged.
+        let partial = self.converter.input_samples % u64::from(self.converter.input_channels);
+        if partial > 0 {
+            self.incomplete_samples += partial;
+            self.converter.input_samples -= partial;
+            let keep = self.converter.pending.len() - partial as usize;
+            self.converter.pending.truncate(keep);
+        }
+        match self.converter.finish() {
+            Ok(pcm) => pcm,
+            Err(error) => {
+                self.failure = Some(error.to_string());
+                Vec::new()
+            }
+        }
+    }
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.replaced_samples > 0 {
+            warnings.push(format!(
+                "{} non-finite capture samples replaced with silence",
+                self.replaced_samples
+            ));
+        }
+        if self.incomplete_samples > 0 {
+            warnings.push(format!(
+                "{} samples discarded from an incomplete final capture frame",
+                self.incomplete_samples
+            ));
+        }
+        if let Some(error) = &self.failure {
+            warnings.push(format!("archive conversion stopped for this capture generation: {error}; some audio is missing"));
+        }
+        warnings
+    }
+}

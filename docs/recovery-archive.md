@@ -10,8 +10,12 @@ an anti-aliasing FFT filter, trims its latency and flushes exactly
 Unchanged formats are bit-exact before the existing WAL quantization. Mono is
 duplicated for a wider archive; other differing channel counts fold to their
 mean, since capture does not provide speaker-position metadata. Partial
-interleaved frames carry between drains; an incomplete final frame or non-finite
-PCM is refused. Conversion runs on the pump thread before the WAL; ASR/AEC still
+interleaved frames carry between drains. The strict converter rejects non-finite
+PCM and incomplete final frames. Capture callers replace non-finite samples with
+silence in place and discard only an incomplete final frame, reporting both
+counts. Complete buffered FFT tails are retained. A converter backend failure
+stops conversion for that generation and reports missing audio while allowing
+the already-written recording to finalize. Conversion runs on the pump thread before the WAL; ASR/AEC still
 run after the WAL write. Native-rate originals are not separately archived.
 
 The daemon feeds retired tails, gap padding and converted final tails through
@@ -52,3 +56,10 @@ A review regression also filled the initial ring before creating the generation
 factory. The replacement accepted zero samples instead of eight because capacity
 was read from free slots. The factory now retains the backing ring’s immutable
 capacity; the regression preserves all old queued PCM and a full replacement.
+
+Review regressions exercise normal drains and retired-generation recovery in
+both daemon and CLI using synthetic non-finite PCM and incomplete stereo tails.
+They verify good PCM, zero gap padding, final duration, and `ended_at_ms`; daemon
+warnings flow through the existing user-visible degradation channel. Converter
+tests compare salvaged FFT tails with strict conversion of the complete input
+prefix across identity, upsampling and downsampling.

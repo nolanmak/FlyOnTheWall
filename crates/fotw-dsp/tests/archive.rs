@@ -73,3 +73,43 @@ fn downsampling_filters_frequencies_above_target_nyquist() {
     let rms = (middle.iter().map(|x| x * x).sum::<f32>() / middle.len() as f32).sqrt();
     assert!(rms < 0.01, "aliasing energy {rms}");
 }
+
+#[test]
+fn capture_policy_silences_nonfinite_samples_without_changing_duration() {
+    use fotw_dsp::archive::CaptureArchive;
+    let mut converter = CaptureArchive::new(48_000, 2, 48_000, 2).unwrap();
+    let mut pcm = [0.25, f32::NAN, f32::INFINITY, -0.25];
+    let out = converter.process(&mut pcm);
+    assert_eq!(out, [0.25, 0.0, 0.0, -0.25]);
+    assert!(converter.finish().is_empty());
+    assert_eq!(
+        converter.warnings(),
+        ["2 non-finite capture samples replaced with silence"]
+    );
+}
+
+#[test]
+fn capture_policy_retains_complete_fft_tail_when_discarding_a_partial_frame() {
+    use fotw_dsp::archive::CaptureArchive;
+    for (input_rate, output_rate) in [(48_000, 48_000), (48_000, 16_000), (16_000, 48_000)] {
+        let complete = tone(input_rate, 2377, 2);
+        let mut strict = ArchiveConverter::new(input_rate, 2, output_rate, 2).unwrap();
+        let mut expected = strict.process(&complete).unwrap();
+        expected.extend(strict.finish().unwrap());
+        let mut partial = complete;
+        partial.push(0.75);
+        let mut capture = CaptureArchive::new(input_rate, 2, output_rate, 2).unwrap();
+        let mut actual = Vec::new();
+        for chunk in partial.chunks_mut(319) {
+            actual.extend(capture.process(chunk));
+        }
+        actual.extend(capture.finish());
+        assert_eq!(actual, expected);
+        assert_eq!(
+            capture.warnings(),
+            ["1 samples discarded from an incomplete final capture frame"]
+        );
+        assert!(capture.finish().is_empty());
+        assert_eq!(capture.warnings().len(), 1);
+    }
+}

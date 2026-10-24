@@ -36,7 +36,7 @@ use fotw_audio::{
     AudioPlatform, AudioTap, CaptureTimestamp, DeviceId, FormatRequest, FrameFlags, FrameSink,
     PlatformProbe, StreamFormat, SystemScope, TapError, TapId,
 };
-use fotw_pipeline::resample::{ArchiveConverter, Downmixer, Resampler16k};
+use fotw_pipeline::resample::{CaptureArchive, Downmixer, Resampler16k};
 use fotw_pipeline::ring::{AudioRing, RingConsumer, RingProducer};
 use fotw_pipeline::wal::{SessionWal, SttRecord, TrackFormat};
 use fotw_stt::deepgram::DeepgramConfig;
@@ -493,11 +493,8 @@ impl LegChannel {
     }
 }
 
-fn archive_converter(
-    format: StreamFormat,
-    archive: TrackFormat,
-) -> Result<ArchiveConverter, String> {
-    ArchiveConverter::new(
+fn archive_converter(format: StreamFormat, archive: TrackFormat) -> Result<CaptureArchive, String> {
+    CaptureArchive::new(
         format.sample_rate_hz,
         format.channels,
         archive.sample_rate_hz,
@@ -513,8 +510,9 @@ fn archive_converter(
 /// consumers the ordinary drain reads, rather than a second private copy.
 struct ChannelMeta {
     slot: ProducerSlot,
-    converter: ArchiveConverter,
+    converter: CaptureArchive,
     retired_drops: u64,
+    archive_warnings: Vec<String>,
     monitor: crate::capture_health::CaptureMonitor,
     label: &'static str,
     channel: LegChannel,
@@ -599,16 +597,14 @@ fn supervise_channel_observed(
                 break;
             }
             remaining -= n;
-            let pcm = meta
-                .converter
-                .process(&scratch[..n])
-                .map_err(|e| e.to_string())?;
+            let pcm = meta.converter.process(&mut scratch[..n]);
             meta.channel.write(wal, &pcm).map_err(|e| e.to_string())?;
             on_pcm(&pcm)?;
         }
-        let tail = meta.converter.finish().map_err(|e| e.to_string())?;
+        let tail = meta.converter.finish();
         meta.channel.write(wal, &tail).map_err(|e| e.to_string())?;
         on_pcm(&tail)?;
+        meta.archive_warnings.extend(meta.converter.warnings());
         meta.retired_drops += cons.dropped_frames();
         *cons = meta.slot.replacement()?;
         meta.converter = archive_converter(format, meta.wal_format)?;
@@ -1766,6 +1762,7 @@ pub async fn run_with_control(
         mic_samples,
         dropped_samples,
         abandoned_samples,
+        archive_warnings,
     } = match tokio::time::timeout(deadlines.join, pump_counts).await {
         Ok(Ok(counts)) => counts?,
         // The sender went with the thread.
@@ -1834,6 +1831,9 @@ pub async fn run_with_control(
     // it is a hole in the recording. It rides the same channel as a provider
     // failure because that is the only one a human ever sees — the field below
     // has never been read by anything (#79).
+    for warning in archive_warnings {
+        control.errors.record(warning);
+    }
     if dropped_samples > 0 {
         control.errors.record(format!(
             "capture: {dropped_samples} samples were dropped at a full ring — \
@@ -2063,6 +2063,7 @@ pub async fn run_supervised(
                 TrackFormat::new(sys_format.sample_rate_hz, sys_format.channels),
             )?,
             retired_drops: 0,
+            archive_warnings: Vec::new(),
             monitor: control.capture_health.clone(),
             label: "system",
             channel: LegChannel::System,
@@ -2077,6 +2078,7 @@ pub async fn run_supervised(
                 slot: mic_slot,
                 converter,
                 retired_drops: 0,
+                archive_warnings: Vec::new(),
                 monitor: control.capture_health.clone(),
                 label: "mic",
                 channel: LegChannel::Mic,
@@ -2163,6 +2165,7 @@ pub async fn run_supervised(
         mic_samples,
         dropped_samples,
         abandoned_samples,
+        archive_warnings,
     } = match tokio::time::timeout(deadlines.join, pump_counts).await {
         Ok(Ok(counts)) => counts?,
         Ok(Err(_)) => return Err("pump panicked".to_string()),
@@ -2208,6 +2211,9 @@ pub async fn run_supervised(
         }
     }
 
+    for warning in archive_warnings {
+        control.errors.record(warning);
+    }
     if dropped_samples > 0 {
         control.errors.record(format!(
             "capture: {dropped_samples} samples were dropped at a full ring — \
@@ -2444,6 +2450,7 @@ const GENEROUS_DRAIN: Duration = Duration::from_secs(30);
 
 /// What one pump run moved, and what it did not.
 struct PumpCounts {
+    archive_warnings: Vec<String>,
     /// Interleaved samples written to the system leg.
     system_samples: u64,
     /// Interleaved samples written to the mic leg.
@@ -2655,9 +2662,7 @@ fn pump_drain(
         if n > 0 {
             let normalized = supervision
                 .as_mut()
-                .map(|s| s.system.converter.process(&scratch[..n]))
-                .transpose()
-                .map_err(|e| e.to_string())?;
+                .map(|s| s.system.converter.process(&mut scratch[..n]));
             let pcm = normalized.as_deref().unwrap_or(&scratch[..n]);
             // Raw first, always. Derived work can fail; this must not.
             wal.write_system(pcm)
@@ -2673,9 +2678,7 @@ fn pump_drain(
             let normalized = supervision
                 .as_mut()
                 .and_then(|s| s.mic.as_mut())
-                .map(|meta| meta.converter.process(&scratch[..m]))
-                .transpose()
-                .map_err(|e| e.to_string())?;
+                .map(|meta| meta.converter.process(&mut scratch[..m]));
             let pcm = normalized.as_deref().unwrap_or(&scratch[..m]);
             // Raw first here too, for the same reason as the system leg.
             wal.write_mic(pcm)
@@ -2718,12 +2721,12 @@ fn pump_drain(
     }
 
     if let Some(sup) = supervision.as_mut() {
-        let tail = sup.system.converter.finish().map_err(|e| e.to_string())?;
+        let tail = sup.system.converter.finish();
         wal.write_system(&tail).map_err(|e| e.to_string())?;
         sys_written += tail.len() as u64;
         transcription.feed(LegChannel::System, &tail)?;
         if let Some(mic) = sup.mic.as_mut() {
-            let tail = mic.converter.finish().map_err(|e| e.to_string())?;
+            let tail = mic.converter.finish();
             wal.write_mic(&tail).map_err(|e| e.to_string())?;
             mic_written += tail.len() as u64;
             transcription.feed(LegChannel::Mic, &tail)?;
@@ -2739,7 +2742,21 @@ fn pump_drain(
     // taken while the taps were still delivering. Both legs are summed: the
     // caller's field is one number, and either leg falling behind means the
     // same thing about this machine.
+    let mut archive_warnings = Vec::new();
+    if let Some(sup) = &supervision {
+        for meta in std::iter::once(&sup.system).chain(sup.mic.iter()) {
+            for warning in meta
+                .archive_warnings
+                .iter()
+                .cloned()
+                .chain(meta.converter.warnings())
+            {
+                archive_warnings.push(format!("capture [{}]: {warning}", meta.label));
+            }
+        }
+    }
     Ok(PumpCounts {
+        archive_warnings,
         system_samples: sys_written,
         mic_samples: mic_written,
         dropped_samples: sys.dropped_frames()
@@ -3515,6 +3532,7 @@ mod supervised_recovery_tests {
                 slot,
                 converter: archive_converter(format, wal_format).unwrap(),
                 retired_drops: 0,
+                archive_warnings: Vec::new(),
                 monitor: crate::capture_health::CaptureMonitor::default(),
                 label,
                 channel,
@@ -3828,6 +3846,100 @@ mod supervised_recovery_tests {
                 .chunks_exact(2)
                 .any(|v| i16::from_le_bytes([v[0], v[1]]) > 20_000)
         );
+    }
+
+    #[test]
+    fn invalid_capture_does_not_strand_the_recording() {
+        for (name, pcm, expected) in [
+            (
+                "nonfinite",
+                vec![0.25, f32::NAN, f32::INFINITY, -0.25],
+                vec![8191i16, 0, 0, -8191],
+            ),
+            ("partial", vec![0.25, -0.25, 0.75], vec![8191i16, -8191]),
+        ] {
+            for retired in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let clock = ManualClock::new();
+                let archive = TrackFormat::new(48_000, 2);
+                let (mut meta, _, _, _) = fake_leg(
+                    "system",
+                    LegChannel::System,
+                    TapId::system_default(),
+                    archive,
+                    &clock,
+                );
+                let (mut producer, mut consumer) = AudioRing::with_capacity_frames(16);
+                producer.push_block(&pcm);
+                let (_, mic) = AudioRing::with_capacity_frames(16);
+                let mut wal = SessionWal::create_with_formats(root.path(), archive, None).unwrap();
+                let dir = wal.dir().to_owned();
+                if retired {
+                    let plat = MockPlatform::macos_taps();
+                    let mut scratch = vec![0.0; 48_000];
+                    supervise_channel(&mut wal, &mut meta, &mut consumer, &plat, 0, &mut scratch)
+                        .unwrap();
+                    clock.advance(Duration::from_secs(6));
+                    supervise_channel(&mut wal, &mut meta, &mut consumer, &plat, 0, &mut scratch)
+                        .unwrap();
+                }
+                let stopped = AtomicBool::new(true);
+                let counts = pump_drain(
+                    wal,
+                    consumer,
+                    mic,
+                    StreamFormat::new(48_000, 2, SampleFormat::F32),
+                    None,
+                    SttFeeds {
+                        system: None,
+                        mic: None,
+                        echo_gate: None,
+                    },
+                    PumpStop {
+                        stopped: &stopped,
+                        drain: GENEROUS_DRAIN,
+                    },
+                    Some(Supervision {
+                        plat: Arc::new(MockPlatform::macos_taps()),
+                        epoch_ns: 0,
+                        system: meta,
+                        mic: None,
+                        interval: SUPERVISE_INTERVAL,
+                        last: Instant::now(),
+                    }),
+                )
+                .unwrap_or_else(|error| panic!("{name} must preserve the recording: {error}"));
+                assert_eq!(
+                    counts.system_samples,
+                    if retired { 0 } else { expected.len() as u64 }
+                );
+                assert_eq!(counts.archive_warnings.len(), 1, "degradation is reported");
+                assert!(counts.archive_warnings[0].contains(if name == "nonfinite" {
+                    "2 non-finite capture samples"
+                } else {
+                    "1 samples discarded"
+                }));
+                let manifest: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap())
+                        .unwrap();
+                assert!(manifest["ended_at_ms"].is_number(), "{name} must finalize");
+                let samples: Vec<_> = std::fs::read(dir.join("system.pcm"))
+                    .unwrap()
+                    .chunks_exact(2)
+                    .map(|x| i16::from_le_bytes([x[0], x[1]]))
+                    .collect();
+                assert_eq!(
+                    &samples[..expected.len()],
+                    &expected,
+                    "{name} retains good audio"
+                );
+                assert_eq!(
+                    samples.len(),
+                    expected.len() + if retired { 6 * 48_000 * 2 } else { 0 }
+                );
+                assert!(samples[expected.len()..].iter().all(|sample| *sample == 0));
+            }
+        }
     }
 
     #[test]

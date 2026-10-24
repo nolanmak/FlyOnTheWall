@@ -39,7 +39,7 @@
 //! stereo system tap, so the two legs are padded from their own formats and
 //! never from one session-wide count (#82).
 
-use fotw_pipeline::resample::ArchiveConverter;
+use fotw_pipeline::resample::CaptureArchive;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -127,11 +127,8 @@ impl FrameSink for RingSink {
     fn on_error(&mut self, _e: TapError) {}
 }
 
-fn archive_converter(
-    format: StreamFormat,
-    archive: TrackFormat,
-) -> Result<ArchiveConverter, String> {
-    ArchiveConverter::new(
+fn archive_converter(format: StreamFormat, archive: TrackFormat) -> Result<CaptureArchive, String> {
+    CaptureArchive::new(
         format.sample_rate_hz,
         format.channels,
         archive.sample_rate_hz,
@@ -143,7 +140,7 @@ fn archive_converter(
 /// One supervised capture leg and everything the pump needs to service it.
 struct Leg {
     slot: ProducerSlot,
-    converter: ArchiveConverter,
+    converter: CaptureArchive,
     retired_drops: u64,
     boundary_samples: u64,
     label: &'static str,
@@ -260,7 +257,7 @@ pub fn record(root: PathBuf, seconds: u64) -> Result<PathBuf, String> {
     // system tap is stereo, and one count applied to both is #80 — the
     // encoder reads the mono mic WAL as stereo and archives it at half its
     // real length.
-    let mut wal = SessionWal::create_with_formats(
+    let wal = SessionWal::create_with_formats(
         &root,
         TrackFormat::new(sys_format.sample_rate_hz, sys_format.channels),
         mic_format.map(|f| TrackFormat::new(f.sample_rate_hz, f.channels)),
@@ -310,78 +307,8 @@ pub fn record(root: PathBuf, seconds: u64) -> Result<PathBuf, String> {
     // owns the supervisors so a rebuild's padding lands in the right place in
     // the stream. One pump drains BOTH rings; a thread per leg would double
     // the wakeups and buy nothing, since the writes go to one session anyway.
-    let pump = std::thread::spawn(move || -> Result<Vec<(Channel, Leg, u64)>, String> {
-        let mut scratch = vec![0.0f32; 48_000];
-        let mut written = vec![0u64; legs.len()];
-        let mut last_supervise = Instant::now();
-        let mut stopping = false;
-
-        loop {
-            // Stop capture the moment the caller asks, then keep draining what
-            // is already in the rings. Supervising a tap the user deliberately
-            // ended would read its silence as a fault and rebuild it.
-            if !stopping && pump_stop.load(Ordering::Acquire) {
-                stopping = true;
-                for (_, leg) in &mut legs {
-                    let _ = leg.supervisor.stop();
-                }
-            }
-
-            let mut moved = false;
-            for (i, (channel, leg)) in legs.iter_mut().enumerate() {
-                let n = leg.consumer.pop_into(&mut scratch);
-                if n > 0 {
-                    let pcm = leg
-                        .converter
-                        .process(&scratch[..n])
-                        .map_err(|e| e.to_string())?;
-                    channel
-                        .write(&mut wal, &pcm)
-                        .map_err(|e| format!("{} write failed: {e}", leg.label))?;
-                    written[i] += pcm.len() as u64;
-                    moved = true;
-                }
-            }
-
-            if !stopping && last_supervise.elapsed() >= SUPERVISE_INTERVAL {
-                last_supervise = Instant::now();
-                for (channel, leg) in &mut legs {
-                    supervise(
-                        &mut wal,
-                        *channel,
-                        leg,
-                        &*pump_plat,
-                        session_epoch_ns,
-                        &mut scratch,
-                    )?;
-                }
-            }
-
-            if !moved {
-                if stopping {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-
-        for (i, (channel, leg)) in legs.iter_mut().enumerate() {
-            let tail = leg.converter.finish().map_err(|e| e.to_string())?;
-            channel.write(&mut wal, &tail).map_err(|e| e.to_string())?;
-            written[i] += tail.len() as u64 + leg.boundary_samples;
-        }
-        wal.flush().map_err(|e| format!("flush failed: {e}"))?;
-        let gaps = wal.manifest().gaps.len();
-        wal.finalize()
-            .map_err(|e| format!("finalize failed: {e}"))?;
-        if gaps > 0 {
-            println!("\n  ! {gaps} gap(s) recorded in the manifest");
-        }
-        Ok(legs
-            .into_iter()
-            .zip(written)
-            .map(|((c, l), w)| (c, l, w))
-            .collect())
+    let pump = std::thread::spawn(move || {
+        pump_recording(wal, legs, &*pump_plat, session_epoch_ns, &pump_stop)
     });
 
     let began = Instant::now();
@@ -432,6 +359,88 @@ pub fn record(root: PathBuf, seconds: u64) -> Result<PathBuf, String> {
         ));
     }
     Ok(dir)
+}
+
+/// Drain and finalize the CLI's recording, including after recoverable driver
+/// corruption. Kept separate from native device setup for deterministic WAL tests.
+fn pump_recording(
+    mut wal: SessionWal,
+    mut legs: Vec<(Channel, Leg)>,
+    plat: &(impl AudioPlatform + ?Sized),
+    session_epoch_ns: u64,
+    stop: &AtomicBool,
+) -> Result<Vec<(Channel, Leg, u64)>, String> {
+    let mut scratch = vec![0.0f32; 48_000];
+    let mut written = vec![0u64; legs.len()];
+    let mut last_supervise = Instant::now();
+    let mut stopping = false;
+
+    loop {
+        // Stop capture the moment the caller asks, then keep draining what
+        // is already in the rings. Supervising a tap the user deliberately
+        // ended would read its silence as a fault and rebuild it.
+        if !stopping && stop.load(Ordering::Acquire) {
+            stopping = true;
+            for (_, leg) in &mut legs {
+                let _ = leg.supervisor.stop();
+            }
+        }
+
+        let mut moved = false;
+        for (i, (channel, leg)) in legs.iter_mut().enumerate() {
+            let n = leg.consumer.pop_into(&mut scratch);
+            if n > 0 {
+                let pcm = leg.converter.process(&mut scratch[..n]);
+                channel
+                    .write(&mut wal, &pcm)
+                    .map_err(|e| format!("{} write failed: {e}", leg.label))?;
+                written[i] += pcm.len() as u64;
+                moved = true;
+            }
+        }
+
+        if !stopping && last_supervise.elapsed() >= SUPERVISE_INTERVAL {
+            last_supervise = Instant::now();
+            for (channel, leg) in &mut legs {
+                supervise(
+                    &mut wal,
+                    *channel,
+                    leg,
+                    plat,
+                    session_epoch_ns,
+                    &mut scratch,
+                )?;
+            }
+        }
+
+        if !moved {
+            if stopping {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    for (i, (channel, leg)) in legs.iter_mut().enumerate() {
+        let tail = leg.converter.finish();
+        channel.write(&mut wal, &tail).map_err(|e| e.to_string())?;
+        written[i] += tail.len() as u64 + leg.boundary_samples;
+        for warning in leg.converter.warnings() {
+            println!("  ! [{}] {warning}", leg.label);
+        }
+    }
+    wal.flush().map_err(|e| format!("flush failed: {e}"))?;
+    let gaps = wal.manifest().gaps.len();
+    wal.finalize()
+        .map_err(|e| format!("finalize failed: {e}"))?;
+    if gaps > 0 {
+        println!("\n  ! {gaps} gap(s) recorded in the manifest");
+    }
+    Ok(legs
+        .into_iter()
+        .zip(written)
+        .map(|((c, l), w)| (c, l, w))
+        .collect())
 }
 
 /// The shape each of the session's two PCM legs is written in.
@@ -489,16 +498,16 @@ fn supervise(
                 break;
             }
             remaining -= n;
-            let pcm = leg
-                .converter
-                .process(&scratch[..n])
-                .map_err(|e| e.to_string())?;
+            let pcm = leg.converter.process(&mut scratch[..n]);
             channel.write(wal, &pcm).map_err(|e| e.to_string())?;
             leg.boundary_samples += pcm.len() as u64;
         }
-        let tail = leg.converter.finish().map_err(|e| e.to_string())?;
+        let tail = leg.converter.finish();
         channel.write(wal, &tail).map_err(|e| e.to_string())?;
         leg.boundary_samples += tail.len() as u64;
+        for warning in leg.converter.warnings() {
+            println!("  ! [{}] {warning}", leg.label);
+        }
         leg.retired_drops += leg.consumer.dropped_frames();
         leg.consumer = leg.slot.replacement()?;
         leg.converter = archive_converter(format, leg.wal_format)?;
@@ -632,6 +641,60 @@ mod tests {
     }
 
     #[test]
+    fn cli_invalid_capture_finalizes_both_current_and_retired_generations() {
+        for retired in [false, true] {
+            for (name, pcm, expected) in [
+                (
+                    "nonfinite",
+                    vec![0.25, f32::NAN, f32::INFINITY, -0.25],
+                    vec![8191i16, 0, 0, -8191],
+                ),
+                ("partial", vec![0.25, -0.25, 0.75], vec![8191i16, -8191]),
+            ] {
+                let root = scratch_dir(&format!("invalid-{name}-{retired}"));
+                let clock = ManualClock::new();
+                let mut leg = fake_leg("system", TapId::system_default(), stereo48(), &clock);
+                let (mut producer, consumer) = AudioRing::with_capacity_frames(16);
+                producer.push_block(&pcm);
+                leg.consumer = consumer;
+                let mut wal = SessionWal::create_with_formats(&root, stereo48(), None).unwrap();
+                let dir = wal.dir().to_owned();
+                let plat = MockPlatform::macos_taps();
+                if retired {
+                    let mut scratch = vec![0.0; 48_000];
+                    supervise(&mut wal, Channel::System, &mut leg, &plat, 0, &mut scratch).unwrap();
+                    clock.advance(Duration::from_secs(6));
+                    supervise(&mut wal, Channel::System, &mut leg, &plat, 0, &mut scratch).unwrap();
+                }
+                let result = pump_recording(
+                    wal,
+                    vec![(Channel::System, leg)],
+                    &plat,
+                    0,
+                    &AtomicBool::new(true),
+                )
+                .unwrap_or_else(|error| panic!("{name} must finalize: {error}"));
+                assert_eq!(
+                    result[0].2 as usize,
+                    expected.len() + if retired { 6 * 48_000 * 2 } else { 0 }
+                );
+                let state = SessionState::read(&dir).unwrap();
+                assert!(state.manifest.ended_at_ms.is_some());
+                let samples: Vec<_> = std::fs::read(dir.join("system.pcm"))
+                    .unwrap()
+                    .chunks_exact(2)
+                    .map(|x| i16::from_le_bytes([x[0], x[1]]))
+                    .collect();
+                assert_eq!(&samples[..expected.len()], &expected);
+                assert_eq!(samples.len(), result[0].2 as usize);
+                assert!(samples[expected.len()..].iter().all(|sample| *sample == 0));
+                drop(result);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn cli_recovery_keeps_new_format_after_gap_and_preserves_archive_duration() {
         struct EmittingTap(FakeTap, Vec<f32>);
         impl AudioTap for EmittingTap {
@@ -694,8 +757,8 @@ mod tests {
         assert_eq!(leg.consumer.slots(), 160);
         assert_eq!(leg.boundary_samples, 960 + 6 * 48_000 * 2);
         let n = leg.consumer.pop_into(&mut scratch);
-        let mut converted = leg.converter.process(&scratch[..n]).unwrap();
-        converted.extend(leg.converter.finish().unwrap());
+        let mut converted = leg.converter.process(&mut scratch[..n]);
+        converted.extend(leg.converter.finish());
         assert_eq!(converted.len(), 960);
         wal.write_system(&converted).unwrap();
         wal.flush().unwrap();
