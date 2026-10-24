@@ -30,6 +30,12 @@
 //! removed by comparing normalized leading text against the transcript tail.
 //! Letting the synthesized final move the anchor instead would skip the
 //! replayed audio, and the words lost would never appear anywhere.
+//!
+//! Durable handoff uses [`DeepgramStreamConfig::with_confirmed_finals`]. In
+//! that mode interrupted partials remain uncommitted, and reconnects do not
+//! trim words against synthesized text. The caller must retain pending audio,
+//! reset abandoned live partials, and arbitrate provider epochs itself. This
+//! option alone neither extends the replay ring nor implements failover.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -85,6 +91,10 @@ pub struct DeepgramStreamConfig {
     /// reconnect. Zero for the earlier leg, and zero for a single-leg session,
     /// where there is nothing to line up against.
     pub session_offset_ms: u64,
+    /// Emit finals only when the provider confirms them. Durable handoff
+    /// controllers must replay interrupted partials instead of committing them.
+    /// Off by default to preserve the existing partial-to-final contract.
+    pub confirmed_finals_only: bool,
 }
 
 impl DeepgramStreamConfig {
@@ -106,7 +116,19 @@ impl DeepgramStreamConfig {
             backoff: BackoffPolicy::spec(),
             tail_tokens: DEFAULT_TAIL_TOKENS,
             session_offset_ms: 0,
+            confirmed_finals_only: false,
         }
+    }
+
+    /// Require provider-confirmed utterance finals for durable replay/handoff.
+    ///
+    /// Reconnect and shutdown discard dangling partials instead of synthesizing
+    /// finals. Callers must retain uncommitted audio and invalidate abandoned
+    /// live partials. This does not implement a durable replay store itself.
+    #[must_use]
+    pub fn with_confirmed_finals(mut self) -> Self {
+        self.confirmed_finals_only = true;
+        self
     }
 
     /// Anchor this leg `session_offset_ms` into the session (#86).
@@ -344,7 +366,9 @@ impl Driver {
         // Spec 7.3's conformance property: every partial is eventually
         // superseded by a final, including the one that was open when the
         // meeting ended.
-        if let Some(dangling) = self.normalizer.finish() {
+        if let Some(dangling) = self.normalizer.finish()
+            && !self.config.confirmed_finals_only
+        {
             self.commit_final(dangling);
         }
         self.emit(StreamEvent::State(StreamState::Closed));
@@ -399,7 +423,9 @@ impl Driver {
         // `last_final_end_ms` is on the session clock the anchor puts it on.
         let replay = self.ring.replay_from(self.leg_ms(self.last_final_end_ms));
         if !first_connection {
-            if let Some(mut dangling) = self.normalizer.reconnected_at(replay.start_ms) {
+            if let Some(mut dangling) = self.normalizer.reconnected_at(replay.start_ms)
+                && !self.config.confirmed_finals_only
+            {
                 // The dangling partial goes through deduplication too. On a
                 // single reconnect it never overlaps — the tail ends with the
                 // previous utterance's final. But when a *second* socket dies
@@ -411,7 +437,9 @@ impl Driver {
                     self.commit_final(dangling);
                 }
             }
-            self.dedupe_armed = true;
+            // Confirmed mode has not published the dangling text. Trimming
+            // its prefix would remove words that have never been committed.
+            self.dedupe_armed = !self.config.confirmed_finals_only;
             if replay.lost_audio() {
                 self.emit(StreamEvent::Error(
                     SttError::new(
