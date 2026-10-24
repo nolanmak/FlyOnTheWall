@@ -35,7 +35,7 @@ text in the textarea. The store/web regression suites and workspace Clippy pass;
 63 Node UI tests pass. Full workspace regression is also run before pushing.
 
 Outstanding before completion: encrypted draft recovery discovery across
-browser/daemon restarts; transcript-window augmentation; actual browser
+browser/daemon restarts; live recording acceptance; actual browser
 keyboard/IME/narrow-layout checks.
 The saved-meeting editor remaps supplied anchors without creating historic
 timestamps. Live first-input capture is implemented below; browser acceptance remains #13 work.
@@ -206,3 +206,37 @@ absent while the library still renders. Test tabs, servers and temporary
 libraries were removed. CDP was unavailable and no browser settings changed.
 This establishes saved-note editing/navigation/reload, not live hardware capture,
 IME behavior or narrow-layout acceptance.
+
+
+## Transcript windows for augmentation
+
+The daemon reads the note body and anchor snapshot from the same meeting as its
+primary transcript. Each anchored block supplies a window from 90 seconds before
+to 90 seconds after its original capture offset, clipped to zero and the saved
+meeting duration. First-speech display rebasing never enters this calculation.
+A transcript segment intersecting the window keeps its whole text and original
+timestamps; without word-level alignment, trimming its text would fabricate a
+boundary. A block outside the recording duration receives no contextual evidence.
+
+The augment call receives raw notes plus structured block windows and matching
+excerpts. Overlapping windows share excerpt text once, referenced by original
+segment IDs. In map/reduce, each request includes only excerpts available in its
+own transcript chunk. The instruction treats excerpts as untrusted speech,
+requires matching-window grounding and citations to the transcript document,
+and forbids inventing evidence for an empty window. Unanchored notes retain their
+existing raw-note input path. Typing still does not trigger a summary call.
+
+Before any anchored-note provider call, the pipeline checks all planned chunks
+against context capacity, including output reserve and a conservative byte-based
+ceiling for structured note content. It repacks into smaller whole-speaker-turn
+chunks when necessary. A note payload or indivisible turn that cannot fit returns
+a context error before making a call. Only one chunk's repeated window payload
+is allocated at a time. This is conservative estimation, not a model tokenizer
+or a token-cost measurement.
+
+Red/green tests demonstrated missing structured windows, missing daemon prompt
+context and a context overflow resolved by repacking. Tests cover start/end
+clipping, exact boundary intersection, overlapping excerpt deduplication,
+invalid offsets, chunk isolation, refusing oversized notes before a transport
+call, and verifying a prompt cannot contain a second meeting's fixture text.
+These are synthetic-provider tests; real model quality evaluation remains open.
