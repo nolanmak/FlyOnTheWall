@@ -279,7 +279,7 @@ impl<'a> Pipeline<'a> {
         // Render/check one window payload at a time, so a long meeting cannot
         // allocate every chunk's repeated notes simultaneously. Byte length is
         // a conservative token ceiling for the structured notes, not a price estimate.
-        if !anchors.is_empty() {
+        if !anchors.is_empty() || !user_notes.trim().is_empty() {
             let usable = capabilities.usable_context_tokens;
             let overhead = crate::tokens::estimate_tokens(system.text())
                 .saturating_add(self.config.max_output_tokens)
@@ -1829,6 +1829,18 @@ mod tests {
             &[anchor],
             600_000,
         ));
+        assert!(
+            matches!(result, Err(SummarizeError::ContextOverflow { .. })),
+            "{result:?}"
+        );
+        assert_eq!(transport.call_count(), 0);
+    }
+    #[test]
+    fn oversized_unanchored_notes_fail_before_any_provider_call() {
+        let transport = MockTransport::new();
+        let adapter = small_context_adapter(transport.clone());
+        let pipeline = Pipeline::new(&adapter, &adapter);
+        let result = block_on(pipeline.run(&document(), &"x".repeat(20_000)));
         assert!(
             matches!(result, Err(SummarizeError::ContextOverflow { .. })),
             "{result:?}"
