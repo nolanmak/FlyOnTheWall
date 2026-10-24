@@ -2204,6 +2204,10 @@ fn spawn_leg_collector(
                     crate::diag!("  ! transcription ({leg}): {e}");
                     errors.record(format!("{leg}: {e}"));
                 }
+                // A local worker can be stuck inside native inference even after
+                // its deadline. Closed fences late output without waiting for
+                // that worker to drop its event sender.
+                StreamEvent::State(fotw_stt::StreamState::Closed) => break,
                 _ => {}
             }
         }
@@ -2233,7 +2237,8 @@ impl LegStream {
     ///
     /// Deepgram is asked to finalize first so the utterance in flight is not
     /// lost with the socket. A local leg's close already transcribes everything
-    /// written before it, however far behind the model has fallen.
+    /// written before it within a bounded drain deadline; overload/timeouts
+    /// retain audio and report incomplete transcription.
     async fn finish(&self) {
         match self {
             Self::Deepgram(stream) => {
@@ -3492,6 +3497,35 @@ mod supervised_recovery_tests {
             counters.t0_ns(),
             Some(123_456),
             "and captured this leg's t0 for anchoring (#86)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod local_collector_shutdown_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn closed_event_finishes_collector_even_if_model_still_owns_sender() {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut task = spawn_leg_collector(
+            "fixture",
+            receiver,
+            sink,
+            SttErrors::default(),
+            SegmentTap::default(),
+        );
+        sender
+            .send(StreamEvent::State(fotw_stt::StreamState::Closed))
+            .unwrap();
+        let completed = tokio::time::timeout(Duration::from_millis(100), &mut task)
+            .await
+            .is_ok();
+        task.abort();
+        assert!(
+            completed,
+            "stalled inference sender must not hold a closed session collector alive"
         );
     }
 }
