@@ -653,8 +653,18 @@ section {
 .note-editor textarea {
   display: block; width: 100%; min-height: 180px; resize: vertical;
   margin-top: 8px; padding: 16px; border: 1px solid var(--line);
-  border-radius: var(--radius); background: var(--surface); color: var(--fg);
+  border-radius: var(--radius, 8px); background: var(--surface, var(--bg)); color: var(--fg);
   font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 .note-editor [role="status"] { font-size: 12px; color: var(--muted); }
 .note-editor .actions { flex-wrap: wrap; }
+
+.note-editor button {
+  min-height: 36px; padding: 6px 10px; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--surface, var(--bg)); color: var(--fg);
+  font: inherit; font-size: 13px; cursor: pointer;
+}
+.note-editor button:disabled { opacity: .5; cursor: default; }
+.note-editor button:focus-visible, .note-editor textarea:focus-visible {
+  outline: 3px solid var(--accent); outline-offset: 3px;
+}
