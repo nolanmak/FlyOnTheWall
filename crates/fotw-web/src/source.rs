@@ -26,6 +26,26 @@ use serde::{Deserialize, Serialize};
 /// which blocks, and blocking a runtime worker while a two-hour transcript is
 /// read would stall every other connection — including the live delta stream.
 pub trait MeetingSource: Send + Sync + 'static {
+    /// Read an editable note snapshot. Unsupported sources refuse the operation.
+    ///
+    /// # Errors
+    /// Missing meeting or backing-store failure.
+    fn note(&self, _id: &str) -> Result<crate::notes::NoteDocument, crate::notes::NoteError> {
+        Err(crate::notes::NoteError::NotFound)
+    }
+
+    /// Atomically save a note using its observed revision.
+    ///
+    /// # Errors
+    /// Missing meeting, conflict, invalid input or backing-store failure.
+    fn save_note(
+        &self,
+        _id: &str,
+        _doc: crate::notes::NoteDocument,
+    ) -> Result<crate::notes::NoteDocument, crate::notes::NoteError> {
+        Err(crate::notes::NoteError::NotFound)
+    }
+
     /// Most recent meetings first.
     ///
     /// # Errors

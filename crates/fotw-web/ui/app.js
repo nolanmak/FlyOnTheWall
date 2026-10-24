@@ -403,7 +403,9 @@ function renderDetail(detail) {
   // Notes first, and above the summary, because they are the user's own words
   // and the summary is a derived artifact. Search has always indexed notes, so
   // before this they could be matched but never read.
-  if (detail.note_md) {
+  if (typeof FOTWNotes !== "undefined") {
+    FOTWNotes.mount(detail.meeting.id, el.detail, api);
+  } else if (detail.note_md) {
     const notes = document.createElement("section");
     notes.className = "notes";
     notes.appendChild(text("h3", "Your notes"));
@@ -551,6 +553,7 @@ function updateMeetingSelection() {
 }
 
 async function openMeeting(id) {
+  if (typeof FOTWNotes !== "undefined") FOTWNotes.flushAll();
   selectedMeetingId = id;
   updateMeetingSelection();
   const request = ++detailRequest;
@@ -985,6 +988,7 @@ function renderRecording(body) {
 // Navigation only: the session model survives showing another meeting.
 // Starting a new capture resets the model via status.session_id, never here.
 function showLive() {
+  if (typeof FOTWNotes !== "undefined") FOTWNotes.flushAll();
   ++detailRequest;
   currentDetail = null;
   selectedMeetingId = null;
