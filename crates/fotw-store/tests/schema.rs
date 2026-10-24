@@ -46,6 +46,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "people",
     "recordings",
     "segments",
+    "session_notes",
     "settings",
     "summaries",
     "tags",

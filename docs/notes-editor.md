@@ -86,3 +86,26 @@ block movement and matching text/anchor snapshots during in-flight saves. A
 mounted-control test verifies keyboard focus and the emitted save payload. All
 63 UI tests pass; actual browser/IME, mobile selection and live recording-time
 checks remain outstanding.
+
+## Encrypted recording drafts (storage foundation)
+
+Schema 5 adds a STRICT `session_notes` table keyed by the capture/WAL session ID,
+before the recording has a meeting row. `SessionNoteDocument` stores the original
+capture start, revision, Markdown and stable anchors in the SQLCipher library.
+The save API uses an immediate transaction and compare-and-swap revision. It
+shares the note size/identity validation, rejects changing the capture start or
+an existing anchor's original time, and rejects anchors beyond the supplied
+recording elapsed time. That elapsed time must come from the authoritative
+recorder when the HTTP adapter is added, not from a client assertion.
+
+A forward-only migration preserves existing note text, revisions and anchor IDs.
+Explicit library archives include the draft rows; their existing plaintext
+warning applies. Import still accepts pre-schema-5 manifests without drafts.
+Tests cover reopen recovery, ciphertext lacking a fixture plaintext marker,
+stale revisions, bounds, unchanged offsets, injected update failure, full archive
+roundtrips (including every column) and migration from a populated v4 library.
+
+This is not yet user-visible crash recovery: the live notes routes/editor,
+recovery discovery, atomic session-to-meeting handoff and late-save routing still
+need implementation. No new browser storage is used. The table is not a
+replacement for that complete flow, and #122/#13 remain open.
