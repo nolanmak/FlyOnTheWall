@@ -56,6 +56,10 @@ pub enum StoreError {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
+    /// Another editor saved after this caller loaded its snapshot.
+    #[error("note revision changed; reload before saving")]
+    NoteConflict,
+
     /// Filesystem failure, with the path that caused it.
     #[error("io error while {context} ({path})")]
     Io {

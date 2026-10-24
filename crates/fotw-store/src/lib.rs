@@ -44,6 +44,7 @@ mod key;
 mod media;
 mod migrations;
 mod models;
+mod notes;
 mod repo;
 mod search;
 
@@ -62,5 +63,6 @@ pub use crate::migrations::LATEST_SCHEMA_VERSION;
 pub use crate::models::{
     Meeting, NewMeeting, NewSegment, NewSummary, NoteAnchor, StoredSegment, Summary,
 };
+pub use crate::notes::{MAX_NOTE_BYTES, NoteDocument};
 pub use crate::repo::MeetingRepo;
 pub use crate::search::{FTS_TABLES, SearchHit, SearchQuery, SearchSource, SearchWeights};
