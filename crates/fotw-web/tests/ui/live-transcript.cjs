@@ -16,7 +16,7 @@ function harness() {
     addEventListener(k,f){this.listeners[k]=f;} setAttribute(k,v){this[k]=v;}
   }
   const root=new Element('body');
-  const nodes=new Map(['detail','status','record','live','elapsed','consent','consent-label','recording','recording-limit','return-live'].map(id=>{let n=root.appendChild(new Element('div'));n.id=id;return [id,n];}));
+  const nodes=new Map(['list','detail','status','record','live','elapsed','consent','consent-label','recording','recording-limit','return-live'].map(id=>{let n=root.appendChild(new Element('div'));n.id=id;return [id,n];}));
   const all=(n=root)=>[n,...n.children.flatMap(all)];
   const document={createElement:t=>new Element(t),getElementById:id=>all().find(n=>n.id===id)||null};
   const ctx=vm.createContext({document,Date,Intl,Set,Map,URLSearchParams,window:{location:{search:''}},localStorage:{getItem:()=>null},setInterval:()=>1,clearInterval(){},setTimeout(){},XMLSerializer:class {serializeToString(n){return n.textContent;}}});
@@ -109,4 +109,22 @@ test('UI and Rust exports share the same zero, leading-silence and multi-hour co
   const payload=h.ctx.storedTranscriptPayload({meeting:{title:'Shared fixture',started_at_ms:1000},segments});
   fixture.labels.forEach(label=>{assert.ok(payload.text.includes('['+label+']'));assert.ok(payload.html.includes('['+label+']'));});
  }
+});
+
+
+test('meeting selection is accessible, survives list/search refresh, and clears for live view',async()=>{
+ const h=harness();
+ h.ctx.api=async()=>({meeting:{id:'A'}});
+ h.ctx.renderDetail=()=>{};
+ const rows=[{id:'A',title:'First',started_at_ms:1000},{id:'B',title:'Second',started_at_ms:2000}];
+ h.ctx.renderList(rows);
+ await h.ctx.openMeeting('A');
+ assert.equal(h.nodes.get('list').children[0]['aria-current'],'true');
+ assert.equal(h.nodes.get('list').children[1]['aria-current'],'false');
+ h.ctx.renderList(rows);
+ assert.equal(h.nodes.get('list').children[0]['aria-current'],'true');
+ h.ctx.renderHits([{meeting_id:'A',meeting_title:'First',source:'notes',snippet:'match'}]);
+ assert.equal(h.nodes.get('list').children[0]['aria-current'],'true');
+ h.ctx.showLive();
+ assert.equal(h.nodes.get('list').children[0]['aria-current'],'false');
 });

@@ -252,6 +252,8 @@ function renderList(meetings) {
     const item = document.createElement("button");
     item.className = "meeting";
     item.type = "button";
+    item.dataset.meetingId = m.id;
+    item.setAttribute("aria-current", String(m.id === selectedMeetingId));
     item.appendChild(text("span", m.title || "Untitled meeting", "title"));
     item.appendChild(text("span", when(m.started_at_ms), "meta"));
     item.appendChild(text("span", listMeta(m), "meta"));
@@ -486,6 +488,8 @@ function renderHits(hits) {
     const item = document.createElement("button");
     item.className = "meeting";
     item.type = "button";
+    item.dataset.meetingId = h.meeting_id;
+    item.setAttribute("aria-current", String(h.meeting_id === selectedMeetingId));
     item.appendChild(text("span", h.meeting_title || "Untitled meeting", "title"));
     item.appendChild(text("span", h.source, "meta"));
     item.appendChild(text("span", h.snippet, "snippet"));
@@ -537,8 +541,18 @@ let currentDetail = null;
 let detailRequest = 0;
 let selectedMeetingId = null;
 
+function updateMeetingSelection() {
+  if (!el.list) return;
+  for (const row of el.list.children) {
+    if (row.dataset.meetingId) {
+      row.setAttribute("aria-current", String(row.dataset.meetingId === selectedMeetingId));
+    }
+  }
+}
+
 async function openMeeting(id) {
   selectedMeetingId = id;
+  updateMeetingSelection();
   const request = ++detailRequest;
   try {
     const detail = await api("/api/meetings/" + encodeURIComponent(id));
@@ -974,6 +988,7 @@ function showLive() {
   ++detailRequest;
   currentDetail = null;
   selectedMeetingId = null;
+  updateMeetingSelection();
   clear(el.detail);
   el.detail.appendChild(text("h2", "Recording"));
   el.detail.appendChild(
