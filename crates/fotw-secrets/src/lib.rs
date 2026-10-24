@@ -58,6 +58,8 @@
 #![warn(missing_docs)]
 
 pub mod cache;
+#[cfg(any(test, feature = "conformance"))]
+pub mod conformance;
 mod error;
 mod fingerprint;
 mod index;

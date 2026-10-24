@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Shared consumer checks; never enabled by a release dependency.
+conformance = []
+
 [dependencies]
 thiserror = { workspace = true }
 # The credentials index is a store row (docs/REQUIREMENTS.md 10). It derives
