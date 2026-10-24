@@ -641,7 +641,7 @@ where
     }
 }
 
-fn json<T: Serialize>(state: &AppState, value: &T) -> Response {
+pub(crate) fn json<T: Serialize>(state: &AppState, value: &T) -> Response {
     let Ok(body) = serde_json::to_vec(value) else {
         return server_error();
     };
@@ -660,7 +660,7 @@ fn json<T: Serialize>(state: &AppState, value: &T) -> Response {
 
 /// A bare 500. No body: a SQLite error string can quote the row it choked on,
 /// and §10's never-log rules do not stop at the log file.
-fn server_error() -> Response {
+pub(crate) fn server_error() -> Response {
     Response::builder()
         .status(StatusCode::INTERNAL_SERVER_ERROR)
         .body(Body::empty())

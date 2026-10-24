@@ -184,6 +184,10 @@ fn routes(state: AppState) -> Router {
         .route("/assets/{*path}", get(assets::asset))
         .route("/api/meetings", get(api::list_meetings))
         .route("/api/meetings/{id}", get(api::get_meeting))
+        .route(
+            "/api/meetings/{id}/notes",
+            get(crate::notes::load).post(crate::notes::save),
+        )
         .route("/api/search", get(api::search))
         .route("/api/ws-ticket", post(api::ws_ticket))
         .route("/api/handoff", post(api::handoff))
