@@ -10,7 +10,7 @@ against these baselines, not treated as a completed extraction.
 | --- | --- | --- |
 | Credential addresses, secret wrappers, redaction, OS key store | fotw-secrets | Murmur resolves explicit process/.env settings before keychain; FlyOnTheWall does not acquire that policy |
 | Audio format/callback/frame timestamps and platform taps | fotw-audio | Each app owns capture consent, device recovery, deadlines and generation fencing |
-| PCM resampling | fotw-pipeline today; Murmur source copy | Extraction still pending; keep rates, phase and channel behavior tested |
+| PCM resampling | fotw-dsp | Pipeline re-exports the shared implementation; Murmur consumes the same crate |
 | Transcript segments, typed errors, provider wire protocol | fotw-stt | Each app chooses retries, persistence, fallback and delivery |
 | Dictation final drain | Murmur streaming.rs | CloseStream followed by final Metadata; do not replace with meeting socket-close policy |
 | Meeting WAL/recovery | FlyOnTheWall daemon | Never move meeting data or consent policy into Murmur |
@@ -47,8 +47,7 @@ and cancellation. Injected timestamp, finalization and late-final regressions
 fail these tests. Murmur retains its separately tested CloseStream/Metadata
 transport. Its full workspace tests, formatting and Clippy pass after removing
 the vendor copies. The production dependency graph excludes whisper-rs.
-Resampler extraction, provider capabilities and complete hosted compatibility
-gates remain outstanding.
+Provider capabilities and complete hosted compatibility gates remain outstanding.
 Shared Rust source does not share loaded model memory. Sharing model workers is
 separate #120 work, conditional on measured contention.
 
@@ -57,3 +56,14 @@ with `cargo check --locked`; its full workspace tests and Clippy pass with the
 Git pin. A disposable clean clone also passed the full workspace with the same
 producer path substitution used by the compatibility workflow. No OS keychain
 test was enabled. Hosted compatibility checks remain required on each revision.
+
+## Shared PCM conversion
+
+`fotw-dsp` owns the formerly identical resampler copies without pulling meeting
+WAL, Opus, capture or model runtimes into dictation. `fotw-pipeline::resample`
+re-exports the API to preserve existing callers. Existing anti-aliasing,
+passband, Bluetooth-rate, downmix and clamping tests run against the new owner
+and the pipeline public API. The opt-in `conformance::streaming()` contract
+checks callback-size independence (including split stereo frames), output
+length, finite samples and signed little-endian PCM across 8–96 kHz inputs.
+Dropping pending samples between callbacks makes that contract fail.
