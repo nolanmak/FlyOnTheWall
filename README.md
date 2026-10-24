@@ -164,6 +164,14 @@ fotwd stt                           # which engine the next recording will use
 
 On-device transcription is a different trade-off from Deepgram's. Text appears once each speaker pauses, a second or two after they stop, rather than word by word. The far end of the call is not split into speakers: everything from the call audio is one voice, and your microphone is always `me`. If the model is missing or cannot load, the meeting is still recorded, the dashboard says why there is no transcript, and nothing is sent to Deepgram instead.
 
+Local inference queues are bounded to 60 seconds of PCM and 8,192 commands per
+track. If inference cannot keep up, transcription stops with an incomplete
+status while original audio remains recorded; automatic backfill is still
+tracked in #12/#33. Stop waits at most 30 seconds per local stream for pending
+inference, then reports incomplete output and fences late results. A native
+model call may continue computing after that deadline; this is not a promise
+of immediate compute interruption.
+
 ### Choose a summary engine
 
 Pick one:
