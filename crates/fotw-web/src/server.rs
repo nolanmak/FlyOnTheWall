@@ -192,6 +192,7 @@ fn routes(state: AppState) -> Router {
             "/api/sessions/{id}/notes",
             get(crate::notes::load_session).post(crate::notes::save_session),
         )
+        .route("/api/note-drafts", get(crate::notes::list_drafts))
         .route("/api/search", get(api::search))
         .route("/api/ws-ticket", post(api::ws_ticket))
         .route("/api/handoff", post(api::handoff))

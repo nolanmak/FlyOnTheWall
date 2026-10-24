@@ -68,4 +68,4 @@ pub use crate::notes::{MAX_NOTE_BYTES, NoteDocument};
 pub use crate::repo::MeetingRepo;
 pub use crate::search::{FTS_TABLES, SearchHit, SearchQuery, SearchSource, SearchWeights};
 
-pub use crate::session_notes::SessionNoteDocument;
+pub use crate::session_notes::{SessionNoteDocument, SessionNoteDraftSummary};

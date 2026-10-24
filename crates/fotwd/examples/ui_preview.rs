@@ -216,6 +216,25 @@ async fn main() -> Result<(), String> {
         println!("  seeded {id}  {title}");
     }
 
+    // An unfinished recording's saved notes, for recovery UI checks without audio.
+    db.save_session_note(
+        &fotw_store::SessionNoteDocument {
+            session_id: format!("preview-recovery-{}", std::process::id()),
+            started_at_ms: now_ms.saturating_sub(7_200_000) as i64,
+            note: fotw_store::NoteDocument {
+                revision: 0,
+                body_md: "Recovery fixture: revisit the migration plan.\n\nCafé follow-up.".into(),
+                anchors: vec![fotw_store::NoteAnchor::new(
+                    0,
+                    "Recovery fixture: revisit the migration plan.",
+                    250,
+                )],
+            },
+        },
+        1_000,
+    )
+    .map_err(|e| e.to_string())?;
+
     // The real server, the real ingress policy, the real embedded assets.
     let source = Arc::new(fotw_web::StoreSource::new(db));
     let server = fotw_web::WebServer::bind(0, source)

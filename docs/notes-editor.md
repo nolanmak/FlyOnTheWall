@@ -6,8 +6,9 @@ owns its meeting ID. Navigation leaves unfinished writes associated with that
 ID; edits made during a save are queued behind it using the returned revision.
 
 Draft text stays in tab memory. Unloading with unsaved text warns the user.
-No note text is written to browser storage. This does not provide recovery
-from a browser crash: an encrypted draft/recovery path is still required.
+No note text is written to browser storage. Successfully saved session drafts
+can be discovered after reopening the app (see recovery below). Text still
+waiting for a successful save remains vulnerable to a browser crash.
 
 GET/POST `/api/meetings/{id}/notes` use the existing host/origin/bearer guard.
 The request contains `revision`, `body_md`, and `anchors`; revision zero means
@@ -34,9 +35,8 @@ proves rollback of text, revision, anchors and the FTS index. UI tests use liter
 text in the textarea. The store/web regression suites and workspace Clippy pass;
 63 Node UI tests pass. Full workspace regression is also run before pushing.
 
-Outstanding before completion: encrypted draft recovery discovery across
-browser/daemon restarts; live recording acceptance; actual browser
-keyboard/IME/narrow-layout checks.
+Outstanding before completion: native live recording acceptance, audio recovery
+integration, and actual browser IME/narrow-layout checks.
 The saved-meeting editor remaps supplied anchors without creating historic
 timestamps. Live first-input capture is implemented below; browser acceptance remains #13 work.
 Neither #122 nor #13 is complete.
@@ -105,9 +105,8 @@ Tests cover reopen recovery, ciphertext lacking a fixture plaintext marker,
 stale revisions, bounds, unchanged offsets, injected update failure, full archive
 roundtrips (including every column) and migration from a populated v4 library.
 
-This is not yet user-visible crash recovery: recovery discovery still needs
-implementation. No new browser storage is used. The table is not a
-replacement for that complete flow, and #122/#13 remain open.
+The recovery view below exposes durable unfinished drafts without new browser
+storage. It does not recover audio or unsaved keystrokes; #122/#13 remain open.
 
 ## Atomic handoff and late saves (store contract)
 
@@ -157,8 +156,8 @@ bound are enforced by the store on every late write.
 The synthetic HTTP test first failed on the missing authenticated route, then
 passed authentication, hostile-origin, forged-clock, wrong-session, bounds,
 stale-write, orphan-read, finalization-gap and first/late-save checks against a
-temporary encrypted library. Recovery discovery and real browser acceptance remain outstanding; these
-endpoints alone do not complete #122 or #13.
+temporary encrypted library. The recovery view below makes orphan drafts
+discoverable; live browser acceptance remains outstanding for #122/#13.
 
 
 ## Live editor and capture clock
@@ -192,7 +191,8 @@ anchor and absent capture-clock interpolation. The 70 UI tests now include
 live/saved navigation during a pending write, first-input timing, paste, edit,
 reorder, deletion/recreation, Stop, automatic bounds, clock rollback, finalization
 retry and preserving text after a late end-clock update. Real browser/IME,
-permission/hardware tests and encrypted orphan discovery remain separate gates.
+permission/hardware tests remain separate gates. Encrypted orphan discovery is
+implemented below.
 
 
 Native Chrome check (synthetic library, 2026-10-24): edited a saved note using
@@ -240,3 +240,43 @@ clipping, exact boundary intersection, overlapping excerpt deduplication,
 invalid offsets, chunk isolation, refusing oversized notes before a transport
 call, and verifying a prompt cannot contain a second meeting's fixture text.
 These are synthetic-provider tests; real model quality evaluation remains open.
+
+
+## Discovering unfinished notes
+
+The header's Unfinished notes button lists durable session drafts, newest capture
+first with session ID as a deterministic tie-breaker. The authenticated
+`GET /api/note-drafts?limit=50&offset=0` returns only session ID, capture start
+and last-save time, capped at 100 rows per request. Text and anchors are loaded
+only when a draft is selected. Finalized drafts leave this index atomically
+with their handoff to the saved meeting.
+
+Navigation first flushes pending editor saves. Selecting the active recording
+returns to its live editor. An orphan opens a read-only recovery view with
+explicit copy, Markdown download and JSON download actions. JSON retains the
+original session identity, note revision, block IDs and capture offsets. No
+missing end clock is invented; unknown elapsed time remains null. Downloading
+or copying never deletes or modifies the source draft. If a draft finalized
+between listing and opening, the view follows its saved-meeting identity;
+a late response cannot replace a subsequently selected view.
+
+The index loads 50 rows at a time. A failed page can be retried at the same
+offset without clearing earlier results; Refresh restarts discovery. A failed
+reload of a selected draft retains its previously loaded text. Offset paging
+is a live view, not a snapshot: concurrently finalized rows can shift page
+boundaries; Refresh reloads the current index.
+
+Behavioral red/green tests exposed the missing store index, authenticated
+route, recovery rendering and navigation callback before their implementations.
+Store tests cover reopen, stable paging, caps and finalized-row removal; web
+tests cover authorization and metadata-only responses. All 73 UI tests pass,
+including page retries, literal script-shaped text, explicit exports preserving
+anchors and late-response navigation fencing. Full local `just ci` passes;
+cargo-deny and the Windows target were explicitly skipped as unavailable.
+
+Native Chrome check (synthetic library, 2026-10-24): keyboard navigation opened
+Unfinished notes, selected the fixture and displayed its Unicode body. An
+explicit JSON download preserved the body and the original 250 ms anchor,
+with missing elapsed time and meeting ID still null. The export was inspected
+and removed. This verifies discovery, viewing and JSON export, not a real
+microphone crash, clipboard behavior, or IME acceptance.
