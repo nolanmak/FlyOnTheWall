@@ -11,6 +11,7 @@
 pub mod echo;
 pub mod opus;
 pub mod promote;
+pub mod replay;
 pub mod resample;
 pub mod retention;
 pub mod ring;
