@@ -150,6 +150,7 @@ struct Utterance {
 /// Deliberately simple: the model is the judge of what was said; this only
 /// has to find where somebody was talking.
 pub struct Endpointer {
+    voiced_samples: u64,
     config: EndpointConfig,
     frame_len: usize,
     preroll_len: usize,
@@ -172,6 +173,7 @@ impl Endpointer {
     pub fn new(config: EndpointConfig) -> Self {
         let per_ms = SAMPLES_PER_MS as usize;
         Self {
+            voiced_samples: 0,
             frame_len: config.frame_ms.max(1) as usize * per_ms,
             preroll_len: config.preroll_ms as usize * per_ms,
             config,
@@ -183,6 +185,23 @@ impl Endpointer {
             preroll: VecDeque::new(),
             utterance: None,
         }
+    }
+
+    /// Samples classified as speech by this endpointer's adaptive noise gate.
+    /// Silence does not advance this counter. It is separate from elapsed audio.
+    #[must_use]
+    pub const fn voiced_samples(&self) -> u64 {
+        self.voiced_samples
+    }
+
+    /// Processed prefix no longer held as an utterance or speech preroll.
+    /// Used only after completed chunks have been transcribed successfully.
+    #[must_use]
+    pub fn safe_through_sample(&self) -> u64 {
+        self.utterance.as_ref().map_or_else(
+            || self.position.saturating_sub(self.preroll.len() as u64),
+            |utterance| utterance.start_sample,
+        )
     }
 
     /// Feed audio, returning every utterance it completed.
@@ -220,19 +239,24 @@ impl Endpointer {
         }
         // Only over a full window: the first frames of a leg may be its
         // first word, and a voice swings well past the range in any window.
-        if self.recent.len() == self.recent_len {
-            let (quietest, loudest) = self
-                .recent
-                .iter()
-                .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &l| {
-                    (lo.min(l), hi.max(l))
-                });
-            if loudest - quietest < self.config.min_range_db {
-                self.noise_db = self.noise_db.max(quietest).clamp(-90.0, -25.0);
-            }
+        let (quietest, loudest) = self
+            .recent
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &l| {
+                (lo.min(l), hi.max(l))
+            });
+        let varied = loudest - quietest >= self.config.min_range_db;
+        if self.recent.len() == self.recent_len && !varied {
+            self.noise_db = self.noise_db.max(quietest).clamp(-90.0, -25.0);
         }
         let speech =
             level > (self.noise_db + self.config.margin_db).max(self.config.speech_floor_db);
+        // A loud constant background can exceed the clamped noise floor.
+        // It must still not drive the no-final speech deadline: use the same
+        // variation criterion that rejects steady utterances in finish().
+        if speech && varied {
+            self.voiced_samples = self.voiced_samples.saturating_add(frame.len() as u64);
+        }
         if !speech {
             // Falls fast, rises slowly: one loud breath must not raise the
             // floor enough to hide the next sentence.

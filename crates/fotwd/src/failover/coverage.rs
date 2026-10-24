@@ -48,6 +48,8 @@ pub enum SwitchReason {
     Manual,
     /// Recovery resumes pending local work after a process restart.
     ResumePending,
+    /// Finish audio not confirmed by the cloud before the bounded Stop drain.
+    FinishingTail,
 }
 
 /// A provider epoch begins at the last durably committed audio boundary.
@@ -120,7 +122,13 @@ fn journal_path(dir: &Path, source: Source) -> PathBuf {
         Source::Mic => "mic.stt-coverage.jsonl",
     })
 }
-fn lock(path: &Path) -> io::Result<File> {
+struct OwnerLock(File);
+impl Drop for OwnerLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+fn lock(path: &Path) -> io::Result<OwnerLock> {
     let owner = OpenOptions::new()
         .read(true)
         .write(true)
@@ -128,7 +136,7 @@ fn lock(path: &Path) -> io::Result<File> {
         .truncate(false)
         .open(path.with_extension("jsonl.lock"))?;
     owner.try_lock().map_err(io::Error::from)?;
-    Ok(owner)
+    Ok(OwnerLock(owner))
 }
 fn validate_engine(engine: &EngineDescriptor) -> io::Result<()> {
     if engine.provider.is_empty()
@@ -180,7 +188,7 @@ fn read_line(reader: &mut impl BufRead) -> io::Result<Vec<u8>> {
 /// replay audio until pending transcription is resolved. Never call from an
 /// audio callback or async executor; the handoff worker owns blocking IO.
 pub struct CoverageJournal {
-    _owner: File,
+    _owner: OwnerLock,
     file: File,
     path: PathBuf,
     audio: ReplayReader,
@@ -293,7 +301,7 @@ impl CoverageJournal {
     }
 
     fn from_header(
-        owner: File,
+        owner: OwnerLock,
         file: File,
         path: PathBuf,
         audio: ReplayReader,
@@ -478,5 +486,40 @@ impl CoverageJournal {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod owner_release_tests {
+    use super::*;
+
+    #[test]
+    fn a_duplicate_descriptor_does_not_retain_departed_journal_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let _audio =
+            fotw_pipeline::replay::ReplayWriter::create(dir.path(), "s", ReplaySource::System, 0)
+                .unwrap();
+        let journal = CoverageJournal::create(
+            dir.path(),
+            "s",
+            Source::System,
+            EngineDescriptor {
+                provider: "fixture".into(),
+                model: "fixture".into(),
+                revision: None,
+                capabilities: SttCapabilities::deepgram(),
+            },
+        )
+        .unwrap();
+        let inherited = journal._owner.0.try_clone().unwrap();
+        drop(journal);
+        let recovered = CoverageJournal::open(dir.path(), "s", Source::System);
+        assert!(
+            recovered.is_ok(),
+            "departed journal owner retained lock: {:?}",
+            recovered.as_ref().err()
+        );
+        drop(recovered);
+        drop(inherited);
     }
 }
