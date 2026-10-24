@@ -81,7 +81,7 @@
 //! from a flapping device cannot reset the budget.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::clock::Clock;
@@ -511,10 +511,9 @@ type OpenFn = Box<dyn FnMut() -> Result<Box<dyn AudioTap>, TapError> + Send>;
 
 /// Produces the sink for a newly started tap.
 ///
-/// It must deliver into the **same** downstream ring as the sink before it —
-/// that is what makes the rebuild invisible to the WAL — so implementations
-/// typically hand back a producer that was recycled when the previous sink was
-/// dropped, rather than allocating a new one.
+/// Called on the control thread before native startup. Recorders isolate each
+/// attempt in a new ring, then use the recovery event to drain the old tail,
+/// pad its gap, and install conversion for the replacement format.
 type SinkFn = Box<dyn FnMut() -> Box<dyn FrameSink> + Send>;
 
 // Each start owns its own mailbox. A callback retained by an old backend
@@ -524,15 +523,21 @@ const NO_CALLBACK_FAULT: u64 = u64::MAX;
 struct FaultObservingSink {
     inner: Box<dyn FrameSink>,
     fault: Arc<AtomicU64>,
+    active: Arc<AtomicBool>,
     clock: Arc<dyn Clock>,
 }
 impl FrameSink for FaultObservingSink {
     fn on_frames(&mut self, pcm: &[f32], ts: CaptureTimestamp, flags: FrameFlags) {
-        if self.fault.load(Ordering::Acquire) == NO_CALLBACK_FAULT {
+        if self.active.load(Ordering::Acquire)
+            && self.fault.load(Ordering::Acquire) == NO_CALLBACK_FAULT
+        {
             self.inner.on_frames(pcm, ts, flags);
         }
     }
     fn on_error(&mut self, error: TapError) {
+        if !self.active.load(Ordering::Acquire) {
+            return;
+        }
         if error.is_transient_device_fault() {
             let _ = self.fault.compare_exchange(
                 NO_CALLBACK_FAULT,
@@ -591,6 +596,7 @@ pub struct CaptureSupervisor {
     open: OpenFn,
     make_sink: SinkFn,
     callback_fault: Arc<AtomicU64>,
+    callback_active: Arc<AtomicBool>,
     tap: Option<Box<dyn AudioTap>>,
     format: Option<StreamFormat>,
     watchdog: Watchdog,
@@ -609,6 +615,12 @@ pub struct CaptureSupervisor {
     healthy_since_ns: Option<u64>,
     previous_delivery: Option<(u64, TapActivity)>,
     no_audio_notified: bool,
+}
+
+impl Drop for CaptureSupervisor {
+    fn drop(&mut self) {
+        self.retire_callbacks();
+    }
 }
 
 impl std::fmt::Debug for CaptureSupervisor {
@@ -644,6 +656,7 @@ impl CaptureSupervisor {
             open: Box::new(open),
             make_sink: Box::new(make_sink),
             callback_fault: Arc::new(AtomicU64::new(NO_CALLBACK_FAULT)),
+            callback_active: Arc::new(AtomicBool::new(false)),
             tap: None,
             format: None,
             watchdog,
@@ -666,12 +679,30 @@ impl CaptureSupervisor {
     }
 
     fn observing_sink(&mut self) -> Box<dyn FrameSink> {
+        self.retire_callbacks();
+        self.callback_active = Arc::new(AtomicBool::new(true));
         self.callback_fault = Arc::new(AtomicU64::new(NO_CALLBACK_FAULT));
         Box::new(FaultObservingSink {
             inner: (self.make_sink)(),
             fault: Arc::clone(&self.callback_fault),
+            active: Arc::clone(&self.callback_active),
             clock: Arc::clone(&self.clock),
         })
+    }
+
+    // Admission fence, not a native callback join. A callback already admitted
+    // before retirement can finish; native stop owns quiescence. Neither this
+    // control-side store nor callback-side loads wait on the audio thread.
+    fn retire_callbacks(&self) {
+        self.callback_active.store(false, Ordering::Release);
+    }
+
+    fn start_observed(&mut self, tap: &mut dyn AudioTap) -> Result<StreamFormat, TapError> {
+        let result = tap.start(self.observing_sink());
+        if result.is_err() {
+            self.retire_callbacks();
+        }
+        result
     }
 
     /// The mailbox a platform listener raises into.
@@ -690,7 +721,7 @@ impl CaptureSupervisor {
             return Err(TapError::AlreadyRunning);
         }
         let mut tap = (self.open)()?;
-        let format = tap.start(self.observing_sink())?;
+        let format = self.start_observed(&mut *tap)?;
         let now = self.clock.now_ns();
         self.tap = Some(tap);
         self.format = Some(format);
@@ -714,6 +745,7 @@ impl CaptureSupervisor {
     /// tap stops delivering is that the user ended the meeting, and treating
     /// that as a fault would resurrect capture after the recording closed.
     pub fn stop(&mut self) -> Result<(), TapError> {
+        self.retire_callbacks();
         let result = match self.tap.take() {
             Some(mut tap) => tap.stop(),
             None => Ok(()),
@@ -740,9 +772,11 @@ impl CaptureSupervisor {
     ///
     /// In every other respect this is [`stop`](Self::stop): the supervisor goes
     /// [`State::Idle`], will not rebuild, and clears its debounce. Returns
-    /// `None` if no tap was running. The returned tap is still delivering into
-    /// its sink until the caller stops or drops it.
+    /// `None` if no tap was running. Native callbacks may continue until the
+    /// caller stops or drops it, but new deliveries into its sink are revoked.
+    /// A callback admitted before revocation can still finish.
     pub fn take_running_tap(&mut self) -> Option<Box<dyn AudioTap>> {
+        self.retire_callbacks();
         let tap = self.tap.take();
         self.state = State::Idle;
         self.debounce.clear();
@@ -1097,6 +1131,7 @@ impl CaptureSupervisor {
             self.state = State::Quarantined;
             return PollOutcome::Abandoned;
         }
+        self.retire_callbacks();
         // The full sequence, in order: stop, then destroy. Dropping the tap is
         // what destroys the aggregate and then the tap itself, and it happens
         // before anything new is created.
@@ -1128,7 +1163,7 @@ impl CaptureSupervisor {
         self.last_attempt_ns = Some(now);
 
         let started = (self.open)().and_then(|mut tap| {
-            let format = tap.start(self.observing_sink())?;
+            let format = self.start_observed(&mut *tap)?;
             Ok((tap, format))
         });
 
