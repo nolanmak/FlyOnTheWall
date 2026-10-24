@@ -1,6 +1,7 @@
 //! Serve the real UI over a throwaway library, for looking at it.
 //!
 //!     cargo run -p fotwd --example ui_preview
+//!     cargo run -p fotwd --example ui_preview -- --live-notes
 //!
 //! Every other way into the library goes through audio capture — a TCC grant,
 //! a signed build, and an actual meeting to record — so the web UI was
@@ -27,6 +28,9 @@
 //! Deliberately an example rather than a `fotwd` subcommand: shipping a "write
 //! fake meetings into my library" verb in the product binary is how a user
 //! ends up with fabricated meetings they cannot tell from real ones.
+
+#[path = "support/live_notes.rs"]
+mod live_notes_fixture;
 
 use std::sync::Arc;
 
@@ -216,12 +220,42 @@ async fn main() -> Result<(), String> {
         println!("  seeded {id}  {title}");
     }
 
+    // An unfinished recording's saved notes, for recovery UI checks without audio.
+    db.save_session_note(
+        &fotw_store::SessionNoteDocument {
+            session_id: format!("preview-recovery-{}", std::process::id()),
+            started_at_ms: now_ms.saturating_sub(7_200_000) as i64,
+            note: fotw_store::NoteDocument {
+                revision: 0,
+                body_md: "Recovery fixture: revisit the migration plan.\n\nCafé follow-up.".into(),
+                anchors: vec![fotw_store::NoteAnchor::new(
+                    0,
+                    "Recovery fixture: revisit the migration plan.",
+                    250,
+                )],
+            },
+        },
+        1_000,
+    )
+    .map_err(|e| e.to_string())?;
+
     // The real server, the real ingress policy, the real embedded assets.
     let source = Arc::new(fotw_web::StoreSource::new(db));
-    let server = fotw_web::WebServer::bind(0, source)
+    let fixture_recorder = if std::env::args().any(|arg| arg == "--live-notes") {
+        Some(live_notes_fixture::recorder(&root)?)
+    } else {
+        None
+    };
+    let recorder = fixture_recorder
+        .as_ref()
+        .map(|recorder| recorder.clone() as Arc<dyn fotw_web::recorder::RecorderControl>);
+    let server = fotw_web::WebServer::bind_with_recorder(0, source, recorder)
         .await
         .map_err(|e| format!("bind: {e}"))?;
     let state = server.state().clone();
+    if let Some(recorder) = fixture_recorder {
+        recorder.attach_hub(state.hub().clone());
+    }
     let _flusher = state.hub().spawn_flusher();
 
     println!("\n  {}", state.launch_url());

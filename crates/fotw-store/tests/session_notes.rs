@@ -194,3 +194,44 @@ fn first_save_after_stop_uses_alias_and_existing_meeting_notes_are_never_replace
     ));
     assert_eq!(db.note_document(&meeting).unwrap(), draft.note);
 }
+
+#[test]
+fn recovery_index_survives_reopen_pages_deterministically_and_excludes_finalized_drafts() {
+    let (_dir, path) = common::tmp_db();
+    let key = common::test_key();
+    let mut db = Db::open(&path, &key).unwrap();
+    for id in ["draft-C", "draft-A", "draft-B"] {
+        db.save_session_note(&fixture(id), 500).unwrap();
+    }
+    drop(db);
+    let mut db = Db::open(&path, &key).unwrap();
+    let first = db.session_note_drafts(2, 0).unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .map(|d| d.session_id.as_str())
+            .collect::<Vec<_>>(),
+        ["draft-A", "draft-B"]
+    );
+    assert_eq!(
+        db.session_note_drafts(2, 2).unwrap()[0].session_id,
+        "draft-C"
+    );
+    assert!(db.session_note_drafts(0, 0).unwrap().is_empty());
+    let mut meeting = fotw_store::NewMeeting::new("fixture", "UTC");
+    meeting.started_at_ms = 1000;
+    db.finalize_capture("draft-B", meeting, 1500, None).unwrap();
+    assert_eq!(
+        db.session_note_drafts(100, 0)
+            .unwrap()
+            .iter()
+            .map(|d| d.session_id.as_str())
+            .collect::<Vec<_>>(),
+        ["draft-A", "draft-C"]
+    );
+    for i in 0..105 {
+        db.save_session_note(&fixture(&format!("bulk-{i:03}")), 500)
+            .unwrap();
+    }
+    assert_eq!(db.session_note_drafts(u32::MAX, 0).unwrap().len(), 100);
+}

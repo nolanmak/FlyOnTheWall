@@ -5,9 +5,10 @@ maximum debounce, blur/navigation flush, and explicit save/retry. Each draft
 owns its meeting ID. Navigation leaves unfinished writes associated with that
 ID; edits made during a save are queued behind it using the returned revision.
 
-Draft text stays in tab memory. Unloading with unsaved text warns the user.
-No note text is written to browser storage. This does not provide recovery
-from a browser crash: an encrypted draft/recovery path is still required.
+Unacknowledged edits stay in tab memory and unloading warns about unsaved text.
+Acknowledged recording-session drafts live in the encrypted library and appear
+under Unfinished notes after a browser restart. No note text is written to browser
+storage. Keystrokes not acknowledged before a crash can still be lost.
 
 GET/POST `/api/meetings/{id}/notes` use the existing host/origin/bearer guard.
 The request contains `revision`, `body_md`, and `anchors`; revision zero means
@@ -32,13 +33,13 @@ save, network failure, and conflict resolution. Temporary encrypted databases
 cover two connections, export and search. An injected anchor-insert failure
 proves rollback of text, revision, anchors and the FTS index. UI tests use literal script-shaped
 text in the textarea. The store/web regression suites and workspace Clippy pass;
-62 Node UI tests pass. Full workspace regression is also run before pushing.
+73 Node UI tests pass. Full workspace regression is also run before pushing.
 
-Outstanding before completion: live-session identity handoff; encrypted draft
-recovery across browser/daemon restarts; live first-key anchors; trusted
-keyboard/IME and mobile selection checks.
+Remaining acceptance includes trusted keyboard/IME, mobile selection, physical
+recording/clock/device behavior and transcript-window grounding for augmentation.
 The saved-meeting editor remaps supplied anchors without creating historic
-timestamps. Live first-keystroke capture remains #13 work.
+timestamps. The live first-input implementation is described below; physical timing
+acceptance remains part of #13.
 Neither #122 nor #13 is complete.
 
 ## Persistent block identity
@@ -84,7 +85,7 @@ Red/green tests cover edits, reorder, insertion, deletion/recreation, duplicate
 paragraph edits/deletion, split/merge, fenced code, Unicode, explicit identical
 block movement and matching text/anchor snapshots during in-flight saves. A
 mounted-control test verifies keyboard focus and the emitted save payload. All
-62 UI tests pass. Trusted keyboard/IME, mobile selection and live recording-time
+73 UI tests pass. Trusted keyboard/IME, mobile selection and live recording-time
 checks remain outstanding.
 
 ## Saved-editor WebKit acceptance
@@ -128,11 +129,10 @@ populated older libraries, full archives round-trip both new tables, and imports
 continue to accept older manifests without these rows. Explicit archives retain
 their existing plaintext-export warning.
 
-This increment provides the store contract. The daemon and authenticated live
-routes still need to supply the authoritative capture/stop clock and call the
-handoff. Recovery discovery and the live editor remain required before claiming
-user-visible recording-draft recovery. Unacknowledged keystrokes are not covered
-by database durability. No browser storage is added; #122 and #13 stay open.
+The store contract covers acknowledged drafts. The finalization and live adapters
+described below supply capture/stop bounds, handoff and recovery discovery.
+Unacknowledged keystrokes are not covered by database durability. No browser
+storage is added; native acceptance and augmentation keep #122 and #13 open.
 
 ## Recording finalization integration
 
@@ -152,4 +152,49 @@ Fixture tests cover frozen clocks, nonnegative bounds, capture-end persistence,
 transaction rollback/retry and preservation of files under colliding identities.
 These clocks use epoch milliseconds with rollback clamping; physical clock,
 sleep/wake and device behavior still need native acceptance. The authenticated
-live-note routes and UI remain the next integration step for #122/#13.
+live-note routes and UI below consume these bounds for #122/#13.
+
+## Live editor, authenticated clocks and recovery
+
+The session-note API takes the active recorder clock or the finalized alias clock,
+never a client-supplied recording duration. Unknown sessions are refused. An
+unfinished durable draft whose recorder clock is gone can be read and exported,
+and saves are refused until authoritative bounds are available. Saved aliases
+continue to accept revision-checked late writes to the canonical note.
+
+The live editor captures an anchor on first input for each new block, using a
+monotonic interpolation of the recorder's latest elapsed time. Edits and movement
+keep original identities/times; saved-meeting edits create no historic times.
+Stop freezes the client clock and flushes pending text. The actual event-hub
+handoff links the same draft to the saved meeting, retaining in-flight edits.
+The Unfinished notes control lists durable drafts with pagination and retry;
+recovered text is read-only and offers Markdown/JSON exports and copy/manual copy.
+
+### Browser evidence
+
+`cargo run -p fotwd --example ui_preview -- --live-notes` runs one synthetic
+recording with the real encrypted finalizer and event hub. It opens no microphone
+and reads no user keys. Rerun the example to reset its one-shot recording.
+
+An isolated nonpersistent WebKit view verified:
+
+- First-input anchors within 500ms of the sampled recorder clock.
+- Autosave and recovery in a fresh view while the synthetic capture continued.
+- Saved-history browsing and Return to recording without text/identity leakage.
+- A session-note POST delayed 400ms across Stop, canonical event-hub navigation,
+  preserved text and anchors, and frozen bounds in the saved meeting.
+- Read-only recovery, refused writes without a clock, and Markdown/JSON export
+  retaining Unicode text and anchor metadata. Download Blobs were inspected in
+  memory; native Downloads and the system clipboard were not used.
+
+| State | Synthetic screenshot |
+| --- | --- |
+| Recording, narrow viewport | [Live editor](live-notes/recording-390.png) |
+| Saved after Stop and delayed write | [Canonical meeting](live-notes/saved-after-stop.png) |
+| Read-only unfinished draft | [Recovery](live-notes/recovered-draft.png) |
+
+All 73 Node UI tests and the authenticated session-note API regression pass.
+Database reopen/migration/archive tests establish storage durability separately.
+Trusted keyboard/IME, real capture-stop/drain/device/sleep scenarios and process
+crash acceptance still need validation; augmentation window integration remains
+#13 work. Neither #122 nor #13 is closed by this increment.
