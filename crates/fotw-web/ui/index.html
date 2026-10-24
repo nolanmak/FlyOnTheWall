@@ -13,6 +13,7 @@
       <h1>FlyOnTheWall</h1>
       <input
         id="search"
+        aria-label="Search meetings, notes, and transcripts"
         type="search"
         placeholder="Search meetings, notes, transcripts"
         autocomplete="off"
@@ -31,7 +32,7 @@
     <p id="recording-limit" class="recording-limit" hidden></p>
     <main>
       <nav id="list" aria-label="Meetings"></nav>
-      <section id="detail" aria-live="polite"></section>
+      <section id="detail" aria-label="Meeting details" aria-live="polite"></section>
     </main>
     <details id="gh-settings" class="gh-settings" hidden>
       <summary>GitHub export</summary>
