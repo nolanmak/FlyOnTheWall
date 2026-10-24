@@ -50,34 +50,7 @@ impl MeetingRepo<'_> {
 
     /// Insert a meeting and return its id.
     pub fn create(&mut self, m: NewMeeting) -> Result<String> {
-        let id = new_id();
-        let now = now_ms();
-        self.db.conn().execute(
-            "INSERT INTO meetings (
-                 id, title, started_at_ms, tz, folder_id, template_id,
-                 calendar_uid, calendar_source, meeting_url, app_hint,
-                 state, language, disclosed,
-                 created_at, updated_at, lamport, origin_device_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, 0, ?15)",
-            params![
-                id,
-                m.title,
-                m.started_at_ms,
-                m.tz,
-                m.folder_id,
-                m.template_id,
-                m.calendar_uid,
-                m.calendar_source,
-                m.meeting_url,
-                m.app_hint,
-                m.state,
-                m.language,
-                i64::from(m.disclosed),
-                now,
-                m.origin_device_id,
-            ],
-        )?;
-        Ok(id)
+        insert_meeting(self.db.conn(), m)
     }
 
     /// Fetch one meeting.
@@ -307,33 +280,8 @@ impl MeetingRepo<'_> {
         model: &str,
         make_primary: bool,
     ) -> Result<String> {
-        let id = new_id();
-        let now = now_ms();
-        let origin: String = self.origin_device_of(meeting_id)?;
-
         let tx = self.db.conn_mut().transaction()?;
-        if make_primary {
-            tx.execute(
-                "UPDATE transcripts SET is_primary = 0, updated_at = ?2, lamport = lamport + 1
-                 WHERE meeting_id = ?1 AND is_primary = 1",
-                params![meeting_id, now],
-            )?;
-        }
-        tx.execute(
-            "INSERT INTO transcripts (
-                 id, meeting_id, provider, model, is_primary,
-                 created_at, updated_at, lamport, origin_device_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 0, ?7)",
-            params![
-                id,
-                meeting_id,
-                provider,
-                model,
-                i64::from(make_primary),
-                now,
-                origin
-            ],
-        )?;
+        let id = insert_transcript(&tx, meeting_id, provider, model, make_primary)?;
         tx.commit()?;
         Ok(id)
     }
@@ -401,50 +349,8 @@ impl MeetingRepo<'_> {
     /// than trusted from the caller, so the denormalised column cannot drift
     /// away from the join it exists to avoid.
     pub fn append_segments(&mut self, transcript_id: &str, segments: &[NewSegment]) -> Result<()> {
-        if segments.is_empty() {
-            return Ok(());
-        }
-        let meeting_id: String = self
-            .db
-            .conn()
-            .query_row(
-                "SELECT meeting_id FROM transcripts WHERE id = ?1",
-                params![transcript_id],
-                |r| r.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| StoreError::NotFound {
-                kind: "transcript",
-                id: transcript_id.to_owned(),
-            })?;
-
         let tx = self.db.conn_mut().transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO segments (
-                     id, transcript_id, meeting_id, idx, start_ms, end_ms,
-                     channel, speaker_label, person_id, text, confidence,
-                     is_final, words
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            )?;
-            for s in segments {
-                stmt.execute(params![
-                    new_id(),
-                    transcript_id,
-                    meeting_id,
-                    s.idx,
-                    s.start_ms,
-                    s.end_ms,
-                    s.channel,
-                    s.speaker_label,
-                    s.person_id,
-                    s.text,
-                    s.confidence,
-                    i64::from(s.is_final),
-                    s.words,
-                ])?;
-            }
-        }
+        insert_segments(&tx, transcript_id, segments)?;
         tx.commit()?;
         Ok(())
     }
@@ -725,4 +631,130 @@ impl MeetingRepo<'_> {
                 id: meeting_id.to_owned(),
             })
     }
+}
+
+pub(crate) fn insert_meeting(conn: &rusqlite::Connection, m: NewMeeting) -> Result<String> {
+    let id = new_id();
+    let now = now_ms();
+    conn.execute(
+        "INSERT INTO meetings (
+                 id, title, started_at_ms, tz, folder_id, template_id,
+                 calendar_uid, calendar_source, meeting_url, app_hint,
+                 state, language, disclosed,
+                 created_at, updated_at, lamport, origin_device_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, 0, ?15)",
+        params![
+            id,
+            m.title,
+            m.started_at_ms,
+            m.tz,
+            m.folder_id,
+            m.template_id,
+            m.calendar_uid,
+            m.calendar_source,
+            m.meeting_url,
+            m.app_hint,
+            m.state,
+            m.language,
+            i64::from(m.disclosed),
+            now,
+            m.origin_device_id,
+        ],
+    )?;
+    Ok(id)
+}
+
+pub(crate) fn insert_transcript(
+    tx: &rusqlite::Transaction<'_>,
+    meeting_id: &str,
+    provider: &str,
+    model: &str,
+    make_primary: bool,
+) -> Result<String> {
+    let id = new_id();
+    let now = now_ms();
+    let origin: String = tx
+        .query_row(
+            "SELECT origin_device_id FROM meetings WHERE id=?1",
+            [meeting_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::NotFound {
+            kind: "meeting",
+            id: meeting_id.into(),
+        })?;
+
+    if make_primary {
+        tx.execute(
+            "UPDATE transcripts SET is_primary = 0, updated_at = ?2, lamport = lamport + 1
+                 WHERE meeting_id = ?1 AND is_primary = 1",
+            params![meeting_id, now],
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO transcripts (
+                 id, meeting_id, provider, model, is_primary,
+                 created_at, updated_at, lamport, origin_device_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 0, ?7)",
+        params![
+            id,
+            meeting_id,
+            provider,
+            model,
+            i64::from(make_primary),
+            now,
+            origin
+        ],
+    )?;
+    Ok(id)
+}
+
+pub(crate) fn insert_segments(
+    tx: &rusqlite::Transaction<'_>,
+    transcript_id: &str,
+    segments: &[NewSegment],
+) -> Result<()> {
+    if segments.is_empty() {
+        return Ok(());
+    }
+    let meeting_id: String = tx
+        .query_row(
+            "SELECT meeting_id FROM transcripts WHERE id = ?1",
+            params![transcript_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::NotFound {
+            kind: "transcript",
+            id: transcript_id.to_owned(),
+        })?;
+
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO segments (
+                     id, transcript_id, meeting_id, idx, start_ms, end_ms,
+                     channel, speaker_label, person_id, text, confidence,
+                     is_final, words
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        )?;
+        for s in segments {
+            stmt.execute(params![
+                new_id(),
+                transcript_id,
+                meeting_id,
+                s.idx,
+                s.start_ms,
+                s.end_ms,
+                s.channel,
+                s.speaker_label,
+                s.person_id,
+                s.text,
+                s.confidence,
+                i64::from(s.is_final),
+                s.words,
+            ])?;
+        }
+    }
+    Ok(())
 }
