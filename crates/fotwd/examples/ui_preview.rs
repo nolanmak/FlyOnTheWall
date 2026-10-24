@@ -241,15 +241,21 @@ async fn main() -> Result<(), String> {
 
     // The real server, the real ingress policy, the real embedded assets.
     let source = Arc::new(fotw_web::StoreSource::new(db));
-    let recorder = if std::env::args().any(|arg| arg == "--live-notes") {
+    let fixture_recorder = if std::env::args().any(|arg| arg == "--live-notes") {
         Some(live_notes_fixture::recorder(&root)?)
     } else {
         None
     };
+    let recorder = fixture_recorder
+        .as_ref()
+        .map(|recorder| recorder.clone() as Arc<dyn fotw_web::recorder::RecorderControl>);
     let server = fotw_web::WebServer::bind_with_recorder(0, source, recorder)
         .await
         .map_err(|e| format!("bind: {e}"))?;
     let state = server.state().clone();
+    if let Some(recorder) = fixture_recorder {
+        recorder.attach_hub(state.hub().clone());
+    }
     let _flusher = state.hub().spawn_flusher();
 
     println!("\n  {}", state.launch_url());

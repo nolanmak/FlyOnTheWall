@@ -1,6 +1,6 @@
 //! Synthetic recorder for exercising the real live-note API without audio.
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fotw_store::{Db, DbKey, NewMeeting};
@@ -12,11 +12,16 @@ struct State {
     started: Instant,
     stopped: Option<(u64, Instant)>,
 }
-struct FixtureRecorder {
+pub(super) struct FixtureRecorder {
     session: String,
     state: Mutex<State>,
+    hub: OnceLock<Arc<fotw_web::DeltaHub>>,
 }
 impl FixtureRecorder {
+    pub(super) fn attach_hub(&self, hub: Arc<fotw_web::DeltaHub>) {
+        let _ = self.hub.set(hub);
+    }
+
     fn status_for(&self, state: &State) -> RecordingStatus {
         match state.stopped {
             Some((_, at)) if at.elapsed() >= Duration::from_secs(1) => RecordingStatus::idle(),
@@ -49,7 +54,7 @@ impl RecorderControl for FixtureRecorder {
             meeting.title = "Synthetic live notes".into();
             meeting.started_at_ms = i64::try_from(state.started_at_ms)
                 .map_err(|error| RecorderError::Failed(error.to_string()))?;
-            state
+            let meeting_id = state
                 .db
                 .finalize_capture(
                     &self.session,
@@ -59,6 +64,13 @@ impl RecorderControl for FixtureRecorder {
                 )
                 .map_err(|error| RecorderError::Failed(error.to_string()))?;
             state.stopped = Some((end, Instant::now()));
+            if let Some(hub) = self.hub.get() {
+                hub.announce_session_ready(
+                    &meeting_id,
+                    fotw_web::MeetingReadyReason::Persisted,
+                    Some(&self.session),
+                );
+            }
         }
         Ok(self.status_for(&state))
     }
@@ -68,7 +80,7 @@ impl RecorderControl for FixtureRecorder {
 }
 
 /// A one-shot synthetic recording with the real encrypted note finalization path.
-pub(super) fn recorder(root: &Path) -> Result<Arc<dyn RecorderControl>, String> {
+pub(super) fn recorder(root: &Path) -> Result<Arc<FixtureRecorder>, String> {
     let db = Db::open(
         root.join("db.sqlite3"),
         &DbKey::from_bytes(super::PREVIEW_KEY),
@@ -83,6 +95,7 @@ pub(super) fn recorder(root: &Path) -> Result<Arc<dyn RecorderControl>, String> 
     .map_err(|error| error.to_string())?;
     Ok(Arc::new(FixtureRecorder {
         session: format!("preview-live-{}", std::process::id()),
+        hub: OnceLock::new(),
         state: Mutex::new(State {
             db,
             started_at_ms,
