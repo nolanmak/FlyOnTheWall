@@ -1,9 +1,11 @@
-name: Murmur shared-credentials compatibility
+name: Murmur shared-speech compatibility
 
 on:
   pull_request:
     paths:
       - 'crates/fotw-secrets/**'
+      - 'crates/fotw-audio/**'
+      - 'crates/fotw-stt/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/murmur-compatibility.yml'
@@ -11,6 +13,8 @@ on:
     branches: [main]
     paths:
       - 'crates/fotw-secrets/**'
+      - 'crates/fotw-audio/**'
+      - 'crates/fotw-stt/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/murmur-compatibility.yml'
@@ -36,23 +40,23 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           repository: nolanmak/Murmur
-          ref: 2fcb33e1eb2eb79653aeff63234c1e601978de7b
+          ref: 882b106e3e6ebadc3f50f276b316a8c2a732593f
           path: consumer
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@46817827a5bfabe028bf34e1cce71fd40e2ff697 # 1.95.0
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libdbus-1-dev
-      - name: Substitute only the shared crate under review
+      - name: Substitute the shared crates under review
         working-directory: consumer
         run: |
           python3 - <<'PY'
           import json, os, pathlib
           root = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
-          crate = root / 'producer/crates/fotw-secrets'
-          pathlib.Path('compatibility.toml').write_text(
-              '[patch."https://github.com/nolanmak/FlyOnTheWall"]\n'
-              'fotw-secrets = { path = ' + json.dumps(str(crate)) + ' }\n'
-          )
+          patch = '[patch."https://github.com/nolanmak/FlyOnTheWall"]\n'
+          for name in ('fotw-audio', 'fotw-stt', 'fotw-secrets'):
+              crate = root / 'producer/crates' / name
+              patch += name + ' = { path = ' + json.dumps(str(crate)) + ' }\n'
+          pathlib.Path('compatibility.toml').write_text(patch)
           PY
       # The consumer's ordinary CI uses --locked against its Git pin. This
       # compatibility run deliberately substitutes the reviewed producer source,

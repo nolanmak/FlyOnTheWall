@@ -15,7 +15,7 @@ against these baselines, not treated as a completed extraction.
 | Dictation final drain | Murmur streaming.rs | CloseStream followed by final Metadata; do not replace with meeting socket-close policy |
 | Meeting WAL/recovery | FlyOnTheWall daemon | Never move meeting data or consent policy into Murmur |
 | Local HTTP Whisper and insertion | Murmur | Local-only skips credential resolution; original-field insertion remains app-owned |
-| Local in-process Whisper and bounded queues | fotw-stt local adapter | Optional runtime and capability extraction still pending |
+| Local in-process Whisper and bounded queues | fotw-stt local adapter | Whisper runtime is opt-in; capability extraction still pending |
 
 ## First migrated contract: credentials
 
@@ -35,13 +35,20 @@ Murmur's provider policy is not changed by sharing the dependency.
 Upgrade by choosing a reviewed full commit SHA, updating both dependency and
 dev-dependency pins in Murmur, updating Cargo.lock, and running both consumers'
 required checks. Roll back those manifest/lockfile changes together. Never pin a
-moving branch or silently update to upstream main. The `murmur-compatibility.yml` workflow patches only fotw-secrets into
-Murmur revision `2fcb33e1eb2eb79653aeff63234c1e601978de7b`, then runs its workspace
+moving branch or silently update to upstream main. The `murmur-compatibility.yml` workflow patches fotw-audio, fotw-stt and fotw-secrets into
+Murmur revision `882b106e3e6ebadc3f50f276b316a8c2a732593f`, then runs its workspace
 tests on macOS and Linux. The disposable compatibility lockfile may update for
 the source substitution; ordinary consumer CI continues to use `--locked`.
 
-Audio/STT vendor removal, provider capabilities, the shared audio/transcription
-conformance suite and complete upgrade compatibility gates remain outstanding.
+Murmur now consumes all three crates at an immutable Git revision. The shared
+audio/STT conformance suite covers format validation, provider timestamps,
+interim/final normalization, stream-end finalization, bounded local PCM, silence
+and cancellation. Injected timestamp, finalization and late-final regressions
+fail these tests. Murmur retains its separately tested CloseStream/Metadata
+transport. Its full workspace tests, formatting and Clippy pass after removing
+the vendor copies. The production dependency graph excludes whisper-rs.
+Resampler extraction, provider capabilities and complete hosted compatibility
+gates remain outstanding.
 Shared Rust source does not share loaded model memory. Sharing model workers is
 separate #120 work, conditional on measured contention.
 
