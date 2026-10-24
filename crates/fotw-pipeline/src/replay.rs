@@ -42,7 +42,7 @@ impl ReplaySource {
         })
     }
 
-    fn lock(self, dir: &Path) -> io::Result<File> {
+    fn lock(self, dir: &Path) -> io::Result<OwnerLock> {
         let path = self.path(dir).with_extension("stt16.lock");
         let file = OpenOptions::new()
             .read(true)
@@ -53,7 +53,18 @@ impl ReplaySource {
         // Lock a sidecar, not PCM: on Windows a byte-range lock on PCM would
         // also prevent independent readers from reading the locked bytes.
         file.try_lock().map_err(io::Error::from)?;
-        Ok(file)
+        Ok(OwnerLock(file))
+    }
+}
+
+struct OwnerLock(File);
+
+impl Drop for OwnerLock {
+    fn drop(&mut self) {
+        // A process spawn may briefly inherit this open file description
+        // before exec closes CLOEXEC descriptors. Closing our copy alone can
+        // leave flock held by that copy; explicitly release logical ownership.
+        let _ = self.0.unlock();
     }
 }
 
@@ -72,7 +83,7 @@ fn invalid(message: &str) -> io::Error {
 
 /// Sole append owner for one leg's canonical stream.
 pub struct ReplayWriter {
-    _owner: File,
+    _owner: OwnerLock,
     file: File,
     end_sample: u64,
     failed: bool,
@@ -327,5 +338,34 @@ impl ReplayReader {
             .chunks_exact(2)
             .map(|v| i16::from_le_bytes([v[0], v[1]]))
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod owner_release_tests {
+    use super::*;
+
+    #[test]
+    fn releasing_an_owner_unlocks_even_if_a_spawned_child_still_holds_a_duplicate_descriptor() {
+        let dir = std::env::temp_dir().join(format!(
+            "fotw-replay-inherited-owner-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let writer = ReplayWriter::create(&dir, "fixture", ReplaySource::System, 0).unwrap();
+        // A concurrent process spawn can inherit the open file description
+        // until exec closes CLOEXEC descriptors. dup models that deterministically.
+        let inherited = writer._owner.0.try_clone().unwrap();
+        drop(writer);
+        let resumed = ReplayWriter::resume(&dir, "fixture", ReplaySource::System);
+        assert!(
+            resumed.is_ok(),
+            "the departed owner must release the lock: {:?}",
+            resumed.as_ref().err()
+        );
+        drop(resumed);
+        drop(inherited);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
