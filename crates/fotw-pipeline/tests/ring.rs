@@ -16,11 +16,17 @@ fn writing_from_a_real_time_section_allocates_nothing() {
     let block = [0.25f32; 480];
     let before = allocation_violations();
 
+    let rejected;
     {
         let _rt = RtGuard::enter();
-        for _ in 0..8 {
-            producer.push_block(&block);
+        for i in 0..8 {
+            if i % 2 == 0 {
+                producer.push_block(&block);
+            } else {
+                producer.push_complete_block(&block);
+            }
         }
+        rejected = producer.push_complete_block(&block);
     }
 
     assert_eq!(
@@ -28,6 +34,10 @@ fn writing_from_a_real_time_section_allocates_nothing() {
         before,
         "the producer half must be allocation-free after construction; this is \
          the whole reason the ring is preallocated"
+    );
+    assert_eq!(
+        rejected, 0,
+        "the complete-block overflow path is allocation-free too"
     );
 
     let mut out = vec![0.0f32; 8 * 480];
@@ -40,8 +50,8 @@ fn writing_from_a_real_time_section_allocates_nothing() {
 fn an_overrun_drops_and_counts_rather_than_blocking() {
     // Capacity deliberately smaller than what we push. Blocking here would
     // stall the audio thread, which is the one thing that must never happen:
-    // the network is the only backpressure point, and a dropped block is
-    // recoverable because the WAL is written independently.
+    // the loss must be observable. Samples dropped before the WAL cannot be
+    // recovered from that WAL; precise overrun gap placement is separate work.
     let (mut producer, mut consumer) = AudioRing::with_capacity_frames(512);
     let block = [1.0f32; 480];
 
