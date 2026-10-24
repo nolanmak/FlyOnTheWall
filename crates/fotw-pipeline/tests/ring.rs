@@ -174,3 +174,29 @@ fn complete_callbacks_preserve_frames_through_wraparound_without_allocating() {
     assert_eq!(consumer.dropped_frames(), 8);
     assert_eq!(producer.dropped_frames(), 8);
 }
+
+#[test]
+fn abandoning_initial_attempt_isolates_late_pcm_and_retains_replacement_capacity() {
+    // Open can fail before requesting a sink, or start can fail after requesting
+    // one. Neither case may leave the next successful producer on the old ring.
+    for requested in [false, true] {
+        let (producer, mut original) = AudioRing::with_capacity_frames(8);
+        let generations = GenerationRing::new(producer);
+        let mut failed = requested.then(|| generations.producer());
+        let mut empty = generations.discard_initial_attempt();
+        assert_eq!(empty.slots(), 0);
+        if let Some(producer) = &mut failed {
+            assert_eq!(producer.push_complete_block(&[-0.9; 2]), 2);
+        }
+        let mut recovered = generations.producer();
+        assert_eq!(recovered.push_complete_block(&[0.75; 8]), 8);
+        let mut current = generations
+            .take_replacement()
+            .expect("recovery has its own consumer");
+        let mut pcm = [0.0; 8];
+        assert_eq!(empty.pop_into(&mut pcm), 0);
+        assert_eq!(current.pop_into(&mut pcm), 8);
+        assert_eq!(pcm, [0.75; 8]);
+        assert_eq!(original.pop_into(&mut pcm), if requested { 2 } else { 0 });
+    }
+}

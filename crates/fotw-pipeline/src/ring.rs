@@ -183,6 +183,21 @@ impl GenerationRing {
         state.next = Some(consumer);
         producer
     }
+    /// Abandon an unsuccessful initial attempt, including PCM emitted before
+    /// start returned an error. Replace the caller's consumer with this empty
+    /// one; every later producer will have a separate replacement consumer,
+    /// even when the initial open failed before requesting a producer.
+    pub fn discard_initial_attempt(&self) -> RingConsumer {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.initial.take();
+        state.next.take();
+        let (_producer, consumer) = AudioRing::with_capacity_frames(self.capacity);
+        consumer
+    }
+
     /// Consume the most recent attempt after its authoritative format is known.
     pub fn take_replacement(&self) -> Option<RingConsumer> {
         self.state
