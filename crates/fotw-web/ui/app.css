@@ -707,3 +707,8 @@ button, summary { min-height: 36px; }
 .note-editor button:focus-visible, .note-editor textarea:focus-visible {
   outline: 3px solid var(--accent); outline-offset: 3px;
 }
+
+.note-recovery > p { color: var(--muted); }
+.recovery-list { display: grid; gap: 8px; margin: 16px 0; }
+.recovery-list button { text-align: left; padding: 12px; }
+.note-recovery > button { margin-right: 8px; }

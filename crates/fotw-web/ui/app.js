@@ -36,6 +36,7 @@ const el = {
   consentLabel: document.getElementById("consent-label"),
   record: document.getElementById("record"),
   returnLive: document.getElementById("return-live"),
+  noteDrafts: document.getElementById("note-drafts"),
   recording: document.getElementById("recording"),
   recordingLimit: document.getElementById("recording-limit"),
   ghSettings: document.getElementById("gh-settings"),
@@ -101,6 +102,7 @@ async function api(path, options) {
     // (#112); the rest ignore the extra property.
     const failed = new Error("request failed");
     failed.status = res.status;
+    try { failed.code = (await res.json()).error; } catch (_) {}
     throw failed;
   }
   return res.json();
@@ -642,6 +644,9 @@ function handleStreamFrame(frame) {
     recoverLiveHistory();
     refreshLibrary();
   } else if (frame.kind === "meeting_ready") {
+    if (frame.reason === "persisted" && frame.session_id && typeof FOTWNotes !== "undefined") {
+      FOTWNotes.finishSession(frame.session_id, frame.meeting_id);
+    }
     if (frame.reason === "persisted" && frame.session_id === liveSessionId) {
       liveSavedMeetingId = frame.meeting_id;
       adoptSavedLive();
@@ -717,6 +722,7 @@ async function recoverLiveHistory() {
     if (liveSessionId !== id || snapshot.session_id !== id) return;
     liveHistoryMissing = snapshot.truncated;
     liveSavedMeetingId = snapshot.saved_meeting_id || liveSavedMeetingId;
+    if (liveSavedMeetingId && typeof FOTWNotes !== "undefined") FOTWNotes.finishSession(id, liveSavedMeetingId);
     if (typeof snapshot.speech_origin_ms === "number") {
       liveSnapshotOrigin = liveSnapshotOrigin === null ? snapshot.speech_origin_ms
         : Math.min(liveSnapshotOrigin, snapshot.speech_origin_ms);
@@ -795,6 +801,7 @@ const FINISHING_POLL_MS = 1000;
 // the badge, the button, the clock and the poll rate, so nothing can disagree
 // with anything else.
 let recState = "idle";
+const noteClock = typeof FOTWNotes !== "undefined" ? new FOTWNotes.RecordingClock() : null;
 let recordingSince = null;
 let autoStopAt = null;
 let clockTimer = null;
@@ -898,12 +905,14 @@ function paintRecordButton() {
 }
 
 function renderRecording(body) {
+  noteClock?.update(body);
   if (body.session_id) selectLiveSession(body.session_id);
   const was = recState;
   // Anything the daemon does not name is treated as idle. An unrecognised
   // word must never be the one that leaves a clock running.
   recState =
     body.state === "recording" || body.state === "finishing" ? body.state : "idle";
+  mountLiveNotes();
   paintLiveNavigation();
   adoptSavedLive();
   autoStopAt = body.auto_stop_at_ms ?? null;
@@ -998,6 +1007,9 @@ function showLive() {
   el.detail.appendChild(
     text("p", "Words appear here as the provider finalizes them.", "meta"),
   );
+  if (typeof FOTWNotes !== "undefined") {
+    const notes = document.createElement("div");notes.id = "live-notes";el.detail.appendChild(notes);
+  }
   const history = text("p", "Time since first speech", "meta");
   history.id = "live-history";
   el.detail.appendChild(history);
@@ -1019,8 +1031,43 @@ function showLive() {
   transcript.appendChild(body);
   el.detail.appendChild(transcript);
   renderLiveTranscript();
+  mountLiveNotes();
   paintLiveNavigation();
   adoptSavedLive();
+}
+
+async function showNoteDrafts() {
+  if (typeof FOTWNotes === "undefined") return;
+  const request=++detailRequest;currentDetail=null;selectedMeetingId=null;
+  updateMeetingSelection();clear(el.detail);paintLiveNavigation();
+  el.detail.appendChild(text("p","Saving pending notes…","meta"));
+  await FOTWNotes.flushAll();
+  if(request!==detailRequest)return;
+  clear(el.detail);FOTWNotes.mountRecovery(el.detail,api,showRecoveredNote);
+}
+function showRecoveredNote(id) {
+  if (id===liveSessionId && recState==="recording") {showLive();return;}
+  if (typeof FOTWNotes === "undefined") return;
+  FOTWNotes.flushAll();const request=++detailRequest;currentDetail=null;selectedMeetingId=null;
+  updateMeetingSelection();clear(el.detail);paintLiveNavigation();
+  FOTWNotes.mountRecovered(id,el.detail,api,{onSaved:meetingId=>{
+    if(request===detailRequest)openMeeting(meetingId);
+  }});
+}
+async function loadNoteDraftControl() {
+  if (!el.noteDrafts || typeof FOTWNotes === "undefined") return;
+  try {await api("/api/note-drafts?limit=1");el.noteDrafts.hidden=false;}
+  catch(e) {el.noteDrafts.hidden=e.status===404;}
+}
+
+function mountLiveNotes() {
+  if (typeof FOTWNotes === "undefined" || !liveSessionId || !liveIsShowing()) return;
+  const parent = document.getElementById("live-notes");
+  if (!parent || parent.dataset.sessionId === liveSessionId) return;
+  FOTWNotes.flushAll();
+  clear(parent);
+  const id = liveSessionId;parent.dataset.sessionId = id;
+  FOTWNotes.mount(id, parent, api, {session:true, clock:()=>noteClock?.offset(id) ?? null});
 }
 
 // Is the live view the thing on screen?
@@ -1042,6 +1089,10 @@ async function onRecord() {
       ? "/api/recording/stop"
       : "/api/recording/start?ack=all-party";
   el.record.disabled = true;
+  if (recState === "recording") {
+    noteClock?.stop();
+    if (typeof FOTWNotes !== "undefined") FOTWNotes.flushAll();
+  }
   ++recordingRequest;
   try {
     const body = await api(path, { method: "POST" });
@@ -1064,6 +1115,8 @@ async function onRecord() {
       await loadMeetings();
     }
   } catch (e) {
+    noteClock?.retry();
+    pollRecording();
     say("Could not reach the recorder.");
     // Not a flat `disabled = false`: CON-01 says an idle Start stays disabled
     // until the box is ticked.
@@ -1578,6 +1631,7 @@ async function main() {
   el.search.addEventListener("input", onSearch);
   el.record.addEventListener("click", onRecord);
   el.returnLive.addEventListener("click", showLive);
+  el.noteDrafts?.addEventListener("click", showNoteDrafts);
   // Re-evaluates the disabled state; the box gates Start and nothing else.
   // Through `paintRecordButton` so it is state-aware: ticking the box while a
   // meeting is being written must not re-enable a button with nothing to do.
@@ -1599,6 +1653,7 @@ async function main() {
     if (el.ghSettings.open) loadGithubRepos();
   });
   await loadMeetings();
+  await loadNoteDraftControl();
   await loadGithub();
   await loadSummarize();
   await pollRecording();

@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
-function harness() {
+function harness(notes) {
   class Element {
     constructor(tag) { this.tagName=tag; this.children=[]; this.listeners={}; this.scrollHeight=1000;this.clientHeight=100;this.scrollTop=10;this.dataset={};this.classList={add(){},toggle(){}}; }
     get firstChild(){return this.children[0];} get childElementCount(){return this.children.length;}
@@ -19,7 +19,7 @@ function harness() {
   const nodes=new Map(['list','detail','status','record','live','elapsed','consent','consent-label','recording','recording-limit','return-live'].map(id=>{let n=root.appendChild(new Element('div'));n.id=id;return [id,n];}));
   const all=(n=root)=>[n,...n.children.flatMap(all)];
   const document={createElement:t=>new Element(t),getElementById:id=>all().find(n=>n.id===id)||null};
-  const ctx=vm.createContext({document,Date,Intl,Set,Map,URLSearchParams,window:{location:{search:''}},localStorage:{getItem:()=>null},setInterval:()=>1,clearInterval(){},setTimeout(){},XMLSerializer:class {serializeToString(n){return n.textContent;}}});
+  const ctx=vm.createContext({FOTWNotes:notes,document,Date,Intl,Set,Map,URLSearchParams,window:{location:{search:''}},localStorage:{getItem:()=>null},setInterval:()=>1,clearInterval(){},setTimeout(){},XMLSerializer:class {serializeToString(n){return n.textContent;}}});
   vm.runInContext(fs.readFileSync(path.join(__dirname,'../../ui/app.js'),'utf8'),ctx);
   const run=s=>vm.runInContext(s,ctx);
   return {ctx,run,document,nodes,all,old(n=2){let detail=nodes.get('detail');while(detail.firstChild)detail.removeChild(detail.firstChild);let body=detail.appendChild(new Element('div'));body.id='segments';for(let i=0;i<n;i++){let row=body.appendChild(new Element('p'));row.textContent='old '+i;}return body;}};
@@ -127,4 +127,32 @@ test('meeting selection is accessible, survives list/search refresh, and clears 
  assert.equal(h.nodes.get('list').children[0]['aria-current'],'true');
  h.ctx.showLive();
  assert.equal(h.nodes.get('list').children[0]['aria-current'],'false');
+});
+
+test('live notes mount once per session, keep their original clock, and link to the saved identity',()=>{
+ const mounts=[],links=[];
+ const notes={RecordingClock:require('../../ui/notes.js').RecordingClock,flushAll:()=>Promise.resolve(),
+  mount:(id,parent,api,options)=>mounts.push({id,options}),finishSession:(...args)=>links.push(args)};
+ const h=harness(notes);h.ctx.refreshLibrary=()=>{};
+ h.ctx.renderRecording({state:'recording',session_id:'A',started_at_ms:1000,elapsed_ms:125});h.ctx.showLive();
+ assert.equal(mounts.length,1);assert.equal(mounts[0].id,'A');assert.equal(mounts[0].options.session,true);
+ assert.ok(mounts[0].options.clock()>=125);
+ h.ctx.renderRecording({state:'recording',session_id:'A',started_at_ms:1000,elapsed_ms:200});
+ assert.equal(mounts.length,1,'status polling must not replace the focused editor');
+ h.ctx.renderRecording({state:'recording',session_id:'B',started_at_ms:9000,elapsed_ms:0});
+ assert.equal(mounts.length,2);assert.equal(mounts[0].options.clock(),null,'old draft cannot use the new capture clock');
+ h.ctx.handleStreamFrame({kind:'meeting_ready',reason:'persisted',session_id:'B',meeting_id:'saved-B'});
+ assert.deepEqual(links.at(-1),['B','saved-B']);
+});
+
+test('recovery navigation opens the selected draft and a late saved alias cannot steal a newer view',async()=>{
+ let selected,alias;const recovered=[],opened=[];
+ const notes={RecordingClock:require('../../ui/notes.js').RecordingClock,flushAll:()=>Promise.resolve(),mount(){},finishSession(){},
+  mountRecovery:(parent,api,onOpen)=>{selected=onOpen;},mountRecovered:(id,parent,api,options)=>{recovered.push(id);alias=options.onSaved;}};
+ const h=harness(notes);h.ctx.openMeeting=id=>opened.push(id);
+ await h.ctx.showNoteDrafts();assert.equal(typeof selected,'function');selected('orphan-A');
+ assert.deepEqual(recovered,['orphan-A']);h.ctx.showLive();alias('late-saved');assert.deepEqual(opened,[]);
+ h.ctx.renderRecording({state:'recording',session_id:'live-A',started_at_ms:1000,elapsed_ms:100});
+ h.ctx.showRecoveredNote('live-A');assert.ok(h.document.getElementById('live-pane'));
+ assert.equal(recovered.length,1,'active draft returns to the live editor');
 });

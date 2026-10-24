@@ -46,6 +46,34 @@ pub trait MeetingSource: Send + Sync + 'static {
         Err(crate::notes::NoteError::NotFound)
     }
 
+    /// Discover unfinished encrypted note drafts without returning their contents.
+    fn note_drafts(
+        &self,
+        _limit: u32,
+        _offset: u32,
+    ) -> Result<Vec<crate::notes::DraftSummary>, crate::notes::NoteError> {
+        Err(crate::notes::NoteError::NotFound)
+    }
+
+    /// Read a live or recovered draft using an optional recorder-owned clock.
+    fn session_note(
+        &self,
+        _id: &str,
+        _clock: Option<crate::notes::SessionClock>,
+    ) -> Result<crate::notes::SessionNote, crate::notes::NoteError> {
+        Err(crate::notes::NoteError::NotFound)
+    }
+
+    /// Save a draft against the recorder or finalized alias clock, never a client clock.
+    fn save_session_note(
+        &self,
+        _id: &str,
+        _doc: crate::notes::NoteDocument,
+        _clock: Option<crate::notes::SessionClock>,
+    ) -> Result<crate::notes::SessionNote, crate::notes::NoteError> {
+        Err(crate::notes::NoteError::NotFound)
+    }
+
     /// Most recent meetings first.
     ///
     /// # Errors
