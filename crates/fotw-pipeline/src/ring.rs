@@ -161,7 +161,7 @@ struct GenerationState {
 impl GenerationRing {
     /// Keep the initial ring; allocate each replacement on the control thread.
     pub fn new(initial: RingProducer) -> Self {
-        let capacity = initial.slots();
+        let capacity = initial.inner.buffer().capacity();
         Self {
             state: Arc::new(std::sync::Mutex::new(GenerationState {
                 initial: Some(initial),

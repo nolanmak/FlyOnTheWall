@@ -5,10 +5,28 @@
 //! (docs/REQUIREMENTS.md CAP-04).
 
 use fotw_pipeline::ring::AudioRing;
+use fotw_pipeline::ring::GenerationRing;
 use fotw_pipeline::rt::{RtAlloc, RtGuard, allocation_violations};
 
 #[global_allocator]
 static ALLOC: RtAlloc = RtAlloc;
+
+#[test]
+fn queued_initial_audio_does_not_shrink_replacement_capacity() {
+    let (mut producer, mut old_consumer) = AudioRing::with_capacity_frames(8);
+    assert_eq!(producer.push_complete_block(&[1.0; 8]), 8);
+    let generations = GenerationRing::new(producer);
+    let initial = generations.producer();
+    drop(initial);
+    let mut replacement = generations.producer();
+    assert_eq!(replacement.push_complete_block(&[2.0; 8]), 8);
+    let mut current = generations.take_replacement().unwrap();
+    let mut samples = [0.0; 8];
+    assert_eq!(old_consumer.pop_into(&mut samples), 8);
+    assert_eq!(samples, [1.0; 8]);
+    assert_eq!(current.pop_into(&mut samples), 8);
+    assert_eq!(samples, [2.0; 8]);
+}
 
 #[test]
 fn writing_from_a_real_time_section_allocates_nothing() {

@@ -47,3 +47,8 @@ cover wraparound, oversized/empty callbacks and allocation freedom. This preserv
 sample shape; it does not recover dropped audio or add precise-position overrun
 gap markers. Those timeline/backfill requirements remain open.
 
+
+A review regression also filled the initial ring before creating the generation
+factory. The replacement accepted zero samples instead of eight because capacity
+was read from free slots. The factory now retains the backing ring’s immutable
+capacity; the regression preserves all old queued PCM and a full replacement.
