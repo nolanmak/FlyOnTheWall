@@ -63,3 +63,134 @@ fn draft_bounds_and_original_times_are_checked_without_losing_saved_text() {
     assert!(db.save_session_note(&changed, 500).is_err());
     assert_eq!(db.session_note("session-A").unwrap(), Some(draft));
 }
+
+#[test]
+fn promotion_preserves_revision_and_routes_late_saves_to_the_meeting() {
+    let mut db = Db::open_in_memory(&common::test_key()).unwrap();
+    let mut draft = fixture("session-A");
+    draft.note.revision = db.save_session_note(&draft, 300).unwrap();
+    draft.note.body_md = "updated before stop".into();
+    draft.note.revision = db.save_session_note(&draft, 400).unwrap();
+    let meeting = db
+        .meetings()
+        .create(fotw_store::NewMeeting::new("fixture", "UTC"))
+        .unwrap();
+    db.promote_session_note("session-A", &meeting, 1000, 500)
+        .unwrap();
+    assert_eq!(db.note_document(&meeting).unwrap(), draft.note);
+    assert_eq!(db.session_note("session-A").unwrap(), Some(draft.clone()));
+    draft.note.body_md = "last edit while finishing".into();
+    draft.note.revision = db.save_session_note(&draft, 500).unwrap();
+    assert_eq!(db.note_document(&meeting).unwrap(), draft.note);
+    assert_eq!(
+        db.conn()
+            .query_row("SELECT COUNT(*) FROM session_notes", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    db.promote_session_note("session-A", &meeting, 1000, 500)
+        .unwrap();
+    assert_eq!(db.note_document(&meeting).unwrap(), draft.note);
+}
+
+#[test]
+fn failed_handoff_preserves_draft_and_creates_neither_note_nor_alias() {
+    let mut db = Db::open_in_memory(&common::test_key()).unwrap();
+    let mut draft = fixture("session-A");
+    draft.note.revision = db.save_session_note(&draft, 300).unwrap();
+    let meeting = db
+        .meetings()
+        .create(fotw_store::NewMeeting::new("fixture", "UTC"))
+        .unwrap();
+    db.conn().execute_batch("CREATE TRIGGER fail_link BEFORE INSERT ON session_note_links BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    assert!(
+        db.promote_session_note("session-A", &meeting, 1000, 500)
+            .is_err()
+    );
+    assert_eq!(db.session_note("session-A").unwrap(), Some(draft));
+    assert_eq!(db.note_document(&meeting).unwrap().revision, 0);
+    assert_eq!(db.session_note_meeting("session-A").unwrap(), None);
+    assert!(
+        db.search(&fotw_store::SearchQuery::new("decision"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn late_save_respects_frozen_bounds_and_conflicts_with_saved_meeting_edits() {
+    let (_dir, path) = common::tmp_db();
+    let mut live = Db::open(&path, &common::test_key()).unwrap();
+    let mut draft = fixture("session-A");
+    draft.note.revision = live.save_session_note(&draft, 300).unwrap();
+    let meeting = live
+        .meetings()
+        .create(fotw_store::NewMeeting::new("fixture", "UTC"))
+        .unwrap();
+    live.promote_session_note("session-A", &meeting, 1000, 500)
+        .unwrap();
+    let mut saved = Db::open(&path, &common::test_key()).unwrap();
+    let mut future = draft.clone();
+    future
+        .note
+        .anchors
+        .push(NoteAnchor::new(1, "too late", 501));
+    assert!(live.save_session_note(&future, 999_999).is_err());
+    saved
+        .save_note_document(
+            &meeting,
+            draft.note.revision,
+            "saved editor won",
+            &draft.note.anchors,
+        )
+        .unwrap();
+    draft.note.body_md = "late stale edit".into();
+    assert!(matches!(
+        live.save_session_note(&draft, 500),
+        Err(StoreError::NoteConflict)
+    ));
+    assert_eq!(
+        saved.note_document(&meeting).unwrap().body_md,
+        "saved editor won"
+    );
+    assert_eq!(
+        live.session_note("session-A")
+            .unwrap()
+            .unwrap()
+            .note
+            .body_md,
+        "saved editor won"
+    );
+}
+
+#[test]
+fn first_save_after_stop_uses_alias_and_existing_meeting_notes_are_never_replaced() {
+    let mut db = Db::open_in_memory(&common::test_key()).unwrap();
+    let meeting = db
+        .meetings()
+        .create(fotw_store::NewMeeting::new("fixture", "UTC"))
+        .unwrap();
+    db.promote_session_note("session-A", &meeting, 1000, 500)
+        .unwrap();
+    assert_eq!(
+        db.session_note("session-A").unwrap().unwrap().note.revision,
+        0
+    );
+    let mut draft = fixture("session-A");
+    draft.note.revision = db.save_session_note(&draft, 500).unwrap();
+    assert_eq!(db.note_document(&meeting).unwrap(), draft.note);
+    let other = db
+        .meetings()
+        .create(fotw_store::NewMeeting::new("fixture", "UTC"))
+        .unwrap();
+    assert!(
+        db.promote_session_note("session-A", &other, 1000, 500)
+            .is_err()
+    );
+    assert!(matches!(
+        db.promote_session_note("session-B", &meeting, 1000, 500),
+        Err(StoreError::NoteConflict)
+    ));
+    assert_eq!(db.note_document(&meeting).unwrap(), draft.note);
+}

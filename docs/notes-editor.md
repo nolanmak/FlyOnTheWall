@@ -106,6 +106,30 @@ stale revisions, bounds, unchanged offsets, injected update failure, full archiv
 roundtrips (including every column) and migration from a populated v4 library.
 
 This is not yet user-visible crash recovery: the live notes routes/editor,
-recovery discovery, atomic session-to-meeting handoff and late-save routing still
+recovery discovery and daemon integration of the handoff contract below still
 need implementation. No new browser storage is used. The table is not a
 replacement for that complete flow, and #122/#13 remain open.
+
+## Atomic handoff and late saves (store contract)
+
+Schema 6 adds a session-to-meeting alias with the original capture start and
+frozen elapsed time. `promote_session_note` moves text and anchors, preserves the
+note revision, creates the alias and removes the draft in one transaction. An
+existing destination note is a conflict; a repeated handoff to the same meeting
+and clock is idempotent. An alias is created even when the first debounced note
+save has not arrived yet. Reads and later saves through the session then operate
+on the canonical meeting note with the same compare-and-swap revision. A saved
+meeting editor and an old live tab therefore cannot silently overwrite each
+other, and caller-supplied elapsed time cannot exceed the frozen recording bound.
+Deleting a meeting cascades its alias.
+
+Tests cover draft revision continuity, first save after Stop, concurrent editor
+conflicts across connections, idempotence, frozen bounds and rollback after an
+injected alias-insert failure (including text, anchors and FTS). The aliases are
+included in full library archive roundtrips; older manifests remain readable.
+A populated schema-5 draft survives the forward migration.
+
+The daemon and HTTP/live editor still need to call this contract with the actual
+capture-stop clock. Sample counts and the later persistence timestamp are not
+substitutes, especially with gaps or a long transcription drain. This store work
+does not yet establish end-to-end live notes or crash recovery UX.
