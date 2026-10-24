@@ -726,13 +726,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fotw-dsp"
+version = "0.1.0"
+dependencies = [
+ "rubato",
+ "thiserror",
+]
+
+[[package]]
 name = "fotw-pipeline"
 version = "0.1.0"
 dependencies = [
+ "fotw-dsp",
  "ogg",
  "opusic-sys",
  "rtrb",
- "rubato",
  "serde",
  "serde_json",
  "thiserror",

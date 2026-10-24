@@ -3,6 +3,7 @@ resolver = "3"
 members = [
   "crates/fotw-audio",
   "crates/fotw-pipeline",
+  "crates/fotw-dsp",
   "crates/fotw-stt",
   "crates/fotw-summarize",
   "crates/fotw-store",
