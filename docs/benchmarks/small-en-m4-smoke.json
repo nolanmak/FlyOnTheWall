@@ -1,0 +1,132 @@
+{
+  "recorded_date": "2026-10-24",
+  "cli": {
+    "machine": "Apple M4",
+    "ram_bytes": 17179869184,
+    "runtime": "Homebrew whisper.cpp 1.9.1",
+    "threads": 4,
+    "fixture": {
+      "source": "https://raw.githubusercontent.com/ggml-org/whisper.cpp/v1.9.1/samples/jfk.wav",
+      "bytes": 352078,
+      "sha256": "59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e",
+      "rate": 16000,
+      "channels": 1,
+      "seconds": 11.0
+    },
+    "model_file": "ggml-small.en.bin",
+    "model_bytes": 487614201,
+    "model_sha256": "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
+    "runs": [
+      {
+        "run": "metal-1",
+        "wall_seconds": 0.65,
+        "audio_seconds": 11.0,
+        "real_time_factor": 0.05909090909090909,
+        "max_rss_bytes": 857112576,
+        "transcript": "And so, my fellow Americans, ask not what your country can do for you. Ask what you can do for your country.",
+        "exit_code": 0
+      },
+      {
+        "run": "metal-2",
+        "wall_seconds": 0.58,
+        "audio_seconds": 11.0,
+        "real_time_factor": 0.05272727272727273,
+        "max_rss_bytes": 854409216,
+        "transcript": "And so, my fellow Americans, ask not what your country can do for you. Ask what you can do for your country.",
+        "exit_code": 0
+      },
+      {
+        "run": "metal-3",
+        "wall_seconds": 0.58,
+        "audio_seconds": 11.0,
+        "real_time_factor": 0.05272727272727273,
+        "max_rss_bytes": 854507520,
+        "transcript": "And so, my fellow Americans, ask not what your country can do for you. Ask what you can do for your country.",
+        "exit_code": 0
+      },
+      {
+        "run": "cpu-1",
+        "wall_seconds": 2.73,
+        "audio_seconds": 11.0,
+        "real_time_factor": 0.24818181818181817,
+        "max_rss_bytes": 843677696,
+        "transcript": "And so, my fellow Americans, ask not what your country can do for you. Ask what you can do for your country.",
+        "exit_code": 0
+      }
+    ],
+    "limitations": [
+      "Short clean public English speech only",
+      "Fresh process per run; filesystem/model cache not controlled",
+      "No streaming, concurrent app, long-meeting or provider-switch acceptance",
+      "Process RSS is not whole-system unified-memory use",
+      "No Nova-3 or Parakeet comparison; no WER or vocabulary-recall claim"
+    ]
+  },
+  "murmur": {
+    "startup_seconds": 0.5345850419999999,
+    "transcription_seconds_including_example_startup": 0.9792052089999999,
+    "transcript": "And so, my fellow Americans, ask not what your country can\n do for you.\n Ask what you can do for your country.",
+    "app": "Murmur real local_stt::transcribe",
+    "model_sha256": "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
+    "fixture_sha256": "59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e",
+    "stop": {
+      "ready": false,
+      "stopped": true
+    },
+    "owned_state_removed": true,
+    "validation": {
+      "passed": true,
+      "method": "expected phrase after whitespace normalization",
+      "note": "The server returns segment newlines. The initial harness compared an unnormalized phrase and failed; the app command succeeded. This check validates the captured output after normalizing whitespace."
+    }
+  },
+  "flyonthewall": {
+    "backend": "actual fotw_stt::WhisperEngine",
+    "whisper_rs": "0.16.0",
+    "whisper_rs_sys": "0.15.0",
+    "build_features": [
+      "local-whisper",
+      "metal"
+    ],
+    "threads_per_recognizer": "min(available_parallelism, 8), production default",
+    "sampling": "production greedy best_of=1",
+    "model_shared_between_legs": true,
+    "runs": [
+      {
+        "audio_seconds_per_leg": 11.0,
+        "inference_seconds": 0.431135584,
+        "legs": 1,
+        "load_seconds": 0.152920208,
+        "model": "small.en",
+        "total_seconds": 0.603763291,
+        "transcripts": [
+          "And so, my fellow Americans, ask not what your country can do for you. Ask what you can do for your country."
+        ],
+        "wall_seconds": 1.06,
+        "max_rss_bytes": 717406208,
+        "exit_code": 0
+      },
+      {
+        "audio_seconds_per_leg": 11.0,
+        "inference_seconds": 0.56068025,
+        "legs": 2,
+        "load_seconds": 0.152708167,
+        "model": "small.en",
+        "total_seconds": 0.731969292,
+        "transcripts": [
+          "And so, my fellow Americans, ask not what your country can do for you. Ask what you can do for your country.",
+          "And so, my fellow Americans, ask not what your country can do for you. Ask what you can do for your country."
+        ],
+        "wall_seconds": 1.08,
+        "max_rss_bytes": 816398336,
+        "exit_code": 0
+      }
+    ],
+    "limitations": [
+      "direct backend, not microphone/system capture or VAD",
+      "same 11-second public clip supplied to each leg",
+      "filesystem cache and desktop background load not controlled",
+      "not a Nova-3, Parakeet, AEC, failover or long-meeting comparison"
+    ]
+  }
+}
