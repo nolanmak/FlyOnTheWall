@@ -241,6 +241,11 @@ async fn main() -> Result<(), String> {
 
     // The real server, the real ingress policy, the real embedded assets.
     let source = Arc::new(fotw_web::StoreSource::new(db));
+    if std::env::args().any(|arg| arg == "--live-notes")
+        && std::env::args().any(|arg| arg == "--capture-recovery")
+    {
+        return Err("Choose one preview mode: --live-notes or --capture-recovery".into());
+    }
     let fixture_recorder = if std::env::args().any(|arg| arg == "--live-notes") {
         Some(live_notes_fixture::recorder(&root)?)
     } else {
@@ -249,6 +254,13 @@ async fn main() -> Result<(), String> {
     let recorder = fixture_recorder
         .as_ref()
         .map(|recorder| recorder.clone() as Arc<dyn fotw_web::recorder::RecorderControl>);
+    let recorder = recorder.or_else(|| {
+        std::env::args()
+            .any(|arg| arg == "--capture-recovery")
+            .then(|| {
+                Arc::new(RecoveryPreview::new()) as Arc<dyn fotw_web::recorder::RecorderControl>
+            })
+    });
     let server = fotw_web::WebServer::bind_with_recorder(0, source, recorder)
         .await
         .map_err(|e| format!("bind: {e}"))?;
@@ -261,4 +273,81 @@ async fn main() -> Result<(), String> {
     println!("\n  {}", state.launch_url());
     println!("\n  Ctrl-C to stop. The library is thrown away on the next run.");
     server.serve().await.map_err(|e| format!("server: {e}"))
+}
+
+/// Synthetic health UI fixture. No microphone, system tap, or provider opens.
+struct RecoveryPreview {
+    started: u64,
+    retry: std::sync::Mutex<Option<std::time::Instant>>,
+    stopped: std::sync::atomic::AtomicBool,
+}
+impl RecoveryPreview {
+    fn new() -> Self {
+        Self {
+            started: fotw_store::now_ms() as u64,
+            retry: std::sync::Mutex::new(None),
+            stopped: false.into(),
+        }
+    }
+}
+impl fotw_web::RecorderControl for RecoveryPreview {
+    fn start(&self) -> Result<fotw_web::RecordingStatus, fotw_web::RecorderError> {
+        Err(fotw_web::RecorderError::AlreadyRecording)
+    }
+    fn stop(&self) -> Result<fotw_web::RecordingStatus, fotw_web::RecorderError> {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(self.status())
+    }
+    fn retry_capture(
+        &self,
+        id: &str,
+        source: fotw_web::recorder::CaptureSource,
+    ) -> Result<(), fotw_web::RecorderError> {
+        if id != "preview-capture-recovery"
+            || source != fotw_web::recorder::CaptureSource::Mic
+            || self.stopped.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(fotw_web::RecorderError::NotRecording);
+        }
+        let mut retry = self.retry.lock().unwrap();
+        if retry.is_some() {
+            return Err(fotw_web::RecorderError::Failed(
+                "retry already requested".into(),
+            ));
+        }
+        *retry = Some(std::time::Instant::now());
+        Ok(())
+    }
+    fn status(&self) -> fotw_web::RecordingStatus {
+        use fotw_web::recorder::{CaptureDelivery, CaptureHealth, SourceCaptureStatus};
+        if self.stopped.load(std::sync::atomic::Ordering::Relaxed) {
+            return fotw_web::RecordingStatus::idle();
+        }
+        let retry = self.retry.lock().unwrap();
+        let state = match *retry {
+            None => CaptureDelivery::Exhausted,
+            Some(at) if at.elapsed().as_secs() < 10 => CaptureDelivery::Confirming,
+            Some(_) => CaptureDelivery::Healthy,
+        };
+        fotw_web::RecordingStatus::recording(
+            self.started,
+            (fotw_store::now_ms() as u64).saturating_sub(self.started),
+        )
+        .with_session_id(Some("preview-capture-recovery".into()))
+        .with_capture_health(Some(CaptureHealth {
+            system: SourceCaptureStatus {
+                state: CaptureDelivery::Healthy,
+                attempts: 0,
+                max_attempts: 3,
+                retry_in_ms: None,
+            },
+            mic: SourceCaptureStatus {
+                state,
+                attempts: if retry.is_none() { 3 } else { 1 },
+                max_attempts: 3,
+                retry_in_ms: None,
+            },
+        }))
+    }
 }
