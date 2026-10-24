@@ -58,6 +58,7 @@ impl MeetingSource for StoreSource {
                 .anchors
                 .into_iter()
                 .map(|a| crate::notes::NoteAnchor {
+                    id: Some(a.id),
                     block_idx: a.block_idx,
                     block_text: a.block_text,
                     typed_at_ms: a.typed_at_ms,
@@ -74,8 +75,18 @@ impl MeetingSource for StoreSource {
         let anchors: Vec<_> = doc
             .anchors
             .iter()
-            .map(|a| fotw_store::NoteAnchor::new(a.block_idx, &a.block_text, a.typed_at_ms))
+            .map(|a| {
+                let mut anchor =
+                    fotw_store::NoteAnchor::new(a.block_idx, &a.block_text, a.typed_at_ms);
+                if let Some(id) = &a.id {
+                    anchor.id = id.clone();
+                }
+                anchor
+            })
             .collect();
+        for (a, stored) in doc.anchors.iter_mut().zip(&anchors) {
+            a.id = Some(stored.id.clone());
+        }
         doc.revision = self
             .lock()
             .save_note_document(id, doc.revision, &doc.body_md, &anchors)

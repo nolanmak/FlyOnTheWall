@@ -88,5 +88,32 @@ async fn notes_require_auth_and_stale_writes_cannot_replace_saved_text() {
     let after: serde_json::Value = serde_json::from_str(&after.body).unwrap();
     assert_eq!(after["revision"], 1);
     assert!(after["body_md"].as_str().unwrap().contains("café"));
+    // Older clients can omit the identity when creating an anchor; the server
+    // must return it so later edits preserve it instead of minting another.
+    let anchored = serde_json::json!({"revision":1,"body_md":"first", "anchors":[
+        {"block_idx":0,"block_text":"first","typed_at_ms":1000}
+    ]});
+    let saved = h
+        .post(&path, &h.authorised(), Some(&anchored.to_string()))
+        .await;
+    assert_eq!(saved.status, 200);
+    let mut doc: serde_json::Value = serde_json::from_str(&saved.body).unwrap();
+    let identity = doc["anchors"][0]["id"].as_str().unwrap().to_owned();
+    doc["anchors"][0]["block_idx"] = 1.into();
+    doc["anchors"][0]["block_text"] = "first edited".into();
+    doc["body_md"] = "unanchored\n\nfirst edited".into();
+    let edited = h.post(&path, &h.authorised(), Some(&doc.to_string())).await;
+    assert_eq!(edited.status, 200);
+    let loaded = h.get(&path, &h.authorised()).await;
+    let mut loaded: serde_json::Value = serde_json::from_str(&loaded.body).unwrap();
+    assert_eq!(loaded["anchors"][0]["id"], identity);
+    assert_eq!(loaded["anchors"][0]["typed_at_ms"], 1000);
+    loaded["anchors"][0]["typed_at_ms"] = 2000.into();
+    assert_eq!(
+        h.post(&path, &h.authorised(), Some(&loaded.to_string()))
+            .await
+            .status,
+        422
+    );
     task.abort();
 }

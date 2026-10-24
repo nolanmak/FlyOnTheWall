@@ -528,6 +528,7 @@ impl MeetingRepo<'_> {
         let note_id = existing.clone().unwrap_or_else(new_id);
 
         let tx = self.db.conn_mut().transaction()?;
+        crate::notes::validate_existing_anchors(&tx, meeting_id, anchors)?;
         if existing.is_some() {
             tx.execute(
                 "UPDATE notes SET body_md = ?2, updated_at = ?3, lamport = lamport + 1
@@ -553,7 +554,7 @@ impl MeetingRepo<'_> {
             )?;
             for a in anchors {
                 stmt.execute(params![
-                    new_id(),
+                    a.id,
                     note_id,
                     meeting_id,
                     a.block_idx,
@@ -581,7 +582,7 @@ impl MeetingRepo<'_> {
         };
 
         let mut stmt = conn.prepare(
-            "SELECT block_idx, block_text, typed_at_ms FROM note_anchors
+            "SELECT block_idx, block_text, typed_at_ms, id FROM note_anchors
              WHERE note_id = ?1 ORDER BY block_idx",
         )?;
         let rows = stmt.query_map(params![note_id], |r| {
@@ -589,6 +590,7 @@ impl MeetingRepo<'_> {
                 block_idx: r.get(0)?,
                 block_text: r.get(1)?,
                 typed_at_ms: r.get(2)?,
+                id: r.get(3)?,
             })
         })?;
         let mut anchors = Vec::new();

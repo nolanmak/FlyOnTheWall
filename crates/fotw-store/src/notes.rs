@@ -40,14 +40,15 @@ impl Db {
         if let Some((id, body, lamport)) = row {
             result.revision = revision(lamport)?;
             result.body_md = body;
-            let mut stmt = tx.prepare("SELECT block_idx,block_text,typed_at_ms FROM note_anchors WHERE note_id=?1 ORDER BY block_idx")?;
+            let mut stmt = tx.prepare("SELECT block_idx,block_text,typed_at_ms,id FROM note_anchors WHERE note_id=?1 ORDER BY block_idx")?;
             result.anchors = stmt
                 .query_map([id], |r| {
-                    Ok(NoteAnchor::new(
-                        r.get(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get(2)?,
-                    ))
+                    Ok(NoteAnchor {
+                        block_idx: r.get(0)?,
+                        block_text: r.get(1)?,
+                        typed_at_ms: r.get(2)?,
+                        id: r.get(3)?,
+                    })
                 })?
                 .collect::<std::result::Result<_, _>>()?;
         }
@@ -68,6 +69,7 @@ impl Db {
         anchors: &[NoteAnchor],
     ) -> Result<i64> {
         let mut indices = HashSet::new();
+        let mut identities = HashSet::new();
         if expected < 0
             || body.len() > MAX_NOTE_BYTES
             || anchors.len() > 4096
@@ -75,9 +77,18 @@ impl Db {
                 .iter()
                 .try_fold(0usize, |n, a| n.checked_add(a.block_text.len()))
                 .is_none_or(|n| n > MAX_NOTE_BYTES)
-            || anchors
-                .iter()
-                .any(|a| a.block_idx < 0 || a.typed_at_ms < 0 || !indices.insert(a.block_idx))
+            || anchors.iter().any(|a| {
+                a.block_idx < 0
+                    || a.typed_at_ms < 0
+                    || !indices.insert(a.block_idx)
+                    || a.id.is_empty()
+                    || a.id.len() > 64
+                    || !a
+                        .id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    || !identities.insert(&a.id)
+            })
         {
             return Err(StoreError::InvalidArgument(
                 "invalid note size, revision or anchors".into(),
@@ -103,6 +114,7 @@ impl Db {
         if expected != current {
             return Err(StoreError::NoteConflict);
         }
+        validate_existing_anchors(&tx, meeting_id, anchors)?;
         let next = current
             .checked_add(1)
             .ok_or_else(|| StoreError::InvalidArgument("note revision exhausted".into()))?;
@@ -120,11 +132,33 @@ impl Db {
         tx.execute("DELETE FROM note_anchors WHERE note_id=?1", [&id])?;
         for a in anchors {
             tx.execute("INSERT INTO note_anchors(id,note_id,meeting_id,block_idx,block_text,typed_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
-                params![new_id(),id,meeting_id,a.block_idx,a.block_text,a.typed_at_ms])?;
+                params![a.id,id,meeting_id,a.block_idx,a.block_text,a.typed_at_ms])?;
         }
         tx.commit()?;
         Ok(next)
     }
+}
+
+pub(crate) fn validate_existing_anchors(
+    tx: &rusqlite::Transaction<'_>,
+    meeting_id: &str,
+    anchors: &[NoteAnchor],
+) -> Result<()> {
+    for anchor in anchors {
+        let existing: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT meeting_id,typed_at_ms FROM note_anchors WHERE id=?1",
+                [&anchor.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if existing.is_some_and(|(owner, time)| owner != meeting_id || time != anchor.typed_at_ms) {
+            return Err(StoreError::InvalidArgument(
+                "anchor identity or original offset changed".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn revision(lamport: i64) -> Result<i64> {
@@ -151,6 +185,92 @@ fn meeting_origin(conn: &rusqlite::Connection, id: &str) -> Result<String> {
 mod tests {
     use super::*;
     use crate::{DbKey, NewMeeting, SearchQuery};
+
+    #[test]
+    fn editing_and_reordering_preserve_anchor_identity_and_original_time() {
+        let mut db = Db::open_in_memory(&DbKey::from_bytes([1; 32])).unwrap();
+        let id = db
+            .meetings()
+            .create(NewMeeting::new("fixture", "UTC"))
+            .unwrap();
+        db.save_note_document(
+            &id,
+            0,
+            "first\n\nsecond",
+            &[
+                NoteAnchor::new(0, "first", 100),
+                NoteAnchor::new(1, "second", 200),
+            ],
+        )
+        .unwrap();
+        let original: String = db
+            .conn()
+            .query_row(
+                "SELECT id FROM note_anchors WHERE meeting_id=?1 AND block_idx=0",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut doc = db.note_document(&id).unwrap();
+        doc.anchors[0].block_idx = 1;
+        doc.anchors[0].block_text = "first edited".into();
+        doc.anchors[1].block_idx = 0;
+        db.save_note_document(&id, doc.revision, "second\n\nfirst edited", &doc.anchors)
+            .unwrap();
+        let (after, time): (String, i64) = db
+            .conn()
+            .query_row(
+                "SELECT id,typed_at_ms FROM note_anchors WHERE meeting_id=?1 AND block_idx=1",
+                [&id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(after, original);
+        assert_eq!(time, 100);
+    }
+
+    #[test]
+    fn changed_offsets_and_cross_meeting_identities_are_rejected_atomically() {
+        let mut db = Db::open_in_memory(&DbKey::from_bytes([1; 32])).unwrap();
+        let first = db
+            .meetings()
+            .create(NewMeeting::new("first", "UTC"))
+            .unwrap();
+        let other = db
+            .meetings()
+            .create(NewMeeting::new("other", "UTC"))
+            .unwrap();
+        let anchor = NoteAnchor::new(0, "original", 200);
+        db.save_note_document(&first, 0, "original", &[anchor])
+            .unwrap();
+        let before = db.note_document(&first).unwrap();
+        let mut changed = before.anchors.clone();
+        changed[0].typed_at_ms = 201;
+        assert!(matches!(
+            db.save_note_document(&first, before.revision, "changed", &changed),
+            Err(StoreError::InvalidArgument(_))
+        ));
+        assert_eq!(db.note_document(&first).unwrap(), before);
+        assert!(matches!(
+            db.meetings()
+                .upsert_note(&first, "legacy changed", &changed),
+            Err(StoreError::InvalidArgument(_))
+        ));
+        assert_eq!(db.note_document(&first).unwrap(), before);
+        assert!(matches!(
+            db.save_note_document(&other, 0, "copied", &before.anchors),
+            Err(StoreError::InvalidArgument(_))
+        ));
+        assert_eq!(db.note_document(&other).unwrap().revision, 0);
+        let mut duplicate = before.anchors.clone();
+        duplicate.push(before.anchors[0].clone());
+        duplicate[1].block_idx = 1;
+        assert!(matches!(
+            db.save_note_document(&first, before.revision, "duplicate", &duplicate),
+            Err(StoreError::InvalidArgument(_))
+        ));
+        assert_eq!(db.note_document(&first).unwrap(), before);
+    }
 
     #[test]
     fn anchor_write_failure_rolls_back_body_revision_and_search_index() {
