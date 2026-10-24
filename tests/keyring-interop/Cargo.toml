@@ -1,0 +1,14 @@
+[package]
+name = "fotw-keyring-interop"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# This migration probe deliberately retains the former backend. Keep it out
+# of the application's dependency graph and advisory audit.
+[workspace]
+
+[dependencies]
+keyring-core = "1"
+zbus-secret-service-keyring-store = { version = "=1.0.0", features = ["crypto-rust"] }
+dbus-secret-service-keyring-store = { version = "=1.0.1", features = ["crypto-rust"] }
