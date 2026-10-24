@@ -67,6 +67,22 @@ impl RingProducer {
         took
     }
 
+    /// Copy a complete callback or drop/count the entire callback.
+    ///
+    /// Capture callbacks contain complete interleaved frames. A partial sample
+    /// write can split a frame and shift all later channels, so capture sinks
+    /// use this operation even before startup reports the channel count.
+    /// The single producer owns all writes; a concurrent consumer can only free
+    /// more slots between the check and copy. No allocation, lock or retry.
+    pub fn push_complete_block(&mut self, block: &[f32]) -> usize {
+        if self.inner.slots() < block.len() {
+            self.dropped
+                .fetch_add(block.len() as u64, Ordering::Relaxed);
+            return 0;
+        }
+        self.push_block(block)
+    }
+
     /// Samples dropped because the consumer could not keep up.
     ///
     /// Non-zero here is the signal that the pump is falling behind. It must be

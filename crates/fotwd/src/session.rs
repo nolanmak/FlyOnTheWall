@@ -377,10 +377,9 @@ impl FrameSink for RingSink {
                 .first_host_ns
                 .store(ts.host_ns, Ordering::Relaxed);
         }
-        // The return value is deliberately ignored: a short write means the
-        // pump is behind, and retrying on a real-time thread is blocking by
-        // another name. The shortfall is counted for the pump to surface.
-        let _ = self.producer.push_block(pcm);
+        // If capacity is insufficient, drop/count the whole callback rather
+        // than splitting an interleaved frame. Never retry on the audio thread.
+        let _ = self.producer.push_complete_block(pcm);
     }
 
     fn on_error(&mut self, _e: TapError) {}
@@ -471,7 +470,7 @@ impl FrameSink for SupervisedSink {
                 .store(ts.host_ns, Ordering::Relaxed);
         }
         if let Some(producer) = self.producer.as_mut() {
-            let _ = producer.push_block(pcm);
+            let _ = producer.push_complete_block(pcm);
         }
     }
 
@@ -3829,6 +3828,44 @@ mod supervised_recovery_tests {
                 .chunks_exact(2)
                 .any(|v| i16::from_le_bytes([v[0], v[1]]) > 20_000)
         );
+    }
+
+    #[test]
+    fn capture_overflow_never_leaves_a_partial_interleaved_frame() {
+        for supervised in [false, true] {
+            let (producer, mut consumer) = AudioRing::with_capacity_frames(5);
+            let counters = LegCounters::default();
+            let mut sink: Box<dyn FrameSink> = if supervised {
+                ProducerSlot::holding(producer).sink(Arc::new(ActivityCounters::new()), counters, 2)
+            } else {
+                Box::new(RingSink { producer, counters })
+            };
+            sink.on_frames(
+                &[1.0, -1.0, 2.0, -2.0],
+                CaptureTimestamp::new(0, 0),
+                FrameFlags::empty(),
+            );
+            sink.on_frames(
+                &[3.0, -3.0, 4.0, -4.0],
+                CaptureTimestamp::new(2, 1),
+                FrameFlags::empty(),
+            );
+            let mut scratch = [0.0; 8];
+            assert_eq!(
+                consumer.pop_into(&mut scratch),
+                4,
+                "supervised={supervised}: do not append a half frame"
+            );
+            assert_eq!(&scratch[..4], &[1.0, -1.0, 2.0, -2.0]);
+            assert_eq!(consumer.dropped_frames(), 4);
+            sink.on_frames(
+                &[5.0, -5.0],
+                CaptureTimestamp::new(4, 2),
+                FrameFlags::empty(),
+            );
+            assert_eq!(consumer.pop_into(&mut scratch), 2);
+            assert_eq!(&scratch[..2], &[5.0, -5.0]);
+        }
     }
 
     /// The daemon-specific requirement the CLI path has no equivalent of: the
