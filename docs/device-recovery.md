@@ -163,15 +163,41 @@ Behavioral RED tests observed `Stopped` instead of `Recovering` and just one
 open instead of the three permitted attempts. Four new manual-clock tests cover
 initial open failure, native start failure/drop, retry spacing and exhaustion,
 manual retry preserving the full gap, Stop, reuse, and unchanged mandatory-start
-behavior. All 50 watchdog tests pass. This is the supervisor prerequisite only:
-daemon/CLI optional-microphone wiring still needs a reserved archive track,
-correct generation-ring ownership when the initial open never created a sink,
-initial-gap ordering, and finalization of an outage that never recovers. These
-must have persisted-audio tests before claiming startup microphone recovery.
+behavior. All 50 watchdog tests pass.
+
+Daemon and CLI now retain that supervisor, its watcher and a microphone archive
+track after initial failure. An unknown native format reserves 16 kHz mono on
+disk; the first successful start supplies the actual native format for conversion.
+Failed initial-start PCM is discarded, and a failed open that never requested a
+sink still causes the next attempt to use a separate ring. The original source
+format is not inferred from the archive policy. Initial failed-start buffer
+counts are excluded from the retained-capture diagnostics.
+
+Missing startup audio is padded during recording in whole-second increments,
+then the final fractional tail is padded on recovery or Stop. Adjacent manifest
+gaps with the same reason coalesce, so a permanently absent microphone does not
+accumulate either a marker per poll or a whole meeting of pending silence to
+write at Stop. Padding is clipped to the session epoch and passes through the
+same post-WAL transcription feed as other gap padding. The source health UI stays
+recovering/exhausted until actual recovery, then confirming until sustained
+healthy delivery. Native operations can still block the pump; this change does
+not establish a deadline for native recovery or disk writes.
+
+The production `run_supervised` fixture first failed because its saved manifest
+omitted the startup outage. Additional RED assertions exposed failed-start
+samples counted as captured audio and missing audio saved only at Stop. It now
+covers failed open, failed start after partial delivery, recovery from 48 kHz
+stereo into the reserved mono track, exhausted recovery, and Stop before the
+first retry. It checks actual persisted PCM, retained system samples, initial
+and final health, one contiguous gap, live persistence and sample counts. A CLI
+fixture checks incremental padding, epoch clipping, replacement-ring ownership
+and conversion. WAL tests prove coalescing preserves separate sources and
+separated outages. These are deterministic fixture checks; signed-app physical
+microphone and provider-switch checks remain open.
 
 This is partial implementation of #121. Quiescence of native callbacks already in flight,
-suspend/wake notification boundaries and complete wake gaps, recovery of a microphone
-that failed its initial open, and bounded native recovery operations remain
+suspend/wake notification boundaries and complete wake gaps, physical verification
+of startup microphone recovery, and bounded native recovery operations remain
 required. Closing the mailbox cancels queued work; it cannot interrupt a native
 operation already running. Native input format
 validation does not itself implement live format notifications or conversion.

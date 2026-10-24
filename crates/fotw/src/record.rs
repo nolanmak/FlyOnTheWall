@@ -145,13 +145,12 @@ struct Leg {
     slot: ProducerSlot,
     converter: ArchiveConverter,
     retired_drops: u64,
+    startup_padded_until: Option<u64>,
     boundary_samples: u64,
     label: &'static str,
     supervisor: CaptureSupervisor,
     counters: Arc<ActivityCounters>,
     consumer: RingConsumer,
-    /// What the tap is delivering right now. Re-read after every rebuild.
-    format: StreamFormat,
     /// The shape **this leg's** PCM is being written in, which is fixed for
     /// the session and is not necessarily the other leg's — a mono mic
     /// alongside a stereo system tap is the ordinary case. Padding a gap from
@@ -222,7 +221,7 @@ pub fn record(root: PathBuf, seconds: u64) -> Result<PathBuf, String> {
 
     // The mic leg: a separate device, a separate IOProc and a separate ring.
     // Never fused into one aggregate — see fotw_audio::platform::macos::mic.
-    let (mic_producer, mic_consumer) = AudioRing::with_capacity_frames(capacity);
+    let (mic_producer, mut mic_consumer) = AudioRing::with_capacity_frames(capacity);
     let mic_slot = ProducerSlot::holding(mic_producer);
     let mic_counters = Arc::new(ActivityCounters::new());
     let mut mic = {
@@ -240,15 +239,26 @@ pub fn record(root: PathBuf, seconds: u64) -> Result<PathBuf, String> {
         )
     };
     let mic_format = mic
-        .start()
-        .map_err(|e| eprintln!("  ! mic unavailable: {e}"))
+        .start_recovering()
+        .map_err(|e| eprintln!("  ! mic unavailable; recovery scheduled: {e}"))
         .ok();
-    let _mic_watch = mic_format.and_then(|_| plat.watch_devices(mic.signal()).ok());
+    if mic_format.is_none() {
+        mic_consumer = mic_slot.0.discard_initial_attempt();
+    }
+    let discarded_mic_activity = if mic_format.is_none() {
+        mic_counters.snapshot()
+    } else {
+        TapActivity::default()
+    };
+    let _mic_watch = plat.watch_devices(mic.signal()).ok();
+    // Reserve an archive format even when the device's native format is unknown.
+    let mic_archive =
+        mic_format.unwrap_or(StreamFormat::new(16_000, 1, fotw_audio::SampleFormat::F32));
 
     println!("  system   : {sys_format}");
     match mic_format {
         Some(f) => println!("  mic      : {f}"),
-        None => println!("  mic      : (not capturing)"),
+        None => println!("  mic      : (unavailable; retrying)"),
     }
     println!("  session  : {}", root.display());
 
@@ -263,7 +273,10 @@ pub fn record(root: PathBuf, seconds: u64) -> Result<PathBuf, String> {
     let mut wal = SessionWal::create_with_formats(
         &root,
         TrackFormat::new(sys_format.sample_rate_hz, sys_format.channels),
-        mic_format.map(|f| TrackFormat::new(f.sample_rate_hz, f.channels)),
+        Some(TrackFormat::new(
+            mic_archive.sample_rate_hz,
+            mic_archive.channels,
+        )),
     )
     .map_err(|e| format!("could not create the session: {e}"))?;
     let dir = wal.dir().to_path_buf();
@@ -279,32 +292,30 @@ pub fn record(root: PathBuf, seconds: u64) -> Result<PathBuf, String> {
             slot: sys_slot,
             converter: archive_converter(sys_format, formats.system)?,
             retired_drops: 0,
+            startup_padded_until: None,
             boundary_samples: 0,
             label: "system",
             supervisor: system,
             counters: Arc::clone(&sys_counters),
             consumer: sys_consumer,
-            format: sys_format,
             wal_format: formats.system,
         },
     )];
-    if let Some(format) = mic_format {
-        legs.push((
-            Channel::Mic,
-            Leg {
-                slot: mic_slot,
-                converter: archive_converter(format, formats.mic)?,
-                retired_drops: 0,
-                boundary_samples: 0,
-                label: "mic",
-                supervisor: mic,
-                counters: Arc::clone(&mic_counters),
-                consumer: mic_consumer,
-                format,
-                wal_format: formats.mic,
-            },
-        ));
-    }
+    legs.push((
+        Channel::Mic,
+        Leg {
+            slot: mic_slot,
+            converter: archive_converter(mic_archive, formats.mic)?,
+            retired_drops: 0,
+            startup_padded_until: mic_format.is_none().then_some(session_epoch_ns),
+            boundary_samples: 0,
+            label: "mic",
+            supervisor: mic,
+            counters: Arc::clone(&mic_counters),
+            consumer: mic_consumer,
+            wal_format: formats.mic,
+        },
+    ));
 
     // The pump: normal priority, does the I/O, drains on a 100 ms cadence, and
     // owns the supervisors so a rebuild's padding lands in the right place in
@@ -322,8 +333,31 @@ pub fn record(root: PathBuf, seconds: u64) -> Result<PathBuf, String> {
             // ended would read its silence as a fault and rebuild it.
             if !stopping && pump_stop.load(Ordering::Acquire) {
                 stopping = true;
-                for (_, leg) in &mut legs {
+                for (channel, leg) in &mut legs {
+                    let startup_gap = leg.supervisor.pending_startup_gap().map(|mut gap| {
+                        gap.start_ns = gap
+                            .start_ns
+                            .max(leg.startup_padded_until.unwrap_or(session_epoch_ns));
+                        gap
+                    });
                     let _ = leg.supervisor.stop();
+                    if let Some(gap) = startup_gap {
+                        let gap = CaptureGap {
+                            start_ns: gap.start_ns.max(session_epoch_ns),
+                            ..gap
+                        };
+                        apply_gap(
+                            &mut wal,
+                            *channel,
+                            leg.label,
+                            &gap,
+                            leg.wal_format,
+                            session_epoch_ns,
+                            &mut scratch,
+                        )?;
+                        leg.boundary_samples += gap.frames_to_pad(leg.wal_format.sample_rate_hz)
+                            * u64::from(leg.wal_format.channels);
+                    }
                 }
             }
 
@@ -401,7 +435,15 @@ pub fn record(root: PathBuf, seconds: u64) -> Result<PathBuf, String> {
     let mut system_silent = 0u64;
     for (channel, mut leg, written) in legs {
         let _ = leg.supervisor.stop();
-        let activity = leg.counters.snapshot();
+        let mut activity = leg.counters.snapshot();
+        if channel == Channel::Mic {
+            activity.buffers = activity
+                .buffers
+                .saturating_sub(discarded_mic_activity.buffers);
+            activity.silent_buffers = activity
+                .silent_buffers
+                .saturating_sub(discarded_mic_activity.silent_buffers);
+        }
         let secs = written as f64
             / f64::from(leg.wal_format.sample_rate_hz)
             / f64::from(leg.wal_format.channels.max(1));
@@ -502,9 +544,17 @@ fn supervise(
         leg.retired_drops += leg.consumer.dropped_frames();
         leg.consumer = leg.slot.replacement()?;
         leg.converter = archive_converter(format, leg.wal_format)?;
-        leg.format = format;
 
-        for gap in gaps {
+        for mut gap in gaps {
+            if gap.reason == fotw_audio::supervisor::GapReason::InitiallyUnavailable {
+                gap.start_ns = gap
+                    .start_ns
+                    .max(leg.startup_padded_until.take().unwrap_or(epoch_ns));
+            }
+            let gap = CaptureGap {
+                start_ns: gap.start_ns.max(epoch_ns),
+                ..gap
+            };
             leg.boundary_samples += gap.frames_to_pad(leg.wal_format.sample_rate_hz)
                 * u64::from(leg.wal_format.channels);
             apply_gap(
@@ -516,6 +566,27 @@ fn supervise(
                 epoch_ns,
                 scratch,
             )?;
+        }
+    }
+    if let (Some(until), Some(mut gap)) = (
+        leg.startup_padded_until,
+        leg.supervisor.pending_startup_gap(),
+    ) {
+        gap.start_ns = until;
+        gap.end_ns = until + gap.end_ns.saturating_sub(until) / 1_000_000_000 * 1_000_000_000;
+        if gap.end_ns > until {
+            apply_gap(
+                wal,
+                channel,
+                leg.label,
+                &gap,
+                leg.wal_format,
+                epoch_ns,
+                scratch,
+            )?;
+            leg.boundary_samples += gap.frames_to_pad(leg.wal_format.sample_rate_hz)
+                * u64::from(leg.wal_format.channels);
+            leg.startup_padded_until = Some(gap.end_ns);
         }
     }
     Ok(())
@@ -532,6 +603,13 @@ fn apply_gap(
     epoch_ns: u64,
     scratch: &mut [f32],
 ) -> Result<(), String> {
+    let gap = CaptureGap {
+        start_ns: gap.start_ns.max(epoch_ns),
+        ..*gap
+    };
+    if gap.duration_ns() == 0 {
+        return Ok(());
+    }
     let start_ms = gap.start_ns.saturating_sub(epoch_ns) / 1_000_000;
     let end_ms = gap.end_ns.saturating_sub(epoch_ns) / 1_000_000;
     wal.mark_gap(start_ms, end_ms, format!("{label}: {}", gap.reason))
@@ -621,14 +699,84 @@ mod tests {
             slot,
             converter: archive_converter(format, wal_format).unwrap(),
             retired_drops: 0,
+            startup_padded_until: None,
             boundary_samples: 0,
             label,
             supervisor,
             counters,
             consumer,
-            format,
             wal_format,
         }
+    }
+
+    #[test]
+    fn cli_initial_mic_outage_is_clipped_to_epoch_and_recovery_uses_a_new_ring() {
+        let root = scratch_dir("initial-mic-outage");
+        let clock = ManualClock::new();
+        let archive = TrackFormat::new(16_000, 1);
+        let mut leg = fake_leg("mic", TapId::mic("default"), archive, &clock);
+        leg.supervisor.stop().unwrap();
+        let (producer, consumer) = AudioRing::with_capacity_frames(48_000);
+        leg.consumer = consumer;
+        leg.slot = ProducerSlot::holding(producer);
+        let slot = leg.slot.clone();
+        let counters = leg.counters.clone();
+        let mut opened = false;
+        leg.supervisor = CaptureSupervisor::new(
+            SupervisorConfig::default(),
+            clock.clone(),
+            move || {
+                if !std::mem::replace(&mut opened, true) {
+                    return Err(TapError::platform("fixture initial open failure"));
+                }
+                Ok(Box::new(FakeTap::new(
+                    TapId::mic("default"),
+                    StreamFormat::new(48_000, 2, fotw_audio::SampleFormat::F32),
+                )))
+            },
+            move || slot.sink(counters.clone(), 1),
+        );
+        assert!(leg.supervisor.start_recovering().is_err());
+        leg.consumer = leg.slot.0.discard_initial_attempt();
+        leg.startup_padded_until = Some(2_000_000_000);
+        clock.advance(Duration::from_secs(10));
+        let mut wal = SessionWal::create_with_formats(&root, archive, Some(archive)).unwrap();
+        // The WAL began two seconds after the initial attempt.
+        supervise(
+            &mut wal,
+            Channel::Mic,
+            &mut leg,
+            &MockPlatform::macos_taps(),
+            2_000_000_000,
+            &mut vec![0.0; 48_000],
+        )
+        .unwrap();
+        assert_eq!(leg.boundary_samples, 8 * 16_000);
+        clock.advance(Duration::from_secs(5));
+        supervise(
+            &mut wal,
+            Channel::Mic,
+            &mut leg,
+            &MockPlatform::macos_taps(),
+            2_000_000_000,
+            &mut vec![0.0; 48_000],
+        )
+        .unwrap();
+        assert_eq!(leg.boundary_samples, 13 * 16_000);
+        assert_eq!(leg.consumer.slots(), 0);
+        assert_eq!(wal.manifest().gaps[0].start_ms, 0);
+        assert_eq!(wal.manifest().gaps[0].end_ms, 13_000);
+        // The new native format is active before its first drain.
+        let mut converted = leg.converter.process(&vec![0.75; 960]).unwrap();
+        converted.extend(leg.converter.finish().unwrap());
+        assert_eq!(converted.len(), 160);
+        wal.write_mic(&converted).unwrap();
+        wal.flush().unwrap();
+        let bytes = std::fs::read(wal.dir().join("mic.pcm")).unwrap();
+        assert_eq!(bytes.len(), (13 * 16_000 + 160) * 2);
+        assert!(bytes[..13 * 16_000 * 2].iter().all(|v| *v == 0));
+        drop(wal);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

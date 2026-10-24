@@ -267,3 +267,31 @@ fn a_session_with_no_mic_tap_records_no_mic_format_and_infers_nothing() {
     assert_eq!(s.mic_frames, 0);
     assert!(!s.manifest.track_formats(&dir).mic_inferred);
 }
+
+#[test]
+fn incremental_gaps_coalesce_without_merging_sources_or_disjoint_outages() {
+    let root = tmpdir("incremental-gaps");
+    let mut wal = SessionWal::create(&root, 16_000, 1).unwrap();
+    wal.mark_gap(0, 1000, "mic: initially-unavailable").unwrap();
+    wal.mark_gap(500, 800, "system: callback-fault").unwrap();
+    for second in 1..60 {
+        wal.mark_gap(
+            second * 1000,
+            (second + 1) * 1000,
+            "mic: initially-unavailable",
+        )
+        .unwrap();
+    }
+    wal.mark_gap(61_000, 62_000, "mic: initially-unavailable")
+        .unwrap();
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(wal.dir().join("manifest.json")).unwrap()).unwrap();
+    let gaps = saved["gaps"].as_array().unwrap();
+    assert_eq!(gaps.len(), 3);
+    assert_eq!(gaps[0]["start_ms"], 0);
+    assert_eq!(gaps[0]["end_ms"], 60_000);
+    assert_eq!(gaps[1]["reason"], "system: callback-fault");
+    assert_eq!(gaps[2]["start_ms"], 61_000);
+    drop(wal);
+    std::fs::remove_dir_all(root).unwrap();
+}

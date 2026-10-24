@@ -502,6 +502,8 @@ impl SessionWal {
 
     /// Record an interval that was not captured.
     ///
+    /// Adjacent gaps with the same reason extend the existing marker, including
+    /// when a different source's marker was added between updates.
     /// Gaps are written through to the manifest immediately: the whole point
     /// of a gap marker is to survive the crash that may follow the event that
     /// caused it.
@@ -511,11 +513,24 @@ impl SessionWal {
         end_ms: u64,
         reason: impl Into<String>,
     ) -> std::io::Result<()> {
-        self.manifest.gaps.push(Gap {
-            start_ms,
-            end_ms,
-            reason: reason.into(),
-        });
+        let reason = reason.into();
+        // Incremental missing-audio padding extends one continuous outage,
+        // rather than growing the manifest once per pump poll.
+        if let Some(previous) = self
+            .manifest
+            .gaps
+            .iter_mut()
+            .rev()
+            .find(|gap| gap.end_ms == start_ms && gap.reason == reason)
+        {
+            previous.end_ms = end_ms;
+        } else {
+            self.manifest.gaps.push(Gap {
+                start_ms,
+                end_ms,
+                reason,
+            });
+        }
         self.write_manifest()
     }
 
