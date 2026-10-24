@@ -1,45 +1,50 @@
-# Shared speech core migration (#119)
+# Shared speech contracts (#119)
 
-## Inventory and ownership
+FlyOnTheWall maintains the reusable audio, transcription and credential crates.
+This increment exposes opt-in `conformance` features for downstream tests and
+separates the native Whisper runtime from the transcription contracts.
 
-Baseline mains: FlyOnTheWall ca83343; Murmur 3edd3c4. Murmur's vendor snapshot was
-5cfe8562877823fa5403a3e9cd340996d575ce33. The offline-suite changes are reviewed
-against these baselines, not treated as a completed extraction.
-
-| Contract | Maintained owner | Consumer policy |
+| Contract | Maintained owner | Application responsibility |
 | --- | --- | --- |
-| Credential addresses, secret wrappers, redaction, OS key store | fotw-secrets | Murmur resolves explicit process/.env settings before keychain; FlyOnTheWall does not acquire that policy |
-| Audio format/callback/frame timestamps and platform taps | fotw-audio | Each app owns capture consent, device recovery, deadlines and generation fencing |
-| PCM resampling | fotw-pipeline today; Murmur source copy | Extraction still pending; keep rates, phase and channel behavior tested |
-| Transcript segments, typed errors, provider wire protocol | fotw-stt | Each app chooses retries, persistence, fallback and delivery |
-| Dictation final drain | Murmur streaming.rs | CloseStream followed by final Metadata; do not replace with meeting socket-close policy |
-| Meeting WAL/recovery | FlyOnTheWall daemon | Never move meeting data or consent policy into Murmur |
-| Local HTTP Whisper and insertion | Murmur | Local-only skips credential resolution; original-field insertion remains app-owned |
-| Local in-process Whisper and bounded queues | fotw-stt local adapter | Optional runtime and capability extraction still pending |
+| Credential addressing, secret wrappers, redaction, OS key store | `fotw-secrets` | Environment/config precedence and whether a provider needs credentials |
+| Audio format, callback and clock types; platform taps | `fotw-audio` | Consent, recovery policy, deadlines and generation fencing |
+| Transcript segments, provider normalization and local-stream lifecycle | `fotw-stt` | Retries, persistence, fallback and delivery |
+| PCM resampling | `fotw-pipeline` and Murmur's copy today | Further extraction remains part of #119 |
+| Meeting WAL and recovery | FlyOnTheWall daemon | Never moved into Murmur |
+| Dictation insertion and final drain | Murmur | Remain application-owned |
 
-## First migrated contract: credentials
+## Features and behavioral checks
 
-The secrets source was byte-for-byte identical between Murmur's vendor copy and
-FlyOnTheWall before migration. Murmur consumes an immutable Git revision and its
-Cargo.lock rather than a sibling path. No package or new repository is published.
-Original Apache-2.0 LICENSE/NOTICE remain in both repositories.
+`fotw-stt` consumers must explicitly enable `local-whisper` to compile the
+macOS whisper.cpp/Metal implementation. `fotwd` enables it, preserving the
+recording app's local transcription. Consumers using an external local helper
+can import the same types without building another model runtime.
 
-`fotw-secrets` exposes a `conformance` feature for consumer tests only. Both apps
-run `conformance::credentials()` against their actual resolved implementation.
-It uses synthetic strings and InMemoryKeyStore, never an OS keychain. An injected
-Authorization-header redaction regression made this suite fail; restoring the
-implementation makes it pass. Existing library tests still own the broader
-recovery/encryption contract. Consumer config/local/fallback tests establish that
-Murmur's provider policy is not changed by sharing the dependency.
+The `conformance` features are intended for consumer dev-dependencies. They
+exercise synthetic credential storage/redaction, audio framing and clock units,
+transcript timing and final/interim semantics, replay bounds, silence, local
+end-of-stream drain, queue overload and abandoned-worker output fencing.
+They use no real credentials, microphone, cloud service or model weights.
+The producer runs these contracts in its own tests as well.
 
-Upgrade by choosing a reviewed full commit SHA, updating both dependency and
-dev-dependency pins in Murmur, updating Cargo.lock, and running both consumers'
-required checks. Roll back those manifest/lockfile changes together. Never pin a
-moving branch or silently update to upstream main. An upstream compatibility job
-will test source changes against an immutable consumer revision before migration
-is considered complete.
+## Compatibility and upgrade policy
 
-Audio/STT vendor removal, provider capabilities, the shared audio/transcription
-conformance suite and complete upgrade compatibility gates remain outstanding.
-Shared Rust source does not share loaded model memory. Sharing model workers is
-separate #120 work, conditional on measured contention.
+`.github/workflows/murmur-compatibility.yml` checks immutable Murmur migration
+commit `882b106e3e6ebadc3f50f276b316a8c2a732593f` on macOS and Linux. It replaces
+that consumer's three Git dependencies with the exact producer crates under
+review and runs its workspace tests. Cargo may update source entries in this
+disposable checkout; ordinary consumer builds retain their committed lockfile.
+This is a pinned migration consumer, not a claim that Murmur main has already
+removed its vendor snapshot or that every later consumer revision is compatible.
+
+For a consumer upgrade, review a full producer commit SHA, update dependency
+and dev-dependency pins together with Cargo.lock, and run both repositories'
+required checks. Roll back those manifest/lockfile changes together. Never use
+a moving branch as the dependency version. Advance the compatibility consumer
+pin deliberately as migrations ship. Preserve both repositories' Apache-2.0
+LICENSE/NOTICE files.
+
+Shared DSP, complete capability negotiation, consumer vendor removal and newer
+consumer coverage remain tracked in #119. Shared source does not share loaded
+model memory: a shared inference worker remains separate #120 work, conditional
+on measured contention.
