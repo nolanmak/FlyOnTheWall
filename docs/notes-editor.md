@@ -32,11 +32,11 @@ save, network failure, and conflict resolution. Temporary encrypted databases
 cover two connections, export and search. An injected anchor-insert failure
 proves rollback of text, revision, anchors and the FTS index. UI tests use literal script-shaped
 text in the textarea. The store/web regression suites and workspace Clippy pass;
-52 Node UI tests pass. Full workspace regression is also run before pushing.
+63 Node UI tests pass. Full workspace regression is also run before pushing.
 
-Outstanding before completion: live-session identity handoff; encrypted draft
-recovery across browser/daemon restarts; editor block tracking and first-key
-anchors through edits/reordering; actual browser keyboard/narrow-layout checks.
+Outstanding before completion: live editor integration; encrypted draft
+recovery discovery across browser/daemon restarts; first-key anchors during
+recording; actual browser keyboard/narrow-layout checks.
 The saved-meeting editor remaps supplied anchors without creating historic
 timestamps. Live first-keystroke capture and browser acceptance remain #13 work.
 Neither #122 nor #13 is complete.
@@ -95,8 +95,8 @@ capture start, revision, Markdown and stable anchors in the SQLCipher library.
 The save API uses an immediate transaction and compare-and-swap revision. It
 shares the note size/identity validation, rejects changing the capture start or
 an existing anchor's original time, and rejects anchors beyond the supplied
-recording elapsed time. That elapsed time must come from the authoritative
-recorder when the HTTP adapter is added, not from a client assertion.
+recording elapsed time. The HTTP adapter obtains that bound from the recorder
+or the finalized session alias, never from a client assertion.
 
 A forward-only migration preserves existing note text, revisions and anchor IDs.
 Explicit library archives include the draft rows; their existing plaintext
@@ -105,9 +105,8 @@ Tests cover reopen recovery, ciphertext lacking a fixture plaintext marker,
 stale revisions, bounds, unchanged offsets, injected update failure, full archive
 roundtrips (including every column) and migration from a populated v4 library.
 
-This is not yet user-visible crash recovery: the live notes routes/editor,
-recovery discovery and daemon integration of the handoff contract below still
-need implementation. No new browser storage is used. The table is not a
+This is not yet user-visible crash recovery: live editor integration and
+recovery discovery still need implementation. No new browser storage is used. The table is not a
 replacement for that complete flow, and #122/#13 remain open.
 
 ## Atomic handoff and late saves (store contract)
@@ -129,7 +128,34 @@ injected alias-insert failure (including text, anchors and FTS). The aliases are
 included in full library archive roundtrips; older manifests remain readable.
 A populated schema-5 draft survives the forward migration.
 
-The daemon and HTTP/live editor still need to call this contract with the actual
-capture-stop clock. Sample counts and the later persistence timestamp are not
-substitutes, especially with gaps or a long transcription drain. This store work
-does not yet establish end-to-end live notes or crash recovery UX.
+The daemon now finalizes capture through one transaction for the meeting,
+transcript, frozen duration and draft handoff. A retry with the same session and
+clock returns the existing meeting without overwriting later edits. Failures
+roll back newly created rows and leave the draft intact. The start comes from
+the WAL and the end is frozen before transcription drains. Legacy imports
+without a capture clock retain their independent-import behavior.
+
+
+## Live-note HTTP contract
+
+GET/POST `/api/sessions/{id}/notes` use the same host/origin/bearer guard and
+request document as saved notes. Responses contain `session_id`, `meeting_id`
+(null until finalized), `started_at_ms`, `elapsed_ms` and `note`. The recorder
+provides the clock only when its current session ID matches the route; a
+persisted alias takes precedence after finalization, even if another recording
+has started. Clock fields in a POST body are rejected.
+
+A durable orphan draft can be read by ID with `elapsed_ms: null`. Writing it
+without an active or finalized clock returns 409 with
+`recording_clock_unavailable`; clients must retain their draft and retry after
+finalization instead of treating this as a revision conflict. An unknown session
+returns the standard bare 404, including during the finalization gap if no draft
+has ever been saved. Once an alias exists, the first save is accepted even if no
+live draft existed. Revisions, original anchor offsets and the frozen elapsed
+bound are enforced by the store on every late write.
+
+The synthetic HTTP test first failed on the missing authenticated route, then
+passed authentication, hostile-origin, forged-clock, wrong-session, bounds,
+stale-write, orphan-read, finalization-gap and first/late-save checks against a
+temporary encrypted library. The live editor and recovery discovery are still
+outstanding; these endpoints alone do not complete #122 or #13.

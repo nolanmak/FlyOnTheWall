@@ -50,48 +50,100 @@ impl StoreSource {
 
 impl MeetingSource for StoreSource {
     fn note(&self, id: &str) -> Result<crate::notes::NoteDocument, crate::notes::NoteError> {
-        let doc = self.lock().note_document(id).map_err(note_error)?;
-        Ok(crate::notes::NoteDocument {
-            revision: doc.revision,
-            body_md: doc.body_md,
-            anchors: doc
-                .anchors
-                .into_iter()
-                .map(|a| crate::notes::NoteAnchor {
-                    id: Some(a.id),
-                    block_idx: a.block_idx,
-                    block_text: a.block_text,
-                    typed_at_ms: a.typed_at_ms,
-                })
-                .collect(),
-        })
+        self.lock()
+            .note_document(id)
+            .map(wire_note)
+            .map_err(note_error)
     }
 
     fn save_note(
         &self,
         id: &str,
-        mut doc: crate::notes::NoteDocument,
+        doc: crate::notes::NoteDocument,
     ) -> Result<crate::notes::NoteDocument, crate::notes::NoteError> {
-        let anchors: Vec<_> = doc
-            .anchors
-            .iter()
-            .map(|a| {
-                let mut anchor =
-                    fotw_store::NoteAnchor::new(a.block_idx, &a.block_text, a.typed_at_ms);
-                if let Some(id) = &a.id {
-                    anchor.id = id.clone();
-                }
-                anchor
-            })
-            .collect();
-        for (a, stored) in doc.anchors.iter_mut().zip(&anchors) {
-            a.id = Some(stored.id.clone());
-        }
+        let mut doc = stored_note(doc);
         doc.revision = self
             .lock()
-            .save_note_document(id, doc.revision, &doc.body_md, &anchors)
+            .save_note_document(id, doc.revision, &doc.body_md, &doc.anchors)
             .map_err(note_error)?;
-        Ok(doc)
+        Ok(wire_note(doc))
+    }
+
+    fn session_note(
+        &self,
+        id: &str,
+        clock: Option<crate::notes::SessionClock>,
+    ) -> Result<crate::notes::SessionNote, crate::notes::NoteError> {
+        let mut db = self.lock();
+        let draft = db.session_note(id).map_err(note_error)?;
+        let frozen = db.session_note_clock(id).map_err(note_error)?;
+        let clock = frozen
+            .map(|(started_at_ms, elapsed_ms)| crate::notes::SessionClock {
+                started_at_ms,
+                elapsed_ms,
+            })
+            .or(clock);
+        let (started, note) = match draft {
+            Some(d) => (d.started_at_ms, wire_note(d.note)),
+            None => (
+                clock
+                    .ok_or(crate::notes::NoteError::NotFound)?
+                    .started_at_ms,
+                crate::notes::NoteDocument {
+                    revision: 0,
+                    body_md: String::new(),
+                    anchors: vec![],
+                },
+            ),
+        };
+        if clock.is_some_and(|c| c.started_at_ms != started) {
+            return Err(crate::notes::NoteError::Invalid);
+        }
+        Ok(crate::notes::SessionNote {
+            session_id: id.into(),
+            meeting_id: db.session_note_meeting(id).map_err(note_error)?,
+            started_at_ms: started,
+            elapsed_ms: clock.map(|c| c.elapsed_ms),
+            note,
+        })
+    }
+
+    fn save_session_note(
+        &self,
+        id: &str,
+        doc: crate::notes::NoteDocument,
+        clock: Option<crate::notes::SessionClock>,
+    ) -> Result<crate::notes::SessionNote, crate::notes::NoteError> {
+        let mut db = self.lock();
+        let frozen = db.session_note_clock(id).map_err(note_error)?;
+        let clock = frozen
+            .map(|(started_at_ms, elapsed_ms)| crate::notes::SessionClock {
+                started_at_ms,
+                elapsed_ms,
+            })
+            .or(clock);
+        let Some(clock) = clock else {
+            return Err(if db.session_note(id).map_err(note_error)?.is_some() {
+                crate::notes::NoteError::Unavailable
+            } else {
+                crate::notes::NoteError::NotFound
+            });
+        };
+        let mut draft = fotw_store::SessionNoteDocument {
+            session_id: id.into(),
+            started_at_ms: clock.started_at_ms,
+            note: stored_note(doc),
+        };
+        draft.note.revision = db
+            .save_session_note(&draft, clock.elapsed_ms)
+            .map_err(note_error)?;
+        Ok(crate::notes::SessionNote {
+            session_id: id.into(),
+            meeting_id: db.session_note_meeting(id).map_err(note_error)?,
+            started_at_ms: clock.started_at_ms,
+            elapsed_ms: Some(clock.elapsed_ms),
+            note: wire_note(draft.note),
+        })
     }
 
     fn list(&self, limit: u32, offset: u32) -> Result<Vec<MeetingRow>, SourceError> {
@@ -208,5 +260,41 @@ fn note_error(error: StoreError) -> crate::notes::NoteError {
         StoreError::NoteConflict => NoteError::Conflict,
         StoreError::InvalidArgument(_) => NoteError::Invalid,
         _ => NoteError::Backend,
+    }
+}
+
+fn wire_note(doc: fotw_store::NoteDocument) -> crate::notes::NoteDocument {
+    crate::notes::NoteDocument {
+        revision: doc.revision,
+        body_md: doc.body_md,
+        anchors: doc
+            .anchors
+            .into_iter()
+            .map(|a| crate::notes::NoteAnchor {
+                id: Some(a.id),
+                block_idx: a.block_idx,
+                block_text: a.block_text,
+                typed_at_ms: a.typed_at_ms,
+            })
+            .collect(),
+    }
+}
+
+fn stored_note(doc: crate::notes::NoteDocument) -> fotw_store::NoteDocument {
+    fotw_store::NoteDocument {
+        revision: doc.revision,
+        body_md: doc.body_md,
+        anchors: doc
+            .anchors
+            .into_iter()
+            .map(|a| {
+                let mut anchor =
+                    fotw_store::NoteAnchor::new(a.block_idx, a.block_text, a.typed_at_ms);
+                if let Some(id) = a.id {
+                    anchor.id = id;
+                }
+                anchor
+            })
+            .collect(),
     }
 }
