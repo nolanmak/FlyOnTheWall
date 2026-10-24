@@ -111,6 +111,84 @@ fn write_script(stream: &DeepgramStream, script: &TranscriptScript) {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn confirmed_finals_do_not_commit_a_partial_when_the_client_stops() {
+    let script = TranscriptScript::from_sentences(&["alpha beta gamma"], 200, 100);
+    let mock = MockDeepgram::start(script).await;
+    let (stream, mut events) = open(config(&mock).with_confirmed_finals());
+    stream.write(&stamped_pcm(0, 550)); // first two words completed, utterance still open.
+    let partial = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let event = events.recv().await.expect("stream remains open");
+            if let StreamEvent::Partial(segment) = event {
+                break segment;
+            }
+        }
+    })
+    .await
+    .expect("provider partial arrived");
+    assert_eq!(partial.text, "alpha beta");
+    stream.close().await.unwrap();
+    let remaining = drain(&mut events).await;
+    assert!(
+        finals(&remaining).is_empty(),
+        "interrupted text must stay pending for durable replay: {:?}",
+        finals(&remaining)
+    );
+}
+
+#[tokio::test]
+async fn confirmed_finals_replay_a_partial_without_splitting_or_text_trimming_repeated_words() {
+    let script = TranscriptScript::from_sentences(&["yes yes please", "yes yes please"], 200, 100);
+    // First utterance interrupted, then second utterance interrupted after an
+    // identical utterance has already been committed. Text equality is not
+    // sufficient to decide which source interval has been transcribed.
+    for disconnect_frame in [7, 14] {
+        let mock = MockDeepgram::builder()
+            .connection_modes(vec![MockMode::DisconnectAfter(disconnect_frame)])
+            .script(script.clone())
+            .start()
+            .await;
+        let (stream, mut events) = open(
+            config(&mock)
+                .with_confirmed_finals()
+                .with_session_offset_ms(137),
+        );
+        write_script(&stream, &script);
+        let mut collected = Vec::new();
+        tokio::time::timeout(TIMEOUT, async {
+            while !finals(&collected)
+                .iter()
+                .any(|s| s.end_ms >= 137 + script.total_ms())
+            {
+                collected.push(
+                    events
+                        .recv()
+                        .await
+                        .expect("stream remains open until script completes"),
+                );
+            }
+        })
+        .await
+        .expect("reconnected provider completed the script");
+        stream.close().await.unwrap();
+        collected.extend(drain(&mut events).await);
+        assert!(mock.connection_count() >= 2);
+        let segments = finals(&collected);
+        assert_eq!(
+            segments.len(),
+            2,
+            "only confirmed complete utterances are committed: {segments:?}"
+        );
+        for (segment, utterance) in segments.iter().zip(&script.utterances) {
+            assert_eq!(segment.text, utterance.text());
+            assert_eq!(segment.start_ms, 137 + utterance.start_ms());
+            assert_eq!(segment.end_ms, 137 + utterance.end_ms());
+            assert_eq!(segment.words.len(), 3);
+        }
+    }
+}
+
+#[tokio::test]
 async fn transcribes_a_stream_and_reports_its_lifecycle() {
     let script = short_script();
     let mock = MockDeepgram::start(script.clone()).await;
