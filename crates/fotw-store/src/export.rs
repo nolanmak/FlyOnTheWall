@@ -225,6 +225,17 @@ row_type!(
 );
 
 row_type!(
+    /// Durable session-to-meeting note alias and frozen recording clock.
+    SessionNoteLinkRow, "session_note_links",
+    pk = ["session_id"], exclusive = ["meeting_id"], {
+        session_id: String,
+        meeting_id: String,
+        started_at_ms: i64,
+        elapsed_ms: i64,
+    }
+);
+
+row_type!(
     /// A row of `folders`.
     FolderRow, "folders",
     pk = ["id"], exclusive = [], {
@@ -735,6 +746,7 @@ impl_table_row!(
     AppMetaRow,
     SettingRow,
     SessionNoteRow,
+    SessionNoteLinkRow,
     FolderRow,
     TemplateRow,
     PersonRow,

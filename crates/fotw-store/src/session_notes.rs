@@ -14,9 +14,75 @@ pub struct SessionNoteDocument {
 }
 
 impl Db {
+    /// Atomically attach a session's notes to its saved meeting, preserving revisions.
+    pub fn promote_session_note(
+        &mut self,
+        session: &str,
+        meeting: &str,
+        started_at_ms: i64,
+        elapsed_ms: i64,
+    ) -> Result<()> {
+        validate_session(session)?;
+        if started_at_ms < 0 || elapsed_ms < 0 {
+            return Err(invalid("invalid recording clock"));
+        }
+        let tx = self
+            .conn_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(link) = read_link(&tx, session)? {
+            if link.meeting != meeting
+                || link.started != started_at_ms
+                || link.elapsed != elapsed_ms
+            {
+                return Err(invalid(
+                    "session already attached to a different meeting or clock",
+                ));
+            }
+            tx.commit()?;
+            return Ok(());
+        }
+        let target = crate::notes::read_note(&tx, meeting)?;
+        if target.revision != 0 {
+            return Err(StoreError::NoteConflict);
+        }
+        if let Some(draft) = read(&tx, session)? {
+            if draft.started_at_ms != started_at_ms
+                || draft
+                    .note
+                    .anchors
+                    .iter()
+                    .any(|a| a.typed_at_ms > elapsed_ms)
+            {
+                return Err(invalid("draft does not match the recording clock"));
+            }
+            crate::notes::write_note(
+                &tx,
+                meeting,
+                0,
+                draft.note.revision,
+                &draft.note.body_md,
+                &draft.note.anchors,
+            )?;
+        }
+        tx.execute("INSERT INTO session_note_links(session_id,meeting_id,started_at_ms,elapsed_ms) VALUES(?1,?2,?3,?4)",
+            params![session,meeting,started_at_ms,elapsed_ms])?;
+        tx.execute("DELETE FROM session_notes WHERE session_id=?1", [session])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The saved meeting attached to a session, including sessions without notes.
+    pub fn session_note_meeting(&self, session: &str) -> Result<Option<String>> {
+        validate_session(session)?;
+        Ok(read_link(self.conn(), session)?.map(|link| link.meeting))
+    }
+
     /// Load a durable draft, or None when this session has never saved notes.
-    pub fn session_note(&self, session: &str) -> Result<Option<SessionNoteDocument>> {
-        read(self.conn(), session)
+    pub fn session_note(&mut self, session: &str) -> Result<Option<SessionNoteDocument>> {
+        let tx = self.conn_mut().transaction()?;
+        let draft = read(&tx, session)?;
+        tx.commit()?;
+        Ok(draft)
     }
 
     /// Save against the observed revision, bounded by the authoritative recording clock.
@@ -50,6 +116,32 @@ impl Db {
         let tx = self
             .conn_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(link) = read_link(&tx, &draft.session_id)? {
+            if link.started != draft.started_at_ms
+                || draft
+                    .note
+                    .anchors
+                    .iter()
+                    .any(|a| a.typed_at_ms > link.elapsed)
+            {
+                return Err(invalid("draft exceeds the original recording bounds"));
+            }
+            let next = draft
+                .note
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| invalid("note revision exhausted"))?;
+            crate::notes::write_note(
+                &tx,
+                &link.meeting,
+                draft.note.revision,
+                next,
+                &draft.note.body_md,
+                &draft.note.anchors,
+            )?;
+            tx.commit()?;
+            return Ok(next);
+        }
         let old = read(&tx, &draft.session_id)?;
         let revision = old.as_ref().map_or(0, |d| d.note.revision);
         if draft.note.revision != revision {
@@ -98,6 +190,13 @@ fn invalid(message: &str) -> StoreError {
 }
 fn read(conn: &rusqlite::Connection, session: &str) -> Result<Option<SessionNoteDocument>> {
     validate_session(session)?;
+    if let Some(link) = read_link(conn, session)? {
+        return Ok(Some(SessionNoteDocument {
+            session_id: session.into(),
+            started_at_ms: link.started,
+            note: crate::notes::read_note(conn, &link.meeting)?,
+        }));
+    }
     let row: Option<(i64,i64,String,String)> = conn.query_row(
         "SELECT started_at_ms,revision,body_md,anchors_json FROM session_notes WHERE session_id=?1", [session],
         |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
@@ -116,4 +215,14 @@ fn read(conn: &rusqlite::Connection, session: &str) -> Result<Option<SessionNote
         })
     })
     .transpose()
+}
+
+struct Link {
+    meeting: String,
+    started: i64,
+    elapsed: i64,
+}
+fn read_link(conn: &rusqlite::Connection, session: &str) -> Result<Option<Link>> {
+    Ok(conn.query_row("SELECT meeting_id,started_at_ms,elapsed_ms FROM session_note_links WHERE session_id=?1", [session],
+        |r| Ok(Link{meeting:r.get(0)?,started:r.get(1)?,elapsed:r.get(2)?})).optional()?)
 }

@@ -24,34 +24,7 @@ impl Db {
     /// Missing meeting or database failure.
     pub fn note_document(&mut self, meeting_id: &str) -> Result<NoteDocument> {
         let tx = self.conn_mut().transaction()?;
-        meeting_origin(&tx, meeting_id)?;
-        let row: Option<(String, String, i64)> = tx
-            .query_row(
-                "SELECT id, body_md, lamport FROM notes WHERE meeting_id=?1",
-                [meeting_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?;
-        let mut result = NoteDocument {
-            revision: 0,
-            body_md: String::new(),
-            anchors: vec![],
-        };
-        if let Some((id, body, lamport)) = row {
-            result.revision = revision(lamport)?;
-            result.body_md = body;
-            let mut stmt = tx.prepare("SELECT block_idx,block_text,typed_at_ms,id FROM note_anchors WHERE note_id=?1 ORDER BY block_idx")?;
-            result.anchors = stmt
-                .query_map([id], |r| {
-                    Ok(NoteAnchor {
-                        block_idx: r.get(0)?,
-                        block_text: r.get(1)?,
-                        typed_at_ms: r.get(2)?,
-                        id: r.get(3)?,
-                    })
-                })?
-                .collect::<std::result::Result<_, _>>()?;
-        }
+        let result = read_note(&tx, meeting_id)?;
         tx.commit()?;
         Ok(result)
     }
@@ -73,45 +46,95 @@ impl Db {
         let tx = self
             .conn_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let origin = meeting_origin(&tx, meeting_id)?;
-        let row: Option<(String, i64)> = tx
-            .query_row(
-                "SELECT id,lamport FROM notes WHERE meeting_id=?1",
-                [meeting_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let current = row
-            .as_ref()
-            .map(|(_, n)| revision(*n))
-            .transpose()?
-            .unwrap_or(0);
-        if expected != current {
-            return Err(StoreError::NoteConflict);
-        }
-        validate_existing_anchors(&tx, meeting_id, anchors)?;
-        let next = current
+        let next = expected
             .checked_add(1)
             .ok_or_else(|| StoreError::InvalidArgument("note revision exhausted".into()))?;
-        let id = row
-            .as_ref()
-            .map(|(id, _)| id.clone())
-            .unwrap_or_else(new_id);
-        let now = now_ms();
-        tx.execute(
+        write_note(&tx, meeting_id, expected, next, body, anchors)?;
+        tx.commit()?;
+        Ok(next)
+    }
+}
+
+pub(crate) fn read_note(tx: &rusqlite::Connection, meeting_id: &str) -> Result<NoteDocument> {
+    meeting_origin(tx, meeting_id)?;
+    let row: Option<(String, String, i64)> = tx
+        .query_row(
+            "SELECT id, body_md, lamport FROM notes WHERE meeting_id=?1",
+            [meeting_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let mut result = NoteDocument {
+        revision: 0,
+        body_md: String::new(),
+        anchors: vec![],
+    };
+    if let Some((id, body, lamport)) = row {
+        result.revision = revision(lamport)?;
+        result.body_md = body;
+        let mut stmt = tx.prepare("SELECT block_idx,block_text,typed_at_ms,id FROM note_anchors WHERE note_id=?1 ORDER BY block_idx")?;
+        result.anchors = stmt
+            .query_map([id], |r| {
+                Ok(NoteAnchor {
+                    block_idx: r.get(0)?,
+                    block_text: r.get(1)?,
+                    typed_at_ms: r.get(2)?,
+                    id: r.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+    }
+    Ok(result)
+}
+
+pub(crate) fn write_note(
+    tx: &rusqlite::Transaction<'_>,
+    meeting_id: &str,
+    expected: i64,
+    next: i64,
+    body: &str,
+    anchors: &[NoteAnchor],
+) -> Result<()> {
+    validate_note(expected, body, anchors)?;
+    if next <= expected {
+        return Err(StoreError::InvalidArgument(
+            "invalid next note revision".into(),
+        ));
+    }
+    let origin = meeting_origin(tx, meeting_id)?;
+    let row: Option<(String, i64)> = tx
+        .query_row(
+            "SELECT id,lamport FROM notes WHERE meeting_id=?1",
+            [meeting_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let current = row
+        .as_ref()
+        .map(|(_, n)| revision(*n))
+        .transpose()?
+        .unwrap_or(0);
+    if expected != current {
+        return Err(StoreError::NoteConflict);
+    }
+    validate_existing_anchors(tx, meeting_id, anchors)?;
+    let id = row
+        .as_ref()
+        .map(|(id, _)| id.clone())
+        .unwrap_or_else(new_id);
+    let now = now_ms();
+    tx.execute(
             "INSERT INTO notes(id,meeting_id,body_md,created_at,updated_at,lamport,origin_device_id)
              VALUES(?1,?2,?3,?4,?4,?5,?6)
              ON CONFLICT(meeting_id) DO UPDATE SET body_md=excluded.body_md,updated_at=excluded.updated_at,lamport=excluded.lamport",
             params![id,meeting_id,body,now,next-1,origin],
         )?;
-        tx.execute("DELETE FROM note_anchors WHERE note_id=?1", [&id])?;
-        for a in anchors {
-            tx.execute("INSERT INTO note_anchors(id,note_id,meeting_id,block_idx,block_text,typed_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+    tx.execute("DELETE FROM note_anchors WHERE note_id=?1", [&id])?;
+    for a in anchors {
+        tx.execute("INSERT INTO note_anchors(id,note_id,meeting_id,block_idx,block_text,typed_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
                 params![a.id,id,meeting_id,a.block_idx,a.block_text,a.typed_at_ms])?;
-        }
-        tx.commit()?;
-        Ok(next)
     }
+    Ok(())
 }
 
 pub(crate) fn validate_note(expected: i64, body: &str, anchors: &[NoteAnchor]) -> Result<()> {

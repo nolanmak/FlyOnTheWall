@@ -55,6 +55,7 @@ const ALL_TABLES: &[&str] = &[
     "people",
     "recordings",
     "segments",
+    "session_note_links",
     "session_notes",
     "settings",
     "summaries",
@@ -351,6 +352,9 @@ VALUES ('mtg-3', 'Historic', -86400000, 4102444800000, 4102531200000, 'Pacific/K
 -- drops the row and the provenance with it.
 INSERT INTO transcripts (id, meeting_id, provider, model, is_primary, language, audio_ms, cost_micros, raw_response_rel_path, created_at, updated_at, lamport, origin_device_id)
 VALUES ('tr-3', 'mtg-3', 'deepgram', 'nova-3', 1, NULL, 0, 0, '', 120, 121, 0, 'dev-2');
+
+INSERT INTO session_note_links(session_id,meeting_id,started_at_ms,elapsed_ms)
+VALUES ('saved-fixture','mtg-1',1000,500);
 
 INSERT INTO session_notes(session_id,started_at_ms,revision,body_md,anchors_json,updated_at_ms)
 VALUES ('live-fixture',1000,2,'draft café','[{"id":"draft-anchor","block_idx":0,"block_text":"draft café","typed_at_ms":250}]',1500);
@@ -1086,6 +1090,7 @@ fn every_column_of_every_table_appears_in_the_archive() {
         ("app_meta", &manifest, "app_meta"),
         ("settings", &manifest, "settings"),
         ("session_notes", &manifest, "session_notes"),
+        ("session_note_links", &manifest, "session_note_links"),
         ("folders", &manifest, "folders"),
         ("templates", &manifest, "templates"),
         ("people", &manifest, "people"),
@@ -1239,6 +1244,10 @@ fn archives_written_before_session_notes_remain_importable() {
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     manifest["schema_version"] = 4.into();
     manifest.as_object_mut().unwrap().remove("session_notes");
+    manifest
+        .as_object_mut()
+        .unwrap()
+        .remove("session_note_links");
     std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
     let mut dest = open_at(&f.fresh.join("db.sqlite3"));
     assert_eq!(dest.import_library(&f.archive).unwrap().meetings, 3);
