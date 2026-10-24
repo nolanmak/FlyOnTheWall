@@ -413,7 +413,7 @@ impl DaemonRecorder {
     }
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -656,8 +656,14 @@ impl RecorderControl for DaemonRecorder {
         let ended_at_ms = *live.stopped_at_ms.get_or_insert(now_ms());
         // Trip and return. The task clears the slot once the meeting is on
         // disk; until then status reads `finishing`.
+        live.ready.signal_capture_stopped(ended_at_ms);
         live.stop.stop();
-        Ok(RecordingStatus::finishing(live.started_at_ms, ended_at_ms)
+        let started_at_ms = live
+            .ready
+            .capture_started_at_ms()
+            .unwrap_or(live.started_at_ms);
+        let ended_at_ms = live.ready.capture_ended_at_ms().unwrap_or(ended_at_ms);
+        Ok(RecordingStatus::finishing(started_at_ms, ended_at_ms)
             .with_transcription_error(live.errors.latest())
             .with_session_id(live.ready.session_id()))
     }
@@ -665,12 +671,16 @@ impl RecorderControl for DaemonRecorder {
     fn status(&self) -> RecordingStatus {
         let slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
         slot.as_ref().map_or_else(RecordingStatus::idle, |live| {
-            match live.stopped_at_ms {
+            let started_at_ms = live
+                .ready
+                .capture_started_at_ms()
+                .unwrap_or(live.started_at_ms);
+            match live.ready.capture_ended_at_ms().or(live.stopped_at_ms) {
                 // Frozen: the tap is shut, so the number cannot grow.
-                Some(ended_at_ms) => RecordingStatus::finishing(live.started_at_ms, ended_at_ms),
+                Some(ended_at_ms) => RecordingStatus::finishing(started_at_ms, ended_at_ms),
                 None => RecordingStatus::recording(
-                    live.started_at_ms,
-                    now_ms().saturating_sub(live.started_at_ms),
+                    started_at_ms,
+                    now_ms().saturating_sub(started_at_ms),
                 ),
             }
             // Kept for finishing too: a tab loaded mid-finalize must still see
@@ -680,7 +690,7 @@ impl RecorderControl for DaemonRecorder {
             .with_transcription_error(live.errors.latest())
             .with_session_id(live.ready.session_id())
             .with_auto_stop_at_ms(
-                live.started_at_ms
+                started_at_ms
                     .saturating_add(u64::try_from(self.ceiling.as_millis()).unwrap_or(u64::MAX)),
             )
         })

@@ -1279,6 +1279,8 @@ pub struct ReadySignal(Arc<ReadyInner>);
 #[derive(Debug, Default)]
 struct ReadyInner {
     session_id: std::sync::OnceLock<String>,
+    capture_started_at_ms: std::sync::OnceLock<u64>,
+    capture_ended_at_ms: std::sync::OnceLock<u64>,
     ready: std::sync::Mutex<bool>,
     woke: std::sync::Condvar,
 }
@@ -1294,6 +1296,29 @@ impl ReadySignal {
     #[must_use]
     pub fn session_id(&self) -> Option<String> {
         self.0.session_id.get().cloned()
+    }
+
+    /// Original capture clock, available once the WAL exists.
+    #[must_use]
+    pub fn capture_started_at_ms(&self) -> Option<u64> {
+        self.0.capture_started_at_ms.get().copied()
+    }
+    /// Frozen capture-stop clock, independent of transcription drain.
+    #[must_use]
+    pub fn capture_ended_at_ms(&self) -> Option<u64> {
+        self.0
+            .capture_ended_at_ms
+            .get()
+            .map(|end| (*end).max(self.capture_started_at_ms().unwrap_or(0)))
+    }
+    /// Publish capture identity and its authoritative start before readiness.
+    pub fn signal_capture(&self, session_id: String, started_at_ms: u64) {
+        let _ = self.0.capture_started_at_ms.set(started_at_ms);
+        self.signal_session(session_id);
+    }
+    /// Freeze the first capture-stop request.
+    pub fn signal_capture_stopped(&self, ended_at_ms: u64) {
+        let _ = self.0.capture_ended_at_ms.set(ended_at_ms);
     }
 
     /// Publish identity before releasing callers waiting for live capture.
@@ -1671,11 +1696,12 @@ pub async fn run_with_control(
     // exists and the pump is draining. Announced here rather than at the top
     // of the function because a tap that blocks in `start` never reaches this
     // line — which is the whole point.
-    control.ready.signal_session(
+    control.ready.signal_capture(
         dir.file_name()
             .expect("session directory")
             .to_string_lossy()
             .into_owned(),
+        started_at_ms,
     );
 
     // Whichever comes first. `select!` drops the loser, and both branches are
@@ -1687,6 +1713,9 @@ pub async fn run_with_control(
         }
         () = stop_signal.wait() => {}
     }
+    control
+        .ready
+        .signal_capture_stopped(crate::recording::now_ms());
 
     // Stop capture first, then let the pump drain what is already buffered.
     //
@@ -2053,11 +2082,12 @@ pub async fn run_supervised(
 
     // Capture is live: both supervisors returned from `start`, the WAL exists
     // and the pump is draining and polling the watchdogs.
-    control.ready.signal_session(
+    control.ready.signal_capture(
         dir.file_name()
             .expect("session directory")
             .to_string_lossy()
             .into_owned(),
+        started_at_ms,
     );
 
     tokio::select! {
@@ -2066,6 +2096,9 @@ pub async fn run_supervised(
         }
         () = stop_signal.wait() => {}
     }
+    control
+        .ready
+        .signal_capture_stopped(crate::recording::now_ms());
 
     // Under supervision the pump owns the taps and closes them itself the
     // instant it sees this latch — detached, so a wedged HAL teardown cannot
