@@ -125,3 +125,24 @@ fn a_dropped_consumer_is_visible_to_the_producer() {
          silently writing into a ring nobody drains"
     );
 }
+
+#[test]
+fn complete_callbacks_preserve_frames_through_wraparound_without_allocating() {
+    let (mut producer, mut consumer) = AudioRing::with_capacity_frames(5);
+    let before = allocation_violations();
+    let mut output = [0.0; 8];
+    {
+        let _guard = RtGuard::enter();
+        assert_eq!(producer.push_complete_block(&[1.0, -1.0, 2.0, -2.0]), 4);
+        assert_eq!(producer.push_complete_block(&[3.0, -3.0]), 0);
+        assert_eq!(consumer.pop_into(&mut output[..2]), 2);
+        assert_eq!(producer.push_complete_block(&[4.0, -4.0]), 2);
+        assert_eq!(producer.push_complete_block(&[0.0; 6]), 0);
+        assert_eq!(producer.push_complete_block(&[]), 0);
+    }
+    assert_eq!(allocation_violations(), before);
+    assert_eq!(consumer.pop_into(&mut output), 4);
+    assert_eq!(&output[..4], &[2.0, -2.0, 4.0, -4.0]);
+    assert_eq!(consumer.dropped_frames(), 8);
+    assert_eq!(producer.dropped_frames(), 8);
+}

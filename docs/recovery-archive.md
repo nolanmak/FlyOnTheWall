@@ -32,3 +32,18 @@ physical-device evidence. Live sample-rate notifications remain open.
 Native device/format notifications, callback quiescence and physical persisted-
 audio acceptance remain open. This does not archive native-rate originals
 separately from the fixed-format tracks.
+
+Capture sinks now enqueue a complete callback or drop/count that complete
+callback. A short sample-level ring write could split an interleaved frame and
+shift the channels of later PCM. The old sample-level ring API remains available
+for non-capture users; daemon (both supervised and prebuilt) and CLI capture
+sinks use the complete-block operation. The single-producer capacity check and
+copy allocate nothing, acquire no locks and never retry on the audio thread.
+
+A real sink fixture first exposed five queued samples instead of four after a
+stereo overflow. It now verifies intact frames, whole-block drop counts and
+correct channel order after draining and accepting another callback. Ring tests
+cover wraparound, oversized/empty callbacks and allocation freedom. This preserves
+sample shape; it does not recover dropped audio or add precise-position overrun
+gap markers. Those timeline/backfill requirements remain open.
+

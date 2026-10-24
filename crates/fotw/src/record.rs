@@ -117,11 +117,10 @@ impl FrameSink for RingSink {
             pcm.len() as u64 / u64::from(self.channels),
             flags.contains(FrameFlags::SILENT),
         );
-        // Deliberately ignoring the return value. A short write means the
-        // pump is behind; retrying here would be blocking by another name,
-        // and the shortfall is already counted for the pump to surface.
+        // Drop/count a whole callback on overrun; partial samples could split
+        // an interleaved frame. Never retry on the audio thread.
         if let Some(producer) = self.producer.as_mut() {
-            let _ = producer.push_block(pcm);
+            let _ = producer.push_complete_block(pcm);
         }
     }
 
