@@ -13,6 +13,7 @@
       <h1>FlyOnTheWall</h1>
       <input
         id="search"
+        aria-label="Search meetings, notes, and transcripts"
         type="search"
         placeholder="Search meetings, notes, transcripts"
         autocomplete="off"
@@ -23,15 +24,17 @@
         everyone consented
       </label>
       <button id="record" type="button" hidden>Start</button>
+      <button id="note-drafts" type="button" hidden>Unfinished notes</button>
       <button id="return-live" type="button" hidden>Return to recording</button>
       <span id="recording" class="recording" hidden>recording</span>
       <span id="elapsed" class="elapsed" hidden>0:00</span>
       <span id="live" class="live" hidden>live</span>
     </header>
     <p id="recording-limit" class="recording-limit" hidden></p>
+    <section id="capture-health" class="capture-health" aria-label="Audio capture health" hidden></section>
     <main>
       <nav id="list" aria-label="Meetings"></nav>
-      <section id="detail" aria-live="polite"></section>
+      <section id="detail" aria-label="Meeting details" aria-live="polite"></section>
     </main>
     <details id="gh-settings" class="gh-settings" hidden>
       <summary>GitHub export</summary>
@@ -143,6 +146,7 @@
     <p id="status" role="status"></p>
     <script src="/assets/github.js"></script>
     <script src="/assets/documents.js"></script>
+    <script src="/assets/notes.js"></script>
     <script src="/assets/app.js"></script>
   </body>
 </html>

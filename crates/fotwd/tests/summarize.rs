@@ -73,6 +73,7 @@ fn seeded_meeting(db: &mut Db, dir: &std::path::Path) -> String {
     let outcome = SessionOutcome {
         dir: dir.to_path_buf(),
         started_at_ms: 0,
+        capture_ended_at_ms: None,
         system_samples: 1_000,
         mic_samples: 0,
         system_buffers: LegBuffers {
@@ -359,4 +360,62 @@ async fn a_weakly_grounded_summary_says_so_above_the_summary_itself() {
         "the grounding caveat sits below the summary it qualifies: {}",
         stored.body_md
     );
+}
+
+#[tokio::test]
+async fn anchored_notes_receive_only_their_own_meetings_capture_window() {
+    let dir = tmpdir("note-context");
+    let mut db = db_at(&dir);
+    let base = SessionOutcome {
+        dir: dir.clone(),
+        started_at_ms: 1000,
+        segments: vec![
+            seg(0, "early excluded", 1_000),
+            seg(1, "pricing window fixture", 180_000),
+            seg(2, "late excluded", 400_000),
+        ],
+        ..SessionOutcome::default()
+    };
+    let id = persist::persist_session(&mut db, &base, "Context fixture").unwrap();
+    db.meetings().finish(&id, 501_000).unwrap();
+    db.save_note_document(
+        &id,
+        0,
+        "pricing??",
+        &[fotw_store::NoteAnchor::new(0, "pricing??", 180_000)],
+    )
+    .unwrap();
+    let other = SessionOutcome {
+        dir: dir.clone(),
+        segments: vec![seg(3, "OTHER MEETING MUST NOT LEAK", 180_000)],
+        ..SessionOutcome::default()
+    };
+    persist::persist_session(&mut db, &other, "Other fixture").unwrap();
+    let mock = Arc::new(MockTransport::new());
+    let _ = summarize::summarize_meeting_with(
+        &mut db,
+        &anthropic(),
+        &id,
+        &general(),
+        Arc::clone(&mock),
+    )
+    .await;
+    let request = mock.request(0).body;
+    let text = request["messages"][0]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|b| b["text"].as_str())
+        .find(|s| s.starts_with("The user's raw notes:"))
+        .unwrap();
+    let context: serde_json::Value =
+        serde_json::from_str(text.strip_prefix("The user's raw notes:\n\n").unwrap())
+            .expect("anchored context");
+    assert_eq!(context["raw_notes"], "pricing??");
+    assert_eq!(context["windows"][0]["start_ms"], 90_000);
+    assert_eq!(context["windows"][0]["end_ms"], 270_000);
+    assert!(text.contains("pricing window fixture"));
+    assert!(!text.contains("early excluded"));
+    assert!(!text.contains("late excluded"));
+    assert!(!request.to_string().contains("OTHER MEETING MUST NOT LEAK"));
 }

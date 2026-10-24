@@ -377,7 +377,7 @@ the list of crates that use it.
 Used by:
 
 - cmov 0.5.4
-- ctutils 0.4.2
+- ctutils 0.4.4
 - encoding_rs 0.8.35
 - utf8_iter 1.0.4
 - zeroize 1.9.0
@@ -3550,7 +3550,6 @@ Used by:
 
 - apple-native-keyring-store 1.0.2
 - keyring-core 1.0.0
-- keyring 4.1.6
 
 ````text
                               Apache License
@@ -7312,7 +7311,7 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 Used by:
 
 - tokio-util 0.7.19
-- tokio 1.53.1
+- tokio 1.53.3
 
 ````text
 MIT License

@@ -172,11 +172,28 @@ where
     // The user's typed notes, if any. They are a *saliency signal*, not just
     // another input: the prompt contract treats each line as a pointer to
     // expand from the transcript, never as a claim to accept (§8.3).
-    let notes = db
+    let notes = db.note_document(meeting_id)?;
+    let anchors: Vec<fotw_summarize::note_context::Anchor> = notes
+        .anchors
+        .iter()
+        .map(|a| {
+            let invalid = || {
+                fotw_store::StoreError::InvalidArgument("invalid note anchor clock or index".into())
+            };
+            Ok(fotw_summarize::note_context::Anchor {
+                id: a.id.clone(),
+                block_idx: usize::try_from(a.block_idx).map_err(|_| invalid())?,
+                text: a.block_text.clone(),
+                typed_at_ms: u64::try_from(a.typed_at_ms).map_err(|_| invalid())?,
+            })
+        })
+        .collect::<Result<_, fotw_store::StoreError>>()?;
+    let duration_ms = db
         .meetings()
-        .note(meeting_id)?
-        .map(|(body, _)| body)
-        .unwrap_or_default();
+        .get(meeting_id)?
+        .duration_ms
+        .and_then(|d| u64::try_from(d).ok())
+        .unwrap_or_else(|| segments.iter().map(|s| s.end_ms).max().unwrap_or(0));
 
     let document = TranscriptDocument::from_segments(&segments);
     // Two adapters. On the API they are two models — extraction is a
@@ -205,7 +222,9 @@ where
         ..PipelineConfig::default()
     });
 
-    let outcome = pipeline.run(&document, &notes).await?;
+    let outcome = pipeline
+        .run_with_anchors(&document, &notes.body_md, &anchors, duration_ms)
+        .await?;
     let warnings = user_warnings(&outcome);
 
     // The admonitions ride in *our* rendered markdown, never in

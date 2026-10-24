@@ -90,13 +90,11 @@ impl MicTap {
         // Read the format every time. A Bluetooth headset engaging HFP drops
         // the input to 16 or 24 kHz mid-session, and a converter configured
         // once at session start would then be silently wrong (CAP-07).
-        let probed = device
-            .nominal_sample_rate()
-            .ok()
-            .map(|rate| StreamFormat::new(rate as u32, 1, SampleFormat::F32));
-        let format = probed
-            .filter(StreamFormat::is_plausible)
-            .unwrap_or(self.hint);
+        // Live rate-change notification/rebuild remains separate from probing.
+        let asbd = device.input_asbd().map_err(|e| {
+            TapError::platform(format!("Cannot read microphone stream format: {e:?}"))
+        })?;
+        let format = capture_format(&asbd)?;
 
         self.state.device_frames.store(0, Ordering::Release);
         {
@@ -150,6 +148,18 @@ fn on_io(state: &IoState, input: &cat::AudioBufList<1>, channels: u64) {
     let Some(sink) = guard.as_mut() else {
         return;
     };
+    // The ASBD was validated before starting. Never reinterpret a changed
+    // buffer layout using the old channel count, including partial frames.
+    // A typed error does not count as a delivered buffer in watchdog health.
+    let bad_layout = input.number_buffers != 1
+        || channels == 0
+        || u64::from(input.buffers[0].number_channels) != channels
+        || !u64::from(input.buffers[0].data_bytes_size).is_multiple_of(channels * 4);
+    if bad_layout {
+        sink.on_error(TapError::StreamFormatChanged);
+        return;
+    }
+
     let buf = &input.buffers[0];
     if buf.data.is_null() || buf.data_bytes_size == 0 {
         return;
@@ -185,6 +195,9 @@ impl crate::tap::AudioTap for MicTap {
         if self.running.is_some() {
             return Err(TapError::platform("mic tap is already started"));
         }
+        // Initialize the capture epoch/timebase on the control thread before
+        // native startup can invoke the real-time callback.
+        let _ = clock::host_ns();
         let running = self.build(sink)?;
         let format = running.format;
         self.running = Some(running);
@@ -200,5 +213,119 @@ impl crate::tap::AudioTap for MicTap {
             .unwrap_or_else(PoisonError::into_inner);
         *guard = None;
         Ok(())
+    }
+}
+
+fn capture_format(asbd: &cat::AudioStreamBasicDesc) -> Result<StreamFormat, TapError> {
+    let channels = u16::try_from(asbd.channels_per_frame)
+        .map_err(|_| TapError::FormatUnsupported("Microphone channel count is too large".into()))?;
+    let format = StreamFormat::new(asbd.sample_rate as u32, channels, SampleFormat::F32);
+    let bytes_per_frame = u32::from(channels) * 4;
+    if !asbd.sample_rate.is_finite()
+        || asbd.sample_rate.fract() != 0.0
+        || !format.is_plausible()
+        || !asbd.is_native_endian()
+        || !asbd
+            .format_flags
+            .contains(cat::audio::FormatFlags::NATIVE_FLOAT_PACKED)
+        || asbd.bits_per_channel != 32
+        || asbd.frames_per_packet != 1
+        || asbd.bytes_per_frame != bytes_per_frame
+        || asbd.bytes_per_packet != bytes_per_frame
+        || (!asbd.is_interleaved() && channels != 1)
+    {
+        return Err(TapError::FormatUnsupported("Microphone must provide a known-rate, native packed Float32 interleaved stream (or mono Float32)".into()));
+    }
+    Ok(format)
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+    #[derive(Default)]
+    struct Observed {
+        samples: Vec<f32>,
+        flags: Vec<FrameFlags>,
+        timestamps: Vec<CaptureTimestamp>,
+        format_errors: usize,
+    }
+    struct FixtureSink(Arc<Mutex<Observed>>);
+    impl FrameSink for FixtureSink {
+        fn on_frames(&mut self, pcm: &[f32], at: CaptureTimestamp, flags: FrameFlags) {
+            let mut seen = self.0.lock().unwrap();
+            seen.samples.extend_from_slice(pcm);
+            seen.flags.push(flags);
+            seen.timestamps.push(at);
+        }
+        fn on_error(&mut self, error: TapError) {
+            assert!(matches!(error, TapError::StreamFormatChanged));
+            assert!(error.is_transient_device_fault());
+            self.0.lock().unwrap().format_errors += 1;
+        }
+    }
+    #[test]
+    fn changed_channel_layout_is_not_delivered_under_the_old_format() {
+        let seen = Arc::new(Mutex::new(Observed::default()));
+        let state = IoState {
+            sink: Mutex::new(Some(Box::new(FixtureSink(seen.clone())))),
+            device_frames: AtomicU64::new(0),
+        };
+        let mut pcm = [0.25_f32, -0.25, 0.5, -0.5];
+        let mut input = cat::AudioBufList {
+            number_buffers: 1,
+            buffers: [cat::AudioBuf {
+                number_channels: 2,
+                data_bytes_size: 16,
+                data: pcm.as_mut_ptr().cast(),
+            }],
+        };
+        on_io(&state, &input, 2);
+        assert_eq!(state.device_frames.load(Ordering::Acquire), 2);
+        input.buffers[0].number_channels = 1;
+        on_io(&state, &input, 2);
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.samples, pcm,
+            "changed layout must not append audio under stale metadata"
+        );
+        assert_eq!(state.device_frames.load(Ordering::Acquire), 2);
+        assert_eq!(seen.format_errors, 1);
+        assert_eq!(
+            seen.flags.len(),
+            1,
+            "a rejected buffer must not refresh watchdog health"
+        );
+    }
+    #[test]
+    fn preserves_stereo_rate_and_frame_clock() {
+        let actual =
+            capture_format(&cat::AudioStreamBasicDesc::common_f32(24000.0, 2, true)).unwrap();
+        assert_eq!(actual, StreamFormat::new(24000, 2, SampleFormat::F32));
+        assert_eq!(actual.frames_in(480), Some(240));
+        assert_eq!(actual.frames_to_ns(240), 10_000_000);
+    }
+    #[test]
+    fn refuses_unknown_or_incompatible_descriptions_instead_of_guessing() {
+        let valid = cat::AudioStreamBasicDesc::common_f32(48000.0, 1, true);
+        let mut cases = Vec::new();
+        for rate in [0.0, f64::NAN, f64::INFINITY, 48000.5] {
+            let mut bad = valid;
+            bad.sample_rate = rate;
+            cases.push(bad);
+        }
+        let mut integer = valid;
+        integer.bits_per_channel = 16;
+        integer.bytes_per_frame = 2;
+        cases.push(integer);
+        let mut truncated = valid;
+        truncated.bytes_per_packet = 3;
+        cases.push(truncated);
+        let mut unknown = valid;
+        unknown.channels_per_frame = 0;
+        cases.push(unknown);
+        for bad in cases {
+            assert!(capture_format(&bad).is_err(), "accepted {bad:?}");
+        }
+        assert!(capture_format(&cat::AudioStreamBasicDesc::common_f32(16000.0, 1, false)).is_ok());
     }
 }

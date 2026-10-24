@@ -25,6 +25,22 @@ use crate::session::SessionOutcome;
 /// disk. Dropping it here would make the library quietly lossy in exactly the
 /// case where the user most needs to find the recording.
 pub fn persist_session(db: &mut Db, outcome: &SessionOutcome, title: &str) -> StoreResult<String> {
+    // Validate before creating a row: a bad clock must not leave a phantom meeting.
+    let capture_end = outcome
+        .capture_ended_at_ms
+        .map(|ended| {
+            if ended < outcome.started_at_ms {
+                return Err(fotw_store::StoreError::InvalidArgument(
+                    "capture ends before it starts".into(),
+                ));
+            }
+            i64::try_from(ended).map_err(|_| {
+                fotw_store::StoreError::InvalidArgument(
+                    "capture clock exceeds storage range".into(),
+                )
+            })
+        })
+        .transpose()?;
     // Cross-leg dedupe happens HERE, not at session end: `stt.jsonl` is the
     // crash-recovery record and stays raw, so a matcher misfire is always
     // recoverable from the session directory. The database — and everything
@@ -52,8 +68,30 @@ pub fn persist_session(db: &mut Db, outcome: &SessionOutcome, title: &str) -> St
     m.title = title.to_owned();
     // The real capture start, not now: they differ by the length of the
     // meeting, and using now would make every recording show zero duration.
-    if outcome.started_at_ms > 0 {
+    if outcome.started_at_ms > 0 || capture_end.is_some() {
         m.started_at_ms = outcome.started_at_ms as i64;
+    }
+    // A real capture has a stable WAL identity and frozen end. Commit its
+    // meeting, transcript and note alias together so retry cannot split them.
+    if let Some(ended) = capture_end {
+        let session = outcome
+            .dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| {
+                fotw_store::StoreError::InvalidArgument("capture has no session identity".into())
+            })?;
+        let rows: Vec<NewSegment> = outcome
+            .segments
+            .iter()
+            .enumerate()
+            .map(|(i, s)| to_row(i as i64, s))
+            .collect();
+        let transcript = outcome
+            .segments
+            .first()
+            .map(|s| (s.provider.as_str(), s.model.as_str(), rows.as_slice()));
+        return db.finalize_capture(session, m, ended, transcript);
     }
     let meeting_id = db.meetings().create(m)?;
 
@@ -76,7 +114,7 @@ pub fn persist_session(db: &mut Db, outcome: &SessionOutcome, title: &str) -> St
         db.meetings().append_segments(&transcript_id, &rows)?;
     }
 
-    let ended = fotw_store::now_ms();
+    let ended = capture_end.unwrap_or_else(fotw_store::now_ms);
     db.meetings().finish(&meeting_id, ended)?;
     // `finish` stamps the timing only; the state machine is a separate
     // concern. Without this the meeting stays in `recording` forever and the
@@ -175,6 +213,7 @@ fn outcome_shallow(o: &SessionOutcome) -> SessionOutcome {
     SessionOutcome {
         dir: o.dir.clone(),
         started_at_ms: o.started_at_ms,
+        capture_ended_at_ms: o.capture_ended_at_ms,
         system_samples: o.system_samples,
         mic_samples: o.mic_samples,
         stt_errors: o.stt_errors.clone(),
@@ -278,6 +317,7 @@ mod tests {
         let outcome = SessionOutcome {
             dir: dir.clone(),
             started_at_ms: 1_754_900_000_000,
+            capture_ended_at_ms: None,
             system_samples: 480_000,
             mic_samples: 0,
             stt_errors: Vec::new(),

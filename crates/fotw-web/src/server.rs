@@ -184,6 +184,15 @@ fn routes(state: AppState) -> Router {
         .route("/assets/{*path}", get(assets::asset))
         .route("/api/meetings", get(api::list_meetings))
         .route("/api/meetings/{id}", get(api::get_meeting))
+        .route(
+            "/api/meetings/{id}/notes",
+            get(crate::notes::load).post(crate::notes::save),
+        )
+        .route(
+            "/api/sessions/{id}/notes",
+            get(crate::notes::load_session).post(crate::notes::save_session),
+        )
+        .route("/api/note-drafts", get(crate::notes::list_drafts))
         .route("/api/search", get(api::search))
         .route("/api/ws-ticket", post(api::ws_ticket))
         .route("/api/handoff", post(api::handoff))
@@ -201,6 +210,7 @@ fn routes(state: AppState) -> Router {
         .route("/api/recording/transcript", get(api::recording_transcript))
         .route("/api/recording/start", post(api::recording_start))
         .route("/api/recording/stop", post(api::recording_stop))
+        .route("/api/recording/retry", post(api::recording_retry))
         .route(
             "/api/settings/github",
             get(api::github_settings).post(api::github_set_settings),

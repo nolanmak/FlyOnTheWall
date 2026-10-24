@@ -257,12 +257,69 @@ impl<'a> Pipeline<'a> {
         document: &TranscriptDocument,
         user_notes: &str,
     ) -> Result<SummaryOutcome, SummarizeError> {
-        let system = prompt::assemble(&self.config.template_body);
-        let plan = chunk::plan(document, &self.prose.capabilities());
-        let chunks = plan.chunks(document);
+        self.run_with_anchors(document, user_notes, &[], 0).await
+    }
 
+    /// Augment notes with original-recording windows, scoped to each map chunk.
+    /// The caller supplies anchors from the same meeting as the transcript.
+    ///
+    /// # Errors
+    /// As [`Self::run`], including context overflow before any provider call.
+    pub async fn run_with_anchors(
+        &self,
+        document: &TranscriptDocument,
+        user_notes: &str,
+        anchors: &[crate::note_context::Anchor],
+        duration_ms: u64,
+    ) -> Result<SummaryOutcome, SummarizeError> {
+        let system = prompt::assemble(&self.config.template_body);
+        let capabilities = self.prose.capabilities();
+        let mut plan = chunk::plan(document, &capabilities);
+        let mut chunks = plan.chunks(document);
+        // Render/check one window payload at a time, so a long meeting cannot
+        // allocate every chunk's repeated notes simultaneously. Byte length is
+        // a conservative token ceiling for the structured notes, not a price estimate.
+        if !anchors.is_empty() {
+            let usable = capabilities.usable_context_tokens;
+            let overhead = crate::tokens::estimate_tokens(system.text())
+                .saturating_add(self.config.max_output_tokens)
+                .saturating_add(1024);
+            let minimum = overhead.saturating_add(user_notes.len());
+            if minimum > usable {
+                return Err(SummarizeError::ContextOverflow {
+                    needed: minimum,
+                    usable,
+                });
+            }
+            let turns = chunk::speaker_turns(document);
+            let mut budget = chunks.iter().map(|c| c.tokens).max().unwrap_or(1).max(1);
+            loop {
+                let overflow = chunks.iter().find_map(|c| {
+                    let note = crate::note_context::render(
+                        document,
+                        &c.segments,
+                        user_notes,
+                        anchors,
+                        duration_ms,
+                    );
+                    let needed = overhead
+                        .saturating_add(c.tokens)
+                        .saturating_add(note.as_ref().map_or(0, String::len));
+                    (needed > usable).then_some(needed)
+                });
+                let Some(needed) = overflow else { break };
+                if budget == 1 {
+                    return Err(SummarizeError::ContextOverflow { needed, usable });
+                }
+                budget = (budget / 2).max(1);
+                chunks = chunk::pack(&turns, budget);
+                plan = chunk::Plan::MapReduce {
+                    chunks: chunks.clone(),
+                };
+            }
+        }
         let (blocks, usage_a) = self
-            .run_call_a(document, user_notes, &system, &chunks)
+            .run_call_a(document, user_notes, anchors, duration_ms, &system, &chunks)
             .await?;
         let (extraction, usage_b, extraction_failures) =
             self.run_call_b(document, &system, &chunks).await?;
@@ -311,6 +368,8 @@ impl<'a> Pipeline<'a> {
         &self,
         document: &TranscriptDocument,
         user_notes: &str,
+        anchors: &[crate::note_context::Anchor],
+        duration_ms: u64,
         system: &SystemPrompt,
         chunks: &[Chunk],
     ) -> Result<(Vec<AnnotatedBlock>, Usage), SummarizeError> {
@@ -319,6 +378,13 @@ impl<'a> Pipeline<'a> {
         let mut mapped: Vec<Vec<AnnotatedBlock>> = Vec::new();
 
         for chunk in chunks {
+            let notes = crate::note_context::render(
+                document,
+                &chunk.segments,
+                user_notes,
+                anchors,
+                duration_ms,
+            );
             let request = LlmRequest {
                 model: self.model_for(self.prose),
                 system: system.text().to_string(),
@@ -328,10 +394,10 @@ impl<'a> Pipeline<'a> {
                     cache_ttl: capabilities.clamp_ttl(self.config.cache_ttl()),
                     title: DOCUMENT_TITLE.to_string(),
                 }),
-                user_notes: (!user_notes.trim().is_empty()).then(|| user_notes.to_string()),
+                user_notes: notes.clone(),
                 instruction: prompt::augment_instruction(
                     &self.config.meeting_date,
-                    !user_notes.trim().is_empty(),
+                    notes.is_some(),
                 ),
                 // Never combined with `output_format`, which stays None here.
                 citations: capabilities.native_citations,
@@ -1704,5 +1770,69 @@ mod tests {
             mapped.usage_a.output_tokens > 500,
             "map + reduce output tokens were not summed"
         );
+    }
+    #[test]
+    fn anchored_windows_repack_chunks_before_the_first_provider_call() {
+        let transport = MockTransport::new();
+        let adapter = small_context_adapter(transport.clone());
+        let pipeline = Pipeline::new(&adapter, &adapter).with_config(PipelineConfig {
+            max_output_tokens: 512,
+            ..PipelineConfig::default()
+        });
+        let anchor = crate::note_context::Anchor {
+            id: "fixture".into(),
+            block_idx: 0,
+            text: "pricing??".into(),
+            typed_at_ms: 0,
+        };
+        let result =
+            block_on(pipeline.run_with_anchors(&long_document(), "pricing??", &[anchor], 600_000));
+        assert!(
+            matches!(result, Err(SummarizeError::Transport(_))),
+            "must fit context and reach fake transport: {result:?}"
+        );
+        assert_eq!(transport.call_count(), 1);
+        let request = transport.request(0).body;
+        let content = &request["messages"][0]["content"];
+        let text = content[1]["text"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("The user's raw notes:\n\n")
+            .unwrap();
+        let context: Value = serde_json::from_str(text).unwrap();
+        assert!(!context["excerpts"].as_array().unwrap().is_empty());
+        let document = content[0].to_string();
+        for excerpt in context["excerpts"].as_array().unwrap() {
+            let id = excerpt["segment_id"].as_u64().unwrap();
+            assert!(
+                document.contains(&format!("[#{id}]")),
+                "context escaped its chunk"
+            );
+            assert!(excerpt["start_ms"].as_u64().unwrap() <= 90_000);
+        }
+    }
+
+    #[test]
+    fn oversized_anchored_notes_fail_before_any_provider_call() {
+        let transport = MockTransport::new();
+        let adapter = small_context_adapter(transport.clone());
+        let pipeline = Pipeline::new(&adapter, &adapter);
+        let anchor = crate::note_context::Anchor {
+            id: "fixture".into(),
+            block_idx: 0,
+            text: "fixture".into(),
+            typed_at_ms: 0,
+        };
+        let result = block_on(pipeline.run_with_anchors(
+            &document(),
+            &"x".repeat(20_000),
+            &[anchor],
+            600_000,
+        ));
+        assert!(
+            matches!(result, Err(SummarizeError::ContextOverflow { .. })),
+            "{result:?}"
+        );
+        assert_eq!(transport.call_count(), 0);
     }
 }

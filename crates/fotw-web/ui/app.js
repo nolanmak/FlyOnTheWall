@@ -36,8 +36,10 @@ const el = {
   consentLabel: document.getElementById("consent-label"),
   record: document.getElementById("record"),
   returnLive: document.getElementById("return-live"),
+  noteDrafts: document.getElementById("note-drafts"),
   recording: document.getElementById("recording"),
   recordingLimit: document.getElementById("recording-limit"),
+  captureHealth: document.getElementById("capture-health"),
   ghSettings: document.getElementById("gh-settings"),
   ghRepo: document.getElementById("gh-repo"),
   ghBranch: document.getElementById("gh-branch"),
@@ -101,6 +103,7 @@ async function api(path, options) {
     // (#112); the rest ignore the extra property.
     const failed = new Error("request failed");
     failed.status = res.status;
+    try { failed.code = (await res.json()).error; } catch (_) {}
     throw failed;
   }
   return res.json();
@@ -252,6 +255,8 @@ function renderList(meetings) {
     const item = document.createElement("button");
     item.className = "meeting";
     item.type = "button";
+    item.dataset.meetingId = m.id;
+    item.setAttribute("aria-current", String(m.id === selectedMeetingId));
     item.appendChild(text("span", m.title || "Untitled meeting", "title"));
     item.appendChild(text("span", when(m.started_at_ms), "meta"));
     item.appendChild(text("span", listMeta(m), "meta"));
@@ -401,7 +406,9 @@ function renderDetail(detail) {
   // Notes first, and above the summary, because they are the user's own words
   // and the summary is a derived artifact. Search has always indexed notes, so
   // before this they could be matched but never read.
-  if (detail.note_md) {
+  if (typeof FOTWNotes !== "undefined") {
+    FOTWNotes.mount(detail.meeting.id, el.detail, api);
+  } else if (detail.note_md) {
     const notes = document.createElement("section");
     notes.className = "notes";
     notes.appendChild(text("h3", "Your notes"));
@@ -486,6 +493,8 @@ function renderHits(hits) {
     const item = document.createElement("button");
     item.className = "meeting";
     item.type = "button";
+    item.dataset.meetingId = h.meeting_id;
+    item.setAttribute("aria-current", String(h.meeting_id === selectedMeetingId));
     item.appendChild(text("span", h.meeting_title || "Untitled meeting", "title"));
     item.appendChild(text("span", h.source, "meta"));
     item.appendChild(text("span", h.snippet, "snippet"));
@@ -537,8 +546,19 @@ let currentDetail = null;
 let detailRequest = 0;
 let selectedMeetingId = null;
 
+function updateMeetingSelection() {
+  if (!el.list) return;
+  for (const row of el.list.children) {
+    if (row.dataset.meetingId) {
+      row.setAttribute("aria-current", String(row.dataset.meetingId === selectedMeetingId));
+    }
+  }
+}
+
 async function openMeeting(id) {
+  if (typeof FOTWNotes !== "undefined") FOTWNotes.flushAll();
   selectedMeetingId = id;
+  updateMeetingSelection();
   const request = ++detailRequest;
   try {
     const detail = await api("/api/meetings/" + encodeURIComponent(id));
@@ -625,6 +645,9 @@ function handleStreamFrame(frame) {
     recoverLiveHistory();
     refreshLibrary();
   } else if (frame.kind === "meeting_ready") {
+    if (frame.reason === "persisted" && frame.session_id && typeof FOTWNotes !== "undefined") {
+      FOTWNotes.finishSession(frame.session_id, frame.meeting_id);
+    }
     if (frame.reason === "persisted" && frame.session_id === liveSessionId) {
       liveSavedMeetingId = frame.meeting_id;
       adoptSavedLive();
@@ -700,6 +723,7 @@ async function recoverLiveHistory() {
     if (liveSessionId !== id || snapshot.session_id !== id) return;
     liveHistoryMissing = snapshot.truncated;
     liveSavedMeetingId = snapshot.saved_meeting_id || liveSavedMeetingId;
+    if (liveSavedMeetingId && typeof FOTWNotes !== "undefined") FOTWNotes.finishSession(id, liveSavedMeetingId);
     if (typeof snapshot.speech_origin_ms === "number") {
       liveSnapshotOrigin = liveSnapshotOrigin === null ? snapshot.speech_origin_ms
         : Math.min(liveSnapshotOrigin, snapshot.speech_origin_ms);
@@ -778,6 +802,7 @@ const FINISHING_POLL_MS = 1000;
 // the badge, the button, the clock and the poll rate, so nothing can disagree
 // with anything else.
 let recState = "idle";
+const noteClock = typeof FOTWNotes !== "undefined" ? new FOTWNotes.RecordingClock() : null;
 let recordingSince = null;
 let autoStopAt = null;
 let clockTimer = null;
@@ -874,6 +899,7 @@ function showRecordingControls(visible) {
 // re-enable a button with nothing to do, and Stop must never be gated on the
 // box, because a user who cannot stop a recording is the worse failure.
 function paintRecordButton() {
+  if (captureStopPending) { el.record.disabled = true; return; }
   el.record.textContent = recState === "idle" ? "Start" : "Stop";
   if (recState === "finishing") el.record.disabled = true;
   else if (recState === "recording") el.record.disabled = false;
@@ -881,12 +907,15 @@ function paintRecordButton() {
 }
 
 function renderRecording(body) {
+  noteClock?.update(body);
   if (body.session_id) selectLiveSession(body.session_id);
   const was = recState;
   // Anything the daemon does not name is treated as idle. An unrecognised
   // word must never be the one that leaves a clock running.
   recState =
     body.state === "recording" || body.state === "finishing" ? body.state : "idle";
+  renderCaptureHealth(body);
+  mountLiveNotes();
   paintLiveNavigation();
   adoptSavedLive();
   autoStopAt = body.auto_stop_at_ms ?? null;
@@ -968,17 +997,107 @@ function renderRecording(body) {
   }
 }
 
+// Keep rows mounted between polls so status refreshes preserve keyboard focus.
+const captureHealthRows = new Map();
+const captureRetryPending = new Map();
+let captureHealthSession = null;
+let captureStopPending = false;
+function renderCaptureHealth(body) {
+  if (!el.captureHealth) return;
+  const health = body.capture_health;
+  const active = recState === "recording" && !captureStopPending && body.session_id && health;
+  el.captureHealth.hidden = !active;
+  if (!active) {
+    clear(el.captureHealth);
+    captureHealthRows.clear();
+    captureRetryPending.clear();
+    captureHealthSession = null;
+    return;
+  }
+  if (captureHealthSession !== body.session_id) captureRetryPending.clear();
+  captureHealthSession = body.session_id;
+  const labels = { system: "System audio", mic: "Microphone" };
+  const messages = {
+    confirming: "Checking audio delivery",
+    healthy: "Healthy",
+    quiet: "Silence detected",
+    recovering: "Recovering audio",
+    exhausted: "Automatic recovery stopped",
+    stopped: "Stopped",
+    unavailable: "Unavailable",
+  };
+  for (const source of ["system", "mic"]) {
+    const status = health[source];
+    let row = captureHealthRows.get(source);
+    if (!row) {
+      const container = text("div", "", "capture-source");
+      const message = text("span", "");
+      message.setAttribute("role", "status");
+      const detail = text("span", "", "meta");
+      const button = text("button", "Retry " + labels[source].toLowerCase());
+      button.type = "button";
+      button.addEventListener("click", () => retryCapture(source, button));
+      container.appendChild(message);
+      container.appendChild(detail);
+      container.appendChild(button);
+      el.captureHealth.appendChild(container);
+      row = { message, detail, button };
+      captureHealthRows.set(source, row);
+    }
+    const state = status?.state;
+    const message = labels[source] + ": " + (messages[state] || "Status unavailable");
+    if (row.message.textContent !== message) row.message.textContent = message;
+    const attempts = Number.isInteger(status?.attempts) ? status.attempts : 0;
+    const max = Number.isInteger(status?.max_attempts) ? status.max_attempts : 0;
+    row.detail.textContent = (attempts || state === "recovering")
+      ? attempts + " of " + max + " recovery attempts used" : "";
+    if (state === "recovering" && Number.isFinite(status.retry_in_ms)) {
+      row.detail.textContent += "; next attempt in " + Math.ceil(Math.max(0, status.retry_in_ms) / 1000) + "s";
+    }
+    row.button.hidden = state !== "exhausted";
+    row.button.disabled = captureRetryPending.has(source);
+  }
+}
+
+async function retryCapture(source, button) {
+  const id = captureHealthSession;
+  if (!id || recState !== "recording" || captureRetryPending.has(source)) return;
+  const request = ++recordingRequest;
+  captureRetryPending.set(source, request);
+  button.disabled = true;
+  try {
+    const body = await api("/api/recording/retry?session_id=" + encodeURIComponent(id)
+      + "&source=" + encodeURIComponent(source), { method: "POST" });
+    if (liveSessionId !== id || recState !== "recording" || request !== recordingRequest) return;
+    renderRecording(body);
+    if (body.error) say(body.error);
+  } catch (e) {
+    if (liveSessionId === id && recState === "recording" && request === recordingRequest)
+      say("Could not request audio recovery. Try again.");
+  } finally {
+    if (captureRetryPending.get(source) === request) {
+      captureRetryPending.delete(source);
+      button.disabled = false;
+    }
+  }
+}
+
 // Navigation only: the session model survives showing another meeting.
 // Starting a new capture resets the model via status.session_id, never here.
 function showLive() {
+  if (typeof FOTWNotes !== "undefined") FOTWNotes.flushAll();
   ++detailRequest;
   currentDetail = null;
   selectedMeetingId = null;
+  updateMeetingSelection();
   clear(el.detail);
   el.detail.appendChild(text("h2", "Recording"));
   el.detail.appendChild(
     text("p", "Words appear here as the provider finalizes them.", "meta"),
   );
+  if (typeof FOTWNotes !== "undefined") {
+    const notes = document.createElement("div");notes.id = "live-notes";el.detail.appendChild(notes);
+  }
   const history = text("p", "Time since first speech", "meta");
   history.id = "live-history";
   el.detail.appendChild(history);
@@ -1000,8 +1119,43 @@ function showLive() {
   transcript.appendChild(body);
   el.detail.appendChild(transcript);
   renderLiveTranscript();
+  mountLiveNotes();
   paintLiveNavigation();
   adoptSavedLive();
+}
+
+async function showNoteDrafts() {
+  if (typeof FOTWNotes === "undefined") return;
+  const request=++detailRequest;currentDetail=null;selectedMeetingId=null;
+  updateMeetingSelection();clear(el.detail);paintLiveNavigation();
+  el.detail.appendChild(text("p","Saving pending notes…","meta"));
+  await FOTWNotes.flushAll();
+  if(request!==detailRequest)return;
+  clear(el.detail);FOTWNotes.mountRecovery(el.detail,api,showRecoveredNote);
+}
+function showRecoveredNote(id) {
+  if (id===liveSessionId && recState==="recording") {showLive();return;}
+  if (typeof FOTWNotes === "undefined") return;
+  FOTWNotes.flushAll();const request=++detailRequest;currentDetail=null;selectedMeetingId=null;
+  updateMeetingSelection();clear(el.detail);paintLiveNavigation();
+  FOTWNotes.mountRecovered(id,el.detail,api,{onSaved:meetingId=>{
+    if(request===detailRequest)openMeeting(meetingId);
+  }});
+}
+async function loadNoteDraftControl() {
+  if (!el.noteDrafts || typeof FOTWNotes === "undefined") return;
+  try {await api("/api/note-drafts?limit=1");el.noteDrafts.hidden=false;}
+  catch(e) {el.noteDrafts.hidden=e.status===404;}
+}
+
+function mountLiveNotes() {
+  if (typeof FOTWNotes === "undefined" || !liveSessionId || !liveIsShowing()) return;
+  const parent = document.getElementById("live-notes");
+  if (!parent || parent.dataset.sessionId === liveSessionId) return;
+  FOTWNotes.flushAll();
+  clear(parent);
+  const id = liveSessionId;parent.dataset.sessionId = id;
+  FOTWNotes.mount(id, parent, api, {session:true, clock:()=>noteClock?.offset(id) ?? null});
 }
 
 // Is the live view the thing on screen?
@@ -1017,12 +1171,18 @@ async function onRecord() {
   // Nothing to press while the meeting is being written: capture is already
   // over and Start is refused until the slot frees. The button is disabled in
   // that state, so this only catches a click that raced the poll.
-  if (recState === "finishing") return;
+  if (recState === "finishing" || captureStopPending) return;
   const path =
     recState === "recording"
       ? "/api/recording/stop"
       : "/api/recording/start?ack=all-party";
   el.record.disabled = true;
+  if (recState === "recording") {
+    captureStopPending = true;
+    renderCaptureHealth({});
+    noteClock?.stop();
+    if (typeof FOTWNotes !== "undefined") FOTWNotes.flushAll();
+  }
   ++recordingRequest;
   try {
     const body = await api(path, { method: "POST" });
@@ -1045,10 +1205,17 @@ async function onRecord() {
       await loadMeetings();
     }
   } catch (e) {
+    noteClock?.retry();
+    pollRecording();
     say("Could not reach the recorder.");
     // Not a flat `disabled = false`: CON-01 says an idle Start stays disabled
     // until the box is ticked.
     paintRecordButton();
+  } finally {
+    const stopped = captureStopPending;
+    captureStopPending = false;
+    paintRecordButton();
+    if (stopped && recState === "recording") pollRecording();
   }
 }
 
@@ -1559,6 +1726,7 @@ async function main() {
   el.search.addEventListener("input", onSearch);
   el.record.addEventListener("click", onRecord);
   el.returnLive.addEventListener("click", showLive);
+  el.noteDrafts?.addEventListener("click", showNoteDrafts);
   // Re-evaluates the disabled state; the box gates Start and nothing else.
   // Through `paintRecordButton` so it is state-aware: ticking the box while a
   // meeting is being written must not re-enable a button with nothing to do.
@@ -1580,6 +1748,7 @@ async function main() {
     if (el.ghSettings.open) loadGithubRepos();
   });
   await loadMeetings();
+  await loadNoteDraftControl();
   await loadGithub();
   await loadSummarize();
   await pollRecording();

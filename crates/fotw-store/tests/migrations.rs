@@ -26,8 +26,8 @@ fn a_fresh_database_lands_on_the_latest_version() {
     let db = Db::open(&path, &test_key()).unwrap();
     assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
     assert_eq!(
-        LATEST_SCHEMA_VERSION, 4,
-        "0001 initial schema, 0002 fts5 search indexes, 0003 enrich report, 0004 sharing documents"
+        LATEST_SCHEMA_VERSION, 6,
+        "0001 initial schema, 0002 fts5 search indexes, 0003 enrich report, 0004 sharing documents, 0005 session notes, 0006 note handoff aliases"
     );
 }
 
@@ -267,4 +267,57 @@ fn open_creates_the_data_root() {
     let db = Db::open(&path, &test_key()).unwrap();
     assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
     assert!(path.exists());
+}
+
+#[test]
+fn a_v4_library_gains_session_drafts_without_rewriting_existing_notes() {
+    let (_dir, path) = tmp_db();
+    {
+        let conn = raw(&path);
+        for sql in [
+            include_str!("../src/schema/0001_initial.sql"),
+            include_str!("../src/schema/0002_fts.sql"),
+            include_str!("../src/schema/0003_enrich_report.sql"),
+            include_str!("../src/schema/0004_documents.sql"),
+        ] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch("PRAGMA user_version=4;
+            INSERT INTO meetings(id,title,started_at_ms,tz,state,created_at,updated_at,origin_device_id) VALUES('m1','fixture',0,'UTC','ready',0,0,'d1');
+            INSERT INTO notes(id,meeting_id,body_md,created_at,updated_at,lamport,origin_device_id) VALUES('n1','m1','retained note',0,0,7,'d1');
+            INSERT INTO note_anchors(id,note_id,meeting_id,block_idx,block_text,typed_at_ms) VALUES('a1','n1','m1',0,'retained note',250);").unwrap();
+    }
+    let mut db = Db::open(&path, &test_key()).unwrap();
+    let note = db.note_document("m1").unwrap();
+    assert_eq!(note.body_md, "retained note");
+    assert_eq!(note.revision, 8);
+    assert_eq!(note.anchors[0].id, "a1");
+    assert_eq!(note.anchors[0].typed_at_ms, 250);
+    assert_eq!(db.session_note("new-session").unwrap(), None);
+}
+
+#[test]
+fn a_v5_library_keeps_unsaved_recording_notes_when_aliases_are_added() {
+    let (_dir, path) = tmp_db();
+    {
+        let conn = raw(&path);
+        for sql in [
+            include_str!("../src/schema/0001_initial.sql"),
+            include_str!("../src/schema/0002_fts.sql"),
+            include_str!("../src/schema/0003_enrich_report.sql"),
+            include_str!("../src/schema/0004_documents.sql"),
+            include_str!("../src/schema/0005_session_notes.sql"),
+        ] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch("PRAGMA user_version=5;
+            INSERT INTO session_notes(session_id,started_at_ms,revision,body_md,anchors_json,updated_at_ms)
+            VALUES('capture-A',1000,3,'draft retained','[]',2000);").unwrap();
+    }
+    let mut db = Db::open(&path, &test_key()).unwrap();
+    let draft = db.session_note("capture-A").unwrap().unwrap();
+    assert_eq!(draft.note.body_md, "draft retained");
+    assert_eq!(draft.note.revision, 3);
+    assert_eq!(draft.started_at_ms, 1000);
+    assert_eq!(db.session_note_meeting("capture-A").unwrap(), None);
 }

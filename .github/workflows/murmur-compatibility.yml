@@ -1,0 +1,68 @@
+name: Murmur shared-speech compatibility
+
+on:
+  pull_request:
+    paths:
+      - 'crates/fotw-secrets/**'
+      - 'crates/fotw-audio/**'
+      - 'crates/fotw-stt/**'
+      - 'crates/fotw-dsp/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/murmur-compatibility.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/fotw-secrets/**'
+      - 'crates/fotw-audio/**'
+      - 'crates/fotw-stt/**'
+      - 'crates/fotw-dsp/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/murmur-compatibility.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  consumer:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_BUILD_JOBS: 3
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          path: producer
+          persist-credentials: false
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          repository: nolanmak/Murmur
+          ref: 85df901f00a5d68e55466f0717cf68694373b48b
+          path: consumer
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@46817827a5bfabe028bf34e1cce71fd40e2ff697 # 1.95.0
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libdbus-1-dev
+      - name: Substitute the shared crates under review
+        working-directory: consumer
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          patch = '[patch."https://github.com/nolanmak/FlyOnTheWall"]\n'
+          for name in ('fotw-audio', 'fotw-stt', 'fotw-secrets', 'fotw-dsp'):
+              crate = root / 'producer/crates' / name
+              patch += name + ' = { path = ' + json.dumps(str(crate)) + ' }\n'
+          pathlib.Path('compatibility.toml').write_text(patch)
+          PY
+      # The consumer's ordinary CI uses --locked against its Git pin. This
+      # compatibility run deliberately substitutes the reviewed producer source,
+      # so Cargo must update the lockfile's source entry in this disposable clone.
+      - name: Run consumer contracts and regressions
+        working-directory: consumer
+        run: cargo --config compatibility.toml test --workspace

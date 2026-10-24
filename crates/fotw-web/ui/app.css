@@ -2,13 +2,21 @@
    to pull from another origin would be blocked, and a stylesheet that half
    loads is worse than one that does not try. */
 
+/* Component display rules must never reveal controls explicitly hidden by state. */
+[hidden] { display: none !important; }
+
 :root {
   color-scheme: light dark;
-  --bg: #ffffff;
-  --fg: #17181c;
-  --muted: #6a6f7a;
-  --line: #e3e5ea;
-  --accent: #2f6bd8;
+  --bg: #f6f7f5;
+  --surface: #ffffff;
+  --sidebar: #edf0ec;
+  --selected: #deebdf;
+  --radius: 12px;
+  --reading-width: 760px;
+  --fg: #222b25;
+  --muted: #5e6860;
+  --line: #d6ddd5;
+  --accent: #28633b;
   /* Deliberately NOT the recording indicator's #d2453d. CON-02 reserves that
      red for one meaning — audio is being captured right now — and a second
      red on screen dilutes the one that must never be missed. Amber is the
@@ -18,11 +26,14 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #16181d;
-    --fg: #e8eaee;
-    --muted: #9aa0ac;
-    --line: #2b2f37;
-    --accent: #6ea0ff;
+    --bg: #171d19;
+    --surface: #202923;
+    --sidebar: #1b231e;
+    --selected: #304a37;
+    --fg: #e8eee8;
+    --muted: #a9b6ab;
+    --line: #3a483e;
+    --accent: #a0d6aa;
     --caution: #e0a54a;
   }
 }
@@ -34,6 +45,7 @@
 body {
   margin: 0;
   height: 100vh;
+  height: 100dvh;
   display: flex;
   flex-direction: column;
   background: var(--bg);
@@ -45,7 +57,9 @@ header {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 12px 16px;
+  padding: 16px 24px;
+  flex-wrap: wrap;
+  background: var(--surface);
   border-bottom: 1px solid var(--line);
 }
 
@@ -57,7 +71,8 @@ h1 {
 
 #search {
   flex: 1;
-  padding: 6px 10px;
+  padding: 10px 14px;
+  min-width: 180px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--bg);
@@ -141,12 +156,14 @@ h1 {
    status line below the fold exactly when it had something to say. */
 main {
   display: grid;
-  grid-template-columns: minmax(220px, 320px) 1fr;
+  grid-template-columns: minmax(240px, 300px) minmax(0, 1fr);
   flex: 1;
   min-height: 0;
 }
 
 nav {
+  padding: 12px;
+  background: var(--sidebar);
   overflow-y: auto;
   border-right: 1px solid var(--line);
 }
@@ -156,9 +173,11 @@ nav {
   flex-direction: column;
   gap: 2px;
   width: 100%;
-  padding: 10px 16px;
-  border: 0;
-  border-bottom: 1px solid var(--line);
+  padding: 14px;
+  margin-bottom: 6px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  overflow-wrap: anywhere;
   background: transparent;
   color: inherit;
   font: inherit;
@@ -188,14 +207,37 @@ nav {
 
 section {
   overflow-y: auto;
-  padding: 16px 24px;
+  padding: 24px 32px;
+  min-width: 0;
 }
+
+#detail > * {
+  max-width: var(--reading-width);
+  margin-left: auto;
+  margin-right: auto;
+}
+
+#detail { overflow-wrap: anywhere; }
+#detail h2 { font-size: 26px; line-height: 1.25; letter-spacing: -0.025em; }
+#detail h3 { margin-top: 28px; font-size: 16px; }
+.meeting[aria-current="true"] {
+  background: var(--selected);
+  border-color: var(--accent);
+  box-shadow: inset 3px 0 var(--accent);
+}
+:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+button, input, select, textarea { accent-color: var(--accent); }
+button, summary { min-height: 36px; }
+
 
 .summary-body,
 .note-body {
-  background: color-mix(in srgb, var(--fg) 4%, transparent);
-  padding: 12px 16px;
-  border-radius: 8px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  padding: 20px 24px;
+  border-radius: var(--radius);
+  font-size: 15px;
+  line-height: 1.7;
 }
 
 .summary-body > :first-child,
@@ -641,6 +683,26 @@ section {
 @keyframes document-spin { to { transform: rotate(360deg); } }
 @keyframes document-pulse { 50% { opacity: .3; } }
 @media (prefers-reduced-motion: reduce) {
-  .document-spinner, .sharing-panel .document-primary.is-busy::before { border-right-color: currentColor; animation: document-pulse 1.6s ease-in-out infinite; }
+  .document-spinner, .sharing-panel .document-primary.is-busy::before { border-right-color: currentColor; animation: none; }
 }
 .document-review { margin-top: 1rem; }
+
+/* User notes remain editable prose, independent of generated summaries. */
+.note-editor label { display: block; color: var(--muted); font-size: 12px; }
+.note-editor textarea {
+  display: block; width: 100%; min-height: 180px; resize: vertical;
+  margin-top: 8px; padding: 16px; border: 1px solid var(--line);
+  border-radius: var(--radius); background: var(--surface); color: var(--fg);
+  font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+.note-editor [role="status"] { font-size: 12px; color: var(--muted); }
+.note-editor .actions { flex-wrap: wrap; }
+
+.note-recovery > p { color: var(--muted); }
+.recovery-list { display: grid; gap: 8px; margin: 16px 0; }
+.recovery-list button { text-align: left; padding: 12px; }
+.note-recovery > button { margin-right: 8px; }
+
+.capture-health { margin: 0.5rem 1rem; padding: 0.75rem 1rem; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+.capture-source { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem 1rem; padding: 0.25rem 0; }
+.capture-source button { margin-left: auto; }

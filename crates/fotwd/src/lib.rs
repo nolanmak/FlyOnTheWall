@@ -175,3 +175,6 @@ fn lost_key_message(db_path: &Path, blob_path: &Path) -> String {
     }
     out
 }
+
+/// Content-free per-source capture health and session-scoped retry mailbox.
+pub mod capture_health;

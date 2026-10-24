@@ -36,7 +36,7 @@ use fotw_audio::{
     AudioPlatform, AudioTap, CaptureTimestamp, DeviceId, FormatRequest, FrameFlags, FrameSink,
     PlatformProbe, StreamFormat, SystemScope, TapError, TapId,
 };
-use fotw_pipeline::resample::{Downmixer, Resampler16k};
+use fotw_pipeline::resample::{ArchiveConverter, Downmixer, Resampler16k};
 use fotw_pipeline::ring::{AudioRing, RingConsumer, RingProducer};
 use fotw_pipeline::wal::{SessionWal, SttRecord, TrackFormat};
 use fotw_stt::deepgram::DeepgramConfig;
@@ -153,6 +153,9 @@ pub struct SessionOutcome {
     /// the length of the meeting, and using the later one makes every
     /// recording show a duration of zero.
     pub started_at_ms: u64,
+    /// First capture-stop time, excluding transcription and persistence drain.
+    /// None for legacy imports without an authoritative stop clock.
+    pub capture_ended_at_ms: Option<u64>,
     /// Interleaved samples written for the system leg.
     pub system_samples: u64,
     /// Interleaved samples written for the mic leg.
@@ -171,11 +174,10 @@ pub struct SessionOutcome {
     /// What the system tap delivered. Required, so always present: a session
     /// whose system tap refuses to start never gets this far.
     pub system_buffers: LegBuffers,
-    /// What the mic tap delivered, or `None` when there was no mic leg at all
-    /// — no input device, or a tap that refused to start. Distinct from
-    /// `Some(LegBuffers::default())`, which is a mic tap that started and then
-    /// never fired: the first is a machine without a microphone, the second is
-    /// a microphone that is not working.
+    /// What the mic tap delivered, excluding discarded initial-start samples.
+    /// `None` means the prebuilt path omitted the mic leg. Supervised recording
+    /// keeps an optional source even when initially unavailable; zero counts
+    /// mean it never delivered retained audio.
     pub mic_buffers: Option<LegBuffers>,
     /// Samples the ring dropped because the pump fell behind.
     pub dropped_samples: u64,
@@ -374,10 +376,9 @@ impl FrameSink for RingSink {
                 .first_host_ns
                 .store(ts.host_ns, Ordering::Relaxed);
         }
-        // The return value is deliberately ignored: a short write means the
-        // pump is behind, and retrying on a real-time thread is blocking by
-        // another name. The shortfall is counted for the pump to surface.
-        let _ = self.producer.push_block(pcm);
+        // If capacity is insufficient, drop/count the whole callback rather
+        // than splitting an interleaved frame. Never retry on the audio thread.
+        let _ = self.producer.push_complete_block(pcm);
     }
 
     fn on_error(&mut self, _e: TapError) {}
@@ -395,33 +396,25 @@ impl FrameSink for RingSink {
 // [`LegCounters`], so a rebuilt tap's audio still reaches degradation (#79/#81)
 // and anchoring (#86). Read `fotw::record`'s module header for the rationale of
 // the rest (why the supervisor is polled from the pump, why the ring producer
-// is recycled rather than recreated, why an unwritten gap is padded).
+// is isolated per generation, why an unwritten gap is padded).
 
-/// The ring producer, parked between taps so a rebuilt tap writes into the
-/// **same** ring as the tap it replaced — that is what makes recovery
-/// invisible to the WAL. The sink hands the producer back here on drop and the
-/// next sink takes it out again; both ends happen on the control path, and the
-/// audio thread holds the producer outright and never touches this lock.
+/// Allocate a separate bounded ring for each tap attempt. The pump retains
+/// the old consumer through its final drain and gap padding, then switches to
+/// the replacement consumer. No lock or allocation occurs on the audio thread.
 #[derive(Clone)]
-struct ProducerSlot(Arc<std::sync::Mutex<Option<RingProducer>>>);
+struct ProducerSlot(fotw_pipeline::ring::GenerationRing);
 
 impl ProducerSlot {
     fn holding(producer: RingProducer) -> Self {
-        Self(Arc::new(std::sync::Mutex::new(Some(producer))))
+        Self(fotw_pipeline::ring::GenerationRing::new(producer))
     }
-
     fn take(&self) -> Option<RingProducer> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+        Some(self.0.producer())
     }
-
-    fn put(&self, producer: RingProducer) {
-        *self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(producer);
+    fn replacement(&self) -> Result<RingConsumer, String> {
+        self.0
+            .take_replacement()
+            .ok_or_else(|| "missing replacement capture generation".into())
     }
 
     /// A sink drawing on this slot that reports to **both** counter sets.
@@ -433,7 +426,6 @@ impl ProducerSlot {
     ) -> Box<dyn FrameSink> {
         Box::new(SupervisedSink {
             producer: self.take(),
-            slot: self.clone(),
             activity,
             counters,
             channels: channels.max(1),
@@ -451,23 +443,11 @@ impl ProducerSlot {
 /// only the first; a daemon that did the same would rebuild a stalled tap
 /// correctly and then report the recovered meeting as dead.
 struct SupervisedSink {
-    /// `None` only if the slot was empty when this sink was built, which the
-    /// supervisor's drop-old-before-open-new ordering makes impossible. If it
-    /// ever happened, counting the buffers still keeps the watchdog from
-    /// mistaking it for a stall and rebuilding in a loop.
+    /// This attempt owns its ring; no producer is reused across generations.
     producer: Option<RingProducer>,
-    slot: ProducerSlot,
     activity: Arc<ActivityCounters>,
     counters: LegCounters,
     channels: u16,
-}
-
-impl Drop for SupervisedSink {
-    fn drop(&mut self) {
-        if let Some(producer) = self.producer.take() {
-            self.slot.put(producer);
-        }
-    }
 }
 
 impl FrameSink for SupervisedSink {
@@ -489,7 +469,7 @@ impl FrameSink for SupervisedSink {
                 .store(ts.host_ns, Ordering::Relaxed);
         }
         if let Some(producer) = self.producer.as_mut() {
-            let _ = producer.push_block(pcm);
+            let _ = producer.push_complete_block(pcm);
         }
     }
 
@@ -512,12 +492,31 @@ impl LegChannel {
     }
 }
 
+fn archive_converter(
+    format: StreamFormat,
+    archive: TrackFormat,
+) -> Result<ArchiveConverter, String> {
+    ArchiveConverter::new(
+        format.sample_rate_hz,
+        format.channels,
+        archive.sample_rate_hz,
+        archive.channels,
+    )
+    .map_err(|e| format!("archive converter: {e}"))
+}
+
 /// One supervised capture leg's control-side state — everything the pump needs
 /// to service it *except* the ring consumer, which the pump already owns and
 /// drains on the normal path. Keeping the consumer out is what lets
-/// [`supervise_channel`] run inside `pump_loop` against the same `sys`/`mic`
+/// [`supervise_channel_observed`] run inside `pump_loop` against the same `sys`/`mic`
 /// consumers the ordinary drain reads, rather than a second private copy.
 struct ChannelMeta {
+    slot: ProducerSlot,
+    converter: ArchiveConverter,
+    retired_drops: u64,
+    /// Initial outage already padded through this host-clock boundary.
+    startup_padded_until: Option<u64>,
+    monitor: crate::capture_health::CaptureMonitor,
     label: &'static str,
     channel: LegChannel,
     supervisor: CaptureSupervisor,
@@ -525,8 +524,6 @@ struct ChannelMeta {
     /// the tap is delivering. The session holds its own clone of the *other*
     /// counter set (`LegCounters`) elsewhere.
     activity: Arc<ActivityCounters>,
-    /// What the tap is delivering now. Re-read after every rebuild.
-    format: StreamFormat,
     /// The shape **this leg's** PCM is written in, fixed for the session and
     /// not necessarily the other leg's — a mono mic beside a stereo system tap
     /// is the ordinary case. Padding a gap from the wrong one fills it with the
@@ -542,6 +539,7 @@ struct ChannelMeta {
 /// before the padding. Mirrors `fotw::record::supervise`; the daemon logs
 /// through [`crate::diag`] rather than `println!` because its stderr is
 /// discarded (#101).
+#[cfg(test)]
 fn supervise_channel(
     wal: &mut SessionWal,
     meta: &mut ChannelMeta,
@@ -550,6 +548,26 @@ fn supervise_channel(
     epoch_ns: u64,
     scratch: &mut [f32],
 ) -> Result<(), String> {
+    supervise_channel_observed(wal, meta, cons, plat, epoch_ns, scratch, &mut |_| Ok(()))
+}
+
+#[allow(clippy::too_many_arguments)] // capture state plus a post-WAL feed observer
+fn supervise_channel_observed(
+    wal: &mut SessionWal,
+    meta: &mut ChannelMeta,
+    cons: &mut RingConsumer,
+    plat: &(impl AudioPlatform + ?Sized),
+    epoch_ns: u64,
+    scratch: &mut [f32],
+    on_pcm: &mut dyn FnMut(&[f32]) -> Result<(), String>,
+) -> Result<(), String> {
+    let source = match meta.channel {
+        LegChannel::System => fotw_web::recorder::CaptureSource::System,
+        LegChannel::Mic => fotw_web::recorder::CaptureSource::Mic,
+    };
+    if meta.monitor.take_retry(source) {
+        meta.supervisor.request_retry();
+    }
     let activity: TapActivity = meta.activity.snapshot();
     // The mic leg gets no corroboration: "is anything rendering output?" is
     // evidence about the *system* mixdown and says nothing about an input
@@ -560,6 +578,8 @@ fn supervise_channel(
         LegChannel::Mic => meta.supervisor.poll(activity, &OutputActivity::Unknown),
     };
 
+    meta.monitor
+        .publish(source, meta.supervisor.recovery_status());
     for event in meta.supervisor.drain_events() {
         if event.is_user_visible() {
             crate::diag!("  ! [{}] {}", meta.label, event.user_message());
@@ -568,38 +588,36 @@ fn supervise_channel(
             continue;
         };
 
-        if format != meta.format {
-            // Re-reading the format after every rebuild is seam rule 1, and a
-            // Bluetooth headset engaging HFP changes it mid-meeting. The
-            // manifest declares one rate for the whole session, so this needs a
-            // resampler on the pump before it is correct; saying so beats
-            // writing 16 kHz samples into a 48 kHz file quietly.
-            crate::diag!(
-                "  ! [{}] format changed across the rebuild: {} -> {format}. \
-                 The manifest still records this leg as {} Hz / {} ch; its \
-                 timing will be wrong until resampling is wired in.",
-                meta.label,
-                meta.format,
-                meta.wal_format.sample_rate_hz,
-                meta.wal_format.channels
-            );
-            meta.format = format;
-        }
-
-        // Everything still in the ring predates the outage — the tap was
-        // stopped before the rebuild began — so draining it first is what puts
-        // the padding after the last pre-gap sample instead of in the middle.
-        loop {
-            let n = cons.pop_into(scratch);
+        // A separate ring holds the replacement, including callbacks fired
+        // inside start(). Drain only the retired generation before the gap.
+        let mut remaining = cons.slots();
+        while remaining > 0 {
+            let limit = remaining.min(scratch.len());
+            let n = cons.pop_into(&mut scratch[..limit]);
             if n == 0 {
                 break;
             }
-            meta.channel
-                .write(wal, &scratch[..n])
-                .map_err(|e| format!("{} write failed: {e}", meta.label))?;
+            remaining -= n;
+            let pcm = meta
+                .converter
+                .process(&scratch[..n])
+                .map_err(|e| e.to_string())?;
+            meta.channel.write(wal, &pcm).map_err(|e| e.to_string())?;
+            on_pcm(&pcm)?;
         }
+        let tail = meta.converter.finish().map_err(|e| e.to_string())?;
+        meta.channel.write(wal, &tail).map_err(|e| e.to_string())?;
+        on_pcm(&tail)?;
+        meta.retired_drops += cons.dropped_frames();
+        *cons = meta.slot.replacement()?;
+        meta.converter = archive_converter(format, meta.wal_format)?;
 
-        for gap in gaps {
+        for mut gap in gaps {
+            if gap.reason == fotw_audio::supervisor::GapReason::InitiallyUnavailable {
+                gap.start_ns = gap
+                    .start_ns
+                    .max(meta.startup_padded_until.take().unwrap_or(epoch_ns));
+            }
             apply_leg_gap(
                 wal,
                 meta.channel,
@@ -608,7 +626,30 @@ fn supervise_channel(
                 meta.wal_format,
                 epoch_ns,
                 scratch,
+                on_pcm,
             )?;
+        }
+    }
+    // Keep a long initial outage durable while recording, rather than leaving
+    // it all for Stop. Whole seconds preserve exact sample counts.
+    if let (Some(until), Some(mut gap)) = (
+        meta.startup_padded_until,
+        meta.supervisor.pending_startup_gap(),
+    ) {
+        gap.start_ns = until;
+        gap.end_ns = until + gap.end_ns.saturating_sub(until) / 1_000_000_000 * 1_000_000_000;
+        if gap.end_ns > until {
+            apply_leg_gap(
+                wal,
+                meta.channel,
+                meta.label,
+                &gap,
+                meta.wal_format,
+                epoch_ns,
+                scratch,
+                on_pcm,
+            )?;
+            meta.startup_padded_until = Some(gap.end_ns);
         }
     }
     Ok(())
@@ -616,6 +657,7 @@ fn supervise_channel(
 
 /// Record a gap in the manifest and, if nothing was captured for it, put the
 /// missing time back into the stream as silence in this leg's own shape.
+#[allow(clippy::too_many_arguments)] // gap metadata and post-WAL observer
 fn apply_leg_gap(
     wal: &mut SessionWal,
     channel: LegChannel,
@@ -624,7 +666,15 @@ fn apply_leg_gap(
     format: TrackFormat,
     epoch_ns: u64,
     scratch: &mut [f32],
+    on_pcm: &mut dyn FnMut(&[f32]) -> Result<(), String>,
 ) -> Result<(), String> {
+    let gap = CaptureGap {
+        start_ns: gap.start_ns.max(epoch_ns),
+        ..*gap
+    };
+    if gap.duration_ns() == 0 {
+        return Ok(());
+    }
     let start_ms = gap.start_ns.saturating_sub(epoch_ns) / 1_000_000;
     let end_ms = gap.end_ns.saturating_sub(epoch_ns) / 1_000_000;
     wal.mark_gap(start_ms, end_ms, format!("{label}: {}", gap.reason))
@@ -651,6 +701,7 @@ fn apply_leg_gap(
         channel
             .write(wal, &scratch[..n])
             .map_err(|e| format!("could not pad the gap: {e}"))?;
+        on_pcm(&scratch[..n])?;
         remaining -= n;
     }
     Ok(())
@@ -689,6 +740,7 @@ impl Supervision {
     /// recording. The taps go on delivering into the rings until their `stop()`
     /// returns, which is exactly the tail the drain deadline bounds.
     fn stop_capture(&mut self) {
+        self.system.monitor.close();
         let mut taken: Vec<Box<dyn AudioTap>> = Vec::new();
         if let Some(tap) = self.system.supervisor.take_running_tap() {
             taken.push(tap);
@@ -1279,6 +1331,8 @@ pub struct ReadySignal(Arc<ReadyInner>);
 #[derive(Debug, Default)]
 struct ReadyInner {
     session_id: std::sync::OnceLock<String>,
+    capture_started_at_ms: std::sync::OnceLock<u64>,
+    capture_ended_at_ms: std::sync::OnceLock<u64>,
     ready: std::sync::Mutex<bool>,
     woke: std::sync::Condvar,
 }
@@ -1294,6 +1348,29 @@ impl ReadySignal {
     #[must_use]
     pub fn session_id(&self) -> Option<String> {
         self.0.session_id.get().cloned()
+    }
+
+    /// Original capture clock, available once the WAL exists.
+    #[must_use]
+    pub fn capture_started_at_ms(&self) -> Option<u64> {
+        self.0.capture_started_at_ms.get().copied()
+    }
+    /// Frozen capture-stop clock, independent of transcription drain.
+    #[must_use]
+    pub fn capture_ended_at_ms(&self) -> Option<u64> {
+        self.0
+            .capture_ended_at_ms
+            .get()
+            .map(|end| (*end).max(self.capture_started_at_ms().unwrap_or(0)))
+    }
+    /// Publish capture identity and its authoritative start before readiness.
+    pub fn signal_capture(&self, session_id: String, started_at_ms: u64) {
+        let _ = self.0.capture_started_at_ms.set(started_at_ms);
+        self.signal_session(session_id);
+    }
+    /// Freeze the first capture-stop request.
+    pub fn signal_capture_stopped(&self, ended_at_ms: u64) {
+        let _ = self.0.capture_ended_at_ms.set(ended_at_ms);
     }
 
     /// Publish identity before releasing callers waiting for live capture.
@@ -1450,6 +1527,8 @@ impl SegmentTap {
 /// The latches a caller outside the session holds, and the clock on its end.
 #[derive(Clone, Debug, Default)]
 pub struct SessionControl {
+    /// Independent source health and session-scoped recovery requests.
+    pub capture_health: crate::capture_health::CaptureMonitor,
     /// Trip to end the session early.
     pub stop: StopSignal,
     /// Tripped by the session once capture is live.
@@ -1524,6 +1603,7 @@ pub async fn run_with_stop(
         transcription,
         duration,
         SessionControl {
+            capture_health: crate::capture_health::CaptureMonitor::default(),
             stop,
             ready: ReadySignal::new(),
             errors: SttErrors::new(),
@@ -1671,11 +1751,12 @@ pub async fn run_with_control(
     // exists and the pump is draining. Announced here rather than at the top
     // of the function because a tap that blocks in `start` never reaches this
     // line — which is the whole point.
-    control.ready.signal_session(
+    control.ready.signal_capture(
         dir.file_name()
             .expect("session directory")
             .to_string_lossy()
             .into_owned(),
+        started_at_ms,
     );
 
     // Whichever comes first. `select!` drops the loser, and both branches are
@@ -1687,6 +1768,9 @@ pub async fn run_with_control(
         }
         () = stop_signal.wait() => {}
     }
+    control
+        .ready
+        .signal_capture_stopped(crate::recording::now_ms());
 
     // Stop capture first, then let the pump drain what is already buffered.
     //
@@ -1836,6 +1920,7 @@ pub async fn run_with_control(
     Ok(SessionOutcome {
         dir,
         started_at_ms,
+        capture_ended_at_ms: control.ready.capture_ended_at_ms(),
         system_samples,
         mic_samples,
         system_buffers,
@@ -1881,10 +1966,10 @@ pub async fn run_supervised(
     let sys_counters = LegCounters::default();
     let mic_counters = LegCounters::default();
 
-    // Every allocation before anything real-time runs: rings, the slots that
-    // recycle each ring's producer across a rebuild, and the watchdog counters.
+    // Allocate initial rings and counters here. Replacement rings are allocated
+    // on the control thread before starting each replacement tap.
     let (sys_prod, sys_cons) = AudioRing::with_capacity_frames(RING_SAMPLES);
-    let (mic_prod, mic_cons) = AudioRing::with_capacity_frames(RING_SAMPLES);
+    let (mic_prod, mut mic_cons) = AudioRing::with_capacity_frames(RING_SAMPLES);
     let sys_slot = ProducerSlot::holding(sys_prod);
     let mic_slot = ProducerSlot::holding(mic_prod);
     let sys_activity = Arc::new(ActivityCounters::new());
@@ -1937,15 +2022,30 @@ pub async fn run_supervised(
             move || slot.sink(Arc::clone(&activity), counters.clone(), 1),
         )
     };
-    let mic_format = mic_supervisor.start().ok();
-    let _mic_watch = mic_format.and_then(|_| plat.watch_devices(mic_supervisor.signal()).ok());
+    let mic_format = mic_supervisor.start_recovering().ok();
+    if mic_format.is_none() {
+        mic_cons = mic_slot.0.discard_initial_attempt();
+    }
+    let discarded_mic_buffers = if mic_format.is_none() {
+        mic_counters.snapshot()
+    } else {
+        LegBuffers::default()
+    };
+    let _mic_watch = plat.watch_devices(mic_supervisor.signal()).ok();
+    // This is an archive policy, not a claim about an unavailable device's
+    // native format. Recovery installs conversion from its authoritative format.
+    let mic_archive =
+        mic_format.unwrap_or(StreamFormat::new(16_000, 1, fotw_audio::SampleFormat::F32));
 
     // A format per leg — the mic is its own device and usually mono where the
     // system tap is stereo; recording the system's shape for both is #80.
     let wal = SessionWal::create_with_formats(
         root,
         TrackFormat::new(sys_format.sample_rate_hz, sys_format.channels),
-        mic_format.map(|f| TrackFormat::new(f.sample_rate_hz, f.channels)),
+        Some(TrackFormat::new(
+            mic_archive.sample_rate_hz,
+            mic_archive.channels,
+        )),
     )
     .map_err(|e| format!("could not create the session: {e}"))?;
     let dir = wal.dir().to_path_buf();
@@ -1971,7 +2071,7 @@ pub async fn run_supervised(
         .to_string_lossy()
         .into_owned();
     let (sys_stt, sys_events, mic_stt, mic_events) =
-        open_legs(transcription, &session_id, anchors, mic_format.is_some());
+        open_legs(transcription, &session_id, anchors, true);
 
     let stop = Arc::new(AtomicBool::new(false));
     let pump_stop = Arc::clone(&stop);
@@ -1987,24 +2087,47 @@ pub async fn run_supervised(
     // Everything the pump needs to service each leg between drains. The taps
     // themselves move into the pump with their supervisors: under supervision it
     // is the pump that stops them, so nothing on this task can touch them again.
+    control.capture_health.publish(
+        fotw_web::recorder::CaptureSource::System,
+        sys_supervisor.recovery_status(),
+    );
+    control.capture_health.publish(
+        fotw_web::recorder::CaptureSource::Mic,
+        mic_supervisor.recovery_status(),
+    );
+    let mic_converter = archive_converter(
+        mic_archive,
+        TrackFormat::new(mic_archive.sample_rate_hz, mic_archive.channels),
+    )?;
     let supervision = Supervision {
         plat: Arc::clone(&plat),
         epoch_ns,
         system: ChannelMeta {
+            slot: sys_slot,
+            converter: archive_converter(
+                sys_format,
+                TrackFormat::new(sys_format.sample_rate_hz, sys_format.channels),
+            )?,
+            retired_drops: 0,
+            startup_padded_until: None,
+            monitor: control.capture_health.clone(),
             label: "system",
             channel: LegChannel::System,
             supervisor: sys_supervisor,
             activity: Arc::clone(&sys_activity),
-            format: sys_format,
             wal_format: TrackFormat::new(sys_format.sample_rate_hz, sys_format.channels),
         },
-        mic: mic_format.map(|f| ChannelMeta {
+        mic: Some(ChannelMeta {
+            slot: mic_slot,
+            converter: mic_converter,
+            retired_drops: 0,
+            startup_padded_until: mic_format.is_none().then_some(epoch_ns),
+            monitor: control.capture_health.clone(),
             label: "mic",
             channel: LegChannel::Mic,
             supervisor: mic_supervisor,
             activity: Arc::clone(&mic_activity),
-            format: f,
-            wal_format: TrackFormat::new(f.sample_rate_hz, f.channels),
+            wal_format: TrackFormat::new(mic_archive.sample_rate_hz, mic_archive.channels),
         }),
         interval: SUPERVISE_INTERVAL,
         last: Instant::now(),
@@ -2020,7 +2143,7 @@ pub async fn run_supervised(
             sys_cons,
             mic_cons,
             sys_format,
-            mic_format,
+            Some(mic_archive),
             feeds,
             PumpStop {
                 stopped: &pump_stop,
@@ -2051,13 +2174,14 @@ pub async fn run_supervised(
         )
     });
 
-    // Capture is live: both supervisors returned from `start`, the WAL exists
-    // and the pump is draining and polling the watchdogs.
-    control.ready.signal_session(
+    // Capture is live: the required system source started, the optional mic
+    // is either started or recovering, and the pump owns both supervisors.
+    control.ready.signal_capture(
         dir.file_name()
             .expect("session directory")
             .to_string_lossy()
             .into_owned(),
+        started_at_ms,
     );
 
     tokio::select! {
@@ -2066,6 +2190,9 @@ pub async fn run_supervised(
         }
         () = stop_signal.wait() => {}
     }
+    control
+        .ready
+        .signal_capture_stopped(crate::recording::now_ms());
 
     // Under supervision the pump owns the taps and closes them itself the
     // instant it sees this latch — detached, so a wedged HAL teardown cannot
@@ -2100,15 +2227,23 @@ pub async fn run_supervised(
     };
 
     let system_buffers = sys_counters.snapshot();
-    let mic_buffers = mic_format.is_some().then(|| mic_counters.snapshot());
+    let mic_snapshot = mic_counters.snapshot();
+    let mic_buffers = Some(LegBuffers {
+        total: mic_snapshot
+            .total
+            .saturating_sub(discarded_mic_buffers.total),
+        silent: mic_snapshot
+            .silent
+            .saturating_sub(discarded_mic_buffers.silent),
+    });
 
     for (leg, buffers) in [("system", Some(system_buffers)), ("mic", mic_buffers)] {
         let Some(buffers) = buffers else { continue };
         match buffers.audio() {
             LegAudio::Audible => {}
             LegAudio::Nothing => control.errors.record(format!(
-                "capture ({leg}): the tap started and then delivered no audio \
-                 at all — the device stalled rather than went quiet"
+                "capture ({leg}): the source delivered no audio — the device \
+                 may be unavailable or stalled"
             )),
             LegAudio::Silent => control.errors.record(format!(
                 "capture ({leg}): every one of {} buffers was digitally silent \
@@ -2162,6 +2297,7 @@ pub async fn run_supervised(
     Ok(SessionOutcome {
         dir,
         started_at_ms,
+        capture_ended_at_ms: control.ready.capture_ended_at_ms(),
         system_samples,
         mic_samples,
         system_buffers,
@@ -2204,6 +2340,10 @@ fn spawn_leg_collector(
                     crate::diag!("  ! transcription ({leg}): {e}");
                     errors.record(format!("{leg}: {e}"));
                 }
+                // A local worker can be stuck inside native inference even after
+                // its deadline. Closed fences late output without waiting for
+                // that worker to drop its event sender.
+                StreamEvent::State(fotw_stt::StreamState::Closed) => break,
                 _ => {}
             }
         }
@@ -2233,7 +2373,8 @@ impl LegStream {
     ///
     /// Deepgram is asked to finalize first so the utterance in flight is not
     /// lost with the socket. A local leg's close already transcribes everything
-    /// written before it, however far behind the model has fallen.
+    /// written before it within a bounded drain deadline; overload/timeouts
+    /// retain audio and report incomplete transcription.
     async fn finish(&self) {
         match self {
             Self::Deepgram(stream) => {
@@ -2383,11 +2524,82 @@ fn pump_loop(
     pump_drain(wal, sys, mic, sys_format, mic_format, stt, stop, None)
 }
 
+struct PumpTranscription {
+    stt: SttFeeds,
+    resampler: Resampler16k,
+    mic_resampler: Option<(Resampler16k, u16)>,
+    system_channels: u16,
+    hush: Vec<i16>,
+}
+impl PumpTranscription {
+    fn feed(&mut self, channel: LegChannel, pcm: &[f32]) -> Result<(), String> {
+        match channel {
+            LegChannel::System => {
+                if let Some(h) = self.stt.system.as_ref() {
+                    let resampled = self
+                        .resampler
+                        .process_all(pcm)
+                        .map_err(|e| format!("resample failed: {e}"))?;
+                    if !resampled.is_empty() {
+                        let mono = Downmixer::to_mono(&resampled, self.system_channels);
+                        // The gate's reference: what the speakers are playing is
+                        // exactly what the system feed carries.
+                        if let Some(gate) = self.stt.echo_gate.as_mut() {
+                            gate.push_system(&mono);
+                        }
+                        h.write_pcm(&Downmixer::to_i16(&mono));
+                    }
+                }
+            }
+            LegChannel::Mic => {
+                if let (Some(h), Some((r, channels))) =
+                    (self.stt.mic.as_ref(), self.mic_resampler.as_mut())
+                {
+                    let resampled = r
+                        .process_all(pcm)
+                        .map_err(|e| format!("mic resample failed: {e}"))?;
+                    if !resampled.is_empty() {
+                        let mono = Downmixer::to_mono(&resampled, *channels);
+                        // CAP-11 v1: on speakers the mic is mostly a copy of the
+                        // system leg — transcribing it again costs money and
+                        // attributes the far end's words to the user. Withheld
+                        // from the FEED only; the WAL above already has the raw
+                        // audio, so this is revertible in principle (the same
+                        // text-not-audio stance Descript documents for its
+                        // mic-bleed fix).
+                        let suppress = self.stt.echo_gate.as_mut().is_some_and(|g| {
+                            g.assess(&mono) == fotw_pipeline::echo::GateVerdict::Suppress
+                        });
+                        if suppress {
+                            // Silence, not absence (#79). This leg's clock is the
+                            // amount of PCM its socket has swallowed — Deepgram
+                            // stamps every segment from it — so withholding a
+                            // chunk does not skip a second, it *deletes* one, and
+                            // every word after it is stamped a second early.
+                            // Suppression's effect survives the change because
+                            // silence transcribes as nothing; what it stops
+                            // costing is time. Feeding zeros also keeps the socket
+                            // from going quiet through sustained far-end speech,
+                            // which is the audio-starvation half of #70.
+                            self.hush.clear();
+                            self.hush.resize(mono.len(), 0);
+                            h.write_pcm(&self.hush);
+                        } else {
+                            h.write_pcm(&Downmixer::to_i16(&mono));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// [`pump_loop`], plus live tap recovery when `supervision` is present.
 ///
 /// The one loop both paths share. When supervising, every
 /// [`Supervision::interval`] it polls each leg's watchdog and applies any
-/// rebuild's gap padding to the WAL in stream order (see [`supervise_channel`]),
+/// rebuild's gap padding to the WAL in stream order (see [`supervise_channel_observed`]),
 /// and on the first sight of the stop latch it detaches and closes the taps
 /// itself — the supervisors it owns are the only handle to them (#85).
 #[allow(clippy::too_many_arguments)] // the WAL, both rings and their formats, the feeds, the latch, and supervision
@@ -2397,7 +2609,7 @@ fn pump_drain(
     mut mic: RingConsumer,
     sys_format: StreamFormat,
     mic_format: Option<StreamFormat>,
-    mut stt: SttFeeds,
+    stt: SttFeeds,
     stop: PumpStop<'_>,
     mut supervision: Option<Supervision>,
 ) -> Result<PumpCounts, String> {
@@ -2405,22 +2617,30 @@ fn pump_drain(
     let (mut sys_written, mut mic_written) = (0u64, 0u64);
     // What a suppressed mic chunk is fed as. Kept across iterations because
     // chunk sizes settle: after the first few rounds this stops growing.
-    let mut hush: Vec<i16> = Vec::new();
+    let hush: Vec<i16> = Vec::new();
 
-    let mut resampler = Resampler16k::new(sys_format.sample_rate_hz, sys_format.channels)
+    let resampler = Resampler16k::new(sys_format.sample_rate_hz, sys_format.channels)
         .map_err(|e| format!("resampler: {e}"))?;
 
     // The mic gets its own resampler because its format is its own: the
     // system tap is 48k stereo, a USB headset mic is whatever it is, and
     // reusing the system resampler was never an option — which is exactly why
     // the old single-stream code had a `let _ = mic_format;` here.
-    let mut mic_resampler = match (&stt.mic, mic_format) {
+    let mic_resampler = match (&stt.mic, mic_format) {
         (Some(_), Some(f)) => Some((
             Resampler16k::new(f.sample_rate_hz, f.channels)
                 .map_err(|e| format!("mic resampler: {e}"))?,
             f.channels,
         )),
         _ => None,
+    };
+
+    let mut transcription = PumpTranscription {
+        stt,
+        resampler,
+        mic_resampler,
+        system_channels: sys_format.channels,
+        hush,
     };
 
     // Armed on the pass that first sees the latch, and the only thing that
@@ -2440,7 +2660,30 @@ fn pump_drain(
             // seen, and only once: every later pass has `drain_by == Some`, so
             // a now-tapless supervisor is never asked to rebuild below.
             if let Some(sup) = supervision.as_mut() {
+                let startup_gap = sup.mic.as_ref().and_then(|m| {
+                    m.supervisor.pending_startup_gap().map(|mut gap| {
+                        gap.start_ns = gap
+                            .start_ns
+                            .max(m.startup_padded_until.unwrap_or(sup.epoch_ns));
+                        gap
+                    })
+                });
                 sup.stop_capture();
+                if let (Some(gap), Some(meta)) = (startup_gap, sup.mic.as_ref()) {
+                    apply_leg_gap(
+                        &mut wal,
+                        LegChannel::Mic,
+                        "mic",
+                        &gap,
+                        meta.wal_format,
+                        sup.epoch_ns,
+                        &mut scratch,
+                        &mut |pcm| {
+                            mic_written += pcm.len() as u64;
+                            transcription.feed(LegChannel::Mic, pcm)
+                        },
+                    )?;
+                }
             }
         }
 
@@ -2452,22 +2695,30 @@ fn pump_drain(
             && let Some(sup) = supervision.as_mut()
             && sup.last.elapsed() >= sup.interval
         {
-            supervise_channel(
+            supervise_channel_observed(
                 &mut wal,
                 &mut sup.system,
                 &mut sys,
                 &*sup.plat,
                 sup.epoch_ns,
                 &mut scratch,
+                &mut |pcm| {
+                    sys_written += pcm.len() as u64;
+                    transcription.feed(LegChannel::System, pcm)
+                },
             )?;
             if let Some(mic_meta) = sup.mic.as_mut() {
-                supervise_channel(
+                supervise_channel_observed(
                     &mut wal,
                     mic_meta,
                     &mut mic,
                     &*sup.plat,
                     sup.epoch_ns,
                     &mut scratch,
+                    &mut |pcm| {
+                        mic_written += pcm.len() as u64;
+                        transcription.feed(LegChannel::Mic, pcm)
+                    },
                 )?;
             }
             sup.last = Instant::now();
@@ -2477,71 +2728,37 @@ fn pump_drain(
 
         let n = sys.pop_into(&mut scratch);
         if n > 0 {
+            let normalized = supervision
+                .as_mut()
+                .map(|s| s.system.converter.process(&scratch[..n]))
+                .transpose()
+                .map_err(|e| e.to_string())?;
+            let pcm = normalized.as_deref().unwrap_or(&scratch[..n]);
             // Raw first, always. Derived work can fail; this must not.
-            wal.write_system(&scratch[..n])
+            wal.write_system(pcm)
                 .map_err(|e| format!("system write failed: {e}"))?;
-            sys_written += n as u64;
+            sys_written += pcm.len() as u64;
             moved = true;
 
-            if let Some(h) = stt.system.as_ref() {
-                let resampled = resampler
-                    .process_all(&scratch[..n])
-                    .map_err(|e| format!("resample failed: {e}"))?;
-                if !resampled.is_empty() {
-                    let mono = Downmixer::to_mono(&resampled, sys_format.channels);
-                    // The gate's reference: what the speakers are playing is
-                    // exactly what the system feed carries.
-                    if let Some(gate) = stt.echo_gate.as_mut() {
-                        gate.push_system(&mono);
-                    }
-                    h.write_pcm(&Downmixer::to_i16(&mono));
-                }
-            }
+            transcription.feed(LegChannel::System, pcm)?;
         }
 
         let m = mic.pop_into(&mut scratch);
         if m > 0 {
+            let normalized = supervision
+                .as_mut()
+                .and_then(|s| s.mic.as_mut())
+                .map(|meta| meta.converter.process(&scratch[..m]))
+                .transpose()
+                .map_err(|e| e.to_string())?;
+            let pcm = normalized.as_deref().unwrap_or(&scratch[..m]);
             // Raw first here too, for the same reason as the system leg.
-            wal.write_mic(&scratch[..m])
+            wal.write_mic(pcm)
                 .map_err(|e| format!("mic write failed: {e}"))?;
-            mic_written += m as u64;
+            mic_written += pcm.len() as u64;
             moved = true;
 
-            if let (Some(h), Some((r, channels))) = (stt.mic.as_ref(), mic_resampler.as_mut()) {
-                let resampled = r
-                    .process_all(&scratch[..m])
-                    .map_err(|e| format!("mic resample failed: {e}"))?;
-                if !resampled.is_empty() {
-                    let mono = Downmixer::to_mono(&resampled, *channels);
-                    // CAP-11 v1: on speakers the mic is mostly a copy of the
-                    // system leg — transcribing it again costs money and
-                    // attributes the far end's words to the user. Withheld
-                    // from the FEED only; the WAL above already has the raw
-                    // audio, so this is revertible in principle (the same
-                    // text-not-audio stance Descript documents for its
-                    // mic-bleed fix).
-                    let suppress = stt.echo_gate.as_mut().is_some_and(|g| {
-                        g.assess(&mono) == fotw_pipeline::echo::GateVerdict::Suppress
-                    });
-                    if suppress {
-                        // Silence, not absence (#79). This leg's clock is the
-                        // amount of PCM its socket has swallowed — Deepgram
-                        // stamps every segment from it — so withholding a
-                        // chunk does not skip a second, it *deletes* one, and
-                        // every word after it is stamped a second early.
-                        // Suppression's effect survives the change because
-                        // silence transcribes as nothing; what it stops
-                        // costing is time. Feeding zeros also keeps the socket
-                        // from going quiet through sustained far-end speech,
-                        // which is the audio-starvation half of #70.
-                        hush.clear();
-                        hush.resize(mono.len(), 0);
-                        h.write_pcm(&hush);
-                    } else {
-                        h.write_pcm(&Downmixer::to_i16(&mono));
-                    }
-                }
-            }
+            transcription.feed(LegChannel::Mic, pcm)?;
         }
 
         match drain_by {
@@ -2563,7 +2780,7 @@ fn pump_drain(
         }
     }
 
-    if let Some(gate) = &stt.echo_gate {
+    if let Some(gate) = &transcription.stt.echo_gate {
         let (assessed, suppressed) = gate.stats();
         if suppressed > 0 {
             // Once, at the end — CAP-11's metric, and the honest nudge: the
@@ -2575,6 +2792,18 @@ fn pump_drain(
         }
     }
 
+    if let Some(sup) = supervision.as_mut() {
+        let tail = sup.system.converter.finish().map_err(|e| e.to_string())?;
+        wal.write_system(&tail).map_err(|e| e.to_string())?;
+        sys_written += tail.len() as u64;
+        transcription.feed(LegChannel::System, &tail)?;
+        if let Some(mic) = sup.mic.as_mut() {
+            let tail = mic.converter.finish().map_err(|e| e.to_string())?;
+            wal.write_mic(&tail).map_err(|e| e.to_string())?;
+            mic_written += tail.len() as u64;
+            transcription.feed(LegChannel::Mic, &tail)?;
+        }
+    }
     wal.flush().map_err(|e| format!("flush failed: {e}"))?;
     // Finalize stamps `ended_at_ms`. Without it every cleanly-ended meeting
     // looks crashed and reappears in the recovery list forever, which trains
@@ -2588,7 +2817,11 @@ fn pump_drain(
     Ok(PumpCounts {
         system_samples: sys_written,
         mic_samples: mic_written,
-        dropped_samples: sys.dropped_frames() + mic.dropped_frames(),
+        dropped_samples: sys.dropped_frames()
+            + mic.dropped_frames()
+            + supervision.as_ref().map_or(0, |s| {
+                s.system.retired_drops + s.mic.as_ref().map_or(0, |m| m.retired_drops)
+            }),
         abandoned_samples: abandoned,
     })
 }
@@ -3316,7 +3549,7 @@ mod supervised_recovery_tests {
     /// capture path wires one: its own ring, its own dual counters, its own
     /// supervisor — on a clock the test moves by hand, so a five-second stall
     /// costs no wall-clock time. Returns the leg's ring consumer (which the pump
-    /// owns on the real path and [`supervise_channel`] drains through) alongside
+    /// owns on the real path and [`supervise_channel_observed`] drains through) alongside
     /// the two counter handles the session would also hold, so a test can assert
     /// on either.
     fn fake_leg(
@@ -3354,11 +3587,15 @@ mod supervised_recovery_tests {
         supervisor.start().unwrap();
         (
             ChannelMeta {
+                slot,
+                converter: archive_converter(format, wal_format).unwrap(),
+                retired_drops: 0,
+                startup_padded_until: None,
+                monitor: crate::capture_health::CaptureMonitor::default(),
                 label,
                 channel,
                 supervisor,
                 activity: Arc::clone(&activity),
-                format,
                 wal_format,
             },
             consumer,
@@ -3459,6 +3696,500 @@ mod supervised_recovery_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn pump_publishes_independent_health_and_consumes_only_the_requested_retry() {
+        use fotw_web::recorder::{CaptureDelivery, CaptureSource};
+        let root = scratch_dir("health-retry");
+        let clock = ManualClock::new();
+        let plat = MockPlatform::macos_taps();
+        let format = TrackFormat::new(8_000, 1);
+        let mut wal = SessionWal::create_with_formats(&root, format, Some(format)).unwrap();
+        let (mut system, mut sys_cons, sys_activity, _) = fake_leg(
+            "system",
+            LegChannel::System,
+            TapId::system_default(),
+            format,
+            &clock,
+        );
+        let (mut mic, mut mic_cons, _, _) = fake_leg(
+            "mic",
+            LegChannel::Mic,
+            TapId::mic("fixture"),
+            format,
+            &clock,
+        );
+        mic.monitor = system.monitor.clone();
+        let monitor = system.monitor.clone();
+        let mut scratch = vec![0.0; 8_000];
+        for _ in 0..700 {
+            clock.advance(Duration::from_millis(100));
+            sys_activity.record(800, false);
+            supervise_channel(&mut wal, &mut system, &mut sys_cons, &plat, 0, &mut scratch)
+                .unwrap();
+            supervise_channel(&mut wal, &mut mic, &mut mic_cons, &plat, 0, &mut scratch).unwrap();
+        }
+        let health = monitor.snapshot().unwrap();
+        assert_eq!(health.system.state, CaptureDelivery::Healthy);
+        assert_eq!(health.mic.state, CaptureDelivery::Exhausted);
+        assert_eq!(system.supervisor.rebuilds(), 0);
+        assert_eq!(mic.supervisor.rebuilds(), 3);
+        assert!(monitor.request_retry(CaptureSource::Mic));
+        clock.advance(Duration::from_millis(100));
+        supervise_channel(&mut wal, &mut mic, &mut mic_cons, &plat, 0, &mut scratch).unwrap();
+        assert_eq!(mic.supervisor.rebuilds(), 4);
+        assert_eq!(
+            monitor.snapshot().unwrap().mic.state,
+            CaptureDelivery::Confirming
+        );
+        assert_eq!(system.supervisor.rebuilds(), 0);
+        assert!(!monitor.take_retry(CaptureSource::Mic));
+        drop(wal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replacement_start_samples_stay_after_the_recovery_gap() {
+        struct StartPcmTap {
+            inner: FakeTap,
+            pcm: Vec<f32>,
+        }
+        impl AudioTap for StartPcmTap {
+            fn id(&self) -> &TapId {
+                self.inner.id()
+            }
+            fn format(&self) -> StreamFormat {
+                self.inner.format()
+            }
+            fn format_is_authoritative(&self) -> bool {
+                self.inner.format_is_authoritative()
+            }
+            fn start(&mut self, sink: Box<dyn FrameSink>) -> Result<StreamFormat, TapError> {
+                let format = self.inner.start(sink)?;
+                self.inner.emit(&self.pcm);
+                Ok(format)
+            }
+            fn stop(&mut self) -> Result<(), TapError> {
+                self.inner.stop()
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let clock = ManualClock::new();
+        let plat = MockPlatform::macos_taps();
+        let wal_format = TrackFormat::new(48_000, 2);
+        let (mut meta, _old_consumer, activity, counters) = fake_leg(
+            "system",
+            LegChannel::System,
+            TapId::system_default(),
+            wal_format,
+            &clock,
+        );
+        meta.supervisor.stop().unwrap();
+        let (producer, fresh_consumer) = AudioRing::with_capacity_frames(48_000);
+        let mut consumer = fresh_consumer;
+        let slot = ProducerSlot::holding(producer);
+        let sink_slot = slot.clone();
+        let sink_activity = activity.clone();
+        let mut generation = 0;
+        meta.supervisor = CaptureSupervisor::new(
+            SupervisorConfig::default(),
+            clock.clone(),
+            move || {
+                let (format, pcm) = if generation == 0 {
+                    (
+                        StreamFormat::new(48_000, 2, SampleFormat::F32),
+                        vec![0.25; 960],
+                    )
+                } else {
+                    (
+                        StreamFormat::new(16_000, 1, SampleFormat::F32),
+                        vec![0.75; 160],
+                    )
+                };
+                generation += 1;
+                Ok(Box::new(StartPcmTap {
+                    inner: FakeTap::new(TapId::system_default(), format),
+                    pcm,
+                }))
+            },
+            move || sink_slot.sink(sink_activity.clone(), counters.clone(), 2),
+        );
+        meta.slot = slot;
+        meta.supervisor.start().unwrap();
+        let mut wal = SessionWal::create_with_formats(root.path(), wal_format, None).unwrap();
+        let mut scratch = vec![0.0; 48_000];
+        supervise_channel(&mut wal, &mut meta, &mut consumer, &plat, 0, &mut scratch).unwrap();
+        clock.advance(Duration::from_secs(6));
+        let mut forwarded = Vec::new();
+        supervise_channel_observed(
+            &mut wal,
+            &mut meta,
+            &mut consumer,
+            &plat,
+            0,
+            &mut scratch,
+            &mut |pcm| {
+                forwarded.extend_from_slice(pcm);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            forwarded.len(),
+            960 + 6 * 48_000 * 2,
+            "retired PCM and gap padding also advance the ASR feed clock"
+        );
+        wal.flush().unwrap();
+        assert_eq!(
+            consumer.slots(),
+            160,
+            "replacement PCM must remain separate until its new format is installed"
+        );
+        let bytes = std::fs::read(wal.dir().join("system.pcm")).unwrap();
+        assert_eq!(
+            bytes.len() / 2,
+            960 + 6 * 48_000 * 2,
+            "only old PCM belongs before gap padding"
+        );
+        assert!(bytes[960 * 2..].iter().all(|byte| *byte == 0));
+        struct FixtureFeed(std::sync::Mutex<Vec<i16>>);
+        impl PcmFeed for FixtureFeed {
+            fn write_pcm(&self, pcm: &[i16]) {
+                self.0.lock().unwrap().extend_from_slice(pcm);
+            }
+        }
+        let feed = Arc::new(FixtureFeed(std::sync::Mutex::new(Vec::new())));
+        let dir = wal.dir().to_owned();
+        let (_unused_producer, mic_consumer) = AudioRing::with_capacity_frames(16);
+        let stop = AtomicBool::new(true);
+        let counts = pump_drain(
+            wal,
+            consumer,
+            mic_consumer,
+            StreamFormat::new(48_000, 2, SampleFormat::F32),
+            None,
+            SttFeeds {
+                system: Some(feed.clone()),
+                mic: None,
+                echo_gate: None,
+            },
+            PumpStop {
+                stopped: &stop,
+                drain: GENEROUS_DRAIN,
+            },
+            Some(Supervision {
+                plat: Arc::new(plat),
+                epoch_ns: 0,
+                system: meta,
+                mic: None,
+                interval: SUPERVISE_INTERVAL,
+                last: Instant::now(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            counts.system_samples, 960,
+            "10 ms mono remains 10 ms archive stereo through the real pump"
+        );
+        assert_eq!(
+            feed.0.lock().unwrap().len(),
+            160,
+            "ASR receives 10 ms at 16 kHz"
+        );
+        let final_bytes = std::fs::read(dir.join("system.pcm")).unwrap();
+        assert_eq!(final_bytes.len(), bytes.len() + 960 * 2);
+        assert_eq!(&final_bytes[..bytes.len()], &bytes);
+        assert!(
+            final_bytes[bytes.len()..]
+                .chunks_exact(2)
+                .any(|v| i16::from_le_bytes([v[0], v[1]]) > 20_000)
+        );
+    }
+
+    // Exercise production startup, both rings, the pump and finalized WAL.
+    #[tokio::test]
+    async fn initially_unavailable_microphone_keeps_system_audio_and_its_full_gap() {
+        use fotw_audio::{
+            AppInfo, BoxFuture, DeviceInfo, Permission, PermissionState, PlatformCaps,
+            PlatformEvent,
+        };
+        use std::sync::{Mutex, atomic::AtomicUsize};
+        type SharedSink = Arc<Mutex<Option<Box<dyn FrameSink>>>>;
+        struct FixtureTap {
+            id: TapId,
+            format: StreamFormat,
+            sink: SharedSink,
+            fail_start: bool,
+            initial: Vec<f32>,
+        }
+        impl AudioTap for FixtureTap {
+            fn id(&self) -> &TapId {
+                &self.id
+            }
+            fn format(&self) -> StreamFormat {
+                self.format
+            }
+            fn format_is_authoritative(&self) -> bool {
+                false
+            }
+            fn start(&mut self, mut sink: Box<dyn FrameSink>) -> Result<StreamFormat, TapError> {
+                if !self.initial.is_empty() {
+                    sink.on_frames(
+                        &self.initial,
+                        CaptureTimestamp::new(0, 0),
+                        FrameFlags::empty(),
+                    );
+                }
+                *self.sink.lock().unwrap() = Some(sink);
+                if self.fail_start {
+                    Err(TapError::platform("fixture failed start"))
+                } else {
+                    Ok(self.format)
+                }
+            }
+            fn stop(&mut self) -> Result<(), TapError> {
+                self.sink.lock().unwrap().take();
+                Ok(())
+            }
+        }
+        struct FixturePlatform {
+            base: MockPlatform,
+            system: SharedSink,
+            opens: AtomicUsize,
+            mode: u8,
+        }
+        impl AudioPlatform for FixturePlatform {
+            fn caps(&self) -> PlatformCaps {
+                self.base.caps()
+            }
+            fn permission(&self, p: Permission) -> PermissionState {
+                self.base.permission(p)
+            }
+            fn request_permission(&self, p: Permission) -> BoxFuture<'static, PermissionState> {
+                self.base.request_permission(p)
+            }
+            fn mics(&self) -> Vec<DeviceInfo> {
+                self.base.mics()
+            }
+            fn capturable_apps(&self) -> Vec<AppInfo> {
+                self.base.capturable_apps()
+            }
+            fn events(&self) -> std::sync::mpsc::Receiver<PlatformEvent> {
+                self.base.events()
+            }
+            fn open_system(
+                &self,
+                _: SystemScope,
+                _: FormatRequest,
+            ) -> Result<Box<dyn AudioTap>, TapError> {
+                Ok(Box::new(FixtureTap {
+                    id: TapId::system_default(),
+                    format: StreamFormat::new(16_000, 1, SampleFormat::F32),
+                    sink: self.system.clone(),
+                    fail_start: false,
+                    initial: vec![],
+                }))
+            }
+            fn open_mic(
+                &self,
+                _: &DeviceId,
+                _: FormatRequest,
+            ) -> Result<Box<dyn AudioTap>, TapError> {
+                let n = self.opens.fetch_add(1, Ordering::SeqCst);
+                if self.mode >= 2 || (n == 0 && self.mode == 0) {
+                    return Err(TapError::platform("fixture missing mic"));
+                }
+                Ok(Box::new(FixtureTap {
+                    id: TapId::mic("default"),
+                    format: StreamFormat::new(48_000, 2, SampleFormat::F32),
+                    sink: Arc::default(),
+                    fail_start: n == 0,
+                    initial: vec![if n == 0 { -0.9 } else { 0.75 }; 960],
+                }))
+            }
+        }
+        for mode in [0, 1, 2, 3] {
+            let root = tempfile::tempdir().unwrap();
+            let clock = ManualClock::new();
+            let platform = Arc::new(FixturePlatform {
+                base: MockPlatform::macos_taps(),
+                system: Arc::default(),
+                opens: AtomicUsize::new(0),
+                mode,
+            });
+            let control = SessionControl::new();
+            let driver = async {
+                while !control.ready.is_ready() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                let initial_state = control.capture_health.snapshot().unwrap().mic.state;
+                let ticks = match mode {
+                    2 => 500,
+                    3 => 20,
+                    _ => 160,
+                };
+                for _ in 0..ticks {
+                    clock.advance(Duration::from_millis(100));
+                    platform.system.lock().unwrap().as_mut().unwrap().on_frames(
+                        &vec![0.25; 1600],
+                        CaptureTimestamp::new(clock.now_ns(), 0),
+                        FrameFlags::empty(),
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                // Give the real pump a chance to service its final due retry.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let path = root
+                    .path()
+                    .join(control.ready.session_id().unwrap())
+                    .join("mic.pcm");
+                let persisted_before_stop = std::fs::metadata(path).unwrap().len() > 0;
+                let final_state = control.capture_health.snapshot().unwrap().mic.state;
+                control.stop.stop();
+                (
+                    ticks * 1600,
+                    initial_state,
+                    final_state,
+                    persisted_before_stop,
+                )
+            };
+            let (outcome, (expected_system, initial_state, final_state, persisted_before_stop)) =
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    tokio::join!(
+                        run_supervised(
+                            root.path(),
+                            platform.clone(),
+                            clock.clone(),
+                            Transcription::Disabled,
+                            Duration::from_secs(60),
+                            control.clone()
+                        ),
+                        driver
+                    )
+                })
+                .await
+                .expect("fixture recording must finish");
+            let outcome = outcome.unwrap();
+            assert_eq!(
+                initial_state,
+                fotw_web::recorder::CaptureDelivery::Recovering
+            );
+            assert_eq!(
+                final_state,
+                match mode {
+                    2 => fotw_web::recorder::CaptureDelivery::Exhausted,
+                    3 => fotw_web::recorder::CaptureDelivery::Recovering,
+                    _ => fotw_web::recorder::CaptureDelivery::Confirming,
+                }
+            );
+            assert!(
+                persisted_before_stop,
+                "missing audio must be persisted before Stop"
+            );
+            assert_eq!(
+                outcome.mic_buffers.unwrap().total,
+                if mode >= 2 { 0 } else { 1 },
+                "discarded failed-start samples must not count as captured audio"
+            );
+            assert_eq!(
+                outcome.system_samples, expected_system,
+                "healthy source must keep every fixture sample"
+            );
+            let system = std::fs::read(outcome.dir.join("system.pcm")).unwrap();
+            assert!(
+                system
+                    .chunks_exact(2)
+                    .all(|v| i16::from_le_bytes([v[0], v[1]]) > 7000)
+            );
+            let mic = std::fs::read(outcome.dir.join("mic.pcm"))
+                .expect("an initially missing microphone must retain its archive track");
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(outcome.dir.join("manifest.json")).unwrap())
+                    .unwrap();
+            let gaps = manifest["gaps"].as_array().unwrap();
+            let gap = gaps
+                .iter()
+                .find(|g| {
+                    g["reason"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("initially-unavailable")
+                })
+                .expect("startup outage must be explicit");
+            assert_eq!(gap["start_ms"], 0);
+            assert_eq!(
+                gaps.len(),
+                1,
+                "incremental padding must not grow the manifest every poll"
+            );
+            let end_ms = gap["end_ms"].as_u64().unwrap();
+            let pad_samples = end_ms as usize * 16;
+            assert!(
+                mic[..pad_samples * 2].iter().all(|v| *v == 0),
+                "failed-start PCM must not leak before padding"
+            );
+            if mode >= 2 {
+                assert_eq!(end_ms, if mode == 2 { 50_000 } else { 2000 });
+                assert_eq!(mic.len(), pad_samples * 2);
+                assert_eq!(
+                    platform.opens.load(Ordering::SeqCst),
+                    if mode == 2 { 3 } else { 1 }
+                );
+            } else {
+                assert!((15_000..=16_000).contains(&end_ms));
+                assert_eq!(
+                    mic.len(),
+                    (pad_samples + 160) * 2,
+                    "48 kHz stereo recovery must become 10 ms at the reserved 16 kHz mono archive format"
+                );
+                assert!(
+                    mic[pad_samples * 2..]
+                        .chunks_exact(2)
+                        .any(|v| i16::from_le_bytes([v[0], v[1]]) > 20_000)
+                );
+                assert_eq!(platform.opens.load(Ordering::SeqCst), 2);
+            }
+            assert_eq!(outcome.mic_samples as usize * 2, mic.len());
+        }
+    }
+
+    #[test]
+    fn capture_overflow_never_leaves_a_partial_interleaved_frame() {
+        for supervised in [false, true] {
+            let (producer, mut consumer) = AudioRing::with_capacity_frames(5);
+            let counters = LegCounters::default();
+            let mut sink: Box<dyn FrameSink> = if supervised {
+                ProducerSlot::holding(producer).sink(Arc::new(ActivityCounters::new()), counters, 2)
+            } else {
+                Box::new(RingSink { producer, counters })
+            };
+            sink.on_frames(
+                &[1.0, -1.0, 2.0, -2.0],
+                CaptureTimestamp::new(0, 0),
+                FrameFlags::empty(),
+            );
+            sink.on_frames(
+                &[3.0, -3.0, 4.0, -4.0],
+                CaptureTimestamp::new(2, 1),
+                FrameFlags::empty(),
+            );
+            let mut scratch = [0.0; 8];
+            assert_eq!(
+                consumer.pop_into(&mut scratch),
+                4,
+                "supervised={supervised}: do not append a half frame"
+            );
+            assert_eq!(&scratch[..4], &[1.0, -1.0, 2.0, -2.0]);
+            assert_eq!(consumer.dropped_frames(), 4);
+            sink.on_frames(
+                &[5.0, -5.0],
+                CaptureTimestamp::new(4, 2),
+                FrameFlags::empty(),
+            );
+            assert_eq!(consumer.pop_into(&mut scratch), 2);
+            assert_eq!(&scratch[..2], &[5.0, -5.0]);
+        }
+    }
+
     /// The daemon-specific requirement the CLI path has no equivalent of: the
     /// supervised sink feeds *both* counter sets. The watchdog reads
     /// [`ActivityCounters`] to decide the tap is alive; the session reads
@@ -3492,6 +4223,35 @@ mod supervised_recovery_tests {
             counters.t0_ns(),
             Some(123_456),
             "and captured this leg's t0 for anchoring (#86)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod local_collector_shutdown_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn closed_event_finishes_collector_even_if_model_still_owns_sender() {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut task = spawn_leg_collector(
+            "fixture",
+            receiver,
+            sink,
+            SttErrors::default(),
+            SegmentTap::default(),
+        );
+        sender
+            .send(StreamEvent::State(fotw_stt::StreamState::Closed))
+            .unwrap();
+        let completed = tokio::time::timeout(Duration::from_millis(100), &mut task)
+            .await
+            .is_ok();
+        task.abort();
+        assert!(
+            completed,
+            "stalled inference sender must not hold a closed session collector alive"
         );
     }
 }

@@ -159,6 +159,7 @@ async fn main() -> Result<(), String> {
         let outcome = SessionOutcome {
             dir: root.clone(),
             started_at_ms,
+            capture_ended_at_ms: None,
             system_samples: t * 48,
             mic_samples: 0,
             system_buffers: LegBuffers {
@@ -215,9 +216,31 @@ async fn main() -> Result<(), String> {
         println!("  seeded {id}  {title}");
     }
 
+    // An unfinished recording's saved notes, for recovery UI checks without audio.
+    db.save_session_note(
+        &fotw_store::SessionNoteDocument {
+            session_id: format!("preview-recovery-{}", std::process::id()),
+            started_at_ms: now_ms.saturating_sub(7_200_000) as i64,
+            note: fotw_store::NoteDocument {
+                revision: 0,
+                body_md: "Recovery fixture: revisit the migration plan.\n\nCafé follow-up.".into(),
+                anchors: vec![fotw_store::NoteAnchor::new(
+                    0,
+                    "Recovery fixture: revisit the migration plan.",
+                    250,
+                )],
+            },
+        },
+        1_000,
+    )
+    .map_err(|e| e.to_string())?;
+
     // The real server, the real ingress policy, the real embedded assets.
     let source = Arc::new(fotw_web::StoreSource::new(db));
-    let server = fotw_web::WebServer::bind(0, source)
+    let recorder = std::env::args()
+        .any(|arg| arg == "--capture-recovery")
+        .then(|| Arc::new(RecoveryPreview::new()) as Arc<dyn fotw_web::RecorderControl>);
+    let server = fotw_web::WebServer::bind_with_recorder(0, source, recorder)
         .await
         .map_err(|e| format!("bind: {e}"))?;
     let state = server.state().clone();
@@ -226,4 +249,81 @@ async fn main() -> Result<(), String> {
     println!("\n  {}", state.launch_url());
     println!("\n  Ctrl-C to stop. The library is thrown away on the next run.");
     server.serve().await.map_err(|e| format!("server: {e}"))
+}
+
+/// Synthetic health UI fixture. No microphone, system tap, or provider opens.
+struct RecoveryPreview {
+    started: u64,
+    retry: std::sync::Mutex<Option<std::time::Instant>>,
+    stopped: std::sync::atomic::AtomicBool,
+}
+impl RecoveryPreview {
+    fn new() -> Self {
+        Self {
+            started: fotw_store::now_ms() as u64,
+            retry: std::sync::Mutex::new(None),
+            stopped: false.into(),
+        }
+    }
+}
+impl fotw_web::RecorderControl for RecoveryPreview {
+    fn start(&self) -> Result<fotw_web::RecordingStatus, fotw_web::RecorderError> {
+        Err(fotw_web::RecorderError::AlreadyRecording)
+    }
+    fn stop(&self) -> Result<fotw_web::RecordingStatus, fotw_web::RecorderError> {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(self.status())
+    }
+    fn retry_capture(
+        &self,
+        id: &str,
+        source: fotw_web::recorder::CaptureSource,
+    ) -> Result<(), fotw_web::RecorderError> {
+        if id != "preview-capture-recovery"
+            || source != fotw_web::recorder::CaptureSource::Mic
+            || self.stopped.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(fotw_web::RecorderError::NotRecording);
+        }
+        let mut retry = self.retry.lock().unwrap();
+        if retry.is_some() {
+            return Err(fotw_web::RecorderError::Failed(
+                "retry already requested".into(),
+            ));
+        }
+        *retry = Some(std::time::Instant::now());
+        Ok(())
+    }
+    fn status(&self) -> fotw_web::RecordingStatus {
+        use fotw_web::recorder::{CaptureDelivery, CaptureHealth, SourceCaptureStatus};
+        if self.stopped.load(std::sync::atomic::Ordering::Relaxed) {
+            return fotw_web::RecordingStatus::idle();
+        }
+        let retry = self.retry.lock().unwrap();
+        let state = match *retry {
+            None => CaptureDelivery::Exhausted,
+            Some(at) if at.elapsed().as_secs() < 10 => CaptureDelivery::Confirming,
+            Some(_) => CaptureDelivery::Healthy,
+        };
+        fotw_web::RecordingStatus::recording(
+            self.started,
+            (fotw_store::now_ms() as u64).saturating_sub(self.started),
+        )
+        .with_session_id(Some("preview-capture-recovery".into()))
+        .with_capture_health(Some(CaptureHealth {
+            system: SourceCaptureStatus {
+                state: CaptureDelivery::Healthy,
+                attempts: 0,
+                max_attempts: 3,
+                retry_in_ms: None,
+            },
+            mic: SourceCaptureStatus {
+                state,
+                attempts: if retry.is_none() { 3 } else { 1 },
+                max_attempts: 3,
+                retry_in_ms: None,
+            },
+        }))
+    }
 }

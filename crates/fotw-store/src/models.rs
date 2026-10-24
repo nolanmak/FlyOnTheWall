@@ -269,8 +269,10 @@ pub struct StoredSegment {
 /// `typed_at_ms` is relative to the meeting start, not the epoch: the meeting's
 /// start time can be corrected after the fact, and the alignment must survive
 /// that.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NoteAnchor {
+    /// Stable block identity; preserved when text or position changes.
+    pub id: String,
     /// Position of the block in the document.
     pub block_idx: i64,
     /// Snapshot of the block text, used to re-anchor after later edits.
@@ -283,6 +285,7 @@ impl NoteAnchor {
     /// Build an anchor.
     pub fn new(block_idx: i64, block_text: impl Into<String>, typed_at_ms: i64) -> Self {
         Self {
+            id: crate::new_id(),
             block_idx,
             block_text: block_text.into(),
             typed_at_ms,

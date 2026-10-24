@@ -226,6 +226,7 @@ impl ReadyTap {
 
 /// A recording in flight, or one still writing itself to disk.
 struct Live {
+    capture_health: crate::capture_health::CaptureMonitor,
     ready: crate::session::ReadySignal,
     stop: StopSignal,
     started_at_ms: u64,
@@ -413,7 +414,7 @@ impl DaemonRecorder {
     }
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -599,7 +600,9 @@ impl RecorderControl for DaemonRecorder {
         let stop = control.stop.clone();
         let ready = control.ready.clone();
         let started_at_ms = now_ms();
+        let capture_health = control.capture_health.clone();
         *slot = Some(Live {
+            capture_health: capture_health.clone(),
             ready: ready.clone(),
             stop: stop.clone(),
             started_at_ms,
@@ -630,6 +633,7 @@ impl RecorderControl for DaemonRecorder {
         // Do not answer until capture is real. Answering on spawn is what let
         // a wedged device show a RECORDING badge over an empty disk.
         if !ready.wait_timeout(self.ready_deadline) {
+            capture_health.close();
             stop.stop();
             *live.lock().unwrap_or_else(|e| e.into_inner()) = None;
             return Err(RecorderError::Failed(
@@ -656,31 +660,70 @@ impl RecorderControl for DaemonRecorder {
         let ended_at_ms = *live.stopped_at_ms.get_or_insert(now_ms());
         // Trip and return. The task clears the slot once the meeting is on
         // disk; until then status reads `finishing`.
+        live.ready.signal_capture_stopped(ended_at_ms);
+        live.capture_health.close();
         live.stop.stop();
-        Ok(RecordingStatus::finishing(live.started_at_ms, ended_at_ms)
+        let started_at_ms = live
+            .ready
+            .capture_started_at_ms()
+            .unwrap_or(live.started_at_ms);
+        let ended_at_ms = live.ready.capture_ended_at_ms().unwrap_or(ended_at_ms);
+        Ok(RecordingStatus::finishing(started_at_ms, ended_at_ms)
+            .with_capture_health(live.capture_health.snapshot())
             .with_transcription_error(live.errors.latest())
             .with_session_id(live.ready.session_id()))
+    }
+
+    fn retry_capture(
+        &self,
+        session_id: &str,
+        source: fotw_web::recorder::CaptureSource,
+    ) -> Result<(), RecorderError> {
+        let slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(live) = slot.as_ref() else {
+            return Err(RecorderError::NotRecording);
+        };
+        if live.stop.is_stopped()
+            || live.stopped_at_ms.is_some()
+            || live.ready.capture_ended_at_ms().is_some()
+            || live.ready.session_id().as_deref() != Some(session_id)
+        {
+            return Err(RecorderError::Failed(
+                "recording changed; refresh its status".into(),
+            ));
+        }
+        if !live.capture_health.request_retry(source) {
+            return Err(RecorderError::Failed(
+                "this source is not waiting for a manual retry".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn status(&self) -> RecordingStatus {
         let slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
         slot.as_ref().map_or_else(RecordingStatus::idle, |live| {
-            match live.stopped_at_ms {
+            let started_at_ms = live
+                .ready
+                .capture_started_at_ms()
+                .unwrap_or(live.started_at_ms);
+            match live.ready.capture_ended_at_ms().or(live.stopped_at_ms) {
                 // Frozen: the tap is shut, so the number cannot grow.
-                Some(ended_at_ms) => RecordingStatus::finishing(live.started_at_ms, ended_at_ms),
+                Some(ended_at_ms) => RecordingStatus::finishing(started_at_ms, ended_at_ms),
                 None => RecordingStatus::recording(
-                    live.started_at_ms,
-                    now_ms().saturating_sub(live.started_at_ms),
+                    started_at_ms,
+                    now_ms().saturating_sub(started_at_ms),
                 ),
             }
             // Kept for finishing too: a tab loaded mid-finalize must still see
             // that transcription failed, or an empty transcript is
             // indistinguishable from a quiet meeting exactly when someone goes
             // looking for the words.
+            .with_capture_health(live.capture_health.snapshot())
             .with_transcription_error(live.errors.latest())
             .with_session_id(live.ready.session_id())
             .with_auto_stop_at_ms(
-                live.started_at_ms
+                started_at_ms
                     .saturating_add(u64::try_from(self.ceiling.as_millis()).unwrap_or(u64::MAX)),
             )
         })
@@ -705,6 +748,7 @@ async fn spawn_session(
     // supervised backend runs the one that builds a per-leg supervisor and
     // rebuilds a stalled tap in place (#101). The finishing tail below is
     // identical, so only the capture call differs.
+    let capture_health = control.capture_health.clone();
     let outcome = match capture {
         SessionCapture::Prebuilt { system, mic } => {
             session::run_with_control(&root, system, mic, transcription, ceiling, control).await
@@ -713,6 +757,8 @@ async fn spawn_session(
             session::run_supervised(&root, plat, clock, transcription, ceiling, control).await
         }
     };
+
+    capture_health.close();
 
     // Free the slot here — the moment capture is safe on disk, before persist.
     // `run_…` does not return until the WAL is written and the taps are
@@ -843,4 +889,85 @@ async fn enrich_and_announce(root: &Path, meeting_id: &str, ready: &ReadyTap) {
     // Unconditional: `problems` is non-fatal and a partial enrichment — a
     // title but no summary — is still something the open tab should be shown.
     ready.emit(meeting_id, MeetingReadyReason::Enriched);
+}
+
+#[cfg(test)]
+mod capture_retry_tests {
+    use super::*;
+    use fotw_audio::supervisor::{DeliveryState, RecoveryStatus};
+    use fotw_web::recorder::{CaptureDelivery, CaptureSource};
+
+    #[tokio::test]
+    async fn retry_is_fenced_by_session_identity_source_health_and_stop() {
+        let recorder = DaemonRecorder::with_parts(
+            PathBuf::from("unused-capture-health-fixture"),
+            tokio::runtime::Handle::current(),
+            SegmentTap::default(),
+            ReadyTap::default(),
+            Box::new(|| panic!("this test must not open audio")),
+            Box::new(|| panic!("this test must not open transcription")),
+            Box::new(|_, _| panic!("this test must not persist anything")),
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+        );
+        let monitor = crate::capture_health::CaptureMonitor::default();
+        let source_status = |state| RecoveryStatus {
+            state,
+            attempts: 3,
+            max_attempts: 3,
+            retry_in_ms: None,
+        };
+        monitor.publish(CaptureSource::System, source_status(DeliveryState::Healthy));
+        monitor.publish(CaptureSource::Mic, source_status(DeliveryState::Exhausted));
+        let ready = crate::session::ReadySignal::new();
+        ready.signal_capture("current-fixture".into(), 1000);
+        *recorder.live.lock().unwrap() = Some(Live {
+            capture_health: monitor.clone(),
+            ready,
+            stop: StopSignal::new(),
+            started_at_ms: 1000,
+            stopped_at_ms: None,
+            errors: SttErrors::new(),
+        });
+        assert_eq!(
+            recorder.status().capture_health.unwrap().system.state,
+            CaptureDelivery::Healthy
+        );
+        assert!(
+            recorder
+                .retry_capture("old-fixture", CaptureSource::Mic)
+                .is_err()
+        );
+        assert!(!monitor.take_retry(CaptureSource::Mic));
+        assert!(
+            recorder
+                .retry_capture("current-fixture", CaptureSource::System)
+                .is_err()
+        );
+        assert!(
+            recorder
+                .retry_capture("current-fixture", CaptureSource::Mic)
+                .is_ok()
+        );
+        assert!(monitor.take_retry(CaptureSource::Mic));
+        assert!(
+            recorder
+                .retry_capture("current-fixture", CaptureSource::Mic)
+                .is_ok()
+        );
+        recorder.stop().unwrap();
+        assert!(
+            !monitor.take_retry(CaptureSource::Mic),
+            "Stop cancels a queued retry"
+        );
+        assert!(
+            recorder
+                .retry_capture("current-fixture", CaptureSource::Mic)
+                .is_err()
+        );
+        assert_eq!(
+            recorder.status().capture_health.unwrap().mic.state,
+            CaptureDelivery::Stopped
+        );
+    }
 }

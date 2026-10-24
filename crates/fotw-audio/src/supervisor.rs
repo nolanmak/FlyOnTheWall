@@ -58,9 +58,9 @@
 //! **Rebuilds that fail.** A machine whose audio stack is genuinely broken
 //! fails every rebuild, and retrying in a tight loop helps nobody. Attempts
 //! are bounded ([`SupervisorConfig::max_attempts`]) and exponentially spaced,
-//! and after the ceiling the supervisor says so once and stops. A device
-//! change afterwards is new evidence — the user plugged something back in —
-//! and re-arms it.
+//! and after the ceiling the supervisor says so once and stops. Device
+//! notifications cannot replenish the budget. An explicit user retry starts
+//! another episode, preserving the outage and the attempt-spacing floor.
 //!
 //! **Rebuilds that succeed and change nothing.** This is the subtler one and
 //! it is the safety net under the silence rule. A denied system-audio grant
@@ -73,22 +73,22 @@
 //! recording into a shredded one and training the user to ignore the warning
 //! that matters.
 //!
-//! So a rebuild after which no audible sample ever arrives is counted as
-//! *ineffective*, and after
-//! [`SupervisorConfig::max_ineffective_recoveries`] of them the supervisor
-//! stops acting on faults and says so once. It keeps watching: the moment a
-//! single audible buffer arrives the count resets and normal supervision
-//! resumes, so a meeting that was merely quiet costs a handful of gaps rather
-//! than ninety of them.
+//! Repeated faults count toward
+//! [`SupervisorConfig::max_ineffective_recoveries`] until ten seconds of healthy
+//! delivery confirms recovery. At the ceiling the supervisor stops acting on
+//! faults and says so once. It keeps watching and delivering audio: sustained
+//! frame progress with audible evidence releases quarantine, but a brief burst
+//! from a flapping device cannot reset the budget.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::clock::Clock;
 use crate::device_change::{Debounce, DeviceChangeKind, DeviceChangeSignal, DeviceChanges};
 use crate::error::TapError;
 use crate::format::StreamFormat;
-use crate::frames::FrameSink;
+use crate::frames::{CaptureTimestamp, FrameFlags, FrameSink};
 use crate::ids::TapId;
 use crate::tap::AudioTap;
 use crate::watchdog::{Fault, OutputProbe, TapActivity, Verdict, Watchdog, WatchdogConfig};
@@ -117,6 +117,10 @@ pub enum GapReason {
     DeviceChanged,
     /// The time spent tearing the old tap down and building the new one.
     RebuildWindow,
+    /// A callback explicitly reported an invalidated device or stream format.
+    CallbackFault,
+    /// The optional source could not be opened or started at recording startup.
+    InitiallyUnavailable,
 }
 
 impl GapReason {
@@ -128,6 +132,8 @@ impl GapReason {
             Self::TapStalledSilent => "tap-stall-silent",
             Self::DeviceChanged => "device-changed",
             Self::RebuildWindow => "rebuild-window",
+            Self::CallbackFault => "callback-fault",
+            Self::InitiallyUnavailable => "initially-unavailable",
         }
     }
 }
@@ -212,7 +218,9 @@ pub enum HealthEvent {
         /// Whether it caused a full rebuild.
         rebuilt: bool,
     },
-    /// The tap was rebuilt and capture is running again.
+    /// A tap successfully restarted. This legacy name denotes the format/gap
+    /// boundary, not proven audio health. Writers must apply it immediately;
+    /// user interfaces wait for `DeliveryConfirmed` or a healthy snapshot.
     Recovered {
         /// Which tap.
         tap: TapId,
@@ -224,6 +232,12 @@ pub enum HealthEvent {
         format: StreamFormat,
         /// What the recording lost, and what the writer must do about it.
         gaps: Vec<CaptureGap>,
+    },
+    /// Ten seconds of sustained delivery confirmed recovery. Emitted once
+    /// after each recovery, separately from the writer's restart boundary.
+    DeliveryConfirmed {
+        /// Which tap.
+        tap: TapId,
     },
     /// A rebuild attempt failed; another is scheduled.
     RecoveryFailed {
@@ -246,15 +260,15 @@ pub enum HealthEvent {
         error: String,
     },
     /// Rebuilding keeps succeeding and keeps not helping, so supervision has
-    /// paused until audible audio returns.
+    /// paused until sustained healthy delivery confirms recovery.
     ///
     /// Distinct from [`HealthEvent::GaveUp`] because the cause is different
-    /// and so is the advice: nothing failed, and the likeliest explanations
-    /// are a denied system-audio grant or a meeting that is genuinely quiet.
+    /// and so is the advice: starts succeed, but delivery may still flap or
+    /// remain silent because the meeting is quiet or permission is denied.
     RecoveryIneffective {
         /// Which tap.
         tap: TapId,
-        /// How many rebuilds produced no audible audio.
+        /// How many rebuilds failed to restore sustained healthy delivery.
         rebuilds: u32,
         /// The fault that kept recurring.
         fault: Fault,
@@ -278,6 +292,7 @@ impl HealthEvent {
     pub const fn is_user_visible(&self) -> bool {
         match self {
             Self::Recovered { .. }
+            | Self::DeliveryConfirmed { .. }
             | Self::GaveUp { .. }
             | Self::RecoveryIneffective { .. }
             | Self::NoAudioDetected { .. } => true,
@@ -310,10 +325,11 @@ impl HealthEvent {
             Self::Recovered { gaps, .. } => {
                 let lost: u64 = gaps.iter().map(CaptureGap::duration_ns).sum();
                 format!(
-                    "Audio capture recovered. {} of this recording is missing.",
+                    "Audio capture restarted; confirming healthy delivery. {} of this recording is missing.",
                     human_secs(lost)
                 )
             }
+            Self::DeliveryConfirmed { .. } => "Audio capture: healthy delivery confirmed.".into(),
             Self::RecoveryFailed { attempt, error, .. } => {
                 format!("Audio capture rebuild attempt {attempt} failed: {error}")
             }
@@ -321,14 +337,16 @@ impl HealthEvent {
                 attempts, error, ..
             } => format!(
                 "Audio capture could not be restarted after {attempts} attempts \
-                 ({error}). Recording continues, but this track will be silent."
+                 ({error}). Automatic retries are paused. Recording continues, \
+                 but audio from this source may be missing."
             ),
             Self::RecoveryIneffective { rebuilds, .. } => format!(
-                "Restarting audio capture {rebuilds} times did not bring any audio \
-                 back, so it will not be restarted again until audio returns. \
-                 Either nothing is playing, or system audio recording is not \
-                 allowed in System Settings > Privacy & Security > Screen & \
-                 System Audio Recording."
+                "Restarting audio capture {rebuilds} times did not restore sustained \
+                 audio. Automatic restarts are paused until ten seconds of \
+                 healthy audio delivery confirms recovery. \
+                 Check the audio device connection. For system audio, also \
+                 check playback and System Settings > Privacy & Security > \
+                 Screen & System Audio Recording."
             ),
             Self::NoAudioDetected { for_ns, .. } => format!(
                 "No audio detected for {}. Check that system audio recording is \
@@ -366,6 +384,36 @@ pub enum PollOutcome {
     Abandoned,
 }
 
+/// A source's delivery state, distinct from whether a device handle opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryState {
+    /// The tap started, but sustained delivery is not yet confirmed.
+    Confirming,
+    /// Sustained delivery has been observed and no subsequent fault detected.
+    Healthy,
+    /// Silence without corroborating evidence of a broken tap.
+    Quiet,
+    /// The tap is absent while a bounded recovery episode runs.
+    Recovering,
+    /// Automatic attempts are exhausted; explicit retry is available.
+    Exhausted,
+    /// Supervision has ended.
+    Stopped,
+}
+
+/// A bounded, content-free snapshot for recorder status and user interfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryStatus {
+    /// Current delivery state.
+    pub state: DeliveryState,
+    /// Recovery attempts spent in the current episode.
+    pub attempts: u32,
+    /// Configured episode ceiling.
+    pub max_attempts: u32,
+    /// Remaining delay before a scheduled attempt, in milliseconds.
+    pub retry_in_ms: Option<u64>,
+}
+
 /// Thresholds and policy for [`CaptureSupervisor`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SupervisorConfig {
@@ -384,11 +432,14 @@ pub struct SupervisorConfig {
     /// A device that chatters would otherwise defer the rebuild forever, and
     /// "forever" is a meeting that never gets recorded.
     pub device_change_debounce_ceiling: Duration,
-    /// Delay before the second rebuild attempt. Doubles each failure.
+    /// Delay before the second rebuild attempt. Doubles with the episode
+    /// attempt number, subject to the retry ceiling and interval floor.
     pub retry_backoff: Duration,
     /// Ceiling on the doubling.
     pub max_retry_backoff: Duration,
-    /// How many consecutive failed rebuilds before giving up.
+    /// Attempts per recovery episode, counting both failed and successful
+    /// starts. Ten seconds of sustained health or an explicit user retry
+    /// earns a new budget. Initial session startup is not a recovery attempt.
     pub max_attempts: u32,
     /// How many rebuilds may succeed without bringing any audible audio back
     /// before supervision pauses.
@@ -396,9 +447,10 @@ pub struct SupervisorConfig {
     /// The safety net under the silence rule, whose corroboration signal
     /// cannot reliably distinguish a stalled tap from a quiet meeting (see
     /// [`crate::watchdog`]). Three, with the default 30 s threshold, means a
-    /// meeting that simply goes quiet costs at most four short gaps and one
+    /// meeting that simply goes quiet costs at most three short gaps and one
     /// notification over two minutes rather than one every thirty seconds
-    /// forever — and the count resets the instant real audio arrives.
+    /// forever. Reset requires ten seconds of sustained healthy delivery; a
+    /// brief burst from a flapping device does not earn a new budget.
     pub max_ineffective_recoveries: u32,
     /// Which kinds of device change are worth a rebuild.
     ///
@@ -409,15 +461,11 @@ pub struct SupervisorConfig {
     /// 45-second recording into 27 rebuilds on the development machine. See
     /// that variant's documentation.
     pub rebuild_triggers: DeviceChanges,
-    /// The shortest interval between two device-change-driven rebuilds.
-    ///
-    /// The structural backstop under the same failure. A rebuild can provoke
-    /// the very notification that would trigger the next one, and no filter on
-    /// *which* notifications matter is guaranteed to catch every such path on
-    /// every macOS version. A floor on the rate is the thing that cannot be
-    /// out-argued. Stall faults are not subject to it — they have their own
-    /// timers and their own ceiling — so a genuinely dead tap still recovers
-    /// promptly.
+    /// The shortest interval between recovery attempts, including failed
+    /// opens, device changes, and explicit manual retries. Defaults to fifteen
+    /// seconds. The first recovery attempt can begin immediately; subsequent
+    /// attempts retain this floor even after sustained health resets the budget.
+    /// Device changes within this window also avoid unnecessary teardown.
     pub min_rebuild_interval: Duration,
     /// Whether a device change forces a full rebuild.
     ///
@@ -445,9 +493,9 @@ impl Default for SupervisorConfig {
             watchdog: WatchdogConfig::default(),
             device_change_debounce: Duration::from_millis(300),
             device_change_debounce_ceiling: Duration::from_secs(1),
-            retry_backoff: Duration::from_millis(250),
-            max_retry_backoff: Duration::from_secs(5),
-            max_attempts: 5,
+            retry_backoff: Duration::from_secs(15),
+            max_retry_backoff: Duration::from_secs(30),
+            max_attempts: 3,
             max_ineffective_recoveries: 3,
             rebuild_triggers: DeviceChanges::of([
                 DeviceChangeKind::DefaultOutput,
@@ -455,7 +503,7 @@ impl Default for SupervisorConfig {
                 DeviceChangeKind::StreamFormat,
                 DeviceChangeKind::DidWake,
             ]),
-            min_rebuild_interval: Duration::from_secs(3),
+            min_rebuild_interval: Duration::from_secs(15),
             rebuild_on_device_change: true,
         }
     }
@@ -466,11 +514,44 @@ type OpenFn = Box<dyn FnMut() -> Result<Box<dyn AudioTap>, TapError> + Send>;
 
 /// Produces the sink for a newly started tap.
 ///
-/// It must deliver into the **same** downstream ring as the sink before it —
-/// that is what makes the rebuild invisible to the WAL — so implementations
-/// typically hand back a producer that was recycled when the previous sink was
-/// dropped, rather than allocating a new one.
+/// Called on the control thread before native startup. Recorders isolate each
+/// attempt in a new ring, then use the recovery event to drain the old tail,
+/// pad its gap, and install conversion for the replacement format.
 type SinkFn = Box<dyn FnMut() -> Box<dyn FrameSink> + Send>;
+
+// Each start owns its own mailbox. A callback retained by an old backend
+// can never fault its replacement. MAX denotes no fault; the first timestamp
+// is kept so delayed polling and retry spacing do not shorten the gap.
+const NO_CALLBACK_FAULT: u64 = u64::MAX;
+struct FaultObservingSink {
+    inner: Box<dyn FrameSink>,
+    fault: Arc<AtomicU64>,
+    active: Arc<AtomicBool>,
+    clock: Arc<dyn Clock>,
+}
+impl FrameSink for FaultObservingSink {
+    fn on_frames(&mut self, pcm: &[f32], ts: CaptureTimestamp, flags: FrameFlags) {
+        if self.active.load(Ordering::Acquire)
+            && self.fault.load(Ordering::Acquire) == NO_CALLBACK_FAULT
+        {
+            self.inner.on_frames(pcm, ts, flags);
+        }
+    }
+    fn on_error(&mut self, error: TapError) {
+        if !self.active.load(Ordering::Acquire) {
+            return;
+        }
+        if error.is_transient_device_fault() {
+            let _ = self.fault.compare_exchange(
+                NO_CALLBACK_FAULT,
+                self.clock.now_ns().min(NO_CALLBACK_FAULT - 1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        self.inner.on_error(error);
+    }
+}
 
 /// An outage in progress: what it will cost and how hard we have tried.
 #[derive(Debug, Clone)]
@@ -497,12 +578,12 @@ enum State {
     Running,
     /// The tap is gone and we are trying to build another.
     Recovering(Recovery),
-    /// We stopped trying. The outage is kept so a device change can resume it
-    /// without losing the gap that has been accumulating.
+    /// We stopped trying. The outage is kept so an explicit user retry can
+    /// resume it without losing the gap that has been accumulating.
     Abandoned(Recovery),
     /// A tap **is** running and being watched, but rebuilding it has stopped
-    /// helping, so faults are noted and not acted on. Released the moment an
-    /// audible buffer arrives.
+    /// helping, so faults are noted and not acted on. Released after ten
+    /// seconds of sustained healthy delivery.
     Quarantined,
 }
 
@@ -510,13 +591,15 @@ enum State {
 ///
 /// Owns the tap, the stall watchdog and the device-change mailbox, and is
 /// driven by a caller that polls it on whatever cadence suits — every 50 to
-/// 250 ms in practice. It never sleeps, never spawns and never blocks, so it
-/// composes with any runtime.
+/// 250 ms in practice. It does not sleep or spawn, but native open/start/stop
+/// operations are currently synchronous and may block the polling thread.
 pub struct CaptureSupervisor {
     config: SupervisorConfig,
     clock: Arc<dyn Clock>,
     open: OpenFn,
     make_sink: SinkFn,
+    callback_fault: Arc<AtomicU64>,
+    callback_active: Arc<AtomicBool>,
     tap: Option<Box<dyn AudioTap>>,
     format: Option<StreamFormat>,
     watchdog: Watchdog,
@@ -527,8 +610,20 @@ pub struct CaptureSupervisor {
     events: Vec<HealthEvent>,
     rebuilds: u32,
     last_rebuild_ns: Option<u64>,
+    last_attempt_ns: Option<u64>,
+    episode_attempts: u32,
+    retry_requested: bool,
     ineffective_recoveries: u32,
+    health_confirmed: bool,
+    healthy_since_ns: Option<u64>,
+    previous_delivery: Option<(u64, TapActivity)>,
     no_audio_notified: bool,
+}
+
+impl Drop for CaptureSupervisor {
+    fn drop(&mut self) {
+        self.retire_callbacks();
+    }
 }
 
 impl std::fmt::Debug for CaptureSupervisor {
@@ -563,6 +658,8 @@ impl CaptureSupervisor {
             clock,
             open: Box::new(open),
             make_sink: Box::new(make_sink),
+            callback_fault: Arc::new(AtomicU64::new(NO_CALLBACK_FAULT)),
+            callback_active: Arc::new(AtomicBool::new(false)),
             tap: None,
             format: None,
             watchdog,
@@ -573,15 +670,49 @@ impl CaptureSupervisor {
             events: Vec::new(),
             rebuilds: 0,
             last_rebuild_ns: None,
+            last_attempt_ns: None,
+            episode_attempts: 0,
+            retry_requested: false,
             ineffective_recoveries: 0,
+            health_confirmed: false,
+            healthy_since_ns: None,
+            previous_delivery: None,
             no_audio_notified: false,
         }
+    }
+
+    fn observing_sink(&mut self) -> Box<dyn FrameSink> {
+        self.retire_callbacks();
+        self.callback_active = Arc::new(AtomicBool::new(true));
+        self.callback_fault = Arc::new(AtomicU64::new(NO_CALLBACK_FAULT));
+        Box::new(FaultObservingSink {
+            inner: (self.make_sink)(),
+            fault: Arc::clone(&self.callback_fault),
+            active: Arc::clone(&self.callback_active),
+            clock: Arc::clone(&self.clock),
+        })
+    }
+
+    // Admission fence, not a native callback join. A callback already admitted
+    // before retirement can finish; native stop owns quiescence. Neither this
+    // control-side store nor callback-side loads wait on the audio thread.
+    fn retire_callbacks(&self) {
+        self.callback_active.store(false, Ordering::Release);
+    }
+
+    fn start_observed(&mut self, tap: &mut dyn AudioTap) -> Result<StreamFormat, TapError> {
+        let result = tap.start(self.observing_sink());
+        if result.is_err() {
+            self.retire_callbacks();
+        }
+        result
     }
 
     /// The mailbox a platform listener raises into.
     ///
     /// Handed to `MacOsPlatform::watch_devices`, or to whatever else can see
-    /// the hardware move.
+    /// the hardware move. Stop/take detach this mailbox; a caller reusing the
+    /// supervisor for another session must register a new watcher.
     #[must_use]
     pub fn signal(&self) -> Arc<DeviceChangeSignal> {
         Arc::clone(&self.signal)
@@ -593,13 +724,84 @@ impl CaptureSupervisor {
             return Err(TapError::AlreadyRunning);
         }
         let mut tap = (self.open)()?;
-        let format = tap.start((self.make_sink)())?;
+        let format = self.start_observed(&mut *tap)?;
         let now = self.clock.now_ns();
         self.tap = Some(tap);
         self.format = Some(format);
         self.watchdog.arm(now);
+        self.health_confirmed = false;
+        self.healthy_since_ns = None;
+        self.previous_delivery = None;
+        self.episode_attempts = 0;
+        self.ineffective_recoveries = 0;
+        self.last_attempt_ns = None;
+        self.last_rebuild_ns = None;
+        self.retry_requested = false;
+        self.no_audio_notified = false;
         self.state = State::Running;
         Ok(format)
+    }
+
+    /// Start an optional source, retaining a failed start for later recovery.
+    ///
+    /// The error is still returned for diagnostics, but unlike [`Self::start`]
+    /// it does not leave the source stopped. Keep polling this supervisor even
+    /// when no format is available. The initial attempt counts toward the
+    /// episode ceiling; further attempts respect backoff and the interval floor.
+    /// A successful retry emits a [`HealthEvent::Recovered`] with the complete
+    /// startup outage, and still requires sustained delivery to confirm health.
+    /// Native open/start calls remain synchronous.
+    pub fn start_recovering(&mut self) -> Result<StreamFormat, TapError> {
+        if !matches!(self.state, State::Idle) {
+            return Err(TapError::AlreadyRunning);
+        }
+        let started_at = self.clock.now_ns();
+        match self.start() {
+            Ok(format) => Ok(format),
+            Err(error) => {
+                self.retire_callbacks();
+                self.format = None;
+                self.health_confirmed = false;
+                self.healthy_since_ns = None;
+                self.previous_delivery = None;
+                self.episode_attempts = 1;
+                self.ineffective_recoveries = 0;
+                self.last_attempt_ns = Some(started_at);
+                self.last_rebuild_ns = None;
+                self.retry_requested = false;
+                self.no_audio_notified = false;
+                let retry_in = self.backoff(1).max(self.config.min_rebuild_interval);
+                // Count the wait after failure, including a slow failed open.
+                let recovery = Recovery {
+                    unwritten_start_ns: started_at,
+                    silent_gap: None,
+                    reason: GapReason::InitiallyUnavailable,
+                    attempt: 1,
+                    next_attempt_ns: self
+                        .clock
+                        .now_ns()
+                        .saturating_add(retry_in.as_nanos() as u64),
+                    last_error: error.to_string(),
+                };
+                if self.episode_attempts >= self.config.max_attempts {
+                    self.events.push(HealthEvent::GaveUp {
+                        tap: self.config.id.clone(),
+                        attempts: 1,
+                        error: error.to_string(),
+                    });
+                    self.state = State::Abandoned(recovery);
+                } else {
+                    self.events.push(HealthEvent::RecoveryFailed {
+                        tap: self.config.id.clone(),
+                        attempt: 1,
+                        error: error.to_string(),
+                        retry_in,
+                    });
+                    self.state = State::Recovering(recovery);
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Stop supervising and stop the tap.
@@ -608,12 +810,17 @@ impl CaptureSupervisor {
     /// tap stops delivering is that the user ended the meeting, and treating
     /// that as a fault would resurrect capture after the recording closed.
     pub fn stop(&mut self) -> Result<(), TapError> {
+        self.retire_callbacks();
         let result = match self.tap.take() {
             Some(mut tap) => tap.stop(),
             None => Ok(()),
         };
         self.state = State::Idle;
         self.debounce.clear();
+        self.pending_changes = DeviceChanges::empty();
+        self.retry_requested = false;
+        // Detach notifications retained by a previous session generation.
+        self.signal = DeviceChangeSignal::new();
         result
     }
 
@@ -630,12 +837,18 @@ impl CaptureSupervisor {
     ///
     /// In every other respect this is [`stop`](Self::stop): the supervisor goes
     /// [`State::Idle`], will not rebuild, and clears its debounce. Returns
-    /// `None` if no tap was running. The returned tap is still delivering into
-    /// its sink until the caller stops or drops it.
+    /// `None` if no tap was running. Native callbacks may continue until the
+    /// caller stops or drops it, but new deliveries into its sink are revoked.
+    /// A callback admitted before revocation can still finish.
     pub fn take_running_tap(&mut self) -> Option<Box<dyn AudioTap>> {
+        self.retire_callbacks();
         let tap = self.tap.take();
         self.state = State::Idle;
         self.debounce.clear();
+        self.pending_changes = DeviceChanges::empty();
+        self.retry_requested = false;
+        // Detach notifications retained by a previous session generation.
+        self.signal = DeviceChangeSignal::new();
         tap
     }
 
@@ -653,10 +866,11 @@ impl CaptureSupervisor {
 
     /// Whether supervision is paused because rebuilding stopped helping.
     ///
-    /// A tap **is** still running and its audio is still being written; what
-    /// has stopped is acting on its faults. Worth surfacing — a session
+    /// A tap **is** still running. Watchdog quarantine keeps delivering its
+    /// audio; an explicit callback fault suppresses further PCM until retry.
+    /// What has stopped is acting on its faults. Worth surfacing — a session
     /// running in this state is one where the recording is probably silent,
-    /// and it is released the moment an audible buffer arrives.
+    /// and it is released after ten seconds of sustained healthy delivery.
     #[must_use]
     pub const fn is_quarantined(&self) -> bool {
         matches!(self.state, State::Quarantined)
@@ -670,6 +884,56 @@ impl CaptureSupervisor {
         std::mem::take(&mut self.events)
     }
 
+    /// Content-free source status. Opening a tap alone never reports healthy.
+    #[must_use]
+    pub fn recovery_status(&self) -> RecoveryStatus {
+        let (state, retry_in_ms) = match &self.state {
+            State::Idle => (DeliveryState::Stopped, None),
+            State::Recovering(r) => (
+                DeliveryState::Recovering,
+                Some(r.next_attempt_ns.saturating_sub(self.clock.now_ns()) / 1_000_000),
+            ),
+            State::Abandoned(_) | State::Quarantined => (DeliveryState::Exhausted, None),
+            State::Running if self.no_audio_notified => (DeliveryState::Quiet, None),
+            State::Running if self.health_confirmed => (DeliveryState::Healthy, None),
+            State::Running => (DeliveryState::Confirming, None),
+        };
+        RecoveryStatus {
+            state,
+            attempts: self.episode_attempts,
+            max_attempts: self.config.max_attempts,
+            retry_in_ms,
+        }
+    }
+
+    /// Snapshot an initial outage that has not recovered, before Stop detaches
+    /// the supervisor. The recorder uses this to preserve a never-available
+    /// optional source's timeline. The snapshot does not schedule recovery.
+    #[must_use]
+    pub fn pending_startup_gap(&self) -> Option<CaptureGap> {
+        let recovery = match &self.state {
+            State::Recovering(recovery) | State::Abandoned(recovery) => recovery,
+            _ => return None,
+        };
+        (recovery.reason == GapReason::InitiallyUnavailable).then(|| CaptureGap {
+            start_ns: recovery.unwritten_start_ns,
+            end_ns: self.clock.now_ns(),
+            kind: GapKind::Unwritten,
+            reason: recovery.reason,
+        })
+    }
+
+    /// Queue an explicit user retry after exhaustion. No device work happens
+    /// until the next poll; stopping cancels the request. The attempt spacing
+    /// still applies, even when a user requests another episode immediately.
+    pub fn request_retry(&mut self) -> bool {
+        if !matches!(self.state, State::Abandoned(_) | State::Quarantined) {
+            return false;
+        }
+        self.retry_requested = true;
+        true
+    }
+
     /// Observe the tap once and act.
     ///
     /// `activity` is a snapshot of [`crate::watchdog::ActivityCounters`] the
@@ -677,6 +941,32 @@ impl CaptureSupervisor {
     /// is rendering output, and is consulted only when it is needed.
     pub fn poll(&mut self, activity: TapActivity, probe: &impl OutputProbe) -> PollOutcome {
         let now = self.clock.now_ns();
+        if matches!(self.state, State::Idle) {
+            return PollOutcome::Stopped;
+        }
+        if std::mem::take(&mut self.retry_requested) {
+            self.episode_attempts = 0;
+            self.ineffective_recoveries = 0;
+            self.debounce.clear();
+            self.pending_changes = DeviceChanges::empty();
+            let _ = self.signal.take();
+            match std::mem::replace(&mut self.state, State::Idle) {
+                State::Abandoned(mut recovery) => {
+                    recovery.next_attempt_ns = self.next_attempt_at(now);
+                    self.state = State::Recovering(recovery);
+                }
+                State::Quarantined => {
+                    let fault_at = self.callback_fault.load(Ordering::Acquire);
+                    let (since, reason) = if fault_at == NO_CALLBACK_FAULT {
+                        (now, GapReason::RebuildWindow)
+                    } else {
+                        (fault_at, GapReason::CallbackFault)
+                    };
+                    return self.begin_recovery(now, None, since, reason);
+                }
+                state => self.state = state,
+            }
+        }
 
         let changes = self.signal.take();
         if !changes.is_empty() {
@@ -706,19 +996,12 @@ impl CaptureSupervisor {
                 }
             }
             State::Abandoned(recovery) => {
-                // A device change after giving up is new evidence — the user
-                // plugged something back in — and is worth another go.
-                if self.debounce.poll(now) {
-                    let resumed = Recovery {
-                        attempt: 0,
-                        next_attempt_ns: now,
-                        ..recovery
-                    };
-                    self.attempt_rebuild(now, resumed)
-                } else {
-                    self.state = State::Abandoned(recovery);
-                    PollOutcome::Abandoned
-                }
+                // Route chatter cannot replenish an exhausted budget. Keep
+                // the original gap for an explicit manual retry.
+                self.debounce.clear();
+                self.pending_changes = DeviceChanges::empty();
+                self.state = State::Abandoned(recovery);
+                PollOutcome::Abandoned
             }
             State::Running => {
                 self.state = State::Running;
@@ -738,11 +1021,29 @@ impl CaptureSupervisor {
         probe: &impl OutputProbe,
         quarantined: bool,
     ) -> PollOutcome {
+        let fault_at = self.callback_fault.load(Ordering::Acquire);
+        if fault_at != NO_CALLBACK_FAULT {
+            self.health_confirmed = false;
+            self.healthy_since_ns = None;
+            self.previous_delivery = None;
+            if quarantined {
+                return PollOutcome::Abandoned;
+            }
+            return self.begin_recovery(now, None, fault_at, GapReason::CallbackFault);
+        }
         let verdict = self.watchdog.poll(now, activity, probe);
 
-        // Audible audio is the only thing that proves a rebuild worked, and it
-        // is what releases a quarantine.
-        if self.watchdog.audible_since_arm() {
+        // A single audible buffer can come from a device that is still
+        // flapping. Only a sustained run earns a fresh recovery budget.
+        let stable = self.observe_delivery(now, activity, verdict);
+        if stable {
+            if !self.health_confirmed && (self.episode_attempts > 0 || quarantined) {
+                self.events.push(HealthEvent::DeliveryConfirmed {
+                    tap: self.config.id.clone(),
+                });
+            }
+            self.health_confirmed = true;
+            self.episode_attempts = 0;
             self.ineffective_recoveries = 0;
             if quarantined {
                 self.state = State::Running;
@@ -752,31 +1053,29 @@ impl CaptureSupervisor {
         // A fault outranks a pending device change: both lead to the same
         // rebuild, and the fault carries the better gap boundaries.
         if let Verdict::Faulted(fault) = verdict {
-            if quarantined && !self.watchdog.audible_since_arm() {
-                // Already told the user. Rebuilding again would spend another
-                // gap to reach the same place.
+            self.health_confirmed = false;
+            if quarantined {
+                // A brief return of audio must not release quarantine.
                 return PollOutcome::Abandoned;
             }
             self.events.push(HealthEvent::StallDetected {
                 tap: self.config.id.clone(),
                 fault,
             });
-            if self.watchdog.audible_since_arm() {
-                self.ineffective_recoveries = 0;
-            } else {
-                self.ineffective_recoveries += 1;
-                if self.ineffective_recoveries > self.config.max_ineffective_recoveries {
-                    self.events.push(HealthEvent::RecoveryIneffective {
-                        tap: self.config.id.clone(),
-                        rebuilds: self.ineffective_recoveries - 1,
-                        fault,
-                    });
-                    // Re-arm so the next fault is measured from here rather
-                    // than firing again on the next poll.
-                    self.watchdog.arm(now);
-                    self.state = State::Quarantined;
-                    return PollOutcome::Abandoned;
-                }
+            self.ineffective_recoveries = self.ineffective_recoveries.saturating_add(1);
+            if self.ineffective_recoveries > self.config.max_ineffective_recoveries {
+                self.events.push(HealthEvent::RecoveryIneffective {
+                    tap: self.config.id.clone(),
+                    rebuilds: self.ineffective_recoveries - 1,
+                    fault,
+                });
+                // Keep watching the existing tap without spending more gaps.
+                self.watchdog.arm(now);
+                self.health_confirmed = false;
+                self.healthy_since_ns = None;
+                self.previous_delivery = None;
+                self.state = State::Quarantined;
+                return PollOutcome::Abandoned;
             }
             let (silent_gap, unwritten_start_ns, reason) = match fault {
                 Fault::NoBuffers { since_ns, .. } => {
@@ -800,6 +1099,14 @@ impl CaptureSupervisor {
 
         if self.debounce.poll(now) {
             let changes = std::mem::replace(&mut self.pending_changes, DeviceChanges::empty());
+            if quarantined && !stable {
+                self.events.push(HealthEvent::DeviceChanged {
+                    tap: self.config.id.clone(),
+                    changes,
+                    rebuilt: false,
+                });
+                return PollOutcome::Abandoned;
+            }
             let too_soon = self.last_rebuild_ns.is_some_and(|last| {
                 now.saturating_sub(last) < self.config.min_rebuild_interval.as_nanos() as u64
             });
@@ -815,6 +1122,9 @@ impl CaptureSupervisor {
                     rebuilt: false,
                 });
                 self.watchdog.arm(now);
+                self.health_confirmed = false;
+                self.healthy_since_ns = None;
+                self.previous_delivery = None;
                 return PollOutcome::Healthy;
             }
             if self.config.rebuild_on_device_change {
@@ -835,6 +1145,9 @@ impl CaptureSupervisor {
                 rebuilt: false,
             });
             self.watchdog.arm(now);
+            self.health_confirmed = false;
+            self.healthy_since_ns = None;
+            self.previous_delivery = None;
             return PollOutcome::Healthy;
         }
 
@@ -844,6 +1157,7 @@ impl CaptureSupervisor {
 
         match verdict {
             Verdict::NoAudio { for_ns } => {
+                self.health_confirmed = false;
                 if !self.no_audio_notified {
                     self.no_audio_notified = true;
                     self.events.push(HealthEvent::NoAudioDetected {
@@ -861,6 +1175,27 @@ impl CaptureSupervisor {
         }
     }
 
+    /// Require actual frame and buffer progress on successive observations.
+    /// Polls separated by a starvation timeout cannot prove continuous health;
+    /// neither can empty callbacks, counter resets, silence without any audible
+    /// evidence since arming, or elapsed wall time alone.
+    fn observe_delivery(&mut self, now: u64, activity: TapActivity, verdict: Verdict) -> bool {
+        let previous = self.previous_delivery.replace((now, activity));
+        let advancing = previous.is_some_and(|(then, before)| {
+            now >= then
+                && now - then < self.config.watchdog.no_buffer_timeout.as_nanos() as u64
+                && activity.frames > before.frames
+                && activity.buffers > before.buffers
+                && activity.silent_buffers >= before.silent_buffers
+        });
+        if !advancing || verdict != Verdict::Healthy || !self.watchdog.audible_since_arm() {
+            self.healthy_since_ns = None;
+            return false;
+        }
+        let since = *self.healthy_since_ns.get_or_insert(now);
+        now.saturating_sub(since) >= Duration::from_secs(10).as_nanos() as u64
+    }
+
     /// Tear the tap down and start trying to build another.
     fn begin_recovery(
         &mut self,
@@ -869,6 +1204,16 @@ impl CaptureSupervisor {
         unwritten_start_ns: u64,
         reason: GapReason,
     ) -> PollOutcome {
+        if self.episode_attempts >= self.config.max_attempts {
+            self.events.push(HealthEvent::GaveUp {
+                tap: self.config.id.clone(),
+                attempts: self.episode_attempts,
+                error: "capture did not sustain healthy delivery".into(),
+            });
+            self.state = State::Quarantined;
+            return PollOutcome::Abandoned;
+        }
+        self.retire_callbacks();
         // The full sequence, in order: stop, then destroy. Dropping the tap is
         // what destroys the aggregate and then the tap itself, and it happens
         // before anything new is created.
@@ -883,17 +1228,24 @@ impl CaptureSupervisor {
             silent_gap,
             reason,
             attempt: 0,
-            next_attempt_ns: now,
+            next_attempt_ns: self.next_attempt_at(now),
             last_error: String::new(),
         };
-        self.attempt_rebuild(now, recovery)
+        if now < recovery.next_attempt_ns {
+            self.state = State::Recovering(recovery);
+            PollOutcome::Waiting
+        } else {
+            self.attempt_rebuild(now, recovery)
+        }
     }
 
     fn attempt_rebuild(&mut self, now: u64, mut recovery: Recovery) -> PollOutcome {
-        recovery.attempt += 1;
+        self.episode_attempts = self.episode_attempts.saturating_add(1);
+        recovery.attempt = self.episode_attempts;
+        self.last_attempt_ns = Some(now);
 
         let started = (self.open)().and_then(|mut tap| {
-            let format = tap.start((self.make_sink)())?;
+            let format = self.start_observed(&mut *tap)?;
             Ok((tap, format))
         });
 
@@ -910,7 +1262,9 @@ impl CaptureSupervisor {
                     self.state = State::Abandoned(recovery);
                     return PollOutcome::Abandoned;
                 }
-                let retry_in = self.backoff(recovery.attempt);
+                let retry_in = self
+                    .backoff(recovery.attempt)
+                    .max(self.config.min_rebuild_interval);
                 self.events.push(HealthEvent::RecoveryFailed {
                     tap: self.config.id.clone(),
                     attempt: recovery.attempt,
@@ -939,6 +1293,9 @@ impl CaptureSupervisor {
         self.rebuilds += 1;
         self.last_rebuild_ns = Some(now);
         self.watchdog.arm(now);
+        self.health_confirmed = false;
+        self.healthy_since_ns = None;
+        self.previous_delivery = None;
         // A change that arrived during the outage has been answered by this
         // rebuild. Leaving it pending would fire a second, pointless rebuild
         // 300 ms later — and spend another gap on it.
@@ -955,8 +1312,14 @@ impl CaptureSupervisor {
         PollOutcome::Rebuilt
     }
 
-    /// Exponential, capped. The first retry is immediate-ish and the last ones
-    /// are far enough apart not to hammer a HAL that is already unhappy.
+    fn next_attempt_at(&self, now: u64) -> u64 {
+        self.last_attempt_ns.map_or(now, |last| {
+            now.max(last.saturating_add(self.config.min_rebuild_interval.as_nanos() as u64))
+        })
+    }
+
+    /// Exponential, capped. The caller also applies the interval floor so a
+    /// smaller backoff cannot hammer a HAL that is already unhappy.
     fn backoff(&self, attempt: u32) -> Duration {
         let shift = attempt.saturating_sub(1).min(16);
         let scaled = self

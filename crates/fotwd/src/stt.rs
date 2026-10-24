@@ -91,8 +91,8 @@ impl SttSettings {
     /// The language the local engine is told to expect, `None` to detect it.
     #[must_use]
     pub fn language(&self) -> Option<String> {
-        let code = self.language.trim();
-        (!code.is_empty() && code != "auto").then(|| code.to_ascii_lowercase())
+        let code = self.language.trim().to_ascii_lowercase();
+        (!code.is_empty() && code != "auto").then_some(code)
     }
 }
 
@@ -335,11 +335,13 @@ mod tests {
 
     #[test]
     fn auto_means_detect() {
-        let settings = SttSettings {
-            language: "auto".into(),
-            ..SttSettings::default()
-        };
-        assert_eq!(settings.language(), None);
+        for language in ["auto", " AUTO ", "", "  "] {
+            let settings = SttSettings {
+                language: language.into(),
+                ..SttSettings::default()
+            };
+            assert_eq!(settings.language(), None);
+        }
     }
 
     #[test]

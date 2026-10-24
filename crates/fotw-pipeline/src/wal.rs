@@ -428,9 +428,7 @@ impl SessionWal {
         system: TrackFormat,
         mic: Option<TrackFormat>,
     ) -> std::io::Result<Self> {
-        let id = session_id();
-        let dir = root.as_ref().join(&id);
-        std::fs::create_dir_all(&dir)?;
+        let (id, dir) = reserve_session_dir(root.as_ref(), session_id)?;
 
         let manifest = Manifest {
             id,
@@ -504,6 +502,8 @@ impl SessionWal {
 
     /// Record an interval that was not captured.
     ///
+    /// Adjacent gaps with the same reason extend the existing marker, including
+    /// when a different source's marker was added between updates.
     /// Gaps are written through to the manifest immediately: the whole point
     /// of a gap marker is to survive the crash that may follow the event that
     /// caused it.
@@ -513,11 +513,24 @@ impl SessionWal {
         end_ms: u64,
         reason: impl Into<String>,
     ) -> std::io::Result<()> {
-        self.manifest.gaps.push(Gap {
-            start_ms,
-            end_ms,
-            reason: reason.into(),
-        });
+        let reason = reason.into();
+        // Incremental missing-audio padding extends one continuous outage,
+        // rather than growing the manifest once per pump poll.
+        if let Some(previous) = self
+            .manifest
+            .gaps
+            .iter_mut()
+            .rev()
+            .find(|gap| gap.end_ms == start_ms && gap.reason == reason)
+        {
+            previous.end_ms = end_ms;
+        } else {
+            self.manifest.gaps.push(Gap {
+                start_ms,
+                end_ms,
+                reason,
+            });
+        }
         self.write_manifest()
     }
 
@@ -879,12 +892,58 @@ fn now_ms() -> u64 {
 }
 
 /// A lexicographically sortable, collision-resistant session id.
+fn reserve_session_dir(
+    root: &Path,
+    mut next_id: impl FnMut() -> String,
+) -> std::io::Result<(String, PathBuf)> {
+    std::fs::create_dir_all(root)?;
+    for _ in 0..128 {
+        let id = next_id();
+        let dir = root.join(&id);
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok((id, dir)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not reserve a unique capture session directory",
+    ))
+}
+
 fn session_id() -> String {
-    let ms = now_ms();
-    // Enough entropy to avoid a collision between two sessions created in the
-    // same millisecond, without taking a uuid dependency in this crate.
-    let n = std::time::Instant::now().elapsed().subsec_nanos() as u64
-        ^ std::process::id() as u64
-        ^ (&ms as *const u64 as u64);
-    format!("{ms:013}-{:08x}", n & 0xffff_ffff)
+    static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let serial = NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // The counter prevents same-process/same-clock collisions. Atomic directory
+    // reservation remains the authority across processes, PID reuse and clocks.
+    format!("{:013}-{:08x}-{serial:016x}", now_ms(), std::process::id())
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    #[test]
+    fn occupied_identity_is_never_reused_even_when_the_generator_collides() {
+        let root = std::env::temp_dir().join(format!("fotw-id-collision-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("occupied")).unwrap();
+        std::fs::write(root.join("occupied/system.pcm"), b"preserved audio").unwrap();
+        std::fs::write(root.join("occupied-file"), b"preserved file").unwrap();
+        let mut ids = ["occupied", "occupied-file", "fresh"].into_iter();
+        let (id, dir) = reserve_session_dir(&root, || ids.next().unwrap().into()).unwrap();
+        assert_eq!(id, "fresh");
+        assert_eq!(dir, root.join("fresh"));
+        assert_eq!(
+            std::fs::read(root.join("occupied/system.pcm")).unwrap(),
+            b"preserved audio"
+        );
+        assert_eq!(
+            std::fs::read(root.join("occupied-file")).unwrap(),
+            b"preserved file"
+        );
+        let exhausted = reserve_session_dir(&root, || "occupied".into()).unwrap_err();
+        assert_eq!(exhausted.kind(), std::io::ErrorKind::AlreadyExists);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

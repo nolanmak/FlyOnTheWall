@@ -75,6 +75,7 @@ pub mod documents;
 pub mod github;
 pub mod health;
 pub mod ingress;
+pub mod notes;
 pub mod query;
 pub mod recorder;
 pub mod secret;

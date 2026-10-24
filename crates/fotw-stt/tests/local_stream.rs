@@ -193,3 +193,88 @@ async fn writes_after_close_are_dropped_not_queued() {
     let _ = drain(rx).await;
     assert!(heard.lock().unwrap().is_empty());
 }
+
+struct LoadingFactory {
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+impl RecognizerFactory for LoadingFactory {
+    fn model(&self) -> &str {
+        "blocked-loading-fixture"
+    }
+    fn language(&self) -> Option<&str> {
+        None
+    }
+    fn create(&self) -> Result<Box<dyn Recognizer>, SttError> {
+        let _ = self.release.lock().unwrap().recv();
+        Ok(Box::new(Scripted {
+            heard: Arc::new(Mutex::new(Vec::new())),
+        }))
+    }
+}
+#[tokio::test]
+async fn slow_model_loading_bounds_audio_and_reports_incomplete_transcription() {
+    let (release, blocked) = std::sync::mpsc::channel();
+    let (stream, rx) = LocalStream::open(
+        LocalStreamConfig::new("bounded", Source::Mic),
+        Arc::new(LoadingFactory {
+            release: Mutex::new(blocked),
+        }),
+    );
+    // The worker cannot drain any input while its model is loading.
+    let piece = vec![8000; 16_000];
+    for _ in 0..70 {
+        stream.write(&piece);
+    }
+    let queued = stream.queued_samples();
+    release.send(()).unwrap();
+    assert!(
+        queued <= 60 * 16_000,
+        "unbounded model queue retained {queued} samples"
+    );
+    let _ = stream.close().await;
+    let events = drain(rx).await;
+    assert!(
+        events
+            .iter()
+            .filter_map(StreamEvent::error)
+            .any(|e| e.message.contains("backlog")),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().all(|e| e.final_segment().is_none()),
+        "overload must not publish shifted/partial coverage"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn wedged_model_cannot_hold_close_or_publish_after_timeout() {
+    let (release, blocked) = std::sync::mpsc::channel();
+    let (stream, mut events) = LocalStream::open(
+        LocalStreamConfig::new("timeout", Source::Mic),
+        Arc::new(LoadingFactory {
+            release: Mutex::new(blocked),
+        }),
+    );
+    stream.write(&speech(1000));
+    let result = stream.close().await;
+    let mut announced = false;
+    while let Ok(event) = events.try_recv() {
+        if let StreamEvent::Error(error) = event {
+            announced |= error.message.contains("timed out");
+        }
+    }
+    release.send(()).unwrap();
+    assert!(
+        result.is_err(),
+        "a timed-out model must not claim successful finalization"
+    );
+    assert!(
+        announced,
+        "timeout must be visible to the session collector"
+    );
+    let events = drain(events).await;
+    assert!(
+        events.iter().all(|e| e.final_segment().is_none()),
+        "late results after timeout cannot be published"
+    );
+}
