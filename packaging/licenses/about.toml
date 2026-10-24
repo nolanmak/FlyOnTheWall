@@ -63,3 +63,17 @@ license = "BSD-3-Clause"
 [[opusic-sys.clarify.files]]
 path = "opus/COPYING"
 checksum = "01e1167d54a096d123cf6dfbbeb19587278845c6481d2d66d545669846079551"
+
+# whisper-rs-sys declares the Unlicense, which covers its Rust bindings. On
+# macOS it also compiles whisper.cpp, and the ggml library inside it, with
+# CMake from its whisper.cpp/ directory (fotw-stt's on-device transcription,
+# #33). Both are under the MIT license in whisper.cpp/LICENSE, whose binary
+# clause is why it has to ship. The template's whisper.cpp section prints this
+# entry.
+[whisper-rs-sys.clarify]
+license = "Unlicense AND MIT"
+
+[[whisper-rs-sys.clarify.files]]
+path = "whisper.cpp/LICENSE"
+license = "MIT"
+checksum = "e562a2ddfaf8280537795ac5ecd34e3012b6582a147ef69ba6a6a5c08c84757d"

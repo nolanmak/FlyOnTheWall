@@ -144,7 +144,7 @@ licenses:
     # about.hbs describes the C libraries these crates compile, as of the crate
     # versions it names. When Cargo.lock moves one, or fotwd stops reaching one,
     # stop so that section is re-checked instead of going stale.
-    for krate in libsqlite3-sys openssl-src opusic-sys; do
+    for krate in libsqlite3-sys openssl-src opusic-sys whisper-rs-sys; do
         # A non-zero exit means the crate is gone from Cargo.lock, or that two
         # versions of it are locked and `-i "$krate"` is ambiguous. cargo's
         # stderr says which.

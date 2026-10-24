@@ -5,13 +5,14 @@
   cargo-about fills in the Rust crate section. The rest is written by hand
   because cargo cannot see it: the icon is artwork, and the C libraries are
   compiled from source that ships inside crate packages (libsqlite3-sys,
-  opusic-sys) or inside a build-only dependency (openssl-src), so no manifest
+  opusic-sys, whisper-rs-sys) or inside a build-only dependency (openssl-src), so no manifest
   declares their licenses. `just licenses` checks that the crate versions
   named in the C library section are the ones Cargo.lock resolves. When one
   moves, re-check the upstream version and license of the library that crate
   compiles, and update the section.
 
-  SQLCipher's and libopus's license texts are not copied into this template.
+  SQLCipher's, libopus's and whisper.cpp's license texts are not copied into
+  this template.
   They are looked up from the clarified crate entries, which cargo-about reads
   from the crate packages and checks against the checksums in about.toml.
   OpenSSL's text is copied, because openssl-src is a build dependency and
@@ -37,7 +38,7 @@ those and regenerate rather than editing this file.
 - [App icon and web UI favicon](#app-icon-and-web-ui-favicon)
 - [C libraries compiled into fotwd](#c-libraries-compiled-into-fotwd):
   [SQLCipher](#sqlcipher), [SQLite](#sqlite), [OpenSSL](#openssl),
-  [libopus](#libopus)
+  [libopus](#libopus), [whisper.cpp and ggml](#whispercpp-and-ggml)
 - [Rust crates](#rust-crates)
 
 ## App icon and web UI favicon
@@ -57,9 +58,9 @@ point.
 
 ## C libraries compiled into fotwd
 
-Three crates compile C libraries from source and link them statically into
-fotwd. A crate's manifest declares the license of the crate, not of the C code
-it carries, so these libraries are listed here separately.
+Four crates compile C and C++ libraries from source and link them statically
+into fotwd. A crate's manifest declares the license of the crate, not of the
+code it carries, so these libraries are listed here separately.
 
 ### SQLCipher
 
@@ -288,6 +289,25 @@ encode recorded audio as Opus. This is libopus's `COPYING` file:
 {{#if (eq id "BSD-3-Clause")}}
 {{#each used_by}}
 {{#if (eq crate.name "opusic-sys")}}
+````text
+{{{../text}}}
+````
+{{/if}}
+{{/each}}
+{{/if}}
+{{/each}}
+
+### whisper.cpp and ggml
+
+whisper-rs-sys 0.15.0 compiles whisper.cpp 1.8.3, and the ggml tensor library
+it carries, with CMake and Metal from the `whisper.cpp/` directory in its
+package. fotw-stt uses it to transcribe meetings on the Mac itself. This is
+whisper.cpp's `LICENSE` file, which covers both:
+
+{{#each licenses}}
+{{#if (eq id "MIT")}}
+{{#each used_by}}
+{{#if (eq crate.name "whisper-rs-sys")}}
 ````text
 {{{../text}}}
 ````
