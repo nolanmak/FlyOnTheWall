@@ -40,7 +40,10 @@ use fotw_pipeline::resample::{Downmixer, Resampler16k};
 use fotw_pipeline::ring::{AudioRing, RingConsumer, RingProducer};
 use fotw_pipeline::wal::{SessionWal, SttRecord, TrackFormat};
 use fotw_stt::deepgram::DeepgramConfig;
-use fotw_stt::{DeepgramStream, DeepgramStreamConfig, Source, StreamEvent, TranscriptSegment};
+use fotw_stt::{
+    DeepgramStream, DeepgramStreamConfig, LocalStream, LocalStreamConfig, RecognizerFactory,
+    Source, StreamEvent, TranscriptSegment,
+};
 
 /// Ring capacity per leg, in samples. Ten seconds at 48 kHz stereo.
 const RING_SAMPLES: usize = 48_000 * 2 * 10;
@@ -814,6 +817,39 @@ impl DeepgramLegs {
     }
 }
 
+/// One on-device recognizer per capture leg, over one model (#33).
+///
+/// Nothing is billed here, but `FOTW_MIC_STT=off` is still honoured: one switch
+/// that meant "do not transcribe my side" should not stop meaning it because
+/// the engine changed.
+pub struct LocalLegs {
+    /// The model both legs share. It loads on the first leg's worker thread.
+    pub engine: Arc<dyn RecognizerFactory>,
+    /// The far end: everybody else on the call. Always transcribed.
+    pub system: Box<LocalStreamConfig>,
+    /// The near end: the user. `None` with no input device or the opt-out set,
+    /// and not opened if the mic tap did not actually start.
+    pub mic: Option<Box<LocalStreamConfig>>,
+}
+
+impl LocalLegs {
+    /// The legs for one session.
+    #[must_use]
+    pub fn for_session(
+        engine: Arc<dyn RecognizerFactory>,
+        session_id: &str,
+        mic_present: bool,
+        mic_enabled: bool,
+    ) -> Self {
+        Self {
+            engine,
+            system: Box::new(LocalStreamConfig::new(session_id, Source::System)),
+            mic: (mic_present && mic_enabled)
+                .then(|| Box::new(LocalStreamConfig::new(session_id, Source::Mic))),
+        }
+    }
+}
+
 /// Whether the mic leg should be transcribed, from `FOTW_MIC_STT`.
 ///
 /// Unset means on. Only the documented `off` and the spellings muscle memory
@@ -1141,6 +1177,19 @@ pub enum Transcription {
     Disabled,
     /// Stream to Deepgram as the meeting runs, one connection per leg.
     Deepgram(DeepgramLegs),
+    /// Transcribe on this machine as the meeting runs, one worker per leg.
+    Local(LocalLegs),
+}
+
+impl Transcription {
+    /// Whether the mic leg is to be transcribed, should the mic start.
+    fn transcribes_mic(&self) -> bool {
+        match self {
+            Self::Disabled => false,
+            Self::Deepgram(legs) => legs.mic.is_some(),
+            Self::Local(legs) => legs.mic.is_some(),
+        }
+    }
 }
 
 impl std::fmt::Debug for Transcription {
@@ -1148,6 +1197,7 @@ impl std::fmt::Debug for Transcription {
         match self {
             Self::Disabled => write!(f, "Disabled"),
             Self::Deepgram(_) => write!(f, "Deepgram(..)"),
+            Self::Local(_) => write!(f, "Local(..)"),
         }
     }
 }
@@ -1536,48 +1586,23 @@ pub async fn run_with_control(
     // be lined up with — its timeline is internally consistent whatever its
     // epoch — so waiting on a tap nobody will read would cost the user
     // readiness for nothing.
-    let both_legs_transcribed = mic_format.is_some()
-        && matches!(&transcription, Transcription::Deepgram(legs) if legs.mic.is_some());
+    let both_legs_transcribed = mic_format.is_some() && transcription.transcribes_mic();
     let anchors = if both_legs_transcribed {
         anchor_legs(&sys_counters, &mic_counters, ANCHOR_DEADLINE).await
     } else {
         LegAnchors::default()
     };
 
-    // The STT side, if configured. `write` is non-blocking, so the pump can
-    // feed it without ever waiting on the network.
-    // One stream per leg. The mic stream is additionally gated on the mic tap
-    // having actually started: a paid connection for a device that is not
-    // there would be fed nothing and still billed for the socket.
-
-    let (sys_stt, sys_events, mic_stt, mic_events) = match transcription {
-        Transcription::Disabled => (None, None, None, None),
-        Transcription::Deepgram(mut legs) => {
-            // The one place a leg's anchor is spelled. From here down it is the
-            // stream's own property, applied at connection zero and carried
-            // across every reconnect.
-            // The WAL owns capture identity. Factory placeholders predate tap
-            // startup and must not escape into deltas, status, or saved handoff.
-            let session_id = dir
-                .file_name()
-                .expect("session directory")
-                .to_string_lossy()
-                .into_owned();
-            legs.system.normalizer.session_id = session_id.clone();
-            legs.system.session_offset_ms = anchors.system_ms;
-            let (s, s_rx) = DeepgramStream::open(*legs.system);
-            let (m, m_rx) = match legs.mic {
-                Some(mut cfg) if mic_format.is_some() => {
-                    cfg.normalizer.session_id = session_id.clone();
-                    cfg.session_offset_ms = anchors.mic_ms;
-                    let (m, rx) = DeepgramStream::open(*cfg);
-                    (Some(Arc::new(m)), Some(rx))
-                }
-                _ => (None, None),
-            };
-            (Some(Arc::new(s)), Some(s_rx), m, m_rx)
-        }
-    };
+    // The STT side, if configured: one stream per leg. `write` is
+    // non-blocking, so the pump can feed it without ever waiting on the
+    // network or the model.
+    let session_id = dir
+        .file_name()
+        .expect("session directory")
+        .to_string_lossy()
+        .into_owned();
+    let (sys_stt, sys_events, mic_stt, mic_events) =
+        open_legs(transcription, &session_id, anchors, mic_format.is_some());
 
     let stop = Arc::new(AtomicBool::new(false));
     let pump_stop = Arc::clone(&stop);
@@ -1793,8 +1818,7 @@ pub async fn run_with_control(
     }
 
     for stream in [sys_stt, mic_stt].into_iter().flatten() {
-        let _ = stream.flush().await;
-        let _ = stream.close().await;
+        stream.finish().await;
     }
     for collector in [sys_collector, mic_collector].into_iter().flatten() {
         // The stream is closed, so the channel ends and this finishes.
@@ -1934,39 +1958,20 @@ pub async fn run_supervised(
     // Both legs on one epoch, settled before either socket exists (#86), and
     // only when both are actually transcribed — a lone leg has nothing to line
     // up against.
-    let both_legs_transcribed = mic_format.is_some()
-        && matches!(&transcription, Transcription::Deepgram(legs) if legs.mic.is_some());
+    let both_legs_transcribed = mic_format.is_some() && transcription.transcribes_mic();
     let anchors = if both_legs_transcribed {
         anchor_legs(&sys_counters, &mic_counters, ANCHOR_DEADLINE).await
     } else {
         LegAnchors::default()
     };
 
-    let (sys_stt, sys_events, mic_stt, mic_events) = match transcription {
-        Transcription::Disabled => (None, None, None, None),
-        Transcription::Deepgram(mut legs) => {
-            // The WAL owns capture identity. Factory placeholders predate tap
-            // startup and must not escape into deltas, status, or saved handoff.
-            let session_id = dir
-                .file_name()
-                .expect("session directory")
-                .to_string_lossy()
-                .into_owned();
-            legs.system.normalizer.session_id = session_id.clone();
-            legs.system.session_offset_ms = anchors.system_ms;
-            let (s, s_rx) = DeepgramStream::open(*legs.system);
-            let (m, m_rx) = match legs.mic {
-                Some(mut cfg) if mic_format.is_some() => {
-                    cfg.normalizer.session_id = session_id.clone();
-                    cfg.session_offset_ms = anchors.mic_ms;
-                    let (m, rx) = DeepgramStream::open(*cfg);
-                    (Some(Arc::new(m)), Some(rx))
-                }
-                _ => (None, None),
-            };
-            (Some(Arc::new(s)), Some(s_rx), m, m_rx)
-        }
-    };
+    let session_id = dir
+        .file_name()
+        .expect("session directory")
+        .to_string_lossy()
+        .into_owned();
+    let (sys_stt, sys_events, mic_stt, mic_events) =
+        open_legs(transcription, &session_id, anchors, mic_format.is_some());
 
     let stop = Arc::new(AtomicBool::new(false));
     let pump_stop = Arc::clone(&stop);
@@ -2142,8 +2147,7 @@ pub async fn run_supervised(
     let _ = taps_closed;
 
     for stream in [sys_stt, mic_stt].into_iter().flatten() {
-        let _ = stream.flush().await;
-        let _ = stream.close().await;
+        stream.finish().await;
     }
     for collector in [sys_collector, mic_collector].into_iter().flatten() {
         let _ = tokio::time::timeout(Duration::from_secs(10), collector).await;
@@ -2218,9 +2222,98 @@ trait PcmFeed: Send + Sync {
     fn write_pcm(&self, pcm: &[i16]);
 }
 
-impl PcmFeed for DeepgramStream {
+/// One leg's open transcription, whichever engine is behind it.
+enum LegStream {
+    Deepgram(DeepgramStream),
+    Local(LocalStream),
+}
+
+impl LegStream {
+    /// Let the engine finish what it has heard, then close it.
+    ///
+    /// Deepgram is asked to finalize first so the utterance in flight is not
+    /// lost with the socket. A local leg's close already transcribes everything
+    /// written before it, however far behind the model has fallen.
+    async fn finish(&self) {
+        match self {
+            Self::Deepgram(stream) => {
+                let _ = stream.flush().await;
+                let _ = stream.close().await;
+            }
+            Self::Local(stream) => {
+                let _ = stream.close().await;
+            }
+        }
+    }
+}
+
+impl PcmFeed for LegStream {
     fn write_pcm(&self, pcm: &[i16]) {
-        self.write(pcm);
+        match self {
+            Self::Deepgram(stream) => stream.write(pcm),
+            Self::Local(stream) => stream.write(pcm),
+        }
+    }
+}
+
+type LegEvents = tokio::sync::mpsc::UnboundedReceiver<StreamEvent>;
+
+/// The open legs: system stream and events, then mic stream and events.
+type OpenLegs = (
+    Option<Arc<LegStream>>,
+    Option<LegEvents>,
+    Option<Arc<LegStream>>,
+    Option<LegEvents>,
+);
+
+/// Open each configured leg on the session's identity and clock.
+///
+/// The one place a leg's anchor is spelled. From here down it is the stream's
+/// own property, applied at connection zero and carried across every reconnect.
+/// `session_id` is the WAL's: the factory's placeholder predates tap startup
+/// and must not escape into deltas, status, or saved handoff.
+///
+/// The mic leg is additionally gated on the mic tap having actually started: a
+/// stream for a device that is not there would be fed nothing — and, for
+/// Deepgram, still billed for the socket.
+fn open_legs(
+    transcription: Transcription,
+    session_id: &str,
+    anchors: LegAnchors,
+    mic_started: bool,
+) -> OpenLegs {
+    match transcription {
+        Transcription::Disabled => (None, None, None, None),
+        Transcription::Deepgram(mut legs) => {
+            legs.system.normalizer.session_id = session_id.to_owned();
+            legs.system.session_offset_ms = anchors.system_ms;
+            let (s, s_rx) = DeepgramStream::open(*legs.system);
+            let (m, m_rx) = match legs.mic {
+                Some(mut cfg) if mic_started => {
+                    cfg.normalizer.session_id = session_id.to_owned();
+                    cfg.session_offset_ms = anchors.mic_ms;
+                    let (m, rx) = DeepgramStream::open(*cfg);
+                    (Some(Arc::new(LegStream::Deepgram(m))), Some(rx))
+                }
+                _ => (None, None),
+            };
+            (Some(Arc::new(LegStream::Deepgram(s))), Some(s_rx), m, m_rx)
+        }
+        Transcription::Local(mut legs) => {
+            legs.system.session_id = session_id.to_owned();
+            legs.system.session_offset_ms = anchors.system_ms;
+            let (s, s_rx) = LocalStream::open(*legs.system, Arc::clone(&legs.engine));
+            let (m, m_rx) = match legs.mic {
+                Some(mut cfg) if mic_started => {
+                    cfg.session_id = session_id.to_owned();
+                    cfg.session_offset_ms = anchors.mic_ms;
+                    let (m, rx) = LocalStream::open(*cfg, legs.engine);
+                    (Some(Arc::new(LegStream::Local(m))), Some(rx))
+                }
+                _ => (None, None),
+            };
+            (Some(Arc::new(LegStream::Local(s))), Some(s_rx), m, m_rx)
+        }
     }
 }
 

@@ -46,6 +46,9 @@ tokio = { workspace = true, features = [
   "process",
   "io-util",
 ] }
+# Checks a downloaded local-STT model against its published checksum (#33).
+# Already in the lock via fotw-secrets, so no new supply chain.
+sha2 = "0.11"
 reqwest = { version = "0.13.4", default-features = false, features = ["http2", "native-tls", "json", "charset"] }
 
 [dev-dependencies]

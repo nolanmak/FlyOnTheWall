@@ -25,6 +25,11 @@
 //! parts of STT-09 that are easy to get subtly wrong are assertable without a
 //! runtime, and only the socket plumbing needs one.
 //!
+//! On-device transcription follows the same split: [`local`]'s endpointer and
+//! segment builder are pure, its worker thread is the transport, and the model
+//! sits behind a trait whose whisper.cpp implementation, [`whisper`], is the
+//! only code here that needs weights to test.
+//!
 //! See `docs/REQUIREMENTS.md` §7.
 
 #![forbid(unsafe_code)]
@@ -38,11 +43,14 @@ pub mod deepgram;
 pub mod deepgram_stream;
 pub mod deepgram_wire;
 pub mod error;
+pub mod local;
 pub mod replay;
 pub mod speaker;
 pub mod store;
 pub mod stream;
 pub mod transcript;
+#[cfg(target_os = "macos")]
+pub mod whisper;
 
 pub use backoff::{BackoffPolicy, FixedJitter, Jitter, ProcessJitter, ReconnectBudget};
 pub use capabilities::{CustomVocabulary, FeatureAvailability, RetentionControl, SttCapabilities};
@@ -51,6 +59,9 @@ pub use dedupe::{TranscriptTail, normalize_tokens, trim_leading_tokens};
 pub use deepgram_stream::{DeepgramStream, DeepgramStreamConfig, map_transport_error};
 pub use deepgram_wire::{DeepgramEndpoint, DeepgramStreamParams, map_close, map_http_status};
 pub use error::{FailoverPolicy, SttError, SttErrorClass};
+pub use local::{
+    EndpointConfig, LocalStream, LocalStreamConfig, Recognized, Recognizer, RecognizerFactory,
+};
 pub use replay::{PcmRing, Replay, to_linear16_le};
 pub use speaker::{SpeakerNormalizer, SpeakerRegistry};
 pub use store::{
@@ -58,3 +69,5 @@ pub use store::{
 };
 pub use stream::{StreamEvent, StreamState};
 pub use transcript::{Source, TimestampSource, TranscriptSegment, Word};
+#[cfg(target_os = "macos")]
+pub use whisper::WhisperEngine;

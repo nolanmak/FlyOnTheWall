@@ -82,6 +82,7 @@ use crate::session::{
     self, DeepgramLegs, FinishDeadlines, SegmentTap, SessionControl, SessionOutcome, StopSignal,
     SttErrors, Transcription,
 };
+use crate::stt::{SttEngine, SttSettings};
 // This module runs entirely inside the daemon, where stderr is discarded, so
 // every diagnostic below is also written to the daemon's log (#101). The two
 // that handle transcript-derived text deliberately do NOT use `diag!` — see
@@ -300,6 +301,7 @@ impl DaemonRecorder {
         // test that injects its own gets no announcements — which is right:
         // there is no hub behind them.
         let finish_ready = on_ready.clone();
+        let transcription_root = root.clone();
         // The real daemon supervises the taps it opens itself, so a stalled
         // Core Audio process tap is rebuilt mid-meeting instead of recording
         // silence to the end (docs/REQUIREMENTS.md 6.4, #101). The session
@@ -315,7 +317,7 @@ impl DaemonRecorder {
                 plat: Arc::new(platform::host()),
                 clock: Arc::new(HostClock),
             },
-            Box::new(keychain_transcription),
+            Box::new(move || configured_transcription(&transcription_root)),
             Box::new(move |root, outcome| persist_and_promote(root, outcome, &finish_ready)),
             UI_CEILING,
             READY_DEADLINE,
@@ -415,6 +417,35 @@ fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// What `Start` transcribes with: the engine `fotwd stt` stored (#33).
+///
+/// Read at every Start, so a change applies to the next meeting without a
+/// restart. Fails closed: a library that cannot be read leaves the choice
+/// unknown, and the unknown choice may be "audio never leaves this machine" —
+/// so the meeting records untranscribed rather than guessing Deepgram.
+fn configured_transcription(root: &Path) -> Transcription {
+    let settings = match crate::open_library(root) {
+        Ok(db) => SttSettings::read(&db),
+        Err(e) => {
+            diag!(
+                "  ! could not read the transcription settings; recording without a transcript: {e}"
+            );
+            return Transcription::Disabled;
+        }
+    };
+    match settings.engine {
+        SttEngine::Deepgram => keychain_transcription(),
+        SttEngine::Local => crate::stt::local_transcription(
+            &settings,
+            root.parent().unwrap_or(root),
+            &format!("fotw-web-{}", now_ms()),
+            // As for Deepgram: whether a mic started is the session's call.
+            true,
+            session::mic_stt_enabled(std::env::var("FOTW_MIC_STT").ok().as_deref()),
+        ),
+    }
 }
 
 /// Look the Deepgram key up in the OS keychain, with `DEEPGRAM_API_KEY` as the

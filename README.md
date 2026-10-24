@@ -1,13 +1,13 @@
 # FlyOnTheWall
 
-An open-source, local-first meeting recorder for macOS. It captures system audio and your microphone as two separate streams with **no bot joining the call**, transcribes them live through **Deepgram with your own API key**, and turns each finished meeting into a title, a summary that cites the transcript, and action items whose evidence is checked, using a summary engine you choose. The meeting library is a SQLCipher-encrypted database on your own disk. **The recorded audio beside it is not encrypted yet** — see [Privacy](#privacy).
+An open-source, local-first meeting recorder for macOS. It captures system audio and your microphone as two separate streams with **no bot joining the call**, transcribes them live through **Deepgram with your own API key** or **on your Mac with whisper.cpp**, and turns each finished meeting into a title, a summary that cites the transcript, and action items whose evidence is checked, using a summary engine you choose. The meeting library is a SQLCipher-encrypted database on your own disk. **The recorded audio beside it is not encrypted yet** — see [Privacy](#privacy).
 
 > **Status: pre-release.** macOS only (14.4 or later), built from source. There are no signed or prebuilt releases. Capture, live Deepgram transcription, the encrypted library, summaries, exports and the web dashboard are implemented and wired together; the largest gaps are listed under [Known gaps](#known-gaps). **[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)** is the 2026-08 design record, not a description of the current code; work is tracked in [issues](https://github.com/nolanmak/FlyOnTheWall/issues).
 
 ### Known gaps
 
 - **Audio is not encrypted at rest** ([#56](https://github.com/nolanmak/FlyOnTheWall/issues/56)). Only the database is.
-- **Deepgram is the only speech-to-text provider.** On-device transcription ([#33](https://github.com/nolanmak/FlyOnTheWall/issues/33)) and an ordered failover chain across providers ([#12](https://github.com/nolanmak/FlyOnTheWall/issues/12)) are planned. `fotwd key set` already accepts `elevenlabs` and `openai` keys, but nothing uses them yet.
+- **Two speech-to-text engines: Deepgram, or whisper.cpp on your Mac.** On-device transcription ([#33](https://github.com/nolanmak/FlyOnTheWall/issues/33)) is configured from the command line only, you download the model yourself, and Apple's SpeechAnalyzer is not used. An ordered failover chain across providers ([#12](https://github.com/nolanmak/FlyOnTheWall/issues/12)) is planned. `fotwd key set` already accepts `elevenlabs` and `openai` keys, but nothing uses them yet.
 - **No menu-bar item or floating recording indicator.** Both are written, in `fotw-shell`, but nothing in the app starts them ([#58](https://github.com/nolanmak/FlyOnTheWall/issues/58)). Recording is started, stopped and shown in the dashboard.
 - **Notes cannot be typed yet.** The library, search, summaries and exports all handle a meeting's notes, but no shipped screen or command writes them.
 - **Windows and Linux** capture backends are empty placeholders (milestone M4).
@@ -21,7 +21,7 @@ An open-source, local-first meeting recorder for macOS. It captures system audio
 ## Features
 
 - **Two-stream capture.** Core Audio process taps record system audio and the default microphone into a crash-safe session on disk as the audio arrives, so a crash, a network stall or a provider outage does not lose the recording. Nothing records until you press **Start** in the dashboard, and Start is enabled only once you tick *everyone consented*.
-- **Live transcription.** With a Deepgram key, both streams are transcribed while you record and the transcript appears in the dashboard as it arrives. Without a key the meeting is still recorded, just not transcribed.
+- **Live transcription.** Both streams are transcribed while you record and the transcript appears in the dashboard as it arrives: by Deepgram with your key, or on this Mac with whisper.cpp after `fotwd stt local`, in which case no audio leaves the machine. With neither, the meeting is still recorded, just not transcribed.
 - **An encrypted, searchable library.** SQLCipher, with full-text search over titles, transcripts, notes and summaries. Its key lives in the macOS keychain, behind a mandatory [Recovery Key](#your-recovery-key).
 - **Summaries.** Each finished meeting gets a title, a summary that cites transcript segments, and action items whose evidence is checked before they are kept. Templates are Markdown files; `fotwd templates install` copies the built-in ones to `~/.flyonthewall/templates` for you to edit.
 - **Exports.** `fotwd export <id>` writes one meeting as Markdown, text or JSON. `fotwd export-all <dest> --yes-plaintext` writes a lossless archive of the whole library that `fotwd import` reads back. `fotwd export-okf <dest>` writes a folder of Markdown an agent can index. All of them are plain text.
@@ -86,7 +86,7 @@ Nothing marked no needs a key to read: the transcript text in `sessions/<id>/stt
 
 There is no FlyOnTheWall server. Data leaves only for services you configure, under your own accounts:
 
-- **Audio, to Deepgram** — only while recording, and only when a Deepgram key is configured. Both streams go straight to `api.deepgram.com`, and every request carries `mip_opt_out=true`, Deepgram's opt-out from model training.
+- **Audio, to Deepgram** — only while recording, only when a Deepgram key is configured, and never once you switch to on-device transcription with `fotwd stt local`. Both streams go straight to `api.deepgram.com`, and every request carries `mip_opt_out=true`, Deepgram's opt-out from model training.
 - **Transcripts and notes, to your summary engine** — for each finished meeting, once an engine is configured. That is the Anthropic API when an Anthropic key is stored, otherwise the `claude` or `codex` CLI you enabled, which sends it to Anthropic or OpenAI through that CLI's own login. Meeting documents use the same engine. With no engine configured nothing is sent, and meetings get a local fallback title.
 - **Transcripts, to GitHub** — only if you turn GitHub export on; it is off by default. It uses your `gh` login to commit each meeting's full transcript and notes, its summary and its saved document brief as Markdown to the repository you choose. In auto mode the daemon syncs each meeting once it has finished and been summarised, and syncs it again when its summary or saved brief changes; every meeting shows its own sync state in the dashboard, and a meeting whose push failed is retried on a bounded schedule without being asked. Meetings recorded before auto was switched on are left alone unless you also turn on *sync every meeting in the library*. A meeting no automatic pass covers — any meeting while the mode is manual, and anything from before the cutoff — says so and offers *Sync now*, which is the only way one of those reaches the repository. It refuses any repository GitHub does not confirm is private, unless the export settings store your acknowledgement that it may be public; see [GitHub sync](docs/SHARING_DOCUMENTS.md#github-sync).
 - **Library contents, to an agent** — only if you point an agent at `fotwd mcp`. The reading is local; what that agent then sends to its own model is up to the agent.
@@ -146,6 +146,24 @@ fotwd key list           # which providers have a key stored, never the key itse
 
 The key goes into the macOS keychain. It is looked up each time you press **Start**, so a running app uses it from the next recording.
 
+### Or transcribe on this Mac
+
+whisper.cpp runs inside the app, with Metal on Apple silicon, and no meeting audio leaves the machine. FlyOnTheWall does not download models itself, so fetch one first. The recommended model is large-v3-turbo, quantized (574 MB):
+
+```sh
+mkdir -p ~/Library/Application\ Support/com.flyonthewall.fotw/models
+curl -L --fail -o ~/Library/Application\ Support/com.flyonthewall.fotw/models/ggml-large-v3-turbo-q5_0.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
+
+fotwd stt test some-recording.wav   # optional: transcribe a file to check speed and accuracy
+fotwd stt local                     # checks the file against its published SHA-256, then switches
+fotwd stt                           # which engine the next recording will use
+```
+
+`fotwd stt local` with no model shows these commands and the other published models (`--model base.en`, `small.en`, `large-v3-turbo`), and `--model` also takes a path to a ggml model of your own. `--language en` skips language detection. `fotwd stt deepgram` switches back. The setting is read each time you press **Start**.
+
+On-device transcription is a different trade-off from Deepgram's. Text appears once each speaker pauses, a second or two after they stop, rather than word by word. The far end of the call is not split into speakers: everything from the call audio is one voice, and your microphone is always `me`. If the model is missing or cannot load, the meeting is still recorded, the dashboard says why there is no transcript, and nothing is sent to Deepgram instead.
+
 ### Choose a summary engine
 
 Pick one:
@@ -186,6 +204,7 @@ The library and the audio live in `~/Library/Application Support/com.flyonthewal
 | `db.sqlite3`, with its `-wal` and `-shm` files | the encrypted library |
 | `db.sqlite3.recovery` | the library key, sealed under your Recovery Key |
 | `media/` | archived audio, **unencrypted** |
+| `models/` | Whisper models for on-device transcription, which you download yourself |
 | `sessions/` | meetings not yet archived, raw audio and transcript, **unencrypted** |
 | `audit.jsonl` | who started each recording and the consent warning shown |
 | `fotwd.log` | daemon diagnostics |
@@ -207,7 +226,7 @@ A backup of this folder contains your meeting audio in the clear, and retention 
 
 ## Stack
 
-Pure Rust. A daemon (`fotwd`) owns capture, STT and storage, serves the dashboard on `127.0.0.1` to your own browser, and is also the command line for everything the dashboard does not cover. A separate `fotw` binary has two capture diagnostics, `doctor` and `record`. A thin AppKit shell in Rust (`fotw-shell`) for the menu-bar item and the recording indicator is written but not yet started by the app ([#58](https://github.com/nolanmak/FlyOnTheWall/issues/58)). It all runs from one `.app` bundle, because the capture grant belongs to a signed bundle — a macOS TCC requirement, not a UI framework choice. The release path (`just release-sign`, `just notarize`) exists, but no signed build has been published. No Tauri, no Electron, no Swift, no Xcode.
+Pure Rust, plus whisper.cpp, which is compiled from source for on-device transcription. A daemon (`fotwd`) owns capture, STT and storage, serves the dashboard on `127.0.0.1` to your own browser, and is also the command line for everything the dashboard does not cover. A separate `fotw` binary has two capture diagnostics, `doctor` and `record`. A thin AppKit shell in Rust (`fotw-shell`) for the menu-bar item and the recording indicator is written but not yet started by the app ([#58](https://github.com/nolanmak/FlyOnTheWall/issues/58)). It all runs from one `.app` bundle, because the capture grant belongs to a signed bundle — a macOS TCC requirement, not a UI framework choice. The release path (`just release-sign`, `just notarize`) exists, but no signed build has been published. No Tauri, no Electron, no Swift, no Xcode.
 
 ## Scope
 

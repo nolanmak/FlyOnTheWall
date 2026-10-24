@@ -13,8 +13,8 @@ Everything on `main` today. It is an early build: macOS 14.4 or later only,
 built from source.
 
 **Limits worth knowing before you use it.** Recorded audio is not encrypted at
-rest yet; only the library database is. Deepgram is the only speech-to-text
-provider. Audio capture is implemented for macOS only: `fotw-audio` has Windows
+rest yet; only the library database is. Speech-to-text is Deepgram, or
+whisper.cpp on the Mac itself. Audio capture is implemented for macOS only: `fotw-audio` has Windows
 and Linux modules behind its platform seam, and CI checks that it compiles for
 Windows, but neither captures anything.
 
@@ -38,6 +38,13 @@ Windows, but neither captures anything.
 
 - Deepgram streaming speech-to-text for both legs, with reconnect and gapless
   replay, 48 kHz to 16 kHz resampling, and a live transcript in the dashboard.
+- On-device transcription with whisper.cpp (#33), compiled in with Metal.
+  `fotwd stt local` switches to it, after checking the model you downloaded
+  against its published SHA-256. Each leg is cut into utterances at its pauses
+  and transcribed on a worker thread of its own, so capture never waits on the
+  model. `fotwd stt test <wav>` runs a file through the same path. If the
+  engine is set to local and the model is missing, the meeting is recorded
+  without a transcript and the reason is shown. Nothing falls back to Deepgram.
 
 #### Library and keys
 

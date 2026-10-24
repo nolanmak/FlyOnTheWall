@@ -27,6 +27,7 @@ pub mod retention;
 pub mod secrets;
 pub mod serve;
 pub mod session;
+pub mod stt;
 pub mod summarize;
 /// Names the integration tests share, so none of them hand-writes one that
 /// resolves to a real engine — #83. Absent from every shipped build; see the

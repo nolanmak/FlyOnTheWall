@@ -1,12 +1,12 @@
 //! `fotwd` — the FlyOnTheWall daemon, and the command line for its library.
 //!
 //! `fotwd serve` is what the app bundle runs: the loopback web dashboard,
-//! recordings started from it, Deepgram transcription when a key is
-//! configured, the SQLCipher library, and the background retention sweeper,
+//! recordings started from it, transcription with Deepgram or on-device
+//! whisper.cpp (`fotwd stt` picks), the SQLCipher library, and the background retention sweeper,
 //! summary backfill and GitHub export worker. A bare launch with no arguments
 //! and no terminal (a Finder double-click) does the same. Every other
-//! subcommand works on that same library from a terminal: `key` and `engine`
-//! configure it, `recover` opens it with the Recovery Key, `export`,
+//! subcommand works on that same library from a terminal: `key`, `stt` and
+//! `engine` configure it, `recover` opens it with the Recovery Key, `export`,
 //! `export-all`, `export-okf` and `import` move meetings out and in, `mcp`
 //! serves it to a local agent, and `record` captures one meeting without the
 //! dashboard. The usage text in `main`'s fallback arm lists them all.
@@ -109,6 +109,7 @@ async fn main() -> ExitCode {
         }
         Some("dedupe") => dedupe_command(&args[1..]),
         Some("engine") => engine_command(&args[1..]),
+        Some("stt") => stt_command(&args[1..]).await,
         Some("key") => key_command(&args[1..]),
         Some("recover") => {
             let pos = positionals(&args[1..], &[]);
@@ -180,6 +181,7 @@ async fn main() -> ExitCode {
                  onboard | detect [seconds] | \
                  retention [dir] [--apply] [--days <n>] [--budget-gib <n>] | \
                  key <set <provider>|list> | engine [claude-cli|codex-cli|off] | \
+                 stt [local [--model <name|path>] [--language <code>]|deepgram|test <wav>] | \
                  dedupe <id|--all> [dir] [--revert <transcript-id>] | \
                  recover [dir] [--check] | \
                  retitle-legacy [dir] [--apply] | \
@@ -191,8 +193,9 @@ async fn main() -> ExitCode {
                  import <dest> [dir]>"
             );
             eprintln!();
-            eprintln!("  Run `fotwd key set deepgram` to transcribe as well as record.");
-            eprintln!("  Without a key the meeting is still recorded, but not transcribed,");
+            eprintln!("  Run `fotwd key set deepgram` to transcribe as well as record, or");
+            eprintln!("  `fotwd stt local` to transcribe on this Mac with whisper.cpp.");
+            eprintln!("  Without either the meeting is still recorded, but not transcribed,");
             eprintln!("  and no command transcribes the saved audio afterwards.");
             ExitCode::FAILURE
         }
@@ -660,40 +663,77 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
         .open_mic(&DeviceId::new("default"), FormatRequest::any())
         .ok();
 
-    let key_store = secrets::keystore().ok();
-    let found = key_store
-        .as_ref()
-        .and_then(|s| secrets::deepgram_key(*s as &dyn KeyStore));
-    let transcription = match found {
-        Some((secret, origin)) => {
-            match origin {
-                secrets::Origin::Environment => println!(
-                    "  transcribe : Deepgram nova-3 (key from DEEPGRAM_API_KEY — \
-                     readable by any child process; prefer `fotwd key set deepgram`)"
-                ),
-                _ => println!("  transcribe : Deepgram nova-3 (key from keychain)"),
-            }
-            // Both legs by default (#60): a transcript missing the user's
-            // half of every conversation fails at the product's one job. The
-            // second stream doubles the Deepgram bill, so it is declinable —
-            // and the line below says which legs are live, so the bill is
-            // never a surprise.
-            let mic_stt = session::mic_stt_enabled(std::env::var("FOTW_MIC_STT").ok().as_deref());
-            match (mic.is_some(), mic_stt) {
-                (true, true) => println!("  streams    : system + mic (FOTW_MIC_STT=off for one)"),
-                (true, false) => println!("  streams    : system only (FOTW_MIC_STT=off)"),
-                (false, _) => println!("  streams    : system only (no input device)"),
-            }
-            Transcription::Deepgram(session::DeepgramLegs::for_session(
-                secret.expose(),
+    // The engine `fotwd stt` stored, as the dashboard's Start reads it, and
+    // failing closed the same way: an unreadable choice may have been "never
+    // off this machine".
+    let settings = match open_db(&root) {
+        Ok(db) => Some(fotwd::stt::SttSettings::read(&db)),
+        Err(e) => {
+            eprintln!("fotwd: {e}");
+            None
+        }
+    };
+    // Both legs by default (#60): a transcript missing the user's half of
+    // every conversation fails at the product's one job. On Deepgram the
+    // second stream doubles the bill, so it is declinable — and the line
+    // below says which legs are live, so the bill is never a surprise.
+    let mic_stt = session::mic_stt_enabled(std::env::var("FOTW_MIC_STT").ok().as_deref());
+    let streams_line = || match (mic.is_some(), mic_stt) {
+        (true, true) => println!("  streams    : system + mic (FOTW_MIC_STT=off for one)"),
+        (true, false) => println!("  streams    : system only (FOTW_MIC_STT=off)"),
+        (false, _) => println!("  streams    : system only (no input device)"),
+    };
+    let transcription = match settings {
+        None => {
+            println!(
+                "  transcribe : off (the library could not be read, so the engine is unknown)"
+            );
+            Transcription::Disabled
+        }
+        Some(settings) if settings.engine == fotwd::stt::SttEngine::Local => {
+            let data_root = data_root_of(&root);
+            println!(
+                "  transcribe : on this Mac, whisper.cpp ({})",
+                settings.model_path(&data_root).display()
+            );
+            streams_line();
+            fotwd::stt::local_transcription(
+                &settings,
+                &data_root,
                 &session_id(),
                 mic.is_some(),
                 mic_stt,
-            ))
+            )
         }
-        None => {
-            println!("  transcribe : off (run `fotwd key set deepgram` to enable)");
-            Transcription::Disabled
+        Some(_) => {
+            let key_store = secrets::keystore().ok();
+            let found = key_store
+                .as_ref()
+                .and_then(|s| secrets::deepgram_key(*s as &dyn KeyStore));
+            match found {
+                Some((secret, origin)) => {
+                    match origin {
+                        secrets::Origin::Environment => println!(
+                            "  transcribe : Deepgram nova-3 (key from DEEPGRAM_API_KEY — \
+                             readable by any child process; prefer `fotwd key set deepgram`)"
+                        ),
+                        _ => println!("  transcribe : Deepgram nova-3 (key from keychain)"),
+                    }
+                    streams_line();
+                    Transcription::Deepgram(session::DeepgramLegs::for_session(
+                        secret.expose(),
+                        &session_id(),
+                        mic.is_some(),
+                        mic_stt,
+                    ))
+                }
+                None => {
+                    println!(
+                        "  transcribe : off (`fotwd key set deepgram` or `fotwd stt local` to enable)"
+                    );
+                    Transcription::Disabled
+                }
+            }
         }
     };
 
@@ -1450,6 +1490,338 @@ fn engine_command(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `fotwd stt [local [--model <name|path>] [--language <code>] | deepgram | test <wav>]`.
+///
+/// Which engine transcribes recordings (#33). Bare, it reports what the next
+/// Start will actually use — including a configured engine that cannot run —
+/// in the spirit of `fotwd engine`.
+async fn stt_command(args: &[String]) -> ExitCode {
+    use fotwd::stt::{SttEngine, SttSettings};
+
+    let root = default_root();
+    let data_root = data_root_of(&root);
+
+    if args.first().map(String::as_str) == Some("test") {
+        let Some(wav) = positionals(&args[1..], &["--model", "--language"])
+            .first()
+            .map(PathBuf::from)
+        else {
+            eprintln!("usage: fotwd stt test <file.wav> [--model <name|path>] [--language <code>]");
+            return ExitCode::FAILURE;
+        };
+        // With `--model`, a model can be tried before there is a library to
+        // store a choice in; without it, the stored choice is what is tested.
+        let mut settings = match flag_value(args, "--model") {
+            Some(model) => match resolve_model_arg(&model, &data_root) {
+                Ok(path) => SttSettings {
+                    model: path.to_string_lossy().into_owned(),
+                    ..SttSettings::default()
+                },
+                Err(e) => {
+                    eprintln!("fotwd: {e}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            None => match open_db(&root) {
+                Ok(db) => SttSettings::read(&db),
+                Err(e) => {
+                    eprintln!("fotwd: {e}");
+                    return ExitCode::FAILURE;
+                }
+            },
+        };
+        if let Some(language) = flag_value(args, "--language") {
+            settings.language = language;
+        }
+        return stt_test(&settings, &data_root, &wav).await;
+    }
+
+    let mut db = match open_db(&root) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("fotwd: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut settings = SttSettings::read(&db);
+
+    match args.first().map(String::as_str) {
+        None => {
+            print_stt_status(&settings, &data_root);
+            ExitCode::SUCCESS
+        }
+        Some("local") => {
+            if !cfg!(target_os = "macos") {
+                eprintln!("fotwd: local transcription is macOS-only for now");
+                return ExitCode::FAILURE;
+            }
+            if let Some(model) = flag_value(args, "--model") {
+                settings.model = match resolve_model_arg(&model, &data_root) {
+                    Ok(path) => path.to_string_lossy().into_owned(),
+                    Err(e) => {
+                        eprintln!("fotwd: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+            }
+            if let Some(language) = flag_value(args, "--language") {
+                let code = language.trim().to_ascii_lowercase();
+                // Whisper takes ISO 639-1 codes, plus a handful of 3-letter
+                // ones (`haw`, `yue`); anything else is a typo, not a language.
+                let looks_like_code =
+                    (2..=3).contains(&code.len()) && code.chars().all(|c| c.is_ascii_lowercase());
+                if code != "auto" && !looks_like_code {
+                    eprintln!(
+                        "fotwd: `{language}` is not a language code; try `en`, `de` or `auto`"
+                    );
+                    return ExitCode::FAILURE;
+                }
+                settings.language = if code == "auto" { String::new() } else { code };
+            }
+            let path = settings.model_path(&data_root);
+            if !check_model(&path, &data_root) {
+                return ExitCode::FAILURE;
+            }
+            settings.engine = SttEngine::Local;
+            settings.model = path.to_string_lossy().into_owned();
+            if let Err(e) = settings.write(&mut db) {
+                eprintln!("fotwd: {e}");
+                return ExitCode::FAILURE;
+            }
+            print_stt_status(&settings, &data_root);
+            println!();
+            println!("  Meetings started from now on are transcribed on this Mac; no audio is");
+            println!("  sent to Deepgram. The model loads when you press Start, so the first");
+            println!("  lines can take a few seconds longer than the rest.");
+            ExitCode::SUCCESS
+        }
+        Some("deepgram") => {
+            settings.engine = SttEngine::Deepgram;
+            if let Err(e) = settings.write(&mut db) {
+                eprintln!("fotwd: {e}");
+                return ExitCode::FAILURE;
+            }
+            print_stt_status(&settings, &data_root);
+            ExitCode::SUCCESS
+        }
+        Some(other) => {
+            eprintln!(
+                "usage: fotwd stt [local [--model <name|path>] [--language <code>] | deepgram | \
+                 test <file.wav> [--model <name|path>]]"
+            );
+            eprintln!("fotwd: unknown stt command `{other}`");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `--model` as a known model's name (into the models folder) or a file path.
+///
+/// A relative path is made absolute here, because the daemon that reads the
+/// setting runs from a different working directory than this shell.
+fn resolve_model_arg(model: &str, data_root: &std::path::Path) -> Result<PathBuf, String> {
+    if !model.contains('/')
+        && let Some(known) = fotwd::stt::known_model(model)
+    {
+        return Ok(fotwd::stt::models_dir(data_root).join(fotwd::stt::model_file_name(known.name)));
+    }
+    std::path::absolute(model).map_err(|e| format!("cannot resolve {model}: {e}"))
+}
+
+/// Verify a model, printing what was found and, when it is missing, how to
+/// fetch it. `true` when it is usable.
+fn check_model(path: &std::path::Path, data_root: &std::path::Path) -> bool {
+    use fotwd::stt::{KNOWN_MODELS, ModelError};
+
+    println!("  checking   : {}", path.display());
+    match fotwd::stt::verify_model(path) {
+        Ok(Some(known)) => {
+            println!(
+                "  verified   : {} matches its published checksum",
+                known.name
+            );
+            true
+        }
+        Ok(None) => {
+            println!("  note       : not a published model, so it was not checksum-verified");
+            true
+        }
+        Err(ModelError::Missing(_)) => {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(fotwd::stt::known_model);
+            eprintln!();
+            eprintln!("  No model there yet. FlyOnTheWall does not download models itself;");
+            if let Some(known) = name {
+                eprintln!(
+                    "  fetch {} ({} MB) with:",
+                    known.name,
+                    known.bytes / 1_000_000
+                );
+                eprintln!();
+                eprintln!("    mkdir -p '{}'", path.parent().unwrap_or(path).display());
+                eprintln!("    curl -L --fail -o '{}' \\", path.display());
+                eprintln!("      {}", known.url());
+                eprintln!();
+                eprintln!(
+                    "  then run `fotwd stt local` again; it checks the file before using it."
+                );
+            } else {
+                eprintln!("  put a ggml Whisper model at that path, or pick a published one.");
+            }
+            eprintln!();
+            eprintln!(
+                "  Published models (`--model <name>`, kept in {}):",
+                fotwd::stt::models_dir(data_root).display()
+            );
+            for m in KNOWN_MODELS {
+                eprintln!(
+                    "    {:<20} {:>5} MB  {}",
+                    m.name,
+                    m.bytes / 1_000_000,
+                    m.note
+                );
+            }
+            false
+        }
+        Err(e) => {
+            eprintln!("fotwd: {e}");
+            false
+        }
+    }
+}
+
+fn print_stt_status(settings: &fotwd::stt::SttSettings, data_root: &std::path::Path) {
+    match settings.engine {
+        fotwd::stt::SttEngine::Local => {
+            let path = settings.model_path(data_root);
+            println!("  engine     : local — whisper.cpp on this Mac; meeting audio stays here");
+            println!("  model      : {}", path.display());
+            println!(
+                "  language   : {}",
+                settings
+                    .language()
+                    .unwrap_or_else(|| "detected per utterance".to_owned())
+            );
+            if !cfg!(target_os = "macos") {
+                println!("  ! local transcription is macOS-only for now; meetings record");
+                println!("    without a transcript");
+            } else if !path.is_file() {
+                println!("  ! the model file is missing, so meetings record without a transcript;");
+                println!("    run `fotwd stt local` to see how to fetch it");
+            }
+        }
+        fotwd::stt::SttEngine::Deepgram => {
+            let has_key = secrets::keystore().ok().is_some_and(|s| {
+                s.contains(SecretKey::ApiKey(Provider::Deepgram))
+                    .unwrap_or(false)
+            }) || std::env::var_os("DEEPGRAM_API_KEY").is_some();
+            if has_key {
+                println!(
+                    "  engine     : deepgram — audio streams to api.deepgram.com while recording"
+                );
+            } else {
+                println!("  engine     : deepgram — but no key is stored, so meetings record");
+                println!("               without a transcript");
+            }
+            println!("    `fotwd stt local`   to transcribe on this Mac instead");
+        }
+    }
+}
+
+/// `fotwd stt test <file.wav>`: run a recording through the local engine the
+/// way a meeting leg is run — same endpointer, same worker — and print what it
+/// heard and how fast. Proves a model works before a meeting depends on it.
+#[cfg(target_os = "macos")]
+async fn stt_test(
+    settings: &fotwd::stt::SttSettings,
+    data_root: &std::path::Path,
+    wav: &std::path::Path,
+) -> ExitCode {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use fotw_pipeline::resample::{Downmixer, Resampler16k};
+    use fotw_stt::{LocalStream, LocalStreamConfig, Source, StreamEvent, WhisperEngine};
+
+    let audio = match fotw_audio::wav::read(wav) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("fotwd: cannot read {}: {e}", wav.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let channels = audio.format.channels;
+    let pcm = match Resampler16k::new(audio.format.sample_rate_hz, channels)
+        .and_then(|mut r| r.process_all(&audio.samples))
+    {
+        Ok(resampled) => Downmixer::to_i16(&Downmixer::to_mono(&resampled, channels)),
+        Err(e) => {
+            eprintln!("fotwd: cannot resample {}: {e}", wav.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let path = settings.model_path(data_root);
+    if !check_model(&path, data_root) {
+        return ExitCode::FAILURE;
+    }
+    let engine = Arc::new(WhisperEngine::new(&path, settings.language()));
+    let loading = Instant::now();
+    if let Err(e) = engine.load() {
+        eprintln!("fotwd: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("  loaded     : in {:.1}s", loading.elapsed().as_secs_f64());
+    println!();
+
+    let started = Instant::now();
+    let (stream, mut events) =
+        LocalStream::open(LocalStreamConfig::new("stt-test", Source::System), engine);
+    // In the pump's 20 ms pieces, so the endpointer sees what a meeting gives it.
+    for piece in pcm.chunks(320) {
+        stream.write(piece);
+    }
+    let mut lines = 0usize;
+    let print = async {
+        while let Some(event) = events.recv().await {
+            match event {
+                StreamEvent::Final(seg) => {
+                    lines += 1;
+                    let s = seg.start_ms / 1_000;
+                    println!("  [{:02}:{:02}] {}", s / 60, s % 60, seg.text);
+                }
+                StreamEvent::Error(e) => eprintln!("  ! {e}"),
+                _ => {}
+            }
+        }
+    };
+    let (_, ()) = tokio::join!(stream.close(), print);
+
+    let seconds = pcm.len() as f64 / 16_000.0;
+    let took = started.elapsed().as_secs_f64();
+    println!();
+    println!(
+        "  {lines} line(s) from {seconds:.1}s of audio in {took:.1}s ({:.1}x real time)",
+        seconds / took.max(0.001)
+    );
+    if lines == 0 {
+        println!("  (nothing recognized: is there speech in the file, and is it loud enough?)");
+    }
+    ExitCode::SUCCESS
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn stt_test(
+    _settings: &fotwd::stt::SttSettings,
+    _data_root: &std::path::Path,
+    _wav: &std::path::Path,
+) -> ExitCode {
+    eprintln!("fotwd: local transcription is macOS-only for now");
+    ExitCode::FAILURE
 }
 
 fn key_command(args: &[String]) -> ExitCode {
