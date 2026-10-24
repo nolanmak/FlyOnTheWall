@@ -308,6 +308,9 @@ impl crate::tap::AudioTap for SystemTap {
         if self.running.is_some() {
             return Err(TapError::platform("tap is already started"));
         }
+        // Initialize the capture epoch/timebase on the control thread before
+        // native startup can invoke the real-time callback.
+        let _ = clock::host_ns();
         let running = self.build(sink)?;
         let format = running.format;
         self.running = Some(running);
