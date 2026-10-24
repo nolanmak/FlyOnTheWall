@@ -1,6 +1,7 @@
 //! Serve the real UI over a throwaway library, for looking at it.
 //!
 //!     cargo run -p fotwd --example ui_preview
+//!     cargo run -p fotwd --example ui_preview -- --live-notes
 //!
 //! Every other way into the library goes through audio capture — a TCC grant,
 //! a signed build, and an actual meeting to record — so the web UI was
@@ -27,6 +28,9 @@
 //! Deliberately an example rather than a `fotwd` subcommand: shipping a "write
 //! fake meetings into my library" verb in the product binary is how a user
 //! ends up with fabricated meetings they cannot tell from real ones.
+
+#[path = "support/live_notes.rs"]
+mod live_notes_fixture;
 
 use std::sync::Arc;
 
@@ -237,7 +241,12 @@ async fn main() -> Result<(), String> {
 
     // The real server, the real ingress policy, the real embedded assets.
     let source = Arc::new(fotw_web::StoreSource::new(db));
-    let server = fotw_web::WebServer::bind(0, source)
+    let recorder = if std::env::args().any(|arg| arg == "--live-notes") {
+        Some(live_notes_fixture::recorder(&root)?)
+    } else {
+        None
+    };
+    let server = fotw_web::WebServer::bind_with_recorder(0, source, recorder)
         .await
         .map_err(|e| format!("bind: {e}"))?;
     let state = server.state().clone();
