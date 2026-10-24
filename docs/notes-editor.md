@@ -198,3 +198,27 @@ Database reopen/migration/archive tests establish storage durability separately.
 Trusted keyboard/IME, real capture-stop/drain/device/sleep scenarios and process
 crash acceptance still need validation; augmentation window integration remains
 #13 work. Neither #122 nor #13 is closed by this increment.
+
+## Anchored augmentation context
+
+Augmentation reads one meeting's note document and anchors together, then gives
+each anchored block a recording-relative ±90-second window. Windows clip to the
+recording bounds; out-of-recording anchors supply no evidence. Matching excerpts
+are restricted to the current map chunk and deduplicated across overlapping
+windows. Boundary-overlapping turns retain their original text and timestamps;
+the code does not invent word-level clipping. Transcript segment IDs remain the
+citation source. The prompt treats note/excerpt text as untrusted data and asks
+the model to expand each block only from its matching excerpt IDs.
+
+Structured note payloads reserve context before provider calls, with a conservative
+byte-length ceiling. Chunks are repacked to fit or a context-overflow error is
+returned. Notes without anchors receive the same preflight budget protection.
+A new regression first reached the mock provider with an oversized unanchored
+note; after the guard fix it rejects the input with zero provider calls.
+
+The summarizer suite and daemon integration tests verify original offsets,
+edge clipping, overlapping-window deduplication, map-chunk isolation, context
+repacking/overflow and exclusion of another meeting's transcript. These tests
+inspect actual mock-provider requests and use no real keys or cloud calls.
+Model output quality, native timing and the remaining acceptance gates for
+#13/#122 still require validation.
