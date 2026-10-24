@@ -25,6 +25,18 @@ env:
 # the bumps.
 
 jobs:
+  keyring-interop:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@46817827a5bfabe028bf34e1cce71fd40e2ff697 # 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: tests/keyring-interop
+      - run: sudo apt-get update && sudo apt-get install -y dbus-x11 gnome-keyring
+      - run: bash scripts/test-keyring-interop.sh
+
   lint:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
