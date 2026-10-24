@@ -711,11 +711,10 @@ impl CaptureSupervisor {
     }
 
     fn remember_cleanup(&mut self, error: &TapError) {
-        if let Some(state) = error
-            .cleanup_state()
-            .filter(|state| !state.resources_released())
+        if let TapError::Cleanup { state, message } = error
+            && !state.resources_released()
         {
-            self.cleanup_blocked = Some((state, error.to_string()));
+            self.cleanup_blocked = Some((*state, message.clone()));
         }
     }
 
@@ -729,10 +728,10 @@ impl CaptureSupervisor {
     }
 
     fn stop_tap(&mut self) -> Result<(), TapError> {
-        let result = match self.tap.take() {
-            Some(mut tap) => tap.stop(),
-            None => self.cleanup_error().map_or(Ok(()), Err),
+        let Some(mut tap) = self.tap.take() else {
+            return self.cleanup_error().map_or(Ok(()), Err);
         };
+        let result = tap.stop();
         if let Err(error) = &result {
             if error.cleanup_state().is_none() {
                 self.cleanup_blocked = Some((CleanupState::Unconfirmed, error.to_string()));

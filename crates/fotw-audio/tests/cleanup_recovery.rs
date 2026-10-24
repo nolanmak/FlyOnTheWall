@@ -122,3 +122,16 @@ fn confirmed_release_allows_recovery_even_when_stop_reported_an_error() {
     );
     assert_eq!(*opens.lock().unwrap(), 2);
 }
+
+#[test]
+fn repeated_stop_preserves_the_original_cleanup_diagnostic_without_growth() {
+    let (mut supervisor, _, opens, _) = setup(CleanupState::Stopped, false);
+    supervisor.start().unwrap();
+    let original = supervisor.stop().unwrap_err().to_string();
+    assert_eq!(original, "capture cleanup Stopped: injected native failure");
+    for _ in 0..50 {
+        assert_eq!(supervisor.stop().unwrap_err().to_string(), original);
+        assert_eq!(supervisor.start().unwrap_err().to_string(), original);
+    }
+    assert_eq!(*opens.lock().unwrap(), 1);
+}
