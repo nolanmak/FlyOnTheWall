@@ -34,7 +34,6 @@ This is partial implementation of #121. A successful start still emits
 `Recovered` before sustained health is established. Accurate UI recovery state
 and manual-retry wiring, generation fencing for native callbacks, sleep-aware
 gaps, format-stable archive conversion, and bounded native recovery operations
-remain required. Native input format
-validation does not itself implement live format notifications or conversion.
+remain required. Live format notifications and conversion also remain required.
 Signed-app device/sleep tests and full-pipeline persisted-audio checks remain
 acceptance gates; synthetic supervisor tests do not prove them.
