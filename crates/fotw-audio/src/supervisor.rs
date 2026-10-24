@@ -906,6 +906,23 @@ impl CaptureSupervisor {
         }
     }
 
+    /// Snapshot an initial outage that has not recovered, before Stop detaches
+    /// the supervisor. The recorder uses this to preserve a never-available
+    /// optional source's timeline. The snapshot does not schedule recovery.
+    #[must_use]
+    pub fn pending_startup_gap(&self) -> Option<CaptureGap> {
+        let recovery = match &self.state {
+            State::Recovering(recovery) | State::Abandoned(recovery) => recovery,
+            _ => return None,
+        };
+        (recovery.reason == GapReason::InitiallyUnavailable).then(|| CaptureGap {
+            start_ns: recovery.unwritten_start_ns,
+            end_ns: self.clock.now_ns(),
+            kind: GapKind::Unwritten,
+            reason: recovery.reason,
+        })
+    }
+
     /// Queue an explicit user retry after exhaustion. No device work happens
     /// until the next poll; stopping cancels the request. The attempt spacing
     /// still applies, even when a user requests another episode immediately.
