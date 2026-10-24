@@ -157,6 +157,18 @@ to reopen FlyOnTheWall. The other source can continue recording.
 These tests inject registration/start/stop/unregistration/dependency failures;
 they do not exercise real microphones, process-tap permissions, sleep/wake, or
 physical USB/Bluetooth changes. Native calls remain synchronous and can block;
-controller deadlines and ownership must be validated separately. Early process-tap
-setup failures before a callback is owned still use cidre's guards and require a
-separate teardown audit. This change does not close the full device-recovery issue.
+controller deadlines and ownership must be validated separately. The explicit
+owner also covers process-tap UID/format lookup and aggregate construction before
+callback registration. A failure there releases only acquired dependencies;
+failed native release is returned alongside the setup error and fences that
+source until restart. An aggregate enters the owner immediately after creation,
+before callback/queue assembly. Preparation alone never starts capture. This does
+not close the full device-recovery issue.
+
+
+The partial-setup regressions first reproduced cleanup status being discarded
+when a setup error escaped through Drop. Fixtures now cover UID/format/aggregate
+setup errors, failed tap release, failed aggregate release (which must retain the
+referenced tap), successful preparation without premature registration, and Drop
+before Start. These inject native results through the same lifecycle used by the
+macOS adapter; they do not open a real device or request permissions.

@@ -136,75 +136,82 @@ impl SystemTap {
             TapError::platform(format!("AudioHardwareCreateProcessTap failed: {e:?}"))
         })?;
 
-        // --- 3. Read UID and the authoritative format --------------------
-        let tap_uid = tap
-            .uid()
-            .map_err(|e| TapError::platform(format!("kAudioTapPropertyUID failed: {e:?}")))?;
-        let asbd = tap
-            .asbd()
-            .map_err(|e| TapError::platform(format!("kAudioTapPropertyFormat failed: {e:?}")))?;
-        let format = asbd_to_format(&asbd)?;
+        let (prepared, format) = CaptureOwner::prepare(NativeAssets::system(tap), |assets| {
+            // --- 3. Read UID and the authoritative format --------------------
+            let tap_uid = assets
+                .system_tap()
+                .uid()
+                .map_err(|e| TapError::platform(format!("kAudioTapPropertyUID failed: {e:?}")))?;
+            let asbd = assets.system_tap().asbd().map_err(|e| {
+                TapError::platform(format!("kAudioTapPropertyFormat failed: {e:?}"))
+            })?;
+            let format = asbd_to_format(&asbd)?;
 
-        // --- 4. Tap-only private aggregate device ------------------------
-        let sub_tap = cf::DictionaryOf::with_keys_values(
-            &[sub_tap_keys::uid(), sub_tap_keys::drift_compensation()],
-            &[
-                tap_uid.as_type_ref(),
-                cf::Boolean::value_true().as_type_ref(),
-            ],
-        );
-        let tap_list = cf::ArrayOf::from_slice(&[sub_tap.as_ref()]);
-        let agg_uid = cf::Uuid::new().to_cf_string();
+            // --- 4. Tap-only private aggregate device ------------------------
+            let sub_tap = cf::DictionaryOf::with_keys_values(
+                &[sub_tap_keys::uid(), sub_tap_keys::drift_compensation()],
+                &[
+                    tap_uid.as_type_ref(),
+                    cf::Boolean::value_true().as_type_ref(),
+                ],
+            );
+            let tap_list = cf::ArrayOf::from_slice(&[sub_tap.as_ref()]);
+            let agg_uid = cf::Uuid::new().to_cf_string();
 
-        let dict = cf::DictionaryOf::with_keys_values(
-            &[
-                agg::uid(),
-                agg::name(),
-                agg::is_private(),
-                agg::is_stacked(),
-                agg::tap_auto_start(),
-                agg::tap_list(),
-            ],
-            &[
-                agg_uid.as_type_ref(),
-                cf::str!(c"FlyOnTheWall").as_type_ref(),
-                cf::Boolean::value_true().as_type_ref(),
-                cf::Boolean::value_false().as_type_ref(),
-                cf::Boolean::value_true().as_type_ref(),
-                tap_list.as_type_ref(),
-            ],
-        );
+            let dict = cf::DictionaryOf::with_keys_values(
+                &[
+                    agg::uid(),
+                    agg::name(),
+                    agg::is_private(),
+                    agg::is_stacked(),
+                    agg::tap_auto_start(),
+                    agg::tap_list(),
+                ],
+                &[
+                    agg_uid.as_type_ref(),
+                    cf::str!(c"FlyOnTheWall").as_type_ref(),
+                    cf::Boolean::value_true().as_type_ref(),
+                    cf::Boolean::value_false().as_type_ref(),
+                    cf::Boolean::value_true().as_type_ref(),
+                    tap_list.as_type_ref(),
+                ],
+            );
 
-        let device = AggregateDevice::with_desc(&dict).map_err(|e| {
-            TapError::platform(format!("AudioHardwareCreateAggregateDevice failed: {e:?}"))
+            let device = AggregateDevice::with_desc(&dict).map_err(|e| {
+                TapError::platform(format!("AudioHardwareCreateAggregateDevice failed: {e:?}"))
+            })?;
+
+            assets.set_system_device(device);
+
+            // --- 5. IOProc on a dedicated serial queue -----------------------
+            self.state.device_frames.store(0, Ordering::Release);
+            {
+                let mut guard = self
+                    .state
+                    .sink
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                *guard = Some(sink);
+            }
+
+            let queue = dispatch::Queue::serial_with_ar_pool();
+            let state = Arc::clone(&self.state);
+            let channels = format.channels as u32;
+
+            let block = blocks::EscBlock::new5(
+                move |_now: &cat::AudioTimeStamp,
+                      input: &cat::AudioBufList<1>,
+                      _input_time: &cat::AudioTimeStamp,
+                      _output: &mut cat::AudioBufList<1>,
+                      _output_time: &cat::AudioTimeStamp| {
+                    on_io(&state, input, channels);
+                },
+            );
+
+            assets.set_callback(block, queue);
+            Ok(format)
         })?;
-
-        // --- 5. IOProc on a dedicated serial queue -----------------------
-        self.state.device_frames.store(0, Ordering::Release);
-        {
-            let mut guard = self
-                .state
-                .sink
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            *guard = Some(sink);
-        }
-
-        let queue = dispatch::Queue::serial_with_ar_pool();
-        let state = Arc::clone(&self.state);
-        let channels = format.channels as u32;
-
-        let block = blocks::EscBlock::new5(
-            move |_now: &cat::AudioTimeStamp,
-                  input: &cat::AudioBufList<1>,
-                  _input_time: &cat::AudioTimeStamp,
-                  _output: &mut cat::AudioBufList<1>,
-                  _output_time: &cat::AudioTimeStamp| {
-                on_io(&state, input, channels);
-            },
-        );
-
-        let capture = CaptureOwner::start(NativeAssets::system(device, tap, block, queue))?;
+        let capture = prepared.start_prepared()?;
         Ok(Running { format, capture })
     }
 }
