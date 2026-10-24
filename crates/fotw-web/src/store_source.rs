@@ -49,6 +49,51 @@ impl StoreSource {
 }
 
 impl MeetingSource for StoreSource {
+    fn note(&self, id: &str) -> Result<crate::notes::NoteDocument, crate::notes::NoteError> {
+        let doc = self.lock().note_document(id).map_err(note_error)?;
+        Ok(crate::notes::NoteDocument {
+            revision: doc.revision,
+            body_md: doc.body_md,
+            anchors: doc
+                .anchors
+                .into_iter()
+                .map(|a| crate::notes::NoteAnchor {
+                    id: Some(a.id),
+                    block_idx: a.block_idx,
+                    block_text: a.block_text,
+                    typed_at_ms: a.typed_at_ms,
+                })
+                .collect(),
+        })
+    }
+
+    fn save_note(
+        &self,
+        id: &str,
+        mut doc: crate::notes::NoteDocument,
+    ) -> Result<crate::notes::NoteDocument, crate::notes::NoteError> {
+        let anchors: Vec<_> = doc
+            .anchors
+            .iter()
+            .map(|a| {
+                let mut anchor =
+                    fotw_store::NoteAnchor::new(a.block_idx, &a.block_text, a.typed_at_ms);
+                if let Some(id) = &a.id {
+                    anchor.id = id.clone();
+                }
+                anchor
+            })
+            .collect();
+        for (a, stored) in doc.anchors.iter_mut().zip(&anchors) {
+            a.id = Some(stored.id.clone());
+        }
+        doc.revision = self
+            .lock()
+            .save_note_document(id, doc.revision, &doc.body_md, &anchors)
+            .map_err(note_error)?;
+        Ok(doc)
+    }
+
     fn list(&self, limit: u32, offset: u32) -> Result<Vec<MeetingRow>, SourceError> {
         let mut db = self.lock();
         let meetings = db
@@ -153,5 +198,15 @@ fn map_err(e: StoreError) -> SourceError {
     match e {
         StoreError::InvalidArgument(m) => SourceError::BadQuery(m),
         other => SourceError::Backend(other.to_string()),
+    }
+}
+
+fn note_error(error: StoreError) -> crate::notes::NoteError {
+    use crate::notes::NoteError;
+    match error {
+        StoreError::NotFound { .. } => NoteError::NotFound,
+        StoreError::NoteConflict => NoteError::Conflict,
+        StoreError::InvalidArgument(_) => NoteError::Invalid,
+        _ => NoteError::Backend,
     }
 }
