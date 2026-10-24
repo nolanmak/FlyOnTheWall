@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NoteAnchor {
+    /// Stable identity. Older clients may omit it when creating an anchor.
+    #[serde(default)]
+    pub id: Option<String>,
     /// Current block position.
     pub block_idx: i64,
     /// Text associated with that block.

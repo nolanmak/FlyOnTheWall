@@ -20,6 +20,7 @@ legacy note writes invalidate editor snapshots too, without a schema rewrite.
 
 Store limits: 1 MiB UTF-8 body, 1 MiB aggregate anchor text, at most 4,096
 anchors, nonnegative recording offsets and unique nonnegative block positions.
+Anchor IDs are unique, nonempty ASCII identifiers of at most 64 bytes.
 The HTTP JSON request also has Axum's default 2 MiB body limit. Invalid saves
 preserve the preceding document. Store errors never expose note content in API
 responses. Search, meeting details, and Markdown/JSON export read the same note.
@@ -34,8 +35,27 @@ text in the textarea. The store/web regression suites and workspace Clippy pass;
 52 Node UI tests pass. Full workspace regression is also run before pushing.
 
 Outstanding before completion: live-session identity handoff; encrypted draft
-recovery across browser/daemon restarts; stable block identities and first-key
+recovery across browser/daemon restarts; editor block tracking and first-key
 anchors through edits/reordering; actual browser keyboard/narrow-layout checks.
 The current saved-meeting editor retains supplied anchors without creating
 historic timestamps. Anchor remapping through text edits remains #13 work.
 Neither #122 nor #13 is complete.
+
+## Persistent block identity
+
+The existing `note_anchors.id` now survives store/API roundtrips instead of being
+regenerated at every save. No database migration is required. Both note writers
+preserve supplied identities and reject moving an existing identity to another
+meeting or changing its original recording offset. The revision-checked editor
+writer additionally rejects duplicate, empty or oversized IDs before mutation.
+The API returns `id` on every anchor; older clients may omit it to create an
+anchor, and must retain the returned ID for subsequent edits. Existing stored
+rows gain no new timestamps or IDs when loaded.
+
+A regression test first demonstrated that editing/reordering changed the stored
+ID. Store and HTTP tests now preserve IDs/offsets across text/index updates and
+verify atomic rejection of changed offsets, duplicate identities and identity
+reuse from another meeting. Existing export/import and store regression tests
+pass. These guarantees apply to caller-supplied block edits; the current freeform
+textarea does not yet identify the user's block operations. No claim of complete
+anchor remapping or live recording-time capture is made.
