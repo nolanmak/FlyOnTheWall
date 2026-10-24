@@ -58,9 +58,9 @@
 //! **Rebuilds that fail.** A machine whose audio stack is genuinely broken
 //! fails every rebuild, and retrying in a tight loop helps nobody. Attempts
 //! are bounded ([`SupervisorConfig::max_attempts`]) and exponentially spaced,
-//! and after the ceiling the supervisor says so once and stops. A device
-//! change afterwards is new evidence — the user plugged something back in —
-//! and re-arms it.
+//! and after the ceiling the supervisor says so once and stops. Device
+//! notifications cannot replenish the budget. An explicit user retry starts
+//! another episode, preserving the outage and the attempt-spacing floor.
 //!
 //! **Rebuilds that succeed and change nothing.** This is the subtler one and
 //! it is the safety net under the silence rule. A denied system-audio grant
@@ -320,7 +320,8 @@ impl HealthEvent {
                 attempts, error, ..
             } => format!(
                 "Audio capture could not be restarted after {attempts} attempts \
-                 ({error}). Recording continues, but this track will be silent."
+                 ({error}). Automatic retries are paused. Recording continues, \
+                 but audio from this source may be missing."
             ),
             Self::RecoveryIneffective { rebuilds, .. } => format!(
                 "Restarting audio capture {rebuilds} times did not restore sustained \
@@ -384,11 +385,14 @@ pub struct SupervisorConfig {
     /// A device that chatters would otherwise defer the rebuild forever, and
     /// "forever" is a meeting that never gets recorded.
     pub device_change_debounce_ceiling: Duration,
-    /// Delay before the second rebuild attempt. Doubles each failure.
+    /// Delay before the second rebuild attempt. Doubles with the episode
+    /// attempt number, subject to the retry ceiling and interval floor.
     pub retry_backoff: Duration,
     /// Ceiling on the doubling.
     pub max_retry_backoff: Duration,
-    /// How many consecutive failed rebuilds before giving up.
+    /// Attempts per recovery episode, counting both failed and successful
+    /// starts. Ten seconds of sustained health or an explicit user retry
+    /// earns a new budget. Initial session startup is not a recovery attempt.
     pub max_attempts: u32,
     /// How many rebuilds may succeed without bringing any audible audio back
     /// before supervision pauses.
@@ -396,7 +400,7 @@ pub struct SupervisorConfig {
     /// The safety net under the silence rule, whose corroboration signal
     /// cannot reliably distinguish a stalled tap from a quiet meeting (see
     /// [`crate::watchdog`]). Three, with the default 30 s threshold, means a
-    /// meeting that simply goes quiet costs at most four short gaps and one
+    /// meeting that simply goes quiet costs at most three short gaps and one
     /// notification over two minutes rather than one every thirty seconds
     /// forever. Reset requires ten seconds of sustained healthy delivery; a
     /// brief burst from a flapping device does not earn a new budget.
@@ -410,15 +414,11 @@ pub struct SupervisorConfig {
     /// 45-second recording into 27 rebuilds on the development machine. See
     /// that variant's documentation.
     pub rebuild_triggers: DeviceChanges,
-    /// The shortest interval between two device-change-driven rebuilds.
-    ///
-    /// The structural backstop under the same failure. A rebuild can provoke
-    /// the very notification that would trigger the next one, and no filter on
-    /// *which* notifications matter is guaranteed to catch every such path on
-    /// every macOS version. A floor on the rate is the thing that cannot be
-    /// out-argued. Stall faults are not subject to it — they have their own
-    /// timers and their own ceiling — so a genuinely dead tap still recovers
-    /// promptly.
+    /// The shortest interval between recovery attempts, including failed
+    /// opens, device changes, and explicit manual retries. Defaults to fifteen
+    /// seconds. The first recovery attempt can begin immediately; subsequent
+    /// attempts retain this floor even after sustained health resets the budget.
+    /// Device changes within this window also avoid unnecessary teardown.
     pub min_rebuild_interval: Duration,
     /// Whether a device change forces a full rebuild.
     ///
@@ -446,9 +446,9 @@ impl Default for SupervisorConfig {
             watchdog: WatchdogConfig::default(),
             device_change_debounce: Duration::from_millis(300),
             device_change_debounce_ceiling: Duration::from_secs(1),
-            retry_backoff: Duration::from_millis(250),
-            max_retry_backoff: Duration::from_secs(5),
-            max_attempts: 5,
+            retry_backoff: Duration::from_secs(15),
+            max_retry_backoff: Duration::from_secs(30),
+            max_attempts: 3,
             max_ineffective_recoveries: 3,
             rebuild_triggers: DeviceChanges::of([
                 DeviceChangeKind::DefaultOutput,
@@ -456,7 +456,7 @@ impl Default for SupervisorConfig {
                 DeviceChangeKind::StreamFormat,
                 DeviceChangeKind::DidWake,
             ]),
-            min_rebuild_interval: Duration::from_secs(3),
+            min_rebuild_interval: Duration::from_secs(15),
             rebuild_on_device_change: true,
         }
     }
@@ -498,8 +498,8 @@ enum State {
     Running,
     /// The tap is gone and we are trying to build another.
     Recovering(Recovery),
-    /// We stopped trying. The outage is kept so a device change can resume it
-    /// without losing the gap that has been accumulating.
+    /// We stopped trying. The outage is kept so an explicit user retry can
+    /// resume it without losing the gap that has been accumulating.
     Abandoned(Recovery),
     /// A tap **is** running and being watched, but rebuilding it has stopped
     /// helping, so faults are noted and not acted on. Released after ten
@@ -528,6 +528,9 @@ pub struct CaptureSupervisor {
     events: Vec<HealthEvent>,
     rebuilds: u32,
     last_rebuild_ns: Option<u64>,
+    last_attempt_ns: Option<u64>,
+    episode_attempts: u32,
+    retry_requested: bool,
     ineffective_recoveries: u32,
     healthy_since_ns: Option<u64>,
     previous_delivery: Option<(u64, TapActivity)>,
@@ -576,6 +579,9 @@ impl CaptureSupervisor {
             events: Vec::new(),
             rebuilds: 0,
             last_rebuild_ns: None,
+            last_attempt_ns: None,
+            episode_attempts: 0,
+            retry_requested: false,
             ineffective_recoveries: 0,
             healthy_since_ns: None,
             previous_delivery: None,
@@ -586,7 +592,8 @@ impl CaptureSupervisor {
     /// The mailbox a platform listener raises into.
     ///
     /// Handed to `MacOsPlatform::watch_devices`, or to whatever else can see
-    /// the hardware move.
+    /// the hardware move. Stop/take detach this mailbox; a caller reusing the
+    /// supervisor for another session must register a new watcher.
     #[must_use]
     pub fn signal(&self) -> Arc<DeviceChangeSignal> {
         Arc::clone(&self.signal)
@@ -605,6 +612,11 @@ impl CaptureSupervisor {
         self.watchdog.arm(now);
         self.healthy_since_ns = None;
         self.previous_delivery = None;
+        self.episode_attempts = 0;
+        self.ineffective_recoveries = 0;
+        self.last_attempt_ns = None;
+        self.last_rebuild_ns = None;
+        self.retry_requested = false;
         self.state = State::Running;
         Ok(format)
     }
@@ -621,6 +633,10 @@ impl CaptureSupervisor {
         };
         self.state = State::Idle;
         self.debounce.clear();
+        self.pending_changes = DeviceChanges::empty();
+        self.retry_requested = false;
+        // Detach notifications retained by a previous session generation.
+        self.signal = DeviceChangeSignal::new();
         result
     }
 
@@ -643,6 +659,10 @@ impl CaptureSupervisor {
         let tap = self.tap.take();
         self.state = State::Idle;
         self.debounce.clear();
+        self.pending_changes = DeviceChanges::empty();
+        self.retry_requested = false;
+        // Detach notifications retained by a previous session generation.
+        self.signal = DeviceChangeSignal::new();
         tap
     }
 
@@ -677,6 +697,17 @@ impl CaptureSupervisor {
         std::mem::take(&mut self.events)
     }
 
+    /// Queue an explicit user retry after exhaustion. No device work happens
+    /// until the next poll; stopping cancels the request. The attempt spacing
+    /// still applies, even when a user requests another episode immediately.
+    pub fn request_retry(&mut self) -> bool {
+        if !matches!(self.state, State::Abandoned(_) | State::Quarantined) {
+            return false;
+        }
+        self.retry_requested = true;
+        true
+    }
+
     /// Observe the tap once and act.
     ///
     /// `activity` is a snapshot of [`crate::watchdog::ActivityCounters`] the
@@ -684,6 +715,26 @@ impl CaptureSupervisor {
     /// is rendering output, and is consulted only when it is needed.
     pub fn poll(&mut self, activity: TapActivity, probe: &impl OutputProbe) -> PollOutcome {
         let now = self.clock.now_ns();
+        if matches!(self.state, State::Idle) {
+            return PollOutcome::Stopped;
+        }
+        if std::mem::take(&mut self.retry_requested) {
+            self.episode_attempts = 0;
+            self.ineffective_recoveries = 0;
+            self.debounce.clear();
+            self.pending_changes = DeviceChanges::empty();
+            let _ = self.signal.take();
+            match std::mem::replace(&mut self.state, State::Idle) {
+                State::Abandoned(mut recovery) => {
+                    recovery.next_attempt_ns = self.next_attempt_at(now);
+                    self.state = State::Recovering(recovery);
+                }
+                State::Quarantined => {
+                    return self.begin_recovery(now, None, now, GapReason::RebuildWindow);
+                }
+                state => self.state = state,
+            }
+        }
 
         let changes = self.signal.take();
         if !changes.is_empty() {
@@ -713,19 +764,12 @@ impl CaptureSupervisor {
                 }
             }
             State::Abandoned(recovery) => {
-                // A device change after giving up is new evidence — the user
-                // plugged something back in — and is worth another go.
-                if self.debounce.poll(now) {
-                    let resumed = Recovery {
-                        attempt: 0,
-                        next_attempt_ns: now,
-                        ..recovery
-                    };
-                    self.attempt_rebuild(now, resumed)
-                } else {
-                    self.state = State::Abandoned(recovery);
-                    PollOutcome::Abandoned
-                }
+                // Route chatter cannot replenish an exhausted budget. Keep
+                // the original gap for an explicit manual retry.
+                self.debounce.clear();
+                self.pending_changes = DeviceChanges::empty();
+                self.state = State::Abandoned(recovery);
+                PollOutcome::Abandoned
             }
             State::Running => {
                 self.state = State::Running;
@@ -751,6 +795,7 @@ impl CaptureSupervisor {
         // flapping. Only a sustained run earns a fresh recovery budget.
         let stable = self.observe_delivery(now, activity, verdict);
         if stable {
+            self.episode_attempts = 0;
             self.ineffective_recoveries = 0;
             if quarantined {
                 self.state = State::Running;
@@ -804,6 +849,14 @@ impl CaptureSupervisor {
 
         if self.debounce.poll(now) {
             let changes = std::mem::replace(&mut self.pending_changes, DeviceChanges::empty());
+            if quarantined && !stable {
+                self.events.push(HealthEvent::DeviceChanged {
+                    tap: self.config.id.clone(),
+                    changes,
+                    rebuilt: false,
+                });
+                return PollOutcome::Abandoned;
+            }
             let too_soon = self.last_rebuild_ns.is_some_and(|last| {
                 now.saturating_sub(last) < self.config.min_rebuild_interval.as_nanos() as u64
             });
@@ -898,6 +951,15 @@ impl CaptureSupervisor {
         unwritten_start_ns: u64,
         reason: GapReason,
     ) -> PollOutcome {
+        if self.episode_attempts >= self.config.max_attempts {
+            self.events.push(HealthEvent::GaveUp {
+                tap: self.config.id.clone(),
+                attempts: self.episode_attempts,
+                error: "capture did not sustain healthy delivery".into(),
+            });
+            self.state = State::Quarantined;
+            return PollOutcome::Abandoned;
+        }
         // The full sequence, in order: stop, then destroy. Dropping the tap is
         // what destroys the aggregate and then the tap itself, and it happens
         // before anything new is created.
@@ -912,14 +974,21 @@ impl CaptureSupervisor {
             silent_gap,
             reason,
             attempt: 0,
-            next_attempt_ns: now,
+            next_attempt_ns: self.next_attempt_at(now),
             last_error: String::new(),
         };
-        self.attempt_rebuild(now, recovery)
+        if now < recovery.next_attempt_ns {
+            self.state = State::Recovering(recovery);
+            PollOutcome::Waiting
+        } else {
+            self.attempt_rebuild(now, recovery)
+        }
     }
 
     fn attempt_rebuild(&mut self, now: u64, mut recovery: Recovery) -> PollOutcome {
-        recovery.attempt += 1;
+        self.episode_attempts = self.episode_attempts.saturating_add(1);
+        recovery.attempt = self.episode_attempts;
+        self.last_attempt_ns = Some(now);
 
         let started = (self.open)().and_then(|mut tap| {
             let format = tap.start((self.make_sink)())?;
@@ -939,7 +1008,9 @@ impl CaptureSupervisor {
                     self.state = State::Abandoned(recovery);
                     return PollOutcome::Abandoned;
                 }
-                let retry_in = self.backoff(recovery.attempt);
+                let retry_in = self
+                    .backoff(recovery.attempt)
+                    .max(self.config.min_rebuild_interval);
                 self.events.push(HealthEvent::RecoveryFailed {
                     tap: self.config.id.clone(),
                     attempt: recovery.attempt,
@@ -986,8 +1057,14 @@ impl CaptureSupervisor {
         PollOutcome::Rebuilt
     }
 
-    /// Exponential, capped. The first retry is immediate-ish and the last ones
-    /// are far enough apart not to hammer a HAL that is already unhappy.
+    fn next_attempt_at(&self, now: u64) -> u64 {
+        self.last_attempt_ns.map_or(now, |last| {
+            now.max(last.saturating_add(self.config.min_rebuild_interval.as_nanos() as u64))
+        })
+    }
+
+    /// Exponential, capped. The caller also applies the interval floor so a
+    /// smaller backoff cannot hammer a HAL that is already unhappy.
     fn backoff(&self, attempt: u32) -> Duration {
         let shift = attempt.saturating_sub(1).min(16);
         let scaled = self
