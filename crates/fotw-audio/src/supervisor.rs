@@ -119,6 +119,8 @@ pub enum GapReason {
     RebuildWindow,
     /// A callback explicitly reported an invalidated device or stream format.
     CallbackFault,
+    /// The optional source could not be opened or started at recording startup.
+    InitiallyUnavailable,
 }
 
 impl GapReason {
@@ -131,6 +133,7 @@ impl GapReason {
             Self::DeviceChanged => "device-changed",
             Self::RebuildWindow => "rebuild-window",
             Self::CallbackFault => "callback-fault",
+            Self::InitiallyUnavailable => "initially-unavailable",
         }
     }
 }
@@ -737,6 +740,68 @@ impl CaptureSupervisor {
         self.no_audio_notified = false;
         self.state = State::Running;
         Ok(format)
+    }
+
+    /// Start an optional source, retaining a failed start for later recovery.
+    ///
+    /// The error is still returned for diagnostics, but unlike [`Self::start`]
+    /// it does not leave the source stopped. Keep polling this supervisor even
+    /// when no format is available. The initial attempt counts toward the
+    /// episode ceiling; further attempts respect backoff and the interval floor.
+    /// A successful retry emits a [`HealthEvent::Recovered`] with the complete
+    /// startup outage, and still requires sustained delivery to confirm health.
+    /// Native open/start calls remain synchronous.
+    pub fn start_recovering(&mut self) -> Result<StreamFormat, TapError> {
+        if !matches!(self.state, State::Idle) {
+            return Err(TapError::AlreadyRunning);
+        }
+        let started_at = self.clock.now_ns();
+        match self.start() {
+            Ok(format) => Ok(format),
+            Err(error) => {
+                self.retire_callbacks();
+                self.format = None;
+                self.health_confirmed = false;
+                self.healthy_since_ns = None;
+                self.previous_delivery = None;
+                self.episode_attempts = 1;
+                self.ineffective_recoveries = 0;
+                self.last_attempt_ns = Some(started_at);
+                self.last_rebuild_ns = None;
+                self.retry_requested = false;
+                self.no_audio_notified = false;
+                let retry_in = self.backoff(1).max(self.config.min_rebuild_interval);
+                // Count the wait after failure, including a slow failed open.
+                let recovery = Recovery {
+                    unwritten_start_ns: started_at,
+                    silent_gap: None,
+                    reason: GapReason::InitiallyUnavailable,
+                    attempt: 1,
+                    next_attempt_ns: self
+                        .clock
+                        .now_ns()
+                        .saturating_add(retry_in.as_nanos() as u64),
+                    last_error: error.to_string(),
+                };
+                if self.episode_attempts >= self.config.max_attempts {
+                    self.events.push(HealthEvent::GaveUp {
+                        tap: self.config.id.clone(),
+                        attempts: 1,
+                        error: error.to_string(),
+                    });
+                    self.state = State::Abandoned(recovery);
+                } else {
+                    self.events.push(HealthEvent::RecoveryFailed {
+                        tap: self.config.id.clone(),
+                        attempt: 1,
+                        error: error.to_string(),
+                        retry_in,
+                    });
+                    self.state = State::Recovering(recovery);
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Stop supervising and stop the tap.
