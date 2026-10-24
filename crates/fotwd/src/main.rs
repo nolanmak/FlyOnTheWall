@@ -1568,20 +1568,22 @@ async fn stt_command(args: &[String]) -> ExitCode {
             }
             if let Some(language) = flag_value(args, "--language") {
                 let code = language.trim().to_ascii_lowercase();
-                // Whisper takes ISO 639-1 codes, plus a handful of 3-letter
-                // ones (`haw`, `yue`); anything else is a typo, not a language.
-                let looks_like_code =
-                    (2..=3).contains(&code.len()) && code.chars().all(|c| c.is_ascii_lowercase());
-                if code != "auto" && !looks_like_code {
-                    eprintln!(
-                        "fotwd: `{language}` is not a language code; try `en`, `de` or `auto`"
-                    );
+                #[cfg(target_os = "macos")]
+                if let Err(error) = fotw_stt::whisper::validate_language(Some(&code), true) {
+                    eprintln!("fotwd: {}", error.message);
                     return ExitCode::FAILURE;
                 }
                 settings.language = if code == "auto" { String::new() } else { code };
             }
             let path = settings.model_path(&data_root);
             if !check_model(&path, &data_root) {
+                return ExitCode::FAILURE;
+            }
+            // Validate the actual model metadata before persisting this choice.
+            // Renaming an English-only model must not bypass language validation.
+            #[cfg(target_os = "macos")]
+            if let Err(error) = fotw_stt::WhisperEngine::new(&path, settings.language()).load() {
+                eprintln!("fotwd: {}", error.message);
                 return ExitCode::FAILURE;
             }
             settings.engine = SttEngine::Local;
@@ -1704,7 +1706,7 @@ fn print_stt_status(settings: &fotwd::stt::SttSettings, data_root: &std::path::P
                 "  language   : {}",
                 settings
                     .language()
-                    .unwrap_or_else(|| "detected per utterance".to_owned())
+                    .unwrap_or_else(|| "automatic (English-only models use English)".to_owned())
             );
             if !cfg!(target_os = "macos") {
                 println!("  ! local transcription is macOS-only for now; meetings record");
