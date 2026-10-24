@@ -67,8 +67,37 @@ prove native teardown or callback quiescence. The wrapper observes reported
 faults; it does not create missing native sample-rate notifications or implement
 format conversion.
 
+Both daemon and CLI now allocate a separate bounded ring for each tap attempt.
+A replacement can deliver inside `start()`; those samples stay out of the retired
+ring. At the recovery boundary the pump drains and finishes the old converter,
+pads the gap in archive units, and installs a fresh converter for the replacement.
+The track's original archive rate/channels remain fixed. Rate conversion uses
+an anti-aliasing FFT filter, trims its latency and flushes exactly
+`floor(native_frames * archive_rate / native_rate)` frames per generation.
+Unchanged formats are bit-exact before the existing WAL quantization. Mono is
+duplicated for a wider archive; other differing channel counts fold to their
+mean, since capture does not provide speaker-position metadata. Partial
+interleaved frames carry between drains; an incomplete final frame or non-finite
+PCM is refused. Conversion runs on the pump thread before the WAL; ASR/AEC still
+run after the WAL write. Native-rate originals are not separately archived.
+
+The daemon feeds retired tails, gap padding and converted final tails through
+the same ASR path, preserving the provider's clock across recovery. Retired ring
+drop counts are retained. New-generation PCM cannot be mixed with late old-ring
+writes; native callback quiescence itself is still a separate requirement.
+
+Behavioral RED/GREEN: five converter tests initially failed on identity conversion,
+including 16,001 mono samples versus 96,006 required archive samples. The recorder
+fixture initially drained replacement-start PCM before the gap (zero queued new
+samples instead of 160). It now verifies persisted old PCM, zero gap padding,
+new-format conversion through the actual pump, 10 ms of output at both archive
+and ASR rates, and preservation of prior bytes. Separate tests cover fractional
+44.1 kHz rates, odd stereo drains, anti-alias rejection, finalization and isolation
+from retained old producers/failed attempts. These are synthetic fixtures, not
+physical-device evidence. Live sample-rate notifications remain open.
+
 This is partial implementation of #121. Generation fencing for native callbacks,
-sleep-aware gaps, format-stable archive conversion, recovery of a microphone
+sleep-aware gaps, recovery of a microphone
 that failed its initial open, and bounded native recovery operations remain
 required. Closing the mailbox cancels queued work; it cannot interrupt a native
 operation already running. Native input format
