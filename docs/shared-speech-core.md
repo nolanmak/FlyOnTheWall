@@ -35,12 +35,12 @@ Murmur's provider policy is not changed by sharing the dependency.
 Upgrade by choosing a reviewed full commit SHA, updating both dependency and
 dev-dependency pins in Murmur, updating Cargo.lock, and running both consumers'
 required checks. Roll back those manifest/lockfile changes together. Never pin a
-moving branch or silently update to upstream main. The `murmur-compatibility.yml` workflow patches fotw-audio, fotw-stt and fotw-secrets into
-Murmur revision `882b106e3e6ebadc3f50f276b316a8c2a732593f`, then runs its workspace
+moving branch or silently update to upstream main. The `murmur-compatibility.yml` workflow patches fotw-audio, fotw-stt, fotw-secrets and fotw-dsp into
+Murmur revision `85df901f00a5d68e55466f0717cf68694373b48b`, then runs its workspace
 tests on macOS and Linux. The disposable compatibility lockfile may update for
 the source substitution; ordinary consumer CI continues to use `--locked`.
 
-Murmur now consumes all three crates at an immutable Git revision. The shared
+Murmur now consumes all four crates at an immutable Git revision. The shared
 audio/STT conformance suite covers format validation, provider timestamps,
 interim/final normalization, stream-end finalization, bounded local PCM, silence
 and cancellation. Injected timestamp, finalization and late-final regressions
