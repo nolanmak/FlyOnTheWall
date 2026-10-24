@@ -103,13 +103,35 @@ impl Drop for DeviceWatcher {
 ///
 /// The returned watcher must be kept alive for the length of the session.
 pub fn watch(signal: Arc<DeviceChangeSignal>) -> Result<DeviceWatcher, TapError> {
+    watch_with_register(signal, register)
+}
+
+fn register(
+    addr: &PropAddr,
+    queue: &dispatch::Queue,
+    block: &mut PropListenerBlock,
+) -> Result<(), TapError> {
+    System::OBJ
+        .add_prop_listener_block(addr, Some(queue), block)
+        .map_err(|e| {
+            TapError::platform(format!(
+                "AudioObjectAddPropertyListenerBlock({:?}) failed: {e:?}",
+                addr.selector
+            ))
+        })
+}
+
+fn watch_with_register(
+    signal: Arc<DeviceChangeSignal>,
+    mut add: impl FnMut(&PropAddr, &dispatch::Queue, &mut PropListenerBlock) -> Result<(), TapError>,
+) -> Result<DeviceWatcher, TapError> {
     // A dedicated serial queue rather than `None`. Passing `None` asks the HAL
     // to deliver on the main run loop, and a daemon with no run loop pumping
     // would then never see a notification at all — a failure that looks
     // exactly like the listener not being registered.
     let queue = dispatch::Queue::serial_with_ar_pool();
 
-    let mut block = cidre::blocks::EscBlock::new2(move |n: u32, addrs: *const PropAddr| {
+    let block = cidre::blocks::EscBlock::new2(move |n: u32, addrs: *const PropAddr| {
         if addrs.is_null() || n == 0 {
             return;
         }
@@ -125,24 +147,20 @@ pub fn watch(signal: Arc<DeviceChangeSignal>) -> Result<DeviceWatcher, TapError>
         }
     });
 
-    let mut registered = Vec::with_capacity(WATCHED.len());
-    for (selector, _) in WATCHED {
-        let addr = selector.global_addr();
-        System::OBJ
-            .add_prop_listener_block(&addr, Some(&queue), &mut block)
-            .map_err(|e| {
-                TapError::platform(format!(
-                    "AudioObjectAddPropertyListenerBlock({selector:?}) failed: {e:?}"
-                ))
-            })?;
-        registered.push(addr);
-    }
-
-    Ok(DeviceWatcher {
+    // Own successful registrations immediately. If any later add fails, the
+    // watcher's Drop unregisters the completed prefix before releasing its
+    // block/queue; constructing this guard after the loop leaks that prefix.
+    let mut watcher = DeviceWatcher {
         block,
         queue,
-        registered,
-    })
+        registered: Vec::with_capacity(WATCHED.len()),
+    };
+    for (selector, _) in WATCHED {
+        let addr = selector.global_addr();
+        add(&addr, &watcher.queue, &mut watcher.block)?;
+        watcher.registered.push(addr);
+    }
+    Ok(watcher)
 }
 
 /// Whether any *other* process is currently rendering output audio.
@@ -222,6 +240,30 @@ pub fn default_output_uid() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_partial_registration_failure_releases_every_installed_listener() {
+        // Real property-listener registration only; this opens no audio tap.
+        // The closure's weak ownership proves the HAL no longer retains the
+        // block after rollback, including when a later registration fails.
+        for fail_at in 0..WATCHED.len() {
+            let signal = DeviceChangeSignal::new();
+            let weak = Arc::downgrade(&signal);
+            let mut attempt = 0;
+            let result = watch_with_register(signal, |addr, queue, block| {
+                if attempt == fail_at {
+                    return Err(TapError::platform("fixture registration failure"));
+                }
+                attempt += 1;
+                register(addr, queue, block)
+            });
+            assert!(result.is_err());
+            assert!(
+                weak.upgrade().is_none(),
+                "registration failure at {fail_at} leaked a HAL callback"
+            );
+        }
+    }
 
     /// The mapping has to be exhaustive and collision-free, and it is a table
     /// rather than a `match`, so nothing else checks it.
