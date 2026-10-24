@@ -1490,7 +1490,7 @@ fn rebuilds_that_never_bring_audio_back_stop_by_themselves() {
 /// ...and it has to start again by itself, or one quiet stretch early in a
 /// meeting disables the watchdog for the rest of it.
 #[test]
-fn audible_audio_releases_the_quarantine() {
+fn sustained_delivery_releases_the_quarantine() {
     let h = Harness::new();
     let cfg = supervisor_config();
     let mut sup = h.supervisor(cfg.clone());
@@ -1521,21 +1521,28 @@ fn audible_audio_releases_the_quarantine() {
     let rebuilds_while_quiet = sup.rebuilds();
     let _ = sup.drain_events();
 
-    // Somebody finally speaks.
-    for _ in 0..10 {
+    // Brief audio is not proof that a flapping device has recovered.
+    for _ in 0..100 {
         h.advance(TICK);
         activity.buffers += 1;
         activity.frames += 4_800;
         assert_eq!(
             sup.poll(activity, &OutputActivity::Active),
             PollOutcome::Healthy,
-            "audible audio must end the quarantine immediately"
+            "audio is still delivered while recovery is being confirmed"
+        );
+        assert!(
+            sup.is_quarantined(),
+            "less than ten seconds cannot reset recovery"
         );
     }
+    h.advance(TICK);
+    activity.buffers += 1;
+    activity.frames += 4_800;
+    sup.poll(activity, &OutputActivity::Active);
     assert!(
         !sup.is_quarantined(),
-        "one audible buffer releases it; waiting for the next fault to do it \
-         leaves the supervisor reporting a state it is not in"
+        "ten seconds of delivery must release recovery"
     );
 
     // And the watchdog is doing its job again.
@@ -1565,4 +1572,119 @@ fn a_stopped_supervisor_stops_supervising() {
     );
     assert_eq!(sup.rebuilds(), 0);
     assert_eq!(h.opens.load(Ordering::Relaxed), 1);
+}
+
+/// A small audible burst after each successful rebuild must not buy an
+/// unlimited new budget. This previously rebuilt forever.
+#[test]
+fn brief_audio_between_stalls_does_not_reset_the_recovery_budget() {
+    let h = Harness::new();
+    let cfg = supervisor_config();
+    let mut sup = h.supervisor(cfg.clone());
+    sup.start().unwrap();
+    let mut activity = TapActivity::default();
+    for _ in 0..10 {
+        // Establish a baseline after any rebuild, then deliver one second.
+        sup.poll(activity, &OutputActivity::Active);
+        for _ in 0..10 {
+            h.advance(TICK);
+            activity.buffers += 1;
+            activity.frames += 4_800;
+            sup.poll(activity, &OutputActivity::Active);
+        }
+        h.advance(cfg.watchdog.no_buffer_timeout + TICK);
+        sup.poll(activity, &OutputActivity::Active);
+    }
+    assert_eq!(
+        sup.rebuilds(),
+        cfg.max_ineffective_recoveries,
+        "short bursts must not allow unbounded rebuilds"
+    );
+    assert!(sup.is_quarantined());
+}
+
+#[test]
+fn recovery_confirmation_requires_progress_not_just_elapsed_time() {
+    for interruption in ["empty", "no_callback", "counter_reset", "unobserved_gap"] {
+        let h = Harness::new();
+        let cfg = SupervisorConfig {
+            max_ineffective_recoveries: 0,
+            ..supervisor_config()
+        };
+        let mut sup = h.supervisor(cfg.clone());
+        sup.start().unwrap();
+        let mut activity = TapActivity::default();
+        h.advance(cfg.watchdog.no_buffer_timeout + TICK);
+        sup.poll(activity, &OutputActivity::Active);
+        assert!(sup.is_quarantined());
+        sup.poll(activity, &OutputActivity::Active);
+        for _ in 0..90 {
+            h.advance(TICK);
+            activity.buffers += 1;
+            activity.frames += 4_800;
+            sup.poll(activity, &OutputActivity::Active);
+        }
+        h.advance(TICK);
+        match interruption {
+            "empty" => activity.buffers += 1,
+            "no_callback" => {}
+            "counter_reset" => activity = TapActivity::default(),
+            "unobserved_gap" => {
+                h.advance(Duration::from_secs(20));
+                activity.buffers += 1;
+                activity.frames += 4_800;
+            }
+            _ => unreachable!(),
+        }
+        sup.poll(activity, &OutputActivity::Active);
+        assert!(
+            sup.is_quarantined(),
+            "{interruption} cannot confirm recovery"
+        );
+        for _ in 0..100 {
+            h.advance(TICK);
+            activity.buffers += 1;
+            activity.frames += 4_800;
+            sup.poll(activity, &OutputActivity::Active);
+            assert!(
+                sup.is_quarantined(),
+                "{interruption} must restart the ten-second window"
+            );
+        }
+        h.advance(TICK);
+        activity.buffers += 1;
+        activity.frames += 4_800;
+        sup.poll(activity, &OutputActivity::Active);
+        assert!(
+            !sup.is_quarantined(),
+            "{interruption}: sustained recovery must still work"
+        );
+    }
+}
+
+#[test]
+fn sustained_health_earns_a_new_budget_before_exhaustion() {
+    let h = Harness::new();
+    let cfg = SupervisorConfig {
+        max_ineffective_recoveries: 1,
+        ..supervisor_config()
+    };
+    let mut sup = h.supervisor(cfg.clone());
+    sup.start().unwrap();
+    let mut activity = TapActivity::default();
+    for expected in 1..=3 {
+        h.advance(cfg.watchdog.no_buffer_timeout + TICK);
+        assert_eq!(
+            sup.poll(activity, &OutputActivity::Active),
+            PollOutcome::Rebuilt
+        );
+        assert_eq!(sup.rebuilds(), expected);
+        sup.poll(activity, &OutputActivity::Active);
+        for _ in 0..110 {
+            h.advance(TICK);
+            activity.buffers += 1;
+            activity.frames += 4_800;
+            sup.poll(activity, &OutputActivity::Active);
+        }
+    }
 }

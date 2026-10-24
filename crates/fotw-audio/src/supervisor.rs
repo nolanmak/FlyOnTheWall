@@ -73,13 +73,12 @@
 //! recording into a shredded one and training the user to ignore the warning
 //! that matters.
 //!
-//! So a rebuild after which no audible sample ever arrives is counted as
-//! *ineffective*, and after
-//! [`SupervisorConfig::max_ineffective_recoveries`] of them the supervisor
-//! stops acting on faults and says so once. It keeps watching: the moment a
-//! single audible buffer arrives the count resets and normal supervision
-//! resumes, so a meeting that was merely quiet costs a handful of gaps rather
-//! than ninety of them.
+//! Repeated faults count toward
+//! [`SupervisorConfig::max_ineffective_recoveries`] until ten seconds of healthy
+//! delivery confirms recovery. At the ceiling the supervisor stops acting on
+//! faults and says so once. It keeps watching and delivering audio: sustained
+//! frame progress with audible evidence releases quarantine, but a brief burst
+//! from a flapping device cannot reset the budget.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -246,15 +245,15 @@ pub enum HealthEvent {
         error: String,
     },
     /// Rebuilding keeps succeeding and keeps not helping, so supervision has
-    /// paused until audible audio returns.
+    /// paused until sustained healthy delivery confirms recovery.
     ///
     /// Distinct from [`HealthEvent::GaveUp`] because the cause is different
-    /// and so is the advice: nothing failed, and the likeliest explanations
-    /// are a denied system-audio grant or a meeting that is genuinely quiet.
+    /// and so is the advice: starts succeed, but delivery may still flap or
+    /// remain silent because the meeting is quiet or permission is denied.
     RecoveryIneffective {
         /// Which tap.
         tap: TapId,
-        /// How many rebuilds produced no audible audio.
+        /// How many rebuilds failed to restore sustained healthy delivery.
         rebuilds: u32,
         /// The fault that kept recurring.
         fault: Fault,
@@ -324,11 +323,12 @@ impl HealthEvent {
                  ({error}). Recording continues, but this track will be silent."
             ),
             Self::RecoveryIneffective { rebuilds, .. } => format!(
-                "Restarting audio capture {rebuilds} times did not bring any audio \
-                 back, so it will not be restarted again until audio returns. \
-                 Either nothing is playing, or system audio recording is not \
-                 allowed in System Settings > Privacy & Security > Screen & \
-                 System Audio Recording."
+                "Restarting audio capture {rebuilds} times did not restore sustained \
+                 audio. Automatic restarts are paused until ten seconds of \
+                 healthy audio delivery confirms recovery. \
+                 Check the audio device connection. For system audio, also \
+                 check playback and System Settings > Privacy & Security > \
+                 Screen & System Audio Recording."
             ),
             Self::NoAudioDetected { for_ns, .. } => format!(
                 "No audio detected for {}. Check that system audio recording is \
@@ -398,7 +398,8 @@ pub struct SupervisorConfig {
     /// [`crate::watchdog`]). Three, with the default 30 s threshold, means a
     /// meeting that simply goes quiet costs at most four short gaps and one
     /// notification over two minutes rather than one every thirty seconds
-    /// forever — and the count resets the instant real audio arrives.
+    /// forever. Reset requires ten seconds of sustained healthy delivery; a
+    /// brief burst from a flapping device does not earn a new budget.
     pub max_ineffective_recoveries: u32,
     /// Which kinds of device change are worth a rebuild.
     ///
@@ -501,8 +502,8 @@ enum State {
     /// without losing the gap that has been accumulating.
     Abandoned(Recovery),
     /// A tap **is** running and being watched, but rebuilding it has stopped
-    /// helping, so faults are noted and not acted on. Released the moment an
-    /// audible buffer arrives.
+    /// helping, so faults are noted and not acted on. Released after ten
+    /// seconds of sustained healthy delivery.
     Quarantined,
 }
 
@@ -528,6 +529,8 @@ pub struct CaptureSupervisor {
     rebuilds: u32,
     last_rebuild_ns: Option<u64>,
     ineffective_recoveries: u32,
+    healthy_since_ns: Option<u64>,
+    previous_delivery: Option<(u64, TapActivity)>,
     no_audio_notified: bool,
 }
 
@@ -574,6 +577,8 @@ impl CaptureSupervisor {
             rebuilds: 0,
             last_rebuild_ns: None,
             ineffective_recoveries: 0,
+            healthy_since_ns: None,
+            previous_delivery: None,
             no_audio_notified: false,
         }
     }
@@ -598,6 +603,8 @@ impl CaptureSupervisor {
         self.tap = Some(tap);
         self.format = Some(format);
         self.watchdog.arm(now);
+        self.healthy_since_ns = None;
+        self.previous_delivery = None;
         self.state = State::Running;
         Ok(format)
     }
@@ -656,7 +663,7 @@ impl CaptureSupervisor {
     /// A tap **is** still running and its audio is still being written; what
     /// has stopped is acting on its faults. Worth surfacing — a session
     /// running in this state is one where the recording is probably silent,
-    /// and it is released the moment an audible buffer arrives.
+    /// and it is released after ten seconds of sustained healthy delivery.
     #[must_use]
     pub const fn is_quarantined(&self) -> bool {
         matches!(self.state, State::Quarantined)
@@ -740,9 +747,10 @@ impl CaptureSupervisor {
     ) -> PollOutcome {
         let verdict = self.watchdog.poll(now, activity, probe);
 
-        // Audible audio is the only thing that proves a rebuild worked, and it
-        // is what releases a quarantine.
-        if self.watchdog.audible_since_arm() {
+        // A single audible buffer can come from a device that is still
+        // flapping. Only a sustained run earns a fresh recovery budget.
+        let stable = self.observe_delivery(now, activity, verdict);
+        if stable {
             self.ineffective_recoveries = 0;
             if quarantined {
                 self.state = State::Running;
@@ -752,31 +760,27 @@ impl CaptureSupervisor {
         // A fault outranks a pending device change: both lead to the same
         // rebuild, and the fault carries the better gap boundaries.
         if let Verdict::Faulted(fault) = verdict {
-            if quarantined && !self.watchdog.audible_since_arm() {
-                // Already told the user. Rebuilding again would spend another
-                // gap to reach the same place.
+            if quarantined {
+                // A brief return of audio must not release quarantine.
                 return PollOutcome::Abandoned;
             }
             self.events.push(HealthEvent::StallDetected {
                 tap: self.config.id.clone(),
                 fault,
             });
-            if self.watchdog.audible_since_arm() {
-                self.ineffective_recoveries = 0;
-            } else {
-                self.ineffective_recoveries += 1;
-                if self.ineffective_recoveries > self.config.max_ineffective_recoveries {
-                    self.events.push(HealthEvent::RecoveryIneffective {
-                        tap: self.config.id.clone(),
-                        rebuilds: self.ineffective_recoveries - 1,
-                        fault,
-                    });
-                    // Re-arm so the next fault is measured from here rather
-                    // than firing again on the next poll.
-                    self.watchdog.arm(now);
-                    self.state = State::Quarantined;
-                    return PollOutcome::Abandoned;
-                }
+            self.ineffective_recoveries = self.ineffective_recoveries.saturating_add(1);
+            if self.ineffective_recoveries > self.config.max_ineffective_recoveries {
+                self.events.push(HealthEvent::RecoveryIneffective {
+                    tap: self.config.id.clone(),
+                    rebuilds: self.ineffective_recoveries - 1,
+                    fault,
+                });
+                // Keep watching the existing tap without spending more gaps.
+                self.watchdog.arm(now);
+                self.healthy_since_ns = None;
+                self.previous_delivery = None;
+                self.state = State::Quarantined;
+                return PollOutcome::Abandoned;
             }
             let (silent_gap, unwritten_start_ns, reason) = match fault {
                 Fault::NoBuffers { since_ns, .. } => {
@@ -815,6 +819,8 @@ impl CaptureSupervisor {
                     rebuilt: false,
                 });
                 self.watchdog.arm(now);
+                self.healthy_since_ns = None;
+                self.previous_delivery = None;
                 return PollOutcome::Healthy;
             }
             if self.config.rebuild_on_device_change {
@@ -835,6 +841,8 @@ impl CaptureSupervisor {
                 rebuilt: false,
             });
             self.watchdog.arm(now);
+            self.healthy_since_ns = None;
+            self.previous_delivery = None;
             return PollOutcome::Healthy;
         }
 
@@ -859,6 +867,27 @@ impl CaptureSupervisor {
             }
             Verdict::Faulted(_) => unreachable!("faults return above"),
         }
+    }
+
+    /// Require actual frame and buffer progress on successive observations.
+    /// Polls separated by a starvation timeout cannot prove continuous health;
+    /// neither can empty callbacks, counter resets, silence without any audible
+    /// evidence since arming, or elapsed wall time alone.
+    fn observe_delivery(&mut self, now: u64, activity: TapActivity, verdict: Verdict) -> bool {
+        let previous = self.previous_delivery.replace((now, activity));
+        let advancing = previous.is_some_and(|(then, before)| {
+            now >= then
+                && now - then < self.config.watchdog.no_buffer_timeout.as_nanos() as u64
+                && activity.frames > before.frames
+                && activity.buffers > before.buffers
+                && activity.silent_buffers >= before.silent_buffers
+        });
+        if !advancing || verdict != Verdict::Healthy || !self.watchdog.audible_since_arm() {
+            self.healthy_since_ns = None;
+            return false;
+        }
+        let since = *self.healthy_since_ns.get_or_insert(now);
+        now.saturating_sub(since) >= Duration::from_secs(10).as_nanos() as u64
     }
 
     /// Tear the tap down and start trying to build another.
@@ -939,6 +968,8 @@ impl CaptureSupervisor {
         self.rebuilds += 1;
         self.last_rebuild_ns = Some(now);
         self.watchdog.arm(now);
+        self.healthy_since_ns = None;
+        self.previous_delivery = None;
         // A change that arrived during the outage has been answered by this
         // rebuild. Leaving it pending would fire a second, pointless rebuild
         // 300 ms later — and spend another gap on it.
