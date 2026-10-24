@@ -28,7 +28,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc as std_mpsc;
+use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -44,8 +44,11 @@ pub const SAMPLE_RATE: u32 = 16_000;
 
 const SAMPLES_PER_MS: u64 = SAMPLE_RATE as u64 / 1_000;
 
-/// How far behind real time a leg may fall before the user is told (60 s).
-const BACKLOG_WARN_SAMPLES: u64 = 60 * SAMPLE_RATE as u64;
+/// How far behind real time a leg may fall before the user is told (30 s).
+const BACKLOG_WARN_SAMPLES: u64 = 30 * SAMPLE_RATE as u64;
+const MAX_QUEUED_SAMPLES: u64 = 60 * SAMPLE_RATE as u64;
+const MAX_QUEUED_COMMANDS: usize = 8192;
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Where the [`Endpointer`] cuts.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -443,7 +446,9 @@ enum Command {
 /// Only finals are emitted: the model sees an utterance once, after it ends.
 #[derive(Debug)]
 pub struct LocalStream {
-    commands: std_mpsc::Sender<Command>,
+    commands: mpsc::Sender<Command>,
+    aborted: Arc<AtomicBool>,
+    events: mpsc::WeakUnboundedSender<StreamEvent>,
     closed: Arc<AtomicBool>,
     /// Samples written and not yet taken by the worker.
     backlog: Arc<AtomicU64>,
@@ -459,9 +464,10 @@ impl LocalStream {
         config: LocalStreamConfig,
         engine: Arc<dyn RecognizerFactory>,
     ) -> (Self, mpsc::UnboundedReceiver<StreamEvent>) {
-        let (command_tx, command_rx) = std_mpsc::channel();
+        let (command_tx, mut command_rx) = mpsc::channel(MAX_QUEUED_COMMANDS);
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let backlog = Arc::new(AtomicU64::new(0));
+        let aborted = Arc::new(AtomicBool::new(false));
         let name = match config.source {
             Source::Mic => "fotw-stt-local-mic",
             Source::System => "fotw-stt-local-system",
@@ -473,10 +479,11 @@ impl LocalStream {
             events: event_tx.clone(),
             backlog: Arc::clone(&backlog),
             warned_behind: false,
+            aborted: aborted.clone(),
         };
         if let Err(error) = std::thread::Builder::new()
             .name(name.to_owned())
-            .spawn(move || worker.run(&command_rx))
+            .spawn(move || worker.run(&mut command_rx))
         {
             let _ = event_tx.send(StreamEvent::Error(
                 SttError::new(
@@ -491,6 +498,8 @@ impl LocalStream {
         (
             Self {
                 commands: command_tx,
+                aborted,
+                events: event_tx.downgrade(),
                 closed: Arc::new(AtomicBool::new(false)),
                 backlog,
             },
@@ -498,14 +507,57 @@ impl LocalStream {
         )
     }
 
-    /// Hand the worker 16 kHz mono PCM. Never blocks and never fails.
+    /// Hand the worker 16 kHz mono PCM without blocking capture.
+    /// On overload, stop transcription and report incomplete coverage; the
+    /// session WAL remains authoritative for a later retry. Never skip samples
+    /// and continue on a shortened clock.
     pub fn write(&self, pcm: &[i16]) {
-        if pcm.is_empty() || self.closed.load(Ordering::SeqCst) {
+        if pcm.is_empty()
+            || self.closed.load(Ordering::SeqCst)
+            || self.aborted.load(Ordering::SeqCst)
+        {
             return;
         }
-        self.backlog.fetch_add(pcm.len() as u64, Ordering::SeqCst);
-        if self.commands.send(Command::Audio(pcm.to_vec())).is_err() {
-            self.backlog.fetch_sub(pcm.len() as u64, Ordering::SeqCst);
+        for chunk in pcm.chunks(SAMPLE_RATE as usize) {
+            let count = chunk.len() as u64;
+            if self
+                .backlog
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |queued| {
+                    queued
+                        .checked_add(count)
+                        .filter(|next| *next <= MAX_QUEUED_SAMPLES)
+                })
+                .is_err()
+            {
+                self.overloaded();
+                return;
+            }
+            if self
+                .commands
+                .try_send(Command::Audio(chunk.to_vec()))
+                .is_err()
+            {
+                self.backlog.fetch_sub(count, Ordering::SeqCst);
+                self.overloaded();
+                return;
+            }
+        }
+    }
+
+    fn overloaded(&self) {
+        self.abort_with_error("local transcription backlog exceeded its bound; transcript incomplete, recording retained");
+    }
+
+    fn abort_with_error(&self, message: &str) {
+        if !self.aborted.swap(true, Ordering::SeqCst)
+            && let Some(events) = self.events.upgrade()
+        {
+            let _ = events.send(StreamEvent::Error(SttError::new(
+                SttErrorClass::Server,
+                PROVIDER,
+                message,
+            )));
+            let _ = events.send(StreamEvent::State(StreamState::Closed));
         }
     }
 
@@ -521,10 +573,23 @@ impl LocalStream {
             return Ok(());
         }
         let (ack_tx, ack_rx) = oneshot::channel();
-        if self.commands.send(Command::Flush(ack_tx)).is_err() {
+        if self.aborted.load(Ordering::SeqCst) {
             return Err(worker_gone("flush"));
         }
-        ack_rx.await.map_err(|_| worker_gone("flush"))
+        tokio::time::timeout(DRAIN_TIMEOUT, async {
+            self.commands
+                .send(Command::Flush(ack_tx))
+                .await
+                .map_err(|_| worker_gone("flush"))?;
+            ack_rx.await.map_err(|_| worker_gone("flush"))
+        })
+        .await
+        .map_err(|_| {
+            self.abort_with_error(
+                "local transcription flush timed out; transcript incomplete, recording retained",
+            );
+            worker_gone("flush timeout")
+        })?
     }
 
     /// Close the stream, once the audio already written has been transcribed.
@@ -532,23 +597,48 @@ impl LocalStream {
     ///
     /// # Errors
     ///
-    /// Never; the `Result` matches [`crate::DeepgramStream::close`].
+    /// When inference is overloaded, unavailable or does not drain within 30s.
+    /// The session retains recorded audio for recovery.
     pub async fn close(&self) -> Result<(), SttError> {
         if self.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
         let (ack_tx, ack_rx) = oneshot::channel();
-        if self.commands.send(Command::Close(ack_tx)).is_err() {
-            return Ok(());
+        if self.aborted.load(Ordering::SeqCst) {
+            return Err(worker_gone("close after overload"));
         }
-        let _ = ack_rx.await;
-        Ok(())
+        tokio::time::timeout(DRAIN_TIMEOUT, async {
+            self.commands
+                .send(Command::Close(ack_tx))
+                .await
+                .map_err(|_| worker_gone("close"))?;
+            ack_rx.await.map_err(|_| worker_gone("close"))
+        })
+        .await
+        .map_err(|_| {
+            self.abort_with_error(
+                "local transcription close timed out; transcript incomplete, recording retained",
+            );
+            worker_gone("close timeout")
+        })?
+    }
+
+    /// Number of samples queued for the local worker (excludes in-flight inference).
+    #[must_use]
+    pub fn queued_samples(&self) -> u64 {
+        self.backlog.load(Ordering::SeqCst)
     }
 
     /// Whether [`close`](Self::close) has been called.
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for LocalStream {
+    fn drop(&mut self) {
+        self.aborted.store(true, Ordering::SeqCst);
     }
 }
 
@@ -568,10 +658,11 @@ struct Worker {
     events: mpsc::UnboundedSender<StreamEvent>,
     backlog: Arc<AtomicU64>,
     warned_behind: bool,
+    aborted: Arc<AtomicBool>,
 }
 
 impl Worker {
-    fn run(mut self, commands: &std_mpsc::Receiver<Command>) {
+    fn run(mut self, commands: &mut mpsc::Receiver<Command>) {
         self.emit(StreamEvent::State(StreamState::Connecting));
         // A model that will not load leaves the leg recording untranscribed:
         // the audio is on disk either way, and the error says why.
@@ -588,7 +679,10 @@ impl Worker {
 
         let mut pending_close = None;
         // Ends on `Close`, or when the handle is dropped without one.
-        while let Ok(command) = commands.recv() {
+        while let Some(command) = commands.blocking_recv() {
+            if self.aborted.load(Ordering::SeqCst) {
+                break;
+            }
             match command {
                 Command::Audio(pcm) => {
                     self.backlog.fetch_sub(pcm.len() as u64, Ordering::SeqCst);
@@ -616,7 +710,8 @@ impl Worker {
         }
 
         // Whatever was mid-utterance when the meeting ended is still speech.
-        if let Some(recognizer) = recognizer.as_deref_mut()
+        if !self.aborted.load(Ordering::SeqCst)
+            && let Some(recognizer) = recognizer.as_deref_mut()
             && let Some(chunk) = self.endpointer.flush()
         {
             self.transcribe(recognizer, &chunk);
@@ -649,7 +744,7 @@ impl Worker {
         }
     }
 
-    /// Say once when the model falls a minute behind the meeting, and again
+    /// Say once when the model falls 30 seconds behind the meeting, and again
     /// only after it has caught up.
     fn check_backlog(&mut self) {
         let behind = self.backlog.load(Ordering::SeqCst);
@@ -673,6 +768,9 @@ impl Worker {
     }
 
     fn emit(&self, event: StreamEvent) {
+        if self.aborted.load(Ordering::SeqCst) && matches!(event, StreamEvent::Final(_)) {
+            return;
+        }
         let _ = self.events.send(event);
     }
 }
