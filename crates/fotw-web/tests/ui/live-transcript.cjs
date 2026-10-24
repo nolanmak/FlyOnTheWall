@@ -216,3 +216,47 @@ test('Stop disables capture retry immediately even before its response arrives',
  resolveStop({state:'finishing',session_id:'fixture',elapsed_ms:1000});await stopped;
  assert.equal(panel.hidden,true);
 });
+
+test('a status poll cannot swallow the current session retry error',async()=>{
+ const h=harness(),messages=[];h.ctx.say=message=>messages.push(message);
+ const body={state:'recording',session_id:'retry-error',started_at_ms:1000,
+ capture_health:{system:{state:'healthy'},mic:{state:'exhausted',attempts:3,max_attempts:3}}};
+ h.ctx.renderRecording(body);
+ const button=h.all(h.nodes.get('capture-health')).find(n=>n.tagName==='button'&&!n.hidden);
+ let reply;h.ctx.api=url=>url.startsWith('/api/recording/retry') ? new Promise(resolve=>reply=resolve) : Promise.resolve(body);
+ const pending=button.listeners.click();
+ await h.ctx.pollRecording();
+ messages.length=0; // Ignore the harness's unrelated unauthorised bootstrap status.
+ reply({...body,error:'Microphone retry was refused'});await pending;
+ assert.deepEqual(messages,['Microphone retry was refused']);
+ assert.equal(button.disabled,false,'a refused retry must remain available');
+});
+
+test('an accepted queued retry stays disabled through exhausted snapshots until the pump advances',async()=>{
+ const h=harness();const body={state:'recording',session_id:'retry-queued',started_at_ms:1000,
+ capture_health:{system:{state:'healthy'},mic:{state:'exhausted',attempts:3,max_attempts:3}}};
+ h.ctx.renderRecording(body);const panel=h.nodes.get('capture-health');
+ const button=h.all(panel).find(n=>n.tagName==='button'&&!n.hidden);
+ h.ctx.api=async()=>body;
+ await button.listeners.click();
+ assert.equal(button.disabled,true,'POST acknowledgment is not pump acknowledgment');
+ h.ctx.renderRecording(body);assert.equal(button.disabled,true,'old exhausted status must not re-enable Retry');
+ h.ctx.renderRecording({...body,capture_health:{system:{state:'healthy'},mic:{state:'recovering',attempts:0,max_attempts:3}}});
+ assert.equal(button.hidden,true);
+ h.ctx.renderRecording(body);
+ assert.equal(button.disabled,false,'a later exhausted episode may be retried again');
+});
+
+test('a pump transition observed before the POST reply releases the retry for a later episode',async()=>{
+ const h=harness();const body={state:'recording',session_id:'retry-poll-first',started_at_ms:1000,
+ capture_health:{system:{state:'healthy'},mic:{state:'exhausted',attempts:3,max_attempts:3}}};
+ const recovering={...body,capture_health:{system:{state:'healthy'},mic:{state:'recovering',attempts:0,max_attempts:3}}};
+ h.ctx.renderRecording(body);const panel=h.nodes.get('capture-health');
+ const button=h.all(panel).find(n=>n.tagName==='button'&&!n.hidden);
+ let reply;h.ctx.api=url=>url.startsWith('/api/recording/retry') ? new Promise(resolve=>reply=resolve) : Promise.resolve(recovering);
+ const pending=button.listeners.click();await h.ctx.pollRecording();
+ reply(body);await pending;
+ assert.match(panel.textContent,/Recovering audio/,'the old POST snapshot cannot rewind a newer poll');
+ h.ctx.renderRecording(body);
+ assert.equal(button.disabled,false,'the pump already acknowledged the previous retry');
+});
