@@ -32,13 +32,13 @@ save, network failure, and conflict resolution. Temporary encrypted databases
 cover two connections, export and search. An injected anchor-insert failure
 proves rollback of text, revision, anchors and the FTS index. UI tests use literal script-shaped
 text in the textarea. The store/web regression suites and workspace Clippy pass;
-52 Node UI tests pass. Full workspace regression is also run before pushing.
+62 Node UI tests pass. Full workspace regression is also run before pushing.
 
 Outstanding before completion: live-session identity handoff; encrypted draft
-recovery across browser/daemon restarts; editor block tracking and first-key
-anchors through edits/reordering; actual browser keyboard/narrow-layout checks.
+recovery across browser/daemon restarts; live first-key anchors; trusted
+keyboard/IME and mobile selection checks.
 The saved-meeting editor remaps supplied anchors without creating historic
-timestamps. Live first-keystroke capture and browser acceptance remain #13 work.
+timestamps. Live first-keystroke capture remains #13 work.
 Neither #122 nor #13 is complete.
 
 ## Persistent block identity
@@ -57,7 +57,7 @@ ID. Store and HTTP tests now preserve IDs/offsets across text/index updates and
 verify atomic rejection of changed offsets, duplicate identities and identity
 reuse from another meeting. Existing export/import and store regression tests
 pass. These guarantees apply to caller-supplied block edits; the editor integration below tracks supported block operations. No claim of
-complete live recording-time capture or browser acceptance is made.
+complete live recording-time capture is made; saved-editor rendering is checked below.
 
 ## Editor block operations
 
@@ -84,5 +84,23 @@ Red/green tests cover edits, reorder, insertion, deletion/recreation, duplicate
 paragraph edits/deletion, split/merge, fenced code, Unicode, explicit identical
 block movement and matching text/anchor snapshots during in-flight saves. A
 mounted-control test verifies keyboard focus and the emitted save payload. All
-63 UI tests pass; actual browser/IME, mobile selection and live recording-time
+62 UI tests pass. Trusted keyboard/IME, mobile selection and live recording-time
 checks remain outstanding.
+
+## Saved-editor WebKit acceptance
+
+An isolated WebKit view with a nonpersistent data store loaded the real embedded
+assets and API over the synthetic `ui_preview` library. It saved literal
+script-shaped text, observed a higher revision and Saved status, switched to a
+different meeting without leaking the draft, and returned to the saved text.
+Six fresh WebKit views recovered it from the encrypted store at 390, 768 and
+1440 CSS pixels in both light and dark appearances. All six reported no page
+horizontal overflow, a labeled/focusable textarea and respected hidden states.
+The initial rendering exposed the hidden consent label; the global hidden rule
+fixes author styles overriding that attribute. Screenshots were inspected.
+
+These are DOM/API and rendering checks, including synthetic input events.
+They do not establish trusted hardware keyboard events, IME behavior, real
+recording timestamps or crash recovery of unsaved drafts. No user meeting,
+provider key, microphone or browser profile was used. The view minted a fresh
+one-time launch URL for each run, respecting the 30-second handoff lifetime.
