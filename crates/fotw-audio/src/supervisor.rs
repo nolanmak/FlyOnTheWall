@@ -81,13 +81,14 @@
 //! from a flapping device cannot reset the budget.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::clock::Clock;
 use crate::device_change::{Debounce, DeviceChangeKind, DeviceChangeSignal, DeviceChanges};
 use crate::error::TapError;
 use crate::format::StreamFormat;
-use crate::frames::FrameSink;
+use crate::frames::{CaptureTimestamp, FrameFlags, FrameSink};
 use crate::ids::TapId;
 use crate::tap::AudioTap;
 use crate::watchdog::{Fault, OutputProbe, TapActivity, Verdict, Watchdog, WatchdogConfig};
@@ -116,6 +117,8 @@ pub enum GapReason {
     DeviceChanged,
     /// The time spent tearing the old tap down and building the new one.
     RebuildWindow,
+    /// A callback explicitly reported an invalidated device or stream format.
+    CallbackFault,
 }
 
 impl GapReason {
@@ -127,6 +130,7 @@ impl GapReason {
             Self::TapStalledSilent => "tap-stall-silent",
             Self::DeviceChanged => "device-changed",
             Self::RebuildWindow => "rebuild-window",
+            Self::CallbackFault => "callback-fault",
         }
     }
 }
@@ -513,6 +517,34 @@ type OpenFn = Box<dyn FnMut() -> Result<Box<dyn AudioTap>, TapError> + Send>;
 /// dropped, rather than allocating a new one.
 type SinkFn = Box<dyn FnMut() -> Box<dyn FrameSink> + Send>;
 
+// Each start owns its own mailbox. A callback retained by an old backend
+// can never fault its replacement. MAX denotes no fault; the first timestamp
+// is kept so delayed polling and retry spacing do not shorten the gap.
+const NO_CALLBACK_FAULT: u64 = u64::MAX;
+struct FaultObservingSink {
+    inner: Box<dyn FrameSink>,
+    fault: Arc<AtomicU64>,
+    clock: Arc<dyn Clock>,
+}
+impl FrameSink for FaultObservingSink {
+    fn on_frames(&mut self, pcm: &[f32], ts: CaptureTimestamp, flags: FrameFlags) {
+        if self.fault.load(Ordering::Acquire) == NO_CALLBACK_FAULT {
+            self.inner.on_frames(pcm, ts, flags);
+        }
+    }
+    fn on_error(&mut self, error: TapError) {
+        if error.is_transient_device_fault() {
+            let _ = self.fault.compare_exchange(
+                NO_CALLBACK_FAULT,
+                self.clock.now_ns().min(NO_CALLBACK_FAULT - 1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        self.inner.on_error(error);
+    }
+}
+
 /// An outage in progress: what it will cost and how hard we have tried.
 #[derive(Debug, Clone)]
 struct Recovery {
@@ -551,13 +583,14 @@ enum State {
 ///
 /// Owns the tap, the stall watchdog and the device-change mailbox, and is
 /// driven by a caller that polls it on whatever cadence suits — every 50 to
-/// 250 ms in practice. It never sleeps, never spawns and never blocks, so it
-/// composes with any runtime.
+/// 250 ms in practice. It does not sleep or spawn, but native open/start/stop
+/// operations are currently synchronous and may block the polling thread.
 pub struct CaptureSupervisor {
     config: SupervisorConfig,
     clock: Arc<dyn Clock>,
     open: OpenFn,
     make_sink: SinkFn,
+    callback_fault: Arc<AtomicU64>,
     tap: Option<Box<dyn AudioTap>>,
     format: Option<StreamFormat>,
     watchdog: Watchdog,
@@ -610,6 +643,7 @@ impl CaptureSupervisor {
             clock,
             open: Box::new(open),
             make_sink: Box::new(make_sink),
+            callback_fault: Arc::new(AtomicU64::new(NO_CALLBACK_FAULT)),
             tap: None,
             format: None,
             watchdog,
@@ -631,6 +665,15 @@ impl CaptureSupervisor {
         }
     }
 
+    fn observing_sink(&mut self) -> Box<dyn FrameSink> {
+        self.callback_fault = Arc::new(AtomicU64::new(NO_CALLBACK_FAULT));
+        Box::new(FaultObservingSink {
+            inner: (self.make_sink)(),
+            fault: Arc::clone(&self.callback_fault),
+            clock: Arc::clone(&self.clock),
+        })
+    }
+
     /// The mailbox a platform listener raises into.
     ///
     /// Handed to `MacOsPlatform::watch_devices`, or to whatever else can see
@@ -647,7 +690,7 @@ impl CaptureSupervisor {
             return Err(TapError::AlreadyRunning);
         }
         let mut tap = (self.open)()?;
-        let format = tap.start((self.make_sink)())?;
+        let format = tap.start(self.observing_sink())?;
         let now = self.clock.now_ns();
         self.tap = Some(tap);
         self.format = Some(format);
@@ -724,8 +767,9 @@ impl CaptureSupervisor {
 
     /// Whether supervision is paused because rebuilding stopped helping.
     ///
-    /// A tap **is** still running and its audio is still being written; what
-    /// has stopped is acting on its faults. Worth surfacing — a session
+    /// A tap **is** still running. Watchdog quarantine keeps delivering its
+    /// audio; an explicit callback fault suppresses further PCM until retry.
+    /// What has stopped is acting on its faults. Worth surfacing — a session
     /// running in this state is one where the recording is probably silent,
     /// and it is released after ten seconds of sustained healthy delivery.
     #[must_use]
@@ -796,7 +840,13 @@ impl CaptureSupervisor {
                     self.state = State::Recovering(recovery);
                 }
                 State::Quarantined => {
-                    return self.begin_recovery(now, None, now, GapReason::RebuildWindow);
+                    let fault_at = self.callback_fault.load(Ordering::Acquire);
+                    let (since, reason) = if fault_at == NO_CALLBACK_FAULT {
+                        (now, GapReason::RebuildWindow)
+                    } else {
+                        (fault_at, GapReason::CallbackFault)
+                    };
+                    return self.begin_recovery(now, None, since, reason);
                 }
                 state => self.state = state,
             }
@@ -855,6 +905,16 @@ impl CaptureSupervisor {
         probe: &impl OutputProbe,
         quarantined: bool,
     ) -> PollOutcome {
+        let fault_at = self.callback_fault.load(Ordering::Acquire);
+        if fault_at != NO_CALLBACK_FAULT {
+            self.health_confirmed = false;
+            self.healthy_since_ns = None;
+            self.previous_delivery = None;
+            if quarantined {
+                return PollOutcome::Abandoned;
+            }
+            return self.begin_recovery(now, None, fault_at, GapReason::CallbackFault);
+        }
         let verdict = self.watchdog.poll(now, activity, probe);
 
         // A single audible buffer can come from a device that is still
@@ -1068,7 +1128,7 @@ impl CaptureSupervisor {
         self.last_attempt_ns = Some(now);
 
         let started = (self.open)().and_then(|mut tap| {
-            let format = tap.start((self.make_sink)())?;
+            let format = tap.start(self.observing_sink())?;
             Ok((tap, format))
         });
 
