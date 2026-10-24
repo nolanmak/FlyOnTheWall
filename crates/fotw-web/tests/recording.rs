@@ -152,6 +152,7 @@ async fn every_recording_route_needs_the_bearer() {
         ("GET", "/api/recording/status"),
         ("POST", "/api/recording/start"),
         ("POST", "/api/recording/stop"),
+        ("POST", "/api/recording/retry?session_id=fixture&source=mic"),
     ] {
         let res = match method {
             "GET" => r.h.get(path, &anon).await,
@@ -410,6 +411,7 @@ async fn a_server_without_a_recorder_hides_the_routes_entirely() {
         ("GET", "/api/recording/status"),
         ("POST", "/api/recording/start?ack=all-party"),
         ("POST", "/api/recording/stop"),
+        ("POST", "/api/recording/retry?session_id=fixture&source=mic"),
     ] {
         let res = match method {
             "GET" => h.get(path, &auth).await,
@@ -544,4 +546,95 @@ async fn a_healthy_recording_reports_no_transcription_error() {
 
     let idle = serde_json::to_value(RecordingStatus::idle()).unwrap();
     assert!(idle["transcription_error"].is_null());
+}
+
+#[tokio::test]
+async fn retry_route_is_state_private_and_rejects_invalid_sources() {
+    let r = rig().await;
+    let auth = r.h.authorised();
+    for path in [
+        "/api/recording/retry",
+        "/api/recording/retry?session_id=fixture&source=other",
+    ] {
+        let response = r.h.post(path, &auth, None).await;
+        assert_eq!(response.status, 404);
+    }
+    let response =
+        r.h.post(
+            "/api/recording/retry?session_id=fixture&source=mic",
+            &auth,
+            None,
+        )
+        .await;
+    assert_eq!(
+        response.status, 200,
+        "recording state belongs in the authorized body"
+    );
+    let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(body["state"], "idle");
+    assert_eq!(body["error"], "capture retry is unavailable");
+}
+
+#[tokio::test]
+async fn retry_forwards_source_and_session_and_returns_independent_health() {
+    use fotw_web::recorder::{CaptureDelivery, CaptureHealth, CaptureSource, SourceCaptureStatus};
+    #[derive(Default)]
+    struct RetryRecorder(Mutex<Vec<(String, CaptureSource)>>);
+    impl RecorderControl for RetryRecorder {
+        fn start(&self) -> Result<RecordingStatus, RecorderError> {
+            unreachable!()
+        }
+        fn stop(&self) -> Result<RecordingStatus, RecorderError> {
+            unreachable!()
+        }
+        fn retry_capture(&self, id: &str, source: CaptureSource) -> Result<(), RecorderError> {
+            self.0.lock().unwrap().push((id.into(), source));
+            Ok(())
+        }
+        fn status(&self) -> RecordingStatus {
+            let status = |state| SourceCaptureStatus {
+                state,
+                attempts: 0,
+                max_attempts: 3,
+                retry_in_ms: None,
+            };
+            RecordingStatus::recording(1000, 2000)
+                .with_session_id(Some("fixture / session".into()))
+                .with_capture_health(Some(CaptureHealth {
+                    system: status(CaptureDelivery::Healthy),
+                    mic: status(CaptureDelivery::Recovering),
+                }))
+        }
+    }
+    let recorder = Arc::new(RetryRecorder::default());
+    let server =
+        WebServer::bind_with_recorder(0, Arc::new(MemorySource::new()), Some(recorder.clone()))
+            .await
+            .unwrap();
+    let state = server.state().clone();
+    let h = common::Harness {
+        addr: server.addr(),
+        token: state.policy().secret().expose_hex(),
+        authority: state.policy().authority().to_owned(),
+        origin: state.policy().origin().to_owned(),
+        state,
+    };
+    tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+    let response = h
+        .post(
+            "/api/recording/retry?session_id=fixture%20%2F%20session&source=mic",
+            &h.authorised(),
+            None,
+        )
+        .await;
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        *recorder.0.lock().unwrap(),
+        vec![("fixture / session".into(), CaptureSource::Mic)]
+    );
+    let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(body["capture_health"]["system"]["state"], "healthy");
+    assert_eq!(body["capture_health"]["mic"]["state"], "recovering");
 }

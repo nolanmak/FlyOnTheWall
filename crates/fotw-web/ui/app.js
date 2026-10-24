@@ -39,6 +39,7 @@ const el = {
   noteDrafts: document.getElementById("note-drafts"),
   recording: document.getElementById("recording"),
   recordingLimit: document.getElementById("recording-limit"),
+  captureHealth: document.getElementById("capture-health"),
   ghSettings: document.getElementById("gh-settings"),
   ghRepo: document.getElementById("gh-repo"),
   ghBranch: document.getElementById("gh-branch"),
@@ -898,6 +899,7 @@ function showRecordingControls(visible) {
 // re-enable a button with nothing to do, and Stop must never be gated on the
 // box, because a user who cannot stop a recording is the worse failure.
 function paintRecordButton() {
+  if (captureStopPending) { el.record.disabled = true; return; }
   el.record.textContent = recState === "idle" ? "Start" : "Stop";
   if (recState === "finishing") el.record.disabled = true;
   else if (recState === "recording") el.record.disabled = false;
@@ -912,6 +914,7 @@ function renderRecording(body) {
   // word must never be the one that leaves a clock running.
   recState =
     body.state === "recording" || body.state === "finishing" ? body.state : "idle";
+  renderCaptureHealth(body);
   mountLiveNotes();
   paintLiveNavigation();
   adoptSavedLive();
@@ -991,6 +994,100 @@ function renderRecording(body) {
         ? "Transcription failed during this meeting: "
         : "Recording, but transcription is failing: ") + body.transcription_error,
     );
+  }
+}
+
+// Keep rows mounted between polls so status refreshes preserve keyboard focus.
+const captureHealthRows = new Map();
+const captureRetryPending = new Map();
+let captureHealthSession = null;
+let captureStopPending = false;
+function renderCaptureHealth(body) {
+  if (!el.captureHealth) return;
+  const health = body.capture_health;
+  const active = recState === "recording" && !captureStopPending && body.session_id && health;
+  el.captureHealth.hidden = !active;
+  if (!active) {
+    clear(el.captureHealth);
+    captureHealthRows.clear();
+    captureRetryPending.clear();
+    captureHealthSession = null;
+    return;
+  }
+  if (captureHealthSession !== body.session_id) captureRetryPending.clear();
+  captureHealthSession = body.session_id;
+  const labels = { system: "System audio", mic: "Microphone" };
+  const messages = {
+    confirming: "Checking audio delivery",
+    healthy: "Healthy",
+    quiet: "Silence detected",
+    recovering: "Recovering audio",
+    exhausted: "Automatic recovery stopped",
+    stopped: "Stopped",
+    unavailable: "Unavailable",
+  };
+  for (const source of ["system", "mic"]) {
+    const status = health[source];
+    let row = captureHealthRows.get(source);
+    if (!row) {
+      const container = text("div", "", "capture-source");
+      const message = text("span", "");
+      message.setAttribute("role", "status");
+      const detail = text("span", "", "meta");
+      const button = text("button", "Retry " + labels[source].toLowerCase());
+      button.type = "button";
+      button.addEventListener("click", () => retryCapture(source, button));
+      container.appendChild(message);
+      container.appendChild(detail);
+      container.appendChild(button);
+      el.captureHealth.appendChild(container);
+      row = { container, message, detail, button };
+      captureHealthRows.set(source, row);
+    }
+    const state = status?.state;
+    const pending = captureRetryPending.get(source);
+    if (pending && state !== "exhausted") {
+      pending.observedTransition = true;
+      if (pending.accepted) captureRetryPending.delete(source);
+    }
+    row.container.setAttribute("data-state", state || "unavailable");
+    const message = labels[source] + ": " + (messages[state] || "Status unavailable");
+    if (row.message.textContent !== message) row.message.textContent = message;
+    const attempts = Number.isInteger(status?.attempts) ? status.attempts : 0;
+    const max = Number.isInteger(status?.max_attempts) ? status.max_attempts : 0;
+    row.detail.textContent = (attempts || state === "recovering")
+      ? attempts + " of " + max + " recovery attempts used" : "";
+    if (state === "recovering" && Number.isFinite(status.retry_in_ms)) {
+      row.detail.textContent += "; next attempt in " + Math.ceil(Math.max(0, status.retry_in_ms) / 1000) + "s";
+    }
+    row.button.hidden = state !== "exhausted";
+    row.button.disabled = captureRetryPending.has(source);
+  }
+}
+
+async function retryCapture(source, button) {
+  const id = captureHealthSession;
+  if (!id || recState !== "recording" || captureRetryPending.has(source)) return;
+  const request = ++recordingRequest;
+  const pending = { accepted: false, observedTransition: false };
+  captureRetryPending.set(source, pending);
+  const active = () => liveSessionId === id && captureHealthSession === id
+    && recState === "recording" && !captureStopPending;
+  button.disabled = true;
+  try {
+    const body = await api("/api/recording/retry?session_id=" + encodeURIComponent(id)
+      + "&source=" + encodeURIComponent(source), { method: "POST" });
+    if (!active()) return;
+    pending.accepted = !body.error;
+    if (request === recordingRequest) renderRecording(body);
+    if (body.error) say(body.error);
+  } catch (e) {
+    if (active()) say("Could not request audio recovery. Try again.");
+  } finally {
+    if (captureRetryPending.get(source) === pending) {
+      if (!pending.accepted || pending.observedTransition) captureRetryPending.delete(source);
+      button.disabled = captureRetryPending.has(source);
+    }
   }
 }
 
@@ -1083,13 +1180,15 @@ async function onRecord() {
   // Nothing to press while the meeting is being written: capture is already
   // over and Start is refused until the slot frees. The button is disabled in
   // that state, so this only catches a click that raced the poll.
-  if (recState === "finishing") return;
+  if (recState === "finishing" || captureStopPending) return;
   const path =
     recState === "recording"
       ? "/api/recording/stop"
       : "/api/recording/start?ack=all-party";
   el.record.disabled = true;
   if (recState === "recording") {
+    captureStopPending = true;
+    renderCaptureHealth({});
     noteClock?.stop();
     if (typeof FOTWNotes !== "undefined") FOTWNotes.flushAll();
   }
@@ -1121,6 +1220,11 @@ async function onRecord() {
     // Not a flat `disabled = false`: CON-01 says an idle Start stays disabled
     // until the box is ticked.
     paintRecordButton();
+  } finally {
+    const stopped = captureStopPending;
+    captureStopPending = false;
+    paintRecordButton();
+    if (stopped && recState === "recording") pollRecording();
   }
 }
 

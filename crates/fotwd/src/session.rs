@@ -521,6 +521,7 @@ impl LegChannel {
 /// [`supervise_channel`] run inside `pump_loop` against the same `sys`/`mic`
 /// consumers the ordinary drain reads, rather than a second private copy.
 struct ChannelMeta {
+    monitor: crate::capture_health::CaptureMonitor,
     label: &'static str,
     channel: LegChannel,
     supervisor: CaptureSupervisor,
@@ -553,6 +554,13 @@ fn supervise_channel(
     epoch_ns: u64,
     scratch: &mut [f32],
 ) -> Result<(), String> {
+    let source = match meta.channel {
+        LegChannel::System => fotw_web::recorder::CaptureSource::System,
+        LegChannel::Mic => fotw_web::recorder::CaptureSource::Mic,
+    };
+    if meta.monitor.take_retry(source) {
+        meta.supervisor.request_retry();
+    }
     let activity: TapActivity = meta.activity.snapshot();
     // The mic leg gets no corroboration: "is anything rendering output?" is
     // evidence about the *system* mixdown and says nothing about an input
@@ -563,6 +571,8 @@ fn supervise_channel(
         LegChannel::Mic => meta.supervisor.poll(activity, &OutputActivity::Unknown),
     };
 
+    meta.monitor
+        .publish(source, meta.supervisor.recovery_status());
     for event in meta.supervisor.drain_events() {
         if event.is_user_visible() {
             crate::diag!("  ! [{}] {}", meta.label, event.user_message());
@@ -692,6 +702,7 @@ impl Supervision {
     /// recording. The taps go on delivering into the rings until their `stop()`
     /// returns, which is exactly the tail the drain deadline bounds.
     fn stop_capture(&mut self) {
+        self.system.monitor.close();
         let mut taken: Vec<Box<dyn AudioTap>> = Vec::new();
         if let Some(tap) = self.system.supervisor.take_running_tap() {
             taken.push(tap);
@@ -1478,6 +1489,8 @@ impl SegmentTap {
 /// The latches a caller outside the session holds, and the clock on its end.
 #[derive(Clone, Debug, Default)]
 pub struct SessionControl {
+    /// Independent source health and session-scoped recovery requests.
+    pub capture_health: crate::capture_health::CaptureMonitor,
     /// Trip to end the session early.
     pub stop: StopSignal,
     /// Tripped by the session once capture is live.
@@ -1552,6 +1565,7 @@ pub async fn run_with_stop(
         transcription,
         duration,
         SessionControl {
+            capture_health: crate::capture_health::CaptureMonitor::default(),
             stop,
             ready: ReadySignal::new(),
             errors: SttErrors::new(),
@@ -2020,10 +2034,21 @@ pub async fn run_supervised(
     // Everything the pump needs to service each leg between drains. The taps
     // themselves move into the pump with their supervisors: under supervision it
     // is the pump that stops them, so nothing on this task can touch them again.
+    control.capture_health.publish(
+        fotw_web::recorder::CaptureSource::System,
+        sys_supervisor.recovery_status(),
+    );
+    if mic_format.is_some() {
+        control.capture_health.publish(
+            fotw_web::recorder::CaptureSource::Mic,
+            mic_supervisor.recovery_status(),
+        );
+    }
     let supervision = Supervision {
         plat: Arc::clone(&plat),
         epoch_ns,
         system: ChannelMeta {
+            monitor: control.capture_health.clone(),
             label: "system",
             channel: LegChannel::System,
             supervisor: sys_supervisor,
@@ -2032,6 +2057,7 @@ pub async fn run_supervised(
             wal_format: TrackFormat::new(sys_format.sample_rate_hz, sys_format.channels),
         },
         mic: mic_format.map(|f| ChannelMeta {
+            monitor: control.capture_health.clone(),
             label: "mic",
             channel: LegChannel::Mic,
             supervisor: mic_supervisor,
@@ -3397,6 +3423,7 @@ mod supervised_recovery_tests {
         supervisor.start().unwrap();
         (
             ChannelMeta {
+                monitor: crate::capture_health::CaptureMonitor::default(),
                 label,
                 channel,
                 supervisor,
@@ -3500,6 +3527,57 @@ mod supervised_recovery_tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pump_publishes_independent_health_and_consumes_only_the_requested_retry() {
+        use fotw_web::recorder::{CaptureDelivery, CaptureSource};
+        let root = scratch_dir("health-retry");
+        let clock = ManualClock::new();
+        let plat = MockPlatform::macos_taps();
+        let format = TrackFormat::new(8_000, 1);
+        let mut wal = SessionWal::create_with_formats(&root, format, Some(format)).unwrap();
+        let (mut system, mut sys_cons, sys_activity, _) = fake_leg(
+            "system",
+            LegChannel::System,
+            TapId::system_default(),
+            format,
+            &clock,
+        );
+        let (mut mic, mut mic_cons, _, _) = fake_leg(
+            "mic",
+            LegChannel::Mic,
+            TapId::mic("fixture"),
+            format,
+            &clock,
+        );
+        mic.monitor = system.monitor.clone();
+        let monitor = system.monitor.clone();
+        let mut scratch = vec![0.0; 8_000];
+        for _ in 0..700 {
+            clock.advance(Duration::from_millis(100));
+            sys_activity.record(800, false);
+            supervise_channel(&mut wal, &mut system, &mut sys_cons, &plat, 0, &mut scratch)
+                .unwrap();
+            supervise_channel(&mut wal, &mut mic, &mut mic_cons, &plat, 0, &mut scratch).unwrap();
+        }
+        let health = monitor.snapshot().unwrap();
+        assert_eq!(health.system.state, CaptureDelivery::Healthy);
+        assert_eq!(health.mic.state, CaptureDelivery::Exhausted);
+        assert_eq!(system.supervisor.rebuilds(), 0);
+        assert_eq!(mic.supervisor.rebuilds(), 3);
+        assert!(monitor.request_retry(CaptureSource::Mic));
+        clock.advance(Duration::from_millis(100));
+        supervise_channel(&mut wal, &mut mic, &mut mic_cons, &plat, 0, &mut scratch).unwrap();
+        assert_eq!(mic.supervisor.rebuilds(), 4);
+        assert_eq!(
+            monitor.snapshot().unwrap().mic.state,
+            CaptureDelivery::Confirming
+        );
+        assert_eq!(system.supervisor.rebuilds(), 0);
+        assert!(!monitor.take_retry(CaptureSource::Mic));
+        drop(wal);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// The daemon-specific requirement the CLI path has no equivalent of: the

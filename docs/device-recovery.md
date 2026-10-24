@@ -30,10 +30,71 @@ five default retries, a reset after brief success, and 167 open calls (including
 initial startup) under route chatter before the fix. They verify mixed failures, successful route rebuilds,
 manual retry/gap boundaries, and stopped-session notification isolation.
 
-This is partial implementation of #121. A successful start still emits
-`Recovered` before sustained health is established. Accurate UI recovery state
-and manual-retry wiring, generation fencing for native callbacks, sleep-aware
-gaps, format-stable archive conversion, and bounded native recovery operations
-remain required. Live format notifications and conversion also remain required.
+The legacy `Recovered` event remains the immediate format/gap boundary for
+writers. Its user message now says restart is being confirmed; a separate
+`DeliveryConfirmed` event fires once after sustained health. The supervisor also
+exposes bounded, content-free delivery snapshots. A session-owned monitor carries
+independent system/microphone state to the recording-status API and dashboard.
+The dashboard keeps controls mounted across polls and distinguishes checking,
+healthy, silent, recovering, exhausted and unavailable sources. Retry uses the
+normal authenticated ingress and requires an exact active session ID plus an
+exhausted source. Stop closes the monitor, discards pending requests and refuses
+late publications; old browser responses cannot restore stopped/replaced state.
+
+Tests cover source independence through the real pump adapter, authenticated
+routing, stale session rejection, Stop, retry deduplication, preserved controls,
+and late browser responses. A pending Stop immediately removes retry controls;
+status polls cannot restore them until the stop request finishes.
+`ui_preview --capture-recovery` offers a synthetic
+browser fixture with a healthy system source and exhausted microphone. Retrying
+moves it through checking to healthy without opening devices or providers.
+
+This is partial implementation of #121. Generation fencing for native callbacks,
+sleep-aware gaps, format-stable archive conversion, recovery of a microphone
+that failed its initial open, and bounded native recovery operations remain
+required. Closing the mailbox cancels queued work; it cannot interrupt a native
+operation already running. Native input format
+validation does not itself implement live format notifications or conversion.
 Signed-app device/sleep tests and full-pipeline persisted-audio checks remain
 acceptance gates; synthetic supervisor tests do not prove them.
+
+Native Chrome fixture check: the real dashboard showed healthy system audio
+beside an exhausted microphone. Keyboard activation of Retry microphone changed
+it to checking, then healthy after the fixture timer; system audio stayed
+healthy. The owned preview tab, server and temporary library were removed.
+This validates the browser flow, not physical device recovery or microphone
+permissions. The full local suite includes 46 watchdog/recovery tests and 77 UI
+tests; the final embedded-web unit suite also passes.
+
+## Dashboard and API verification
+
+The extracted workflow passed 46 watchdog, 22 recording API and 2 session-monitor
+tests, all 80 browser unit tests, and full local `just ci`. Source-branch RED
+regressions showed an immediate “recovered” announcement before health and a
+missing exhausted-microphone UI. Strict Clippy and the synthetic preview build
+also passed after the fixture was corrected to reset its episode budget.
+
+An isolated, nonpersistent WebKit view exercised the real authenticated local API
+against a temporary encrypted synthetic library. System audio remained healthy
+while the microphone was exhausted; two synchronous clicks sent one retry POST.
+The microphone moved through checking to healthy after ten seconds, its retry
+budget reset to zero, and the retry button disappeared. Stop cleared the health
+controls. A status poll preserved the mounted retry button and DOM focus. These
+are synthetic browser checks; they do not establish physical keyboard focus,
+native audio/device recovery, or a release-ready signed-app session.
+
+The preview accepts either `--live-notes` or `--capture-recovery`; supplying both
+is refused. Each fixture keeps its own recorder behavior. The images below show
+only the source-health toolbar in that synthetic preview.
+
+![One exhausted source offers a retry while the other stays healthy](capture-health/exhausted.png)
+
+![Sustained delivery restores healthy status and the recovery budget](capture-health/healthy.png)
+
+Review regressions reproduced two retry races: a poll discarded a current-session
+retry error, and a queued-but-unconsumed retry became clickable again. The UI
+now reports errors for the still-active recording independently of poll ordering.
+An accepted retry stays disabled through old exhausted snapshots until delivery
+state advances; a later exhausted episode can be retried again. A transition
+observed before the POST reply also counts as acknowledgement. Stop and session
+replacement still discard the old request.

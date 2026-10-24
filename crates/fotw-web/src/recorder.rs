@@ -41,6 +41,58 @@ pub enum RecordingState {
     Finishing,
 }
 
+/// A capture source. Kept separate from provider/transcription failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureSource {
+    /// Computer output.
+    System,
+    /// Local microphone.
+    Mic,
+}
+
+/// What has been observed about this source's audio delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureDelivery {
+    /// Startup has not yet demonstrated sustained audio delivery.
+    Confirming,
+    /// Sustained delivery has been confirmed.
+    Healthy,
+    /// Silence without evidence that the device failed.
+    Quiet,
+    /// A bounded retry episode is in progress.
+    Recovering,
+    /// Automatic retry budget is exhausted.
+    Exhausted,
+    /// The recording has stopped.
+    Stopped,
+    /// This source could not be opened.
+    Unavailable,
+}
+
+/// Content-free health of one source; no native error text or device identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceCaptureStatus {
+    /// Delivery state.
+    pub state: CaptureDelivery,
+    /// Attempts spent in the current episode.
+    pub attempts: u32,
+    /// Episode ceiling.
+    pub max_attempts: u32,
+    /// Remaining delay for a queued attempt.
+    pub retry_in_ms: Option<u64>,
+}
+
+/// Independent health for each capture source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureHealth {
+    /// Computer output.
+    pub system: SourceCaptureStatus,
+    /// Microphone.
+    pub mic: SourceCaptureStatus,
+}
+
 /// What the recorder is doing, with the timings the UI renders.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingStatus {
@@ -83,6 +135,9 @@ pub struct RecordingStatus {
     /// empty string, which the UI would render as a blank warning.
     #[serde(default)]
     pub transcription_error: Option<String>,
+    /// Independent capture health, absent when the backend has no monitor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_health: Option<CaptureHealth>,
 }
 
 impl RecordingStatus {
@@ -97,6 +152,7 @@ impl RecordingStatus {
             elapsed_ms: None,
             ended_at_ms: None,
             transcription_error: None,
+            capture_health: None,
         }
     }
 
@@ -111,6 +167,7 @@ impl RecordingStatus {
             elapsed_ms: Some(elapsed_ms),
             ended_at_ms: None,
             transcription_error: None,
+            capture_health: None,
         }
     }
 
@@ -129,6 +186,7 @@ impl RecordingStatus {
             elapsed_ms: Some(ended_at_ms.saturating_sub(started_at_ms)),
             ended_at_ms: Some(ended_at_ms),
             transcription_error: None,
+            capture_health: None,
         }
     }
 
@@ -150,6 +208,13 @@ impl RecordingStatus {
     #[must_use]
     pub fn with_transcription_error(mut self, error: Option<String>) -> Self {
         self.transcription_error = error.filter(|e| !e.trim().is_empty());
+        self
+    }
+
+    /// Attach a content-free snapshot of both capture sources.
+    #[must_use]
+    pub fn with_capture_health(mut self, health: Option<CaptureHealth>) -> Self {
+        self.capture_health = health;
         self
     }
 
@@ -227,6 +292,17 @@ pub trait RecorderControl: Send + Sync + 'static {
     /// [`RecorderError::NotRecording`] if nothing is in flight, or
     /// [`RecorderError::Failed`] if finalizing failed.
     fn stop(&self) -> Result<RecordingStatus, RecorderError>;
+
+    /// Queue a retry for an exhausted source in the named active session.
+    /// The session ID fences late requests from old tabs. Implementations must
+    /// refuse finishing/stopped sessions and sources that are not exhausted.
+    fn retry_capture(
+        &self,
+        _session_id: &str,
+        _source: CaptureSource,
+    ) -> Result<(), RecorderError> {
+        Err(RecorderError::Failed("capture retry is unavailable".into()))
+    }
 
     /// What is happening right now. Must not block for long: the UI polls it.
     fn status(&self) -> RecordingStatus;

@@ -1893,3 +1893,100 @@ fn recovery_episode_successful_route_rebuilds_share_the_budget() {
         "a running episode must not be replenished by retries"
     );
 }
+
+#[test]
+fn restart_does_not_announce_recovery_before_sustained_audio() {
+    let h = Harness::new();
+    let mut sup = h.supervisor(supervisor_config());
+    sup.start().unwrap();
+    h.advance(Duration::from_secs(5));
+    assert_eq!(
+        sup.poll(TapActivity::default(), &OutputActivity::Active),
+        PollOutcome::Rebuilt
+    );
+    let message = sup
+        .drain_events()
+        .into_iter()
+        .find_map(|e| match e {
+            HealthEvent::Recovered { .. } => Some(e.user_message()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        message.contains("confirming"),
+        "a successful start has not proved health: {message}"
+    );
+    assert!(
+        message.contains("5.0 s"),
+        "the restart must still disclose the gap"
+    );
+}
+
+#[test]
+fn sustained_audio_announces_health_once_after_restart() {
+    let h = Harness::new();
+    let mut sup = h.supervisor(supervisor_config());
+    sup.start().unwrap();
+    h.advance(Duration::from_secs(5));
+    sup.poll(TapActivity::default(), &OutputActivity::Active);
+    sup.drain_events();
+    let mut activity = TapActivity::default();
+    sup.poll(activity, &OutputActivity::Active);
+    for tick in 0..120 {
+        h.advance(TICK);
+        activity.buffers += 1;
+        activity.frames += 4_800;
+        sup.poll(activity, &OutputActivity::Active);
+        let confirmed = sup
+            .drain_events()
+            .iter()
+            .filter(|e| e.user_message().contains("healthy delivery confirmed"))
+            .count();
+        assert_eq!(
+            confirmed,
+            usize::from(tick == 100),
+            "confirmation occurs once at ten seconds, not on start or every poll (tick {tick})"
+        );
+    }
+}
+
+#[test]
+fn health_snapshot_tracks_delivery_instead_of_successful_start() {
+    use fotw_audio::supervisor::DeliveryState;
+    let h = Harness::new();
+    let mut sup = h.supervisor(supervisor_config());
+    assert_eq!(sup.recovery_status().state, DeliveryState::Stopped);
+    sup.start().unwrap();
+    assert_eq!(sup.recovery_status().state, DeliveryState::Confirming);
+    let mut activity = TapActivity::default();
+    sup.poll(activity, &OutputActivity::Active);
+    for tick in 0..101 {
+        h.advance(TICK);
+        activity.buffers += 1;
+        activity.frames += 4_800;
+        sup.poll(activity, &OutputActivity::Active);
+        assert_eq!(
+            sup.recovery_status().state,
+            if tick == 100 {
+                DeliveryState::Healthy
+            } else {
+                DeliveryState::Confirming
+            }
+        );
+    }
+    h.fail_next_opens(3);
+    h.advance(Duration::from_secs(5));
+    sup.poll(activity, &OutputActivity::Active);
+    let recovering = sup.recovery_status();
+    assert_eq!(recovering.state, DeliveryState::Recovering);
+    assert_eq!(recovering.attempts, 1);
+    assert_eq!(recovering.retry_in_ms, Some(15_000));
+    h.advance(Duration::from_secs(15));
+    sup.poll(activity, &OutputActivity::Active);
+    h.advance(Duration::from_secs(30));
+    sup.poll(activity, &OutputActivity::Active);
+    assert_eq!(sup.recovery_status().state, DeliveryState::Exhausted);
+    assert_eq!(sup.recovery_status().attempts, 3);
+    sup.stop().unwrap();
+    assert_eq!(sup.recovery_status().state, DeliveryState::Stopped);
+}
