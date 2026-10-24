@@ -20,10 +20,10 @@ enum DeviceOwner {
     Aggregate(ManuallyDrop<AggregateDevice>),
 }
 pub(super) struct NativeAssets {
-    device: DeviceOwner,
+    device: Option<DeviceOwner>,
     tap: Option<ManuallyDrop<TapGuard>>,
-    block: arc::R<DeviceIoBlock>,
-    queue: arc::R<dispatch::Queue>,
+    block: Option<arc::R<DeviceIoBlock>>,
+    queue: Option<arc::R<dispatch::Queue>>,
 }
 // Native handles are controlled by one owner; callbacks have their own serial
 // dispatch queue and retain only the existing synchronized capture state.
@@ -48,27 +48,33 @@ impl NativeAssets {
         queue: arc::R<dispatch::Queue>,
     ) -> Self {
         Self {
-            device: DeviceOwner::Physical(device),
+            device: Some(DeviceOwner::Physical(device)),
             tap: None,
-            block,
-            queue,
+            block: Some(block),
+            queue: Some(queue),
         }
     }
-    pub fn system(
-        device: AggregateDevice,
-        tap: TapGuard,
-        block: arc::R<DeviceIoBlock>,
-        queue: arc::R<dispatch::Queue>,
-    ) -> Self {
+    /// Own the process tap before any fallible property/aggregate setup.
+    pub fn system(tap: TapGuard) -> Self {
         Self {
-            device: DeviceOwner::Aggregate(ManuallyDrop::new(device)),
+            device: None,
             tap: Some(ManuallyDrop::new(tap)),
-            block,
-            queue,
+            block: None,
+            queue: None,
         }
+    }
+    pub fn system_tap(&self) -> &TapGuard {
+        self.tap.as_ref().expect("owned process tap")
+    }
+    pub fn set_system_device(&mut self, device: AggregateDevice) {
+        self.device = Some(DeviceOwner::Aggregate(ManuallyDrop::new(device)));
+    }
+    pub fn set_callback(&mut self, block: arc::R<DeviceIoBlock>, queue: arc::R<dispatch::Queue>) {
+        self.block = Some(block);
+        self.queue = Some(queue);
     }
     fn device(&self) -> Device {
-        let device = match &self.device {
+        let device = match self.device.as_ref().expect("configured capture device") {
             DeviceOwner::Physical(device) => device,
             DeviceOwner::Aggregate(device) => device.as_ref(),
         };
@@ -85,11 +91,15 @@ fn check(status: i32, operation: &str) -> Result<(), String> {
 impl CaptureAssets for NativeAssets {
     type Proc = DeviceIoProcId;
     fn register(&mut self) -> Result<Self::Proc, String> {
-        // macOS 26 requires a non-null queue for reliable block delivery.
-        self.device()
-            .create_io_proc_id_with_block(Some(&self.queue), &mut self.block)
+        // Only a successfully prepared owner may register its callback.
+        let device = self.device();
+        let queue = self.queue.as_ref().expect("configured callback queue");
+        let block = self.block.as_mut().expect("configured callback block");
+        device
+            .create_io_proc_id_with_block(Some(queue), block)
             .map_err(|error| format!("AudioDeviceCreateIOProcIDWithBlock failed: {error:?}"))
     }
+
     fn start(&mut self, proc: Self::Proc) -> Result<(), String> {
         // SAFETY: the registered callback and all native dependencies are owned.
         check(
@@ -114,12 +124,14 @@ impl CaptureAssets for NativeAssets {
     fn drain(&mut self) {
         // This runs on the control owner, never on the callback's serial queue.
         // Unregistration precedes the barrier, so no later callback can enqueue.
-        self.queue.sync(|| ());
+        if let Some(queue) = &self.queue {
+            queue.sync(|| ());
+        }
     }
     fn release_device(&mut self) -> Result<(), String> {
         match self.device {
-            DeviceOwner::Physical(_) => Ok(()),
-            DeviceOwner::Aggregate(_) => {
+            None | Some(DeviceOwner::Physical(_)) => Ok(()),
+            Some(DeviceOwner::Aggregate(_)) => {
                 // SAFETY: IOProc is destroyed and drained before its aggregate.
                 check(
                     unsafe { AudioHardwareDestroyAggregateDevice(self.device().0.0) },
@@ -130,8 +142,8 @@ impl CaptureAssets for NativeAssets {
     }
     fn retain(&mut self, failure: &Failure) {
         let slot = match self.device {
-            DeviceOwner::Physical(_) => &MIC_FAILURE,
-            DeviceOwner::Aggregate(_) => &SYSTEM_FAILURE,
+            Some(DeviceOwner::Physical(_)) => &MIC_FAILURE,
+            None | Some(DeviceOwner::Aggregate(_)) => &SYSTEM_FAILURE,
         };
         *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(failure.clone());
     }
