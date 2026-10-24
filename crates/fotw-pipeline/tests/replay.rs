@@ -73,6 +73,7 @@ fn refuses_overwrite_wrong_session_and_unbounded_catchup_allocations() {
     let mut writer = ReplayWriter::create(&fixture.0, "original", ReplaySource::Mic, 0).unwrap();
     writer.append(&[i16::MIN, 0, i16::MAX]).unwrap();
     writer.sync().unwrap();
+    drop(writer); // Exercise existing-file refusal independently of the live lock.
     let before: Vec<_> = std::fs::read_dir(&fixture.0)
         .unwrap()
         .map(|e| {
