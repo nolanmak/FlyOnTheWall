@@ -35,11 +35,18 @@ Murmur's provider policy is not changed by sharing the dependency.
 Upgrade by choosing a reviewed full commit SHA, updating both dependency and
 dev-dependency pins in Murmur, updating Cargo.lock, and running both consumers'
 required checks. Roll back those manifest/lockfile changes together. Never pin a
-moving branch or silently update to upstream main. An upstream compatibility job
-will test source changes against an immutable consumer revision before migration
-is considered complete.
+moving branch or silently update to upstream main. The `murmur-compatibility.yml` workflow patches only fotw-secrets into
+Murmur revision `2fcb33e1eb2eb79653aeff63234c1e601978de7b`, then runs its workspace
+tests on macOS and Linux. The disposable compatibility lockfile may update for
+the source substitution; ordinary consumer CI continues to use `--locked`.
 
 Audio/STT vendor removal, provider capabilities, the shared audio/transcription
 conformance suite and complete upgrade compatibility gates remain outstanding.
 Shared Rust source does not share loaded model memory. Sharing model workers is
 separate #120 work, conditional on measured contention.
+
+Validation of the first migration: Murmur builds from a fresh standalone clone
+with `cargo check --locked`; its full workspace tests and Clippy pass with the
+Git pin. A disposable clean clone also passed the full workspace with the same
+producer path substitution used by the compatibility workflow. No OS keychain
+test was enabled. Hosted compatibility checks remain required on each revision.
