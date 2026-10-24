@@ -68,8 +68,30 @@ pub fn persist_session(db: &mut Db, outcome: &SessionOutcome, title: &str) -> St
     m.title = title.to_owned();
     // The real capture start, not now: they differ by the length of the
     // meeting, and using now would make every recording show zero duration.
-    if outcome.started_at_ms > 0 {
+    if outcome.started_at_ms > 0 || capture_end.is_some() {
         m.started_at_ms = outcome.started_at_ms as i64;
+    }
+    // A real capture has a stable WAL identity and frozen end. Commit its
+    // meeting, transcript and note alias together so retry cannot split them.
+    if let Some(ended) = capture_end {
+        let session = outcome
+            .dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| {
+                fotw_store::StoreError::InvalidArgument("capture has no session identity".into())
+            })?;
+        let rows: Vec<NewSegment> = outcome
+            .segments
+            .iter()
+            .enumerate()
+            .map(|(i, s)| to_row(i as i64, s))
+            .collect();
+        let transcript = outcome
+            .segments
+            .first()
+            .map(|s| (s.provider.as_str(), s.model.as_str(), rows.as_slice()));
+        return db.finalize_capture(session, m, ended, transcript);
     }
     let meeting_id = db.meetings().create(m)?;
 

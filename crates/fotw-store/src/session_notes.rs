@@ -14,6 +14,47 @@ pub struct SessionNoteDocument {
 }
 
 impl Db {
+    /// Save one completed capture and transfer its draft in one transaction.
+    /// Retrying the same session and clock returns the original meeting, preserving edits.
+    /// A changed clock is rejected rather than attaching notes to another recording.
+    pub fn finalize_capture(
+        &mut self,
+        session: &str,
+        mut meeting: crate::NewMeeting,
+        ended_at_ms: i64,
+        transcript: Option<(&str, &str, &[crate::NewSegment])>,
+    ) -> Result<String> {
+        validate_session(session)?;
+        let started = meeting.started_at_ms;
+        if started < 0 || ended_at_ms < started {
+            return Err(invalid("invalid recording clock"));
+        }
+        let elapsed = ended_at_ms - started;
+        let tx = self
+            .conn_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(link) = read_link(&tx, session)? {
+            if link.started != started || link.elapsed != elapsed {
+                return Err(invalid("session already attached to a different clock"));
+            }
+            tx.commit()?;
+            return Ok(link.meeting);
+        }
+        meeting.state = "ready".into();
+        let id = crate::repo::insert_meeting(&tx, meeting)?;
+        if let Some((provider, model, segments)) = transcript {
+            let tid = crate::repo::insert_transcript(&tx, &id, provider, model, true)?;
+            crate::repo::insert_segments(&tx, &tid, segments)?;
+        }
+        tx.execute(
+            "UPDATE meetings SET ended_at_ms=?2,duration_ms=?3 WHERE id=?1",
+            params![id, ended_at_ms, elapsed],
+        )?;
+        promote_in_transaction(&tx, session, &id, started, elapsed)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
     /// Atomically attach a session's notes to its saved meeting, preserving revisions.
     pub fn promote_session_note(
         &mut self,
@@ -29,44 +70,7 @@ impl Db {
         let tx = self
             .conn_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(link) = read_link(&tx, session)? {
-            if link.meeting != meeting
-                || link.started != started_at_ms
-                || link.elapsed != elapsed_ms
-            {
-                return Err(invalid(
-                    "session already attached to a different meeting or clock",
-                ));
-            }
-            tx.commit()?;
-            return Ok(());
-        }
-        let target = crate::notes::read_note(&tx, meeting)?;
-        if target.revision != 0 {
-            return Err(StoreError::NoteConflict);
-        }
-        if let Some(draft) = read(&tx, session)? {
-            if draft.started_at_ms != started_at_ms
-                || draft
-                    .note
-                    .anchors
-                    .iter()
-                    .any(|a| a.typed_at_ms > elapsed_ms)
-            {
-                return Err(invalid("draft does not match the recording clock"));
-            }
-            crate::notes::write_note(
-                &tx,
-                meeting,
-                0,
-                draft.note.revision,
-                &draft.note.body_md,
-                &draft.note.anchors,
-            )?;
-        }
-        tx.execute("INSERT INTO session_note_links(session_id,meeting_id,started_at_ms,elapsed_ms) VALUES(?1,?2,?3,?4)",
-            params![session,meeting,started_at_ms,elapsed_ms])?;
-        tx.execute("DELETE FROM session_notes WHERE session_id=?1", [session])?;
+        promote_in_transaction(&tx, session, meeting, started_at_ms, elapsed_ms)?;
         tx.commit()?;
         Ok(())
     }
@@ -225,4 +229,48 @@ struct Link {
 fn read_link(conn: &rusqlite::Connection, session: &str) -> Result<Option<Link>> {
     Ok(conn.query_row("SELECT meeting_id,started_at_ms,elapsed_ms FROM session_note_links WHERE session_id=?1", [session],
         |r| Ok(Link{meeting:r.get(0)?,started:r.get(1)?,elapsed:r.get(2)?})).optional()?)
+}
+
+fn promote_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    session: &str,
+    meeting: &str,
+    started_at_ms: i64,
+    elapsed_ms: i64,
+) -> Result<()> {
+    if let Some(link) = read_link(tx, session)? {
+        if link.meeting != meeting || link.started != started_at_ms || link.elapsed != elapsed_ms {
+            return Err(invalid(
+                "session already attached to a different meeting or clock",
+            ));
+        }
+        return Ok(());
+    }
+    let target = crate::notes::read_note(tx, meeting)?;
+    if target.revision != 0 {
+        return Err(StoreError::NoteConflict);
+    }
+    if let Some(draft) = read(tx, session)? {
+        if draft.started_at_ms != started_at_ms
+            || draft
+                .note
+                .anchors
+                .iter()
+                .any(|a| a.typed_at_ms > elapsed_ms)
+        {
+            return Err(invalid("draft does not match the recording clock"));
+        }
+        crate::notes::write_note(
+            tx,
+            meeting,
+            0,
+            draft.note.revision,
+            &draft.note.body_md,
+            &draft.note.anchors,
+        )?;
+    }
+    tx.execute("INSERT INTO session_note_links(session_id,meeting_id,started_at_ms,elapsed_ms) VALUES(?1,?2,?3,?4)",
+            params![session,meeting,started_at_ms,elapsed_ms])?;
+    tx.execute("DELETE FROM session_notes WHERE session_id=?1", [session])?;
+    Ok(())
 }
