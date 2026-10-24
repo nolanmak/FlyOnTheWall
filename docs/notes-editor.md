@@ -133,3 +133,23 @@ routes still need to supply the authoritative capture/stop clock and call the
 handoff. Recovery discovery and the live editor remain required before claiming
 user-visible recording-draft recovery. Unacknowledged keystrokes are not covered
 by database durability. No browser storage is added; #122 and #13 stay open.
+
+## Recording finalization integration
+
+Recorder status now uses the original capture/WAL start clock. The first stop
+request freezes its end before tap teardown, transcription drain or persistence,
+and later stop/cleanup calls cannot extend it. `SessionOutcome` carries that
+boundary so meeting duration excludes final transcription time. Legacy imported
+outcomes without a stop boundary keep their existing fallback behavior.
+
+For outcomes with an authoritative boundary, persistence commits the meeting,
+transcript, note promotion and session alias in one transaction. A failed handoff
+leaves the draft and no phantom meeting; retry uses the same session identity.
+The WAL reserves directories with atomic creation and retries collisions rather
+than reopening an existing session directory.
+
+Fixture tests cover frozen clocks, nonnegative bounds, capture-end persistence,
+transaction rollback/retry and preservation of files under colliding identities.
+These clocks use epoch milliseconds with rollback clamping; physical clock,
+sleep/wake and device behavior still need native acceptance. The authenticated
+live-note routes and UI remain the next integration step for #122/#13.
