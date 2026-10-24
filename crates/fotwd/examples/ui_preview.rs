@@ -344,7 +344,11 @@ impl fotw_web::RecorderControl for RecoveryPreview {
             },
             mic: SourceCaptureStatus {
                 state,
-                attempts: if retry.is_none() { 3 } else { 1 },
+                attempts: match state {
+                    CaptureDelivery::Exhausted => 3,
+                    CaptureDelivery::Confirming => 1,
+                    _ => 0,
+                },
                 max_attempts: 3,
                 retry_in_ms: None,
             },

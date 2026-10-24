@@ -1041,10 +1041,11 @@ function renderCaptureHealth(body) {
       container.appendChild(detail);
       container.appendChild(button);
       el.captureHealth.appendChild(container);
-      row = { message, detail, button };
+      row = { container, message, detail, button };
       captureHealthRows.set(source, row);
     }
     const state = status?.state;
+    row.container.setAttribute("data-state", state || "unavailable");
     const message = labels[source] + ": " + (messages[state] || "Status unavailable");
     if (row.message.textContent !== message) row.message.textContent = message;
     const attempts = Number.isInteger(status?.attempts) ? status.attempts : 0;

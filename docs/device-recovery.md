@@ -65,3 +65,28 @@ healthy. The owned preview tab, server and temporary library were removed.
 This validates the browser flow, not physical device recovery or microphone
 permissions. The full local suite includes 46 watchdog/recovery tests and 77 UI
 tests; the final embedded-web unit suite also passes.
+
+## Dashboard and API verification
+
+The extracted workflow passed 46 watchdog, 22 recording API and 2 session-monitor
+tests, all 77 browser unit tests, and full local `just ci`. Source-branch RED
+regressions showed an immediate “recovered” announcement before health and a
+missing exhausted-microphone UI. Strict Clippy and the synthetic preview build
+also passed after the fixture was corrected to reset its episode budget.
+
+An isolated, nonpersistent WebKit view exercised the real authenticated local API
+against a temporary encrypted synthetic library. System audio remained healthy
+while the microphone was exhausted; two synchronous clicks sent one retry POST.
+The microphone moved through checking to healthy after ten seconds, its retry
+budget reset to zero, and the retry button disappeared. Stop cleared the health
+controls. A status poll preserved the mounted retry button and DOM focus. These
+are synthetic browser checks; they do not establish physical keyboard focus,
+native audio/device recovery, or a release-ready signed-app session.
+
+The preview accepts either `--live-notes` or `--capture-recovery`; supplying both
+is refused. Each fixture keeps its own recorder behavior. The images below show
+only the source-health toolbar in that synthetic preview.
+
+![One exhausted source offers a retry while the other stays healthy](capture-health/exhausted.png)
+
+![Sustained delivery restores healthy status and the recovery budget](capture-health/healthy.png)
