@@ -11,4 +11,4 @@ publish = false
 [dependencies]
 keyring-core = "1"
 zbus-secret-service-keyring-store = { version = "=1.0.0", features = ["crypto-rust"] }
-dbus-secret-service-keyring-store = { version = "=1.0.1", features = ["crypto-rust", "vendored"] }
+dbus-secret-service-keyring-store = { version = "=1.0.1", features = ["crypto-rust"] }

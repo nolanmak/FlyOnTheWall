@@ -1,8 +1,27 @@
 //! Linux-only migration probe, run by scripts/test-keyring-interop.sh.
 
-#[cfg(test)]
+// Compile the production adapter itself, without enabling real-account tests
+// or exposing an OS-store hook in the public application API.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../../../crates/fotw-secrets/src/platform.rs"]
+mod production_platform;
+
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use keyring_core::api::CredentialStoreApi;
+
+    #[test]
+    fn unavailable_service_refuses_initialization_and_entry_creation() {
+        assert_eq!(
+            std::env::var("FOTW_ISOLATED_KEYRING_TEST").as_deref(),
+            Ok("unavailable")
+        );
+        assert!(super::production_platform::store_status().is_err());
+        assert!(matches!(
+            super::production_platform::entry("org.flyonthewall.interop-test", "absent"),
+            Err(keyring_core::Error::NoDefaultStore)
+        ));
+    }
 
     #[test]
     fn backends_share_existing_binary_credentials_without_copying_them() {
@@ -18,9 +37,8 @@ mod tests {
         let old = legacy
             .build(&service, "synthetic-master-key", None)
             .unwrap();
-        let new = replacement
-            .build(&service, "synthetic-master-key", None)
-            .unwrap();
+        super::production_platform::store_status().unwrap();
+        let new = super::production_platform::entry(&service, "synthetic-master-key").unwrap();
         let distinct = replacement
             .build(&service, "different-account", None)
             .unwrap();

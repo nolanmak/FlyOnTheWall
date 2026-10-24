@@ -18,5 +18,9 @@ unset GNOME_KEYRING_CONTROL GNOME_KEYRING_PID
 # A private bus and temporary keyring, never the user's login bus or keychain.
 dbus-run-session -- bash -euo pipefail -c '
     printf "%s" "synthetic-test-password" | gnome-keyring-daemon --unlock --components=secrets
-    cargo test --locked --manifest-path tests/keyring-interop/Cargo.toml -- --nocapture
+    cargo test --locked --manifest-path tests/keyring-interop/Cargo.toml backends_share -- --nocapture
 '
+# A fresh process exercises cached initialization failure, not a live keyring.
+FOTW_ISOLATED_KEYRING_TEST=unavailable \
+DBUS_SESSION_BUS_ADDRESS="unix:path=$fixture_root/no-such-bus" \
+    cargo test --locked --manifest-path tests/keyring-interop/Cargo.toml unavailable_service -- --nocapture

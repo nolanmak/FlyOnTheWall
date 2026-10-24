@@ -89,3 +89,39 @@ with the installed base.en artifact (SHA-256
 audio. Normal CI requires no weights; rerun the explicit model test with
 `FOTW_WHISPER_ENGLISH_MODEL` pointing to an English-only model and
 `cargo test -p fotw-stt --features local-whisper --lib real_english_model -- --ignored`.
+
+
+## Explicit credential stores and Linux backend compatibility
+
+`fotw-secrets` now initializes a private, cached `keyring-core` store rather
+than installing an all-in-one keyring global default. macOS still selects
+`apple-native-keyring-store::keychain::Store`; Windows still selects
+`windows-native-keyring-store::Store`. Linux selects the DBus Secret Service
+backend. Service/account strings, missing-entry handling, error redaction and
+operation deadlines remain at their existing boundaries. Initialization probes
+store availability without a test credential write; unavailable stores refuse
+operations without a plaintext fallback. As before, initialization failure is
+cached for the process lifetime.
+
+This removes the retired `zbus_names`, `zvariant` and `zvariant_derive` crates
+from the application dependency graph. The observed local
+`cargo deny check advisories` failed before this change with
+RUSTSEC-2026-0370/0371/0372 and passes after it; no advisory was suppressed.
+Compatible upgrades of the prior backend still required zbus 5. Linux uses
+system libdbus, requiring `libdbus-1-dev` and `pkg-config` at build time. We do
+not compile or distribute the old C sources bundled in libdbus-sys.
+
+Before changing production, the isolated interoperability probe passed in
+Linux CI job 120843894681 at 5047db3. It tested all byte values, existing-key
+reads, replacement visible through the old backend, one item after updating,
+account isolation, new-key creation and cross-backend deletion. It used a
+private bus and temporary Secret Service with synthetic service/account names.
+The follow-up probe compiles the actual production platform adapter and checks
+missing-service refusal in a fresh process. Its separate workspace intentionally
+retains the old backend for compatibility tests; it is not linked into fotwd.
+See `tests/keyring-interop/README.md` and `scripts/test-keyring-interop.sh`.
+
+Native user-account keychain tests were not enabled. Existing Mac grants and
+real stored keys were not accessed for this migration. The Linux production
+adapter, hosted compatibility matrix and native release gates still require
+verification at the resulting revision before approval.

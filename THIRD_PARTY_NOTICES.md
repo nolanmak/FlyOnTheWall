@@ -3550,7 +3550,6 @@ Used by:
 
 - apple-native-keyring-store 1.0.2
 - keyring-core 1.0.0
-- keyring 4.1.6
 
 ````text
                               Apache License

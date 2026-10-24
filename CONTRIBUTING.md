@@ -46,6 +46,9 @@ on you.
 The app itself needs macOS 14.4 or later. The test suite also runs on Linux (CI
 runs it on Ubuntu); there you need a C compiler, `make` and `perl` for the
 vendored OpenSSL that SQLCipher is built against, plus cmake, just and Node.
+Linux also needs `pkg-config` and the system libdbus development package
+(`sudo apt-get install libdbus-1-dev pkg-config` on Debian/Ubuntu). Secret
+Service uses system libdbus; we do not bundle its C sources.
 
 ## Building and testing
 

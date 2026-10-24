@@ -110,14 +110,11 @@ impl OsKeyStore {
 
 /// Ask the platform whether a credential store initialised.
 ///
-/// `keyring::Entry::store_status()` is why this crate is on keyring 4 rather
-/// than the flatter v3 API: it reports initialisation *without* attempting a
-/// read or a write. A probe that had to write would either leave a test
-/// credential in the user's keychain or, worse, discover the problem halfway
-/// through a real `set()` — at which point we would have to guess whether a
-/// partial credential was left behind.
+/// Initializing the selected platform store does not create, read or modify
+/// a credential. Failure is cached, matching the previous keyring v1 facade;
+/// no filesystem or plaintext fallback is provided.
 fn platform_availability() -> StoreAvailability {
-    match keyring::Entry::store_status() {
+    match crate::platform::store_status() {
         Ok(()) => StoreAvailability::Available,
         Err(err) => StoreAvailability::Unavailable(err.to_string()),
     }
@@ -302,7 +299,7 @@ impl KeyStore for OsKeyStore {
         let material = secret.expose().to_owned();
         let for_thread = account.clone();
         with_deadline("writing", account, move || {
-            keyring::Entry::new(key.service(), &for_thread)
+            crate::platform::entry(key.service(), &for_thread)
                 .and_then(|entry| entry.set_password(&material))
                 .map_err(|err| SecretsError::from_keyring("writing", &for_thread, err))
         })
@@ -318,7 +315,7 @@ impl KeyStore for OsKeyStore {
         // on the worker thread: if we have already timed out, the `SecretString`
         // is dropped there and zeroed there.
         with_deadline("reading", account, move || {
-            keyring::Entry::new(key.service(), &for_thread)
+            crate::platform::entry(key.service(), &for_thread)
                 .and_then(|entry| entry.get_password())
                 .map(SecretString::new)
                 .map_err(|err| SecretsError::from_keyring("reading", &for_thread, err))
@@ -329,13 +326,13 @@ impl KeyStore for OsKeyStore {
         let account = key.account();
         let for_thread = account.clone();
         with_deadline("deleting", account, move || {
-            let entry = keyring::Entry::new(key.service(), &for_thread)
+            let entry = crate::platform::entry(key.service(), &for_thread)
                 .map_err(|err| SecretsError::from_keyring("deleting", &for_thread, err))?;
             match entry.delete_credential() {
                 Ok(()) => Ok(()),
                 // Deleting something that is not there is the desired state,
                 // not a failure.
-                Err(keyring::Error::NoEntry) => Ok(()),
+                Err(keyring_core::Error::NoEntry) => Ok(()),
                 Err(err) => Err(SecretsError::from_keyring("deleting", &for_thread, err)),
             }
         })
