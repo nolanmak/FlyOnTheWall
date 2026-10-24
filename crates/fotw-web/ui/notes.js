@@ -78,27 +78,71 @@
     return mapped.sort((a,b)=>a.block_idx-b.block_idx);
   }
 
+  class RecordingClock {
+    constructor(now=()=>Date.now()) { this.now=now; }
+    update(status) {
+      if(status.session_id!==this.status?.session_id)this.stopping=false;
+      this.status=status;this.received=this.now();
+    }
+    stop() { this.stopping=true; }
+    retry() { this.stopping=false; }
+    offset(id) {
+      const s=this.status;
+      if(this.stopping || !s || s.state!=='recording' || s.session_id!==id
+          || !Number.isFinite(s.elapsed_ms) || !Number.isFinite(s.started_at_ms))return null;
+      const elapsed=Math.max(0,s.elapsed_ms)+Math.max(0,this.now()-this.received);
+      if(Number.isFinite(s.auto_stop_at_ms) && elapsed>=s.auto_stop_at_ms-s.started_at_ms)return null;
+      return Math.floor(elapsed);
+    }
+  }
+
   class Draft {
-    constructor(id, api, notify = () => {}) {
-      this.id=id; this.api=api; this.notify=notify;
+    constructor(id, api, notify = () => {}, options = {}) {
+      this.id=id; this.api=api; this.notify=notify;this.options=options;this.savedMeetingId=null;
       this.body=''; this.anchors=[]; this.revision=0; this.dirty=false;
       this.status='loading'; this.version=0; this.pending=null; this.loaded=false;
     }
-    path() { return '/api/meetings/'+encodeURIComponent(this.id)+'/notes'; }
+    path() { return '/api/'+(this.options.session?'sessions':'meetings')+'/'+encodeURIComponent(this.id)+'/notes'; }
+    document(response) {
+      if(!this.options.session)return response;
+      this.savedMeetingId=response.meeting_id || this.savedMeetingId;
+      if(this.savedMeetingId && Number.isFinite(response.elapsed_ms)) {
+        // A final status may arrive after typing. Preserve the text, but do not
+        // pretend blocks typed beyond capture's end were spoken during it.
+        const bounded=this.anchors.filter(a=>a.typed_at_ms<=response.elapsed_ms);
+        if(bounded.length!==this.anchors.length) {this.anchors=bounded;this.version++;this.dirty=true;}
+      }
+      if(this.savedMeetingId)linkSession(this.id,this.savedMeetingId);
+      return response.note;
+    }
     changed() { this.notify(this); }
     async load() {
       if (this.dirty) return;
       this.status='loading';this.changed();
       try {
-        const d=await this.api(this.path());
+        const d=this.document(await this.api(this.path()));
         this.body=d.body_md;this.revision=d.revision;this.anchors=d.anchors;
         this.loaded=true;this.status='saved';
       } catch (_) { this.status='error'; }
       this.changed();
     }
     edit(body, selection) {
-      if (!this.loaded) return;
-      this.anchors=remapAnchors(this.body,body,this.anchors,selection);
+      if (!this.loaded || body===this.body) return;
+      // Track unanchored old blocks too: loading/editing old text must never
+      // manufacture its first-keystroke time. Only genuinely new blocks anchor.
+      const tracked=blocks(this.body).map((block,index)=>this.anchors.find(a=>a.block_idx===index)
+        || {id:null,block_idx:index,block_text:block.text,typed_at_ms:null});
+      const mapped=remapAnchors(this.body,body,tracked,selection);
+      this.anchors=mapped.filter(a=>a.id!==null);
+      const offset=this.options.session && !this.savedMeetingId ? this.options.clock?.() : null;
+      if(Number.isFinite(offset) && offset>=0) {
+        for(const [index,block] of blocks(body).entries()) {
+          if(mapped.some(a=>a.block_idx===index))continue;
+          const id=this.options.newId ? this.options.newId() : root.crypto.randomUUID();
+          this.anchors.push({id,block_idx:index,block_text:block.text,typed_at_ms:Math.floor(offset)});
+        }
+        this.anchors.sort((a,b)=>a.block_idx-b.block_idx);
+      }
       this.body=body;this.version++;this.dirty=true;
       if (this.status!=='conflict') this.status='unsaved';
       this.changed();
@@ -130,22 +174,32 @@
         const payload={revision:this.revision,body_md:this.body,anchors:this.anchors};
         this.status='saving';this.changed();
         try {
-          const saved=await this.api(this.path(), {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});
+          const response=await this.api(this.path(), {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});
+          const saved=this.document(response);
           this.revision=saved.revision;
           this.dirty=version!==this.version;
           this.status=this.dirty?'unsaved':'saved';
         } catch (e) {
-          this.status=e.status===409?'conflict':'error';
+          this.status=e.status===409 && e.code!=='recording_clock_unavailable'?'conflict':'error';
           this.changed();return;
         }
         this.changed();
       }
     }
+    async retrySave() {
+      if(this.pending)await this.pending;
+      if(this.status==='conflict' || !this.dirty)return;
+      if(this.options.session) {
+        try { this.document(await this.api(this.path())); }
+        catch (_) { this.status='error';this.changed();return; }
+      }
+      await this.flush();
+    }
     async overwrite() {
       if(this.pending || this.status!=='conflict')return;
       // The user explicitly chose their draft. Refresh only the revision, not text.
       try {
-        const current=await this.api(this.path());
+        const current=this.document(await this.api(this.path()));
         this.revision=current.revision;this.status='unsaved';
         await this.flush();
       } catch (_) { this.status='conflict';this.changed(); }
@@ -157,8 +211,21 @@
   }
 
   const drafts=new Map();
-  function flushAll() { return Promise.all([...drafts.values()].map(d=>d.flush())); }
-  function mount(id, parent, api) {
+  function linkSession(sessionId, meetingId) {
+    const draft=drafts.get('session:'+sessionId);
+    if(draft) {
+      draft.savedMeetingId=meetingId;
+      // Never discard an independently edited saved-meeting draft.
+      if(!drafts.has('meeting:'+meetingId))drafts.set('meeting:'+meetingId,draft);
+    }
+  }
+  async function finishSession(sessionId, meetingId) {
+    linkSession(sessionId,meetingId);
+    const draft=drafts.get('session:'+sessionId);
+    if(draft)await draft.retrySave();
+  }
+  function flushAll() { return Promise.all([...new Set(drafts.values())].map(d=>d.flush())); }
+  function mount(id, parent, api, options = {}) {
     const make=(tag,text)=>{const n=document.createElement(tag);if(text)n.textContent=text;return n;};
     const section=make('section');section.className='notes note-editor';
     section.appendChild(make('h3','Your notes'));
@@ -174,8 +241,9 @@
     for(const b of [up,down])b.type='button';
     for(const b of [retry,overwrite,reload,up,down])actions.appendChild(b);
     section.appendChild(actions);parent.appendChild(section);
-    let draft=drafts.get(id);
-    if(!draft){draft=new Draft(id,api);drafts.set(id,draft);}
+    const key=(options.session?'session:':'meeting:')+id;
+    let draft=drafts.get(key);
+    if(!draft){draft=new Draft(id,api,()=>{},options);drafts.set(key,draft);}
     let delay=null, maximum=null;
     const cancelTimers=()=>{clearTimeout(delay);clearTimeout(maximum);delay=maximum=null;};
     const flush=()=>{cancelTimers();return draft.flush();};
@@ -216,13 +284,14 @@
     up.addEventListener('click',()=>move(-1));
     down.addEventListener('click',()=>move(1));
     input.addEventListener('blur',flush);
-    retry.addEventListener('click',()=>draft.loaded?flush():draft.load());
+    retry.addEventListener('click',()=>{cancelTimers();return draft.loaded?draft.retrySave():draft.load();});
     overwrite.addEventListener('click',()=>draft.overwrite());
     reload.addEventListener('click',()=>{cancelTimers();draft.discard();});
     draft.notify();
     if(!draft.loaded)draft.load();
+    return draft;
   }
-  root.FOTWNotes={Draft,mount,flushAll,blocks,remapAnchors};
+  root.FOTWNotes={Draft,RecordingClock,mount,flushAll,linkSession,finishSession,blocks,remapAnchors};
   if(typeof window!=='undefined' && window.addEventListener) {
     window.addEventListener('beforeunload',e=>{
       if([...drafts.values()].some(d=>d.dirty)) { e.preventDefault();e.returnValue=''; }

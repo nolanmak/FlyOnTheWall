@@ -145,3 +145,93 @@ test('merging two anchored paragraphs keeps the leading identity, not a later ti
  d.edit('First point Second point');
  assert.deepEqual(d.anchors,[{id:'first',block_idx:0,block_text:'First point Second point',typed_at_ms:100}]);
 });
+
+test('live typing anchors immediately and retains its clock through edits, split, paste and stop',async()=>{
+ let now=125, serial=0, recording=true;const writes=[];
+ const empty={revision:0,body_md:'',anchors:[]};
+ const wrap=note=>({session_id:'live-A',meeting_id:null,started_at_ms:1000,elapsed_ms:5000,note});
+ const api=async(path,opts)=>{if(!opts)return wrap(empty);const doc=JSON.parse(opts.body);writes.push([path,doc]);return {...wrap({...doc,revision:doc.revision+1}),meeting_id:'saved-A'};};
+ const d=new Draft('live-A',api,()=>{},{session:true,clock:()=>recording?now:null,newId:()=>`live-${++serial}`});
+ await d.load();d.edit('F');
+ assert.equal(d.anchors[0]?.typed_at_ms,125,'anchor at input, not delayed autosave');
+ now=900;d.edit('First');assert.equal(d.anchors[0].typed_at_ms,125);
+ d.edit('First\n\nSecond\n\nThird');
+ assert.deepEqual(d.anchors.map(a=>a.typed_at_ms),[125,900,900]);
+ const first=d.anchors[0].id;d.moveBlock(0,1);assert.equal(d.anchors[1].id,first);
+ d.edit('Second\n\nFirst');now=1000;d.edit('Second\n\nFirst\n\nThird');
+ assert.equal(d.anchors[2].typed_at_ms,1000,'recreated block has a new first time');
+ recording=false;d.edit(d.body+'\n\nAfter stop');assert.equal(d.anchors.length,3);
+ await d.flush();assert.equal(d.revision,1);assert.equal(d.status,'saved');
+ assert.equal(writes[0][0],'/api/sessions/live-A/notes');assert.equal(d.savedMeetingId,'saved-A');
+});
+
+test('finalization-gap responses keep a retryable live draft, not an overwrite conflict',async()=>{
+ let pending=true;
+ const d=new Draft('gap',async(_,opts)=>{
+  if(!opts)return {note:{revision:0,body_md:'',anchors:[]},meeting_id:null};
+  if(pending)throw Object.assign(new Error('finishing'),{status:409,code:'recording_clock_unavailable'});
+  return {note:{...JSON.parse(opts.body),revision:1},meeting_id:'saved-gap'};
+ },()=>{},{session:true,clock:()=>null});
+ await d.load();d.edit('keep me');await d.flush();
+ assert.equal(d.status,'error');assert.equal(d.dirty,true);
+ pending=false;await d.flush();assert.equal(d.status,'saved');assert.equal(d.body,'keep me');
+});
+
+test('the live clock uses capture offsets across sleep, clamps rollback, and stops at capture bounds',()=>{
+ const {RecordingClock}=require('../../ui/notes.js');let now=10000;const c=new RecordingClock(()=>now);
+ c.update({state:'recording',session_id:'clock-A',started_at_ms:1000,elapsed_ms:125,auto_stop_at_ms:11000});
+ assert.equal(c.offset('clock-A'),125);assert.equal(c.offset('wrong'),null);
+ now+=1000;assert.equal(c.offset('clock-A'),1125);
+ now-=2000;assert.equal(c.offset('clock-A'),125,'clock rollback cannot produce negative time');
+ now=11000;c.stop();assert.equal(c.offset('clock-A'),null);
+ c.update({state:'recording',session_id:'clock-A',started_at_ms:1000,elapsed_ms:1200});
+ assert.equal(c.offset('clock-A'),null,'poll during Stop must not re-enable anchors');
+ c.retry();c.update({state:'recording',session_id:'clock-A',started_at_ms:1000,elapsed_ms:1300,auto_stop_at_ms:3000});
+ now+=1000;assert.equal(c.offset('clock-A'),null,'no anchors beyond automatic stop');
+ c.update({state:'finishing',session_id:'clock-A',started_at_ms:1000,elapsed_ms:2000});
+ assert.equal(c.offset('clock-A'),null);
+ c.update({state:'recording',session_id:'clock-B',started_at_ms:5000,elapsed_ms:0});
+ assert.equal(c.offset('clock-A'),null);assert.equal(c.offset('clock-B'),0);
+});
+
+test('editing recovered unanchored text does not fabricate its first-keystroke time',async()=>{
+ const d=new Draft('recovered',async()=>({note:snapshot(),meeting_id:null}),()=>{},
+  {session:true,clock:()=>1234,newId:()=> 'new-block'});
+ await d.load();d.edit('original edited');assert.equal(d.anchors.length,0);
+ d.edit('original edited\n\nNew block');assert.deepEqual(d.anchors.map(a=>[a.block_idx,a.typed_at_ms]),[[1,1234]]);
+});
+
+test('saved navigation reuses the live draft while its original session save is in flight',async()=>{
+ class Element {constructor(tag){this.children=[];this.listeners={};this.value='';this.dataset={};}
+  appendChild(n){this.children.push(n);return n;}setAttribute(){}addEventListener(k,f){this.listeners[k]=f;}}
+ global.document={createElement:tag=>new Element(tag)};
+ try {
+  const notes=require('../../ui/notes.js');let release;const writes=[];
+  const api=async(path,opts)=>{if(!opts)return {note:{revision:0,body_md:'',anchors:[]},meeting_id:null};
+   const d=JSON.parse(opts.body);writes.push([path,d]);if(writes.length===1)await new Promise(r=>release=r);
+   return {note:{...d,revision:d.revision+1},meeting_id:'alias-saved'};};
+  const live=notes.mount('alias-live',new Element(),api,{session:true,clock:()=>100,newId:()=> 'alias-block'});
+  await new Promise(setImmediate);live.edit('draft before stop');const pending=live.flush();
+  notes.linkSession('alias-live','alias-saved');
+  const saved=notes.mount('alias-saved',new Element(),api);
+  assert.equal(saved,live);assert.equal(saved.body,'draft before stop');
+  saved.edit('edited while finalizing');release();await pending;
+  assert.deepEqual(writes.map(w=>w[0]),['/api/sessions/alias-live/notes','/api/sessions/alias-live/notes']);
+  assert.equal(writes[1][1].revision,1);assert.equal(saved.dirty,false);
+ }finally{delete global.document;}
+});
+
+test('late final clock removes only beyond-end anchors and retains text on retry',async()=>{
+ let finalized=false;const writes=[];
+ const d=new Draft('late-bound',async(_,opts)=>{
+  const note={revision:0,body_md:'',anchors:[]};
+  if(!opts)return {note,meeting_id:finalized?'saved-bound':null,elapsed_ms:500};
+  const payload=JSON.parse(opts.body);writes.push(payload);
+  if(!finalized)throw Object.assign(new Error('gap'),{status:409,code:'recording_clock_unavailable'});
+  return {note:{...payload,revision:payload.revision+1},meeting_id:'saved-bound',elapsed_ms:500};
+ },()=>{},{session:true,clock:()=>600,newId:()=> 'late-block'});
+ await d.load();d.edit('text typed after unknown stop');await d.flush();
+ assert.equal(d.anchors.length,1);finalized=true;await d.retrySave();
+ assert.equal(d.body,'text typed after unknown stop');assert.equal(writes.at(-1).anchors.length,0);
+ d.edit(d.body+'\n\nMore after stop');assert.equal(d.anchors.length,0);
+});
