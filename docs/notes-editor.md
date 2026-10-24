@@ -129,11 +129,10 @@ populated older libraries, full archives round-trip both new tables, and imports
 continue to accept older manifests without these rows. Explicit archives retain
 their existing plaintext-export warning.
 
-This increment provides the store contract. The daemon and authenticated live
-routes still need to supply the authoritative capture/stop clock and call the
-handoff. Recovery discovery and the live editor remain required before claiming
-user-visible recording-draft recovery. Unacknowledged keystrokes are not covered
-by database durability. No browser storage is added; #122 and #13 stay open.
+The store contract covers acknowledged drafts. The finalization and live adapters
+described below supply capture/stop bounds, handoff and recovery discovery.
+Unacknowledged keystrokes are not covered by database durability. No browser
+storage is added; native acceptance and augmentation keep #122 and #13 open.
 
 ## Recording finalization integration
 
@@ -153,7 +152,7 @@ Fixture tests cover frozen clocks, nonnegative bounds, capture-end persistence,
 transaction rollback/retry and preservation of files under colliding identities.
 These clocks use epoch milliseconds with rollback clamping; physical clock,
 sleep/wake and device behavior still need native acceptance. The authenticated
-live-note routes and UI remain the next integration step for #122/#13.
+live-note routes and UI below consume these bounds for #122/#13.
 
 ## Live editor, authenticated clocks and recovery
 
