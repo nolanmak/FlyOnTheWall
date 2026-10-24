@@ -149,7 +149,7 @@ async fn a_session_reports_ready_once_the_taps_are_running() {
     let ready = control.ready.clone();
     let stop = control.stop.clone();
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         session::run_with_control(
             &root.join("sessions"),
             file_tap(),
@@ -165,7 +165,20 @@ async fn a_session_reports_ready_once_the_taps_are_running() {
         ready.wait_timeout(Duration::from_secs(10)),
         "the session never reported that capture was live"
     );
+    let started = ready
+        .capture_started_at_ms()
+        .expect("WAL start published with readiness");
+    assert_eq!(ready.capture_ended_at_ms(), None);
     stop.stop();
+    let outcome = task.await.unwrap().unwrap();
+    assert_eq!(outcome.started_at_ms, started);
+    let ended = ready
+        .capture_ended_at_ms()
+        .expect("stop published before completion");
+    assert!(ended >= started);
+    assert_eq!(outcome.capture_ended_at_ms, Some(ended));
+    ready.signal_capture_stopped(ended.saturating_add(60_000));
+    assert_eq!(ready.capture_ended_at_ms(), Some(ended));
 }
 
 /// A session whose tap wedges must never claim capture is live.
@@ -313,4 +326,28 @@ async fn a_start_that_cannot_open_a_device_leaves_the_recorder_idle() {
     );
     assert!(healthy.start().is_ok());
     healthy.stop().ok();
+}
+
+#[test]
+fn capture_clock_is_published_with_readiness_and_stop_is_frozen_before_drain() {
+    let ready = ReadySignal::new();
+    assert_eq!(ready.capture_started_at_ms(), None);
+    assert_eq!(ready.capture_ended_at_ms(), None);
+    ready.signal_capture("fixture-session".into(), 1_000);
+    assert!(ready.is_ready());
+    assert_eq!(ready.capture_started_at_ms(), Some(1_000));
+    ready.signal_capture_stopped(1_250);
+    ready.signal_capture_stopped(9_000); // late cleanup cannot lengthen capture
+    assert_eq!(ready.capture_ended_at_ms(), Some(1_250));
+    assert_eq!(ready.session_id().as_deref(), Some("fixture-session"));
+}
+
+#[test]
+fn a_stop_during_startup_or_clock_rollback_never_precedes_capture_start() {
+    let ready = ReadySignal::new();
+    ready.signal_capture_stopped(900);
+    ready.signal_capture("fixture-session".into(), 1_000);
+    assert_eq!(ready.capture_ended_at_ms(), Some(1_000));
+    ready.signal_capture_stopped(2_000);
+    assert_eq!(ready.capture_ended_at_ms(), Some(1_000));
 }

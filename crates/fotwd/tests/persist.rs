@@ -59,6 +59,7 @@ fn outcome(dir: &std::path::Path, segments: Vec<TranscriptSegment>) -> SessionOu
     SessionOutcome {
         dir: dir.to_path_buf(),
         started_at_ms: 0,
+        capture_ended_at_ms: None,
         system_samples: 480_000,
         mic_samples: 240_000,
         system_buffers: LegBuffers {
@@ -190,9 +191,8 @@ fn word_level_timings_round_trip_through_the_blob() {
 
 #[test]
 fn persisting_twice_creates_two_meetings_not_a_duplicate_transcript() {
-    // Each recording is its own meeting. Re-running the same session object
-    // must not silently merge into the previous one, which would make the
-    // library quietly lossy.
+    // Legacy imports without a capture clock have no durable capture identity.
+    // Preserve their independent-import behavior; real captures retry by WAL ID.
     let dir = tmpdir("twice");
     let mut db = db_at(&dir);
     let o = outcome(&dir, vec![seg(0, "one", 0, Source::System, None)]);
@@ -222,4 +222,115 @@ fn the_duration_reflects_the_recording_not_the_write() {
         (85..=95).contains(&secs),
         "expected roughly 90s, got {secs}s"
     );
+}
+
+#[test]
+fn persistence_does_not_count_transcription_drain_as_recording_time() {
+    let dir = tmpdir("capture-end");
+    let mut db = db_at(&dir);
+    let mut o = outcome(&dir, vec![]);
+    o.started_at_ms = 1_000;
+    o.capture_ended_at_ms = Some(2_250);
+    let id = persist::persist_session(&mut db, &o, "Short fixture").unwrap();
+    let meeting = db.meetings().get(&id).unwrap();
+    assert_eq!(meeting.started_at_ms, 1_000);
+    assert_eq!(meeting.ended_at_ms, Some(2_250));
+    assert_eq!(meeting.duration_ms, Some(1_250));
+}
+
+#[test]
+fn invalid_capture_clocks_do_not_create_partial_meetings() {
+    let dir = tmpdir("invalid-capture-end");
+    let mut db = db_at(&dir);
+    for ended in [999, u64::MAX] {
+        let mut o = outcome(&dir, vec![]);
+        o.started_at_ms = 1_000;
+        o.capture_ended_at_ms = Some(ended);
+        assert!(persist::persist_session(&mut db, &o, "Invalid fixture").is_err());
+        assert!(db.meetings().list(10, 0).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn finalization_transfers_live_notes_once_and_late_saves_follow_the_meeting() {
+    use fotw_store::{NoteAnchor, NoteDocument, SessionNoteDocument};
+    let dir = tmpdir("notes-handoff");
+    let mut db = db_at(&dir);
+    let mut o = outcome(
+        &dir.join("session-fixture"),
+        vec![seg(0, "fixture words", 0, Source::Mic, None)],
+    );
+    o.started_at_ms = 1_000;
+    o.capture_ended_at_ms = Some(2_000);
+    let mut draft = SessionNoteDocument {
+        session_id: "session-fixture".into(),
+        started_at_ms: 1_000,
+        note: NoteDocument {
+            revision: 0,
+            body_md: "decision".into(),
+            anchors: vec![NoteAnchor::new(0, "decision", 250)],
+        },
+    };
+    draft.note.revision = db.save_session_note(&draft, 500).unwrap();
+    let id = persist::persist_session(&mut db, &o, "Fixture").unwrap();
+    assert_eq!(db.note_document(&id).unwrap(), draft.note);
+    assert_eq!(
+        db.session_note_meeting("session-fixture").unwrap(),
+        Some(id.clone())
+    );
+    assert_eq!(persist::persist_session(&mut db, &o, "Retry").unwrap(), id);
+    assert_eq!(db.meetings().list(10, 0).unwrap().len(), 1);
+    draft.note.body_md = "decision updated".into();
+    draft.note.anchors[0].block_text = "decision updated".into();
+    draft.note.revision = db.save_session_note(&draft, 1_000).unwrap();
+    assert_eq!(db.note_document(&id).unwrap(), draft.note);
+    assert_eq!(
+        persist::persist_session(&mut db, &o, "Retry after edit").unwrap(),
+        id
+    );
+    assert_eq!(db.note_document(&id).unwrap(), draft.note);
+    o.capture_ended_at_ms = Some(3_000);
+    assert!(persist::persist_session(&mut db, &o, "Wrong clock").is_err());
+    assert_eq!(db.meetings().list(10, 0).unwrap().len(), 1);
+    assert_eq!(db.note_document(&id).unwrap(), draft.note);
+}
+
+#[test]
+fn failed_note_handoff_rolls_back_meeting_and_transcript_then_retries() {
+    use fotw_store::{NoteDocument, SessionNoteDocument};
+    let dir = tmpdir("notes-handoff-rollback");
+    let mut db = db_at(&dir);
+    let mut o = outcome(
+        &dir.join("session-rollback"),
+        vec![seg(0, "fixture words", 0, Source::Mic, None)],
+    );
+    o.started_at_ms = 1_000;
+    o.capture_ended_at_ms = Some(2_000);
+    let mut draft = SessionNoteDocument {
+        session_id: "session-rollback".into(),
+        started_at_ms: 1_000,
+        note: NoteDocument {
+            revision: 0,
+            body_md: "retain this fixture".into(),
+            anchors: vec![],
+        },
+    };
+    draft.note.revision = db.save_session_note(&draft, 500).unwrap();
+    db.conn().execute_batch("CREATE TRIGGER fail_link BEFORE INSERT ON session_note_links BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    assert!(persist::persist_session(&mut db, &o, "Fixture").is_err());
+    assert!(db.meetings().list(10, 0).unwrap().is_empty());
+    for table in ["transcripts", "segments", "notes", "session_note_links"] {
+        let count: i64 = db
+            .conn()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+    assert_eq!(
+        db.session_note("session-rollback").unwrap(),
+        Some(draft.clone())
+    );
+    db.conn().execute_batch("DROP TRIGGER fail_link").unwrap();
+    let id = persist::persist_session(&mut db, &o, "Fixture").unwrap();
+    assert_eq!(db.note_document(&id).unwrap(), draft.note);
 }
