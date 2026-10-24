@@ -666,8 +666,8 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
     // The engine `fotwd stt` stored, as the dashboard's Start reads it, and
     // failing closed the same way: an unreadable choice may have been "never
     // off this machine".
-    let settings = match open_db(&root) {
-        Ok(db) => Some(fotwd::stt::SttSettings::read(&db)),
+    let settings = match open_db(&root).and_then(|db| fotwd::stt::SttSettings::read(&db)) {
+        Ok(settings) => Some(settings),
         Err(e) => {
             eprintln!("fotwd: {e}");
             None
@@ -685,9 +685,7 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
     };
     let transcription = match settings {
         None => {
-            println!(
-                "  transcribe : off (the library could not be read, so the engine is unknown)"
-            );
+            println!("  transcribe : off (the saved engine choice could not be read)");
             Transcription::Disabled
         }
         Some(settings) if settings.engine == fotwd::stt::SttEngine::Local => {
@@ -1524,8 +1522,8 @@ async fn stt_command(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
-            None => match open_db(&root) {
-                Ok(db) => SttSettings::read(&db),
+            None => match open_db(&root).and_then(|db| SttSettings::read(&db)) {
+                Ok(settings) => settings,
                 Err(e) => {
                     eprintln!("fotwd: {e}");
                     return ExitCode::FAILURE;
@@ -1545,7 +1543,22 @@ async fn stt_command(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut settings = SttSettings::read(&db);
+    let selected = match args.first().map(String::as_str) {
+        Some("local") => Some(SttEngine::Local),
+        Some("deepgram") => Some(SttEngine::Deepgram),
+        _ => None,
+    };
+    let mut settings = if let Some(engine) = selected {
+        SttSettings::for_selection(&db, engine)
+    } else {
+        match SttSettings::read(&db) {
+            Ok(settings) => settings,
+            Err(error) => {
+                eprintln!("fotwd: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
 
     match args.first().map(String::as_str) {
         None => {
