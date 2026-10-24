@@ -24,6 +24,17 @@ pub fn normalization() {
     assert_eq!(final_segment.end_ms, 1180);
     assert_eq!(final_segment.timestamp_source, TimestampSource::Provider);
     assert_eq!(final_segment.text, "hello");
+    // Meeting adapters explicitly finalize an open utterance at end-of-stream.
+    // Murmur's separate transport still requires CloseStream/Metadata evidence.
+    wire["is_final"] = false.into();
+    wire["speech_final"] = false.into();
+    let open = normalizer.push_json(&wire.to_string()).unwrap().unwrap();
+    let finished = normalizer.finish().unwrap();
+    assert!(finished.is_final);
+    assert_eq!(finished.id, open.id);
+    assert_eq!(finished.text, open.text);
+    assert!(normalizer.finish().is_none());
+
     assert_eq!(
         normalizer.push_json("{").unwrap_err().class,
         SttErrorClass::Server
