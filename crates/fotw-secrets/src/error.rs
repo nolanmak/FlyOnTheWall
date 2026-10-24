@@ -3,7 +3,7 @@
 /// Everything that can go wrong storing, reading or validating a secret.
 ///
 /// Deliberately platform-neutral: a keychain status is carried as text rather
-/// than as a `keyring::Error`, for a reason specific to this crate. The
+/// than as a `keyring_core::Error`, for a reason specific to this crate. The
 /// `keyring_core::Error::BadEncoding` variant holds the **raw credential
 /// bytes**, and `Ambiguous` holds `Entry` values whose `Debug` reaches into
 /// the platform store. Since error types derive `Debug` and errors get logged
@@ -66,23 +66,23 @@ impl SecretsError {
     /// Flatten a `keyring` error into a platform-neutral one, attaching the
     /// operation and the account it concerned.
     ///
-    /// This is the **only** conversion from `keyring::Error`, and it is why
-    /// there is no `From<keyring::Error>` impl: a blanket `?` conversion would
+    /// This is the **only** conversion from `keyring_core::Error`, and it is why
+    /// there is no `From<keyring_core::Error>` impl: a blanket `?` conversion would
     /// let a future call site pull a `BadEncoding(Vec<u8>)` — the variant that
     /// carries raw credential bytes — into a `Debug`-derived error type
     /// without noticing. Requiring the operation and key at the call site
     /// makes the conversion a decision rather than a coercion.
-    pub fn from_keyring(operation: &'static str, key: &str, err: keyring::Error) -> Self {
+    pub fn from_keyring(operation: &'static str, key: &str, err: keyring_core::Error) -> Self {
         match err {
-            keyring::Error::NoEntry => Self::NotFound {
+            keyring_core::Error::NoEntry => Self::NotFound {
                 key: key.to_owned(),
             },
             // The store never initialised. On Linux that is the Secret
             // Service being absent, which is exactly KEY-05.
-            keyring::Error::NoDefaultStore => Self::NoSecretService(
+            keyring_core::Error::NoDefaultStore => Self::NoSecretService(
                 "the platform credential store could not be initialised".to_owned(),
             ),
-            keyring::Error::NoStorageAccess(detail) => Self::AccessDenied {
+            keyring_core::Error::NoStorageAccess(detail) => Self::AccessDenied {
                 operation,
                 key: key.to_owned(),
                 detail: detail.to_string(),
@@ -92,7 +92,7 @@ impl SecretsError {
             // a fixed message rather than forward it: the operator needs to
             // know the keychain has duplicate entries for this account, and
             // needs nothing else from the payload.
-            keyring::Error::Ambiguous(_) => Self::Platform {
+            keyring_core::Error::Ambiguous(_) => Self::Platform {
                 operation,
                 key: key.to_owned(),
                 detail: "several credentials in the keychain match this account; \
@@ -146,7 +146,7 @@ mod tests {
     /// through `Display`. This test pins that.
     #[test]
     fn keyring_errors_are_flattened_to_their_display_text() {
-        let leaky = keyring::Error::BadEncoding(b"sk-live-RAW-SECRET-BYTES".to_vec());
+        let leaky = keyring_core::Error::BadEncoding(b"sk-live-RAW-SECRET-BYTES".to_vec());
 
         // Prove the hazard is real before proving we avoid it.
         assert!(
@@ -165,7 +165,8 @@ mod tests {
 
     #[test]
     fn missing_entries_become_not_found() {
-        let err = SecretsError::from_keyring("reading", "db:masterkey", keyring::Error::NoEntry);
+        let err =
+            SecretsError::from_keyring("reading", "db:masterkey", keyring_core::Error::NoEntry);
         assert!(err.is_not_found());
         assert!(!err.is_no_secret_service());
     }
@@ -178,7 +179,7 @@ mod tests {
         let err = SecretsError::from_keyring(
             "writing",
             "apikey:deepgram",
-            keyring::Error::NoDefaultStore,
+            keyring_core::Error::NoDefaultStore,
         );
         assert!(err.is_no_secret_service());
         assert!(!err.is_not_found());

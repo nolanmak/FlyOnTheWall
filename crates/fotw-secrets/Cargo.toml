@@ -22,22 +22,10 @@ serde = { workspace = true }
 # that disagrees with the rest of the world is a fingerprint we cannot verify.
 sha2 = "0.11"
 
-# OS keychain: macOS Keychain Services, Windows Credential Manager, Secret
-# Service on Linux (docs/REQUIREMENTS.md 10). MIT OR Apache-2.0.
-#
-# v4 is a rewrite around `keyring-core` with pluggable stores; the `v1` default
-# feature restores the flat `Entry` API and picks the platform store for us.
-# The reason we take v4 rather than pinning v3 is `Entry::store_status()`,
-# which reports whether the platform credential store initialised *without*
-# attempting a write. That is exactly the probe KEY-05 needs: it lets us refuse
-# to store on a Linux box with no Secret Service instead of discovering the
-# problem halfway through a set() and having to guess whether we left a
-# partial credential behind.
-#
-# Its platform backends are already target-gated in its own manifest, so this
-# is a plain dependency rather than a per-target one -- a Linux build pulls
-# zbus and no Apple frameworks, a macOS build the reverse.
-keyring = "4.1"
+# Use the core API with explicit platform stores. The all-in-one keyring v1
+# facade forces a Linux zbus backend with retired transitive crates.
+# Our platform adapter retains initialization without a test credential write.
+keyring-core = "1"
 
 # ---------------------------------------------------------------- recovery key
 #
@@ -91,3 +79,12 @@ serde_json = { workspace = true }
 # The KEY-01 acceptance test needs a real directory tree to byte-scan. Already
 # in the lock file via fotw-store's dev-dependencies, so no new supply chain.
 tempfile = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = "1"
+
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
+dbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }

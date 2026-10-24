@@ -62,6 +62,7 @@ mod error;
 mod fingerprint;
 mod index;
 mod keys;
+mod platform;
 pub mod recovery;
 mod redact;
 mod secret;
