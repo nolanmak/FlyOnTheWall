@@ -104,3 +104,32 @@ They do not establish trusted hardware keyboard events, IME behavior, real
 recording timestamps or crash recovery of unsaved drafts. No user meeting,
 provider key, microphone or browser profile was used. The view minted a fresh
 one-time launch URL for each run, respecting the 30-second handoff lifetime.
+
+## Durable recording drafts and atomic handoff (storage increment)
+
+Schema 5 adds `session_notes`, keyed by capture session before a meeting row
+exists. Acknowledged drafts store their original start, revision, Markdown and
+anchors inside the encrypted library. Saves compare the observed revision in an
+immediate transaction, preserve original anchor times and validate bounds against
+an elapsed time supplied by the recorder. Reopening the database retains drafts.
+
+Schema 6 adds a session-to-meeting alias with the original start and frozen
+recording duration. Promotion moves text/anchors, preserves the revision, creates
+the alias and removes the draft atomically. Existing destination notes cause a
+conflict. Repeating the same promotion is idempotent. The alias also covers a
+first save arriving after Stop: session reads/writes then address the canonical
+meeting note, so a stale live tab and saved-meeting editor cannot overwrite one
+another silently. Deleting the meeting cascades the alias.
+
+Focused encrypted-database tests cover restart recovery, stale revisions,
+recording/anchor bounds, cross-connection conflicts, late saves, first save after
+Stop, and rollback after injected write/alias failures. Schema migrations preserve
+populated older libraries, full archives round-trip both new tables, and imports
+continue to accept older manifests without these rows. Explicit archives retain
+their existing plaintext-export warning.
+
+This increment provides the store contract. The daemon and authenticated live
+routes still need to supply the authoritative capture/stop clock and call the
+handoff. Recovery discovery and the live editor remain required before claiming
+user-visible recording-draft recovery. Unacknowledged keystrokes are not covered
+by database durability. No browser storage is added; #122 and #13 stay open.

@@ -77,7 +77,8 @@ use crate::error::{Result, StoreError};
 use crate::export::{
     ActionItemRow, AppMetaRow, DeviceRow, DocumentRow, FolderRow, MeetingDoc, MeetingRow,
     MeetingTagRow, NoteAnchorRow, NoteRow, ParticipantRow, PersonRow, RecordingRow, SegmentRow,
-    SettingRow, SummaryRow, TableRow, TagRow, TemplateRow, TombstoneRow, TranscriptRow,
+    SessionNoteLinkRow, SessionNoteRow, SettingRow, SummaryRow, TableRow, TagRow, TemplateRow,
+    TombstoneRow, TranscriptRow,
 };
 use crate::migrations::LATEST_SCHEMA_VERSION;
 
@@ -228,6 +229,12 @@ pub struct LibraryManifest {
     pub app_meta: Vec<AppMetaRow>,
     /// `settings`.
     pub settings: Vec<SettingRow>,
+    /// Durable recording-note drafts. Absent in archives predating schema 5.
+    #[serde(default)]
+    pub session_notes: Vec<SessionNoteRow>,
+    /// Session aliases to saved notes. Absent in archives before schema 6.
+    #[serde(default)]
+    pub session_note_links: Vec<SessionNoteLinkRow>,
     /// `folders`.
     pub folders: Vec<FolderRow>,
     /// `templates` (the database rows; the *files* are under `templates/`).
@@ -351,6 +358,8 @@ impl Db {
             devices: self.fetch_all("ORDER BY id")?,
             app_meta: self.fetch_all("ORDER BY key")?,
             settings: self.fetch_all("ORDER BY key")?,
+            session_notes: self.fetch_all("ORDER BY session_id")?,
+            session_note_links: self.fetch_all("ORDER BY session_id")?,
             folders: self.fetch_all("ORDER BY id")?,
             templates: self.fetch_all("ORDER BY id")?,
             people: self.fetch_all("ORDER BY id")?,
@@ -462,6 +471,8 @@ impl Db {
         insert_rows(&tx, &manifest.devices, &mut report)?;
         insert_rows(&tx, &manifest.app_meta, &mut report)?;
         insert_rows(&tx, &manifest.settings, &mut report)?;
+        insert_rows(&tx, &manifest.session_notes, &mut report)?;
+        insert_rows(&tx, &manifest.session_note_links, &mut report)?;
         insert_rows(&tx, &manifest.folders, &mut report)?;
         insert_rows(&tx, &manifest.templates, &mut report)?;
         insert_rows(&tx, &manifest.people, &mut report)?;
@@ -759,6 +770,8 @@ pub fn archived_tables() -> BTreeSet<&'static str> {
         DeviceRow::TABLE_NAME,
         AppMetaRow::TABLE_NAME,
         SettingRow::TABLE_NAME,
+        SessionNoteRow::TABLE_NAME,
+        SessionNoteLinkRow::TABLE_NAME,
         FolderRow::TABLE_NAME,
         TemplateRow::TABLE_NAME,
         PersonRow::TABLE_NAME,
@@ -808,10 +821,10 @@ mod tests {
 
     #[test]
     fn the_archive_covers_every_table_the_schema_has() {
-        // 18 initial tables plus sharing documents; FTS excluded (derived, rebuildable --
+        // 18 initial tables plus sharing documents, session notes and session aliases; FTS excluded (derived, rebuildable --
         // §9.7 invariant 6). A new table added without an archive home fails
         // `every_column_of_every_table_appears_in_the_archive`; this is the
         // cheap unit-level version of the same guard.
-        assert_eq!(archived_tables().len(), 19);
+        assert_eq!(archived_tables().len(), 21);
     }
 }

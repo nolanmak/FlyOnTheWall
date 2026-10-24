@@ -269,7 +269,7 @@ pub struct StoredSegment {
 /// `typed_at_ms` is relative to the meeting start, not the epoch: the meeting's
 /// start time can be corrected after the fact, and the alignment must survive
 /// that.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NoteAnchor {
     /// Stable block identity; preserved when text or position changes.
     pub id: String,
