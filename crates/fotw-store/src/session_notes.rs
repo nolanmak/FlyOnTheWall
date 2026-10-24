@@ -81,6 +81,12 @@ impl Db {
         Ok(read_link(self.conn(), session)?.map(|link| link.meeting))
     }
 
+    /// Frozen (start, elapsed) milliseconds for a finalized capture alias.
+    pub fn session_note_clock(&self, session: &str) -> Result<Option<(i64, i64)>> {
+        validate_session(session)?;
+        Ok(read_link(self.conn(), session)?.map(|link| (link.started, link.elapsed)))
+    }
+
     /// Load a durable draft, or None when this session has never saved notes.
     pub fn session_note(&mut self, session: &str) -> Result<Option<SessionNoteDocument>> {
         let tx = self.conn_mut().transaction()?;
