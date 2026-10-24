@@ -153,6 +153,9 @@ pub struct SessionOutcome {
     /// the length of the meeting, and using the later one makes every
     /// recording show a duration of zero.
     pub started_at_ms: u64,
+    /// First capture-stop time, excluding transcription and persistence drain.
+    /// None for legacy imports without an authoritative stop clock.
+    pub capture_ended_at_ms: Option<u64>,
     /// Interleaved samples written for the system leg.
     pub system_samples: u64,
     /// Interleaved samples written for the mic leg.
@@ -1865,6 +1868,7 @@ pub async fn run_with_control(
     Ok(SessionOutcome {
         dir,
         started_at_ms,
+        capture_ended_at_ms: control.ready.capture_ended_at_ms(),
         system_samples,
         mic_samples,
         system_buffers,
@@ -2195,6 +2199,7 @@ pub async fn run_supervised(
     Ok(SessionOutcome {
         dir,
         started_at_ms,
+        capture_ended_at_ms: control.ready.capture_ended_at_ms(),
         system_samples,
         mic_samples,
         system_buffers,

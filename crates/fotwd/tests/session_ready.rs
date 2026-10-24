@@ -176,6 +176,7 @@ async fn a_session_reports_ready_once_the_taps_are_running() {
         .capture_ended_at_ms()
         .expect("stop published before completion");
     assert!(ended >= started);
+    assert_eq!(outcome.capture_ended_at_ms, Some(ended));
     ready.signal_capture_stopped(ended.saturating_add(60_000));
     assert_eq!(ready.capture_ended_at_ms(), Some(ended));
 }
