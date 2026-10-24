@@ -150,6 +150,25 @@ cover wraparound, oversized/empty callbacks and allocation freedom. This preserv
 sample shape; it does not recover dropped audio or add precise-position overrun
 gap markers. Those timeline/backfill requirements remain open.
 
+The shared supervisor now offers opt-in `start_recovering()` for optional
+sources. Initial open/start failure returns the original error for diagnostics
+but enters a recovery episode instead of `Stopped`. The initial attempt counts
+toward the ceiling; retries honor backoff and the interval floor. An exhausted
+source can be retried explicitly without losing the original outage start.
+Recovery emits an `initially-unavailable` unwritten gap and enters confirmation,
+not healthy delivery. Stop cancels pending work. Mandatory `start()` remains
+fail-fast. Both calls still perform native startup synchronously.
+
+Behavioral RED tests observed `Stopped` instead of `Recovering` and just one
+open instead of the three permitted attempts. Four new manual-clock tests cover
+initial open failure, native start failure/drop, retry spacing and exhaustion,
+manual retry preserving the full gap, Stop, reuse, and unchanged mandatory-start
+behavior. All 50 watchdog tests pass. This is the supervisor prerequisite only:
+daemon/CLI optional-microphone wiring still needs a reserved archive track,
+correct generation-ring ownership when the initial open never created a sink,
+initial-gap ordering, and finalization of an outage that never recovers. These
+must have persisted-audio tests before claiming startup microphone recovery.
+
 This is partial implementation of #121. Quiescence of native callbacks already in flight,
 suspend/wake notification boundaries and complete wake gaps, recovery of a microphone
 that failed its initial open, and bounded native recovery operations remain

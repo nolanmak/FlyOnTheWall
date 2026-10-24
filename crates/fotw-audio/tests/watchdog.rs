@@ -1990,3 +1990,149 @@ fn health_snapshot_tracks_delivery_instead_of_successful_start() {
     sup.stop().unwrap();
     assert_eq!(sup.recovery_status().state, DeliveryState::Stopped);
 }
+
+#[test]
+fn initially_missing_source_recovers_with_the_complete_startup_gap() {
+    use fotw_audio::supervisor::DeliveryState;
+    let h = Harness::new();
+    h.advance(Duration::from_secs(7));
+    h.fail_next_opens(1);
+    let mut sup = h.supervisor(supervisor_config());
+    assert!(sup.start_recovering().is_err());
+    assert_eq!(sup.format(), None);
+    assert_eq!(sup.recovery_status().state, DeliveryState::Recovering);
+    assert_eq!(sup.recovery_status().attempts, 1);
+    assert_eq!(
+        sup.poll(TapActivity::default(), &OutputActivity::Unknown),
+        PollOutcome::Waiting
+    );
+    h.advance(Duration::from_secs(15));
+    assert_eq!(
+        sup.poll(TapActivity::default(), &OutputActivity::Unknown),
+        PollOutcome::Rebuilt
+    );
+    assert_eq!(sup.recovery_status().state, DeliveryState::Confirming);
+    assert_eq!(sup.format(), Some(f48()));
+    let events = sup.drain_events();
+    let gaps = events
+        .iter()
+        .find_map(|event| match event {
+            HealthEvent::Recovered { gaps, .. } => Some(gaps),
+            _ => None,
+        })
+        .expect("recovery must tell the writer to pad initial missing audio");
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0].start_ns, 7_000_000_000);
+    assert_eq!(gaps[0].end_ns, 22_000_000_000);
+    assert_eq!(gaps[0].kind, GapKind::Unwritten);
+    assert_eq!(gaps[0].reason.as_str(), "initially-unavailable");
+}
+
+#[test]
+fn initially_missing_source_exhausts_and_manual_retry_keeps_original_gap() {
+    use fotw_audio::supervisor::DeliveryState;
+    let h = Harness::new();
+    h.fail_next_opens(3);
+    let mut sup = h.supervisor(SupervisorConfig {
+        retry_backoff: Duration::from_millis(100),
+        ..supervisor_config()
+    });
+    assert!(sup.start_recovering().is_err());
+    for _ in 0..2 {
+        h.advance(Duration::from_secs(15));
+        sup.poll(TapActivity::default(), &OutputActivity::Unknown);
+    }
+    assert_eq!(h.opens.load(Ordering::Relaxed), 3);
+    assert_eq!(sup.recovery_status().state, DeliveryState::Exhausted);
+    h.advance(Duration::from_secs(100));
+    assert_eq!(
+        sup.poll(TapActivity::default(), &OutputActivity::Unknown),
+        PollOutcome::Abandoned
+    );
+    assert_eq!(h.opens.load(Ordering::Relaxed), 3);
+    assert!(sup.request_retry());
+    assert_eq!(
+        sup.poll(TapActivity::default(), &OutputActivity::Unknown),
+        PollOutcome::Rebuilt
+    );
+    let events = sup.drain_events();
+    let gap = events
+        .iter()
+        .find_map(|event| match event {
+            HealthEvent::Recovered { gaps, .. } => gaps.first(),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(gap.start_ns, 0);
+    assert_eq!(gap.end_ns, 130_000_000_000);
+}
+
+#[test]
+fn stopping_an_initial_outage_cancels_recovery_and_normal_start_stays_fail_fast() {
+    let h = Harness::new();
+    h.fail_next_opens(2);
+    let mut sup = h.supervisor(supervisor_config());
+    assert!(sup.start().is_err());
+    assert_eq!(
+        sup.poll(TapActivity::default(), &OutputActivity::Unknown),
+        PollOutcome::Stopped
+    );
+    assert!(sup.start_recovering().is_err());
+    sup.stop().unwrap();
+    h.advance(Duration::from_secs(100));
+    assert!(!sup.request_retry());
+    assert_eq!(
+        sup.poll(TapActivity::default(), &OutputActivity::Unknown),
+        PollOutcome::Stopped
+    );
+    assert_eq!(h.opens.load(Ordering::Relaxed), 2);
+    assert!(sup.start_recovering().is_ok());
+    assert_eq!(sup.recovery_status().attempts, 0);
+    assert!(matches!(
+        sup.start_recovering(),
+        Err(TapError::AlreadyRunning)
+    ));
+    assert_eq!(sup.format(), Some(f48()));
+}
+
+#[test]
+fn initially_failed_native_start_is_dropped_and_can_be_retried_after_exhaustion() {
+    use fotw_audio::supervisor::DeliveryState;
+    let h = Harness::new();
+    let log = h.log.clone();
+    let sink = h.sink.clone();
+    let opens = Arc::clone(&h.opens);
+    let mut sup = CaptureSupervisor::new(
+        SupervisorConfig {
+            max_attempts: 1,
+            ..supervisor_config()
+        },
+        Arc::clone(&h.clock) as Arc<dyn fotw_audio::clock::Clock>,
+        move || {
+            let n = opens.fetch_add(1, Ordering::Relaxed);
+            let tap = FakeTap::new(TapId::mic("default"), f16()).with_log(log.clone());
+            Ok(Box::new(if n == 0 {
+                tap.failing_next_start(TapError::platform("device disconnected during start"))
+            } else {
+                tap
+            }) as Box<dyn AudioTap>)
+        },
+        move || sink.sink(),
+    );
+    assert!(sup.start_recovering().is_err());
+    assert_eq!(sup.recovery_status().state, DeliveryState::Exhausted);
+    assert_eq!(sup.format(), None);
+    assert!(h.log.events().contains(&TapEvent::Dropped));
+    assert!(sup.request_retry());
+    assert_eq!(
+        sup.poll(TapActivity::default(), &OutputActivity::Unknown),
+        PollOutcome::Waiting
+    );
+    h.advance(Duration::from_secs(15));
+    assert_eq!(
+        sup.poll(TapActivity::default(), &OutputActivity::Unknown),
+        PollOutcome::Rebuilt
+    );
+    assert_eq!(sup.format(), Some(f16()));
+    assert_eq!(sup.recovery_status().state, DeliveryState::Confirming);
+}
