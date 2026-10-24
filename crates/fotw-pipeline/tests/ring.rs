@@ -5,10 +5,28 @@
 //! (docs/REQUIREMENTS.md CAP-04).
 
 use fotw_pipeline::ring::AudioRing;
+use fotw_pipeline::ring::GenerationRing;
 use fotw_pipeline::rt::{RtAlloc, RtGuard, allocation_violations};
 
 #[global_allocator]
 static ALLOC: RtAlloc = RtAlloc;
+
+#[test]
+fn queued_initial_audio_does_not_shrink_replacement_capacity() {
+    let (mut producer, mut old_consumer) = AudioRing::with_capacity_frames(8);
+    assert_eq!(producer.push_complete_block(&[1.0; 8]), 8);
+    let generations = GenerationRing::new(producer);
+    let initial = generations.producer();
+    drop(initial);
+    let mut replacement = generations.producer();
+    assert_eq!(replacement.push_complete_block(&[2.0; 8]), 8);
+    let mut current = generations.take_replacement().unwrap();
+    let mut samples = [0.0; 8];
+    assert_eq!(old_consumer.pop_into(&mut samples), 8);
+    assert_eq!(samples, [1.0; 8]);
+    assert_eq!(current.pop_into(&mut samples), 8);
+    assert_eq!(samples, [2.0; 8]);
+}
 
 #[test]
 fn writing_from_a_real_time_section_allocates_nothing() {
@@ -16,11 +34,17 @@ fn writing_from_a_real_time_section_allocates_nothing() {
     let block = [0.25f32; 480];
     let before = allocation_violations();
 
+    let rejected;
     {
         let _rt = RtGuard::enter();
-        for _ in 0..8 {
-            producer.push_block(&block);
+        for i in 0..8 {
+            if i % 2 == 0 {
+                producer.push_block(&block);
+            } else {
+                producer.push_complete_block(&block);
+            }
         }
+        rejected = producer.push_complete_block(&block);
     }
 
     assert_eq!(
@@ -28,6 +52,10 @@ fn writing_from_a_real_time_section_allocates_nothing() {
         before,
         "the producer half must be allocation-free after construction; this is \
          the whole reason the ring is preallocated"
+    );
+    assert_eq!(
+        rejected, 0,
+        "the complete-block overflow path is allocation-free too"
     );
 
     let mut out = vec![0.0f32; 8 * 480];
@@ -40,8 +68,8 @@ fn writing_from_a_real_time_section_allocates_nothing() {
 fn an_overrun_drops_and_counts_rather_than_blocking() {
     // Capacity deliberately smaller than what we push. Blocking here would
     // stall the audio thread, which is the one thing that must never happen:
-    // the network is the only backpressure point, and a dropped block is
-    // recoverable because the WAL is written independently.
+    // the loss must be observable. Samples dropped before the WAL cannot be
+    // recovered from that WAL; precise overrun gap placement is separate work.
     let (mut producer, mut consumer) = AudioRing::with_capacity_frames(512);
     let block = [1.0f32; 480];
 
@@ -124,4 +152,25 @@ fn a_dropped_consumer_is_visible_to_the_producer() {
         "the producer must be able to notice the pump died rather than \
          silently writing into a ring nobody drains"
     );
+}
+
+#[test]
+fn complete_callbacks_preserve_frames_through_wraparound_without_allocating() {
+    let (mut producer, mut consumer) = AudioRing::with_capacity_frames(5);
+    let before = allocation_violations();
+    let mut output = [0.0; 8];
+    {
+        let _guard = RtGuard::enter();
+        assert_eq!(producer.push_complete_block(&[1.0, -1.0, 2.0, -2.0]), 4);
+        assert_eq!(producer.push_complete_block(&[3.0, -3.0]), 0);
+        assert_eq!(consumer.pop_into(&mut output[..2]), 2);
+        assert_eq!(producer.push_complete_block(&[4.0, -4.0]), 2);
+        assert_eq!(producer.push_complete_block(&[0.0; 6]), 0);
+        assert_eq!(producer.push_complete_block(&[]), 0);
+    }
+    assert_eq!(allocation_violations(), before);
+    assert_eq!(consumer.pop_into(&mut output), 4);
+    assert_eq!(&output[..4], &[2.0, -2.0, 4.0, -4.0]);
+    assert_eq!(consumer.dropped_frames(), 8);
+    assert_eq!(producer.dropped_frames(), 8);
 }

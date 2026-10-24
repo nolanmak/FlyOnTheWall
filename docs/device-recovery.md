@@ -83,7 +83,7 @@ nonblocking: callbacks already admitted before revocation may finish. It is not
 a native callback join, and does not replace physical teardown/quiescence checks.
 
 This is partial implementation of #121. Quiescence of native callbacks already in flight,
-sleep-aware gaps, format-stable archive conversion, recovery of a microphone
+sleep-aware gaps, recovery of a microphone
 that failed its initial open, and bounded native recovery operations remain
 required. Closing the mailbox cancels queued work; it cannot interrupt a native
 operation already running. Native input format
@@ -131,3 +131,5 @@ An accepted retry stays disabled through old exhausted snapshots until delivery
 state advances; a later exhausted episode can be retried again. A transition
 observed before the POST reply also counts as acknowledgement. Stop and session
 replacement still discard the old request.
+
+Archive conversion and recovery ordering are described in [recovery-archive.md](recovery-archive.md).
