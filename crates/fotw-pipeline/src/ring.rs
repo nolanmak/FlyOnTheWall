@@ -128,3 +128,76 @@ impl RingConsumer {
         self.inner.is_abandoned()
     }
 }
+
+/// Control-thread factory for isolated tap generations. A replacement's PCM
+/// must not enter the old consumer while the pump is draining/padding its gap.
+/// At most one pending consumer is retained; a failed start is superseded by
+/// the next attempt. No mutex or allocation is used by the returned producer.
+#[derive(Clone)]
+pub struct GenerationRing {
+    state: Arc<std::sync::Mutex<GenerationState>>,
+    capacity: usize,
+}
+struct GenerationState {
+    initial: Option<RingProducer>,
+    next: Option<RingConsumer>,
+}
+impl GenerationRing {
+    /// Keep the initial ring; allocate each replacement on the control thread.
+    pub fn new(initial: RingProducer) -> Self {
+        let capacity = initial.slots();
+        Self {
+            state: Arc::new(std::sync::Mutex::new(GenerationState {
+                initial: Some(initial),
+                next: None,
+            })),
+            capacity,
+        }
+    }
+    /// Build a producer for the next attempt, isolating it from earlier PCM.
+    pub fn producer(&self) -> RingProducer {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(initial) = state.initial.take() {
+            return initial;
+        }
+        let (producer, consumer) = AudioRing::with_capacity_frames(self.capacity);
+        state.next = Some(consumer);
+        producer
+    }
+    /// Consume the most recent attempt after its authoritative format is known.
+    pub fn take_replacement(&self) -> Option<RingConsumer> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .next
+            .take()
+    }
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+    #[test]
+    fn retained_old_producer_and_failed_attempt_cannot_mix_with_replacement() {
+        let (producer, mut old_consumer) = AudioRing::with_capacity_frames(8);
+        let generations = GenerationRing::new(producer);
+        let mut old = generations.producer();
+        old.push_block(&[1.0, 1.0]);
+        let mut failed_attempt = generations.producer();
+        failed_attempt.push_block(&[2.0]);
+        let mut replacement = generations.producer();
+        replacement.push_block(&[3.0, 3.0]);
+        assert!(failed_attempt.is_abandoned());
+        old.push_block(&[1.0]);
+        let mut current = generations.take_replacement().unwrap();
+        let mut buffer = [0.0; 8];
+        assert_eq!(old_consumer.pop_into(&mut buffer), 3);
+        assert_eq!(&buffer[..3], &[1.0, 1.0, 1.0]);
+        assert_eq!(current.pop_into(&mut buffer), 2);
+        assert_eq!(&buffer[..2], &[3.0, 3.0]);
+        assert!(generations.take_replacement().is_none());
+    }
+}

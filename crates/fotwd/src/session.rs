@@ -36,7 +36,7 @@ use fotw_audio::{
     AudioPlatform, AudioTap, CaptureTimestamp, DeviceId, FormatRequest, FrameFlags, FrameSink,
     PlatformProbe, StreamFormat, SystemScope, TapError, TapId,
 };
-use fotw_pipeline::resample::{Downmixer, Resampler16k};
+use fotw_pipeline::resample::{ArchiveConverter, Downmixer, Resampler16k};
 use fotw_pipeline::ring::{AudioRing, RingConsumer, RingProducer};
 use fotw_pipeline::wal::{SessionWal, SttRecord, TrackFormat};
 use fotw_stt::deepgram::DeepgramConfig;
@@ -398,33 +398,25 @@ impl FrameSink for RingSink {
 // [`LegCounters`], so a rebuilt tap's audio still reaches degradation (#79/#81)
 // and anchoring (#86). Read `fotw::record`'s module header for the rationale of
 // the rest (why the supervisor is polled from the pump, why the ring producer
-// is recycled rather than recreated, why an unwritten gap is padded).
+// is isolated per generation, why an unwritten gap is padded).
 
-/// The ring producer, parked between taps so a rebuilt tap writes into the
-/// **same** ring as the tap it replaced — that is what makes recovery
-/// invisible to the WAL. The sink hands the producer back here on drop and the
-/// next sink takes it out again; both ends happen on the control path, and the
-/// audio thread holds the producer outright and never touches this lock.
+/// Allocate a separate bounded ring for each tap attempt. The pump retains
+/// the old consumer through its final drain and gap padding, then switches to
+/// the replacement consumer. No lock or allocation occurs on the audio thread.
 #[derive(Clone)]
-struct ProducerSlot(Arc<std::sync::Mutex<Option<RingProducer>>>);
+struct ProducerSlot(fotw_pipeline::ring::GenerationRing);
 
 impl ProducerSlot {
     fn holding(producer: RingProducer) -> Self {
-        Self(Arc::new(std::sync::Mutex::new(Some(producer))))
+        Self(fotw_pipeline::ring::GenerationRing::new(producer))
     }
-
     fn take(&self) -> Option<RingProducer> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+        Some(self.0.producer())
     }
-
-    fn put(&self, producer: RingProducer) {
-        *self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(producer);
+    fn replacement(&self) -> Result<RingConsumer, String> {
+        self.0
+            .take_replacement()
+            .ok_or_else(|| "missing replacement capture generation".into())
     }
 
     /// A sink drawing on this slot that reports to **both** counter sets.
@@ -436,7 +428,6 @@ impl ProducerSlot {
     ) -> Box<dyn FrameSink> {
         Box::new(SupervisedSink {
             producer: self.take(),
-            slot: self.clone(),
             activity,
             counters,
             channels: channels.max(1),
@@ -454,23 +445,11 @@ impl ProducerSlot {
 /// only the first; a daemon that did the same would rebuild a stalled tap
 /// correctly and then report the recovered meeting as dead.
 struct SupervisedSink {
-    /// `None` only if the slot was empty when this sink was built, which the
-    /// supervisor's drop-old-before-open-new ordering makes impossible. If it
-    /// ever happened, counting the buffers still keeps the watchdog from
-    /// mistaking it for a stall and rebuilding in a loop.
+    /// This attempt owns its ring; no producer is reused across generations.
     producer: Option<RingProducer>,
-    slot: ProducerSlot,
     activity: Arc<ActivityCounters>,
     counters: LegCounters,
     channels: u16,
-}
-
-impl Drop for SupervisedSink {
-    fn drop(&mut self) {
-        if let Some(producer) = self.producer.take() {
-            self.slot.put(producer);
-        }
-    }
 }
 
 impl FrameSink for SupervisedSink {
@@ -515,12 +494,28 @@ impl LegChannel {
     }
 }
 
+fn archive_converter(
+    format: StreamFormat,
+    archive: TrackFormat,
+) -> Result<ArchiveConverter, String> {
+    ArchiveConverter::new(
+        format.sample_rate_hz,
+        format.channels,
+        archive.sample_rate_hz,
+        archive.channels,
+    )
+    .map_err(|e| format!("archive converter: {e}"))
+}
+
 /// One supervised capture leg's control-side state — everything the pump needs
 /// to service it *except* the ring consumer, which the pump already owns and
 /// drains on the normal path. Keeping the consumer out is what lets
-/// [`supervise_channel`] run inside `pump_loop` against the same `sys`/`mic`
+/// [`supervise_channel_observed`] run inside `pump_loop` against the same `sys`/`mic`
 /// consumers the ordinary drain reads, rather than a second private copy.
 struct ChannelMeta {
+    slot: ProducerSlot,
+    converter: ArchiveConverter,
+    retired_drops: u64,
     monitor: crate::capture_health::CaptureMonitor,
     label: &'static str,
     channel: LegChannel,
@@ -546,6 +541,7 @@ struct ChannelMeta {
 /// before the padding. Mirrors `fotw::record::supervise`; the daemon logs
 /// through [`crate::diag`] rather than `println!` because its stderr is
 /// discarded (#101).
+#[cfg(test)]
 fn supervise_channel(
     wal: &mut SessionWal,
     meta: &mut ChannelMeta,
@@ -553,6 +549,19 @@ fn supervise_channel(
     plat: &(impl AudioPlatform + ?Sized),
     epoch_ns: u64,
     scratch: &mut [f32],
+) -> Result<(), String> {
+    supervise_channel_observed(wal, meta, cons, plat, epoch_ns, scratch, &mut |_| Ok(()))
+}
+
+#[allow(clippy::too_many_arguments)] // capture state plus a post-WAL feed observer
+fn supervise_channel_observed(
+    wal: &mut SessionWal,
+    meta: &mut ChannelMeta,
+    cons: &mut RingConsumer,
+    plat: &(impl AudioPlatform + ?Sized),
+    epoch_ns: u64,
+    scratch: &mut [f32],
+    on_pcm: &mut dyn FnMut(&[f32]) -> Result<(), String>,
 ) -> Result<(), String> {
     let source = match meta.channel {
         LegChannel::System => fotw_web::recorder::CaptureSource::System,
@@ -581,36 +590,30 @@ fn supervise_channel(
             continue;
         };
 
-        if format != meta.format {
-            // Re-reading the format after every rebuild is seam rule 1, and a
-            // Bluetooth headset engaging HFP changes it mid-meeting. The
-            // manifest declares one rate for the whole session, so this needs a
-            // resampler on the pump before it is correct; saying so beats
-            // writing 16 kHz samples into a 48 kHz file quietly.
-            crate::diag!(
-                "  ! [{}] format changed across the rebuild: {} -> {format}. \
-                 The manifest still records this leg as {} Hz / {} ch; its \
-                 timing will be wrong until resampling is wired in.",
-                meta.label,
-                meta.format,
-                meta.wal_format.sample_rate_hz,
-                meta.wal_format.channels
-            );
-            meta.format = format;
-        }
-
-        // Everything still in the ring predates the outage — the tap was
-        // stopped before the rebuild began — so draining it first is what puts
-        // the padding after the last pre-gap sample instead of in the middle.
-        loop {
-            let n = cons.pop_into(scratch);
+        // A separate ring holds the replacement, including callbacks fired
+        // inside start(). Drain only the retired generation before the gap.
+        let mut remaining = cons.slots();
+        while remaining > 0 {
+            let limit = remaining.min(scratch.len());
+            let n = cons.pop_into(&mut scratch[..limit]);
             if n == 0 {
                 break;
             }
-            meta.channel
-                .write(wal, &scratch[..n])
-                .map_err(|e| format!("{} write failed: {e}", meta.label))?;
+            remaining -= n;
+            let pcm = meta
+                .converter
+                .process(&scratch[..n])
+                .map_err(|e| e.to_string())?;
+            meta.channel.write(wal, &pcm).map_err(|e| e.to_string())?;
+            on_pcm(&pcm)?;
         }
+        let tail = meta.converter.finish().map_err(|e| e.to_string())?;
+        meta.channel.write(wal, &tail).map_err(|e| e.to_string())?;
+        on_pcm(&tail)?;
+        meta.retired_drops += cons.dropped_frames();
+        *cons = meta.slot.replacement()?;
+        meta.converter = archive_converter(format, meta.wal_format)?;
+        meta.format = format;
 
         for gap in gaps {
             apply_leg_gap(
@@ -621,6 +624,7 @@ fn supervise_channel(
                 meta.wal_format,
                 epoch_ns,
                 scratch,
+                on_pcm,
             )?;
         }
     }
@@ -629,6 +633,7 @@ fn supervise_channel(
 
 /// Record a gap in the manifest and, if nothing was captured for it, put the
 /// missing time back into the stream as silence in this leg's own shape.
+#[allow(clippy::too_many_arguments)] // gap metadata and post-WAL observer
 fn apply_leg_gap(
     wal: &mut SessionWal,
     channel: LegChannel,
@@ -637,6 +642,7 @@ fn apply_leg_gap(
     format: TrackFormat,
     epoch_ns: u64,
     scratch: &mut [f32],
+    on_pcm: &mut dyn FnMut(&[f32]) -> Result<(), String>,
 ) -> Result<(), String> {
     let start_ms = gap.start_ns.saturating_sub(epoch_ns) / 1_000_000;
     let end_ms = gap.end_ns.saturating_sub(epoch_ns) / 1_000_000;
@@ -664,6 +670,7 @@ fn apply_leg_gap(
         channel
             .write(wal, &scratch[..n])
             .map_err(|e| format!("could not pad the gap: {e}"))?;
+        on_pcm(&scratch[..n])?;
         remaining -= n;
     }
     Ok(())
@@ -1928,8 +1935,8 @@ pub async fn run_supervised(
     let sys_counters = LegCounters::default();
     let mic_counters = LegCounters::default();
 
-    // Every allocation before anything real-time runs: rings, the slots that
-    // recycle each ring's producer across a rebuild, and the watchdog counters.
+    // Allocate initial rings and counters here. Replacement rings are allocated
+    // on the control thread before starting each replacement tap.
     let (sys_prod, sys_cons) = AudioRing::with_capacity_frames(RING_SAMPLES);
     let (mic_prod, mic_cons) = AudioRing::with_capacity_frames(RING_SAMPLES);
     let sys_slot = ProducerSlot::holding(sys_prod);
@@ -2044,10 +2051,19 @@ pub async fn run_supervised(
             mic_supervisor.recovery_status(),
         );
     }
+    let mic_converter = mic_format
+        .map(|f| archive_converter(f, TrackFormat::new(f.sample_rate_hz, f.channels)))
+        .transpose()?;
     let supervision = Supervision {
         plat: Arc::clone(&plat),
         epoch_ns,
         system: ChannelMeta {
+            slot: sys_slot,
+            converter: archive_converter(
+                sys_format,
+                TrackFormat::new(sys_format.sample_rate_hz, sys_format.channels),
+            )?,
+            retired_drops: 0,
             monitor: control.capture_health.clone(),
             label: "system",
             channel: LegChannel::System,
@@ -2056,15 +2072,20 @@ pub async fn run_supervised(
             format: sys_format,
             wal_format: TrackFormat::new(sys_format.sample_rate_hz, sys_format.channels),
         },
-        mic: mic_format.map(|f| ChannelMeta {
-            monitor: control.capture_health.clone(),
-            label: "mic",
-            channel: LegChannel::Mic,
-            supervisor: mic_supervisor,
-            activity: Arc::clone(&mic_activity),
-            format: f,
-            wal_format: TrackFormat::new(f.sample_rate_hz, f.channels),
-        }),
+        mic: mic_format
+            .zip(mic_converter)
+            .map(|(f, converter)| ChannelMeta {
+                slot: mic_slot,
+                converter,
+                retired_drops: 0,
+                monitor: control.capture_health.clone(),
+                label: "mic",
+                channel: LegChannel::Mic,
+                supervisor: mic_supervisor,
+                activity: Arc::clone(&mic_activity),
+                format: f,
+                wal_format: TrackFormat::new(f.sample_rate_hz, f.channels),
+            }),
         interval: SUPERVISE_INTERVAL,
         last: Instant::now(),
     };
@@ -2452,11 +2473,82 @@ fn pump_loop(
     pump_drain(wal, sys, mic, sys_format, mic_format, stt, stop, None)
 }
 
+struct PumpTranscription {
+    stt: SttFeeds,
+    resampler: Resampler16k,
+    mic_resampler: Option<(Resampler16k, u16)>,
+    system_channels: u16,
+    hush: Vec<i16>,
+}
+impl PumpTranscription {
+    fn feed(&mut self, channel: LegChannel, pcm: &[f32]) -> Result<(), String> {
+        match channel {
+            LegChannel::System => {
+                if let Some(h) = self.stt.system.as_ref() {
+                    let resampled = self
+                        .resampler
+                        .process_all(pcm)
+                        .map_err(|e| format!("resample failed: {e}"))?;
+                    if !resampled.is_empty() {
+                        let mono = Downmixer::to_mono(&resampled, self.system_channels);
+                        // The gate's reference: what the speakers are playing is
+                        // exactly what the system feed carries.
+                        if let Some(gate) = self.stt.echo_gate.as_mut() {
+                            gate.push_system(&mono);
+                        }
+                        h.write_pcm(&Downmixer::to_i16(&mono));
+                    }
+                }
+            }
+            LegChannel::Mic => {
+                if let (Some(h), Some((r, channels))) =
+                    (self.stt.mic.as_ref(), self.mic_resampler.as_mut())
+                {
+                    let resampled = r
+                        .process_all(pcm)
+                        .map_err(|e| format!("mic resample failed: {e}"))?;
+                    if !resampled.is_empty() {
+                        let mono = Downmixer::to_mono(&resampled, *channels);
+                        // CAP-11 v1: on speakers the mic is mostly a copy of the
+                        // system leg — transcribing it again costs money and
+                        // attributes the far end's words to the user. Withheld
+                        // from the FEED only; the WAL above already has the raw
+                        // audio, so this is revertible in principle (the same
+                        // text-not-audio stance Descript documents for its
+                        // mic-bleed fix).
+                        let suppress = self.stt.echo_gate.as_mut().is_some_and(|g| {
+                            g.assess(&mono) == fotw_pipeline::echo::GateVerdict::Suppress
+                        });
+                        if suppress {
+                            // Silence, not absence (#79). This leg's clock is the
+                            // amount of PCM its socket has swallowed — Deepgram
+                            // stamps every segment from it — so withholding a
+                            // chunk does not skip a second, it *deletes* one, and
+                            // every word after it is stamped a second early.
+                            // Suppression's effect survives the change because
+                            // silence transcribes as nothing; what it stops
+                            // costing is time. Feeding zeros also keeps the socket
+                            // from going quiet through sustained far-end speech,
+                            // which is the audio-starvation half of #70.
+                            self.hush.clear();
+                            self.hush.resize(mono.len(), 0);
+                            h.write_pcm(&self.hush);
+                        } else {
+                            h.write_pcm(&Downmixer::to_i16(&mono));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// [`pump_loop`], plus live tap recovery when `supervision` is present.
 ///
 /// The one loop both paths share. When supervising, every
 /// [`Supervision::interval`] it polls each leg's watchdog and applies any
-/// rebuild's gap padding to the WAL in stream order (see [`supervise_channel`]),
+/// rebuild's gap padding to the WAL in stream order (see [`supervise_channel_observed`]),
 /// and on the first sight of the stop latch it detaches and closes the taps
 /// itself — the supervisors it owns are the only handle to them (#85).
 #[allow(clippy::too_many_arguments)] // the WAL, both rings and their formats, the feeds, the latch, and supervision
@@ -2466,7 +2558,7 @@ fn pump_drain(
     mut mic: RingConsumer,
     sys_format: StreamFormat,
     mic_format: Option<StreamFormat>,
-    mut stt: SttFeeds,
+    stt: SttFeeds,
     stop: PumpStop<'_>,
     mut supervision: Option<Supervision>,
 ) -> Result<PumpCounts, String> {
@@ -2474,22 +2566,30 @@ fn pump_drain(
     let (mut sys_written, mut mic_written) = (0u64, 0u64);
     // What a suppressed mic chunk is fed as. Kept across iterations because
     // chunk sizes settle: after the first few rounds this stops growing.
-    let mut hush: Vec<i16> = Vec::new();
+    let hush: Vec<i16> = Vec::new();
 
-    let mut resampler = Resampler16k::new(sys_format.sample_rate_hz, sys_format.channels)
+    let resampler = Resampler16k::new(sys_format.sample_rate_hz, sys_format.channels)
         .map_err(|e| format!("resampler: {e}"))?;
 
     // The mic gets its own resampler because its format is its own: the
     // system tap is 48k stereo, a USB headset mic is whatever it is, and
     // reusing the system resampler was never an option — which is exactly why
     // the old single-stream code had a `let _ = mic_format;` here.
-    let mut mic_resampler = match (&stt.mic, mic_format) {
+    let mic_resampler = match (&stt.mic, mic_format) {
         (Some(_), Some(f)) => Some((
             Resampler16k::new(f.sample_rate_hz, f.channels)
                 .map_err(|e| format!("mic resampler: {e}"))?,
             f.channels,
         )),
         _ => None,
+    };
+
+    let mut transcription = PumpTranscription {
+        stt,
+        resampler,
+        mic_resampler,
+        system_channels: sys_format.channels,
+        hush,
     };
 
     // Armed on the pass that first sees the latch, and the only thing that
@@ -2521,22 +2621,30 @@ fn pump_drain(
             && let Some(sup) = supervision.as_mut()
             && sup.last.elapsed() >= sup.interval
         {
-            supervise_channel(
+            supervise_channel_observed(
                 &mut wal,
                 &mut sup.system,
                 &mut sys,
                 &*sup.plat,
                 sup.epoch_ns,
                 &mut scratch,
+                &mut |pcm| {
+                    sys_written += pcm.len() as u64;
+                    transcription.feed(LegChannel::System, pcm)
+                },
             )?;
             if let Some(mic_meta) = sup.mic.as_mut() {
-                supervise_channel(
+                supervise_channel_observed(
                     &mut wal,
                     mic_meta,
                     &mut mic,
                     &*sup.plat,
                     sup.epoch_ns,
                     &mut scratch,
+                    &mut |pcm| {
+                        mic_written += pcm.len() as u64;
+                        transcription.feed(LegChannel::Mic, pcm)
+                    },
                 )?;
             }
             sup.last = Instant::now();
@@ -2546,71 +2654,37 @@ fn pump_drain(
 
         let n = sys.pop_into(&mut scratch);
         if n > 0 {
+            let normalized = supervision
+                .as_mut()
+                .map(|s| s.system.converter.process(&scratch[..n]))
+                .transpose()
+                .map_err(|e| e.to_string())?;
+            let pcm = normalized.as_deref().unwrap_or(&scratch[..n]);
             // Raw first, always. Derived work can fail; this must not.
-            wal.write_system(&scratch[..n])
+            wal.write_system(pcm)
                 .map_err(|e| format!("system write failed: {e}"))?;
-            sys_written += n as u64;
+            sys_written += pcm.len() as u64;
             moved = true;
 
-            if let Some(h) = stt.system.as_ref() {
-                let resampled = resampler
-                    .process_all(&scratch[..n])
-                    .map_err(|e| format!("resample failed: {e}"))?;
-                if !resampled.is_empty() {
-                    let mono = Downmixer::to_mono(&resampled, sys_format.channels);
-                    // The gate's reference: what the speakers are playing is
-                    // exactly what the system feed carries.
-                    if let Some(gate) = stt.echo_gate.as_mut() {
-                        gate.push_system(&mono);
-                    }
-                    h.write_pcm(&Downmixer::to_i16(&mono));
-                }
-            }
+            transcription.feed(LegChannel::System, pcm)?;
         }
 
         let m = mic.pop_into(&mut scratch);
         if m > 0 {
+            let normalized = supervision
+                .as_mut()
+                .and_then(|s| s.mic.as_mut())
+                .map(|meta| meta.converter.process(&scratch[..m]))
+                .transpose()
+                .map_err(|e| e.to_string())?;
+            let pcm = normalized.as_deref().unwrap_or(&scratch[..m]);
             // Raw first here too, for the same reason as the system leg.
-            wal.write_mic(&scratch[..m])
+            wal.write_mic(pcm)
                 .map_err(|e| format!("mic write failed: {e}"))?;
-            mic_written += m as u64;
+            mic_written += pcm.len() as u64;
             moved = true;
 
-            if let (Some(h), Some((r, channels))) = (stt.mic.as_ref(), mic_resampler.as_mut()) {
-                let resampled = r
-                    .process_all(&scratch[..m])
-                    .map_err(|e| format!("mic resample failed: {e}"))?;
-                if !resampled.is_empty() {
-                    let mono = Downmixer::to_mono(&resampled, *channels);
-                    // CAP-11 v1: on speakers the mic is mostly a copy of the
-                    // system leg — transcribing it again costs money and
-                    // attributes the far end's words to the user. Withheld
-                    // from the FEED only; the WAL above already has the raw
-                    // audio, so this is revertible in principle (the same
-                    // text-not-audio stance Descript documents for its
-                    // mic-bleed fix).
-                    let suppress = stt.echo_gate.as_mut().is_some_and(|g| {
-                        g.assess(&mono) == fotw_pipeline::echo::GateVerdict::Suppress
-                    });
-                    if suppress {
-                        // Silence, not absence (#79). This leg's clock is the
-                        // amount of PCM its socket has swallowed — Deepgram
-                        // stamps every segment from it — so withholding a
-                        // chunk does not skip a second, it *deletes* one, and
-                        // every word after it is stamped a second early.
-                        // Suppression's effect survives the change because
-                        // silence transcribes as nothing; what it stops
-                        // costing is time. Feeding zeros also keeps the socket
-                        // from going quiet through sustained far-end speech,
-                        // which is the audio-starvation half of #70.
-                        hush.clear();
-                        hush.resize(mono.len(), 0);
-                        h.write_pcm(&hush);
-                    } else {
-                        h.write_pcm(&Downmixer::to_i16(&mono));
-                    }
-                }
-            }
+            transcription.feed(LegChannel::Mic, pcm)?;
         }
 
         match drain_by {
@@ -2632,7 +2706,7 @@ fn pump_drain(
         }
     }
 
-    if let Some(gate) = &stt.echo_gate {
+    if let Some(gate) = &transcription.stt.echo_gate {
         let (assessed, suppressed) = gate.stats();
         if suppressed > 0 {
             // Once, at the end — CAP-11's metric, and the honest nudge: the
@@ -2644,6 +2718,18 @@ fn pump_drain(
         }
     }
 
+    if let Some(sup) = supervision.as_mut() {
+        let tail = sup.system.converter.finish().map_err(|e| e.to_string())?;
+        wal.write_system(&tail).map_err(|e| e.to_string())?;
+        sys_written += tail.len() as u64;
+        transcription.feed(LegChannel::System, &tail)?;
+        if let Some(mic) = sup.mic.as_mut() {
+            let tail = mic.converter.finish().map_err(|e| e.to_string())?;
+            wal.write_mic(&tail).map_err(|e| e.to_string())?;
+            mic_written += tail.len() as u64;
+            transcription.feed(LegChannel::Mic, &tail)?;
+        }
+    }
     wal.flush().map_err(|e| format!("flush failed: {e}"))?;
     // Finalize stamps `ended_at_ms`. Without it every cleanly-ended meeting
     // looks crashed and reappears in the recovery list forever, which trains
@@ -2657,7 +2743,11 @@ fn pump_drain(
     Ok(PumpCounts {
         system_samples: sys_written,
         mic_samples: mic_written,
-        dropped_samples: sys.dropped_frames() + mic.dropped_frames(),
+        dropped_samples: sys.dropped_frames()
+            + mic.dropped_frames()
+            + supervision.as_ref().map_or(0, |s| {
+                s.system.retired_drops + s.mic.as_ref().map_or(0, |m| m.retired_drops)
+            }),
         abandoned_samples: abandoned,
     })
 }
@@ -3385,7 +3475,7 @@ mod supervised_recovery_tests {
     /// capture path wires one: its own ring, its own dual counters, its own
     /// supervisor — on a clock the test moves by hand, so a five-second stall
     /// costs no wall-clock time. Returns the leg's ring consumer (which the pump
-    /// owns on the real path and [`supervise_channel`] drains through) alongside
+    /// owns on the real path and [`supervise_channel_observed`] drains through) alongside
     /// the two counter handles the session would also hold, so a test can assert
     /// on either.
     fn fake_leg(
@@ -3423,6 +3513,9 @@ mod supervised_recovery_tests {
         supervisor.start().unwrap();
         (
             ChannelMeta {
+                slot,
+                converter: archive_converter(format, wal_format).unwrap(),
+                retired_drops: 0,
                 monitor: crate::capture_health::CaptureMonitor::default(),
                 label,
                 channel,
@@ -3578,6 +3671,164 @@ mod supervised_recovery_tests {
         assert!(!monitor.take_retry(CaptureSource::Mic));
         drop(wal);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replacement_start_samples_stay_after_the_recovery_gap() {
+        struct StartPcmTap {
+            inner: FakeTap,
+            pcm: Vec<f32>,
+        }
+        impl AudioTap for StartPcmTap {
+            fn id(&self) -> &TapId {
+                self.inner.id()
+            }
+            fn format(&self) -> StreamFormat {
+                self.inner.format()
+            }
+            fn format_is_authoritative(&self) -> bool {
+                self.inner.format_is_authoritative()
+            }
+            fn start(&mut self, sink: Box<dyn FrameSink>) -> Result<StreamFormat, TapError> {
+                let format = self.inner.start(sink)?;
+                self.inner.emit(&self.pcm);
+                Ok(format)
+            }
+            fn stop(&mut self) -> Result<(), TapError> {
+                self.inner.stop()
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let clock = ManualClock::new();
+        let plat = MockPlatform::macos_taps();
+        let wal_format = TrackFormat::new(48_000, 2);
+        let (mut meta, _old_consumer, activity, counters) = fake_leg(
+            "system",
+            LegChannel::System,
+            TapId::system_default(),
+            wal_format,
+            &clock,
+        );
+        meta.supervisor.stop().unwrap();
+        let (producer, fresh_consumer) = AudioRing::with_capacity_frames(48_000);
+        let mut consumer = fresh_consumer;
+        let slot = ProducerSlot::holding(producer);
+        let sink_slot = slot.clone();
+        let sink_activity = activity.clone();
+        let mut generation = 0;
+        meta.supervisor = CaptureSupervisor::new(
+            SupervisorConfig::default(),
+            clock.clone(),
+            move || {
+                let (format, pcm) = if generation == 0 {
+                    (
+                        StreamFormat::new(48_000, 2, SampleFormat::F32),
+                        vec![0.25; 960],
+                    )
+                } else {
+                    (
+                        StreamFormat::new(16_000, 1, SampleFormat::F32),
+                        vec![0.75; 160],
+                    )
+                };
+                generation += 1;
+                Ok(Box::new(StartPcmTap {
+                    inner: FakeTap::new(TapId::system_default(), format),
+                    pcm,
+                }))
+            },
+            move || sink_slot.sink(sink_activity.clone(), counters.clone(), 2),
+        );
+        meta.slot = slot;
+        meta.supervisor.start().unwrap();
+        let mut wal = SessionWal::create_with_formats(root.path(), wal_format, None).unwrap();
+        let mut scratch = vec![0.0; 48_000];
+        supervise_channel(&mut wal, &mut meta, &mut consumer, &plat, 0, &mut scratch).unwrap();
+        clock.advance(Duration::from_secs(6));
+        let mut forwarded = Vec::new();
+        supervise_channel_observed(
+            &mut wal,
+            &mut meta,
+            &mut consumer,
+            &plat,
+            0,
+            &mut scratch,
+            &mut |pcm| {
+                forwarded.extend_from_slice(pcm);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            forwarded.len(),
+            960 + 6 * 48_000 * 2,
+            "retired PCM and gap padding also advance the ASR feed clock"
+        );
+        wal.flush().unwrap();
+        assert_eq!(
+            consumer.slots(),
+            160,
+            "replacement PCM must remain separate until its new format is installed"
+        );
+        let bytes = std::fs::read(wal.dir().join("system.pcm")).unwrap();
+        assert_eq!(
+            bytes.len() / 2,
+            960 + 6 * 48_000 * 2,
+            "only old PCM belongs before gap padding"
+        );
+        assert!(bytes[960 * 2..].iter().all(|byte| *byte == 0));
+        struct FixtureFeed(std::sync::Mutex<Vec<i16>>);
+        impl PcmFeed for FixtureFeed {
+            fn write_pcm(&self, pcm: &[i16]) {
+                self.0.lock().unwrap().extend_from_slice(pcm);
+            }
+        }
+        let feed = Arc::new(FixtureFeed(std::sync::Mutex::new(Vec::new())));
+        let dir = wal.dir().to_owned();
+        let (_unused_producer, mic_consumer) = AudioRing::with_capacity_frames(16);
+        let stop = AtomicBool::new(true);
+        let counts = pump_drain(
+            wal,
+            consumer,
+            mic_consumer,
+            StreamFormat::new(48_000, 2, SampleFormat::F32),
+            None,
+            SttFeeds {
+                system: Some(feed.clone()),
+                mic: None,
+                echo_gate: None,
+            },
+            PumpStop {
+                stopped: &stop,
+                drain: GENEROUS_DRAIN,
+            },
+            Some(Supervision {
+                plat: Arc::new(plat),
+                epoch_ns: 0,
+                system: meta,
+                mic: None,
+                interval: SUPERVISE_INTERVAL,
+                last: Instant::now(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            counts.system_samples, 960,
+            "10 ms mono remains 10 ms archive stereo through the real pump"
+        );
+        assert_eq!(
+            feed.0.lock().unwrap().len(),
+            160,
+            "ASR receives 10 ms at 16 kHz"
+        );
+        let final_bytes = std::fs::read(dir.join("system.pcm")).unwrap();
+        assert_eq!(final_bytes.len(), bytes.len() + 960 * 2);
+        assert_eq!(&final_bytes[..bytes.len()], &bytes);
+        assert!(
+            final_bytes[bytes.len()..]
+                .chunks_exact(2)
+                .any(|v| i16::from_le_bytes([v[0], v[1]]) > 20_000)
+        );
     }
 
     /// The daemon-specific requirement the CLI path has no equivalent of: the
