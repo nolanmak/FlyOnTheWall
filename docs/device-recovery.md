@@ -49,6 +49,24 @@ status polls cannot restore them until the stop request finishes.
 browser fixture with a healthy system source and exhausted microphone. Retrying
 moves it through checking to healthy without opening devices or providers.
 
+Explicit device-invalidated, device-not-found and stream-format callback errors
+now latch their first timestamp in a per-attempt atomic mailbox. Further PCM
+from that faulted sink is refused. The next control poll enters recovery without
+waiting for starvation; retries retain the existing episode budget and spacing.
+Repeated errors cannot move the outage start, and an old sink's mailbox cannot
+fault a replacement. An exhausted callback fault requires explicit retry; unlike
+watchdog quarantine it cannot confirm health by accepting more suspect PCM.
+The eventual recovery gap uses `callback-fault` and preserves the first fault
+time even across exhaustion and manual retry.
+
+`crates/fotw-audio/tests/callback_recovery.rs` first failed because explicit
+callback faults still returned Healthy. Three synthetic tests cover prompt
+rebuild, post-fault PCM refusal, old-error isolation, attempt spacing/ceiling,
+Stop, and complete outage timestamps after manual retry. These checks do not
+prove native teardown or callback quiescence. The wrapper observes reported
+faults; it does not create missing native sample-rate notifications or implement
+format conversion.
+
 This is partial implementation of #121. Generation fencing for native callbacks,
 sleep-aware gaps, format-stable archive conversion, recovery of a microphone
 that failed its initial open, and bounded native recovery operations remain
