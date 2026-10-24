@@ -14,7 +14,7 @@
 //! 2. **Audio is binary, control is text.** They are not interchangeable in
 //!    either direction: JSON sent as binary is interpreted as PCM.
 //! 3. **`diarize_model=v2` is batch-only.** Enforced in
-//!    [`DeepgramStreamParams`](crate::deepgram_wire::DeepgramStreamParams)
+//!    [`DeepgramStreamParams`]
 //!    rather than here, so the failure is a config error at build time instead
 //!    of a 400 at connect time.
 //!

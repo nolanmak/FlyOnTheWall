@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+conformance = []
+
 [dependencies]
 thiserror = { workspace = true }
 
