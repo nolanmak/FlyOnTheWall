@@ -67,3 +67,25 @@ and the pipeline public API. The opt-in `conformance::streaming()` contract
 checks callback-size independence (including split stereo frames), output
 length, finite samples and signed little-endian PCM across 8–96 kHz inputs.
 Dropping pending samples between callbacks makes that contract fail.
+
+## Local language validation
+
+The in-process Whisper adapter validates language codes against the installed
+runtime before opening a model. It then checks `WhisperContext::is_multilingual`
+from model metadata; file names are not evidence of language support. An
+English-only model accepts English and resolves automatic selection to English;
+other explicit languages produce a non-retryable Unsupported error. The local
+setup command loads and validates the selected model/language before saving the
+configuration. Session workers repeat validation when creating a recognizer.
+This does not yet implement a full pre-capture readiness gate for every meeting
+entry point, or the shared language/capability UI.
+
+Validation: the new normalization/capability test failed before implementation;
+local adapter unit tests and settings regressions pass after the change. The
+ignored `real_english_model_rejects_non_english_from_metadata` test was also run
+with the installed base.en artifact (SHA-256
+`a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002`), under the name
+`model.bin`, and passed. It reads model metadata without capturing or uploading
+audio. Normal CI requires no weights; rerun the explicit model test with
+`FOTW_WHISPER_ENGLISH_MODEL` pointing to an English-only model and
+`cargo test -p fotw-stt --features local-whisper --lib real_english_model -- --ignored`.

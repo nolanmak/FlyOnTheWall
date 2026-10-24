@@ -75,8 +75,37 @@ impl WhisperEngine {
     }
 
     fn context(&self) -> Result<Arc<WhisperContext>, SttError> {
-        self.context.get_or_init(|| load(&self.path)).clone()
+        validate_language(self.language.as_deref(), true)?;
+        let context = self.context.get_or_init(|| load(&self.path)).clone()?;
+        validate_language(self.language.as_deref(), context.is_multilingual())?;
+        Ok(context)
     }
+}
+
+/// Normalize a requested language and check it against the loaded model.
+/// `multilingual` must come from model metadata, never the file name.
+pub fn validate_language(
+    language: Option<&str>,
+    multilingual: bool,
+) -> Result<Option<String>, SttError> {
+    let code = language.unwrap_or("auto").trim().to_ascii_lowercase();
+    if code.is_empty() || code == "auto" {
+        return Ok((!multilingual).then(|| "en".to_owned()));
+    }
+    let valid_code = (2..=3).contains(&code.len())
+        && code.bytes().all(|b| b.is_ascii_lowercase())
+        && whisper_rs::get_lang_id(&code).is_some();
+    if !valid_code {
+        return Err(SttError::new(SttErrorClass::Unsupported, PROVIDER,
+            "language is not supported by the installed Whisper runtime; choose a supported code or auto")
+            .not_retryable("unsupported language code"));
+    }
+    if !multilingual && code != "en" {
+        return Err(SttError::new(SttErrorClass::Unsupported, PROVIDER,
+            "this Whisper model supports English only; choose English or install a multilingual model")
+            .not_retryable("language/model mismatch"));
+    }
+    Ok(Some(code))
 }
 
 /// `ggml-large-v3-turbo-q5_0.bin` → `large-v3-turbo-q5_0`.
@@ -130,7 +159,9 @@ impl RecognizerFactory for WhisperEngine {
     }
 
     fn create(&self) -> Result<Box<dyn Recognizer>, SttError> {
-        let state = self.context()?.create_state().map_err(|error| {
+        let context = self.context()?;
+        let language = validate_language(self.language.as_deref(), context.is_multilingual())?;
+        let state = context.create_state().map_err(|error| {
             SttError::new(
                 SttErrorClass::Server,
                 PROVIDER,
@@ -140,7 +171,7 @@ impl RecognizerFactory for WhisperEngine {
         })?;
         Ok(Box::new(WhisperRecognizer {
             state,
-            language: self.language.clone(),
+            language,
             threads: self.threads,
         }))
     }
@@ -215,6 +246,61 @@ fn centiseconds_to_ms(cs: i64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn languages_are_validated_against_runtime_and_model_capabilities() {
+        assert_eq!(
+            validate_language(Some(" EN "), true).unwrap().as_deref(),
+            Some("en")
+        );
+        assert_eq!(validate_language(Some("AUTO"), true).unwrap(), None);
+        assert_eq!(
+            validate_language(None, false).unwrap().as_deref(),
+            Some("en")
+        );
+        assert_eq!(
+            validate_language(Some("auto"), false).unwrap().as_deref(),
+            Some("en")
+        );
+        assert_eq!(
+            validate_language(Some("de"), true).unwrap().as_deref(),
+            Some("de")
+        );
+        for language in ["zz", "english", "en\0", "de"] {
+            let error = validate_language(Some(language), false).unwrap_err();
+            assert_eq!(error.class, SttErrorClass::Unsupported);
+            assert!(!error.retryable);
+        }
+    }
+
+    #[test]
+    fn unsupported_language_is_rejected_before_opening_a_model() {
+        let error = WhisperEngine::new("/nonexistent/model.bin", Some("zz".into()))
+            .load()
+            .unwrap_err();
+        assert_eq!(error.class, SttErrorClass::Unsupported);
+        assert!(error.message.contains("language"));
+        assert!(!error.retryable);
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly supplied English-only GGML model; no downloads"]
+    fn real_english_model_rejects_non_english_from_metadata() {
+        let path = std::env::var_os("FOTW_WHISPER_ENGLISH_MODEL")
+            .expect("set FOTW_WHISPER_ENGLISH_MODEL to an English-only model");
+        let engine = WhisperEngine::new(PathBuf::from(path), Some("de".into()));
+        let error = engine.load().unwrap_err();
+        assert_eq!(error.class, SttErrorClass::Unsupported);
+        assert!(error.message.contains("English only"));
+        let context = engine.context.get().unwrap().as_ref().unwrap();
+        assert!(!context.is_multilingual());
+        assert_eq!(
+            validate_language(None, context.is_multilingual())
+                .unwrap()
+                .as_deref(),
+            Some("en")
+        );
+    }
 
     #[test]
     fn model_names_drop_the_ggml_prefix() {
