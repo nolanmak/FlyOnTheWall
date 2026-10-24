@@ -40,6 +40,11 @@ pub enum TapError {
     #[error("device invalidated: {0}")]
     DeviceInvalidated(TapId),
 
+    /// A callback no longer matches the negotiated stream format. This unit
+    /// variant can be reported from the audio thread without allocating.
+    #[error("audio stream format changed; rebuild capture before accepting more samples")]
+    StreamFormatChanged,
+
     /// The device cannot produce anything usable for this request.
     ///
     /// A *hint* that is not honoured is not this error — that is normal, and
@@ -119,6 +124,9 @@ impl TapError {
     /// correct response (CAP-06).
     #[must_use]
     pub fn is_transient_device_fault(&self) -> bool {
-        matches!(self, Self::DeviceInvalidated(_) | Self::DeviceNotFound(_))
+        matches!(
+            self,
+            Self::DeviceInvalidated(_) | Self::DeviceNotFound(_) | Self::StreamFormatChanged
+        )
     }
 }
