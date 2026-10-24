@@ -67,7 +67,22 @@ prove native teardown or callback quiescence. The wrapper observes reported
 faults; it does not create missing native sample-rate notifications or implement
 format conversion.
 
-This is partial implementation of #121. Generation fencing for native callbacks,
+Each supervised attempt also owns an atomic callback admission flag. Retiring a
+tap revokes new frame/error delivery before native Stop; detach for asynchronous
+teardown and supervisor drop revoke it too. Failed startup revokes its retained
+sink, and every fresh attempt gets a new flag. This prevents retired callbacks
+from updating shared watchdog/session counters, reporting stale errors or adding
+PCM after the attempt ends. It applies even to a healthy tap retired by watchdog
+recovery, not only one that explicitly reported a fault.
+
+Two behavioral regressions first demonstrated retired frames reaching the sink
+and Stop accepting a second sample. Seven callback tests now cover faults,
+budgets/gaps, retirement, Stop/detach/drop, failed initial/recovery starts,
+callbacks emitted inside native Stop, and fresh-session delivery. The fence is
+nonblocking: callbacks already admitted before revocation may finish. It is not
+a native callback join, and does not replace physical teardown/quiescence checks.
+
+This is partial implementation of #121. Quiescence of native callbacks already in flight,
 sleep-aware gaps, format-stable archive conversion, recovery of a microphone
 that failed its initial open, and bounded native recovery operations remain
 required. Closing the mailbox cancels queued work; it cannot interrupt a native
