@@ -49,7 +49,40 @@ status polls cannot restore them until the stop request finishes.
 browser fixture with a healthy system source and exhausted microphone. Retrying
 moves it through checking to healthy without opening devices or providers.
 
-This is partial implementation of #121. Generation fencing for native callbacks,
+Explicit device-invalidated, device-not-found and stream-format callback errors
+now latch their first timestamp in a per-attempt atomic mailbox. Further PCM
+from that faulted sink is refused. The next control poll enters recovery without
+waiting for starvation; retries retain the existing episode budget and spacing.
+Repeated errors cannot move the outage start, and an old sink's mailbox cannot
+fault a replacement. An exhausted callback fault requires explicit retry; unlike
+watchdog quarantine it cannot confirm health by accepting more suspect PCM.
+The eventual recovery gap uses `callback-fault` and preserves the first fault
+time even across exhaustion and manual retry.
+
+`crates/fotw-audio/tests/callback_recovery.rs` first failed because explicit
+callback faults still returned Healthy. Three synthetic tests cover prompt
+rebuild, post-fault PCM refusal, old-error isolation, attempt spacing/ceiling,
+Stop, and complete outage timestamps after manual retry. These checks do not
+prove native teardown or callback quiescence. The wrapper observes reported
+faults; it does not create missing native sample-rate notifications or implement
+format conversion.
+
+Each supervised attempt also owns an atomic callback admission flag. Retiring a
+tap revokes new frame/error delivery before native Stop; detach for asynchronous
+teardown and supervisor drop revoke it too. Failed startup revokes its retained
+sink, and every fresh attempt gets a new flag. This prevents retired callbacks
+from updating shared watchdog/session counters, reporting stale errors or adding
+PCM after the attempt ends. It applies even to a healthy tap retired by watchdog
+recovery, not only one that explicitly reported a fault.
+
+Two behavioral regressions first demonstrated retired frames reaching the sink
+and Stop accepting a second sample. Seven callback tests now cover faults,
+budgets/gaps, retirement, Stop/detach/drop, failed initial/recovery starts,
+callbacks emitted inside native Stop, and fresh-session delivery. The fence is
+nonblocking: callbacks already admitted before revocation may finish. It is not
+a native callback join, and does not replace physical teardown/quiescence checks.
+
+This is partial implementation of #121. Quiescence of native callbacks already in flight,
 sleep-aware gaps, format-stable archive conversion, recovery of a microphone
 that failed its initial open, and bounded native recovery operations remain
 required. Closing the mailbox cancels queued work; it cannot interrupt a native
