@@ -260,3 +260,14 @@ test('a pump transition observed before the POST reply releases the retry for a 
  h.ctx.renderRecording(body);
  assert.equal(button.disabled,false,'the pump already acknowledged the previous retry');
 });
+
+
+test('incomplete native cleanup explains restart and offers no retry',()=>{
+ const h=harness();
+ h.ctx.renderRecording({state:'recording',session_id:'fixture-session',elapsed_ms:1000,
+ capture_health:{system:{state:'healthy'},mic:{state:'cleanup_blocked'}}});
+ const panel=h.nodes.get('capture-health');
+ assert.match(panel.textContent,/System audio: Healthy/);
+ assert.match(panel.textContent,/Microphone: Audio cleanup incomplete; reopen FlyOnTheWall/);
+ assert.equal(h.all(panel).some(n=>n.tagName==='button'&&!n.hidden),false);
+});

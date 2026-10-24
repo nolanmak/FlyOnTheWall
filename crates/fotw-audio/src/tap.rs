@@ -62,6 +62,22 @@ pub trait AudioTap: Send {
 
     /// Stop delivering frames. Idempotent.
     fn stop(&mut self) -> Result<(), TapError>;
+
+    /// Report positive Stop evidence before potentially slow resource cleanup.
+    /// This is not a release acknowledgement; wait for the result as well.
+    fn stop_observed(&mut self, stopped: &mut dyn FnMut()) -> Result<(), TapError> {
+        let result = self.stop();
+        if result.is_ok()
+            || result
+                .as_ref()
+                .err()
+                .and_then(TapError::cleanup_state)
+                .is_some_and(|state| state.capture_stopped())
+        {
+            stopped();
+        }
+        result
+    }
 }
 
 impl fmt::Debug for dyn AudioTap {

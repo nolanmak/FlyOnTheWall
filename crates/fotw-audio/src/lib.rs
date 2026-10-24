@@ -73,7 +73,7 @@ pub mod wav;
 
 pub use crate::activity::{ActivityProbe, ActivitySnapshot, AudioClient, InputDevice, Transport};
 pub use crate::device_change::{DeviceChangeKind, DeviceChangeSignal, DeviceChanges};
-pub use crate::error::TapError;
+pub use crate::error::{CleanupState, TapError};
 pub use crate::events::{EventBus, PlatformEvent};
 pub use crate::format::{FormatRequest, SampleFormat, StreamFormat};
 pub use crate::frames::{CaptureTimestamp, FrameFlags, FrameSink};

@@ -21,11 +21,9 @@
 //!    macOS 26 — always pass `Some`.
 //! 6. `AudioDeviceStart`.
 //!
-//! Teardown is RAII, which is the reason `cidre` was chosen over
-//! `objc2-core-audio`: `StartedDevice`, `AggregateDevice` and `TapGuard` drop
-//! in the correct order. A daemon that starts and stops capture per meeting
-//! leaks private aggregate devices otherwise, and that is the failure that
-//! shows up in week six rather than on day one.
+//! Teardown explicitly stops and unregisters the callback, drains its queue,
+//! then destroys the aggregate and process tap. Unconfirmed cleanup retains
+//! callback lifetimes and blocks subsequent capture until process restart.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -33,13 +31,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use cidre::{
     arc, blocks, cat, cf,
     core_audio::{
-        self as ca, AggregateDevice, DeviceIoBlock, DeviceIoProcId, TapDesc, TapGuard,
-        aggregate_device_keys as agg,
-        hardware::{StartedDevice, sub_tap_keys},
+        self as ca, AggregateDevice, TapDesc, aggregate_device_keys as agg, hardware::sub_tap_keys,
     },
     dispatch, ns,
 };
 
+use super::capture_assets::NativeAssets;
+use super::capture_lifecycle::{CaptureOwner, Failure};
 use crate::clock;
 use crate::error::TapError;
 use crate::format::{SampleFormat, StreamFormat};
@@ -58,25 +56,15 @@ pub struct SystemTap {
     excluded: Vec<AppRef>,
     hint: StreamFormat,
     running: Option<Running>,
+    cleanup_failure: Option<Failure>,
     state: Arc<IoState>,
 }
 
 /// The live Core Audio objects. Dropping this tears everything down in order.
 struct Running {
     format: StreamFormat,
-    // Declaration order IS teardown order: the started device stops first,
-    // then the aggregate is destroyed, then the tap. Reordering these fields
-    // would destroy a tap that an aggregate still references.
-    _started: StartedDevice<AggregateDevice>,
-    _tap: TapGuard,
-    _block: arc::R<DeviceIoBlock>,
-    _queue: arc::R<dispatch::Queue>,
-    _proc_id: DeviceIoProcId,
+    capture: CaptureOwner<NativeAssets>,
 }
-
-// The Core Audio objects are driven from a dedicated dispatch queue and are
-// not shared across threads by this type.
-unsafe impl Send for Running {}
 
 impl std::fmt::Debug for SystemTap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -101,6 +89,7 @@ impl SystemTap {
             // A hint only. Overwritten with the ASBD the platform reports.
             hint: StreamFormat::new(48_000, 2, SampleFormat::F32),
             running: None,
+            cleanup_failure: None,
             state: Arc::new(IoState {
                 sink: Mutex::new(None),
                 device_frames: AtomicU64::new(0),
@@ -205,7 +194,7 @@ impl SystemTap {
         let state = Arc::clone(&self.state);
         let channels = format.channels as u32;
 
-        let mut block = blocks::EscBlock::new5(
+        let block = blocks::EscBlock::new5(
             move |_now: &cat::AudioTimeStamp,
                   input: &cat::AudioBufList<1>,
                   _input_time: &cat::AudioTimeStamp,
@@ -215,26 +204,8 @@ impl SystemTap {
             },
         );
 
-        let proc_id = device
-            // Passing None here silently fails to register the block on
-            // macOS 26 — the callback never fires and nothing errors.
-            .create_io_proc_id_with_block(Some(&queue), &mut block)
-            .map_err(|e| {
-                TapError::platform(format!("AudioDeviceCreateIOProcIDWithBlock failed: {e:?}"))
-            })?;
-
-        // --- 6. Start. THIS is what triggers the TCC prompt. -------------
-        let started = ca::device_start(device, Some(proc_id))
-            .map_err(|e| TapError::platform(format!("AudioDeviceStart failed: {e:?}")))?;
-
-        Ok(Running {
-            format,
-            _started: started,
-            _tap: tap,
-            _block: block,
-            _queue: queue,
-            _proc_id: proc_id,
-        })
+        let capture = CaptureOwner::start(NativeAssets::system(device, tap, block, queue))?;
+        Ok(Running { format, capture })
     }
 }
 
@@ -291,6 +262,13 @@ fn asbd_to_format(asbd: &cat::AudioStreamBasicDesc) -> Result<StreamFormat, TapE
     Ok(format)
 }
 
+impl Drop for SystemTap {
+    fn drop(&mut self) {
+        // Revoke the application sink even when callers rely on Drop alone.
+        let _ = crate::tap::AudioTap::stop(self);
+    }
+}
+
 impl crate::tap::AudioTap for SystemTap {
     fn id(&self) -> &TapId {
         &self.id
@@ -305,29 +283,61 @@ impl crate::tap::AudioTap for SystemTap {
     }
 
     fn start(&mut self, sink: Box<dyn FrameSink>) -> Result<StreamFormat, TapError> {
+        NativeAssets::check_system()?;
         if self.running.is_some() {
             return Err(TapError::platform("tap is already started"));
         }
         // Initialize the capture epoch/timebase on the control thread before
         // native startup can invoke the real-time callback.
         let _ = clock::host_ns();
-        let running = self.build(sink)?;
-        let format = running.format;
-        self.running = Some(running);
-        Ok(format)
+        if let Some(failure) = &self.cleanup_failure {
+            return Err(failure.error());
+        }
+        match self.build(sink) {
+            Ok(running) => {
+                let format = running.format;
+                self.running = Some(running);
+                Ok(format)
+            }
+            Err(error) => {
+                self.cleanup_failure = Failure::from_error(&error);
+                self.state
+                    .sink
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                Err(error)
+            }
+        }
     }
 
     fn stop(&mut self) -> Result<(), TapError> {
-        // Dropping `Running` performs the full documented teardown in order:
-        // AudioDeviceStop -> destroy aggregate -> destroy tap. Partial
-        // recovery is documented as unreliable, so we never do it piecemeal.
-        self.running = None;
-        let mut guard = self
-            .state
+        self.stop_observed(&mut || {})
+    }
+    fn stop_observed(&mut self, stopped: &mut dyn FnMut()) -> Result<(), TapError> {
+        // Revoke application delivery and finish any admitted sink call before
+        // entering native Stop/unregistration. Retained failed callbacks see None.
+        self.state
             .sink
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        *guard = None;
-        Ok(())
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(failure) = &self.cleanup_failure {
+            if failure.state.capture_stopped() {
+                stopped();
+            }
+            return Err(failure.error());
+        }
+        let result = match self.running.take() {
+            Some(mut running) => running.capture.close_observed(stopped),
+            None => {
+                stopped();
+                Ok(())
+            }
+        };
+        if let Err(error) = &result {
+            self.cleanup_failure = Failure::from_error(error);
+        }
+        result
     }
 }

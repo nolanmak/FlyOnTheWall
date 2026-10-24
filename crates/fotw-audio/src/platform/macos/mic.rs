@@ -16,14 +16,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use cidre::{
-    arc, blocks, cat,
-    core_audio::{
-        self as ca, Device, DeviceIoBlock, DeviceIoProcId, System, hardware::StartedDevice,
-    },
-    dispatch,
-};
+use cidre::{blocks, cat, core_audio::System, dispatch};
 
+use super::capture_assets::NativeAssets;
+use super::capture_lifecycle::{CaptureOwner, Failure};
 use crate::clock;
 use crate::error::TapError;
 use crate::format::{SampleFormat, StreamFormat};
@@ -40,19 +36,14 @@ pub struct MicTap {
     id: TapId,
     hint: StreamFormat,
     running: Option<Running>,
+    cleanup_failure: Option<Failure>,
     state: Arc<IoState>,
 }
 
 struct Running {
     format: StreamFormat,
-    // Field order is teardown order, as in the system tap.
-    _started: StartedDevice<Device>,
-    _block: arc::R<DeviceIoBlock>,
-    _queue: arc::R<dispatch::Queue>,
-    _proc_id: DeviceIoProcId,
+    capture: CaptureOwner<NativeAssets>,
 }
-
-unsafe impl Send for Running {}
 
 impl std::fmt::Debug for MicTap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -76,6 +67,7 @@ impl MicTap {
             id: TapId::mic(uid),
             hint: StreamFormat::new(48_000, 1, SampleFormat::F32),
             running: None,
+            cleanup_failure: None,
             state: Arc::new(IoState {
                 sink: Mutex::new(None),
                 device_frames: AtomicU64::new(0),
@@ -110,7 +102,7 @@ impl MicTap {
         let state = Arc::clone(&self.state);
         let channels = u64::from(format.channels.max(1));
 
-        let mut block = blocks::EscBlock::new5(
+        let block = blocks::EscBlock::new5(
             move |_now: &cat::AudioTimeStamp,
                   input: &cat::AudioBufList<1>,
                   _input_time: &cat::AudioTimeStamp,
@@ -120,24 +112,8 @@ impl MicTap {
             },
         );
 
-        let proc_id = device
-            .create_io_proc_id_with_block(Some(&queue), &mut block)
-            .map_err(|e| {
-                TapError::platform(format!(
-                    "mic AudioDeviceCreateIOProcIDWithBlock failed: {e:?}"
-                ))
-            })?;
-
-        let started = ca::device_start(device, Some(proc_id))
-            .map_err(|e| TapError::platform(format!("mic AudioDeviceStart failed: {e:?}")))?;
-
-        Ok(Running {
-            format,
-            _started: started,
-            _block: block,
-            _queue: queue,
-            _proc_id: proc_id,
-        })
+        let capture = CaptureOwner::start(NativeAssets::mic(device, block, queue))?;
+        Ok(Running { format, capture })
     }
 }
 
@@ -178,6 +154,13 @@ fn on_io(state: &IoState, input: &cat::AudioBufList<1>, channels: u64) {
     sink.on_frames(pcm, CaptureTimestamp::new(before, clock::host_ns()), flags);
 }
 
+impl Drop for MicTap {
+    fn drop(&mut self) {
+        // Revoke the application sink even when callers rely on Drop alone.
+        let _ = crate::tap::AudioTap::stop(self);
+    }
+}
+
 impl crate::tap::AudioTap for MicTap {
     fn id(&self) -> &TapId {
         &self.id
@@ -192,27 +175,62 @@ impl crate::tap::AudioTap for MicTap {
     }
 
     fn start(&mut self, sink: Box<dyn FrameSink>) -> Result<StreamFormat, TapError> {
+        NativeAssets::check_mic()?;
         if self.running.is_some() {
             return Err(TapError::platform("mic tap is already started"));
         }
         // Initialize the capture epoch/timebase on the control thread before
         // native startup can invoke the real-time callback.
         let _ = clock::host_ns();
-        let running = self.build(sink)?;
-        let format = running.format;
-        self.running = Some(running);
-        Ok(format)
+        if let Some(failure) = &self.cleanup_failure {
+            return Err(failure.error());
+        }
+        match self.build(sink) {
+            Ok(running) => {
+                let format = running.format;
+                self.running = Some(running);
+                Ok(format)
+            }
+            Err(error) => {
+                self.cleanup_failure = Failure::from_error(&error);
+                self.state
+                    .sink
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                Err(error)
+            }
+        }
     }
 
     fn stop(&mut self) -> Result<(), TapError> {
-        self.running = None;
-        let mut guard = self
-            .state
+        self.stop_observed(&mut || {})
+    }
+    fn stop_observed(&mut self, stopped: &mut dyn FnMut()) -> Result<(), TapError> {
+        // Revoke application delivery and finish any admitted sink call before
+        // entering native Stop/unregistration. Retained failed callbacks see None.
+        self.state
             .sink
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        *guard = None;
-        Ok(())
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(failure) = &self.cleanup_failure {
+            if failure.state.capture_stopped() {
+                stopped();
+            }
+            return Err(failure.error());
+        }
+        let result = match self.running.take() {
+            Some(mut running) => running.capture.close_observed(stopped),
+            None => {
+                stopped();
+                Ok(())
+            }
+        };
+        if let Err(error) = &result {
+            self.cleanup_failure = Failure::from_error(error);
+        }
+        result
     }
 }
 

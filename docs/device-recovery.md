@@ -133,3 +133,30 @@ observed before the POST reply also counts as acknowledgement. Stop and session
 replacement still discard the old request.
 
 Archive conversion and recovery ordering are described in [recovery-archive.md](recovery-archive.md).
+
+
+### Native registration cleanup
+
+macOS capture now explicitly calls Stop, unregisters its IOProc, drains the serial
+callback queue, destroys an owned aggregate, then destroys its process tap. The
+microphone follows the same registration lifetime without destroying the physical
+device. A failed Start after registration follows the same teardown path.
+
+A Stop error does not imply that capture continues: successful unregistration can
+still prove capture stopped and permit full resource release. `TapError::Cleanup`
+reports `Released`, `Stopped` (resources retained), or `Unconfirmed`. The optional
+`AudioTap::stop_observed` notification reports confirmed capture cessation before
+potentially slow resource cleanup; the result remains the cleanup acknowledgment.
+
+Incomplete cleanup retains the callback/block/queue/device bundle until process
+exit instead of freeing memory still referenced by native code. The supervisor
+blocks both automatic and manual retry, and macOS fences later tap instances for
+that source across recording sessions. The recording health panel asks the user
+to reopen FlyOnTheWall. The other source can continue recording.
+
+These tests inject registration/start/stop/unregistration/dependency failures;
+they do not exercise real microphones, process-tap permissions, sleep/wake, or
+physical USB/Bluetooth changes. Native calls remain synchronous and can block;
+controller deadlines and ownership must be validated separately. Early process-tap
+setup failures before a callback is owned still use cidre's guards and require a
+separate teardown audit. This change does not close the full device-recovery issue.

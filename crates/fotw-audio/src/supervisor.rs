@@ -16,13 +16,10 @@
 //!   -> recreate tap -> recreate aggregate -> new IOProc -> AudioDeviceStart
 //! ```
 //!
-//! Above the seam that is: stop the tap, **drop it**, and only then ask the
-//! factory for a new one. On macOS the drop is what performs the second half
-//! of the teardown — `SystemTap`'s live objects are RAII guards whose
-//! declaration order *is* destruction order — so a supervisor that reused the
-//! old object would silently be doing the partial recovery the spec warns
-//! against. `tests/watchdog.rs` asserts the ordering against a journalling
-//! fake, because it is invisible in the type system.
+//! Above the seam, stop and drop the old tap before asking the factory for a
+//! replacement. macOS stop explicitly unregisters and drains callbacks before
+//! releasing the aggregate and process tap. Incomplete teardown fences all
+//! subsequent attempts; errors with confirmed release may still recover.
 //!
 //! # Nothing already written is ever lost
 //!
@@ -86,7 +83,7 @@ use std::time::Duration;
 
 use crate::clock::Clock;
 use crate::device_change::{Debounce, DeviceChangeKind, DeviceChangeSignal, DeviceChanges};
-use crate::error::TapError;
+use crate::error::{CleanupState, TapError};
 use crate::format::StreamFormat;
 use crate::frames::{CaptureTimestamp, FrameFlags, FrameSink};
 use crate::ids::TapId;
@@ -397,6 +394,8 @@ pub enum DeliveryState {
     Recovering,
     /// Automatic attempts are exhausted; explicit retry is available.
     Exhausted,
+    /// Native resources remain retained; reopening requires process restart.
+    CleanupBlocked,
     /// Supervision has ended.
     Stopped,
 }
@@ -613,6 +612,7 @@ pub struct CaptureSupervisor {
     last_attempt_ns: Option<u64>,
     episode_attempts: u32,
     retry_requested: bool,
+    cleanup_blocked: Option<(CleanupState, String)>,
     ineffective_recoveries: u32,
     health_confirmed: bool,
     healthy_since_ns: Option<u64>,
@@ -673,6 +673,7 @@ impl CaptureSupervisor {
             last_attempt_ns: None,
             episode_attempts: 0,
             retry_requested: false,
+            cleanup_blocked: None,
             ineffective_recoveries: 0,
             health_confirmed: false,
             healthy_since_ns: None,
@@ -702,8 +703,41 @@ impl CaptureSupervisor {
 
     fn start_observed(&mut self, tap: &mut dyn AudioTap) -> Result<StreamFormat, TapError> {
         let result = tap.start(self.observing_sink());
-        if result.is_err() {
+        if let Err(error) = &result {
             self.retire_callbacks();
+            self.remember_cleanup(error);
+        }
+        result
+    }
+
+    fn remember_cleanup(&mut self, error: &TapError) {
+        if let TapError::Cleanup { state, message } = error
+            && !state.resources_released()
+        {
+            self.cleanup_blocked = Some((*state, message.clone()));
+        }
+    }
+
+    fn cleanup_error(&self) -> Option<TapError> {
+        self.cleanup_blocked
+            .as_ref()
+            .map(|(state, message)| TapError::Cleanup {
+                state: *state,
+                message: message.clone(),
+            })
+    }
+
+    fn stop_tap(&mut self) -> Result<(), TapError> {
+        let Some(mut tap) = self.tap.take() else {
+            return self.cleanup_error().map_or(Ok(()), Err);
+        };
+        let result = tap.stop();
+        if let Err(error) = &result {
+            if error.cleanup_state().is_none() {
+                self.cleanup_blocked = Some((CleanupState::Unconfirmed, error.to_string()));
+            } else {
+                self.remember_cleanup(error);
+            }
         }
         result
     }
@@ -720,10 +754,19 @@ impl CaptureSupervisor {
 
     /// Open and start the tap.
     pub fn start(&mut self) -> Result<StreamFormat, TapError> {
+        if let Some(error) = self.cleanup_error() {
+            return Err(error);
+        }
         if !matches!(self.state, State::Idle) {
             return Err(TapError::AlreadyRunning);
         }
-        let mut tap = (self.open)()?;
+        let mut tap = match (self.open)() {
+            Ok(tap) => tap,
+            Err(error) => {
+                self.remember_cleanup(&error);
+                return Err(error);
+            }
+        };
         let format = self.start_observed(&mut *tap)?;
         let now = self.clock.now_ns();
         self.tap = Some(tap);
@@ -783,7 +826,9 @@ impl CaptureSupervisor {
                         .saturating_add(retry_in.as_nanos() as u64),
                     last_error: error.to_string(),
                 };
-                if self.episode_attempts >= self.config.max_attempts {
+                if self.cleanup_blocked.is_some()
+                    || self.episode_attempts >= self.config.max_attempts
+                {
                     self.events.push(HealthEvent::GaveUp {
                         tap: self.config.id.clone(),
                         attempts: 1,
@@ -811,10 +856,7 @@ impl CaptureSupervisor {
     /// that as a fault would resurrect capture after the recording closed.
     pub fn stop(&mut self) -> Result<(), TapError> {
         self.retire_callbacks();
-        let result = match self.tap.take() {
-            Some(mut tap) => tap.stop(),
-            None => Ok(()),
-        };
+        let result = self.stop_tap();
         self.state = State::Idle;
         self.debounce.clear();
         self.pending_changes = DeviceChanges::empty();
@@ -887,16 +929,20 @@ impl CaptureSupervisor {
     /// Content-free source status. Opening a tap alone never reports healthy.
     #[must_use]
     pub fn recovery_status(&self) -> RecoveryStatus {
-        let (state, retry_in_ms) = match &self.state {
-            State::Idle => (DeliveryState::Stopped, None),
-            State::Recovering(r) => (
-                DeliveryState::Recovering,
-                Some(r.next_attempt_ns.saturating_sub(self.clock.now_ns()) / 1_000_000),
-            ),
-            State::Abandoned(_) | State::Quarantined => (DeliveryState::Exhausted, None),
-            State::Running if self.no_audio_notified => (DeliveryState::Quiet, None),
-            State::Running if self.health_confirmed => (DeliveryState::Healthy, None),
-            State::Running => (DeliveryState::Confirming, None),
+        let (state, retry_in_ms) = if self.cleanup_blocked.is_some() {
+            (DeliveryState::CleanupBlocked, None)
+        } else {
+            match &self.state {
+                State::Idle => (DeliveryState::Stopped, None),
+                State::Recovering(r) => (
+                    DeliveryState::Recovering,
+                    Some(r.next_attempt_ns.saturating_sub(self.clock.now_ns()) / 1_000_000),
+                ),
+                State::Abandoned(_) | State::Quarantined => (DeliveryState::Exhausted, None),
+                State::Running if self.no_audio_notified => (DeliveryState::Quiet, None),
+                State::Running if self.health_confirmed => (DeliveryState::Healthy, None),
+                State::Running => (DeliveryState::Confirming, None),
+            }
         };
         RecoveryStatus {
             state,
@@ -927,7 +973,9 @@ impl CaptureSupervisor {
     /// until the next poll; stopping cancels the request. The attempt spacing
     /// still applies, even when a user requests another episode immediately.
     pub fn request_retry(&mut self) -> bool {
-        if !matches!(self.state, State::Abandoned(_) | State::Quarantined) {
+        if self.cleanup_blocked.is_some()
+            || !matches!(self.state, State::Abandoned(_) | State::Quarantined)
+        {
             return false;
         }
         self.retry_requested = true;
@@ -943,6 +991,9 @@ impl CaptureSupervisor {
         let now = self.clock.now_ns();
         if matches!(self.state, State::Idle) {
             return PollOutcome::Stopped;
+        }
+        if self.cleanup_blocked.is_some() {
+            return PollOutcome::Abandoned;
         }
         if std::mem::take(&mut self.retry_requested) {
             self.episode_attempts = 0;
@@ -1214,14 +1265,7 @@ impl CaptureSupervisor {
             return PollOutcome::Abandoned;
         }
         self.retire_callbacks();
-        // The full sequence, in order: stop, then destroy. Dropping the tap is
-        // what destroys the aggregate and then the tap itself, and it happens
-        // before anything new is created.
-        if let Some(mut tap) = self.tap.take() {
-            // A stop that fails still has to be followed by the drop: the
-            // whole point of the rebuild is that the old objects go away.
-            let _ = tap.stop();
-        }
+        let cleanup = self.stop_tap();
         self.format = None;
         let recovery = Recovery {
             unwritten_start_ns,
@@ -1229,8 +1273,21 @@ impl CaptureSupervisor {
             reason,
             attempt: 0,
             next_attempt_ns: self.next_attempt_at(now),
-            last_error: String::new(),
+            last_error: cleanup
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
         };
+        if self.cleanup_blocked.is_some() {
+            self.events.push(HealthEvent::GaveUp {
+                tap: self.config.id.clone(),
+                attempts: self.episode_attempts,
+                error: recovery.last_error.clone(),
+            });
+            self.state = State::Abandoned(recovery);
+            return PollOutcome::Abandoned;
+        }
         if now < recovery.next_attempt_ns {
             self.state = State::Recovering(recovery);
             PollOutcome::Waiting
@@ -1252,8 +1309,9 @@ impl CaptureSupervisor {
         let (tap, format) = match started {
             Ok(pair) => pair,
             Err(e) => {
+                self.remember_cleanup(&e);
                 recovery.last_error = e.to_string();
-                if recovery.attempt >= self.config.max_attempts {
+                if self.cleanup_blocked.is_some() || recovery.attempt >= self.config.max_attempts {
                     self.events.push(HealthEvent::GaveUp {
                         tap: self.config.id.clone(),
                         attempts: recovery.attempt,

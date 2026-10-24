@@ -60,6 +60,7 @@ impl CaptureMonitor {
                 DeliveryState::Quiet => CaptureDelivery::Quiet,
                 DeliveryState::Recovering => CaptureDelivery::Recovering,
                 DeliveryState::Exhausted => CaptureDelivery::Exhausted,
+                DeliveryState::CleanupBlocked => CaptureDelivery::CleanupBlocked,
                 DeliveryState::Stopped => CaptureDelivery::Stopped,
             },
             attempts: status.attempts,
@@ -150,5 +151,21 @@ mod tests {
         new.publish(CaptureSource::Mic, status(DeliveryState::Exhausted));
         assert!(!new.take_retry(CaptureSource::Mic));
         assert!(new.request_retry(CaptureSource::Mic));
+    }
+    #[test]
+    fn retained_native_cleanup_is_visible_and_cannot_queue_a_retry() {
+        let monitor = CaptureMonitor::default();
+        monitor.publish(CaptureSource::System, status(DeliveryState::Healthy));
+        monitor.publish(CaptureSource::Mic, status(DeliveryState::CleanupBlocked));
+        assert_eq!(
+            monitor.snapshot().unwrap().mic.state,
+            CaptureDelivery::CleanupBlocked
+        );
+        assert_eq!(
+            monitor.snapshot().unwrap().system.state,
+            CaptureDelivery::Healthy
+        );
+        assert!(!monitor.request_retry(CaptureSource::Mic));
+        assert!(!monitor.take_retry(CaptureSource::Mic));
     }
 }
