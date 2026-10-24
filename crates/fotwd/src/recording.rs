@@ -427,8 +427,20 @@ pub(crate) fn now_ms() -> u64 {
 /// unknown, and the unknown choice may be "audio never leaves this machine" —
 /// so the meeting records untranscribed rather than guessing Deepgram.
 fn configured_transcription(root: &Path) -> Transcription {
-    let settings = match crate::open_library(root) {
-        Ok(db) => SttSettings::read(&db),
+    transcription_for_choice(
+        crate::open_library(root).and_then(|db| SttSettings::read(&db)),
+        root,
+        keychain_transcription,
+    )
+}
+
+fn transcription_for_choice(
+    choice: Result<SttSettings, String>,
+    root: &Path,
+    deepgram: impl FnOnce() -> Transcription,
+) -> Transcription {
+    let settings = match choice {
+        Ok(settings) => settings,
         Err(e) => {
             diag!(
                 "  ! could not read the transcription settings; recording without a transcript: {e}"
@@ -437,7 +449,7 @@ fn configured_transcription(root: &Path) -> Transcription {
         }
     };
     match settings.engine {
-        SttEngine::Deepgram => keychain_transcription(),
+        SttEngine::Deepgram => deepgram(),
         SttEngine::Local => crate::stt::local_transcription(
             &settings,
             root.parent().unwrap_or(root),
@@ -446,6 +458,42 @@ fn configured_transcription(root: &Path) -> Transcription {
             true,
             session::mic_stt_enabled(std::env::var("FOTW_MIC_STT").ok().as_deref()),
         ),
+    }
+}
+
+#[cfg(test)]
+mod transcription_choice_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_saved_settings_never_reach_the_cloud_factory() {
+        let mut db =
+            fotw_store::Db::open_in_memory(&fotw_store::DbKey::from_bytes([0x36; 32])).unwrap();
+        for saved in ["{", "{}", r#"{"engine":"unknown-local"}"#] {
+            db.put_setting(crate::stt::SETTINGS_KEY, saved).unwrap();
+            let choice = SttSettings::read(&db);
+            assert!(choice.is_err());
+            let transcription =
+                transcription_for_choice(choice, Path::new("/unused-fixture"), || {
+                    panic!("invalid settings must not look up a cloud key or open a provider")
+                });
+            assert!(matches!(transcription, Transcription::Disabled));
+        }
+    }
+
+    #[test]
+    fn a_settings_read_failure_never_reaches_the_cloud_factory() {
+        let db =
+            fotw_store::Db::open_in_memory(&fotw_store::DbKey::from_bytes([0x37; 32])).unwrap();
+        db.conn().execute_batch("DROP TABLE settings").unwrap();
+        let choice = SttSettings::read(&db);
+        assert!(choice.is_err());
+        assert!(matches!(
+            transcription_for_choice(choice, Path::new("/unused-fixture"), || {
+                panic!("failed settings read must not select cloud")
+            }),
+            Transcription::Disabled
+        ));
     }
 }
 

@@ -43,28 +43,41 @@ pub enum SttEngine {
 
 /// The stored engine choice.
 ///
-/// Missing or unparseable reads as default — a fresh library, never an error —
-/// the same shape as the summary engine's settings.
+/// Only a missing settings row uses the fresh-library default. An unreadable
+/// or invalid saved choice must never silently enable cloud transcription.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct SttSettings {
     /// Which engine.
     pub engine: SttEngine,
     /// The ggml model file the local engine loads, as an absolute path.
+    #[serde(default)]
     pub model: String,
     /// ISO 639-1 code for the local engine. Empty detects per utterance.
+    #[serde(default)]
     pub language: String,
 }
 
 impl SttSettings {
     /// The settings in force for this library.
+    pub fn read(db: &Db) -> Result<Self, String> {
+        match db.get_setting(SETTINGS_KEY).map_err(|e| e.to_string())? {
+            None => Ok(Self::default()),
+            Some(saved) => serde_json::from_str(&saved).map_err(|_| {
+                "Saved transcription settings are invalid; select a transcription engine again"
+                    .into()
+            }),
+        }
+    }
+
+    /// Prepare settings for an explicit user engine selection. Valid stored
+    /// model/language choices survive; invalid settings can be repaired by
+    /// selecting an engine again. This never persists or starts transcription.
     #[must_use]
-    pub fn read(db: &Db) -> Self {
-        db.get_setting(SETTINGS_KEY)
-            .ok()
-            .flatten()
-            .and_then(|v| serde_json::from_str(&v).ok())
-            .unwrap_or_default()
+    pub fn for_selection(db: &Db, engine: SttEngine) -> Self {
+        let mut settings = Self::read(db).unwrap_or_default();
+        settings.engine = engine;
+        settings
     }
 
     /// Store these settings.
@@ -296,8 +309,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_empty_row_is_deepgram_and_the_default_model() {
-        let settings: SttSettings = serde_json::from_str("{}").unwrap();
+    fn an_explicit_engine_can_omit_optional_model_and_language() {
+        let settings: SttSettings = serde_json::from_str(r#"{"engine":"deepgram"}"#).unwrap();
         assert_eq!(settings.engine, SttEngine::Deepgram);
         assert_eq!(
             settings.model_path(Path::new("/data")),
@@ -323,14 +336,56 @@ mod tests {
     #[test]
     fn the_choice_is_stored_in_the_library() {
         let mut db = Db::open_in_memory(&fotw_store::DbKey::from_bytes([0x33; 32])).unwrap();
-        assert_eq!(SttSettings::read(&db), SttSettings::default());
+        assert_eq!(SttSettings::read(&db).unwrap(), SttSettings::default());
         let local = SttSettings {
             engine: SttEngine::Local,
             model: "/m/ggml-small.en.bin".into(),
             language: String::new(),
         };
         local.write(&mut db).unwrap();
-        assert_eq!(SttSettings::read(&db), local);
+        assert_eq!(SttSettings::read(&db).unwrap(), local);
+    }
+
+    #[test]
+    fn malformed_or_unknown_saved_choices_cannot_revert_to_cloud() {
+        let mut db = Db::open_in_memory(&fotw_store::DbKey::from_bytes([0x34; 32])).unwrap();
+        for saved in [
+            "{",
+            "null",
+            "[]",
+            "{}",
+            r#"{"engine":"local","model":123}"#,
+            r#"{"engine":"future-local-engine"}"#,
+            r#"{"model":"/models/ggml-small.en.bin"}"#,
+            r#"{"engine":"deepgram","unknown_privacy_policy":"local-only"}"#,
+        ] {
+            db.put_setting(SETTINGS_KEY, saved).unwrap();
+            assert!(
+                SttSettings::read(&db).is_err(),
+                "invalid saved choice must be surfaced: {saved}"
+            );
+            assert_eq!(
+                db.get_setting(SETTINGS_KEY).unwrap().as_deref(),
+                Some(saved)
+            );
+        }
+    }
+
+    #[test]
+    fn repairing_invalid_settings_requires_an_explicit_engine_choice() {
+        let mut db = Db::open_in_memory(&fotw_store::DbKey::from_bytes([0x35; 32])).unwrap();
+        db.put_setting(SETTINGS_KEY, "{").unwrap();
+        assert_eq!(
+            SttSettings::for_selection(&db, SttEngine::Local).engine,
+            SttEngine::Local
+        );
+        assert!(
+            SttSettings::read(&db).is_err(),
+            "preparing a choice does not silently rewrite the row"
+        );
+        let explicit = SttSettings::for_selection(&db, SttEngine::Local);
+        explicit.write(&mut db).unwrap();
+        assert_eq!(SttSettings::read(&db).unwrap().engine, SttEngine::Local);
     }
 
     #[test]
