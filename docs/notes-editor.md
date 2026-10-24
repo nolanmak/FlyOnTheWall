@@ -37,8 +37,8 @@ text in the textarea. The store/web regression suites and workspace Clippy pass;
 Outstanding before completion: live-session identity handoff; encrypted draft
 recovery across browser/daemon restarts; editor block tracking and first-key
 anchors through edits/reordering; actual browser keyboard/narrow-layout checks.
-The current saved-meeting editor retains supplied anchors without creating
-historic timestamps. Anchor remapping through text edits remains #13 work.
+The saved-meeting editor remaps supplied anchors without creating historic
+timestamps. Live first-keystroke capture and browser acceptance remain #13 work.
 Neither #122 nor #13 is complete.
 
 ## Persistent block identity
@@ -56,6 +56,33 @@ A regression test first demonstrated that editing/reordering changed the stored
 ID. Store and HTTP tests now preserve IDs/offsets across text/index updates and
 verify atomic rejection of changed offsets, duplicate identities and identity
 reuse from another meeting. Existing export/import and store regression tests
-pass. These guarantees apply to caller-supplied block edits; the current freeform
-textarea does not yet identify the user's block operations. No claim of complete
-anchor remapping or live recording-time capture is made.
+pass. These guarantees apply to caller-supplied block edits; the editor integration below tracks supported block operations. No claim of
+complete live recording-time capture or browser acceptance is made.
+
+## Editor block operations
+
+The textarea identifies paragraphs, list items, headings, individual quoted lines
+and fenced code blocks. It preserves the original Markdown during typing; blank
+lines inside a fence do not split the block. Anchors follow unchanged snapshots
+through reorder, and in-place typing updates the snapshot while keeping its ID
+and original time. Native `beforeinput` selection evidence distinguishes edits
+or deletions of otherwise identical paragraphs. A split keeps the leading
+block's original anchor; a merge keeps the leading surviving anchor. Deleting a
+block removes its anchor; retyping or pasting a new block into a saved meeting
+does not invent a historical time.
+
+“Move block up/down” moves the block containing the cursor, including its ID,
+even when neighboring blocks have identical text. Movement separates blocks with
+blank lines while preserving their internal text, and restores focus/selection.
+Use these controls for an unambiguous move: deleting through cut then pasting is
+treated as deletion and creation. A whole-document replacement that cannot be
+mapped to surviving blocks drops ambiguous anchors rather than attaching them
+to unrelated text. The block grammar is intentionally the editor's documented
+subset, not a complete CommonMark parser.
+
+Red/green tests cover edits, reorder, insertion, deletion/recreation, duplicate
+paragraph edits/deletion, split/merge, fenced code, Unicode, explicit identical
+block movement and matching text/anchor snapshots during in-flight saves. A
+mounted-control test verifies keyboard focus and the emitted save payload. All
+63 UI tests pass; actual browser/IME, mobile selection and live recording-time
+checks remain outstanding.
