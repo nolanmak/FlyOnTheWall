@@ -23,7 +23,7 @@
 //!
 //! The model itself sits behind [`Recognizer`], so everything here is tested
 //! with a scripted recognizer and no weights; the whisper.cpp binding is in
-//! [`crate::whisper`].
+//! `crate::whisper` (feature `local-whisper`).
 
 use std::collections::VecDeque;
 use std::sync::Arc;

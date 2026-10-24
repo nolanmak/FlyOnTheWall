@@ -27,7 +27,7 @@
 //!
 //! On-device transcription follows the same split: [`local`]'s endpointer and
 //! segment builder are pure, its worker thread is the transport, and the model
-//! sits behind a trait whose whisper.cpp implementation, [`whisper`], is the
+//! sits behind a trait whose whisper.cpp implementation, `whisper` (feature `local-whisper`), is the
 //! only code here that needs weights to test.
 //!
 //! See `docs/REQUIREMENTS.md` §7.
@@ -38,6 +38,8 @@
 pub mod backoff;
 pub mod capabilities;
 pub mod clock;
+#[cfg(any(test, feature = "conformance"))]
+pub mod conformance;
 pub mod dedupe;
 pub mod deepgram;
 pub mod deepgram_stream;
@@ -49,7 +51,7 @@ pub mod speaker;
 pub mod store;
 pub mod stream;
 pub mod transcript;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "local-whisper"))]
 pub mod whisper;
 
 pub use backoff::{BackoffPolicy, FixedJitter, Jitter, ProcessJitter, ReconnectBudget};
@@ -69,5 +71,5 @@ pub use store::{
 };
 pub use stream::{StreamEvent, StreamState};
 pub use transcript::{Source, TimestampSource, TranscriptSegment, Word};
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "local-whisper"))]
 pub use whisper::WhisperEngine;
