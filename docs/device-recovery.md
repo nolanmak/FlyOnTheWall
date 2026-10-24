@@ -19,12 +19,22 @@ cargo test -p fotw-audio --test watchdog
 just ci
 ```
 
-This is partial implementation of #121. Failed-open retries still use the older
-backoff policy, device changes can initiate separate rebuilds, and a successful
-start still emits `Recovered` before sustained health is established. Unifying
-these into three-attempt episodes at least fifteen seconds apart, publishing
-accurate UI recovery state/manual retry, generation fencing, sleep-aware gaps,
-and format-stable archive conversion remain required. Native input format
+Recovery attempts now share one episode across failed opens, successful starts
+that do not restore sustained health, and route changes. The default is three
+attempts, at least fifteen seconds apart; failed opens use capped exponential
+backoff. Exhaustion cannot be reset by route chatter. `request_retry()` queues
+an explicit new episode while preserving the original outage and spacing floor.
+Stop or taking the tap cancels a queued retry and detaches the old notification
+mailbox; reused supervisors need a new device watcher. Synthetic tests exposed
+five default retries, a reset after brief success, and 167 open calls (including
+initial startup) under route chatter before the fix. They verify mixed failures, successful route rebuilds,
+manual retry/gap boundaries, and stopped-session notification isolation.
+
+This is partial implementation of #121. A successful start still emits
+`Recovered` before sustained health is established. Accurate UI recovery state
+and manual-retry wiring, generation fencing for native callbacks, sleep-aware
+gaps, format-stable archive conversion, and bounded native recovery operations
+remain required. Native input format
 validation does not itself implement live format notifications or conversion.
 Signed-app device/sleep tests and full-pipeline persisted-audio checks remain
 acceptance gates; synthetic supervisor tests do not prove them.

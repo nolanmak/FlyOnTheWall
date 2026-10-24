@@ -631,6 +631,7 @@ struct Harness {
     clock: Arc<ManualClock>,
     log: TapLog,
     opens: Arc<AtomicUsize>,
+    open_times: Arc<std::sync::Mutex<Vec<u64>>>,
     fail_opens: Arc<AtomicUsize>,
     sink: SinkHandle,
 }
@@ -641,6 +642,7 @@ impl Harness {
             clock: ManualClock::new(),
             log: TapLog::new(),
             opens: Arc::new(AtomicUsize::new(0)),
+            open_times: Arc::default(),
             fail_opens: Arc::new(AtomicUsize::new(0)),
             sink: SinkHandle::new(),
         }
@@ -662,12 +664,15 @@ impl Harness {
     ) -> CaptureSupervisor {
         let log = self.log.clone();
         let opens = Arc::clone(&self.opens);
+        let open_times = Arc::clone(&self.open_times);
+        let clock = Arc::clone(&self.clock);
         let fail = Arc::clone(&self.fail_opens);
         let sink = self.sink.clone();
         CaptureSupervisor::new(
             cfg,
             Arc::clone(&self.clock) as Arc<dyn fotw_audio::clock::Clock>,
             move || {
+                open_times.lock().unwrap().push(clock.now_ns());
                 let n = opens.fetch_add(1, Ordering::Relaxed);
                 if fail.load(Ordering::Relaxed) > 0 {
                     fail.fetch_sub(1, Ordering::Relaxed);
@@ -931,7 +936,7 @@ fn the_user_is_told_what_was_lost() {
 fn a_failed_rebuild_backs_off_and_the_gap_keeps_growing() {
     let h = Harness::new();
     let cfg = SupervisorConfig {
-        retry_backoff: Duration::from_millis(250),
+        retry_backoff: Duration::from_secs(15),
         ..supervisor_config()
     };
     let mut sup = h.supervisor(cfg.clone());
@@ -950,7 +955,7 @@ fn a_failed_rebuild_backs_off_and_the_gap_keeps_growing() {
     );
     let opens_after_first = h.opens.load(Ordering::Relaxed);
 
-    h.advance(Duration::from_millis(250));
+    h.advance(Duration::from_secs(15));
     assert_eq!(
         sup.poll(TapActivity::default(), &OutputActivity::Active),
         PollOutcome::Retrying
@@ -958,7 +963,7 @@ fn a_failed_rebuild_backs_off_and_the_gap_keeps_growing() {
     assert_eq!(h.opens.load(Ordering::Relaxed), opens_after_first + 1);
 
     // Third attempt succeeds. The backoff is exponential, so wait long enough.
-    h.advance(Duration::from_secs(5));
+    h.advance(Duration::from_secs(30));
     assert_eq!(
         sup.poll(TapActivity::default(), &OutputActivity::Active),
         PollOutcome::Rebuilt
@@ -1160,7 +1165,7 @@ fn a_device_change_cannot_rebuild_again_immediately_after_a_rebuild() {
     let mut sup = h.supervisor(cfg.clone());
     sup.start().unwrap();
 
-    let activity = TapActivity {
+    let mut activity = TapActivity {
         buffers: 1,
         silent_buffers: 0,
         frames: 4_800,
@@ -1189,7 +1194,17 @@ fn a_device_change_cannot_rebuild_again_immediately_after_a_rebuild() {
     assert_eq!(sup.rebuilds(), 1);
 
     // Once the floor has passed, a genuine change is honoured again.
-    h.advance(cfg.min_rebuild_interval);
+    // Keep delivering while waiting: advancing the clock without callbacks
+    // would test a starvation rebuild instead of the route-change policy.
+    for _ in 0..(cfg.min_rebuild_interval.as_millis() / TICK.as_millis()) {
+        h.advance(TICK);
+        activity.buffers += 1;
+        activity.frames += 4_800;
+        assert_ne!(
+            sup.poll(activity, &OutputActivity::Active),
+            PollOutcome::Rebuilt
+        );
+    }
     sup.signal().raise(DeviceChangeKind::DefaultOutput);
     sup.poll(activity, &OutputActivity::Active);
     h.advance(cfg.device_change_debounce + TICK);
@@ -1347,11 +1362,10 @@ fn a_healthy_tap_is_never_rebuilt() {
     assert!(sup.drain_events().is_empty());
 }
 
-/// Once recovery has been abandoned, a device change is new evidence — the
-/// user plugged something back in — and is worth another attempt. Without
-/// this, unplugging a dock at minute three costs the remaining 42 minutes.
+/// An exhausted episode can be resumed explicitly without losing its gap.
+/// Route changes alone cannot authorize unlimited new episodes (#121).
 #[test]
-fn a_device_change_re_arms_recovery_after_it_was_abandoned() {
+fn manual_retry_re_arms_recovery_after_it_was_abandoned() {
     let h = Harness::new();
     let cfg = SupervisorConfig {
         max_attempts: 1,
@@ -1382,7 +1396,7 @@ fn a_device_change_re_arms_recovery_after_it_was_abandoned() {
     }
     assert_eq!(h.opens.load(Ordering::Relaxed), opens);
 
-    // ...until the hardware changes underneath us.
+    // Route changes do not replenish the budget.
     sup.signal().raise(DeviceChangeKind::DefaultOutput);
     assert_eq!(
         sup.poll(TapActivity::default(), &OutputActivity::Active),
@@ -1390,6 +1404,12 @@ fn a_device_change_re_arms_recovery_after_it_was_abandoned() {
         "still inside the debounce window"
     );
     h.advance(cfg.device_change_debounce + TICK);
+    assert_eq!(
+        sup.poll(TapActivity::default(), &OutputActivity::Active),
+        PollOutcome::Abandoned
+    );
+    assert_eq!(h.opens.load(Ordering::Relaxed), opens);
+    assert!(sup.request_retry());
     assert_eq!(
         sup.poll(TapActivity::default(), &OutputActivity::Active),
         PollOutcome::Rebuilt
@@ -1687,4 +1707,189 @@ fn sustained_health_earns_a_new_budget_before_exhaustion() {
             sup.poll(activity, &OutputActivity::Active);
         }
     }
+}
+
+#[test]
+fn recovery_episode_defaults_limit_attempts_and_space_them_fifteen_seconds() {
+    let h = Harness::new();
+    let mut sup = h.supervisor(supervisor_config());
+    sup.start().unwrap();
+    h.fail_next_opens(100);
+    for _ in 0..1000 {
+        h.advance(TICK);
+        sup.poll(TapActivity::default(), &OutputActivity::Active);
+    }
+    let times = h.open_times.lock().unwrap();
+    assert_eq!(times.len(), 4, "initial start plus three recovery attempts");
+    for pair in times[1..].windows(2) {
+        assert!(
+            pair[1] - pair[0] >= 15_000_000_000,
+            "attempts too close: {times:?}"
+        );
+    }
+}
+
+#[test]
+fn recovery_episode_counts_failed_opens_and_brief_success_together() {
+    let h = Harness::new();
+    let mut sup = h.supervisor(supervisor_config());
+    sup.start().unwrap();
+    h.fail_next_opens(1);
+    h.advance(Duration::from_secs(5));
+    sup.poll(TapActivity::default(), &OutputActivity::Active);
+    h.advance(Duration::from_secs(15));
+    assert_eq!(
+        sup.poll(TapActivity::default(), &OutputActivity::Active),
+        PollOutcome::Rebuilt
+    );
+    let mut activity = TapActivity::default();
+    sup.poll(activity, &OutputActivity::Active);
+    for _ in 0..10 {
+        h.advance(TICK);
+        activity.buffers += 1;
+        activity.frames += 4_800;
+        sup.poll(activity, &OutputActivity::Active);
+    }
+    h.fail_next_opens(100);
+    for _ in 0..1000 {
+        h.advance(TICK);
+        sup.poll(activity, &OutputActivity::Active);
+    }
+    assert_eq!(
+        h.opens.load(Ordering::Relaxed),
+        4,
+        "a brief success cannot erase the first failed open"
+    );
+    let times = h.open_times.lock().unwrap();
+    assert!(times[1..].windows(2).all(|p| p[1] - p[0] >= 15_000_000_000));
+}
+
+#[test]
+fn recovery_episode_device_chatter_does_not_replenish_an_exhausted_budget() {
+    let h = Harness::new();
+    let mut sup = h.supervisor(supervisor_config());
+    sup.start().unwrap();
+    h.fail_next_opens(1000);
+    for _ in 0..200 {
+        sup.signal().raise(DeviceChangeKind::DefaultInput);
+        h.advance(Duration::from_secs(1));
+        sup.poll(TapActivity::default(), &OutputActivity::Active);
+    }
+    assert_eq!(
+        h.opens.load(Ordering::Relaxed),
+        4,
+        "route flapping must not repeatedly authorize a new recovery episode"
+    );
+}
+
+#[test]
+fn recovery_episode_manual_retry_keeps_spacing_and_the_original_gap() {
+    let h = Harness::new();
+    let mut sup = h.supervisor(SupervisorConfig {
+        max_attempts: 1,
+        ..supervisor_config()
+    });
+    sup.start().unwrap();
+    h.fail_next_opens(1);
+    h.advance(Duration::from_secs(5));
+    assert_eq!(
+        sup.poll(TapActivity::default(), &OutputActivity::Active),
+        PollOutcome::Abandoned
+    );
+    assert!(sup.request_retry());
+    assert_eq!(
+        sup.poll(TapActivity::default(), &OutputActivity::Active),
+        PollOutcome::Waiting
+    );
+    h.advance(Duration::from_millis(14_999));
+    assert_eq!(
+        sup.poll(TapActivity::default(), &OutputActivity::Active),
+        PollOutcome::Waiting
+    );
+    h.advance(Duration::from_millis(1));
+    assert_eq!(
+        sup.poll(TapActivity::default(), &OutputActivity::Active),
+        PollOutcome::Rebuilt
+    );
+    assert_eq!(h.opens.load(Ordering::Relaxed), 3);
+    let gaps: Vec<_> = sup
+        .drain_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            HealthEvent::Recovered { gaps, .. } => Some(gaps),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(gaps.len(), 1);
+    assert_eq!((gaps[0].start_ns, gaps[0].end_ns), (0, 20_000_000_000));
+}
+
+#[test]
+fn recovery_episode_stop_cancels_retry_and_detaches_old_notifications() {
+    let h = Harness::new();
+    let mut sup = h.supervisor(SupervisorConfig {
+        max_attempts: 1,
+        ..supervisor_config()
+    });
+    sup.start().unwrap();
+    let old_signal = sup.signal();
+    h.fail_next_opens(1);
+    h.advance(Duration::from_secs(5));
+    sup.poll(TapActivity::default(), &OutputActivity::Active);
+    assert!(sup.request_retry());
+    sup.stop().unwrap();
+    assert!(!sup.request_retry());
+    h.advance(Duration::from_secs(30));
+    assert_eq!(
+        sup.poll(TapActivity::default(), &OutputActivity::Active),
+        PollOutcome::Stopped
+    );
+    assert_eq!(h.opens.load(Ordering::Relaxed), 2);
+    sup.start().unwrap();
+    old_signal.raise(DeviceChangeKind::DefaultOutput);
+    sup.poll(TapActivity::default(), &OutputActivity::Active);
+    h.advance(Duration::from_secs(1));
+    sup.poll(TapActivity::default(), &OutputActivity::Active);
+    assert_eq!(
+        h.opens.load(Ordering::Relaxed),
+        3,
+        "old-generation events cannot rebuild a new session"
+    );
+    sup.signal().raise(DeviceChangeKind::DefaultOutput);
+    sup.poll(TapActivity::default(), &OutputActivity::Active);
+    h.advance(Duration::from_secs(1));
+    assert_eq!(
+        sup.poll(TapActivity::default(), &OutputActivity::Active),
+        PollOutcome::Rebuilt
+    );
+}
+
+#[test]
+fn recovery_episode_successful_route_rebuilds_share_the_budget() {
+    let h = Harness::new();
+    let mut cfg = supervisor_config();
+    // Exercise route notifications directly, without starvation winning first.
+    cfg.watchdog.no_buffer_timeout = Duration::from_secs(3600);
+    let mut sup = h.supervisor(cfg);
+    sup.start().unwrap();
+    for _ in 0..10 {
+        h.advance(Duration::from_secs(16));
+        sup.signal().raise(DeviceChangeKind::DefaultOutput);
+        sup.poll(TapActivity::default(), &OutputActivity::Active);
+        h.advance(Duration::from_secs(1));
+        sup.poll(TapActivity::default(), &OutputActivity::Active);
+    }
+    assert_eq!(h.opens.load(Ordering::Relaxed), 4);
+    assert!(sup.is_quarantined());
+    assert!(sup.request_retry());
+    assert_eq!(
+        sup.poll(TapActivity::default(), &OutputActivity::Active),
+        PollOutcome::Rebuilt
+    );
+    assert_eq!(h.opens.load(Ordering::Relaxed), 5);
+    assert!(
+        !sup.request_retry(),
+        "a running episode must not be replenished by retries"
+    );
 }
