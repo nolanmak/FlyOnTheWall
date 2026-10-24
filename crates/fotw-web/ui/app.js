@@ -1023,6 +1023,7 @@ function renderCaptureHealth(body) {
     quiet: "Silence detected",
     recovering: "Recovering audio",
     exhausted: "Automatic recovery stopped",
+    cleanup_blocked: "Audio cleanup incomplete; reopen FlyOnTheWall",
     stopped: "Stopped",
     unavailable: "Unavailable",
   };

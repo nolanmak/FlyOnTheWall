@@ -65,6 +65,8 @@ pub enum CaptureDelivery {
     Recovering,
     /// Automatic retry budget is exhausted.
     Exhausted,
+    /// Native resources remain retained; the app must restart before reopening.
+    CleanupBlocked,
     /// The recording has stopped.
     Stopped,
     /// This source could not be opened.

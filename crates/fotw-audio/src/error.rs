@@ -4,6 +4,29 @@ use std::io;
 
 use crate::ids::{DeviceId, TapId};
 
+/// Positive native teardown evidence, independent of an operation's error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CleanupState {
+    /// Capture stopped and every owned native registration/resource was released.
+    Released,
+    /// Capture stopped, but native resources remain unreleased.
+    Stopped,
+    /// Capture could not be confirmed stopped.
+    Unconfirmed,
+}
+impl CleanupState {
+    /// Whether native capture is positively confirmed stopped.
+    #[must_use]
+    pub const fn capture_stopped(self) -> bool {
+        !matches!(self, Self::Unconfirmed)
+    }
+    /// Whether every owned native resource was positively released.
+    #[must_use]
+    pub const fn resources_released(self) -> bool {
+        matches!(self, Self::Released)
+    }
+}
+
 /// Everything that can go wrong opening, starting, or running a tap.
 ///
 /// Deliberately platform-neutral: an OS status code is carried as text in
@@ -79,6 +102,16 @@ pub enum TapError {
         source: io::Error,
     },
 
+    /// Teardown had an error; callers must use its evidence before reopening.
+    /// Native codes remain diagnostic text, never control-flow inputs.
+    #[error("capture cleanup {state:?}: {message}")]
+    Cleanup {
+        /// Positive native teardown evidence.
+        state: CleanupState,
+        /// Diagnostic native operation failures.
+        message: String,
+    },
+
     /// The backend failed for a reason only it understands. The string carries
     /// the OS status; it is for logs and bug reports, never for control flow.
     #[error("platform error: {0}")]
@@ -86,6 +119,15 @@ pub enum TapError {
 }
 
 impl TapError {
+    /// Return positive teardown evidence when the backend supplied it.
+    #[must_use]
+    pub const fn cleanup_state(&self) -> Option<CleanupState> {
+        match self {
+            Self::Cleanup { state, .. } => Some(*state),
+            _ => None,
+        }
+    }
+
     /// Construct an [`TapError::Unsupported`] from anything stringy.
     pub fn unsupported(what: impl Into<String>) -> Self {
         Self::Unsupported(what.into())
