@@ -2,6 +2,9 @@
    to pull from another origin would be blocked, and a stylesheet that half
    loads is worse than one that does not try. */
 
+/* Component display rules must never reveal controls explicitly hidden by state. */
+[hidden] { display: none !important; }
+
 :root {
   color-scheme: light dark;
   --bg: #f6f7f5;

@@ -34,11 +34,11 @@ proves rollback of text, revision, anchors and the FTS index. UI tests use liter
 text in the textarea. The store/web regression suites and workspace Clippy pass;
 63 Node UI tests pass. Full workspace regression is also run before pushing.
 
-Outstanding before completion: live editor integration; encrypted draft
-recovery discovery across browser/daemon restarts; first-key anchors during
-recording; actual browser keyboard/narrow-layout checks.
+Outstanding before completion: encrypted draft recovery discovery across
+browser/daemon restarts; transcript-window augmentation; actual browser
+keyboard/IME/narrow-layout checks.
 The saved-meeting editor remaps supplied anchors without creating historic
-timestamps. Live first-keystroke capture and browser acceptance remain #13 work.
+timestamps. Live first-input capture is implemented below; browser acceptance remains #13 work.
 Neither #122 nor #13 is complete.
 
 ## Persistent block identity
@@ -105,8 +105,8 @@ Tests cover reopen recovery, ciphertext lacking a fixture plaintext marker,
 stale revisions, bounds, unchanged offsets, injected update failure, full archive
 roundtrips (including every column) and migration from a populated v4 library.
 
-This is not yet user-visible crash recovery: live editor integration and
-recovery discovery still need implementation. No new browser storage is used. The table is not a
+This is not yet user-visible crash recovery: recovery discovery still needs
+implementation. No new browser storage is used. The table is not a
 replacement for that complete flow, and #122/#13 remain open.
 
 ## Atomic handoff and late saves (store contract)
@@ -157,5 +157,52 @@ bound are enforced by the store on every late write.
 The synthetic HTTP test first failed on the missing authenticated route, then
 passed authentication, hostile-origin, forged-clock, wrong-session, bounds,
 stale-write, orphan-read, finalization-gap and first/late-save checks against a
-temporary encrypted library. The live editor and recovery discovery are still
-outstanding; these endpoints alone do not complete #122 or #13.
+temporary encrypted library. Recovery discovery and real browser acceptance remain outstanding; these
+endpoints alone do not complete #122 or #13.
+
+
+## Live editor and capture clock
+
+The recording pane now mounts the editor once per capture ID. Status polls and
+transcript updates do not rebuild it. Each draft retains its session endpoint;
+when the saved identity arrives, navigation reuses that draft, including pending
+writes. An independently edited saved-meeting draft is never silently replaced.
+Stop and navigation flush pending text, and a persisted-session event retries a
+save that arrived during the finalization gap. No note text enters browser storage.
+
+A newly created Markdown block receives an ID and recording offset synchronously
+in the input handler, before the 500 ms autosave timer. Further typing preserves
+that first time. Paste creates each new block at the same input time; splitting
+keeps the leading identity and gives a new trailing block the split time.
+Deleting then recreating creates a new identity/time. Existing unanchored text
+loaded from storage stays unanchored when edited. After Stop or a saved identity,
+new text has no historical recording anchor.
+
+The clock interpolates from the recorder's elapsed time, accounts for elapsed
+wall time across sleep, clamps a backward wall-clock jump, and refuses anchors
+at or beyond the announced automatic stop. Stop disables new anchors before its
+HTTP request; an in-flight recording poll cannot re-enable them. An old draft
+cannot use a new session's clock. If finalization reveals that newly typed blocks
+fall beyond the real capture end, retry retains their text and removes those
+out-of-bounds anchors. Metadata refresh never adopts a newer note revision to
+bypass conflict checking.
+
+Behavioral red/green tests covered the missing live mount, missing first-input
+anchor and absent capture-clock interpolation. The 70 UI tests now include
+live/saved navigation during a pending write, first-input timing, paste, edit,
+reorder, deletion/recreation, Stop, automatic bounds, clock rollback, finalization
+retry and preserving text after a late end-clock update. Real browser/IME,
+permission/hardware tests and encrypted orphan discovery remain separate gates.
+
+
+Native Chrome check (synthetic library, 2026-10-24): edited a saved note using
+macOS Accessibility input, observed Saved, navigated to another meeting without
+leaking the fixture text, returned to the original note, then reloaded the page
+and confirmed the saved fixture survived. A native keyboard path was used for
+meeting navigation. This check also caught a component display rule overriding
+`hidden` on the read-only consent label; a global `[hidden]` rule fixes it, and
+the rebuilt preview's accessibility tree confirms both consent and Start are
+absent while the library still renders. Test tabs, servers and temporary
+libraries were removed. CDP was unavailable and no browser settings changed.
+This establishes saved-note editing/navigation/reload, not live hardware capture,
+IME behavior or narrow-layout acceptance.
