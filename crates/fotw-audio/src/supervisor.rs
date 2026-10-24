@@ -211,7 +211,9 @@ pub enum HealthEvent {
         /// Whether it caused a full rebuild.
         rebuilt: bool,
     },
-    /// The tap was rebuilt and capture is running again.
+    /// A tap successfully restarted. This legacy name denotes the format/gap
+    /// boundary, not proven audio health. Writers must apply it immediately;
+    /// user interfaces wait for `DeliveryConfirmed` or a healthy snapshot.
     Recovered {
         /// Which tap.
         tap: TapId,
@@ -223,6 +225,12 @@ pub enum HealthEvent {
         format: StreamFormat,
         /// What the recording lost, and what the writer must do about it.
         gaps: Vec<CaptureGap>,
+    },
+    /// Ten seconds of sustained delivery confirmed recovery. Emitted once
+    /// after each recovery, separately from the writer's restart boundary.
+    DeliveryConfirmed {
+        /// Which tap.
+        tap: TapId,
     },
     /// A rebuild attempt failed; another is scheduled.
     RecoveryFailed {
@@ -277,6 +285,7 @@ impl HealthEvent {
     pub const fn is_user_visible(&self) -> bool {
         match self {
             Self::Recovered { .. }
+            | Self::DeliveryConfirmed { .. }
             | Self::GaveUp { .. }
             | Self::RecoveryIneffective { .. }
             | Self::NoAudioDetected { .. } => true,
@@ -309,10 +318,11 @@ impl HealthEvent {
             Self::Recovered { gaps, .. } => {
                 let lost: u64 = gaps.iter().map(CaptureGap::duration_ns).sum();
                 format!(
-                    "Audio capture recovered. {} of this recording is missing.",
+                    "Audio capture restarted; confirming healthy delivery. {} of this recording is missing.",
                     human_secs(lost)
                 )
             }
+            Self::DeliveryConfirmed { .. } => "Audio capture: healthy delivery confirmed.".into(),
             Self::RecoveryFailed { attempt, error, .. } => {
                 format!("Audio capture rebuild attempt {attempt} failed: {error}")
             }
@@ -365,6 +375,36 @@ pub enum PollOutcome {
     Retrying,
     /// Recovery was abandoned. The session continues without this leg.
     Abandoned,
+}
+
+/// A source's delivery state, distinct from whether a device handle opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryState {
+    /// The tap started, but sustained delivery is not yet confirmed.
+    Confirming,
+    /// Sustained delivery has been observed and no subsequent fault detected.
+    Healthy,
+    /// Silence without corroborating evidence of a broken tap.
+    Quiet,
+    /// The tap is absent while a bounded recovery episode runs.
+    Recovering,
+    /// Automatic attempts are exhausted; explicit retry is available.
+    Exhausted,
+    /// Supervision has ended.
+    Stopped,
+}
+
+/// A bounded, content-free snapshot for recorder status and user interfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryStatus {
+    /// Current delivery state.
+    pub state: DeliveryState,
+    /// Recovery attempts spent in the current episode.
+    pub attempts: u32,
+    /// Configured episode ceiling.
+    pub max_attempts: u32,
+    /// Remaining delay before a scheduled attempt, in milliseconds.
+    pub retry_in_ms: Option<u64>,
 }
 
 /// Thresholds and policy for [`CaptureSupervisor`].
@@ -532,6 +572,7 @@ pub struct CaptureSupervisor {
     episode_attempts: u32,
     retry_requested: bool,
     ineffective_recoveries: u32,
+    health_confirmed: bool,
     healthy_since_ns: Option<u64>,
     previous_delivery: Option<(u64, TapActivity)>,
     no_audio_notified: bool,
@@ -583,6 +624,7 @@ impl CaptureSupervisor {
             episode_attempts: 0,
             retry_requested: false,
             ineffective_recoveries: 0,
+            health_confirmed: false,
             healthy_since_ns: None,
             previous_delivery: None,
             no_audio_notified: false,
@@ -610,6 +652,7 @@ impl CaptureSupervisor {
         self.tap = Some(tap);
         self.format = Some(format);
         self.watchdog.arm(now);
+        self.health_confirmed = false;
         self.healthy_since_ns = None;
         self.previous_delivery = None;
         self.episode_attempts = 0;
@@ -617,6 +660,7 @@ impl CaptureSupervisor {
         self.last_attempt_ns = None;
         self.last_rebuild_ns = None;
         self.retry_requested = false;
+        self.no_audio_notified = false;
         self.state = State::Running;
         Ok(format)
     }
@@ -695,6 +739,28 @@ impl CaptureSupervisor {
     /// for one gap.
     pub fn drain_events(&mut self) -> Vec<HealthEvent> {
         std::mem::take(&mut self.events)
+    }
+
+    /// Content-free source status. Opening a tap alone never reports healthy.
+    #[must_use]
+    pub fn recovery_status(&self) -> RecoveryStatus {
+        let (state, retry_in_ms) = match &self.state {
+            State::Idle => (DeliveryState::Stopped, None),
+            State::Recovering(r) => (
+                DeliveryState::Recovering,
+                Some(r.next_attempt_ns.saturating_sub(self.clock.now_ns()) / 1_000_000),
+            ),
+            State::Abandoned(_) | State::Quarantined => (DeliveryState::Exhausted, None),
+            State::Running if self.no_audio_notified => (DeliveryState::Quiet, None),
+            State::Running if self.health_confirmed => (DeliveryState::Healthy, None),
+            State::Running => (DeliveryState::Confirming, None),
+        };
+        RecoveryStatus {
+            state,
+            attempts: self.episode_attempts,
+            max_attempts: self.config.max_attempts,
+            retry_in_ms,
+        }
     }
 
     /// Queue an explicit user retry after exhaustion. No device work happens
@@ -795,6 +861,12 @@ impl CaptureSupervisor {
         // flapping. Only a sustained run earns a fresh recovery budget.
         let stable = self.observe_delivery(now, activity, verdict);
         if stable {
+            if !self.health_confirmed && (self.episode_attempts > 0 || quarantined) {
+                self.events.push(HealthEvent::DeliveryConfirmed {
+                    tap: self.config.id.clone(),
+                });
+            }
+            self.health_confirmed = true;
             self.episode_attempts = 0;
             self.ineffective_recoveries = 0;
             if quarantined {
@@ -805,6 +877,7 @@ impl CaptureSupervisor {
         // A fault outranks a pending device change: both lead to the same
         // rebuild, and the fault carries the better gap boundaries.
         if let Verdict::Faulted(fault) = verdict {
+            self.health_confirmed = false;
             if quarantined {
                 // A brief return of audio must not release quarantine.
                 return PollOutcome::Abandoned;
@@ -822,6 +895,7 @@ impl CaptureSupervisor {
                 });
                 // Keep watching the existing tap without spending more gaps.
                 self.watchdog.arm(now);
+                self.health_confirmed = false;
                 self.healthy_since_ns = None;
                 self.previous_delivery = None;
                 self.state = State::Quarantined;
@@ -872,6 +946,7 @@ impl CaptureSupervisor {
                     rebuilt: false,
                 });
                 self.watchdog.arm(now);
+                self.health_confirmed = false;
                 self.healthy_since_ns = None;
                 self.previous_delivery = None;
                 return PollOutcome::Healthy;
@@ -894,6 +969,7 @@ impl CaptureSupervisor {
                 rebuilt: false,
             });
             self.watchdog.arm(now);
+            self.health_confirmed = false;
             self.healthy_since_ns = None;
             self.previous_delivery = None;
             return PollOutcome::Healthy;
@@ -905,6 +981,7 @@ impl CaptureSupervisor {
 
         match verdict {
             Verdict::NoAudio { for_ns } => {
+                self.health_confirmed = false;
                 if !self.no_audio_notified {
                     self.no_audio_notified = true;
                     self.events.push(HealthEvent::NoAudioDetected {
@@ -1039,6 +1116,7 @@ impl CaptureSupervisor {
         self.rebuilds += 1;
         self.last_rebuild_ns = Some(now);
         self.watchdog.arm(now);
+        self.health_confirmed = false;
         self.healthy_since_ns = None;
         self.previous_delivery = None;
         // A change that arrived during the outage has been answered by this

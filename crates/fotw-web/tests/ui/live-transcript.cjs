@@ -16,7 +16,7 @@ function harness(notes) {
     addEventListener(k,f){this.listeners[k]=f;} setAttribute(k,v){this[k]=v;}
   }
   const root=new Element('body');
-  const nodes=new Map(['list','detail','status','record','live','elapsed','consent','consent-label','recording','recording-limit','return-live'].map(id=>{let n=root.appendChild(new Element('div'));n.id=id;return [id,n];}));
+  const nodes=new Map(['list','detail','status','record','live','elapsed','consent','consent-label','recording','recording-limit','return-live','capture-health'].map(id=>{let n=root.appendChild(new Element('div'));n.id=id;return [id,n];}));
   const all=(n=root)=>[n,...n.children.flatMap(all)];
   const document={createElement:t=>new Element(t),getElementById:id=>all().find(n=>n.id===id)||null};
   const ctx=vm.createContext({FOTWNotes:notes,document,Date,Intl,Set,Map,URLSearchParams,window:{location:{search:''}},localStorage:{getItem:()=>null},setInterval:()=>1,clearInterval(){},setTimeout(){},XMLSerializer:class {serializeToString(n){return n.textContent;}}});
@@ -155,4 +155,64 @@ test('recovery navigation opens the selected draft and a late saved alias cannot
  h.ctx.renderRecording({state:'recording',session_id:'live-A',started_at_ms:1000,elapsed_ms:100});
  h.ctx.showRecoveredNote('live-A');assert.ok(h.document.getElementById('live-pane'));
  assert.equal(recovered.length,1,'active draft returns to the live editor');
+});
+
+test('capture health distinguishes a healthy system leg from an exhausted microphone',()=>{
+ const h=harness();
+ h.ctx.renderRecording({state:'recording',session_id:'fixture-session',started_at_ms:1000,
+ capture_health:{system:{state:'healthy',attempts:0,max_attempts:3},mic:{state:'exhausted',attempts:3,max_attempts:3}}});
+ const panel=h.nodes.get('capture-health');
+ assert.match(panel.textContent,/System audio: Healthy/);
+ assert.match(panel.textContent,/Microphone: Automatic recovery stopped/);
+ const retry=h.all(panel).find(n=>n.tagName==='button'&&!n.hidden);
+ assert.ok(retry,'exhausted source needs a manual retry');
+ assert.equal(retry.textContent,'Retry microphone');
+ h.ctx.renderRecording({state:'finishing',session_id:'fixture-session',elapsed_ms:1000});
+ assert.equal(panel.hidden,true);
+ assert.equal(panel.textContent,'');
+});
+
+test('recovery polling preserves controls and retry sends the exact session and source once',async()=>{
+ const h=harness(); const body={state:'recording',session_id:'fixture / A',started_at_ms:1000,
+ capture_health:{system:{state:'healthy',attempts:0,max_attempts:3},mic:{state:'exhausted',attempts:3,max_attempts:3}}};
+ h.ctx.renderRecording(body);const panel=h.nodes.get('capture-health');
+ const button=h.all(panel).find(n=>n.tagName==='button'&&!n.hidden);
+ let reply,calls=[];h.ctx.api=(url,opts)=>{calls.push([url,opts.method]);return new Promise(resolve=>reply=resolve);};
+ const pending=button.listeners.click();assert.equal(button.disabled,true);
+ h.ctx.renderRecording(body);
+ assert.equal(h.all(panel).find(n=>n.tagName==='button'&&!n.hidden),button,'polling must preserve focusable elements');
+ assert.equal(button.disabled,true);await button.listeners.click();assert.equal(calls.length,1);
+ assert.deepEqual(calls,[['/api/recording/retry?session_id=fixture%20%2F%20A&source=mic','POST']]);
+ reply({...body,capture_health:{...body.capture_health,mic:{state:'recovering',attempts:0,max_attempts:3,retry_in_ms:12000}}});await pending;
+ assert.match(panel.textContent,/Recovering audio/);assert.match(panel.textContent,/next attempt in 12s/);
+ assert.equal(button.hidden,true);
+});
+
+test('late recovery replies cannot restore a stopped or replaced recording',async()=>{
+ const h=harness(); const body={state:'recording',session_id:'old',started_at_ms:1000,
+ capture_health:{system:{state:'healthy'},mic:{state:'exhausted',attempts:3,max_attempts:3}}};
+ h.ctx.renderRecording(body);const button=h.all(h.nodes.get('capture-health')).find(n=>n.tagName==='button'&&!n.hidden);
+ let reply;h.ctx.api=url=>url.startsWith('/api/recording/retry') ? new Promise(resolve=>reply=resolve) : Promise.resolve({session_id:'new',deltas:[]});
+ const pending=button.listeners.click();
+ h.ctx.renderRecording({state:'finishing',session_id:'old',elapsed_ms:1000});
+ h.ctx.renderRecording({...body,session_id:'new',capture_health:{system:{state:'healthy'},mic:{state:'confirming'}}});
+ reply(body);await pending;
+ assert.equal(h.run('liveSessionId'),'new');
+ assert.match(h.nodes.get('capture-health').textContent,/Microphone: Checking audio delivery/);
+ assert.equal(h.all(h.nodes.get('capture-health')).some(n=>n.tagName==='button'&&!n.hidden),false);
+});
+
+test('Stop disables capture retry immediately even before its response arrives',async()=>{
+ const h=harness();const body={state:'recording',session_id:'fixture',started_at_ms:1000,
+ capture_health:{system:{state:'healthy'},mic:{state:'exhausted'}}};
+ h.ctx.renderRecording(body);const panel=h.nodes.get('capture-health');
+ const retry=h.all(panel).find(n=>n.tagName==='button'&&!n.hidden);
+ let resolveStop,calls=[];h.ctx.api=(url)=>{calls.push(url);return new Promise(resolve=>resolveStop=resolve);};
+ const stopped=h.ctx.onRecord();
+ assert.equal(panel.hidden,true,'a pending Stop must remove the retry action');
+ h.ctx.renderRecording(body);assert.equal(panel.hidden,true,'a stale status poll cannot re-enable retry during Stop');
+ assert.equal(h.nodes.get('record').disabled,true);await h.ctx.onRecord();
+ await retry.listeners.click();assert.deepEqual(calls,['/api/recording/stop']);
+ resolveStop({state:'finishing',session_id:'fixture',elapsed_ms:1000});await stopped;
+ assert.equal(panel.hidden,true);
 });

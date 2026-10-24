@@ -210,6 +210,7 @@ fn routes(state: AppState) -> Router {
         .route("/api/recording/transcript", get(api::recording_transcript))
         .route("/api/recording/start", post(api::recording_start))
         .route("/api/recording/stop", post(api::recording_stop))
+        .route("/api/recording/retry", post(api::recording_retry))
         .route(
             "/api/settings/github",
             get(api::github_settings).post(api::github_set_settings),

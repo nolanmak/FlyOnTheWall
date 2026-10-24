@@ -224,6 +224,38 @@ pub async fn recording_stop(State(state): State<AppState>) -> Response {
     json(&state, &RecordingResponse { status, error })
 }
 
+/// Retry one exhausted source. Protected by the normal recording ingress
+/// guard; state-dependent failures stay in the body, never the HTTP status.
+pub async fn recording_retry(State(state): State<AppState>, uri: Uri) -> Response {
+    let Some(recorder) = state.recorder() else {
+        return not_found();
+    };
+    let Some(id) = uri.query().and_then(|q| query_param(q, "session_id")) else {
+        return not_found();
+    };
+    let source = match uri
+        .query()
+        .and_then(|q| query_param(q, "source"))
+        .as_deref()
+    {
+        Some("system") => crate::recorder::CaptureSource::System,
+        Some("mic") => crate::recorder::CaptureSource::Mic,
+        _ => return not_found(),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let error = recorder
+            .retry_capture(&id, source)
+            .err()
+            .map(|e| e.to_string());
+        (recorder.status(), error)
+    })
+    .await;
+    let Ok((status, error)) = result else {
+        return server_error();
+    };
+    json(&state, &RecordingResponse { status, error })
+}
+
 /// `GET /api/settings/github`, `POST /api/settings/github`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GithubSettingsResponse {
