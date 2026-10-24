@@ -6,6 +6,7 @@ on:
       - 'crates/fotw-secrets/**'
       - 'crates/fotw-audio/**'
       - 'crates/fotw-stt/**'
+      - 'crates/fotw-dsp/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/murmur-compatibility.yml'
@@ -15,6 +16,7 @@ on:
       - 'crates/fotw-secrets/**'
       - 'crates/fotw-audio/**'
       - 'crates/fotw-stt/**'
+      - 'crates/fotw-dsp/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/murmur-compatibility.yml'
@@ -40,7 +42,7 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           repository: nolanmak/Murmur
-          ref: 882b106e3e6ebadc3f50f276b316a8c2a732593f
+          ref: 85df901f00a5d68e55466f0717cf68694373b48b
           path: consumer
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@46817827a5bfabe028bf34e1cce71fd40e2ff697 # 1.95.0
@@ -53,7 +55,7 @@ jobs:
           import json, os, pathlib
           root = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
           patch = '[patch."https://github.com/nolanmak/FlyOnTheWall"]\n'
-          for name in ('fotw-audio', 'fotw-stt', 'fotw-secrets'):
+          for name in ('fotw-audio', 'fotw-stt', 'fotw-secrets', 'fotw-dsp'):
               crate = root / 'producer/crates' / name
               patch += name + ' = { path = ' + json.dumps(str(crate)) + ' }\n'
           pathlib.Path('compatibility.toml').write_text(patch)
