@@ -73,6 +73,7 @@ fn seeded_meeting(db: &mut Db, dir: &std::path::Path) -> String {
     let outcome = SessionOutcome {
         dir: dir.to_path_buf(),
         started_at_ms: 0,
+        capture_ended_at_ms: None,
         system_samples: 1_000,
         mic_samples: 0,
         system_buffers: LegBuffers {

@@ -59,6 +59,7 @@ fn outcome(dir: &std::path::Path, segments: Vec<TranscriptSegment>) -> SessionOu
     SessionOutcome {
         dir: dir.to_path_buf(),
         started_at_ms: 0,
+        capture_ended_at_ms: None,
         system_samples: 480_000,
         mic_samples: 240_000,
         system_buffers: LegBuffers {
@@ -222,4 +223,31 @@ fn the_duration_reflects_the_recording_not_the_write() {
         (85..=95).contains(&secs),
         "expected roughly 90s, got {secs}s"
     );
+}
+
+#[test]
+fn persistence_does_not_count_transcription_drain_as_recording_time() {
+    let dir = tmpdir("capture-end");
+    let mut db = db_at(&dir);
+    let mut o = outcome(&dir, vec![]);
+    o.started_at_ms = 1_000;
+    o.capture_ended_at_ms = Some(2_250);
+    let id = persist::persist_session(&mut db, &o, "Short fixture").unwrap();
+    let meeting = db.meetings().get(&id).unwrap();
+    assert_eq!(meeting.started_at_ms, 1_000);
+    assert_eq!(meeting.ended_at_ms, Some(2_250));
+    assert_eq!(meeting.duration_ms, Some(1_250));
+}
+
+#[test]
+fn invalid_capture_clocks_do_not_create_partial_meetings() {
+    let dir = tmpdir("invalid-capture-end");
+    let mut db = db_at(&dir);
+    for ended in [999, u64::MAX] {
+        let mut o = outcome(&dir, vec![]);
+        o.started_at_ms = 1_000;
+        o.capture_ended_at_ms = Some(ended);
+        assert!(persist::persist_session(&mut db, &o, "Invalid fixture").is_err());
+        assert!(db.meetings().list(10, 0).unwrap().is_empty());
+    }
 }

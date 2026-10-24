@@ -159,6 +159,7 @@ async fn main() -> Result<(), String> {
         let outcome = SessionOutcome {
             dir: root.clone(),
             started_at_ms,
+            capture_ended_at_ms: None,
             system_samples: t * 48,
             mic_samples: 0,
             system_buffers: LegBuffers {
