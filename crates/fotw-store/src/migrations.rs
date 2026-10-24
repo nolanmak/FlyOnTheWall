@@ -14,7 +14,7 @@ use crate::key::DbKey;
 ///
 /// Bump this in the same commit that appends to [`migration_set`]; the two
 /// drifting apart is what [`crate::Db::open`]'s refusal is guarding against.
-pub const LATEST_SCHEMA_VERSION: usize = 4;
+pub const LATEST_SCHEMA_VERSION: usize = 5;
 
 /// Every migration, oldest first. Append only — a released migration is
 /// immutable, because editing one changes the schema of databases that already
@@ -30,6 +30,8 @@ fn migration_set() -> Migrations<'static> {
         M::up(include_str!("schema/0002_fts.sql")).comment("fts5 search indexes"),
         M::up(include_str!("schema/0003_enrich_report.sql")).comment("enrich report on meetings"),
         M::up(include_str!("schema/0004_documents.sql")).comment("versioned sharing documents"),
+        M::up(include_str!("schema/0005_session_notes.sql"))
+            .comment("encrypted recording note drafts"),
     ])
 }
 

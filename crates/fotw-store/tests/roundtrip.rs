@@ -55,6 +55,7 @@ const ALL_TABLES: &[&str] = &[
     "people",
     "recordings",
     "segments",
+    "session_notes",
     "settings",
     "summaries",
     "tags",
@@ -350,6 +351,9 @@ VALUES ('mtg-3', 'Historic', -86400000, 4102444800000, 4102531200000, 'Pacific/K
 -- drops the row and the provenance with it.
 INSERT INTO transcripts (id, meeting_id, provider, model, is_primary, language, audio_ms, cost_micros, raw_response_rel_path, created_at, updated_at, lamport, origin_device_id)
 VALUES ('tr-3', 'mtg-3', 'deepgram', 'nova-3', 1, NULL, 0, 0, '', 120, 121, 0, 'dev-2');
+
+INSERT INTO session_notes(session_id,started_at_ms,revision,body_md,anchors_json,updated_at_ms)
+VALUES ('live-fixture',1000,2,'draft café','[{"id":"draft-anchor","block_idx":0,"block_text":"draft café","typed_at_ms":250}]',1500);
 
 -- A note with an empty body and zero anchors.
 INSERT INTO notes (id, meeting_id, body_md, created_at, updated_at, lamport, origin_device_id)
@@ -1081,6 +1085,7 @@ fn every_column_of_every_table_appears_in_the_archive() {
         ("devices", &manifest, "devices"),
         ("app_meta", &manifest, "app_meta"),
         ("settings", &manifest, "settings"),
+        ("session_notes", &manifest, "session_notes"),
         ("folders", &manifest, "folders"),
         ("templates", &manifest, "templates"),
         ("people", &manifest, "people"),
@@ -1221,4 +1226,22 @@ fn rust_and_ui_share_speech_relative_timestamp_fixtures() {
             assert!(doc.to_markdown().contains(&stamp));
         }
     }
+}
+
+#[test]
+fn archives_written_before_session_notes_remain_importable() {
+    let (f, source) = fixture();
+    source
+        .export_library(&f.archive, &ArchiveOptions::default(), &mut |_| {})
+        .unwrap();
+    let path = f.archive.join("library.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    manifest["schema_version"] = 4.into();
+    manifest.as_object_mut().unwrap().remove("session_notes");
+    std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let mut dest = open_at(&f.fresh.join("db.sqlite3"));
+    assert_eq!(dest.import_library(&f.archive).unwrap().meetings, 3);
+    assert_eq!(dest.session_note("live-fixture").unwrap(), None);
+    assert!(dest.meetings().note("mtg-1").unwrap().is_some());
 }

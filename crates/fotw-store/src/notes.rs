@@ -68,32 +68,7 @@ impl Db {
         body: &str,
         anchors: &[NoteAnchor],
     ) -> Result<i64> {
-        let mut indices = HashSet::new();
-        let mut identities = HashSet::new();
-        if expected < 0
-            || body.len() > MAX_NOTE_BYTES
-            || anchors.len() > 4096
-            || anchors
-                .iter()
-                .try_fold(0usize, |n, a| n.checked_add(a.block_text.len()))
-                .is_none_or(|n| n > MAX_NOTE_BYTES)
-            || anchors.iter().any(|a| {
-                a.block_idx < 0
-                    || a.typed_at_ms < 0
-                    || !indices.insert(a.block_idx)
-                    || a.id.is_empty()
-                    || a.id.len() > 64
-                    || !a
-                        .id
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-                    || !identities.insert(&a.id)
-            })
-        {
-            return Err(StoreError::InvalidArgument(
-                "invalid note size, revision or anchors".into(),
-            ));
-        }
+        validate_note(expected, body, anchors)?;
         // Serialize the compare and replacement across connections/processes.
         let tx = self
             .conn_mut()
@@ -137,6 +112,36 @@ impl Db {
         tx.commit()?;
         Ok(next)
     }
+}
+
+pub(crate) fn validate_note(expected: i64, body: &str, anchors: &[NoteAnchor]) -> Result<()> {
+    let mut indices = HashSet::new();
+    let mut identities = HashSet::new();
+    if expected < 0
+        || body.len() > MAX_NOTE_BYTES
+        || anchors.len() > 4096
+        || anchors
+            .iter()
+            .try_fold(0usize, |n, a| n.checked_add(a.block_text.len()))
+            .is_none_or(|n| n > MAX_NOTE_BYTES)
+        || anchors.iter().any(|a| {
+            a.block_idx < 0
+                || a.typed_at_ms < 0
+                || !indices.insert(a.block_idx)
+                || a.id.is_empty()
+                || a.id.len() > 64
+                || !a
+                    .id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                || !identities.insert(&a.id)
+        })
+    {
+        return Err(StoreError::InvalidArgument(
+            "invalid note size, revision or anchors".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_existing_anchors(

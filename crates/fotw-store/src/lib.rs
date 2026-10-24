@@ -47,6 +47,7 @@ mod models;
 mod notes;
 mod repo;
 mod search;
+mod session_notes;
 
 pub use crate::archive::{
     ArchiveOptions, ArchiveReport, Conflict, ImportReport, LIBRARY_SCHEMA, LibraryManifest,
@@ -66,3 +67,5 @@ pub use crate::models::{
 pub use crate::notes::{MAX_NOTE_BYTES, NoteDocument};
 pub use crate::repo::MeetingRepo;
 pub use crate::search::{FTS_TABLES, SearchHit, SearchQuery, SearchSource, SearchWeights};
+
+pub use crate::session_notes::SessionNoteDocument;
