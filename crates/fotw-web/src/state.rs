@@ -38,6 +38,7 @@ struct Inner {
     /// [`AppState::set_health`].
     health: OnceLock<Arc<dyn DaemonHealth>>,
     speech: OnceLock<Arc<dyn crate::speech::SpeechControl>>,
+    speech_recovery: OnceLock<Arc<dyn crate::speech_recovery::SpeechRecoveryControl>>,
     documents: OnceLock<Arc<dyn crate::documents::DocumentControl>>,
 }
 
@@ -79,6 +80,19 @@ impl std::fmt::Debug for dyn MeetingSource {
 }
 
 impl AppState {
+    /// Attach local saved-audio recovery before serving requests.
+    pub fn set_speech_recovery(
+        &self,
+        control: Arc<dyn crate::speech_recovery::SpeechRecoveryControl>,
+    ) {
+        let _ = self.inner.speech_recovery.set(control);
+    }
+    /// Absent on read-only servers.
+    pub fn speech_recovery(
+        &self,
+    ) -> Option<Arc<dyn crate::speech_recovery::SpeechRecoveryControl>> {
+        self.inner.speech_recovery.get().cloned()
+    }
     /// Attach transcription settings before serving requests.
     pub fn set_speech(&self, control: Arc<dyn crate::speech::SpeechControl>) {
         let _ = self.inner.speech.set(control);
@@ -160,6 +174,7 @@ impl AppState {
                 health: OnceLock::new(),
                 documents: OnceLock::new(),
                 speech: OnceLock::new(),
+                speech_recovery: OnceLock::new(),
                 tickets: TokenTable::new(WS_TICKET_TTL),
                 handoff: TokenTable::new(HANDOFF_TTL),
                 hub: Arc::new(DeltaHub::new()),

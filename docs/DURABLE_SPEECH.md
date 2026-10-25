@@ -272,3 +272,53 @@ handoff, retain one worker until it returns, reject stale results and revalidate
 on deliberate capture start. Repeated matching observations are the consumer's
 recovery policy. Device-free injected-read tests cover instability and errors;
 physical USB/Bluetooth and capture validation remain separate gates.
+
+## Saved meeting retry in the app
+
+A saved meeting with retained canonical audio and a recorded local recovery plan
+shows **Finish transcription** and **Retry locally**. Opening the meeting only
+reads status. Retry uses the original per-source model/revision/language and
+absolute coverage boundary, preserves corrected committed text, and projects
+receipts idempotently into the original meeting and recording clock. It does
+not change today's ASR settings, read a cloud credential, start capture or invoke
+a summarization engine. A completed retry does not initialize another model.
+
+The daemon owns one retry job at a time. The HTTP request returns immediately;
+metadata/model preparation has a 30-second deadline and each source has a
+120-second inference drain. Native calls cannot be forcibly interrupted. Timeout
+or Cancel revokes constructor/inference output while the job retains admission
+until the actual worker, model and cleanup return. Another retry cannot multiply
+a stuck owner. Model loading follows exclusive source/journal admission, and no
+library mutex spans model construction or inference. Missing/changed assets or
+invalid capture identity/clock retain audio and report failure. The installed
+candidate and managed copy are selected by saved identity and SHA-256, with
+checksum checks around native context creation.
+
+Authenticated routes under `/api/meetings/{id}/speech-recovery` expose status,
+`retry` and `cancel`. Action bodies are empty objects; clients cannot choose a
+cloud destination or pass a recording clock. The dashboard fences detached or
+superseded replies, keeps recovery controls keyboard accessible and polls only
+pending work. Successful recovery offers an explicit transcript reload so a
+status update does not replace a note editor underneath the user.
+
+Device-free tests cover repeated projection, edited text, original clocks/audio,
+invalid clocks, deletion, retained constructor/inference ownership, cancellation,
+authentication and stale UI replies. The ignored `speech_recovery` integration
+test accepts only checksum-pinned public small.en/JFK assets and runs through the
+production app controller, including refusal of a different revision. It is a
+functional smoke, not a paired ASR quality or resource benchmark.
+
+This entry point currently requires a finalized capture, its saved meeting alias
+and frozen clock, and the original local plan. Automatic startup scheduling,
+unfinished raw-WAL clock recovery, model provisioning and physical signed-app
+Wi-Fi/device acceptance remain separate unfinished work under #12/#33/#124.
+
+The `ui_preview --saved-speech-recovery` fixture supplies synthetic metadata only
+and has no model/provider/capture capability. Private WKWebView acceptance
+exercises actual authenticated GET/Retry/Cancel, desktop and 390px layouts,
+keyboard focus, completion and retained cleanup. These are native renders, not
+physical-device acceptance:
+
+![Local retry with pending saved audio](speech-recovery/pending-mobile.png)
+
+![Recovered text waits for explicit reload](speech-recovery/completed-mobile.png)

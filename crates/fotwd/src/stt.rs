@@ -167,6 +167,122 @@ fn pinned_local_model(
     Ok((std::sync::Arc::new(engine), format!("sha256:{digest}")))
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn saved_local_model(
+    plan: &crate::failover::coverage::LocalPlan,
+    candidate: &Path,
+    data_root: &Path,
+) -> Result<std::sync::Arc<dyn fotw_stt::RecognizerFactory>, String> {
+    use fotw_stt::RecognizerFactory;
+    plan.validate().map_err(|e| e.to_string())?;
+    let digest = plan
+        .engine
+        .revision
+        .as_deref()
+        .and_then(|r| r.strip_prefix("sha256:"))
+        .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| "Saved model has no verified SHA-256 revision; audio retained".to_owned())?;
+    let managed = known_model(&plan.engine.model)
+        .map(|m| models_dir(data_root).join(model_file_name(m.name)));
+    let path = [Some(candidate.to_owned()), managed]
+        .into_iter()
+        .flatten()
+        .find(|path| {
+            path.is_absolute()
+                && fotw_stt::WhisperEngine::new(path, plan.language.clone()).model()
+                    == plan.engine.model
+                && sha256_file(path).is_ok_and(|hash| hash == digest)
+        })
+        .ok_or_else(|| {
+            "Install the original model revision before retrying; audio retained".to_owned()
+        })?;
+    let engine = fotw_stt::WhisperEngine::new(&path, plan.language.clone());
+    if engine.model() != plan.engine.model {
+        return Err("Installed model identity differs from saved audio".into());
+    }
+    // Native loading is deferred to create(), after the backend has obtained
+    // exclusive source/journal ownership. The wrapper verifies the context's
+    // bytes before and after that load, without reading any cloud credential.
+    Ok(std::sync::Arc::new(SavedFactory {
+        engine,
+        path,
+        digest: digest.into(),
+    }))
+}
+
+#[cfg(target_os = "macos")]
+struct SavedFactory {
+    engine: fotw_stt::WhisperEngine,
+    path: PathBuf,
+    digest: String,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn saved_model_resolution_accepts_a_verified_configured_copy_beside_a_stale_managed_copy() {
+    let root = tempfile::tempdir().unwrap();
+    let candidate = root.path().join("configured/ggml-small.en.bin");
+    let managed = models_dir(root.path()).join(model_file_name("small.en"));
+    std::fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+    std::fs::write(
+        &candidate,
+        b"metadata-only fixture; never load as a native model",
+    )
+    .unwrap();
+    std::fs::write(managed, b"unfinished managed download").unwrap();
+    let plan = crate::failover::coverage::LocalPlan {
+        engine: crate::failover::coverage::EngineDescriptor {
+            provider: fotw_stt::local::PROVIDER.into(),
+            model: "small.en".into(),
+            revision: Some(format!("sha256:{}", sha256_file(&candidate).unwrap())),
+            capabilities: fotw_stt::SttCapabilities::deepgram(),
+        },
+        language: Some("en".into()),
+        endpoint: Default::default(),
+    };
+    // Resolver construction checks identity/revision; create() is deliberately
+    // not called, so these fake bytes never enter whisper.cpp.
+    let factory = saved_local_model(&plan, &candidate, root.path()).unwrap();
+    assert_eq!(factory.model(), "small.en");
+    assert_eq!(factory.language(), Some("en"));
+}
+#[cfg(target_os = "macos")]
+impl fotw_stt::RecognizerFactory for SavedFactory {
+    fn model(&self) -> &str {
+        self.engine.model()
+    }
+    fn language(&self) -> Option<&str> {
+        self.engine.language()
+    }
+    fn create(&self) -> Result<Box<dyn fotw_stt::Recognizer>, fotw_stt::SttError> {
+        let verify = || {
+            if sha256_file(&self.path).is_ok_and(|hash| hash == self.digest) {
+                Ok(())
+            } else {
+                Err(fotw_stt::SttError::new(
+                    fotw_stt::SttErrorClass::Unsupported,
+                    fotw_stt::local::PROVIDER,
+                    "Saved model revision changed; audio retained",
+                ))
+            }
+        };
+        verify()?;
+        let state = self.engine.create()?;
+        verify()?;
+        Ok(state)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn saved_local_model(
+    _plan: &crate::failover::coverage::LocalPlan,
+    _candidate: &Path,
+    _data_root: &Path,
+) -> Result<std::sync::Arc<dyn fotw_stt::RecognizerFactory>, String> {
+    Err("Saved local transcription recovery requires a supported local runtime".into())
+}
+
 #[cfg(not(target_os = "macos"))]
 fn pinned_local_model(
     _settings: &SttSettings,

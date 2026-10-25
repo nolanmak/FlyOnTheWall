@@ -757,3 +757,9 @@ button, summary { min-height: 36px; }
 .saved-speech > details > summary { cursor: pointer; color: var(--muted); }
 .saved-speech .speech-source { margin-top: 8px; }
 .saved-speech .speech-source p { margin: 4px 0 0; }
+
+.speech-recovery { margin: 16px 0; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); overflow-wrap: anywhere; }
+.speech-recovery h3 { margin: 0 0 8px; }
+.speech-recovery p { margin: 8px 0; }
+.recovery-sources { color: var(--muted); font-size: 12px; }
+.recovery-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
