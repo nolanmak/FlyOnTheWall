@@ -48,6 +48,9 @@
 //! thread's job during a meeting, or a post-finalize transcode of the WAL's
 //! PCM (see [`crate::wal::encode_session`]).
 
+mod complete;
+pub use complete::{CompleteArchive, inspect_complete_archive};
+
 use std::ffi::{CStr, c_int};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, Write};

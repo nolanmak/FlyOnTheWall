@@ -244,6 +244,13 @@ impl SavedSpeechRecovery {
             if !entry.file_type().is_ok_and(|m| m.is_dir()) {
                 continue;
             }
+            if entry.file_name().to_str().is_some_and(|session| {
+                self.db()
+                    .session_note_meeting(session)
+                    .is_ok_and(|id| id.is_some())
+            }) {
+                continue;
+            }
             match crate::interrupted_capture::prepare(&entry.path(), stop) {
                 Ok(Some(capture)) => {
                     if stop.load(Ordering::Acquire) {
@@ -404,10 +411,27 @@ impl SavedSpeechRecovery {
         if wal.manifest.id != session || wal.manifest.started_at_ms != started as u64 {
             return Err(RecoveryError::Invalid);
         }
-        // An unfinished WAL must still prove the original Stop and retain its
-        // capture lease throughout inference. Never replace it with recovery time.
+        // An unfinished WAL must prove the original Stop. Saved finalized clocks
+        // remain authoritative, with modern capture ownership retained through
+        // native cleanup too. Legacy indexed captures still use source leases.
         let capture_owner = if wal.is_finalized() {
-            None
+            if held_capture.is_some() {
+                None
+            } else {
+                match std::fs::symlink_metadata(dir.join("capture-owner.lock")) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Ok(m) if m.file_type().is_file() => Some(
+                        fotw_pipeline::capture_clock::CaptureOwner::recover(&dir).map_err(|e| {
+                            if e.kind() == std::io::ErrorKind::WouldBlock {
+                                RecoveryError::Busy
+                            } else {
+                                RecoveryError::Invalid
+                            }
+                        })?,
+                    ),
+                    _ => return Err(RecoveryError::Invalid),
+                }
+            }
         } else if let Some(owner) = held_capture {
             crate::interrupted_capture::verify_stopped(
                 &dir,

@@ -409,6 +409,18 @@ fn cancelling_a_blocked_local_prepare_retains_the_interrupted_capture_lease_unti
 #[test]
 #[ignore = "requires cached public small.en weights and checksum-verified JFK WAV"]
 fn installed_model_recovers_an_unindexed_stopped_wal_without_changing_settings_or_audio() {
+    native_capture_recovery(false);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires cached public small.en weights and checksum-verified JFK WAV"]
+fn installed_model_recovers_a_finalized_archive_after_pcm_retirement() {
+    native_capture_recovery(true);
+}
+
+#[cfg(target_os = "macos")]
+fn native_capture_recovery(archived: bool) {
     use fotw_web::speech_recovery::{RecoveryPhase, SpeechRecoveryControl};
     use sha2::{Digest, Sha256};
     let model = PathBuf::from(
@@ -446,9 +458,21 @@ fn installed_model_recovers_an_unindexed_stopped_wal_without_changing_settings_o
         "small.en",
         &format!("sha256:{}", known.sha256),
     );
-    drop(f.wal.take());
+    if archived {
+        f.wal.take().unwrap().finalize().unwrap();
+        fotw_pipeline::wal::encode_session(&f.dir).unwrap();
+        fotw_pipeline::wal::discard_pcm(&f.dir).unwrap();
+    } else {
+        drop(f.wal.take());
+    }
     let audio_before = std::fs::read(f.dir.join("system.stt16")).unwrap();
-    let raw_before = std::fs::read(f.dir.join("system.pcm")).unwrap();
+    let retained_path = f.dir.join(if archived {
+        "system.opus"
+    } else {
+        "system.pcm"
+    });
+    let retained_before = std::fs::read(&retained_path).unwrap();
+    let manifest_before = std::fs::read(f.dir.join("manifest.json")).unwrap();
     let mut db = Db::open(&f.database, &f.key).unwrap();
     let settings = fotwd::stt::SttSettings {
         engine: fotwd::stt::SttEngine::Deepgram,
@@ -500,15 +524,23 @@ fn installed_model_recovers_an_unindexed_stopped_wal_without_changing_settings_o
         std::fs::read(f.dir.join("system.stt16")).unwrap(),
         audio_before
     );
-    assert_eq!(std::fs::read(f.dir.join("system.pcm")).unwrap(), raw_before);
-    assert!(
-        !fotw_pipeline::wal::SessionState::read(&f.dir)
-            .unwrap()
-            .is_finalized()
+    assert_eq!(std::fs::read(retained_path).unwrap(), retained_before);
+    assert_eq!(
+        std::fs::read(f.dir.join("manifest.json")).unwrap(),
+        manifest_before
     );
+    assert_eq!(
+        fotw_pipeline::wal::SessionState::read(&f.dir)
+            .unwrap()
+            .is_finalized(),
+        archived
+    );
+    if archived {
+        assert!(!f.dir.join("system.pcm").exists());
+    }
     println!(
         "{}",
-        serde_json::json!({"fixture":"public-jfk","unindexed_stopped_wal":true,"phase":"complete","canonical_unchanged":true,"settings_unchanged":true,"elapsed_ms":began.elapsed().as_millis(),"model":"small.en"})
+        serde_json::json!({"fixture":"public-jfk","unindexed_stopped_wal":true,"raw_retired":archived,"phase":"complete","canonical_unchanged":true,"settings_unchanged":true,"elapsed_ms":began.elapsed().as_millis(),"model":"small.en"})
     );
 }
 
@@ -646,4 +678,123 @@ fn failed_prepare_keeps_capture_ownership_through_runtime_blocking_cleanup() {
         );
         assert!(fotw_pipeline::capture_clock::CaptureOwner::recover(&f.dir).is_ok());
     }
+}
+
+#[test]
+fn startup_imports_a_finalized_unindexed_capture_before_or_after_pcm_retirement() {
+    for (finalized, archived) in [(true, false), (true, true), (false, true)] {
+        let mut f = fixture(true, 48000);
+        let wal = f.wal.take().unwrap();
+        let dir = if finalized {
+            wal.finalize().unwrap()
+        } else {
+            let dir = wal.dir().to_owned();
+            drop(wal);
+            dir
+        };
+        if archived {
+            fotw_pipeline::wal::encode_session(&dir).unwrap();
+            fotw_pipeline::wal::discard_pcm(&dir).unwrap();
+        }
+        let canonical = std::fs::read(dir.join("system.stt16")).unwrap();
+        let manifest = std::fs::read(dir.join("manifest.json")).unwrap();
+        let encoded = archived.then(|| std::fs::read(dir.join("system.opus")).unwrap());
+        startup(&owner(&f));
+        let mut db = Db::open(&f.database, &f.key).unwrap();
+        let meeting = db
+            .session_note_meeting(&f.session)
+            .unwrap()
+            .expect("a finalized WAL outside SQL must be discovered too");
+        assert_eq!(
+            db.session_note_clock(&f.session).unwrap(),
+            Some((f.start as i64, 4000))
+        );
+        assert_eq!(
+            db.note_document(&meeting).unwrap().body_md,
+            "durable note before crash"
+        );
+        assert!(f.calls.load(Ordering::SeqCst) > 0);
+        assert_eq!(std::fs::read(dir.join("system.stt16")).unwrap(), canonical);
+        assert_eq!(std::fs::read(dir.join("manifest.json")).unwrap(), manifest);
+        if let Some(encoded) = encoded {
+            assert!(!dir.join("system.pcm").exists());
+            assert_eq!(std::fs::read(dir.join("system.opus")).unwrap(), encoded);
+        }
+    }
+}
+
+#[test]
+fn invalid_retired_archives_do_not_seal_input_project_notes_or_start_a_model() {
+    for corrupt in [false, true] {
+        let mut f = fixture(true, 48000);
+        let dir = f.wal.take().unwrap().finalize().unwrap();
+        fotw_pipeline::wal::encode_session(&dir).unwrap();
+        fotw_pipeline::wal::discard_pcm(&dir).unwrap();
+        let path = dir.join("system.opus");
+        if corrupt {
+            let mut bytes = std::fs::read(&path).unwrap();
+            let n = bytes.len();
+            bytes[n - 1] ^= 1;
+            std::fs::write(&path, bytes).unwrap();
+        } else {
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let n = file.metadata().unwrap().len();
+            file.set_len(n - 1).unwrap();
+        }
+        let canonical = std::fs::read(dir.join("system.stt16")).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        startup(&owner(&f));
+        let mut db = Db::open(&f.database, &f.key).unwrap();
+        assert!(db.session_note_meeting(&f.session).unwrap().is_none());
+        assert!(db.session_note(&f.session).unwrap().is_some());
+        assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+        assert!(!dir.join("system.stt-sealed.json").exists());
+        assert_eq!(std::fs::read(dir.join("system.stt16")).unwrap(), canonical);
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+}
+#[test]
+fn finalized_capture_ownership_survives_cancelled_blocked_preparation() {
+    use fotw_web::speech_recovery::SpeechRecoveryControl;
+    use std::sync::{Mutex, mpsc};
+    let mut f = fixture(true, 48000);
+    let dir = f.wal.take().unwrap().finalize().unwrap();
+    fotw_pipeline::wal::encode_session(&dir).unwrap();
+    fotw_pipeline::wal::discard_pcm(&dir).unwrap();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let gate = Mutex::new(release_rx);
+    let calls = f.calls.clone();
+    let c = SavedSpeechRecovery::with_parts(
+        Db::open(&f.database, &f.key).unwrap(),
+        f.root.path().to_owned(),
+        Arc::new(move |_, _| {
+            entered_tx.send(()).unwrap();
+            gate.lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(4))
+                .unwrap();
+            Ok(Arc::new(Factory(calls.clone())))
+        }),
+        Duration::from_secs(2),
+        Duration::from_secs(5),
+    );
+    let pass = c.start_pending().unwrap().unwrap();
+    entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert!(fotw_pipeline::capture_clock::CaptureOwner::recover(&dir).is_err());
+    drop(pass);
+    assert!(fotw_pipeline::capture_clock::CaptureOwner::recover(&dir).is_err());
+    release_tx.send(()).unwrap();
+    let meeting = Db::open(&f.database, &f.key)
+        .unwrap()
+        .session_note_meeting(&f.session)
+        .unwrap()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while c.read(&meeting).unwrap().worker_running {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(fotw_pipeline::capture_clock::CaptureOwner::recover(&dir).is_ok());
+    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
 }

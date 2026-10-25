@@ -41,7 +41,8 @@ pub struct CaptureSnapshot {
     pub mic_tail_bytes: u64,
 }
 impl CaptureSnapshot {
-    /// Exact Stop-request clock only when all current raw bytes were checkpointed.
+    /// Exact Stop-request clock when retained raw bytes or a verified complete
+    /// archive account for exactly the checkpointed audio.
     pub fn frozen_capture_clock(&self) -> Option<(u64, u64)> {
         if !self.checkpoint.stop_requested
             || self.system_tail_bytes != 0
@@ -104,7 +105,8 @@ impl CaptureOwner {
             dir: dir.to_owned(),
         })
     }
-    /// Read bounded clock evidence while owning the recording.
+    /// Read bounded clock evidence while owning the recording. Retired PCM
+    /// requires a complete, verified archive with matching original frame counts.
     pub fn snapshot(&self) -> io::Result<CaptureSnapshot> {
         let path = self.dir.join("capture-clock.json");
         ordinary(&path)?;
@@ -131,7 +133,12 @@ impl CaptureOwner {
                 "capture checkpoint does not match original manifest",
             ));
         }
-        let tail = |name: &str, count: u64, format: Option<TrackFormat>| -> io::Result<u64> {
+        let tail = |name: &str,
+                    opus: &str,
+                    count: u64,
+                    format: Option<TrackFormat>,
+                    encoded: Option<&crate::wal::EncodedTrack>|
+         -> io::Result<u64> {
             if let Some(format) = format {
                 if format.sample_rate_hz == 0
                     || format.channels == 0
@@ -143,18 +150,86 @@ impl CaptureOwner {
                 return Err(invalid("checkpoint audio has no declared format"));
             }
             let path = self.dir.join(name);
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_file() => {
+                    return metadata
+                        .len()
+                        .checked_sub(count)
+                        .ok_or_else(|| invalid("checkpointed audio has been truncated"));
+                }
+                Ok(_) => return Err(invalid("capture evidence must be an ordinary file")),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            let track = encoded.ok_or_else(|| invalid("retired PCM has no completed archive"))?;
+            if track.file != opus
+                || track.pcm_bytes != count
+                || !crate::opus::SUPPORTED_RATES.contains(&track.sample_rate_hz)
+            {
+                return Err(invalid("archive does not match checkpointed source"));
+            }
+            let encoded_frames = if let Some(format) = format {
+                let expected_rate = if crate::opus::SUPPORTED_RATES.contains(&format.sample_rate_hz)
+                {
+                    format.sample_rate_hz
+                } else {
+                    16000
+                };
+                if track.sample_rate_hz != expected_rate {
+                    return Err(invalid("archive encoder rate differs from capture format"));
+                }
+                u128::from(count / 2 / u64::from(format.channels))
+                    * u128::from(track.sample_rate_hz)
+                    / u128::from(format.sample_rate_hz)
+            } else {
+                0
+            };
+            let expected_ticks =
+                u64::try_from(encoded_frames * u128::from(48000 / track.sample_rate_hz))
+                    .map_err(|_| invalid("archive sample count overflow"))?;
+            let path = self.dir.join(opus);
             ordinary(&path)?;
-            std::fs::metadata(path)?
-                .len()
-                .checked_sub(count)
-                .ok_or_else(|| invalid("checkpointed audio has been truncated"))
+            let mut options = OpenOptions::new();
+            options.read(true);
+            #[cfg(windows)]
+            options.write(true);
+            let file = options.open(path)?;
+            if !file.metadata()?.is_file() || file.metadata()?.len() != track.opus_bytes {
+                return Err(invalid("archive size differs from completed manifest"));
+            }
+            let observed = crate::opus::inspect_complete_archive(
+                (&file).take(
+                    track
+                        .opus_bytes
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("archive size overflow"))?,
+                ),
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if observed.bytes != track.opus_bytes
+                || observed.input_rate_hz != track.sample_rate_hz
+                || observed.pcm_samples_48k != expected_ticks
+                || observed.duration_ms() != track.duration_ms
+            {
+                return Err(invalid("archive timing differs from checkpointed audio"));
+            }
+            file.sync_all()?;
+            Ok(0)
         };
         let system_tail_bytes = tail(
             "system.pcm",
+            "system.opus",
             checkpoint.system_bytes,
             Some(checkpoint.system_format),
+            manifest.encoded.as_ref().map(|e| &e.system),
         )?;
-        let mic_tail_bytes = tail("mic.pcm", checkpoint.mic_bytes, checkpoint.mic_format)?;
+        let mic_tail_bytes = tail(
+            "mic.pcm",
+            "mic.opus",
+            checkpoint.mic_bytes,
+            checkpoint.mic_format,
+            manifest.encoded.as_ref().map(|e| &e.mic),
+        )?;
         Ok(CaptureSnapshot {
             checkpoint,
             system_tail_bytes,

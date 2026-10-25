@@ -1010,3 +1010,15 @@ fn completed_startup_guard_cannot_cancel_a_later_explicit_retry() {
     assert_eq!(finished(&c, &later).phase, RecoveryPhase::Complete);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
+
+#[test]
+fn an_indexed_legacy_capture_without_modern_clock_ownership_still_uses_its_saved_clock() {
+    let f = fixture();
+    std::fs::remove_file(f.dir.join("capture-owner.lock")).unwrap();
+    std::fs::remove_file(f.dir.join("capture-clock.json")).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = controller(&f, calls.clone());
+    c.retry(&f.meeting).unwrap();
+    assert_eq!(finished(&c, &f.meeting).phase, RecoveryPhase::Complete);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
