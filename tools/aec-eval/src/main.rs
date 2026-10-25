@@ -142,7 +142,7 @@ fn metrics(near: &[f32], echo: &[f32], output: &[f32], lag: usize) -> serde_json
         "near_gain": (near_power > 1e-12).then_some(gain),
         "near_gain_db": (near_power > 1e-12).then(|| db(gain * gain)),
         "residual_reduction_db": (echo_power > 1e-12).then(|| db(echo_power / residual)),
-        "near_snr_db": (near_power > 1e-12).then(|| db(near_power / residual)),
+        "near_snr_db": (near_power > 1e-12).then(|| db(gain * gain * near_power / residual)),
         "output_buffer_samples": output.len(), "fixed_delay_samples": lag,
     })
 }
@@ -191,6 +191,23 @@ fn main() {
 mod tests {
     use super::*;
     #[test]
+    fn near_snr_uses_the_retained_signal_power_when_the_backend_attenuates_speech() {
+        let near: Vec<_> = (0..SAMPLES)
+            .map(|i| if i % 2 == 0 { 0.2 } else { -0.2 })
+            .collect();
+        let output: Vec<_> = near
+            .iter()
+            .enumerate()
+            .map(|(i, n)| 0.5 * n + if i % 4 < 2 { 0.1 } else { -0.1 })
+            .collect();
+        let result = metrics(&near, &vec![0.0; SAMPLES], &output, 0);
+        assert!((result["near_gain"].as_f64().unwrap() - 0.5).abs() < 1e-6);
+        assert!(
+            result["near_snr_db"].as_f64().unwrap().abs() < 1e-6,
+            "equal retained near and residual powers must measure 0 dB SNR: {result}"
+        );
+    }
+    #[test]
     fn suppression_is_not_mistaken_for_near_end_preservation() {
         let near = signal(42);
         let zero = vec![0.0; near.len()];
@@ -199,6 +216,7 @@ mod tests {
         assert_eq!(kept["near_gain"], 1.0);
         assert_eq!(deleted["near_gain"], 0.0);
         assert!(deleted["near_gain_db"].as_f64().unwrap() < -100.0);
+        assert!(deleted["near_snr_db"].as_f64().unwrap() < -100.0);
     }
     #[test]
     fn unchanged_echo_is_zero_db_improvement_and_clean_output_has_a_residual_floor() {

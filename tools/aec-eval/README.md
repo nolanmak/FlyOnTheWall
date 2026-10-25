@@ -38,6 +38,12 @@ is **not** an isolated echo measurement. A per-sample -120 dBFS floor bounds
 perfect suppression results. Muting everything cannot pass near-preservation
 controls even though its echo-only reduction looks impressive.
 
+Near SNR uses the retained projection's power, including the measured gain,
+relative to the residual. Using the louder original near signal would overstate
+quality when both speech and interference are attenuated. A calibration test
+first observed 6.02 dB where equal retained signal/noise powers require 0 dB;
+it now verifies the corrected result.
+
 This is a fixed-frame signal probe. It does not flush backend delay, establish
 source-tail preservation, handle arbitrary callback chunks, jitter, drift,
 reference loss or route changes, measure words retained or validate real rooms.
@@ -51,14 +57,14 @@ accepted with stronger comparative evidence before product integration.
 `results/m4-fixed-frame.json` records the 2026-10-25 release run on a Mac16,10
 with an Apple M4 and 16 GiB RAM. Each row processes 20 seconds of generated audio.
 The already-built process used 12,173,312 bytes maximum RSS and 0.46 seconds of
-user CPU across all nine cases plus metric calculation (0.63 seconds elapsed).
+user CPU across all nine cases plus metric calculation (0.62 seconds elapsed).
 Those are this probe's resources, not the app or transcription model's footprint.
 
 | Backend | Echo-only residual reduction | Overlap near gain | Overlap residual reduction | Overlap processing time |
 | --- | ---: | ---: | ---: | ---: |
 | Passthrough | 0.00 dB | +0.06 dB | 0.00 dB | 0.02 ms |
-| Existing gate, 100 ms cadence | 94.46 dB (muted; floor limited) | -0.07 dB | 0.06 dB | 22.61 ms |
-| Sonora AEC3 0.2.0 | 28.56 dB | -3.92 dB | 3.72 dB | 72.26 ms |
+| Existing gate, 100 ms cadence | 94.46 dB (muted; floor limited) | -0.07 dB | 0.06 dB | 22.90 ms |
+| Sonora AEC3 0.2.0 | 28.56 dB | -3.92 dB | 3.72 dB | 72.15 ms |
 
 Near-only controls retain unity gain. Sonora's measured fixed delay is 128
 samples (8 ms); the other controls measure zero. The gate removes echo-only
@@ -72,8 +78,9 @@ gain within 1 dB and near SNR at least 6 dB above passthrough; plus a verified
 tail drain and bounded callback/jitter/reference-failure/route-reset adapter.
 These gates use the raw/gate baselines to prevent accepting echo suppression at
 the expense of local speech. They are not perceptual or real-room standards.
-This candidate fails both overlap gates (gain -3.92 dB and SNR improvement
-3.72 dB), so it is not selected for the app. Native WebRTC/LocalVQE comparison,
+This candidate fails both overlap gates: gain -3.92 dB and retained-near SNR
+3.52 dB versus passthrough's 3.78 dB (a 0.26 dB regression). It is not selected
+for the app. Native WebRTC/LocalVQE comparison,
 approved speech word retention and real-room trials remain required by #72.
 
 ## Pinned sources and provenance
