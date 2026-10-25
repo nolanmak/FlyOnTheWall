@@ -53,6 +53,7 @@ pub async fn start() -> Harness {
         enrich_status: Some("ok".to_owned()),
         enrich_detail: None,
         note_md: Some(NOTE_TEXT.to_owned()),
+        speech_provenance: Vec::new(),
         segments: vec![Segment {
             idx: 0,
             start_ms: 12_000,

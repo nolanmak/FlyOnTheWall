@@ -46,7 +46,25 @@ guard applies to both durable fallback and local-only streams, including native
 recognizer teardown after a close acknowledgement. The app cannot forcibly stop
 a native OS operation.
 
-Persisted provenance display, summary-prompt provenance, startup native recovery
+Saved meeting details expose the primary transcript's actual engine epochs,
+recorded revisions and capabilities, switch reasons and confirmed receipt
+boundaries. The reader does not load inference payloads or turn metadata into
+transcript words. Epochs without receipts have no confirmed processed interval;
+older transcripts explicitly have unknown history. A different primary transcript
+does not inherit stale source history. Expand **Transcription sources** in the
+saved meeting view; all boundaries use the original recording clock, independently
+of the transcript's first-speech display origin.
+
+A synthetic saved-history fixture uses real durable projection and the real API:
+
+```sh
+cargo run -p fotwd --example ui_preview -- --speech-history
+```
+
+Synthetic [desktop](speech-ui/saved-desktop.png) and
+[390px](speech-ui/saved-mobile.png) views show the real saved-history response.
+
+Rendered export and summary-prompt provenance, startup native recovery
 and retry controls remain part of
 [#12](https://github.com/nolanmak/FlyOnTheWall/issues/12).
 

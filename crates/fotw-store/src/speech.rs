@@ -25,6 +25,68 @@ pub struct SpeechEpoch {
     pub reason: Option<String>,
 }
 
+/// Metadata for one actual engine on the primary transcript's recording clock.
+/// Confirmed intervals do not imply complete or accurate recognition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeechProvenance {
+    /// Original capture source (`system` or `mic`).
+    pub source: String,
+    /// Source-local provider epoch.
+    pub epoch: i64,
+    /// Engine boundary in original 16 kHz samples.
+    pub from_sample: i64,
+    /// Last confirmed receipt boundary, absent if this engine has no receipts.
+    pub through_sample: Option<i64>,
+    /// Actual provider.
+    pub provider: String,
+    /// Actual model.
+    pub model: String,
+    /// Recorded revision, when known.
+    pub revision: Option<String>,
+    /// Recorded capabilities, never inferred from current settings.
+    pub capabilities: serde_json::Value,
+    /// Recorded provider switch reason.
+    pub reason: Option<String>,
+}
+
+impl Db {
+    /// Read primary-transcript engine history without loading inference payloads.
+    /// Older transcripts without recorded provenance return an empty history.
+    pub fn speech_provenance(&mut self, meeting_id: &str) -> Result<Vec<SpeechProvenance>> {
+        let Some(transcript) = self.meetings().primary_transcript_id(meeting_id)? else {
+            return Ok(Vec::new());
+        };
+        let mut statement = self.conn().prepare(
+            "SELECT e.source,e.epoch,e.from_sample,MAX(r.through_sample),e.provider,e.model,e.revision,e.capabilities_json,e.reason
+             FROM speech_epochs e LEFT JOIN speech_receipts r ON r.epoch_id=e.id
+             WHERE e.meeting_id=?1 AND e.transcript_id=?2
+             GROUP BY e.id ORDER BY e.source,e.epoch",
+        )?;
+        let rows = statement.query_map(params![meeting_id, transcript], |row| {
+            let capabilities: String = row.get(7)?;
+            Ok(SpeechProvenance {
+                source: row.get(0)?,
+                epoch: row.get(1)?,
+                from_sample: row.get(2)?,
+                through_sample: row.get(3)?,
+                provider: row.get(4)?,
+                model: row.get(5)?,
+                revision: row.get(6)?,
+                capabilities: serde_json::from_str(&capabilities).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        7,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                reason: row.get(8)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+}
+
 /// One settled segment with its original durable identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpeechSegment {

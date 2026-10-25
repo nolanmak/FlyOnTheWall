@@ -120,6 +120,7 @@ async fn a_meeting_without_notes_returns_null_not_empty_string() {
         enrich_status: None,
         enrich_detail: None,
         note_md: None,
+        speech_provenance: Vec::new(),
         segments: Vec::new(),
     });
     let server = WebServer::bind(0, std::sync::Arc::new(source))
@@ -198,6 +199,7 @@ async fn a_meeting_with_no_summary_says_which_kind_of_no_summary_it_is() {
         enrich_status: Some("engine_unresolvable".to_owned()),
         enrich_detail: Some("claude".to_owned()),
         note_md: None,
+        speech_provenance: Vec::new(),
         segments: Vec::new(),
     });
     let server = WebServer::bind(0, std::sync::Arc::new(source))
@@ -234,4 +236,11 @@ async fn a_meeting_with_no_summary_says_which_kind_of_no_summary_it_is() {
         body["enrich_detail"], "claude",
         "the reason is what turns a blank pane into something actionable"
     );
+}
+
+#[test]
+fn older_detail_json_defaults_to_unknown_engine_history() {
+    let value = serde_json::json!({"meeting":{"id":"legacy","title":"Synthetic","started_at_ms":1000,"duration_ms":null,"state":"ready"},"summary_md":null,"enrich_status":null,"enrich_detail":null,"note_md":null,"segments":[]});
+    let detail: fotw_web::MeetingDetail = serde_json::from_value(value).unwrap();
+    assert!(detail.speech_provenance.is_empty());
 }

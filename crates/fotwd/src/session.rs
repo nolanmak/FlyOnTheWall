@@ -4345,6 +4345,11 @@ mod supervised_recovery_tests {
                 if self.mode >= 2 || (n == 0 && self.mode == 0) {
                     return Err(TapError::platform("fixture missing mic"));
                 }
+                // A native reopen can return after the fixture finishes
+                // advancing its clock; exercise that scheduling boundary.
+                if self.mode == 0 && n > 0 {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
                 Ok(Box::new(FixtureTap {
                     id: TapId::mic("default"),
                     format: StreamFormat::new(48_000, 2, SampleFormat::F32),
@@ -4383,15 +4388,33 @@ mod supervised_recovery_tests {
                     );
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
-                // Give the real pump a chance to service its final due retry.
-                tokio::time::sleep(Duration::from_millis(150)).await;
                 let path = root
                     .path()
                     .join(control.ready.session_id().unwrap())
                     .join("mic.pcm");
+                let expected = match mode {
+                    2 => fotw_web::recorder::CaptureDelivery::Exhausted,
+                    3 => fotw_web::recorder::CaptureDelivery::Recovering,
+                    _ => fotw_web::recorder::CaptureDelivery::Confirming,
+                };
+                // Reopen and pump delivery are real background work. Observe
+                // their result with the fixture clock frozen, not a guessed
+                // scheduler delay. Keep every original WAL/format assertion.
+                let settled = tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let state = control.capture_health.snapshot().unwrap().mic.state;
+                        if state == expected && std::fs::metadata(&path).is_ok_and(|m| m.len() > 0)
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await;
                 let persisted_before_stop = std::fs::metadata(path).unwrap().len() > 0;
                 let final_state = control.capture_health.snapshot().unwrap().mic.state;
                 control.stop.stop();
+                settled.expect("pump must publish recovery and persist the gap before Stop");
                 (
                     ticks * 1600,
                     initial_state,
