@@ -1,8 +1,10 @@
 //! Native operations for the tested registration lifecycle. No capture is
 //! started by construction; the owner calls register/start explicitly.
 use super::capture_lifecycle::{CaptureAssets, Failure};
+use super::input_format::InputFormatWatch;
 use crate::TapError;
 use std::sync::Mutex;
+use std::sync::{Arc, atomic::AtomicBool};
 
 // Retained native registrations survive a tap object and a recording session.
 // Fence the whole process, not just a supervisor instance, until restart.
@@ -24,6 +26,7 @@ pub(super) struct NativeAssets {
     tap: Option<ManuallyDrop<TapGuard>>,
     block: Option<arc::R<DeviceIoBlock>>,
     queue: Option<arc::R<dispatch::Queue>>,
+    input_format: Option<InputFormatWatch>,
 }
 // Native handles are controlled by one owner; callbacks have their own serial
 // dispatch queue and retain only the existing synchronized capture state.
@@ -42,17 +45,41 @@ impl NativeAssets {
             .as_ref()
             .map_or(Ok(()), |f| Err(f.error()))
     }
-    pub fn mic(
-        device: Device,
-        block: arc::R<DeviceIoBlock>,
-        queue: arc::R<dispatch::Queue>,
-    ) -> Self {
+    pub fn mic(device: Device) -> Self {
         Self {
             device: Some(DeviceOwner::Physical(device)),
             tap: None,
-            block: Some(block),
-            queue: Some(queue),
+            block: None,
+            queue: None,
+            input_format: None,
         }
+    }
+    pub fn watch_mic_format(&mut self, changed: Arc<AtomicBool>) -> Result<(), TapError> {
+        let device = self.device();
+        let watcher = self.input_format.insert(InputFormatWatch::new(changed));
+        // Own each successful registration before reading a changing topology.
+        for target in InputFormatWatch::device_targets(device) {
+            watcher.add(target).map_err(TapError::platform)?;
+        }
+        let address =
+            ca::PropSelector::DEVICE_STREAMS.addr(ca::PropScope::INPUT, ca::PropElement::MAIN);
+        let streams: Vec<ca::Stream> = device
+            .prop_vec(&address)
+            .map_err(|e| TapError::platform(format!("Cannot monitor microphone streams: {e:?}")))?;
+        if streams.is_empty() {
+            return Err(TapError::FormatUnsupported(
+                "Microphone has no input streams".into(),
+            ));
+        }
+        for stream in streams {
+            watcher
+                .add((
+                    stream.0,
+                    ca::PropSelector::STREAM_VIRTUAL_FORMAT.global_addr(),
+                ))
+                .map_err(TapError::platform)?;
+        }
+        Ok(())
     }
     /// Own the process tap before any fallible property/aggregate setup.
     pub fn system(tap: TapGuard) -> Self {
@@ -61,6 +88,7 @@ impl NativeAssets {
             tap: Some(ManuallyDrop::new(tap)),
             block: None,
             queue: None,
+            input_format: None,
         }
     }
     pub fn system_tap(&self) -> &TapGuard {
@@ -129,6 +157,12 @@ impl CaptureAssets for NativeAssets {
         }
     }
     fn release_device(&mut self) -> Result<(), String> {
+        if let Some(watcher) = &mut self.input_format {
+            // A failed removal retains the entire capture bundle and process
+            // fence; a successful removal drains the listener queue before
+            // releasing its callback or publishing full cleanup.
+            watcher.close()?;
+        }
         match self.device {
             None | Some(DeviceOwner::Physical(_)) => Ok(()),
             Some(DeviceOwner::Aggregate(_)) => {

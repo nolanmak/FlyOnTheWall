@@ -64,6 +64,7 @@ impl<A: CaptureAssets> CaptureOwner<A> {
         };
         Ok((owner, value))
     }
+    #[cfg(test)]
     pub fn start(assets: A) -> Result<Self, TapError> {
         Self::owned(assets).start_prepared()
     }
