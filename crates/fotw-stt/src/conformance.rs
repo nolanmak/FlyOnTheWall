@@ -179,6 +179,62 @@ pub async fn local_lifecycle() {
     }
 }
 
+/// Names, numbers, technical terms, Unicode, exact boundaries and literal snippets.
+///
+/// # Panics
+/// If the shared vocabulary wire shape or deterministic semantics change.
+pub fn vocabulary() {
+    use crate::{
+        CustomVocabulary,
+        vocabulary::{HintSelection, Profile},
+    };
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../tests/fixtures/vocabulary-v1.json")).unwrap();
+    let profile = Profile::parse(&serde_json::to_vec(&fixture["profile"]).unwrap()).unwrap();
+    for case in fixture["cases"].as_array().unwrap() {
+        assert_eq!(
+            profile.expand(case["input"].as_str().unwrap()),
+            case["output"].as_str().unwrap()
+        );
+    }
+    let roundtrip = Profile::parse(&serde_json::to_vec_pretty(&profile).unwrap()).unwrap();
+    assert_eq!(roundtrip, profile);
+    assert_eq!(
+        profile.hints_for(CustomVocabulary::None),
+        HintSelection::Unsupported
+    );
+    assert_eq!(
+        profile.hints_for(CustomVocabulary::Keyterm),
+        HintSelection::Supported {
+            mechanism: CustomVocabulary::Keyterm,
+            terms: &profile.recognition_hints
+        }
+    );
+    assert_eq!(
+        Profile::default().hints_for(CustomVocabulary::None),
+        HintSelection::NotRequested
+    );
+    for mechanism in [
+        CustomVocabulary::Keyterm,
+        CustomVocabulary::Keywords,
+        CustomVocabulary::Prompt,
+    ] {
+        assert_eq!(
+            profile.hints_for(mechanism),
+            HintSelection::Supported {
+                mechanism,
+                terms: &profile.recognition_hints
+            }
+        );
+    }
+    let mut snippets_only = profile.clone();
+    snippets_only.recognition_hints.clear();
+    assert_eq!(
+        snippets_only.hints_for(CustomVocabulary::None),
+        HintSelection::NotRequested
+    );
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
