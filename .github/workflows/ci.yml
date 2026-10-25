@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-  # Weekly run for the advisories job only, so an advisory published against an
+  # Weekly run for advisory jobs only, so an advisory published against an
   # unchanged Cargo.lock shows up without waiting for the next push. Every other
   # job skips scheduled runs.
   schedule:
@@ -25,6 +25,47 @@ env:
 # the bumps.
 
 jobs:
+  aec-eval-advisories:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: tools/aec-eval/Cargo.toml
+          command: check advisories
+
+  aec-eval-deny:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: tools/aec-eval/Cargo.toml
+          command: check licenses bans sources
+
+  aec-eval:
+    if: github.event_name != 'schedule'
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@46817827a5bfabe028bf34e1cce71fd40e2ff697 # 1.95.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: tools/aec-eval
+      # Generated audio only: no device, provider, model asset or credentials.
+      - run: cargo fmt --manifest-path tools/aec-eval/Cargo.toml --check
+      - run: cargo clippy --manifest-path tools/aec-eval/Cargo.toml --locked --all-targets
+      - run: cargo test --manifest-path tools/aec-eval/Cargo.toml --locked
+      - run: cargo run --release --manifest-path tools/aec-eval/Cargo.toml --locked
+
   keyring-interop:
     timeout-minutes: 10
     if: github.event_name != 'schedule'
