@@ -1395,6 +1395,33 @@ async fn recorder_retains_timed_out_native_inference_without_delaying_audio_fini
 
 struct DroppingLocalFactory(BlockingFactory);
 struct DroppingLocalModel(BlockingFactory);
+// Recording readiness precedes asynchronous fixture delivery. This finite,
+// unpaced source acknowledges playback before returning from Start so a fast
+// Stop cannot turn a destructor-ownership test into an empty-recording race.
+struct ReplayedBeforeReady(fotw_audio::platform::file::FileAudioSource);
+impl fotw_audio::AudioTap for ReplayedBeforeReady {
+    fn id(&self) -> &fotw_audio::TapId {
+        self.0.id()
+    }
+    fn format(&self) -> fotw_audio::StreamFormat {
+        self.0.format()
+    }
+    fn format_is_authoritative(&self) -> bool {
+        self.0.format_is_authoritative()
+    }
+    fn start(
+        &mut self,
+        sink: Box<dyn fotw_audio::FrameSink>,
+    ) -> Result<fotw_audio::StreamFormat, fotw_audio::TapError> {
+        let format = self.0.start(sink)?;
+        self.0.wait_for_completion();
+        assert_eq!(self.0.delivered_frames(), self.0.total_frames() as u64);
+        Ok(format)
+    }
+    fn stop(&mut self) -> Result<(), fotw_audio::TapError> {
+        self.0.stop()
+    }
+}
 impl RecognizerFactory for DroppingLocalFactory {
     fn model(&self) -> &str {
         "destructor-fixture"
@@ -1449,14 +1476,14 @@ async fn local_only_recorder_retains_native_destructor_without_delaying_audio_fi
         Default::default(),
         Box::new(|| {
             Ok((
-                Box::new(FileAudioSource::from_wav(
+                Box::new(ReplayedBeforeReady(FileAudioSource::from_wav(
                     TapId::system_default(),
                     fotw_audio::wav::WavData {
                         format: StreamFormat::new(16_000, 1, SampleFormat::I16),
                         samples: vec![0.0; 1600],
                     },
                     ReplaySpeed::Unpaced,
-                )),
+                ))),
                 None,
             ))
         }),

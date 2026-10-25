@@ -298,7 +298,7 @@ impl Recognizer for BlockingModel {
 }
 #[test]
 fn timeout_or_cancel_retains_one_native_owner_and_fences_late_constructor_or_inference() {
-    for (in_create, cancel) in [(true, false), (true, true), (false, true)] {
+    for (in_create, cancel) in [(true, false), (true, true), (false, true), (false, false)] {
         let f = fixture();
         let calls = Arc::new(AtomicUsize::new(0));
         let (release, gate) = std::sync::mpsc::channel();
@@ -326,7 +326,17 @@ fn timeout_or_cancel_retains_one_native_owner_and_fences_late_constructor_or_inf
         if cancel {
             c.cancel(&f.meeting).unwrap();
         } else {
-            clock.store(50, Ordering::Release);
+            if !in_create {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while c.read(&f.meeting).unwrap().phase != RecoveryPhase::Transcribing {
+                    assert!(
+                        Instant::now() < deadline,
+                        "inference phase was never admitted"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+            clock.store(if in_create { 50 } else { 6000 }, Ordering::Release);
         }
         let pending = c.read(&f.meeting).unwrap();
         let duplicate = c.retry(&f.meeting);
@@ -541,4 +551,115 @@ fn active_retry_reports_durable_catchup_before_the_whole_source_finishes() {
         pending.sources[0].pending_audio_ms > 0 && pending.sources[0].pending_audio_ms < before,
         "status must report actual committed progress: {pending:?}"
     );
+}
+
+#[test]
+fn confirmed_cloud_sources_need_no_local_plan_or_model_to_finalize_projection() {
+    use fotw_pipeline::replay::{ReplayReader, ReplaySource};
+    for complete_marker in [false, true] {
+        let f = fixture();
+        let session = f.dir.file_name().unwrap().to_str().unwrap();
+        let mut reader = ReplayReader::open(&f.dir, session, ReplaySource::System).unwrap();
+        let end = reader.saved_end().unwrap();
+        let mut journal = CoverageJournal::open(&f.dir, session, Source::System).unwrap();
+        journal
+            .commit(0, journal.committed_through(), end, vec![])
+            .unwrap();
+        drop(journal);
+        if complete_marker {
+            reader.mark_complete(end).unwrap();
+        }
+        drop(reader);
+        let path = f.dir.join("system.stt-coverage.jsonl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines = text.lines();
+        let mut header: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        header["header"].as_object_mut().unwrap().remove("fallback");
+        let mut updated = serde_json::to_string(&header).unwrap() + "\n";
+        for line in lines {
+            updated.push_str(line);
+            updated.push('\n');
+        }
+        std::fs::write(path, updated).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = controller(&f, calls.clone());
+        assert_eq!(
+            c.read(&f.meeting).unwrap().phase,
+            RecoveryPhase::Incomplete,
+            "confirmed inference still needs an acknowledged database projection"
+        );
+        c.retry(&f.meeting).unwrap();
+        assert_eq!(finished(&c, &f.meeting).phase, RecoveryPhase::Complete);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            ReplayReader::open(&f.dir, session, ReplaySource::System)
+                .unwrap()
+                .is_projected()
+                .unwrap()
+        );
+        assert_eq!(
+            controller(&f, calls.clone())
+                .read(&f.meeting)
+                .unwrap()
+                .phase,
+            RecoveryPhase::Complete
+        );
+        assert!(
+            ReplayReader::open(&f.dir, session, ReplaySource::System)
+                .unwrap()
+                .is_complete()
+                .unwrap()
+        );
+        assert_eq!(
+            CoverageJournal::snapshot(&f.dir, session, Source::System)
+                .unwrap()
+                .epochs
+                .len(),
+            1,
+            "metadata-only completion cannot invent a provider switch"
+        );
+    }
+}
+struct SlowFactory;
+struct SlowModel;
+impl RecognizerFactory for SlowFactory {
+    fn model(&self) -> &str {
+        "fixture-local"
+    }
+    fn language(&self) -> Option<&str> {
+        Some("en")
+    }
+    fn create(&self) -> Result<Box<dyn Recognizer>, SttError> {
+        Ok(Box::new(SlowModel))
+    }
+}
+impl Recognizer for SlowModel {
+    fn transcribe(&mut self, pcm: &[f32]) -> Result<Vec<Recognized>, SttError> {
+        std::thread::sleep(Duration::from_millis(100));
+        Model.transcribe(pcm)
+    }
+}
+#[test]
+fn healthy_long_recovery_outlives_one_stall_budget_while_durable_progress_continues() {
+    let pcm = (0..181 * 16000)
+        .map(|n| if (n / 3200) % 2 == 0 { 1000 } else { 8000 })
+        .collect();
+    let f = fixture_audio(pcm, "fixture-local", "fixture-revision");
+    let c = SavedSpeechRecovery::with_parts(
+        Db::open(&f.database, &f.key).unwrap(),
+        f.root.path().to_owned(),
+        Arc::new(|_, _| Ok(Arc::new(SlowFactory))),
+        Duration::from_secs(5),
+        Duration::from_millis(500),
+    );
+    let began = Instant::now();
+    c.retry(&f.meeting).unwrap();
+    let status = finished(&c, &f.meeting);
+    assert!(began.elapsed() > Duration::from_millis(500));
+    assert_eq!(
+        status.phase,
+        RecoveryPhase::Complete,
+        "healthy long recordings must not expire on a total-time cap: {status:?}"
+    );
+    assert_eq!(status.sources[0].pending_audio_ms, 0);
 }

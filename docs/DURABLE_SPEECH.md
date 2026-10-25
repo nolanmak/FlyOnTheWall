@@ -281,11 +281,14 @@ reads status. Retry uses the original per-source model/revision/language and
 absolute coverage boundary, preserves corrected committed text, and projects
 receipts idempotently into the original meeting and recording clock. It does
 not change today's ASR settings, read a cloud credential, start capture or invoke
-a summarization engine. A completed retry does not initialize another model.
+a summarization engine. A completed retry does not initialize another model. Already-confirmed sources
+need no local recovery plan: missing completion markers can be finalized under
+exclusive file ownership, without loading a model or creating a provider epoch.
 
 The daemon owns one retry job at a time. The HTTP request returns immediately;
-metadata/model preparation has a 30-second deadline and each source has a
-120-second inference drain. Native calls cannot be forcibly interrupted. Timeout
+metadata/model preparation has a 30-second deadline. During inference, only
+a durable coverage advance renews the 120-second progress-stall budget; healthy
+long recordings can run beyond that budget while making progress. Native calls cannot be forcibly interrupted. Timeout
 or Cancel revokes constructor/inference output while the job retains admission
 until the actual worker, model and cleanup return. Another retry cannot multiply
 a stuck owner. Model loading follows exclusive source/journal admission, and no
