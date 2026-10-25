@@ -325,3 +325,36 @@ physical-device acceptance:
 ![Local retry with pending saved audio](speech-recovery/pending-mobile.png)
 
 ![Recovered text waits for explicit reload](speech-recovery/completed-mobile.png)
+
+### Capture ownership and clock evidence
+
+New WALs hold an exclusive `capture-owner.lock` for the writer's lifetime. A
+recovery reader must acquire that existing lease; age, a timeout, or a missing
+lease file never proves that a writer has stopped. A hard process kill releases
+the lease without requiring a Rust destructor.
+
+`capture-clock.json` records the original manifest identity/start/formats, an
+observed elapsed time and fsynced raw PCM byte counts. Both recording pumps
+refresh it every two seconds and before finalization. The first observed Stop
+request freezes the elapsed time while later drain can extend the durable byte
+counts. This timestamp proves a requested Stop, not native teardown completion.
+The archival manifest's later `ended_at_ms` remains a finalization timestamp.
+
+Clock publication flushes the audio first, fsyncs a temporary checkpoint, then
+renames it atomically and syncs the containing directory on Unix. Recovery
+refuses mismatched, unsupported, torn, overflowing or truncated evidence. Extra
+raw bytes remain visible as uncheckpointed tails: they prevent certification of
+a complete frozen clock and are never truncated. An interrupted live checkpoint
+retains its original observed prefix without inventing a Stop or a recovery-time
+end. Legacy recordings without this evidence remain unavailable to this new
+ownership protocol; their audio is preserved.
+
+A checkpoint metadata failure reports one capture warning and does not stop the
+raw-audio pump. Later successful checkpoints can restore evidence; missing or
+stale evidence cannot certify the uncheckpointed audio after a crash.
+
+These primitives and their production checkpoints prepare unfinished-WAL
+recovery. They do not yet enable automatic startup inference or reconstruct
+canonical speech audio from raw PCM; the saved-meeting retry requirements above
+still apply. Device-free contracts include hard process kill/reacquisition,
+live-owner exclusion, Stop/drain clock preservation, tails and corrupt evidence.

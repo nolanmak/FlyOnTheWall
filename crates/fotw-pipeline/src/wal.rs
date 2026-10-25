@@ -399,9 +399,69 @@ pub struct SessionWal {
     mic: BufWriter<File>,
     stt: BufWriter<File>,
     last_sync: Instant,
+    capture_owner: crate::capture_clock::CaptureOwner,
+    capture_checkpoint: Option<crate::capture_clock::CaptureCheckpoint>,
 }
 
 impl SessionWal {
+    /// Persist a raw prefix and its original live clock; Stop freezes the first end.
+    pub fn checkpoint_capture(
+        &mut self,
+        elapsed_ms: u64,
+        stop_requested: bool,
+    ) -> std::io::Result<()> {
+        use crate::capture_clock::CaptureCheckpoint;
+        let previous = self.capture_checkpoint.as_ref();
+        let frozen = previous.filter(|p| p.stop_requested);
+        let elapsed_ms = frozen.map_or(elapsed_ms, |p| p.elapsed_ms);
+        if self
+            .manifest
+            .started_at_ms
+            .checked_add(elapsed_ms)
+            .is_none()
+            || (!stop_requested && previous.is_some_and(|p| elapsed_ms < p.elapsed_ms))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "capture clock overflow or regression",
+            ));
+        }
+        // A Stop timestamp may be published after a newer live observation
+        // when its caller was descheduled. The first Stop is authoritative;
+        // only live observations must advance monotonically.
+        let stop_requested = stop_requested || frozen.is_some();
+        self.flush()?;
+        let checkpoint = CaptureCheckpoint {
+            schema: 1,
+            session_id: self.manifest.id.clone(),
+            started_at_ms: self.manifest.started_at_ms,
+            elapsed_ms,
+            stop_requested,
+            system_bytes: self.system.get_ref().metadata()?.len(),
+            mic_bytes: self.mic.get_ref().metadata()?.len(),
+            system_format: self.manifest.system_format.unwrap(),
+            mic_format: self.manifest.mic_format,
+        };
+        let aligned = |bytes: u64, format: Option<TrackFormat>| {
+            format.map_or(bytes == 0, |f| {
+                f.channels > 0
+                    && f.sample_rate_hz > 0
+                    && bytes.is_multiple_of(u64::from(f.channels) * 2)
+            })
+        };
+        if !aligned(checkpoint.system_bytes, Some(checkpoint.system_format))
+            || !aligned(checkpoint.mic_bytes, checkpoint.mic_format)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "capture checkpoint has invalid PCM format or alignment",
+            ));
+        }
+        self.capture_owner.publish(&checkpoint)?;
+        self.capture_checkpoint = Some(checkpoint);
+        Ok(())
+    }
+
     /// Create a new session directory under `root` for two legs of the same
     /// shape.
     ///
@@ -429,6 +489,7 @@ impl SessionWal {
         mic: Option<TrackFormat>,
     ) -> std::io::Result<Self> {
         let (id, dir) = reserve_session_dir(root.as_ref(), session_id)?;
+        let capture_owner = crate::capture_clock::CaptureOwner::create(&dir)?;
 
         let manifest = Manifest {
             id,
@@ -452,17 +513,20 @@ impl SessionWal {
             promoted: None,
         };
 
-        let wal = Self {
+        let mut wal = Self {
             system: BufWriter::new(create(&dir.join("system.pcm"))?),
             mic: BufWriter::new(create(&dir.join("mic.pcm"))?),
             stt: BufWriter::new(create(&dir.join("stt.jsonl"))?),
             manifest,
             dir,
             last_sync: Instant::now(),
+            capture_owner,
+            capture_checkpoint: None,
         };
         // Write the manifest immediately: a session that crashes one second in
         // must still be identifiable as a session.
         wal.write_manifest()?;
+        wal.checkpoint_capture(0, false)?;
         Ok(wal)
     }
 
