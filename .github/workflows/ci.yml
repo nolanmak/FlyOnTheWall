@@ -66,6 +66,50 @@ jobs:
       - run: cargo test --manifest-path tools/aec-eval/Cargo.toml --locked
       - run: cargo run --release --manifest-path tools/aec-eval/Cargo.toml --locked
 
+  aec-native:
+    if: github.event_name != 'schedule'
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_BUILD_JOBS: 3
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@46817827a5bfabe028bf34e1cce71fd40e2ff697 # 1.95.0
+        with:
+          components: clippy, llvm-tools-preview
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: tools/aec-eval
+          key: native-webrtc
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev pkg-config
+      - name: Provision isolated native build tools
+        shell: bash
+        run: |
+          python3 -m venv "$RUNNER_TEMP/aec-build-tools"
+          "$RUNNER_TEMP/aec-build-tools/bin/pip" install meson==1.11.1 ninja==1.13.0
+          mkdir -p "$RUNNER_TEMP/aec-build-bin"
+          # Upstream invokes Ninja without Cargo's job budget. Bound it too.
+          cat > "$RUNNER_TEMP/aec-build-bin/ninja" <<'SH'
+          #!/bin/sh
+          exec "$RUNNER_TEMP/aec-build-tools/bin/ninja" -j3 "$@"
+          SH
+          chmod +x "$RUNNER_TEMP/aec-build-bin/ninja"
+          echo "$RUNNER_TEMP/aec-build-tools/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/aec-build-bin" >> "$GITHUB_PATH"
+      # Public C++ dependencies only; generated audio, no model or provider.
+      - name: Check and measure native comparison
+        shell: bash
+        run: |
+          export PATH="$RUNNER_TEMP/aec-build-bin:$PATH"
+          cargo clippy --manifest-path tools/aec-eval/Cargo.toml --locked --features native-webrtc --all-targets
+          cargo test --manifest-path tools/aec-eval/Cargo.toml --locked --features native-webrtc
+          cargo run --release --manifest-path tools/aec-eval/Cargo.toml --locked --features native-webrtc
+
   keyring-interop:
     timeout-minutes: 10
     if: github.event_name != 'schedule'

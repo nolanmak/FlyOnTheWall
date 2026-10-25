@@ -9,7 +9,12 @@ publish = false
 # Evaluation is explicitly separate from the shipped app and its dependencies.
 [workspace]
 
+[features]
+# Native C++ comparison is evaluation-only and opt-in; the app is unaffected.
+native-webrtc = ["dep:webrtc-audio-processing"]
+
 [dependencies]
 fotw-pipeline = { path = "../../crates/fotw-pipeline" }
 sonora = "=0.2.0"
 serde_json = "1"
+webrtc-audio-processing = { version = "=2.1.0", features = ["bundled"], optional = true }

@@ -116,8 +116,39 @@ fn run(backend: &str, far: &[f32], mic: &[f32]) -> Vec<f32> {
             out
         }
         "sonora-0.2.0-adapted" => run_streaming(far, mic),
+        #[cfg(feature = "native-webrtc")]
+        "native-webrtc-2.1.0-aec3" => run_native(far, mic),
         _ => panic!("unknown evaluation backend"),
     }
+}
+
+#[cfg(feature = "native-webrtc")]
+fn run_native(far: &[f32], mic: &[f32]) -> Vec<f32> {
+    use webrtc_audio_processing::{Config, Processor, config::EchoCanceller};
+    assert_eq!(far.len(), mic.len());
+    assert!(
+        mic.len().is_multiple_of(FRAME),
+        "fixed-frame control cannot drop a tail"
+    );
+    let processor = Processor::new(RATE as u32).unwrap();
+    assert_eq!(processor.num_samples_per_frame(), FRAME);
+    processor.set_config(Config {
+        echo_canceller: Some(EchoCanceller::Full {
+            stream_delay_ms: None,
+        }),
+        ..Default::default()
+    });
+    let mut output = Vec::with_capacity(mic.len());
+    for (render, capture) in far.chunks_exact(FRAME).zip(mic.chunks_exact(FRAME)) {
+        // Analyze the immutable reference before its matching capture frame.
+        processor.analyze_render_frame([render]).unwrap();
+        let mut cleaned = capture.to_vec();
+        processor
+            .process_capture_frame([cleaned.as_mut_slice()])
+            .unwrap();
+        output.extend(cleaned);
+    }
+    output
 }
 
 fn db(ratio: f64) -> f64 {
@@ -240,12 +271,15 @@ fn main() {
         None
     };
     let mut results = Vec::new();
-    for backend in [
+    let backends = [
         "passthrough",
         "gate-100ms",
         "sonora-0.2.0-aec3",
         "sonora-0.2.0-adapted",
-    ] {
+        #[cfg(feature = "native-webrtc")]
+        "native-webrtc-2.1.0-aec3",
+    ];
+    for backend in backends {
         let adapted = backend == "sonora-0.2.0-adapted";
         let began = Instant::now();
         let control = run(backend, &zero, &near);
@@ -269,6 +303,7 @@ fn main() {
         serde_json::json!({"synthetic_only":true, "hardware":hardware,
         "sample_rate_hz":RATE, "audio_seconds_per_case":20,"warmup_seconds":8,
         "ns_agc_disabled":true,"candidate_selected_for_app":false,
+        "native_webrtc_evaluated":cfg!(feature = "native-webrtc"),
         "undrained_controls_present":true,"callback_adapter_evaluated":true,"results":results})
     );
 }
@@ -276,6 +311,30 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "native-webrtc")]
+    #[test]
+    fn native_aec_reduces_echo_without_mutating_its_render_reference() {
+        let far = signal(127);
+        let original = far.clone();
+        let echo = room(&far);
+        let zero = vec![0.0; SAMPLES];
+        let near = signal(915);
+        let control = run_native(&zero, &near);
+        let lag = delay(&near, &control);
+        let retained = metrics(&near, &zero, &control, lag);
+        assert!(
+            retained["near_gain_db"].as_f64().unwrap().abs() <= 0.5,
+            "echo cancellation cannot pass by muting local speech: {retained}"
+        );
+        let out = run_native(&far, &echo);
+        assert_eq!(far, original);
+        assert_eq!(out.len(), echo.len());
+        let measured = metrics(&zero, &echo, &out, lag);
+        assert!(
+            measured["residual_reduction_db"].as_f64().unwrap() >= 15.0,
+            "native AEC must cancel the known echo fixture: {measured}"
+        );
+    }
     #[test]
     fn the_real_backend_adapter_preserves_the_last_near_only_samples_at_partial_stop() {
         let mut near = signal(42);
