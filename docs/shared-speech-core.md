@@ -30,11 +30,12 @@ The producer runs these contracts in its own tests as well.
 ## Compatibility and upgrade policy
 
 `.github/workflows/murmur-compatibility.yml` checks immutable Murmur consumer
-commit `bac36507b9871bc8ecd9b4286cf4ce02d9dba464` (Murmur #81) on macOS and Linux. It replaces
+commit `0cb5d7e5968ffd4a016833c7c13fe3e90147c22d` (Murmur #82) on macOS and Linux. It replaces
 that consumer's four Git dependencies with the exact producer crates under
 review and runs its workspace tests. Cargo may update source entries in this
 disposable checkout; ordinary consumer builds retain their committed lockfile.
-This is the merged Murmur consumer with its vendor snapshot removed, native
+This consumer includes the successful-Stop route-notification fix, alongside
+its removed vendor snapshot, native
 readiness/cleanup ownership, whole-utterance fallback, vocabulary and opt-in text
 cleanup. Both its Deepgram CloseStream/Metadata drain and external local helper
 remain application-owned. Future consumer revisions require another deliberate
