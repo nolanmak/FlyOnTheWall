@@ -186,6 +186,7 @@ pub mod capture_health;
 /// Dashboard transcription settings.
 pub mod speech_control;
 
+mod interrupted_capture;
 /// Owned saved-audio transcription recovery.
 pub mod speech_recovery;
 /// Content-free live transcription provenance.
