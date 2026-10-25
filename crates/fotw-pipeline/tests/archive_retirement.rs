@@ -143,3 +143,16 @@ fn a_linked_destination_does_not_overwrite_a_file_outside_the_capture() {
     assert_eq!(std::fs::read(sentinel).unwrap(), b"owned fixture bytes");
     assert!(!dir.join("mic.opus").exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn the_encoder_open_itself_rejects_a_destination_link_created_after_preflight() {
+    let root = tempfile::tempdir().unwrap();
+    let sentinel = root.path().join("owned-sentinel");
+    std::fs::write(&sentinel, b"owned fixture bytes").unwrap();
+    let output = root.path().join("system.opus");
+    assert!(std::fs::symlink_metadata(&output).is_err());
+    std::os::unix::fs::symlink(&sentinel, &output).unwrap();
+    assert!(fotw_pipeline::opus::OpusOggWriter::create(&output, 16000).is_err());
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"owned fixture bytes");
+}

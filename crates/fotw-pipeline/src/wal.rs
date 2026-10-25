@@ -857,7 +857,12 @@ pub(crate) fn write_manifest_at(dir: &Path, manifest: &Manifest) -> std::io::Res
         f.write_all(&json)?;
         f.sync_all()?;
     }
-    std::fs::rename(tmp, dir.join("manifest.json"))
+    std::fs::rename(tmp, dir.join("manifest.json"))?;
+    // On Unix the synced file alone does not persist newly created archive
+    // names or the manifest rename. Publish the directory before raw retirement.
+    #[cfg(unix)]
+    File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 /// Encode one leg.
@@ -959,7 +964,7 @@ fn encode_track(
     let stats = writer.finish()?;
     // The completed manifest may authorize raw PCM retirement. Persist the
     // archive itself before publishing that manifest or deleting its source.
-    OpenOptions::new()
+    crate::opus::archive_open_options()
         .read(true)
         .write(true)
         .open(&opus_path)?

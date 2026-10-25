@@ -102,6 +102,9 @@ Encoding checks both raw sources and output file types before opening either
 archive. Missing or shortened previously encoded PCM, linked destinations and
 an orphan microphone archive fail without replacing retained audio or its
 manifest. An absent, never-recorded microphone with no archive remains valid.
-Six synthetic integration tests and full local `just ci` pass. These checks do
+On Unix both destination opens also refuse final-component symlinks at open
+time, including a link introduced after preflight. Manifest publication syncs
+the session directory after renaming the synced manifest, before PCM retirement.
+Seven synthetic integration tests and full local `just ci` pass. These checks do
 not establish active-writer exclusion or transactional replacement after an I/O
 failure; complete-archive validation before destructive retirement remains open.
