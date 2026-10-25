@@ -105,8 +105,8 @@ On Unix both destination opens also refuse final-component symlinks at open
 time, including a link introduced after preflight. Manifest publication syncs
 the session directory after renaming the synced manifest, before PCM retirement.
 Seven synthetic integration tests and full local `just ci` pass. Writer exclusion
-and verification before retirement are described below. Transactional replacement
-after an encoding I/O failure remains open.
+and verification before retirement are described below. Archive retry publication
+is described in "Transactional archive retry" below.
 
 ## Recovering finalized captures and retired PCM
 
@@ -162,9 +162,9 @@ capture lease, so a capture or local recovery worker prevents competing mutation
 The lease is not manufactured for legacy sessions that have no ownership sidecar.
 Verification uses bounded reusable buffers and runs off the capture callback.
 Tests use synthetic owned recordings; they do not establish physical power-loss
-or device-recovery behavior. Transactional replacement of an existing archive
-after an encoding I/O error, raw/canonical reconstruction and unknown-end capture
-admission remain separate work.
+or device-recovery behavior. Archive retry publication is described below.
+Raw/canonical reconstruction and legacy unindexed capture admission remain
+separate work.
 
 ## Automatic recovery of unknown-end canonical prefixes
 
@@ -186,3 +186,34 @@ without an inference attempt; reconstruction is still separate work.
 audio with fake inference. `--interrupted-prefix` intentionally indexes without
 starting inference so reviewers can still exercise manual Retry. Normal app
 startup always uses the automatic pass.
+
+## Transactional archive retry
+
+The first encode still writes incremental `system.opus` and `mic.opus` files so
+a kill leaves their complete pages playable and raw PCM retained. If either
+archive already exists, or the manifest records an earlier completed encode,
+a retry reserves an independent `.archive-<identity>` directory. Both new
+archives are completed and synced there before the manifest atomically selects
+the pair. Existing archives are never overwritten by a retry.
+
+An input or encoder I/O failure removes only the new attempt's owned temporary
+files. Once manifest publication is attempted, the complete generation is kept:
+a directory-sync error can mean the new manifest is already visible. In that
+ambiguous case either selected pair is complete, and the prior pair and raw
+audio still exist. Older generations and complete unpublished generations are
+retained until the session directory is retired, trading some temporary disk
+space for recovery. The manifest remains authoritative; callers must follow
+its encoded track paths rather than assume root-level archives are current.
+
+Verification accepts only the original source basename or that basename inside
+one ordinary app generation directory. Traversal, source swaps and linked
+directories are refused. Published media retains its ordinary filenames and
+is verified against the same source identity, sample count and decoded content
+before session retirement. Manifest staging also refuses symlinks at preflight
+and, on Unix, at open time.
+
+Regression tests exercise a real second-source permission error, a late
+manifest-write error, successful retry, retired-PCM clock verification and
+generation publication/retirement. An existing approved public JFK/small.en
+fixture also checks real Whisper recovery from a finalized generation after
+raw retirement. These checks do not establish physical power-loss behavior.

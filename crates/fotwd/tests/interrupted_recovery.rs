@@ -1008,16 +1008,23 @@ fn native_capture_recovery(archived: bool, prefix_only: bool) {
     if archived {
         f.wal.take().unwrap().finalize().unwrap();
         fotw_pipeline::wal::encode_session(&f.dir).unwrap();
+        let generation = fotw_pipeline::wal::encode_session(&f.dir).unwrap();
+        assert!(generation.system.file.starts_with(".archive-"));
         fotw_pipeline::wal::discard_pcm(&f.dir).unwrap();
     } else {
         drop(f.wal.take());
     }
     let audio_before = std::fs::read(f.dir.join("system.stt16")).unwrap();
-    let retained_path = f.dir.join(if archived {
-        "system.opus"
+    let retained_path = if archived {
+        let encoded = fotw_pipeline::wal::SessionState::read(&f.dir)
+            .unwrap()
+            .manifest
+            .encoded
+            .unwrap();
+        f.dir.join(encoded.system.file)
     } else {
-        "system.pcm"
-    });
+        f.dir.join("system.pcm")
+    };
     let retained_before = std::fs::read(&retained_path).unwrap();
     let manifest_before = std::fs::read(f.dir.join("manifest.json")).unwrap();
     let mut db = Db::open(&f.database, &f.key).unwrap();

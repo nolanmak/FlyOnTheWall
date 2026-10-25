@@ -654,7 +654,13 @@ fn verify(
                 got,
             });
         }
-        wal::verify_encoded_track(&parent, name, track, Some(format))
+        // Published media has canonical names, independently of the immutable
+        // generation selected by the source session's manifest.
+        wal::archive_path(dir, name, &track.file)
+            .map_err(io("verifying source archive identity", dir))?;
+        let mut published_track = track.clone();
+        published_track.file = name.into();
+        wal::verify_encoded_track(&parent, name, &published_track, Some(format))
             .map_err(io("verifying published archive audio", &path))?;
     }
     Ok(())

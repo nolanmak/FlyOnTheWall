@@ -88,6 +88,37 @@ fn media_dir(root: &Path, meeting_id: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn a_retried_archive_generation_is_published_and_verified_before_retirement() {
+    let root = tmpdir("archive-generation");
+    let dir = finished_session(&root, "generation");
+    fotw_pipeline::wal::encode_session(&dir).unwrap();
+    let encoded = fotw_pipeline::wal::encode_session(&dir).unwrap();
+    assert!(encoded.system.file.contains('/'));
+    let expected = std::fs::read(dir.join(&encoded.system.file)).unwrap();
+    let promoted = publish(&dir, &root).unwrap();
+    let media = root.join(&promoted.tracks[0].rel_path);
+    assert_eq!(std::fs::read(&media).unwrap(), expected);
+    stamp(&dir, &promoted).unwrap();
+    let original = std::fs::read(dir.join("manifest.json")).unwrap();
+    let mut forged: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    forged["encoded"]["system"]["file"] = "../outside.opus".into();
+    std::fs::write(
+        dir.join("manifest.json"),
+        serde_json::to_vec(&forged).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        retire(&dir, &root).is_err(),
+        "published verification must retain source path identity"
+    );
+    assert!(dir.join("system.pcm").exists());
+    std::fs::write(dir.join("manifest.json"), original).unwrap();
+    retire(&dir, &root).unwrap();
+    assert!(!dir.exists());
+    assert_eq!(std::fs::read(media).unwrap(), expected);
+}
+
+#[test]
 fn promotion_publishes_media_but_preserves_audio_needed_for_pending_transcription() {
     use fotw_pipeline::replay::{ReplaySource, ReplayWriter};
     let root = tmpdir("pending-transcription");
