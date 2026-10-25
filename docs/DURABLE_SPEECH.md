@@ -64,8 +64,7 @@ cargo run -p fotwd --example ui_preview -- --speech-history
 Synthetic [desktop](speech-ui/saved-desktop.png) and
 [390px](speech-ui/saved-mobile.png) views show the real saved-history response.
 
-Summary-prompt provenance, startup native recovery
-and retry controls remain part of
+Startup native recovery and retry controls remain part of
 [#12](https://github.com/nolanmak/FlyOnTheWall/issues/12).
 
 ## Capture and admission
@@ -195,5 +194,30 @@ interval, and older transcripts explicitly have unknown history.
 The formatter reads only epoch/receipt metadata, never inference payloads, and
 keeps untrusted metadata on one escaped line in Markdown. JSON/archive export
 continues to preserve the original rows and immutable inference payloads.
-Summary-prompt provenance and the remaining recovery/physical/quality gates
-remain follow-up work.
+The remaining recovery/physical/quality gates remain follow-up work.
+
+
+## Summary engine context
+
+The daemon supplies actual primary-transcript engine epochs to summary prose,
+structured extraction and every map/reduce instruction. Provider/model/revision,
+recording-clock boundaries, switch reason and recorded timing/speaker capability
+availability travel as recording facts. They do not become transcript words,
+citable evidence or part of the shared system prompt/cache prefix. Empty history
+explicitly means it was not recorded. The model is instructed to preserve unknown
+owners and avoid carrying system speaker identities across engine epochs; these
+instructions are not a measured guarantee of model attribution quality.
+
+The metadata block is bounded to 6144 bytes, with at most 16 epochs and 96 Unicode
+characters per free-text field. JSON is framed separately, delimiter characters
+are escaped, and omitted epochs or clipped fields are explicitly reported.
+Admission reserves the actual rendered metadata byte count against both prose
+and extraction windows. Reduction also checks its combined mapped input before
+calling a model. Existing citation/evidence validation still uses only original
+transcript segments. Summary engine selection and egress policy remain separate
+from local ASR, and a summary failure does not erase the raw transcript.
+
+Tests use a real temporary library and fake transports, including bounded hostile
+metadata, map/reduce/extraction propagation, unknown history and context rejection.
+No paid-provider attribution evaluation is claimed. Native restart/retry,
+provisioning, AEC and the original physical/quality acceptance remain unfinished.
