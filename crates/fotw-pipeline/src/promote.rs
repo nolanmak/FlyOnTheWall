@@ -295,6 +295,7 @@ pub fn publish(
     data_root: impl AsRef<Path>,
 ) -> Result<Promotion, PromoteError> {
     let dir = session_dir.as_ref();
+    let _owner = wal::archive_owner(dir).map_err(io("acquiring archive ownership", dir))?;
     let root = data_root.as_ref();
     let manifest = manifest_of(dir)?;
     let claim = ready_claim(dir, &manifest)?;
@@ -304,6 +305,15 @@ pub fn publish(
         .ok_or_else(|| PromoteError::NotEncoded {
             dir: dir.to_path_buf(),
         })?;
+
+    let formats = manifest.track_formats(dir);
+    for (name, track, format) in [
+        ("system.opus", &encoded.system, formats.system),
+        ("mic.opus", &encoded.mic, formats.mic),
+    ] {
+        wal::verify_encoded_track(dir, name, track, Some(format))
+            .map_err(io("verifying source archive", dir))?;
+    }
 
     let dest = root.join(&claim.rel_dir);
     std::fs::create_dir_all(&dest).map_err(io("creating the media directory", &dest))?;
@@ -357,6 +367,16 @@ pub fn retire(
     data_root: impl AsRef<Path>,
 ) -> Result<u64, PromoteError> {
     let dir = session_dir.as_ref();
+    let capture_owner = wal::archive_owner(dir).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            PromoteError::PendingTranscription {
+                dir: dir.to_owned(),
+                reason: error.to_string(),
+            }
+        } else {
+            io("acquiring archive ownership", dir)(error)
+        }
+    })?;
     let root = data_root.as_ref();
     let manifest = manifest_of(dir)?;
     let promoted = manifest
@@ -365,7 +385,17 @@ pub fn retire(
         .ok_or_else(|| PromoteError::NotPublished {
             dir: dir.to_path_buf(),
         })?;
-    verify(root, promoted)?;
+    verify(root, promoted, dir, &manifest)?;
+    wal::verify_retained_pcm(
+        dir,
+        manifest
+            .encoded
+            .as_ref()
+            .ok_or_else(|| PromoteError::NotEncoded {
+                dir: dir.to_owned(),
+            })?,
+    )
+    .map_err(io("verifying retained raw audio", dir))?;
 
     let replay_guard = crate::replay::retirement_guard(dir, &manifest.id)
         .map_err(|error| PromoteError::PendingTranscription {
@@ -386,6 +416,7 @@ pub fn retire(
     // The original path is now gone, so a new writer cannot resume there.
     // Release handles before unlinking for platforms that defer open-file deletion.
     drop(replay_guard);
+    drop(capture_owner);
     std::fs::remove_dir_all(&retired).map_err(io("removing the retired session", &retired))?;
     Ok(freed)
 }
@@ -414,7 +445,7 @@ pub fn promote(
     // Already published and still intact? Then all that is left is the retire
     // that the last run did not reach.
     if let Some(done) = manifest.promoted.clone()
-        && verify(root, &done).is_ok()
+        && verify(root, &done, dir, &manifest).is_ok()
     {
         retire_finished_replay(dir, root)?;
         return Ok(done);
@@ -562,9 +593,58 @@ fn copy_durably(src: &Path, dst: &Path) -> Result<u64, PromoteError> {
     Ok(n)
 }
 
-/// Re-stat every published track and insist it is exactly as long as recorded.
-fn verify(data_root: &Path, promoted: &Promotion) -> Result<(), PromoteError> {
-    for t in &promoted.tracks {
+/// Verify both published tracks against their source identity, exact original
+/// frame counts and complete native-decoded Opus contents before retirement.
+fn verify(
+    data_root: &Path,
+    promoted: &Promotion,
+    dir: &Path,
+    manifest: &Manifest,
+) -> Result<(), PromoteError> {
+    let encoded = manifest
+        .encoded
+        .as_ref()
+        .ok_or_else(|| PromoteError::NotEncoded {
+            dir: dir.to_owned(),
+        })?;
+    let invalid = || {
+        io("verifying published archive identity", dir)(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "published archives do not match the original sources",
+        ))
+    };
+    if promoted.tracks.len() != 2
+        || promoted.rel_dir.is_empty()
+        || !Path::new(&promoted.rel_dir)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(invalid());
+    }
+    let mut parent = data_root.to_owned();
+    for component in Path::new(&promoted.rel_dir).components() {
+        parent.push(component);
+        if !std::fs::symlink_metadata(&parent).is_ok_and(|m| m.file_type().is_dir()) {
+            return Err(invalid());
+        }
+    }
+    let formats = manifest.track_formats(dir);
+    for (channel, name, track, format) in [
+        ("system", "system.opus", &encoded.system, formats.system),
+        ("mic", "mic.opus", &encoded.mic, formats.mic),
+    ] {
+        let t = promoted
+            .tracks
+            .iter()
+            .find(|t| t.channel == channel)
+            .ok_or_else(invalid)?;
+        if t.rel_path != format!("{}/{name}", promoted.rel_dir)
+            || t.bytes != track.opus_bytes
+            || t.duration_ms != track.duration_ms
+            || t.sample_rate_hz != track.sample_rate_hz
+        {
+            return Err(invalid());
+        }
         let path = data_root.join(&t.rel_path);
         let got = std::fs::metadata(&path).ok().map(|m| m.len());
         if got != Some(t.bytes) {
@@ -574,6 +654,8 @@ fn verify(data_root: &Path, promoted: &Promotion) -> Result<(), PromoteError> {
                 got,
             });
         }
+        wal::verify_encoded_track(&parent, name, track, Some(format))
+            .map_err(io("verifying published archive audio", &path))?;
     }
     Ok(())
 }

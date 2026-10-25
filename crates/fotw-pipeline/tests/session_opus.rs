@@ -188,12 +188,15 @@ fn a_session_recovered_from_a_crash_can_still_be_archived() {
     // without being replayed first.
     let root = tmpdir("recovered");
     let rate = 16_000u32;
-    let mut wal = SessionWal::create(&root, rate, 1).unwrap();
-    wal.write_system(&tone(440.0, 2.0, 0.5, rate)).unwrap();
-    wal.write_mic(&tone(880.0, 2.0, 0.5, rate)).unwrap();
-    wal.flush().unwrap();
-    let dir = wal.dir().to_path_buf();
-    std::mem::forget(wal); // hard kill: no finalize
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "owned_unfinalized_archive_child"])
+        .env("FOTW_OWNED_OPUS_RECOVERY_CHILD_ROOT", &root)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let dir =
+        std::path::PathBuf::from(std::fs::read_to_string(root.join("owned-child-dir")).unwrap());
+    assert!(dir.starts_with(&root));
 
     // Chop a byte off, exactly as a kill mid-write would.
     let p = dir.join("system.pcm");
@@ -221,6 +224,23 @@ fn a_session_recovered_from_a_crash_can_still_be_archived() {
     let state = SessionState::read(&dir).unwrap();
     assert!(!state.is_finalized());
     assert!(state.manifest.encoded.is_some());
+}
+
+/// Process exit skips destructors while the OS releases the real capture lock.
+/// Forgetting a writer in the parent leaves its file handle locked and models a
+/// live process rather than the intended crashed writer.
+#[test]
+#[ignore = "owned child process only"]
+fn owned_unfinalized_archive_child() {
+    let root = std::path::PathBuf::from(
+        std::env::var_os("FOTW_OWNED_OPUS_RECOVERY_CHILD_ROOT").expect("owned child root"),
+    );
+    let mut wal = SessionWal::create(&root, 16000, 1).unwrap();
+    wal.write_system(&tone(440.0, 2.0, 0.5, 16000)).unwrap();
+    wal.write_mic(&tone(880.0, 2.0, 0.5, 16000)).unwrap();
+    wal.flush().unwrap();
+    std::fs::write(root.join("owned-child-dir"), wal.dir().to_str().unwrap()).unwrap();
+    std::process::exit(0);
 }
 
 #[test]
@@ -428,6 +448,12 @@ fn a_schema_3_session_infers_the_mic_was_mono_from_the_byte_ratio() {
         rate,
         880.0,
         "a legacy mono mic leg",
+    );
+    assert!(discard_pcm(&dir).unwrap() > 0);
+    assert_eq!(
+        discard_pcm(&dir).unwrap(),
+        0,
+        "legacy inferred formats survive PCM retirement"
     );
 }
 
