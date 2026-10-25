@@ -960,3 +960,53 @@ fn startup_horizon_does_not_chase_recordings_saved_after_the_scan_begins() {
     assert_eq!(c.read(&f.meeting).unwrap().phase, RecoveryPhase::Complete);
     assert_eq!(c.read(&late).unwrap().phase, RecoveryPhase::Incomplete);
 }
+
+#[test]
+fn completed_startup_guard_cannot_cancel_a_later_explicit_retry() {
+    let f = fixture();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let block = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (release, gate) = std::sync::mpsc::channel();
+    let (entered, began) = std::sync::mpsc::channel();
+    let manual_factory = Arc::new(BlockingFactory {
+        calls: calls.clone(),
+        entered,
+        gate: Arc::new(std::sync::Mutex::new(gate)),
+        in_create: true,
+    });
+    let choose_block = block.clone();
+    let model_calls = calls.clone();
+    let c = SavedSpeechRecovery::with_parts(
+        Db::open(&f.database, &f.key).unwrap(),
+        f.root.path().to_owned(),
+        Arc::new(move |_, _| {
+            if choose_block.load(Ordering::Acquire) {
+                Ok(manual_factory.clone())
+            } else {
+                Ok(Arc::new(Factory(model_calls.clone())) as Arc<dyn RecognizerFactory>)
+            }
+        }),
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    );
+    let pass = c.start_pending().unwrap().unwrap();
+    startup_finished(&pass);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let (_, later) = add_capture(
+        f.root.path(),
+        &f.database,
+        &f.key,
+        vec![1000; 16000],
+        "fixture-local",
+        "fixture-revision",
+        "manual-after-startup",
+    );
+    block.store(true, Ordering::Release);
+    c.retry(&later).unwrap();
+    began.recv_timeout(Duration::from_secs(3)).unwrap();
+    drop(pass);
+    assert_eq!(c.read(&later).unwrap().phase, RecoveryPhase::Preparing);
+    release.send(()).unwrap();
+    assert_eq!(finished(&c, &later).phase, RecoveryPhase::Complete);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
