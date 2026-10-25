@@ -272,13 +272,13 @@ fn an_unfrozen_clock_or_uncheckpointed_tail_never_manufactures_a_saved_end() {
         }
         drop(f.wal.take());
         startup(&owner(&f));
-        assert!(
-            Db::open(&f.database, &f.key)
-                .unwrap()
-                .session_note_meeting(&f.session)
-                .unwrap()
-                .is_none()
-        );
+        let mut db = Db::open(&f.database, &f.key).unwrap();
+        let id = db
+            .session_note_meeting(&f.session)
+            .unwrap()
+            .expect("retained capture is visible");
+        assert_eq!(db.meetings().get(&id).unwrap().ended_at_ms, None);
+        assert_eq!(db.session_note_clock(&f.session).unwrap(), None);
         assert_eq!(f.calls.load(Ordering::SeqCst), 0);
         assert!(
             !fotw_pipeline::wal::SessionState::read(&f.dir)
@@ -291,6 +291,124 @@ fn an_unfrozen_clock_or_uncheckpointed_tail_never_manufactures_a_saved_end() {
 fn wal_tail(f: &mut Fixture) {
     f.wal.as_mut().unwrap().write_system(&[0.2; 160]).unwrap();
     f.wal.as_mut().unwrap().flush().unwrap();
+}
+#[test]
+fn interrupted_audio_is_visible_without_inventing_a_capture_end_or_sealing_input() {
+    let mut f = fixture(false, 48000);
+    drop(f.wal.take());
+    let original = std::fs::read(f.dir.join("system.stt16")).unwrap();
+    let manifest = std::fs::read(f.dir.join("manifest.json")).unwrap();
+    startup(&owner(&f));
+    let mut db = Db::open(&f.database, &f.key).unwrap();
+    let id = db
+        .session_note_meeting(&f.session)
+        .unwrap()
+        .expect("retained interrupted audio must be discoverable in the library");
+    let meeting = db.meetings().get(&id).unwrap();
+    assert_eq!(meeting.started_at_ms, f.start as i64);
+    assert_eq!(meeting.ended_at_ms, None);
+    assert_eq!(meeting.duration_ms, None);
+    assert_eq!(meeting.state, "interrupted");
+    let document = db.export_meeting(&id).unwrap();
+    assert_eq!(document.segments.len(), 1);
+    assert_eq!(document.segments[0].id, "committed-prefix");
+    assert_eq!(document.segments[0].text, "original committed words");
+    assert_eq!(db.session_note_clock(&f.session).unwrap(), None);
+    assert_eq!(
+        db.note_document(&id).unwrap().body_md,
+        "durable note before crash"
+    );
+    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+    assert!(!f.dir.join("system.stt-sealed.json").exists());
+    assert_eq!(std::fs::read(f.dir.join("system.stt16")).unwrap(), original);
+    let control = owner(&f);
+    use fotw_web::speech_recovery::{RecoveryPhase, SpeechRecoveryControl};
+    assert_eq!(control.read(&id).unwrap().phase, RecoveryPhase::Retained);
+    assert!(!control.read(&id).unwrap().can_retry);
+    assert!(
+        control.retry(&id).is_err(),
+        "unknown-end input cannot start inference"
+    );
+    assert_eq!(
+        std::fs::read(f.dir.join("manifest.json")).unwrap(),
+        manifest
+    );
+    startup(&owner(&f));
+    assert_eq!(db.session_note_meeting(&f.session).unwrap(), Some(id));
+    assert_eq!(db.meetings().list(10, 0).unwrap().len(), 1);
+}
+#[test]
+fn raw_only_interrupted_audio_and_notes_are_indexed_without_a_transcription_claim() {
+    let mut f = fixture(false, 48000);
+    drop(f.wal.take());
+    for suffix in [
+        "stt16",
+        "stt-coverage.jsonl",
+        "stt16.lock",
+        "stt-coverage.jsonl.lock",
+    ] {
+        let path = f.dir.join(format!("system.{suffix}"));
+        if path.exists() {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    let raw = std::fs::read(f.dir.join("system.pcm")).unwrap();
+    startup(&owner(&f));
+    let mut db = Db::open(&f.database, &f.key).unwrap();
+    let id = db.session_note_meeting(&f.session).unwrap().unwrap();
+    assert_eq!(db.meetings().get(&id).unwrap().ended_at_ms, None);
+    assert!(db.export_meeting(&id).unwrap().segments.is_empty());
+    assert_eq!(
+        db.note_document(&id).unwrap().body_md,
+        "durable note before crash"
+    );
+    assert_eq!(std::fs::read(f.dir.join("system.pcm")).unwrap(), raw);
+    assert!(!f.dir.join("system.stt16").exists());
+    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn retained_indexing_waits_for_all_source_owners_and_never_repairs_torn_input() {
+    use std::io::Write;
+    let mut f = fixture(false, 48000);
+    drop(f.wal.take());
+    let held = CoverageJournal::open(&f.dir, &f.session, Source::System).unwrap();
+    startup(&owner(&f));
+    assert!(
+        Db::open(&f.database, &f.key)
+            .unwrap()
+            .session_note_meeting(&f.session)
+            .unwrap()
+            .is_none()
+    );
+    drop(held);
+    for (name, tail) in [
+        ("system.stt-coverage.jsonl", b"{incomplete".as_slice()),
+        ("system.stt16", &[0xff]),
+    ] {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(f.dir.join(name))
+            .unwrap()
+            .write_all(tail)
+            .unwrap();
+    }
+    let journal = std::fs::read(f.dir.join("system.stt-coverage.jsonl")).unwrap();
+    let canonical = std::fs::read(f.dir.join("system.stt16")).unwrap();
+    startup(&owner(&f));
+    let db = Db::open(&f.database, &f.key).unwrap();
+    let id = db.session_note_meeting(&f.session).unwrap().unwrap();
+    assert_eq!(db.export_meeting(&id).unwrap().segments.len(), 1);
+    assert_eq!(
+        std::fs::read(f.dir.join("system.stt-coverage.jsonl")).unwrap(),
+        journal
+    );
+    assert_eq!(
+        std::fs::read(f.dir.join("system.stt16")).unwrap(),
+        canonical
+    );
+    assert!(!f.dir.join("system.stt-sealed.json").exists());
+    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
 }
 #[test]
 fn a_missing_canonical_tail_is_retained_without_blind_raw_reconstruction() {

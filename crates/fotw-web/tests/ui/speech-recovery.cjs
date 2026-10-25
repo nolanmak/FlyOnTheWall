@@ -29,6 +29,18 @@ function rig() {
 }
 function status(phase='incomplete') { return {phase,worker_running:['preparing','transcribing','stopping'].includes(phase),can_retry:phase==='incomplete',sources:[{source:'system',model:'fixture',pending_audio_ms:2500}],message:null}; }
 const flush=()=>new Promise(resolve=>setImmediate(resolve));
+test('interrupted recordings explain the unknown end without offering inference or polling',async()=>{
+  const w=rig();w.respond(()=>({...status('retained'),sources:[]}));
+  const root=w.mount('interrupted');await flush();
+  assert.equal(root.hidden,false);
+  assert.ok(w.all().some(n=>n.tagName==='h3'&&n.textContent==='Interrupted recording'));
+  assert.ok(w.all().some(n=>/final recording time is unknown/i.test(n.textContent)));
+  assert.equal(w.button('Retry locally').disabled,true);
+  assert.equal(w.button('Cancel retry').hidden,true);
+  assert.equal(w.button('Reload transcript').hidden,true);
+  assert.equal(w.timers.length,0);
+  await w.button('Retry locally').click();assert.equal(w.requests.length,1);
+});
 test('opening only reads metadata; retry and cancellation require explicit actions',async()=>{
   const w=rig();w.mount('meeting');await flush();
   assert.equal(w.requests.length,1);assert.equal(w.requests[0].options,undefined);

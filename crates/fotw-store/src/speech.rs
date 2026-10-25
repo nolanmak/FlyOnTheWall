@@ -163,17 +163,44 @@ impl Db {
         ended_at_ms: i64,
         sources: &[SpeechSource],
     ) -> Result<String> {
-        validate(sources)?;
+        self.project_capture(session, meeting, Some(ended_at_ms), 0, sources)
+    }
+
+    /// Index an interrupted recording and any validated committed receipts,
+    /// retaining an unknown end and preserving notes/corrections on retry.
+    pub fn retain_interrupted_capture(
+        &mut self,
+        session: &str,
+        meeting: NewMeeting,
+        observed_elapsed_ms: i64,
+        sources: &[SpeechSource],
+    ) -> Result<String> {
+        self.project_capture(session, meeting, None, observed_elapsed_ms, sources)
+    }
+
+    fn project_capture(
+        &mut self,
+        session: &str,
+        meeting: NewMeeting,
+        ended_at_ms: Option<i64>,
+        observed_elapsed: i64,
+        sources: &[SpeechSource],
+    ) -> Result<String> {
+        if !sources.is_empty() || ended_at_ms.is_some() {
+            validate(sources)?;
+        }
         let tx = self
             .conn_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let meeting_id = crate::session_notes::finalize_in_transaction(
-            &tx,
-            session,
-            meeting,
-            ended_at_ms,
-            None,
-        )?;
+        let meeting_id = if let Some(ended) = ended_at_ms {
+            crate::session_notes::finalize_in_transaction(&tx, session, meeting, ended, None)?
+        } else {
+            crate::session_notes::retain_in_transaction(&tx, session, meeting, observed_elapsed)?
+        };
+        if sources.is_empty() {
+            tx.commit()?;
+            return Ok(meeting_id);
+        }
         let transcript: Option<String> = tx
             .query_row(
                 "SELECT transcript_id FROM speech_epochs WHERE meeting_id=?1 LIMIT 1",

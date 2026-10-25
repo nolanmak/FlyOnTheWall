@@ -92,7 +92,9 @@ impl Db {
     /// Frozen (start, elapsed) milliseconds for a finalized capture alias.
     pub fn session_note_clock(&self, session: &str) -> Result<Option<(i64, i64)>> {
         validate_session(session)?;
-        Ok(read_link(self.conn(), session)?.map(|link| (link.started, link.elapsed)))
+        Ok(read_link(self.conn(), session)?
+            .filter(|link| link.clock_is_final)
+            .map(|link| (link.started, link.elapsed)))
     }
 
     /// Load a durable draft, or None when this session has never saved notes.
@@ -241,10 +243,55 @@ struct Link {
     meeting: String,
     started: i64,
     elapsed: i64,
+    clock_is_final: bool,
 }
 fn read_link(conn: &rusqlite::Connection, session: &str) -> Result<Option<Link>> {
-    Ok(conn.query_row("SELECT meeting_id,started_at_ms,elapsed_ms FROM session_note_links WHERE session_id=?1", [session],
-        |r| Ok(Link{meeting:r.get(0)?,started:r.get(1)?,elapsed:r.get(2)?})).optional()?)
+    Ok(conn.query_row("SELECT meeting_id,started_at_ms,elapsed_ms,clock_is_final FROM session_note_links WHERE session_id=?1", [session],
+        |r| Ok(Link{meeting:r.get(0)?,started:r.get(1)?,elapsed:r.get(2)?,clock_is_final:r.get(3)?})).optional()?)
+}
+
+/// Index retained audio without asserting a capture end. Observations and note
+/// anchors can establish a lower bound, but cannot finalize a recording.
+pub(crate) fn retain_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    session: &str,
+    mut meeting: crate::NewMeeting,
+    observed_elapsed: i64,
+) -> Result<String> {
+    validate_session(session)?;
+    let started = meeting.started_at_ms;
+    if started < 0 || observed_elapsed < 0 || started.checked_add(observed_elapsed).is_none() {
+        return Err(invalid("invalid observed capture clock"));
+    }
+    ensure_capture_not_deleted(tx, session)?;
+    if let Some(link) = read_link(tx, session)? {
+        if link.started != started {
+            return Err(invalid("capture start changed"));
+        }
+        // Never downgrade a completed capture or replace a user's edits.
+        return Ok(link.meeting);
+    }
+    let elapsed = read(tx, session)?.map_or(observed_elapsed, |draft| {
+        draft
+            .note
+            .anchors
+            .iter()
+            .map(|a| a.typed_at_ms)
+            .max()
+            .unwrap_or(0)
+            .max(observed_elapsed)
+    });
+    if started.checked_add(elapsed).is_none() {
+        return Err(invalid("observed note clock exceeds storage range"));
+    }
+    meeting.state = "interrupted".into();
+    let id = crate::repo::insert_meeting(tx, meeting)?;
+    promote_in_transaction(tx, session, &id, started, elapsed)?;
+    tx.execute(
+        "UPDATE session_note_links SET clock_is_final=0 WHERE session_id=?1",
+        [session],
+    )?;
+    Ok(id)
 }
 
 fn promote_in_transaction(
@@ -353,8 +400,21 @@ pub(crate) fn finalize_in_transaction(
     let elapsed = ended_at_ms - started;
     ensure_capture_not_deleted(tx, session)?;
     if let Some(link) = read_link(tx, session)? {
-        if link.started != started || link.elapsed != elapsed {
+        if link.started != started
+            || (link.clock_is_final && link.elapsed != elapsed)
+            || (!link.clock_is_final && link.elapsed > elapsed)
+        {
             return Err(invalid("session already attached to a different clock"));
+        }
+        if !link.clock_is_final {
+            // A later proven Stop may upgrade the same alias. The caller owns
+            // the recording evidence; no title, transcript or note is replaced.
+            tx.execute(
+                "UPDATE session_note_links SET elapsed_ms=?2,clock_is_final=1 WHERE session_id=?1",
+                params![session, elapsed],
+            )?;
+            tx.execute("UPDATE meetings SET ended_at_ms=?2,duration_ms=?3,state='ready',updated_at=?4,lamport=lamport+1 WHERE id=?1",
+                params![link.meeting,ended_at_ms,elapsed,crate::now_ms()])?;
         }
         return Ok(link.meeting);
     }

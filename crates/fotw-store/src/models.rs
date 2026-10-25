@@ -20,7 +20,8 @@ pub struct Meeting {
     pub title: String,
     /// Epoch milliseconds UTC.
     pub started_at_ms: i64,
-    /// Epoch milliseconds UTC, `None` while still recording.
+    /// Epoch milliseconds UTC, `None` while recording or when an interrupted
+    /// recording has no proven final clock.
     pub ended_at_ms: Option<i64>,
     /// Wall-clock length, denormalised so the list view does not have to
     /// subtract nullable columns for every row.
@@ -31,7 +32,7 @@ pub struct Meeting {
     pub folder_id: Option<String>,
     /// Summary template to use, if any.
     pub template_id: Option<String>,
-    /// `recording` | `transcribing` | `ready` | `failed`.
+    /// `recording` | `transcribing` | `ready` | `failed` | `interrupted`.
     pub state: String,
     /// Detected or forced transcription language.
     pub language: Option<String>,

@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryPhase {
+    /// Audio is indexed, but missing final-clock evidence prevents inference.
+    Retained,
     /// Retained canonical audio has unfinished transcription.
     Incomplete,
     /// Resolving the original model and source ownership.

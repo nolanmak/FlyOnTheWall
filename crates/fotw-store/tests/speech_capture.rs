@@ -38,6 +38,110 @@ fn save(db: &mut Db, sources: &[SpeechSource]) -> fotw_store::Result<String> {
     )
 }
 #[test]
+fn an_unknown_end_preserves_receipts_notes_and_edits_then_upgrades_only_with_a_final_clock() {
+    let mut db = Db::open_in_memory(&common::test_key()).unwrap();
+    let draft = fotw_store::SessionNoteDocument {
+        session_id: "capture-fixture".into(),
+        started_at_ms: 1000,
+        note: fotw_store::NoteDocument {
+            revision: 0,
+            body_md: "before interruption".into(),
+            anchors: vec![fotw_store::NoteAnchor::new(0, "before interruption", 1500)],
+        },
+    };
+    let revision = db.save_session_note(&draft, 2000).unwrap();
+    let sources = vec![source("system")];
+    let retain = |db: &mut Db| {
+        db.retain_interrupted_capture(
+            "capture-fixture",
+            NewMeeting::new("fixture-device", "UTC").started_at_ms(1000),
+            1000,
+            &sources,
+        )
+    };
+    let id = retain(&mut db).unwrap();
+    assert_eq!(db.session_note_clock("capture-fixture").unwrap(), None);
+    assert_eq!(db.meetings().get(&id).unwrap().ended_at_ms, None);
+    assert_eq!(db.note_document(&id).unwrap().revision, revision);
+    db.conn()
+        .execute(
+            "UPDATE segments SET text='corrected words' WHERE id='original-system'",
+            [],
+        )
+        .unwrap();
+    db.meetings()
+        .set_title(&id, "Edited interrupted title")
+        .unwrap();
+    db.save_note_document(&id, revision, "edited note", &draft.note.anchors)
+        .unwrap();
+    assert_eq!(retain(&mut db).unwrap(), id);
+    assert_eq!(
+        db.export_meeting(&id).unwrap().segments[0].text,
+        "corrected words"
+    );
+    assert!(
+        db.finalize_speech_capture(
+            "capture-fixture",
+            NewMeeting::new("fixture-device", "UTC").started_at_ms(1000),
+            2000,
+            &sources
+        )
+        .is_err(),
+        "a final clock cannot precede an acknowledged note anchor"
+    );
+    assert_eq!(db.session_note_clock("capture-fixture").unwrap(), None);
+    assert_eq!(save(&mut db, &sources).unwrap(), id);
+    assert_eq!(
+        db.session_note_clock("capture-fixture").unwrap(),
+        Some((1000, 4000))
+    );
+    assert_eq!(retain(&mut db).unwrap(), id);
+    let meeting = db.meetings().get(&id).unwrap();
+    assert_eq!(meeting.ended_at_ms, Some(5000));
+    assert_eq!(meeting.duration_ms, Some(4000));
+    assert_eq!(meeting.title, "Edited interrupted title");
+    assert_eq!(
+        db.export_meeting(&id).unwrap().segments[0].text,
+        "corrected words"
+    );
+    assert_eq!(db.note_document(&id).unwrap().body_md, "edited note");
+}
+
+#[test]
+fn failed_interrupted_receipts_leave_neither_a_phantom_meeting_nor_a_transferred_note() {
+    let mut db = Db::open_in_memory(&common::test_key()).unwrap();
+    let draft = fotw_store::SessionNoteDocument {
+        session_id: "capture-fixture".into(),
+        started_at_ms: 1000,
+        note: fotw_store::NoteDocument {
+            revision: 0,
+            body_md: "retained draft".into(),
+            anchors: vec![],
+        },
+    };
+    db.save_session_note(&draft, 2000).unwrap();
+    db.conn().execute_batch("CREATE TRIGGER fail_receipt BEFORE INSERT ON speech_receipts BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    assert!(
+        db.retain_interrupted_capture(
+            "capture-fixture",
+            NewMeeting::new("fixture", "UTC").started_at_ms(1000),
+            2000,
+            &[source("system")]
+        )
+        .is_err()
+    );
+    assert!(db.meetings().list(10, 0).unwrap().is_empty());
+    assert_eq!(db.session_note_meeting("capture-fixture").unwrap(), None);
+    assert_eq!(
+        db.session_note("capture-fixture")
+            .unwrap()
+            .unwrap()
+            .note
+            .body_md,
+        "retained draft"
+    );
+}
+#[test]
 fn retry_after_restart_appends_tail_and_preserves_edits_and_both_sources() {
     let (_root, path) = common::tmp_db();
     let key = common::test_key();

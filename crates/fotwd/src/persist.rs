@@ -230,6 +230,38 @@ pub fn refresh_speech_projection(
     Ok(())
 }
 
+/// Index retained audio without a final clock, input seal or completion ack.
+pub(crate) fn persist_interrupted(
+    db: &mut Db,
+    dir: &std::path::Path,
+    started: u64,
+    observed_elapsed: u64,
+) -> StoreResult<String> {
+    let outcome = SessionOutcome {
+        dir: dir.to_owned(),
+        ..Default::default()
+    };
+    let prepared = speech_sources(&outcome)?;
+    let session = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| fotw_store::StoreError::InvalidArgument("capture has no identity".into()))?;
+    let integer = |n| {
+        i64::try_from(n).map_err(|_| {
+            fotw_store::StoreError::InvalidArgument("capture clock exceeds storage range".into())
+        })
+    };
+    let mut meeting = fotw_store::NewMeeting::new(device_id(), timezone());
+    meeting.title = "Interrupted recording".into();
+    meeting.started_at_ms = integer(started)?;
+    db.retain_interrupted_capture(
+        session,
+        meeting,
+        integer(observed_elapsed)?,
+        prepared.as_ref().map_or(&[], |p| p.sources.as_slice()),
+    )
+}
+
 struct ProjectionCheckpoint {
     source: Source,
     through_sample: u64,

@@ -195,8 +195,47 @@ tradeoff. Meeting deletion removes original receipt text as well as projected te
 
 The library uses a composite `mixed` / `source-journal` transcript entry; detailed
 source/provider presentation in the dashboard and summary prompts is still pending.
-Existing v6 libraries migrate forward with the normal encrypted backup; older
-binaries refuse a v7 library.
+Existing libraries migrate forward with the normal encrypted backup; older
+binaries refuse a library whose schema is newer than they support.
+
+### Interrupted recordings with unknown ends
+
+Schema 8 distinguishes observed and final session clocks with
+`session_note_links.clock_is_final`. Existing aliases default to final; old
+archives without the additive field retain that meaning. An interrupted alias
+has `clock_is_final=0`: `elapsed_ms` is only an observed high-water mark (also
+preserving any acknowledged note anchors), not a recording duration.
+`session_note_clock` returns no frozen clock for it. The meeting has state
+`interrupted` and null end/duration; recovery time is never substituted.
+
+Startup can index modern, exclusively owned WALs whose Stop is unproven or whose
+raw tail extends beyond the checkpoint. Valid committed receipts and durable
+notes transfer atomically and keep their original identities. Raw-only WALs
+can also become visible without inventing a transcript. Canonical and journal
+leases remain held through projection. This indexing path never repairs torn
+input, seals audio, acknowledges completion, loads a model or changes settings.
+Another source owner, invalid identities, deleted sessions or a failed SQL
+transaction prevent a partial handoff.
+
+The detail panel explains that the final clock is unknown. Local retry is
+refused by the server as well as disabled in the UI. A later, independently
+proven final clock can upgrade the existing alias transactionally without
+replacing titles, notes or corrected transcript text. This is not automatic
+raw-audio transcription: missing canonical identities, raw/canonical gap and
+filter reconstruction, legacy unindexed WALs and physical crash acceptance
+remain follow-up requirements under #12/#124. Playback still depends on the
+existing finalized-media path; indexing alone does not manufacture an archive.
+
+Inspect the real startup/index/status path in a throwaway synthetic library:
+
+```sh
+cargo run -p fotwd --example ui_preview -- --interrupted-capture
+```
+
+The real startup/API path was rendered in isolated WebKit at
+[390px](speech-ui/interrupted-mobile.png) and
+[1100px](speech-ui/interrupted-desktop.png), including a direct refused retry.
+These synthetic, device-free checks do not establish real crash/device recovery.
 
 ## Validation scope
 

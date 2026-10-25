@@ -6,7 +6,7 @@ globalThis.FOTWSpeechRecovery = { mount(id, parent, api, reload) {
   const message=root.appendChild(make('p','Checking saved speech…'));
   message.setAttribute('role','status');message.setAttribute('aria-live','polite');
   const sources=root.appendChild(document.createElement('div'));sources.className='recovery-sources';
-  root.appendChild(make('p','Recover saved speech on this Mac using the original model. Your recording settings stay the same.')).className='meta';
+  const explanation=root.appendChild(make('p','Recover saved speech on this Mac using the original model. Your recording settings stay the same.'));explanation.className='meta';
   const actions=root.appendChild(document.createElement('div'));actions.className='recovery-actions';
   const retry=actions.appendChild(make('button','Retry locally'));
   const cancel=actions.appendChild(make('button','Cancel retry'));
@@ -27,11 +27,12 @@ globalThis.FOTWSpeechRecovery = { mount(id, parent, api, reload) {
     root.hidden=false;
     const running=state.worker_running===true;
     hasRun=hasRun||running;
-    heading.textContent=state.phase==='complete'?'Transcription recovered':'Finish transcription';
-    const labels={incomplete:'Some saved audio is still unconfirmed. Retry locally to finish it.',preparing:'Preparing the original local model…',
+    heading.textContent=state.phase==='retained'?'Interrupted recording':state.phase==='complete'?'Transcription recovered':'Finish transcription';
+    const labels={retained:'The final recording time is unknown. Audio and notes are retained, along with any saved transcript. Transcription cannot resume automatically.',incomplete:'Some saved audio is still unconfirmed. Retry locally to finish it.',preparing:'Preparing the original local model…',
       transcribing:'Recovering saved speech locally…',stopping:'Waiting for local work to stop. Audio is retained.',
       complete:'Recovered speech is saved. Reload the transcript when you are ready.',failed:'Local recovery did not finish. Audio is retained for retry.',cancelled:'Local recovery cancelled. Audio is retained for retry.'};
     message.textContent=state.message||labels[state.phase]||'Recovery status unavailable. Refresh to try again.';
+    explanation.hidden=state.phase==='retained';
     while(sources.firstChild) sources.removeChild(sources.firstChild);
     for(const source of Array.isArray(state.sources)?state.sources:[]) {
       const name=source.source==='system'?'Other participants':source.source==='mic'?'Your microphone':'Capture source';
