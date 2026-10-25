@@ -77,6 +77,7 @@ pub struct SavedSpeechRecovery {
     progress_timeout: Duration,
     state: Arc<Mutex<State>>,
     clock: Arc<dyn Fn() -> Duration + Send + Sync>,
+    hub: Option<Arc<fotw_web::DeltaHub>>,
 }
 impl std::fmt::Debug for SavedSpeechRecovery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -95,6 +96,7 @@ struct SavedCapture {
     model_path: PathBuf,
     sources: Vec<SavedSource>,
     status: RecoveryStatus,
+    capture_owner: Option<fotw_pipeline::capture_clock::CaptureOwner>,
 }
 fn initial(phase: RecoveryPhase) -> RecoveryStatus {
     RecoveryStatus {
@@ -110,7 +112,11 @@ fn regular(path: &Path) -> bool {
 }
 impl SavedSpeechRecovery {
     /// Register manual controls and start the same owned local startup pass.
-    pub fn install(self, state: &fotw_web::AppState) -> std::io::Result<Option<StartupRecovery>> {
+    pub fn install(
+        mut self,
+        state: &fotw_web::AppState,
+    ) -> std::io::Result<Option<StartupRecovery>> {
+        self.hub = Some(state.hub().clone());
         let owner = Arc::new(self);
         state.set_speech_recovery(owner.clone());
         owner.start_pending()
@@ -151,6 +157,7 @@ impl SavedSpeechRecovery {
         if stop.load(Ordering::Acquire) {
             return Ok(());
         }
+        self.import_stopped_captures(stop)?;
         // A fixed upper boundary excludes later sessions, with at most one
         // page of IDs retained. Filesystem and native work never own this SQL lock.
         let upper: Option<String> = self
@@ -217,6 +224,79 @@ impl SavedSpeechRecovery {
         }
         Ok(())
     }
+    fn import_stopped_captures(&self, stop: &AtomicBool) -> Result<(), RecoveryError> {
+        let sessions = crate::retention::sessions_dir(&self.data_root);
+        match std::fs::symlink_metadata(&sessions) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Ok(m) if m.file_type().is_dir() => {}
+            _ => return Err(RecoveryError::Invalid),
+        }
+        let entries = std::fs::read_dir(sessions).map_err(|_| RecoveryError::Invalid)?;
+        let mut needs_reconciliation = false;
+        let mut projection_failed = false;
+        for entry in entries {
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            let Ok(entry) = entry else {
+                continue;
+            };
+            if !entry.file_type().is_ok_and(|m| m.is_dir()) {
+                continue;
+            }
+            match crate::interrupted_capture::prepare(&entry.path(), stop) {
+                Ok(Some(capture)) => {
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let outcome = crate::session::SessionOutcome {
+                        dir: capture.dir.clone(),
+                        started_at_ms: capture.started,
+                        capture_ended_at_ms: Some(capture.ended),
+                        ..Default::default()
+                    };
+                    let newly_indexed = self
+                        .db()
+                        .session_note_meeting(&capture.session)
+                        .is_ok_and(|id| id.is_none());
+                    match crate::persist::persist_session(
+                        &mut self.db(),
+                        &outcome,
+                        "Recovered recording",
+                    ) {
+                        Ok(id) if newly_indexed => {
+                            if let Some(hub) = &self.hub {
+                                // Refresh the library without registering old sessions
+                                // in the live capture's bounded replay history.
+                                hub.announce_meeting_ready(
+                                    &id,
+                                    fotw_web::MeetingReadyReason::Persisted,
+                                );
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => projection_failed = true,
+                    }
+                }
+                Ok(None) => {}
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => needs_reconciliation = true,
+            }
+        }
+        if projection_failed {
+            crate::journal::record(
+                "speech recovery: interrupted capture projection failed; audio retained",
+            );
+        }
+        if needs_reconciliation {
+            crate::journal::record(
+                "speech recovery: interrupted captures require further reconciliation; original audio retained",
+            );
+        }
+        Ok(())
+    }
     /// Production resolver checks the saved revision, never the current provider.
     pub fn new(db: Db, data_root: PathBuf) -> Self {
         let models = data_root.clone();
@@ -247,6 +327,7 @@ impl SavedSpeechRecovery {
             progress_timeout,
             state: Arc::new(Mutex::new(State::default())),
             clock: Arc::new(move || origin.elapsed()),
+            hub: None,
         }
     }
     /// Inject a monotonic clock before the first job, for deterministic deadline tests.
@@ -262,6 +343,13 @@ impl SavedSpeechRecovery {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
     fn load(&self, meeting: &str) -> Result<SavedCapture, RecoveryError> {
+        self.load_with_owner(meeting, None)
+    }
+    fn load_with_owner(
+        &self,
+        meeting: &str,
+        held_capture: Option<&fotw_pipeline::capture_clock::CaptureOwner>,
+    ) -> Result<SavedCapture, RecoveryError> {
         // Release SQL ownership before any filesystem or native work.
         let (session, started, elapsed, model_path) = {
             let mut db = self.db();
@@ -313,14 +401,38 @@ impl SavedSpeechRecovery {
         }
         let wal =
             fotw_pipeline::wal::SessionState::read(&dir).map_err(|_| RecoveryError::Invalid)?;
-        // A clean recording's saved clock is authoritative. A raw crash WAL
-        // needs its separate capture-clock recovery before inference admission.
-        if !wal.is_finalized()
-            || wal.manifest.id != session
-            || wal.manifest.started_at_ms != started as u64
-        {
+        if wal.manifest.id != session || wal.manifest.started_at_ms != started as u64 {
             return Err(RecoveryError::Invalid);
         }
+        // An unfinished WAL must still prove the original Stop and retain its
+        // capture lease throughout inference. Never replace it with recovery time.
+        let capture_owner = if wal.is_finalized() {
+            None
+        } else if let Some(owner) = held_capture {
+            crate::interrupted_capture::verify_stopped(
+                &dir,
+                owner,
+                started as u64,
+                (started + elapsed) as u64,
+            )
+            .map_err(|_| RecoveryError::Invalid)?;
+            None
+        } else {
+            Some(
+                crate::interrupted_capture::own_stopped(
+                    &dir,
+                    started as u64,
+                    (started + elapsed) as u64,
+                )
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        RecoveryError::Busy
+                    } else {
+                        RecoveryError::Invalid
+                    }
+                })?,
+            )
+        };
         let mut sources = Vec::new();
         let mut status = initial(RecoveryPhase::Complete);
         for (source, replay, name) in [
@@ -384,6 +496,7 @@ impl SavedSpeechRecovery {
             model_path,
             sources,
             status,
+            capture_owner,
         })
     }
     fn start_job(&self, meeting: &str, automatic: bool) -> Result<RecoveryStatus, RecoveryError> {
@@ -425,14 +538,20 @@ impl SavedSpeechRecovery {
             .name("saved-speech-recovery".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut capture = owned.load(&id)?;
+                    // Declare this BEFORE the runtime: unwinding drops the
+                    // runtime and joins blocking cleanup before releasing it.
+                    let capture_owner = capture.capture_owner.take();
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
                         .map_err(|_| RecoveryError::Invalid)?;
-                    let result = runtime.block_on(owned.recover(&id));
+                    let result =
+                        runtime.block_on(owned.recover(&id, capture, capture_owner.as_ref()));
                     // Runtime drop joins any owned blocking cleanup before admission
                     // is released, including a late constructor or file flush.
                     drop(runtime);
+                    drop(capture_owner);
                     result
                 }))
                 .unwrap_or(Err(RecoveryError::Invalid));
@@ -553,8 +672,12 @@ impl SavedSpeechRecovery {
             };
         }
     }
-    async fn recover(&self, meeting: &str) -> Result<(), RecoveryError> {
-        let capture = self.load(meeting)?;
+    async fn recover(
+        &self,
+        meeting: &str,
+        capture: SavedCapture,
+        held_capture: Option<&fotw_pipeline::capture_clock::CaptureOwner>,
+    ) -> Result<(), RecoveryError> {
         self.stage(RecoveryPhase::Preparing, Some(capture.status.sources));
         for saved in capture.sources {
             if self.check() {
@@ -640,7 +763,7 @@ impl SavedSpeechRecovery {
         // receipts. No native model or inference wait holds this SQL mutex.
         crate::persist::refresh_speech_projection(&mut self.db(), &capture.dir, meeting)
             .map_err(|_| RecoveryError::Invalid)?;
-        let refreshed = self.load(meeting)?;
+        let refreshed = self.load_with_owner(meeting, held_capture)?;
         if refreshed.status.phase != RecoveryPhase::Complete {
             return Err(RecoveryError::Invalid);
         }

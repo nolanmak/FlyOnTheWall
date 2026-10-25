@@ -172,3 +172,84 @@ setup errors, failed tap release, failed aggregate release (which must retain th
 referenced tap), successful preparation without premature registration, and Drop
 before Start. These inject native results through the same lifecycle used by the
 macOS adapter; they do not open a real device or request permissions.
+
+## Local startup recovery after a requested Stop
+
+The saved-speech startup pass also discovers unindexed capture directories.
+Previously it queried only `session_note_links`, so a process exit after Stop
+but before library persistence left its audio, source receipts and notes outside
+the pass. Eligible captures now appear as **Recovered recording**, with their
+original start/end, notes and stable source segment identities. A new row emits
+an unscoped `meeting_ready` event after SQL commit so an already-open library
+refreshes without rebinding or evicting another live session's replay history.
+Existing rows are not reannounced just because startup sees them again; the
+saved recovery panel retains its explicit reload action after inference.
+
+Admission requires all of the following:
+
+- An ordinary directory and bounded ordinary manifest, with no clean WAL end.
+- Exclusive capture ownership and the original identity-matched, fsynced first
+  Stop-request clock. No raw bytes may extend beyond that checkpoint.
+- An ordinary, identity-matched canonical replay and valid coverage journal for
+  each configured speech source, with a saved local plan for pending input.
+- Canonical duration consistent with the checkpointed raw format/frame count
+  and original source anchor, bounded by the frozen recording clock. This is a
+  refusal check, not proof that quantized raw PCM could reconstruct live filters.
+- All replay/journal leases before changing any input seal or SQL row. A native
+  writer still retaining either lease prevents admission. No source is sealed
+  if another source's metadata or sidecar is invalid, including dangling links.
+
+The importer seals the **existing** canonical input; it never regenerates its
+bytes from quantized raw audio. Committed source receipts project through the
+existing atomic capture/note handoff, then pending intervals use the same
+local-only, revision-checked recovery worker. Current cloud/language settings
+remain unchanged. Exact receipt retries preserve user corrections and notes;
+deleted-capture tombstones prevent resurrection. Capture ownership spans native
+resolution, inference and cleanup, including cancelled/blocked preparation.
+Filesystem discovery owns no database mutex; only an individual projection uses
+the library handle. Diagnostics are content-free and limited to one warning per
+failure class in a pass, so corrupt entries do not flood the journal or hide
+later eligible recordings.
+
+A Stop request is not evidence of clean native finalization: recovery leaves
+`manifest.ended_at_ms` absent and retains the original PCM and canonical files.
+Unknown ends, uncheckpointed raw tails, missing/short/torn canonical input,
+legacy evidence without ownership, and missing inference plans remain retained
+for further reconciliation. This increment does not close #12/#124. In
+particular, raw-only reconstruction needs a durable mapping of conversion state
+and route/gap boundaries; inferred byte-count equality cannot replace it.
+Captures without a Stop proof also need an explicit incomplete-capture clock
+representation, not recovery time as an invented end. Native-device fault and
+crash acceptance and the remaining original matrix stay open.
+
+Behavioral RED/GREEN evidence covers startup discovery, exact clock/notes/text
+preservation, restart idempotence, byte-for-byte canonical retention despite
+intentionally different raw PCM, live/retained source ownership, cancellation,
+corrupt second sources, dangling journals, deleted captures and library events.
+Run the normal tests with:
+
+```sh
+cargo test -p fotwd --test interrupted_recovery --test speech_recovery --test persist
+just ci
+```
+
+An explicit macOS 26.4 run also used the already approved public JFK WAV
+(SHA-256 `59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e`)
+and cached `small.en`
+(`c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d`).
+The production startup controller discovered the unindexed stopped WAL, recovered
+actual speech locally in about 15.5 seconds in that run, preserved the original
+canonical/raw bytes and current cloud/language settings, and left the clean WAL
+end absent. This measures one fixture, not general quality or device readiness.
+No capture, cloud requests, credentials, clipboard, global input or user library
+were involved. The opt-in `installed_model_recovers_an_unindexed_stopped_wal`
+test requires `FOTW_NATIVE_HANDOFF_MODEL` and `FOTW_NATIVE_HANDOFF_WAV` and checks
+both approved hashes before loading; normal CI does not load weights.
+
+A further cleanup regression held an owned Tokio blocking task after preparation
+returned an error. The old lifetime released the capture lease while
+`Runtime::drop` was still joining that task. The worker now declares the lease
+before creating the runtime and retains it until runtime destruction, including
+panic unwinding; final status validation borrows that same lease. Both error and
+panic fixtures verify exclusivity until blocking cleanup returns. Source leases
+also drop before the outer capture lease after initial projection.
