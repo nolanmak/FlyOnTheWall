@@ -29,6 +29,17 @@ function rig() {
 }
 function status(phase='incomplete') { return {phase,worker_running:['preparing','transcribing','stopping'].includes(phase),can_retry:phase==='incomplete',sources:[{source:'system',model:'fixture',pending_audio_ms:2500}],message:null}; }
 const flush=()=>new Promise(resolve=>setImmediate(resolve));
+test('partial speech recovery offers a reload while retaining the interrupted recording warning',async()=>{
+  const w=rig();w.respond(()=>({...status('partial'),message:'Available saved speech recovered. The final recording time remains unknown and original audio is retained.'}));
+  const root=w.mount('partial');await flush();
+  assert.equal(root.hidden,false);
+  assert.ok(w.all().some(n=>n.tagName==='h3'&&n.textContent==='Saved speech recovered'));
+  assert.ok(!w.all().some(n=>n.textContent==='Transcription recovered'));
+  assert.equal(w.button('Reload transcript').hidden,false);
+  assert.equal(w.button('Retry locally').disabled,true);
+  assert.equal(w.timers.length,0);
+  await w.button('Reload transcript').click();assert.equal(w.reloads(),1);
+});
 test('interrupted recordings explain the unknown end without offering inference or polling',async()=>{
   const w=rig();w.respond(()=>({...status('retained'),sources:[]}));
   const root=w.mount('interrupted');await flush();

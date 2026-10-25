@@ -18,6 +18,45 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn a_prefix_projection_ack_never_authorizes_whole_source_retirement() {
+    let fixture = Fixture::new("prefix-projection-scope");
+    let mut writer = ReplayWriter::create(&fixture.0, "s", ReplaySource::System, 11).unwrap();
+    writer.append(&[1, 2, 3, 4]).unwrap();
+    writer.sync().unwrap();
+    let journal = fixture.0.join("system.stt-coverage.jsonl");
+    std::fs::write(&journal, b"{}\n{torn").unwrap();
+    let mut reader = ReplayReader::open(&fixture.0, "s", ReplaySource::System).unwrap();
+    assert!(
+        reader.mark_prefix_projected(13, 4).is_err(),
+        "a torn record is not a valid projection boundary"
+    );
+    reader.mark_prefix_projected(13, 3).unwrap();
+    assert!(reader.is_prefix_projected(13, 3).unwrap());
+    assert!(!reader.is_prefix_projected(14, 3).unwrap());
+    assert!(!reader.is_complete().unwrap());
+    assert!(!reader.is_projected().unwrap());
+    assert!(!fixture.0.join("system.stt-sealed.json").exists());
+    assert!(!fixture.0.join("system.stt-complete.json").exists());
+    std::fs::write(&journal, b"{}\n{}\n").unwrap();
+    assert!(
+        !reader.is_prefix_projected(13, 6).unwrap(),
+        "new journal records require their own SQL acknowledgement"
+    );
+    writer.seal().unwrap();
+    reader.mark_complete(15).unwrap();
+    reader.mark_prefix_projected(15, 6).unwrap();
+    std::fs::copy(
+        fixture.0.join("system.stt-prefix-projected.json"),
+        fixture.0.join("system.stt-projected.json"),
+    )
+    .unwrap();
+    assert!(
+        !reader.is_projected().unwrap_or(false),
+        "prefix and whole-source proof formats must remain incompatible"
+    );
+}
+
+#[test]
 fn replays_an_outage_longer_than_the_provider_ring_from_original_sample_offsets() {
     let fixture = Fixture::new("long-outage");
     let anchor = 7_201_337;

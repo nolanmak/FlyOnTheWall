@@ -47,7 +47,7 @@ fn durable(source: CaptureSource, reader: &StatusReader) -> SpeechSourceStatus {
             Phase::Cloud => SpeechState::Cloud,
             Phase::Local => SpeechState::Local,
             Phase::Complete => SpeechState::Complete,
-            Phase::Incomplete => SpeechState::Incomplete,
+            Phase::Incomplete | Phase::PrefixRecovered => SpeechState::Incomplete,
         },
         epoch: Some(status.epoch.number),
         from_ms: Some(status.epoch.from_sample / 16),

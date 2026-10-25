@@ -5,6 +5,7 @@
 //!     cargo run -p fotwd --example ui_preview -- --speech-history
 //!     cargo run -p fotwd --example ui_preview -- --saved-speech-recovery
 //!     cargo run -p fotwd --example ui_preview -- --interrupted-capture
+//!     cargo run -p fotwd --example ui_preview -- --interrupted-prefix
 //!
 //! Every other way into the library goes through audio capture — a TCC grant,
 //! a signed build, and an actual meeting to record — so the web UI was
@@ -246,12 +247,26 @@ async fn main() -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
-    if std::env::args().any(|arg| arg == "--interrupted-capture") {
+    let prefix_preview = std::env::args().any(|arg| arg == "--interrupted-prefix");
+    if prefix_preview || std::env::args().any(|arg| arg == "--interrupted-capture") {
         let mut wal = fotw_pipeline::wal::SessionWal::create(root.join("sessions"), 16000, 1)
             .map_err(|e| e.to_string())?;
-        wal.write_system(&vec![0.1; 16000])
-            .map_err(|e| e.to_string())?;
-        wal.checkpoint_capture(1200, false)
+        let pcm: Vec<i16> = (0u32..48000)
+            .map(|n| {
+                if (n / 3200).is_multiple_of(2) {
+                    1000
+                } else {
+                    8000
+                }
+            })
+            .collect();
+        wal.write_system(
+            &pcm.iter()
+                .map(|s| f32::from(*s) / 32768.0)
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| e.to_string())?;
+        wal.checkpoint_capture(4000, false)
             .map_err(|e| e.to_string())?;
         db.save_session_note(
             &fotw_store::SessionNoteDocument {
@@ -266,6 +281,9 @@ async fn main() -> Result<(), String> {
             1200,
         )
         .map_err(|e| e.to_string())?;
+        if prefix_preview {
+            seed_prefix_input(&wal, &pcm)?;
+        }
         drop(wal);
     }
     // The real server, the real ingress policy, the real embedded assets.
@@ -319,24 +337,34 @@ async fn main() -> Result<(), String> {
             std::sync::atomic::AtomicU8::new(0),
         )));
     }
-    let _interrupted_pass = if std::env::args().any(|arg| arg == "--interrupted-capture") {
-        if std::env::args().any(|arg| arg == "--saved-speech-recovery") {
-            return Err("Choose one saved-recovery preview mode".into());
-        }
-        let db = Db::open(root.join("db.sqlite3"), &DbKey::from_bytes(PREVIEW_KEY))
-            .map_err(|e| e.to_string())?;
-        fotwd::speech_recovery::SavedSpeechRecovery::with_parts(
-            db,
-            root.clone(),
-            Arc::new(|_, _| Err("No model capability in this raw-only preview".into())),
-            std::time::Duration::from_secs(2),
-            std::time::Duration::from_secs(2),
-        )
-        .install(&state)
-        .map_err(|e| e.to_string())?
-    } else {
-        None
-    };
+    let _interrupted_pass =
+        if prefix_preview || std::env::args().any(|arg| arg == "--interrupted-capture") {
+            if std::env::args().any(|arg| arg == "--saved-speech-recovery") {
+                return Err("Choose one saved-recovery preview mode".into());
+            }
+            let db = Db::open(root.join("db.sqlite3"), &DbKey::from_bytes(PREVIEW_KEY))
+                .map_err(|e| e.to_string())?;
+            fotwd::speech_recovery::SavedSpeechRecovery::with_parts(
+                db,
+                root.clone(),
+                Arc::new(move |plan, _| {
+                    if prefix_preview
+                        && plan.engine.model == "preview-local"
+                        && plan.engine.revision.as_deref() == Some("preview-r1")
+                    {
+                        Ok(Arc::new(PrefixPreviewFactory) as Arc<dyn fotw_stt::RecognizerFactory>)
+                    } else {
+                        Err("No model capability in this raw-only preview".into())
+                    }
+                }),
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+            )
+            .install(&state)
+            .map_err(|e| e.to_string())?
+        } else {
+            None
+        };
     if let Some(recorder) = fixture_recorder {
         recorder.attach_hub(state.hub().clone());
     }
@@ -345,6 +373,74 @@ async fn main() -> Result<(), String> {
     println!("\n  {}", state.launch_url());
     println!("\n  Ctrl-C to stop. The library is thrown away on the next run.");
     server.serve().await.map_err(|e| format!("server: {e}"))
+}
+
+struct PrefixPreviewFactory;
+struct PrefixPreviewRecognizer;
+impl fotw_stt::RecognizerFactory for PrefixPreviewFactory {
+    fn model(&self) -> &str {
+        "preview-local"
+    }
+    fn language(&self) -> Option<&str> {
+        Some("en")
+    }
+    fn create(&self) -> Result<Box<dyn fotw_stt::Recognizer>, fotw_stt::SttError> {
+        Ok(Box::new(PrefixPreviewRecognizer))
+    }
+}
+impl fotw_stt::Recognizer for PrefixPreviewRecognizer {
+    fn transcribe(&mut self, pcm: &[f32]) -> Result<Vec<fotw_stt::Recognized>, fotw_stt::SttError> {
+        Ok(vec![fotw_stt::Recognized {
+            start_ms: 0,
+            end_ms: pcm.len() as u64 / 16,
+            text: "Synthetic speech recovered after interruption.".into(),
+        }])
+    }
+}
+fn seed_prefix_input(wal: &fotw_pipeline::wal::SessionWal, pcm: &[i16]) -> Result<(), String> {
+    use fotwd::failover::coverage::{CoverageJournal, EngineDescriptor, LocalPlan};
+    let session = &wal.manifest().id;
+    let mut writer = fotw_pipeline::replay::ReplayWriter::create(
+        wal.dir(),
+        session,
+        fotw_pipeline::replay::ReplaySource::System,
+        0,
+    )
+    .map_err(|e| e.to_string())?;
+    writer.append(pcm).map_err(|e| e.to_string())?;
+    writer.sync().map_err(|e| e.to_string())?;
+    drop(writer);
+    // Configuration supplies the existing conservative local capability set;
+    // this fixture never opens cloud transport or resolves a real credential.
+    let config = fotwd::failover::stream::FailoverConfig::new(
+        fotw_stt::DeepgramStreamConfig::new(
+            "unused-synthetic",
+            fotw_stt::deepgram::DeepgramConfig::new(session, Source::System),
+        ),
+        Arc::new(PrefixPreviewFactory),
+    );
+    let engine = EngineDescriptor {
+        provider: fotw_stt::local::PROVIDER.into(),
+        model: "preview-local".into(),
+        revision: Some("preview-r1".into()),
+        capabilities: config.local_capabilities,
+    };
+    let plan = LocalPlan {
+        engine: engine.clone(),
+        language: Some("en".into()),
+        endpoint: config.endpoint,
+    };
+    drop(
+        CoverageJournal::create_with_fallback(
+            wal.dir(),
+            session,
+            Source::System,
+            engine,
+            Some(plan),
+        )
+        .map_err(|e| e.to_string())?,
+    );
+    Ok(())
 }
 
 /// Synthetic metadata only. This fixture has no model, capture or provider.

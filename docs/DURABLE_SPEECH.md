@@ -217,8 +217,10 @@ input, seals audio, acknowledges completion, loads a model or changes settings.
 Another source owner, invalid identities, deleted sessions or a failed SQL
 transaction prevent a partial handoff.
 
-The detail panel explains that the final clock is unknown. Local retry is
-refused by the server as well as disabled in the UI. A later, independently
+The detail panel explains that the final clock is unknown. Raw-only recordings
+and sources without a saved local plan cannot start inference. Independently
+clocked canonical prefixes with a saved plan may be retried as described below.
+A later, independently
 proven final clock can upgrade the existing alias transactionally without
 replacing titles, notes or corrected transcript text. This is not automatic
 raw-audio transcription: missing canonical identities, raw/canonical gap and
@@ -236,6 +238,65 @@ The real startup/API path was rendered in isolated WebKit at
 [390px](speech-ui/interrupted-mobile.png) and
 [1100px](speech-ui/interrupted-desktop.png), including a direct refused retry.
 These synthetic, device-free checks do not establish real crash/device recovery.
+
+### Recovering available speech while the recording end is unknown
+
+**Retry locally** can recover an interrupted recording's validated canonical
+prefix using its saved model, revision, language and original sample offsets.
+It does not reconstruct canonical input from quantized raw audio or choose a
+replacement model from current settings. Unknown-end startup remains index-only;
+prefix inference currently requires the explicit retry action.
+
+`FailoverStream::resume_prefix` accepts an explicit exclusive sample boundary.
+Its owner syncs complete samples without truncating a trailing half-sample and
+rejects append/seal operations. Target validation precedes journal repair or
+model creation. A valid retry may repair an uncommitted torn journal line before
+appending new receipts; committed receipts and original audio remain intact.
+Reads and endpoint chunks remain bounded independently of the recording length.
+
+After SQL commits, a separate `stt-prefix-projected.json` acknowledgement records
+the source interval and exact validated journal prefix. Its explicit scope and
+format are incompatible with whole-source retirement proof. Capture and all
+source/journal leases remain held during projection and acknowledgement. A failed
+SQL write or interrupted acknowledgement can be retried without repeating native
+inference. Startup repairs these projection-only gaps without starting unknown-end
+inference; missing-model or unmapped audio remains pending.
+
+Success reports `Phase::PrefixRecovered`, not whole-source completion. The
+existing `finish()` return value still denotes whole-input completion and is
+false for this successful prefix outcome. Prefix recovery writes no original
+input seal, completion marker or retirement acknowledgement. Zero lag covers
+only the requested canonical interval, not additional unmapped original audio.
+
+The app holds capture ownership through preparation, inference and actual native
+cleanup, including cancellation/deadline handling. Projection appends receipts to
+the existing interrupted alias, preserving notes, corrected words and null
+recording end/duration. A source without a saved plan remains pending while
+another source recovers. The dashboard reports partial recovery and offers an
+explicit transcript reload; it does not replace a reader's text automatically.
+Refresh can discover a later independently mapped canonical suffix without
+reusing a stale partial result.
+
+Runtime regressions first exposed whole-file target overrun, refused eligible
+retry, missing partial-result UI, journal repair on an invalid target, and one
+unavailable source hiding another source's recovered text. Further failures
+reproduced refused projection retry after inference and a missing acknowledgement
+not repaired at startup. A separate opt-in
+test transcribed the checksum-verified public JFK clip with the approved small.en
+model through the actual app retry path, preserving audio/settings/unknown clock
+and leaving original completion markers absent. This is native integration
+evidence, not paired model quality, resource benchmarking or physical capture QA.
+
+```sh
+cargo run -p fotwd --example ui_preview -- --interrupted-prefix
+```
+
+This preview uses generated audio and a fake recognizer behind the real
+startup/retry/projection/API path. Isolated WebKit checks exercise retry,
+partial status and explicit reload at [390px](speech-ui/prefix-mobile.png) and
+[1100px](speech-ui/prefix-desktop.png). Raw-only/missing canonical recovery,
+filter/gap reconstruction, automatic unknown-end inference, legacy admission
+and original physical/quality acceptance remain under #12/#124.
 
 ## Validation scope
 

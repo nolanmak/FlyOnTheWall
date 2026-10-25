@@ -113,6 +113,7 @@ struct WorkerConfig {
     cloud_queue_samples: usize,
     cloud_settle: Duration,
     stop_timeout: Duration,
+    prefix_end: Option<u64>,
 }
 
 struct SourceInputs {
@@ -140,6 +141,9 @@ pub enum Phase {
     Local,
     /// All frozen input was durably accounted for.
     Complete,
+    /// The requested saved prefix was accounted for; remaining original audio
+    /// has no completion or retirement proof from this operation.
+    PrefixRecovered,
     /// Audio retained; a pending interval needs retry.
     Incomplete,
 }
@@ -153,9 +157,11 @@ pub struct Status {
     pub epoch: ProviderEpoch,
     /// Absolute end of committed audio.
     pub committed_sample: u64,
-    /// Absolute end of canonical audio accepted by the pump.
+    /// Absolute end accepted by the pump, or the explicit target for prefix
+    /// recovery. Other original audio is outside a prefix operation's scope.
     pub written_sample: u64,
-    /// Audio still awaiting transcription or silence acknowledgement.
+    /// Target audio still awaiting transcription or silence acknowledgement;
+    /// zero lag on a prefix does not account for other retained original audio.
     pub lag_samples: u64,
     /// Worker/native cleanup is still outstanding.
     pub worker_running: bool,
@@ -213,6 +219,7 @@ struct Shared {
     wake: Condvar,
     wait: Mutex<()>,
     events: mpsc::UnboundedSender<Event>,
+    prefix_only: bool,
 }
 
 fn failure(message: impl Into<String>) -> SttError {
@@ -241,6 +248,8 @@ impl Shared {
         }
         gate.status.phase = if error.is_some() {
             Phase::Incomplete
+        } else if self.prefix_only {
+            Phase::PrefixRecovered
         } else {
             Phase::Complete
         };
@@ -380,6 +389,7 @@ impl FailoverStream {
             cloud_queue_samples: config.cloud_queue_samples,
             cloud_settle: config.cloud_settle,
             stop_timeout: config.stop_timeout,
+            prefix_end: None,
         };
         Self::launch(
             worker_config,
@@ -400,11 +410,35 @@ impl FailoverStream {
         dir: &Path,
         request: LocalResumeConfig,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), SttError> {
+        Self::resume_saved(dir, request, None).await
+    }
+
+    async fn resume_saved(
+        dir: &Path,
+        request: LocalResumeConfig,
+        prefix_end: Option<u64>,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), SttError> {
         let directory = dir.to_owned();
         let (config, inputs) = tokio::task::spawn_blocking(move || {
+            let prefix_writer = if prefix_end.is_some() {
+                Some(
+                    ReplayWriter::resume_prefix(
+                        &directory,
+                        &request.session_id,
+                        source(request.source),
+                    )
+                    .map_err(|e| failure(e.to_string()))?,
+                )
+            } else {
+                None
+            };
             let snapshot =
                 CoverageJournal::snapshot(&directory, &request.session_id, request.source)
                     .map_err(|e| failure(e.to_string()))?;
+            let previous_through = snapshot
+                .commits
+                .last()
+                .map_or(snapshot.epochs[0].from_sample, |c| c.through_sample);
             let plan = snapshot.fallback.ok_or_else(|| {
                 failure("saved local recovery plan is unavailable; source audio retained")
             })?;
@@ -416,14 +450,21 @@ impl FailoverStream {
                     "installed recovery model, revision or language does not match the saved plan",
                 ));
             }
-            let mut writer =
-                ReplayWriter::resume(&directory, &request.session_id, source(request.source))
-                    .map_err(|e| failure(e.to_string()))?;
+            let mut writer = match prefix_writer {
+                Some(writer) => writer,
+                None => {
+                    ReplayWriter::resume(&directory, &request.session_id, source(request.source))
+                        .map_err(|e| failure(e.to_string()))?
+                }
+            };
+            let end = prefix_end.unwrap_or(writer.end_sample());
+            if previous_through > end || end > writer.end_sample() {
+                return Err(failure("requested prefix is outside saved coverage/audio"));
+            }
             let mut journal =
                 CoverageJournal::open(&directory, &request.session_id, request.source)
                     .map_err(|e| failure(e.to_string()))?;
-            let end = writer.end_sample();
-            if journal.committed_through() > end {
+            if journal.committed_through() > end || end > writer.end_sample() {
                 return Err(failure("saved coverage exceeds frozen audio"));
             }
             let pending = journal.committed_through() < end;
@@ -432,7 +473,9 @@ impl FailoverStream {
             } else {
                 None
             };
-            writer.seal().map_err(|e| failure(e.to_string()))?;
+            if prefix_end.is_none() {
+                writer.seal().map_err(|e| failure(e.to_string()))?;
+            }
             if pending {
                 journal
                     .switch(plan.engine.clone(), SwitchReason::ResumePending)
@@ -450,6 +493,7 @@ impl FailoverStream {
                 cloud_queue_samples: 0,
                 cloud_settle: Duration::ZERO,
                 stop_timeout: request.stop_timeout,
+                prefix_end,
             };
             Ok::<_, SttError>((
                 config,
@@ -466,6 +510,17 @@ impl FailoverStream {
         Self::launch(config, inputs, None)
     }
 
+    /// Recover an explicitly bounded canonical prefix without closing the
+    /// recording or certifying its remaining audio. Successful status is
+    /// `PrefixRecovered`; `finish` still returns false for whole-input completion.
+    pub async fn resume_prefix(
+        dir: &Path,
+        request: LocalResumeConfig,
+        through_sample: u64,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), SttError> {
+        Self::resume_saved(dir, request, Some(through_sample)).await
+    }
+
     fn launch(
         config: WorkerConfig,
         inputs: SourceInputs,
@@ -478,7 +533,7 @@ impl FailoverStream {
             recognizer,
         } = inputs;
         let anchor = journal.committed_through();
-        let end = writer.end_sample();
+        let end = config.prefix_end.unwrap_or(writer.end_sample());
         let resuming = transport.is_none();
         let (cloud, cloud_events) = match transport {
             Some((cloud, events)) => (Some(Arc::new(cloud)), Some(events)),
@@ -510,6 +565,7 @@ impl FailoverStream {
             wake: Condvar::new(),
             wait: Mutex::new(()),
             events,
+            prefix_only: config.prefix_end.is_some(),
         });
         if resuming && anchor < end {
             let _ = shared
@@ -550,7 +606,11 @@ impl FailoverStream {
                         });
                 drop(worker); // native state and journal ownership released before done.
                 worker_shared.terminal(result.err());
-                worker_shared.done.store(true, Ordering::Release);
+                let actual_done = Arc::clone(&worker_shared.done);
+                // Release the thread's canonical owner before waking a caller
+                // that drops its stream and acquires projection/source leases.
+                drop(worker_shared);
+                actual_done.store(true, Ordering::Release);
                 let _ = done_sender.send(true);
             })
             .map_err(|e| {
@@ -606,12 +666,16 @@ impl FailoverStream {
         let mut done = self.done.clone();
         let drain = async move {
             tokio::task::spawn_blocking(move || {
-                let result = shared
-                    .writer
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .audio
-                    .seal();
+                let result = if shared.prefix_only {
+                    Ok(0)
+                } else {
+                    shared
+                        .writer
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .audio
+                        .seal()
+                };
                 if let Err(error) = result {
                     shared.terminal(Some(failure(error.to_string())));
                 }
@@ -853,6 +917,9 @@ impl Worker {
             return Err(failure(
                 "source completion requires frozen, fully committed input",
             ));
+        }
+        if self.config.prefix_end == Some(end) {
+            return Ok(());
         }
         self.reader
             .mark_complete(end)

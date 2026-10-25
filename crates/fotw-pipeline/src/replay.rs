@@ -37,6 +37,12 @@ pub enum ReplaySource {
 }
 
 impl ReplaySource {
+    fn prefix_projected_path(self, dir: &Path) -> PathBuf {
+        dir.join(match self {
+            Self::System => "system.stt-prefix-projected.json",
+            Self::Mic => "mic.stt-prefix-projected.json",
+        })
+    }
     fn projected_path(self, dir: &Path) -> PathBuf {
         dir.join(match self {
             Self::System => "system.stt-projected.json",
@@ -128,6 +134,14 @@ struct Completion {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProjectionProof {
+    boundary: Completion,
+    journal_bytes: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrefixProjection {
+    scope: String,
     boundary: Completion,
     journal_bytes: u64,
 }
@@ -230,6 +244,7 @@ pub struct ReplayWriter {
     source: ReplaySource,
     session_id: String,
     sealed: bool,
+    prefix_only: bool,
 }
 
 impl ReplayWriter {
@@ -287,6 +302,7 @@ impl ReplayWriter {
             source,
             session_id: session_id.to_owned(),
             sealed: false,
+            prefix_only: false,
         })
     }
 
@@ -326,6 +342,33 @@ impl ReplayWriter {
             source,
             session_id: session_id.to_owned(),
             sealed,
+            prefix_only: false,
+        })
+    }
+
+    /// Own an existing canonical prefix without repairing its trailing bytes
+    /// or granting append/seal capability. The complete prefix is synced;
+    /// its observed end does not certify capture or transcription completion.
+    pub fn resume_prefix(dir: &Path, session_id: &str, source: ReplaySource) -> io::Result<Self> {
+        let owner = source.lock(dir)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(source.path(dir))?;
+        let reader = ReplayReader::from_file(dir, file, session_id, source)?;
+        let sealed = reader.sealed_end()?.is_some();
+        let end_sample = reader.available_end()?;
+        reader.file.sync_data()?;
+        Ok(Self {
+            _owner: owner,
+            file: reader.file,
+            end_sample,
+            failed: false,
+            dir: dir.to_owned(),
+            source,
+            session_id: session_id.to_owned(),
+            sealed,
+            prefix_only: true,
         })
     }
 
@@ -336,7 +379,7 @@ impl ReplayWriter {
     /// must continue independently and surface an incomplete-transcript error.
     pub fn append(&mut self, pcm: &[i16]) -> io::Result<()> {
         self.check_healthy()?;
-        if self.sealed {
+        if self.sealed || self.prefix_only {
             return Err(invalid("replay input is permanently sealed"));
         }
         if pcm.is_empty() {
@@ -396,6 +439,9 @@ impl ReplayWriter {
     /// append afterward. This does not certify transcription completion.
     pub fn seal(&mut self) -> io::Result<u64> {
         self.check_healthy()?;
+        if self.prefix_only {
+            return Err(invalid("prefix ownership cannot seal original input"));
+        }
         let mut reader = ReplayReader::open(&self.dir, &self.session_id, self.source)?;
         reader.sealed_end()?;
         reader.write_boundary(self.end_sample, self.source.sealed_path(&self.dir))?;
@@ -489,6 +535,12 @@ impl ReplayReader {
         self.available_end()
     }
 
+    /// Complete samples currently available, excluding a trailing half-sample.
+    /// This is an observation, not a seal or a transcription completion proof.
+    pub fn complete_prefix_end(&self) -> io::Result<u64> {
+        self.available_end()
+    }
+
     /// Persist completion only after input is frozen and inference has durably
     /// accounted for every saved sample. Partial coverage and torn samples are
     /// refused. The caller establishes inference coverage; this verifies audio.
@@ -559,6 +611,75 @@ impl ReplayReader {
             self.header.source.projected_path(&self.dir),
             &proof,
         )
+    }
+
+    /// Acknowledge only a committed prefix projection while the caller owns
+    /// canonical/journal leases. This separate scoped proof cannot authorize
+    /// whole-input completion or retirement, including for aligned input.
+    pub fn mark_prefix_projected(
+        &mut self,
+        through_sample: u64,
+        journal_bytes: u64,
+    ) -> io::Result<()> {
+        self.sync_through(through_sample)?;
+        let mut journal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.header.source.coverage_path(&self.dir))?;
+        if journal_bytes == 0
+            || !journal.metadata()?.is_file()
+            || journal.metadata()?.len() < journal_bytes
+        {
+            return Err(invalid("prefix projection exceeds saved journal"));
+        }
+        journal.seek(SeekFrom::Start(journal_bytes - 1))?;
+        let mut last = [0];
+        journal.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            return Err(invalid(
+                "prefix projection ends in an incomplete journal record",
+            ));
+        }
+        journal.sync_data()?;
+        let proof = PrefixProjection {
+            scope: "saved-prefix-projection".into(),
+            boundary: Completion {
+                schema: 1,
+                session_id: self.header.session_id.clone(),
+                source: self.header.source,
+                first_sample: self.first_sample(),
+                through_sample,
+            },
+            journal_bytes,
+        };
+        write_marker(
+            &self.dir,
+            self.header.source.prefix_projected_path(&self.dir),
+            &proof,
+        )
+    }
+
+    /// Match an exact validated journal prefix already committed to the DB.
+    /// Additional unprocessed audio or a torn journal suffix is not completion.
+    pub fn is_prefix_projected(&self, through_sample: u64, journal_bytes: u64) -> io::Result<bool> {
+        let Some(proof): Option<PrefixProjection> =
+            read_marker(self.header.source.prefix_projected_path(&self.dir))?
+        else {
+            return Ok(false);
+        };
+        let b = &proof.boundary;
+        let journal = std::fs::metadata(self.header.source.coverage_path(&self.dir))?;
+        Ok(proof.scope == "saved-prefix-projection"
+            && journal.is_file()
+            && journal.len() >= journal_bytes
+            && b.schema == 1
+            && b.session_id == self.header.session_id
+            && b.source == self.header.source
+            && b.first_sample == self.first_sample()
+            && b.through_sample == through_sample
+            && through_sample >= self.first_sample()
+            && through_sample <= self.available_end()?
+            && proof.journal_bytes == journal_bytes)
     }
 
     /// Whether inference and the current journal were durably projected.

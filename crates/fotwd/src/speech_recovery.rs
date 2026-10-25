@@ -89,6 +89,7 @@ struct SavedSource {
     plan: Option<LocalPlan>,
     pending: bool,
     complete: bool,
+    end: u64,
 }
 struct SavedCapture {
     dir: PathBuf,
@@ -97,6 +98,9 @@ struct SavedCapture {
     sources: Vec<SavedSource>,
     status: RecoveryStatus,
     capture_owner: Option<fotw_pipeline::capture_clock::CaptureOwner>,
+    prefix_only: bool,
+    started: u64,
+    observed_elapsed: u64,
 }
 fn initial(phase: RecoveryPhase) -> RecoveryStatus {
     RecoveryStatus {
@@ -192,10 +196,15 @@ impl SavedSpeechRecovery {
                 if stop.load(Ordering::Acquire) {
                     return Ok(());
                 }
-                if !self
-                    .load(&meeting)
-                    .is_ok_and(|capture| capture.status.phase == RecoveryPhase::Incomplete)
-                {
+                if !self.load(&meeting).is_ok_and(|capture| {
+                    capture.status.phase == RecoveryPhase::Incomplete
+                        || (capture.prefix_only
+                            && capture.status.can_retry
+                            && !capture
+                                .sources
+                                .iter()
+                                .any(|s| s.pending && s.plan.is_some()))
+                }) {
                     continue;
                 }
                 match self.start_job(&meeting, true) {
@@ -422,16 +431,28 @@ impl SavedSpeechRecovery {
         if wal.manifest.id != session || wal.manifest.started_at_ms != started as u64 {
             return Err(RecoveryError::Invalid);
         }
-        if !clock_is_final {
-            return Ok(SavedCapture { dir, session, model_path, sources: vec![], capture_owner: None,
-                status: RecoveryStatus { phase: RecoveryPhase::Retained, sources: vec![],
-                    worker_running: false, can_retry: false,
-                    message: Some("Recording interrupted. The final recording time is unknown. Your audio and notes are retained, along with any saved transcript. Transcription cannot resume automatically.".into()) } });
-        }
         // An unfinished WAL must prove the original Stop. Saved finalized clocks
         // remain authoritative, with modern capture ownership retained through
         // native cleanup too. Legacy indexed captures still use source leases.
-        let capture_owner = if wal.is_finalized() {
+        let capture_owner = if !clock_is_final {
+            if let Some(owner) = held_capture {
+                crate::interrupted_capture::verify_retained(&dir, owner, started as u64)
+                    .map_err(|_| RecoveryError::Invalid)?;
+                None
+            } else {
+                Some(
+                    crate::interrupted_capture::own_retained(&dir, started as u64).map_err(
+                        |e| {
+                            if e.kind() == std::io::ErrorKind::WouldBlock {
+                                RecoveryError::Busy
+                            } else {
+                                RecoveryError::Invalid
+                            }
+                        },
+                    )?,
+                )
+            }
+        } else if wal.is_finalized() {
             if held_capture.is_some() {
                 None
             } else {
@@ -475,7 +496,15 @@ impl SavedSpeechRecovery {
             )
         };
         let mut sources = Vec::new();
-        let mut status = initial(RecoveryPhase::Complete);
+        let mut status = initial(if clock_is_final {
+            RecoveryPhase::Complete
+        } else {
+            RecoveryPhase::Retained
+        });
+        if !clock_is_final {
+            status.can_retry = false;
+            status.message=Some("Recording interrupted. The final recording time is unknown. Original audio and notes are retained. Available saved speech may be recovered locally using its original model; other audio remains pending.".into());
+        }
         for (source, replay, name) in [
             (Source::System, ReplaySource::System, "system"),
             (Source::Mic, ReplaySource::Mic, "mic"),
@@ -493,7 +522,12 @@ impl SavedSpeechRecovery {
             let reader =
                 ReplayReader::open(&dir, &session, replay).map_err(|_| RecoveryError::Invalid)?;
             reader.sealed_end().map_err(|_| RecoveryError::Invalid)?;
-            let end = reader.saved_end().map_err(|_| RecoveryError::Invalid)?;
+            let end = if clock_is_final {
+                reader.saved_end()
+            } else {
+                reader.complete_prefix_end()
+            }
+            .map_err(|_| RecoveryError::Invalid)?;
             let through = snapshot
                 .commits
                 .last()
@@ -503,7 +537,7 @@ impl SavedSpeechRecovery {
             }
             let complete =
                 reader.is_complete().map_err(|_| RecoveryError::Invalid)? && through == end;
-            if through < end && plan.is_none() {
+            if clock_is_final && through < end && plan.is_none() {
                 return Err(RecoveryError::Invalid);
             }
             let engine = plan
@@ -511,8 +545,17 @@ impl SavedSpeechRecovery {
                 .map(|plan| &plan.engine)
                 .or_else(|| snapshot.epochs.last().map(|epoch| &epoch.engine))
                 .ok_or(RecoveryError::Invalid)?;
-            if !complete || !reader.is_projected().map_err(|_| RecoveryError::Invalid)? {
+            if clock_is_final
+                && (!complete || !reader.is_projected().map_err(|_| RecoveryError::Invalid)?)
+            {
                 status.phase = RecoveryPhase::Incomplete;
+                status.can_retry = true;
+            } else if !clock_is_final
+                && ((through < end && plan.is_some())
+                    || !reader
+                        .is_prefix_projected(through, snapshot.valid_bytes)
+                        .map_err(|_| RecoveryError::Invalid)?)
+            {
                 status.can_retry = true;
             }
             status.sources.push(RecoverySource {
@@ -526,10 +569,15 @@ impl SavedSpeechRecovery {
                 plan,
                 pending: through < end,
                 complete,
+                end,
             });
         }
-        if sources.is_empty() {
+        if sources.is_empty() && clock_is_final {
             return Err(RecoveryError::NotFound);
+        }
+        if !clock_is_final && !sources.is_empty() && sources.iter().all(|s| !s.pending) {
+            status.phase = RecoveryPhase::Partial;
+            status.message=Some("Available saved speech is accounted for. The final recording time is unknown and additional original audio is retained.".into());
         }
         Ok(SavedCapture {
             dir,
@@ -538,6 +586,9 @@ impl SavedSpeechRecovery {
             sources,
             status,
             capture_owner,
+            prefix_only: !clock_is_final,
+            started: started as u64,
+            observed_elapsed: elapsed as u64,
         })
     }
     fn start_job(&self, meeting: &str, automatic: bool) -> Result<RecoveryStatus, RecoveryError> {
@@ -547,7 +598,7 @@ impl SavedSpeechRecovery {
         let retained: bool = self.db().conn().query_row(
             "SELECT EXISTS(SELECT 1 FROM session_note_links WHERE meeting_id=?1 AND clock_is_final=0)",
             [meeting], |r| r.get(0)).map_err(|_| RecoveryError::Invalid)?;
-        if retained {
+        if retained && !self.load(meeting)?.status.can_retry {
             return Err(RecoveryError::Invalid);
         }
         {
@@ -586,7 +637,8 @@ impl SavedSpeechRecovery {
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let mut capture = owned.load(&id)?;
-                    if capture.status.phase == RecoveryPhase::Retained {
+                    if capture.status.phase == RecoveryPhase::Retained && !capture.status.can_retry
+                    {
                         return Err(RecoveryError::Invalid);
                     }
                     // Declare this BEFORE the runtime: unwinding drops the
@@ -704,18 +756,22 @@ impl SavedSpeechRecovery {
             .mark_complete(end)
             .map_err(|_| RecoveryError::Invalid)
     }
-    fn ended(&self, result: Result<(), RecoveryError>) {
+    fn ended(&self, result: Result<RecoveryPhase, RecoveryError>) {
         if let Some(job) = self.state().job.as_mut() {
             job.status.worker_running = false;
             job.status.phase = match job.stop.load(Ordering::Acquire) {
                 1 => RecoveryPhase::Cancelled,
                 2 => RecoveryPhase::Failed,
-                _ if result.is_ok() => RecoveryPhase::Complete,
+                _ if result.is_ok() => result.unwrap(),
                 _ => RecoveryPhase::Failed,
             };
-            job.status.can_retry = job.status.phase != RecoveryPhase::Complete;
+            job.status.can_retry = !matches!(
+                job.status.phase,
+                RecoveryPhase::Complete | RecoveryPhase::Partial
+            );
             job.status.message = match job.status.phase {
                 RecoveryPhase::Complete => Some("Saved speech recovered locally. Existing corrections and recording times preserved.".into()),
+                RecoveryPhase::Partial => Some("Available saved speech recovered locally. The final recording time remains unknown and additional original audio is retained.".into()),
                 RecoveryPhase::Cancelled => Some("Local recovery cancelled. Audio retained for retry.".into()),
                 _ if job.stop.load(Ordering::Acquire) == 2 => Some("Local recovery made no timely preparation or durable transcription progress. Audio retained for retry.".into()),
                 _ => Some("Local recovery could not finish. Check that the original model revision is installed, then retry; audio retained.".into()),
@@ -727,13 +783,13 @@ impl SavedSpeechRecovery {
         meeting: &str,
         capture: SavedCapture,
         held_capture: Option<&fotw_pipeline::capture_clock::CaptureOwner>,
-    ) -> Result<(), RecoveryError> {
+    ) -> Result<RecoveryPhase, RecoveryError> {
         self.stage(RecoveryPhase::Preparing, Some(capture.status.sources));
         for saved in capture.sources {
             if self.check() {
                 return Err(RecoveryError::Invalid);
             }
-            if saved.complete {
+            if saved.complete || (capture.prefix_only && (!saved.pending || saved.plan.is_none())) {
                 continue;
             }
             self.stage(RecoveryPhase::Preparing, None);
@@ -761,7 +817,13 @@ impl SavedSpeechRecovery {
             };
             // Never abandon a native constructor on cancellation/timeout. Wait
             // for this same admission, then fence its stream before releasing it.
-            let prepare = FailoverStream::resume_local(&capture.dir, request);
+            let prepare = async {
+                if capture.prefix_only {
+                    FailoverStream::resume_prefix(&capture.dir, request, saved.end).await
+                } else {
+                    FailoverStream::resume_local(&capture.dir, request).await
+                }
+            };
             tokio::pin!(prepare);
             let mut tick = tokio::time::interval(Duration::from_millis(20));
             let stream = loop {
@@ -789,7 +851,12 @@ impl SavedSpeechRecovery {
                     }
                     let status = reader.read();
                     if !status.worker_running {
-                        break status.phase == crate::failover::stream::Phase::Complete;
+                        break status.phase
+                            == if capture.prefix_only {
+                                crate::failover::stream::Phase::PrefixRecovered
+                            } else {
+                                crate::failover::stream::Phase::Complete
+                            };
                     }
                     tick.tick().await;
                 }
@@ -809,6 +876,38 @@ impl SavedSpeechRecovery {
         if self.check() {
             return Err(RecoveryError::Invalid);
         }
+        if capture.prefix_only {
+            let _projection_leases =
+                crate::interrupted_capture::projection_leases(&capture.dir, &capture.session)
+                    .map_err(|_| RecoveryError::Invalid)?;
+            let mut db = self.db();
+            if db
+                .session_note_meeting(&capture.session)
+                .map_err(|_| RecoveryError::Invalid)?
+                .as_deref()
+                != Some(meeting)
+                || db
+                    .session_note_clock(&capture.session)
+                    .map_err(|_| RecoveryError::Invalid)?
+                    .is_some()
+            {
+                return Err(RecoveryError::Invalid);
+            }
+            let projected = crate::persist::persist_interrupted(
+                &mut db,
+                &capture.dir,
+                capture.started,
+                capture.observed_elapsed,
+            )
+            .map_err(|_| RecoveryError::Invalid)?;
+            if projected != meeting {
+                return Err(RecoveryError::Invalid);
+            }
+            drop(db);
+            let refreshed = self.load_with_owner(meeting, held_capture)?;
+            self.stage(RecoveryPhase::Partial, Some(refreshed.status.sources));
+            return Ok(RecoveryPhase::Partial);
+        }
         // Revalidate the saved alias/deletion/clock and atomically project
         // receipts. No native model or inference wait holds this SQL mutex.
         crate::persist::refresh_speech_projection(&mut self.db(), &capture.dir, meeting)
@@ -818,21 +917,29 @@ impl SavedSpeechRecovery {
             return Err(RecoveryError::Invalid);
         }
         self.stage(RecoveryPhase::Complete, Some(refreshed.status.sources));
-        Ok(())
+        Ok(RecoveryPhase::Complete)
     }
 }
 impl SpeechRecoveryControl for SavedSpeechRecovery {
     fn read(&self, meeting: &str) -> Result<RecoveryStatus, RecoveryError> {
         self.check();
+        let mut recovered_prefix = false;
         {
             let state = self.state();
             if let Some(job) = &state.job
                 && job.meeting == meeting
             {
-                return Ok(job.status.clone());
+                if job.status.worker_running || job.status.phase != RecoveryPhase::Partial {
+                    return Ok(job.status.clone());
+                }
+                recovered_prefix = true;
             }
         }
         let mut status = self.load(meeting)?.status;
+        if recovered_prefix && status.phase == RecoveryPhase::Retained {
+            status.phase = RecoveryPhase::Partial;
+            status.message=Some("Some saved speech has been recovered. The final recording time is unknown and additional original audio remains pending.".into());
+        }
         status.can_retry &= !self
             .state()
             .job
