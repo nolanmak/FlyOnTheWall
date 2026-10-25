@@ -1271,3 +1271,97 @@ fn archives_written_before_session_notes_remain_importable() {
     assert_eq!(dest.session_note("live-fixture").unwrap(), None);
     assert!(dest.meetings().note("mtg-1").unwrap().is_some());
 }
+
+#[test]
+fn human_exports_retain_actual_primary_engine_boundaries_even_without_words() {
+    let (_f, db) = fixture();
+    let mut doc = db.export_meeting("mtg-1").unwrap();
+    doc.segments.clear();
+    doc.speech_epochs[0].provider = "deepgram".into();
+    doc.speech_epochs[0].model = "nova-3".into();
+    doc.speech_epochs[0].capabilities_json =
+        r#"{"diarization":"both","wordTimestamps":"both"}"#.into();
+    doc.speech_receipts[0].through_sample = 272_000;
+    doc.speech_receipts[0].payload_json =
+        r#"{"epoch":0,"from_sample":0,"through_sample":272000,"segments":[]}"#.into();
+    let mut local = doc.speech_epochs[0].clone();
+    local.id = "export-local-epoch".into();
+    local.epoch = 1;
+    local.from_sample = 272_000;
+    local.provider = "whispercpp".into();
+    local.model = "small.en".into();
+    local.revision = Some("fixture-local-sha".into());
+    local.reason = Some("transport_budget".into());
+    local.capabilities_json = r#"{"diarization":"none","wordTimestamps":"none"}"#.into();
+    let mut receipt = doc.speech_receipts[0].clone();
+    receipt.id = "export-local-receipt".into();
+    receipt.epoch_id = local.id.clone();
+    receipt.from_sample = 272_000;
+    receipt.through_sample = 480_000;
+    receipt.payload_json =
+        r#"{"epoch":1,"from_sample":272000,"through_sample":480000,"segments":[]}"#.into();
+    doc.speech_epochs.push(local);
+    doc.speech_receipts.push(receipt);
+    for content in [doc.to_markdown(), doc.to_plain_text()] {
+        assert!(content.contains("Transcription sources"), "{content}");
+        assert!(content.contains("deepgram / nova-3"), "{content}");
+        assert!(content.contains("whispercpp / small.en"), "{content}");
+        assert!(
+            content.contains("00:00:17") && content.contains("00:00:30"),
+            "{content}"
+        );
+        assert!(
+            content.contains("fixture-local-sha") && content.contains("network retry budget"),
+            "{content}"
+        );
+        assert!(content.contains("Speaker labels unavailable"), "{content}");
+        assert!(content.contains("original recording clock"), "{content}");
+        assert!(!content.contains("All audio transcribed"), "{content}");
+    }
+}
+
+#[test]
+fn human_exports_exclude_nonprimary_history_and_mark_unknown_legacy_engines() {
+    let (_f, db) = fixture();
+    let mut doc = db.export_meeting("mtg-1").unwrap();
+    for transcript in &mut doc.transcripts {
+        transcript.is_primary = i64::from(transcript.id != "tr-1");
+    }
+    for content in [doc.to_markdown(), doc.to_plain_text()] {
+        assert!(
+            content.contains("Engine history was not recorded"),
+            "{content}"
+        );
+        assert!(
+            !content.contains("fixture-provider") && !content.contains("fixture-checksum"),
+            "{content}"
+        );
+    }
+}
+
+#[test]
+fn human_history_does_not_claim_unconfirmed_audio_or_render_metadata_as_markup() {
+    let (_f, db) = fixture();
+    let mut doc = db.export_meeting("mtg-1").unwrap();
+    doc.speech_receipts.clear();
+    doc.speech_epochs[0].provider = "<script>".into();
+    doc.speech_epochs[0].model = "[link](javascript:x)\n## injected".into();
+    let markdown = doc.to_markdown();
+    assert!(
+        markdown.contains("no confirmed processed audio"),
+        "{markdown}"
+    );
+    assert!(!markdown.contains("Audio processed"), "{markdown}");
+    assert!(markdown.contains("&lt;script&gt;"), "{markdown}");
+    assert!(
+        !markdown.contains("<script>") && !markdown.contains("\n## injected"),
+        "{markdown}"
+    );
+    assert!(!markdown.contains("[link](javascript:x)"), "{markdown}");
+    let plain = doc.to_plain_text();
+    assert!(
+        plain.contains("[link](javascript:x) ## injected"),
+        "{plain}"
+    );
+    assert!(!plain.contains("\n## injected"), "{plain}");
+}

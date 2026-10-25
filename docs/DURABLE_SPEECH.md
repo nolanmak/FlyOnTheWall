@@ -160,3 +160,22 @@ loopback transports and a controlled blocking recognizer separately.
 ![Synthetic live source status](speech-ui/live-desktop.png)
 
 ![Synthetic retained transcription work at narrow width](speech-ui/retained-work-mobile.png)
+
+
+## Readable export history
+
+Markdown (including OKF/GitHub's Markdown renderer) and plain-text meeting exports
+carry a separate **Transcription sources** section. It uses the same selected
+primary transcript as the transcript lines, includes source/provider/model,
+recorded revision/capabilities, switch reasons and confirmed audio boundaries,
+and preserves history even when receipts contain only silence. These metadata
+boundaries stay on the original recording clock while transcript lines retain
+their first-speech presentation origin. They do not certify completeness or
+recognition accuracy. An engine without receipts has no confirmed processed
+interval, and older transcripts explicitly have unknown history.
+
+The formatter reads only epoch/receipt metadata, never inference payloads, and
+keeps untrusted metadata on one escaped line in Markdown. JSON/archive export
+continues to preserve the original rows and immutable inference payloads.
+Summary-prompt provenance and the remaining recovery/physical/quality gates
+remain follow-up work.
