@@ -63,3 +63,29 @@ They verify good PCM, zero gap padding, final duration, and `ended_at_ms`; daemo
 warnings flow through the existing user-visible degradation channel. Converter
 tests compare salvaged FFT tails with strict conversion of the complete input
 prefix across identity, upsampling and downsampling.
+
+## Complete Opus tails and page clocks
+
+Opus finalization now pads enough audio to release the codec's delayed samples
+before setting EOS. One extra packet suffices for a frame-aligned input, but a
+nearly full partial frame can require two. The original input count and final
+trim position stay exact. A regression first decoded only 108 of 159 input
+samples at 8 kHz; forty empty/short/aligned/partial cases across all five native
+Opus rates now decode to exactly their original sample count.
+
+Ordinary page granules count decoded packet samples. Pre-skip is reflected in
+the final intended PCM end; adding it to ordinary page clocks shifted their
+starting position. A second regression observed a 2,232-tick page position for
+1,920 decoded samples. It now checks packet durations through libopus, ordinary
+page positions and enough decoded input to support the final trim. See
+[RFC 7845 sections 4.2–4.5 and 7](https://www.rfc-editor.org/rfc/rfc7845.html#section-4.2)
+for pre-skip, granule positions, end trimming and required encoder padding.
+The implementation is written for this repository; no RFC code was copied.
+
+All eleven Opus tests (including waveform, frequency/envelope, arbitrary pushes
+and playable interrupted prefixes) and full local `just ci` pass. These tests
+run the actual native codec over synthetic audio without capture, credentials,
+providers or user recordings. The change prevents new archive tails from being
+lost; existing archived bytes are not rewritten or repaired. Archived-input
+verification and finalized-but-unindexed capture recovery remain separate #12
+work.

@@ -418,3 +418,79 @@ fn silence_costs_far_less_than_speech_under_vbr() {
         loud.len()
     );
 }
+
+#[test]
+fn every_partial_final_frame_preserves_the_exact_decoded_duration() {
+    for rate in [8000, 12000, 16000, 24000, 48000] {
+        let frame = rate as usize / 50;
+        for input_samples in [
+            0,
+            1,
+            frame / 2,
+            frame - 1,
+            frame,
+            frame + 1,
+            2 * frame - 1,
+            5 * frame - 1,
+        ] {
+            let pcm: Vec<f32> = (0..input_samples)
+                .map(|i| 0.3 * (std::f32::consts::TAU * 440.0 * i as f32 / rate as f32).sin())
+                .collect();
+            let mut encoded = Vec::new();
+            let mut writer = OpusOggWriter::new(&mut encoded, rate).unwrap();
+            writer.push_f32(&pcm).unwrap();
+            let stats = writer.finish().unwrap();
+            let decoded = decode_ogg_opus(Cursor::new(encoded), rate).unwrap();
+            assert_eq!(stats.input_samples, input_samples as u64);
+            assert_eq!(
+                decoded.samples.len(),
+                input_samples,
+                "{rate}Hz with {input_samples} input samples must include the encoder's final delayed audio"
+            );
+        }
+    }
+}
+
+#[test]
+fn page_positions_match_decoded_packet_samples_and_leave_room_for_preskip() {
+    let rate = 16000;
+    let input = vec![0.3; rate as usize / 50 * 5 - 1];
+    let mut encoded = Vec::new();
+    let mut writer = OpusOggWriter::with_page_interval(&mut encoded, rate, 40).unwrap();
+    writer.push_f32(&input).unwrap();
+    writer.finish().unwrap();
+    let mut packets = ogg::reading::PacketReader::new(Cursor::new(encoded));
+    let head = packets.read_packet().unwrap().unwrap();
+    let skip = u16::from_le_bytes([head.data[10], head.data[11]]) as u64;
+    packets.read_packet().unwrap().unwrap();
+    let mut decoded = 0u64;
+    let mut saw_eos = false;
+    while let Some(packet) = packets.read_packet().unwrap() {
+        // SAFETY: the packet slice is valid for its checked i32 length; the
+        // native helper only parses its bytes and receives no output pointers.
+        let samples = unsafe {
+            opusic_sys::opus_packet_get_nb_samples(
+                packet.data.as_ptr(),
+                i32::try_from(packet.data.len()).unwrap(),
+                48000,
+            )
+        };
+        assert!(samples > 0);
+        decoded += samples as u64;
+        if packet.last_in_stream() {
+            saw_eos = true;
+            assert_eq!(packet.absgp_page(), skip + input.len() as u64 * 3);
+            assert!(
+                decoded >= packet.absgp_page(),
+                "the codec must actually produce the samples covered by the final granule"
+            );
+        } else if packet.last_in_page() {
+            assert_eq!(
+                packet.absgp_page(),
+                decoded,
+                "ordinary page timing counts decoded samples, without adding pre-skip twice"
+            );
+        }
+    }
+    assert!(saw_eos);
+}
