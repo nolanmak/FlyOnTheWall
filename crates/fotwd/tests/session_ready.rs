@@ -250,6 +250,13 @@ async fn a_healthy_device_reports_recording() {
 async fn a_wedged_device_fails_the_start_instead_of_lying() {
     let root = tmpdir("wedged");
     let released = Arc::new(AtomicBool::new(false));
+    struct Release(Arc<AtomicBool>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let _release_on_unwind = Release(released.clone());
     let for_opener = Arc::clone(&released);
     let rec = recorder(
         &root.join("sessions"),
@@ -283,14 +290,19 @@ async fn a_wedged_device_fails_the_start_instead_of_lying() {
          wedged HAL: {message}"
     );
 
-    // And the slot must be free, or Start is dead until the daemon restarts.
-    // `is_active()`, not `!is_recording()`: finishing is not recording either,
-    // and a slot stuck there refuses every Start just as thoroughly (#77).
-    assert!(
-        !rec.status().is_active(),
-        "a failed start left the recorder holding the slot"
-    );
+    // A timeout bounds the caller, not the native operation. Retain the owner
+    // until it exits so another Start cannot open a second concurrent device.
+    assert_eq!(rec.status().state, RecordingState::Starting);
+    assert!(rec.status().preparation_cancel_requested);
+    assert!(matches!(rec.start(), Err(RecorderError::AlreadyRecording)));
     released.store(true, Ordering::Relaxed);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while rec.status().state != RecordingState::Idle {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("released native setup did not retire its owner");
 }
 
 /// CON-01 puts the audit entry *before* the tap opens on purpose, so a crash

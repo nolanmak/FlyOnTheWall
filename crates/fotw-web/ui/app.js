@@ -912,9 +912,10 @@ function showRecordingControls(visible) {
 // box, because a user who cannot stop a recording is the worse failure.
 function paintRecordButton() {
   if (captureStopPending) { el.record.disabled = true; return; }
-  el.record.textContent = recState === "preparing" ? (preparationCancelRequested ? "Cancelling…" : "Cancel")
+  el.record.textContent = recState === "starting" ? (preparationCancelRequested ? "Stopping…" : "Stop")
+    : recState === "preparing" ? (preparationCancelRequested ? "Cancelling…" : "Cancel")
     : recState === "idle" ? (captureStartPending ? "Preparing…" : "Start") : "Stop";
-  if (recState === "preparing") el.record.disabled = preparationCancelRequested;
+  if (recState === "preparing" || recState === "starting") el.record.disabled = preparationCancelRequested;
   else if (captureStartPending && recState === "idle") el.record.disabled = true;
   else if (recState === "finishing") el.record.disabled = true;
   else if (recState === "recording") el.record.disabled = false;
@@ -928,8 +929,8 @@ function renderRecording(body) {
   // Anything the daemon does not name is treated as idle. An unrecognised
   // word must never be the one that leaves a clock running.
   recState =
-    ["preparing", "recording", "finishing"].includes(body.state) ? body.state : "idle";
-  preparationCancelRequested = recState === "preparing" && Boolean(body.preparation_cancel_requested);
+    ["preparing", "starting", "recording", "finishing"].includes(body.state) ? body.state : "idle";
+  preparationCancelRequested = (recState === "preparing" || recState === "starting") && Boolean(body.preparation_cancel_requested);
   renderCaptureHealth(body);
   mountLiveNotes();
   paintLiveNavigation();
@@ -943,14 +944,14 @@ function renderRecording(body) {
   // word has to be written *and* written back, or it sticks for the rest of
   // the tab's life and the next meeting records under a "finishing…" label.
   // ING-11: textContent, as everything in this file writes text.
-  el.recording.textContent = recState === "preparing" ? "preparing…" : recState === "finishing" ? "finishing…" : "recording";
+  el.recording.textContent = recState === "starting" ? "starting capture…" : recState === "preparing" ? "preparing…" : recState === "finishing" ? "finishing…" : "recording";
   // And the class with it (#91). The badge shipped permanently in `.recording`
   // — CON-02's red, which means audio is being captured *right now* — so a
   // meeting whose taps had already closed announced itself in the one colour
   // that must never be diluted. Written back for the same reason the word is:
   // a class left behind outlives the state that set it. See app.css.
-  el.recording.className = recState === "preparing" ? "preparing" : recState === "finishing" ? "finishing" : "recording";
-  if (recState === "preparing") lastFinalMs = null;
+  el.recording.className = recState === "preparing" || recState === "starting" ? "preparing" : recState === "finishing" ? "finishing" : "recording";
+  if (recState === "preparing" || recState === "starting") lastFinalMs = null;
 
   // The session clock (#66 follow-up): a recording with no visible duration
   // is how a 37-minute accident happens. Exhaustive on purpose — a
@@ -995,7 +996,7 @@ function renderRecording(body) {
   if (was !== "idle" && recState === "idle") {
     refreshLibrary();
   }
-  if (recState === "finishing" || recState === "preparing") startFinishingPoll();
+  if (recState === "finishing" || recState === "preparing" || recState === "starting" || captureStartPending) startFinishingPoll();
   else stopFinishingPoll();
 
   // Said out loud while the meeting is still running. Two Deepgram bugs each
@@ -1007,8 +1008,9 @@ function renderRecording(body) {
   // lie #77 is about.
   if (body.transcription_error) {
     say(
-      (recState === "finishing"
-        ? "Transcription failed during this meeting: "
+      (recState === "preparing" ? "Preparation: "
+        : recState === "starting" ? "Capture setup: "
+        : recState === "finishing" ? "Transcription failed during this meeting: "
         : "Recording, but transcription is failing: ") + body.transcription_error,
     );
   }
@@ -1195,12 +1197,14 @@ function liveIsShowing() {
 }
 
 async function onRecord() {
-  if (recState === "finishing" || captureStopPending || (recState === "preparing" && preparationCancelRequested)) return;
-  const stopping = recState === "recording" || recState === "preparing";
+  if (recState === "finishing" || captureStopPending || ((recState === "preparing" || recState === "starting") && preparationCancelRequested)) return;
+  const stopping = recState === "recording" || recState === "preparing" || recState === "starting";
   const path = stopping ? "/api/recording/stop" : "/api/recording/start?ack=all-party";
   const action = ++recordingAction;
   el.record.disabled = true;
   captureStartPending = !stopping;
+  // Poll setup promptly while Start's HTTP request is still waiting on native work.
+  if (!stopping) startFinishingPoll();
   if (stopping) {
     captureStopPending = true;
     renderCaptureHealth({});
@@ -1222,6 +1226,8 @@ async function onRecord() {
     } else if (body.state === "recording") {
       say("Recording. Tell the other participants.");
       showLive();
+    } else if (body.state === "starting") {
+      say(body.preparation_cancel_requested ? "Stopping capture. Any buffered audio is being saved." : "Starting capture. Audio may already be buffered; Stop to end it.");
     } else if (body.state === "preparing") {
       say(body.preparation_cancel_requested ? "Cancelled. Waiting for setup to finish releasing its resources." : "Preparing recording. Audio has not started.");
     } else if (body.state === "finishing") {
@@ -1242,7 +1248,7 @@ async function onRecord() {
       captureStopPending = false;
       captureStartPending = false;
       paintRecordButton();
-      if (stopped && (recState === "recording" || recState === "preparing")) pollRecording();
+      if (stopped && (recState === "recording" || recState === "preparing" || recState === "starting")) pollRecording();
     }
   }
 }

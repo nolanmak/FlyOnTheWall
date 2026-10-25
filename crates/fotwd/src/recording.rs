@@ -641,7 +641,6 @@ impl RecorderControl for DaemonRecorder {
         };
 
         let transcription = (self.transcription)();
-        let guarded_admission = transcription.needs_preparation();
 
         let mut control = SessionControl::new();
         control.on_segment = self.on_segment.clone();
@@ -688,32 +687,20 @@ impl RecorderControl for DaemonRecorder {
             }
             let preparing = ready.is_preparing();
             capture_health.close();
-            stop.stop();
-            if guarded_admission {
-                let error = if preparing {
-                    "local backup model preparation timed out; capture was not started. Waiting for native preparation to release its resources."
-                } else {
-                    "recording setup timed out; waiting for native setup to release its resources before another Start"
-                }.to_owned();
-                let slot = live.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(owner) = slot.as_ref().filter(|s| s.ready.same_session(&ready)) {
-                    owner.errors.record(error.clone());
-                }
-                ready.fail(error.clone());
-                return Err(RecorderError::Failed(error));
+            ready.request_stop(&stop);
+            let error = if preparing {
+                "local backup model preparation timed out; capture was not started. Waiting for native preparation to release its resources."
+            } else {
+                "recording setup timed out; waiting for native setup to release its resources before another Start. A blocked Core Audio HAL may require restarting coreaudiod and the app."
+            }.to_owned();
+            // Deadlines bound the caller, not an OS operation. Every mode keeps
+            // its native owner until spawn_session actually completes cleanup.
+            let slot = live.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(owner) = slot.as_ref().filter(|s| s.ready.same_session(&ready)) {
+                owner.errors.record(error.clone());
             }
-            let mut slot = live.lock().unwrap_or_else(|e| e.into_inner());
-            if slot.as_ref().is_some_and(|s| s.ready.same_session(&ready)) {
-                *slot = None;
-            }
-            return Err(RecorderError::Failed(
-                "the audio device did not start. This is usually a Core Audio \
-                 HAL that still believes a dead client holds the device; it \
-                 blocks rather than failing, and nothing in this process can \
-                 cancel it. Restart the audio daemon with `sudo killall \
-                 coreaudiod` (this briefly interrupts all audio) and try again."
-                    .to_owned(),
-            ));
+            ready.fail(error.clone());
+            return Err(RecorderError::Failed(error));
         }
 
         Ok(self.status())
@@ -728,15 +715,22 @@ impl RecorderControl for DaemonRecorder {
         // moved this forward would make the meeting appear to grow after it
         // ended — the clock is frozen at the first Stop or it is not frozen.
         if !live.ready.is_ready() {
-            live.stop.stop();
-            let message =
+            let capture_setup = live.ready.request_stop(&live.stop);
+            let message = if capture_setup {
+                live.stopped_at_ms.get_or_insert(now_ms());
+                "stopping capture setup; any buffered audio will be saved"
+            } else {
                 "preparation cancelled; waiting for native setup to release its resources"
-                    .to_owned();
+            }
+            .to_owned();
             live.errors.record(message.clone());
             live.ready.fail(message);
-            return Ok(
-                RecordingStatus::preparing(true).with_transcription_error(live.errors.latest())
-            );
+            let status = if capture_setup {
+                RecordingStatus::starting(true)
+            } else {
+                RecordingStatus::preparing(true)
+            };
+            return Ok(status.with_transcription_error(live.errors.latest()));
         }
         let ended_at_ms = *live.stopped_at_ms.get_or_insert(now_ms());
         // Trip and return. The task clears the slot once the meeting is on
@@ -789,11 +783,17 @@ impl RecorderControl for DaemonRecorder {
                 .capture_started_at_ms()
                 .unwrap_or(live.started_at_ms);
             let status = if !live.ready.is_ready() {
-                RecordingStatus::preparing(live.stop.is_stopped())
+                if live.ready.capture_setup_started() {
+                    RecordingStatus::starting(live.stop.is_stopped())
+                } else {
+                    RecordingStatus::preparing(live.stop.is_stopped())
+                }
             } else {
                 match live.ready.capture_ended_at_ms().or(live.stopped_at_ms) {
                     // Frozen: the tap is shut, so the number cannot grow.
-                    Some(ended_at_ms) => RecordingStatus::finishing(started_at_ms, ended_at_ms),
+                    Some(ended_at_ms) => {
+                        RecordingStatus::finishing(started_at_ms, ended_at_ms.max(started_at_ms))
+                    }
                     None => RecordingStatus::recording(
                         started_at_ms,
                         now_ms().saturating_sub(started_at_ms),
@@ -842,7 +842,7 @@ async fn spawn_session(
     let ready = control.ready.clone();
     let outcome = async {
         let transcription = transcription.prepare(&control).await?;
-        if control.stop.is_stopped() {
+        if !control.ready.begin_capture_setup(&control.stop) {
             return Err("recording preparation cancelled before capture".into());
         }
         match capture {

@@ -302,3 +302,37 @@ test('a late Start reply cannot replace the cancellation of owned preparation',a
  assert.equal(h.nodes.get('record').disabled,true);
  assert.equal(h.nodes.get('elapsed').hidden,true);
 });
+
+test('capture setup offers Stop and never claims that audio has not started',async()=>{
+ const h=harness();const paths=[];
+ h.ctx.renderRecording({state:'starting',preparation_cancel_requested:false});
+ assert.equal(h.nodes.get('record').textContent,'Stop');
+ assert.equal(h.nodes.get('recording').textContent,'starting capture…');
+ h.ctx.api=async p=>{paths.push(p);return {state:'starting',preparation_cancel_requested:true};};
+ await h.ctx.onRecord();
+ assert.equal(paths[0],'/api/recording/stop');
+ assert.match(h.nodes.get('status').textContent,/Stopping capture/);
+ assert.doesNotMatch(h.nodes.get('status').textContent,/Cancelled|Audio has not started/);
+});
+
+test('pending Start polls setup every second so Cancel is promptly available',async()=>{
+ const h=harness(),intervals=[];let release;
+ h.ctx.setInterval=(_,ms)=>{intervals.push(ms);return 1;};
+ h.nodes.get('consent').checked=true;
+ h.ctx.api=()=>new Promise(resolve=>{release=resolve;});
+ const pending=h.ctx.onRecord();
+ assert.ok(intervals.includes(1000));
+ h.ctx.renderRecording({state:'preparing'});
+ assert.equal(h.nodes.get('record').textContent,'Cancel');
+ assert.equal(h.nodes.get('record').disabled,false);
+ release({state:'preparing'});await pending;
+});
+
+test('setup diagnostics never claim a recording or transcription failure before capture readiness',()=>{
+ const h=harness();
+ h.ctx.renderRecording({state:'starting',transcription_error:'Stop requested; any buffered audio will be saved'});
+ assert.match(h.nodes.get('status').textContent,/^Capture setup:/);
+ h.ctx.renderRecording({state:'preparing',transcription_error:'Model unavailable'});
+ assert.match(h.nodes.get('status').textContent,/^Preparation:/);
+ assert.doesNotMatch(h.nodes.get('status').textContent,/Recording, but/);
+});

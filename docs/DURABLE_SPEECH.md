@@ -13,7 +13,15 @@ to their SHA-256 for recovery identity, without asserting publisher authenticity
 An unavailable backup or missing Deepgram key refuses Start. The dashboard
 shows Preparing without a recording clock or red badge and offers Cancel.
 Cancellation retains ownership until native preparation finishes; a late result
-cannot start capture. No model is downloaded automatically.
+cannot start capture. Capture admission and cancellation share a synchronized
+boundary. Once native capture setup wins that boundary, the UI says Starting
+capture and offers Stop, warning that buffered audio may be saved. A late native
+start still publishes capture identity/clock even if Stop woke the waiting Start
+request earlier. Pending Start requests poll setup every second so Cancel does
+not wait for the normal five-second status interval. No model is downloaded
+automatically. Startup deadlines retain native ownership for every speech mode;
+new Start requests are refused until that setup actually exits. A deadline can
+bound the app's wait but cannot force a blocked OS call to return.
 
 The dashboard Transcription panel saves the same policy, model and language.
 It reports file availability without treating it as native readiness, validates
