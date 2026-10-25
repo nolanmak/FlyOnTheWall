@@ -3,7 +3,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::db::Db;
 use crate::error::{Result, StoreError};
@@ -32,6 +32,14 @@ pub struct DeleteOutcome {
 }
 
 impl Db {
+    /// Whether an explicit deletion prevents automatic restoration of a meeting.
+    pub fn meeting_was_deleted(&self, meeting_id: &str) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM tombstones WHERE id=?1 AND kind='meeting')",
+            [meeting_id],
+            |row| row.get(0),
+        )?)
+    }
     /// Delete a meeting and everything derived from it.
     ///
     /// # What "delete" has to mean here
@@ -87,12 +95,34 @@ pub(crate) fn delete_meeting_in(
     root: Option<&Path>,
     meeting_id: &str,
 ) -> Result<DeleteOutcome> {
-    // Read the artifact paths before the rows go away.
-    let rel_paths = media_rel_paths(conn, meeting_id)?;
+    if meeting_id.is_empty()
+        || meeting_id == "."
+        || meeting_id == ".."
+        || meeting_id.contains(['/', '\\', ':'])
+    {
+        return Err(StoreError::InvalidArgument(
+            "invalid meeting identity".into(),
+        ));
+    }
 
     let existed;
+    let rel_paths;
+    let sessions;
     {
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        rel_paths = media_rel_paths(&tx, meeting_id)?;
+        let mut statement =
+            tx.prepare("SELECT session_id FROM session_note_links WHERE meeting_id=?1")?;
+        let linked = statement
+            .query_map([meeting_id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        let mut captured: std::collections::BTreeSet<String> = linked.into_iter().collect();
+        captured.extend(crate::session_notes::deleted_capture_sessions(
+            &tx, meeting_id,
+        )?);
+        captured.extend(claimed_captures(root, meeting_id)?);
+        sessions = captured.into_iter().collect::<Vec<_>>();
 
         let origin: Option<String> = tx
             .query_row(
@@ -102,6 +132,16 @@ pub(crate) fn delete_meeting_in(
             )
             .optional()?;
         existed = origin.is_some();
+
+        for session in &sessions {
+            let key = crate::session_notes::capture_tombstone_id(session, meeting_id)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO tombstones(id,kind,deleted_at,origin_device_id,lamport)
+                VALUES(?1,'capture_session',?2,?3,0)",
+                params![key, now_ms(), origin.as_deref().unwrap_or("unknown")],
+            )?;
+            tx.execute("DELETE FROM session_notes WHERE session_id=?1", [session])?;
+        }
 
         // Everything else hangs off this by ON DELETE CASCADE. Listing the
         // child tables here instead would be a maintenance trap: a table added
@@ -124,7 +164,12 @@ pub(crate) fn delete_meeting_in(
         tx.commit()?;
     }
 
-    let (removed_media, missing_media) = unlink_media(root, meeting_id, &rel_paths)?;
+    // Remove source paths first. A publisher that already opened a source
+    // creates its destination before copying; the following media sweep removes
+    // that destination too. A later source open fails.
+    let mut removed_media = unlink_captures(root, &sessions)?;
+    let (media, missing_media) = unlink_media(root, meeting_id, &rel_paths)?;
+    removed_media.extend(media);
 
     // The FTS5 indexes need no step of their own here: `'secure-delete'` (set
     // in migration 0002) means the triggers above already rewrote the affected
@@ -144,6 +189,122 @@ pub(crate) fn delete_meeting_in(
         removed_media,
         missing_media,
     })
+}
+
+fn unlink_captures(root: Option<&Path>, sessions: &[String]) -> Result<Vec<PathBuf>> {
+    let Some(root) = root else {
+        return Ok(Vec::new());
+    };
+    if sessions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let directory = root.join("sessions");
+    match std::fs::symlink_metadata(&directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(StoreError::io(
+                "inspecting capture storage",
+                &directory,
+                error,
+            ));
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(StoreError::InvalidArgument(
+                "capture storage is not an ordinary directory".into(),
+            ));
+        }
+        Ok(_) => {}
+    }
+    let mut removed = Vec::new();
+    for name in sessions
+        .iter()
+        .flat_map(|session| [session.clone(), format!("{session}.retired")])
+    {
+        // Every session was validated before the database delete committed.
+        let path = directory.join(name);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(StoreError::io("inspecting capture data", &path, error)),
+        };
+        let result = if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            std::fs::remove_file(&path)
+        } else {
+            std::fs::remove_dir_all(&path)
+        };
+        if let Err(error) = result {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                continue;
+            }
+            return Err(StoreError::io("unlinking capture data", &path, error));
+        }
+        removed.push(path);
+    }
+    Ok(removed)
+}
+
+fn claimed_captures(root: Option<&Path>, meeting: &str) -> Result<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct Identity {
+        claim: Option<Claim>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Claim {
+        meeting_id: String,
+    }
+    use std::io::Read;
+    let Some(root) = root else {
+        return Ok(Vec::new());
+    };
+    let directory = root.join("sessions");
+    let metadata = match std::fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(StoreError::io(
+                "inspecting capture storage",
+                &directory,
+                error,
+            ));
+        }
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(StoreError::InvalidArgument(
+            "capture storage is not an ordinary directory".into(),
+        ));
+    }
+    let entries = std::fs::read_dir(&directory)
+        .map_err(|e| StoreError::io("listing capture storage", &directory, e))?;
+    let mut sessions = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| StoreError::io("listing capture storage", &directory, e))?;
+        let kind = entry
+            .file_type()
+            .map_err(|e| StoreError::io("inspecting capture entry", entry.path(), e))?;
+        if !kind.is_dir() || kind.is_symlink() {
+            continue;
+        }
+        let Some(session) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let session = session.strip_suffix(".retired").unwrap_or(&session);
+        let path = entry.path().join("manifest.json");
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let identity: Identity = match serde_json::from_reader(file.take(4 * 1024 * 1024)) {
+            Ok(identity) => identity,
+            Err(_) => continue, // DB aliases still cover damaged current captures.
+        };
+        if identity
+            .claim
+            .is_some_and(|claim| claim.meeting_id == meeting)
+        {
+            crate::session_notes::capture_tombstone_id(session, meeting)?;
+            sessions.push(session.to_owned());
+        }
+    }
+    Ok(sessions)
 }
 
 /// Zero and release the pages the delete freed, then empty the WAL.

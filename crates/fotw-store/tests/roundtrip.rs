@@ -496,8 +496,16 @@ fn export_a_meeting_delete_it_and_re_import_reproduces_every_field() {
     }
     assert_eq!(
         after["tombstones"].len(),
-        before["tombstones"].len() + 1,
+        before["tombstones"].len() + 2,
         "the delete's tombstone was lost or duplicated"
+    );
+    let capture_tombstone: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM tombstones WHERE id='capture:saved-fixture:mtg-1' AND kind='capture_session'",
+        [], |row| row.get(0)).unwrap();
+    assert_eq!(capture_tombstone, 1);
+    assert!(
+        db.session_note("saved-fixture").unwrap().is_some(),
+        "explicitly restored notes must remain readable"
     );
 }
 

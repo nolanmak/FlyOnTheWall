@@ -19,6 +19,228 @@ use common::{test_key, tmp_db};
 
 const PHRASE: &str = "zarquon-fizzbin-quantum-hedgehog";
 
+#[test]
+fn deletion_cleans_retirement_leftovers_and_records_the_original_capture_identity() {
+    let (root, path) = tmp_db();
+    let mut db = Db::open(&path, &test_key()).unwrap();
+    let meeting = db
+        .meetings()
+        .create(NewMeeting::new("fixture", "UTC"))
+        .unwrap();
+    let session = "legacy-retirement";
+    let pending = root.path().join(format!("sessions/{session}.retired"));
+    std::fs::create_dir_all(&pending).unwrap();
+    std::fs::write(
+        pending.join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({"claim":{"meeting_id":meeting}})).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(pending.join("raw.pcm"), PHRASE).unwrap();
+    db.delete_meeting(&meeting).unwrap();
+    assert!(!pending.exists());
+    assert!(
+        db.finalize_capture(
+            session,
+            NewMeeting::new("fixture", "UTC").started_at_ms(1_000),
+            2_000,
+            None
+        )
+        .is_err()
+    );
+    // Interrupted cleanup can leave a retired directory without its manifest.
+    std::fs::create_dir_all(&pending).unwrap();
+    std::fs::write(pending.join("raw.pcm"), PHRASE).unwrap();
+    db.delete_meeting(&meeting).unwrap();
+    assert!(!pending.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn deleting_capture_symlink_unlinks_only_the_link() {
+    let (root, path) = tmp_db();
+    let mut db = Db::open(&path, &test_key()).unwrap();
+    let meeting = db
+        .finalize_capture(
+            "linked-capture",
+            NewMeeting::new("fixture", "UTC").started_at_ms(1_000),
+            2_000,
+            None,
+        )
+        .unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("keep"), b"unrelated").unwrap();
+    std::fs::create_dir_all(root.path().join("sessions")).unwrap();
+    let link = root.path().join("sessions/linked-capture");
+    std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+    db.delete_meeting(&meeting).unwrap();
+    assert!(std::fs::symlink_metadata(link).is_err());
+    assert!(outside.path().join("keep").exists());
+}
+
+#[test]
+fn deleting_a_capture_removes_pending_session_audio_using_its_durable_alias() {
+    let (root, path) = tmp_db();
+    let mut db = Db::open(&path, &test_key()).unwrap();
+    let session = "pending-capture-fixture";
+    let meeting = db
+        .finalize_capture(
+            session,
+            NewMeeting::new("fixture-device", "UTC").started_at_ms(1_000),
+            2_000,
+            None,
+        )
+        .unwrap();
+    let pending = root.path().join("sessions").join(session);
+    let unrelated = root.path().join("sessions/unrelated-capture");
+    std::fs::create_dir_all(&pending).unwrap();
+    std::fs::create_dir_all(&unrelated).unwrap();
+    std::fs::write(pending.join("system.stt16"), b"synthetic-pending-audio").unwrap();
+    std::fs::write(
+        pending.join("system.stt-coverage.jsonl"),
+        b"synthetic-private-transcript",
+    )
+    .unwrap();
+    // The DB alias must suffice even when a crash left an unreadable manifest.
+    std::fs::write(pending.join("manifest.json"), b"{").unwrap();
+    std::fs::write(unrelated.join("keep"), b"unrelated").unwrap();
+    let outcome = db.delete_meeting(&meeting).unwrap();
+    assert!(
+        !pending.exists(),
+        "deleted meeting left pending capture data behind"
+    );
+    assert!(outcome.removed_media.contains(&pending));
+    assert!(unrelated.join("keep").exists());
+}
+
+#[test]
+fn a_late_finalize_cannot_resurrect_an_explicitly_deleted_capture() {
+    let (root, path) = tmp_db();
+    let mut db = Db::open(&path, &test_key()).unwrap();
+    let session = "deleted-capture-fixture";
+    let meeting = db
+        .finalize_capture(
+            session,
+            NewMeeting::new("fixture-device", "UTC").started_at_ms(1_000),
+            2_000,
+            None,
+        )
+        .unwrap();
+    db.delete_meeting(&meeting).unwrap();
+    drop(db);
+    let mut db = Db::open(&path, &test_key()).unwrap();
+    assert!(
+        db.finalize_capture(
+            session,
+            NewMeeting::new("fixture-device", "UTC").started_at_ms(1_000),
+            2_000,
+            None
+        )
+        .is_err(),
+        "a delayed worker recreated a deleted meeting after restart"
+    );
+    assert!(db.session_note_meeting(session).unwrap().is_none());
+    drop(db);
+    drop(root);
+}
+
+#[test]
+fn a_late_note_save_cannot_recreate_a_deleted_capture_draft() {
+    let (_root, path) = tmp_db();
+    let mut db = Db::open(&path, &test_key()).unwrap();
+    let session = "deleted-note-capture";
+    let mut draft = fotw_store::SessionNoteDocument {
+        session_id: session.into(),
+        started_at_ms: 1_000,
+        note: fotw_store::NoteDocument {
+            revision: 0,
+            body_md: PHRASE.into(),
+            anchors: vec![],
+        },
+    };
+    draft.note.revision = db.save_session_note(&draft, 500).unwrap();
+    let meeting = db
+        .finalize_capture(
+            session,
+            NewMeeting::new("fixture", "UTC").started_at_ms(1_000),
+            2_000,
+            None,
+        )
+        .unwrap();
+    db.delete_meeting(&meeting).unwrap();
+    drop(db);
+    let mut db = Db::open(&path, &test_key()).unwrap();
+    assert!(db.save_session_note(&draft, 1_000).is_err());
+    assert!(db.session_note_drafts(100, 0).unwrap().is_empty());
+    assert_eq!(
+        db.conn()
+            .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn deletion_retry_finds_capture_data_after_the_alias_has_cascaded_away() {
+    let (root, path) = tmp_db();
+    let mut db = Db::open(&path, &test_key()).unwrap();
+    let session = "retry-deleted-capture";
+    let meeting = db
+        .finalize_capture(
+            session,
+            NewMeeting::new("fixture-device", "UTC").started_at_ms(1_000),
+            2_000,
+            None,
+        )
+        .unwrap();
+    db.delete_meeting(&meeting).unwrap();
+    let pending = root.path().join("sessions").join(session);
+    std::fs::create_dir_all(&pending).unwrap();
+    std::fs::write(pending.join("retained-data"), b"synthetic-cleanup-retry").unwrap();
+    assert!(!db.delete_meeting(&meeting).unwrap().existed);
+    assert!(!pending.exists());
+    assert!(db.meeting_was_deleted(&meeting).unwrap());
+}
+
+#[test]
+fn legacy_claims_are_deleted_without_requiring_a_note_alias() {
+    let (root, path) = tmp_db();
+    let mut db = Db::open(&path, &test_key()).unwrap();
+    let meeting = db
+        .meetings()
+        .create(NewMeeting::new("fixture-device", "UTC"))
+        .unwrap();
+    let pending = root.path().join("sessions/legacy-claimed-capture");
+    std::fs::create_dir_all(&pending).unwrap();
+    std::fs::write(
+        pending.join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({"claim":{"meeting_id":meeting}})).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(pending.join("system.pcm"), b"synthetic-original").unwrap();
+    db.delete_meeting(&meeting).unwrap();
+    assert!(!pending.exists());
+    assert!(
+        db.finalize_capture(
+            "legacy-claimed-capture",
+            NewMeeting::new("fixture-device", "UTC").started_at_ms(1_000),
+            2_000,
+            None
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn malformed_meeting_identity_cannot_escape_the_media_root() {
+    let (root, path) = tmp_db();
+    let mut db = Db::open(&path, &test_key()).unwrap();
+    std::fs::create_dir_all(root.path().join("media/2026/08")).unwrap();
+    let keep = root.path().join("media/keep");
+    std::fs::write(&keep, b"must survive").unwrap();
+    assert!(db.delete_meeting("../..").is_err());
+    assert!(keep.exists());
+}
+
 /// A meeting with a row in every child table, plus its media directory.
 fn seed(db: &mut Db, root: &Path) -> (String, String) {
     let meeting_id = db
