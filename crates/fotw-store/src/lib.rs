@@ -71,4 +71,4 @@ pub use crate::search::{FTS_TABLES, SearchHit, SearchQuery, SearchSource, Search
 
 pub use crate::session_notes::{SessionNoteDocument, SessionNoteDraftSummary};
 
-pub use crate::speech::{SpeechCommit, SpeechEpoch, SpeechSegment, SpeechSource};
+pub use crate::speech::{SpeechCommit, SpeechEpoch, SpeechProvenance, SpeechSegment, SpeechSource};

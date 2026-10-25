@@ -222,7 +222,24 @@ impl MeetingSource for StoreSource {
             None => Vec::new(),
         };
 
+        let speech_provenance = db
+            .speech_provenance(id)
+            .map_err(map_err)?
+            .into_iter()
+            .map(|epoch| crate::source::SavedSpeechEpoch {
+                source: epoch.source,
+                epoch: epoch.epoch,
+                from_sample: epoch.from_sample,
+                through_sample: epoch.through_sample,
+                provider: epoch.provider,
+                model: epoch.model,
+                revision: epoch.revision,
+                capabilities: epoch.capabilities,
+                reason: epoch.reason,
+            })
+            .collect();
         Ok(Some(MeetingDetail {
+            speech_provenance,
             enrich_status: meeting.enrich_status.clone(),
             enrich_detail: meeting.enrich_detail.clone(),
             meeting: row(meeting),

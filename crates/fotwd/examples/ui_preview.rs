@@ -2,6 +2,7 @@
 //!
 //!     cargo run -p fotwd --example ui_preview
 //!     cargo run -p fotwd --example ui_preview -- --live-notes
+//!     cargo run -p fotwd --example ui_preview -- --speech-history
 //!
 //! Every other way into the library goes through audio capture — a TCC grant,
 //! a signed build, and an actual meeting to record — so the web UI was
@@ -218,6 +219,10 @@ async fn main() -> Result<(), String> {
             .map_err(|e| e.to_string())?;
 
         println!("  seeded {id}  {title}");
+    }
+
+    if std::env::args().any(|arg| arg == "--speech-history") {
+        seed_speech_history(&mut db, now_ms as i64)?;
     }
 
     // An unfinished recording's saved notes, for recovery UI checks without audio.
@@ -446,4 +451,69 @@ impl fotw_web::RecorderControl for SpeechPreview {
             .with_session_id(Some("synthetic-speech-status".into()))
             .with_speech_status(vec![system, mic])
     }
+}
+
+/// Real durable projection with synthetic engine history; no provider or model.
+fn seed_speech_history(db: &mut Db, started: i64) -> Result<(), String> {
+    use fotw_store::{
+        NewMeeting, NewSegment, SpeechCommit, SpeechEpoch, SpeechSegment, SpeechSource,
+    };
+    let epoch =
+        |number, from_sample, provider: &str, model: &str, capabilities, reason| SpeechEpoch {
+            number,
+            from_sample,
+            provider: provider.into(),
+            model: model.into(),
+            revision: (number > 0).then(|| "fixture-sha".into()),
+            capabilities,
+            reason,
+        };
+    let commit = |number, from_sample, through_sample, content: &str| SpeechCommit {
+        epoch: number,
+        from_sample,
+        through_sample,
+        segments: vec![SpeechSegment {
+            id: format!("history-segment-{number}"),
+            timestamp_source: "estimated".into(),
+            words: vec![],
+            row: NewSegment::new(0, from_sample / 16 + 500, through_sample / 16, content)
+                .channel("system"),
+        }],
+    };
+    let mut meeting = NewMeeting::new("synthetic-preview", "UTC").started_at_ms(started);
+    meeting.title = "Provider change fixture".into();
+    let id = db
+        .finalize_speech_capture(
+            "synthetic-saved-history",
+            meeting,
+            started + 30_000,
+            &[SpeechSource {
+                source: "system".into(),
+                epochs: vec![
+                    epoch(
+                        0,
+                        0,
+                        "deepgram",
+                        "nova-3",
+                        serde_json::json!({"diarization":"both","wordTimestamps":"both"}),
+                        None,
+                    ),
+                    epoch(
+                        1,
+                        272_000,
+                        fotw_stt::local::PROVIDER,
+                        "fixture-small.en",
+                        serde_json::json!({"diarization":"none","wordTimestamps":"none"}),
+                        Some("transport_budget".into()),
+                    ),
+                ],
+                commits: vec![
+                    commit(0, 0, 272_000, "Synthetic cloud portion."),
+                    commit(1, 272_000, 480_000, "Synthetic local continuation."),
+                ],
+            }],
+        )
+        .map_err(|e| e.to_string())?;
+    println!("  seeded {id}  Provider change fixture");
+    Ok(())
 }

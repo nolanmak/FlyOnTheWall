@@ -166,6 +166,33 @@ pub struct MeetingDetail {
     pub note_md: Option<String>,
     /// The primary transcript, in order.
     pub segments: Vec<Segment>,
+    /// Actual primary-transcript engine history; empty means not recorded.
+    #[serde(default)]
+    pub speech_provenance: Vec<SavedSpeechEpoch>,
+}
+
+/// Metadata for one actual engine on the primary transcript's recording clock.
+/// Confirmed intervals do not imply complete or accurate recognition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedSpeechEpoch {
+    /// Original capture source (`system` or `mic`).
+    pub source: String,
+    /// Source-local provider epoch.
+    pub epoch: i64,
+    /// Engine boundary in original 16 kHz samples.
+    pub from_sample: i64,
+    /// Last confirmed receipt boundary, absent if this engine has no receipts.
+    pub through_sample: Option<i64>,
+    /// Actual provider.
+    pub provider: String,
+    /// Actual model.
+    pub model: String,
+    /// Recorded revision, when known.
+    pub revision: Option<String>,
+    /// Recorded capabilities, never inferred from current settings.
+    pub capabilities: serde_json::Value,
+    /// Recorded provider switch reason.
+    pub reason: Option<String>,
 }
 
 /// One transcript segment.

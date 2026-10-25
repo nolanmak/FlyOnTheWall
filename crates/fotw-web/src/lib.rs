@@ -100,7 +100,8 @@ pub use crate::recorder::{RecorderControl, RecorderError, RecordingState, Record
 pub use crate::secret::Secret;
 pub use crate::server::{WebServer, router};
 pub use crate::source::{
-    Hit, MeetingDetail, MeetingRow, MeetingSource, MemorySource, Segment, SourceError,
+    Hit, MeetingDetail, MeetingRow, MeetingSource, MemorySource, SavedSpeechEpoch, Segment,
+    SourceError,
 };
 pub use crate::state::AppState;
 pub use crate::state_file::{DaemonState, read_state_file, write_state_file};
