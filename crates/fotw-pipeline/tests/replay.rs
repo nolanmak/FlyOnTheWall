@@ -239,3 +239,48 @@ fn synced_audio_and_writer_ownership_survive_a_hard_process_kill() {
     resumed.append(&[-42]).unwrap();
     assert_eq!(reader.read_from(32_102, 1).unwrap(), [-42]);
 }
+
+#[test]
+fn sealed_input_survives_restart_and_refuses_any_further_append() {
+    let fixture = Fixture::new("sealed-input");
+    let mut writer =
+        ReplayWriter::create(&fixture.0, "sealed-fixture", ReplaySource::Mic, 137 * 16).unwrap();
+    writer.append(&[11, -12, 0, 13]).unwrap();
+    let end = writer.seal().unwrap();
+    assert!(writer.append(&[99]).is_err());
+    assert_eq!(writer.seal().unwrap(), end);
+    drop(writer);
+    let mut recovered =
+        ReplayWriter::resume(&fixture.0, "sealed-fixture", ReplaySource::Mic).unwrap();
+    assert!(recovered.append(&[99]).is_err());
+    let mut reader = ReplayReader::open(&fixture.0, "sealed-fixture", ReplaySource::Mic).unwrap();
+    assert_eq!(reader.sealed_end().unwrap(), Some(end));
+    assert_eq!(reader.read_from(137 * 16, 4).unwrap(), [11, -12, 0, 13]);
+    assert!(
+        !reader.is_complete().unwrap(),
+        "sealed input is not an inference acknowledgement"
+    );
+}
+
+#[test]
+fn altered_sealed_audio_is_refused_without_truncating_or_acknowledging_it() {
+    use std::io::Write;
+    let fixture = Fixture::new("sealed-altered");
+    let mut writer =
+        ReplayWriter::create(&fixture.0, "sealed-fixture", ReplaySource::System, 0).unwrap();
+    writer.append(&[1, 2, 3]).unwrap();
+    writer.seal().unwrap();
+    drop(writer);
+    let path = fixture.0.join("system.stt16");
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    file.write_all(&[42]).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(ReplayWriter::resume(&fixture.0, "sealed-fixture", ReplaySource::System).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    let reader = ReplayReader::open(&fixture.0, "sealed-fixture", ReplaySource::System).unwrap();
+    assert!(reader.sealed_end().is_err());
+    assert!(reader.is_complete().is_err());
+}

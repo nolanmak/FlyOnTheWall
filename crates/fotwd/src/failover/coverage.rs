@@ -30,6 +30,52 @@ pub struct EngineDescriptor {
     pub capabilities: SttCapabilities,
 }
 
+/// Ready local inference plan, persisted before cloud starts. No credential or
+/// model path is stored; recovery resolves the installed revision explicitly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalPlan {
+    /// Actual local provider/model/revision and capabilities.
+    pub engine: EngineDescriptor,
+    /// Original language preference; None means automatic detection.
+    pub language: Option<String>,
+    /// Original utterance endpointing policy.
+    pub endpoint: fotw_stt::local::EndpointConfig,
+}
+
+impl LocalPlan {
+    /// Refuse corrupt/unbounded inference plans before allocating native state.
+    pub fn validate(&self) -> io::Result<()> {
+        validate_engine(&self.engine)?;
+        let e = self.endpoint;
+        if self.engine.provider != fotw_stt::local::PROVIDER
+            || self.language.as_ref().is_some_and(|l| {
+                l.is_empty()
+                    || l.len() > 32
+                    || !l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+            || !(1..=1000).contains(&e.frame_ms)
+            || e.preroll_ms > 5000
+            || e.hangover_ms > 30_000
+            || e.hard_max_ms == 0
+            || e.hard_max_ms > 30_000
+            || e.soft_max_ms > 30_000
+            || e.min_speech_ms > e.hard_max_ms
+            || e.floor_window_ms < e.frame_ms
+            || e.floor_window_ms > 60_000
+            || !e.margin_db.is_finite()
+            || !(0.0..=120.0).contains(&e.margin_db)
+            || !e.speech_floor_db.is_finite()
+            || !(-160.0..=0.0).contains(&e.speech_floor_db)
+            || !e.min_range_db.is_finite()
+            || !(0.0..=120.0).contains(&e.min_range_db)
+        {
+            return Err(invalid("invalid saved local inference plan"));
+        }
+        Ok(())
+    }
+}
+
 /// Why the session moved to another engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,12 +143,14 @@ struct Header {
     source: Source,
     first_sample: u64,
     initial: EngineDescriptor,
+    #[serde(default)]
+    fallback: Option<LocalPlan>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Entry {
-    Opened { header: Header },
+    Opened { header: Box<Header> },
     Switched { epoch: ProviderEpoch },
     Committed { commit: CommittedAudio },
 }
@@ -186,6 +234,8 @@ fn read_line(reader: &mut impl BufRead) -> io::Result<Vec<u8>> {
 pub struct CoverageSnapshot {
     /// Initial engine and every durable switch in order.
     pub epochs: Vec<ProviderEpoch>,
+    /// Local inference plan captured before initial cloud connection, if known.
+    pub fallback: Option<LocalPlan>,
     /// Only complete validated receipt lines; never an in-flight publication.
     pub commits: Vec<CommittedAudio>,
 }
@@ -217,6 +267,20 @@ impl CoverageJournal {
         source: Source,
         initial: EngineDescriptor,
     ) -> io::Result<Self> {
+        Self::create_with_fallback(dir, session_id, source, initial, None)
+    }
+
+    /// Create a source journal with its preflighted local recovery plan.
+    pub fn create_with_fallback(
+        dir: &Path,
+        session_id: &str,
+        source: Source,
+        initial: EngineDescriptor,
+        fallback: Option<LocalPlan>,
+    ) -> io::Result<Self> {
+        if let Some(plan) = &fallback {
+            plan.validate()?;
+        }
         validate_engine(&initial)?;
         let audio = ReplayReader::open(dir, session_id, replay_source(source))?;
         let header = Header {
@@ -225,6 +289,7 @@ impl CoverageJournal {
             source,
             first_sample: audio.first_sample(),
             initial,
+            fallback,
         };
         let path = journal_path(dir, source);
         let owner = lock(&path)?;
@@ -236,7 +301,7 @@ impl CoverageJournal {
         let mut journal = Self::from_header(Some(owner), file, path, audio, header);
         let initialized = journal
             .append(&Entry::Opened {
-                header: journal.header.clone(),
+                header: Box::new(journal.header.clone()),
             })
             .and_then(|()| {
                 #[cfg(unix)]
@@ -268,6 +333,7 @@ impl CoverageJournal {
         Ok(CoverageSnapshot {
             epochs: journal.epochs,
             commits: journal.commits,
+            fallback: journal.header.fallback,
         })
     }
 
@@ -284,6 +350,7 @@ impl CoverageJournal {
         let Entry::Opened { header } = serde_json::from_slice(&first)? else {
             return Err(invalid("missing coverage header"));
         };
+        let header = *header;
         if header.schema != 1
             || header.session_id != session_id
             || header.source != source
@@ -292,6 +359,9 @@ impl CoverageJournal {
             return Err(invalid("coverage identity mismatch"));
         }
         validate_engine(&header.initial)?;
+        if let Some(plan) = &header.fallback {
+            plan.validate()?;
+        }
         let mut journal = Self::from_header(owner, file, path, audio, header);
         let mut valid_bytes = first.len() as u64;
         let mut torn = false;
@@ -357,6 +427,13 @@ impl CoverageJournal {
             ids: HashSet::new(),
             failed: false,
         }
+    }
+
+    /// Ready local plan recorded before cloud was opened. Missing on older
+    /// source journals, which require an explicit recovery model selection.
+    #[must_use]
+    pub fn fallback_plan(&self) -> Option<&LocalPlan> {
+        self.header.fallback.as_ref()
     }
 
     /// Current source coverage on the absolute sample clock.

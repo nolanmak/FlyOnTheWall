@@ -1,7 +1,7 @@
 //! Disk-backed canonical transcription audio for provider handoffs.
 //!
-//! This is the **derived** mono 16 kHz PCM16 stream, after resampling, echo
-//! gating and gap padding. It supplements the original capture WAL; rebuilding
+//! This is the **derived** mono 16 kHz PCM16 stream after resampling and gap
+//! padding. Durable handoff preserves microphone speech before echo suppression. It supplements the original capture WAL; rebuilding
 //! this stream from native-format audio can change both its contents and clock.
 //! Each leg has its own absolute session sample anchor. Reads are bounded to
 //! one second and use independent file descriptions, so catchup cannot move a
@@ -32,11 +32,18 @@ pub const MAX_READ_SAMPLES: usize = SAMPLE_RATE as usize;
 pub enum ReplaySource {
     /// Other participants, captured from system output.
     System,
-    /// Local microphone, including echo-gated silence.
+    /// Local microphone, preserving its original speech in durable handoff mode.
     Mic,
 }
 
 impl ReplaySource {
+    fn sealed_path(self, dir: &Path) -> PathBuf {
+        dir.join(match self {
+            Self::System => "system.stt-sealed.json",
+            Self::Mic => "mic.stt-sealed.json",
+        })
+    }
+
     fn completion_path(self, dir: &Path) -> PathBuf {
         dir.join(match self {
             Self::System => "system.stt-complete.json",
@@ -116,7 +123,7 @@ pub(crate) fn retirement_guard(
     let mut owners = Vec::new();
     for source in [ReplaySource::System, ReplaySource::Mic] {
         if !source.path(dir).try_exists()? {
-            if source.completion_path(dir).try_exists()? {
+            if source.completion_path(dir).try_exists()? || source.sealed_path(dir).try_exists()? {
                 return Err(invalid("completion proof has no replay audio"));
             }
             continue;
@@ -147,6 +154,8 @@ pub struct ReplayWriter {
     failed: bool,
     dir: PathBuf,
     source: ReplaySource,
+    session_id: String,
+    sealed: bool,
 }
 
 impl ReplayWriter {
@@ -202,6 +211,8 @@ impl ReplayWriter {
             failed: false,
             dir: dir.to_owned(),
             source,
+            session_id: session_id.to_owned(),
+            sealed: false,
         })
     }
 
@@ -217,6 +228,7 @@ impl ReplayWriter {
             .write(true)
             .open(source.path(dir))?;
         let mut reader = ReplayReader::from_file(dir, file, session_id, source)?;
+        let sealed = reader.sealed_end()?.is_some();
         let length = reader.file.metadata()?.len();
         let audio_bytes = length
             .checked_sub(reader.audio_offset)
@@ -238,6 +250,8 @@ impl ReplayWriter {
             failed: false,
             dir: dir.to_owned(),
             source,
+            session_id: session_id.to_owned(),
+            sealed,
         })
     }
 
@@ -248,6 +262,9 @@ impl ReplayWriter {
     /// must continue independently and surface an incomplete-transcript error.
     pub fn append(&mut self, pcm: &[i16]) -> io::Result<()> {
         self.check_healthy()?;
+        if self.sealed {
+            return Err(invalid("replay input is permanently sealed"));
+        }
         if pcm.is_empty() {
             return Ok(());
         }
@@ -292,6 +309,18 @@ impl ReplayWriter {
             self.failed = true;
             return Err(error);
         }
+        Ok(self.end_sample)
+    }
+
+    /// Freeze and sync the complete aligned input. The identity-bound atomic
+    /// marker survives a restart; neither this owner nor a resumed owner may
+    /// append afterward. This does not certify transcription completion.
+    pub fn seal(&mut self) -> io::Result<u64> {
+        self.check_healthy()?;
+        let mut reader = ReplayReader::open(&self.dir, &self.session_id, self.source)?;
+        reader.sealed_end()?;
+        reader.write_boundary(self.end_sample, self.source.sealed_path(&self.dir))?;
+        self.sealed = true;
         Ok(self.end_sample)
     }
 
@@ -377,6 +406,28 @@ impl ReplayReader {
     /// accounted for every saved sample. Partial coverage and torn samples are
     /// refused. The caller establishes inference coverage; this verifies audio.
     pub fn mark_complete(&mut self, through_sample: u64) -> io::Result<()> {
+        self.sealed_end()?;
+        self.write_boundary(
+            through_sample,
+            self.header.source.completion_path(&self.dir),
+        )
+    }
+
+    /// Persisted frozen source end, refusing altered input or another identity.
+    /// Absent on older/unclosed sources; an exclusive resume owner may seal it.
+    pub fn sealed_end(&self) -> io::Result<Option<u64>> {
+        match self.read_boundary(self.header.source.sealed_path(&self.dir))? {
+            None => Ok(None),
+            Some(boundary) if self.matches_boundary(&boundary)? => {
+                Ok(Some(boundary.through_sample))
+            }
+            Some(_) => Err(invalid(
+                "sealed replay input has changed or belongs to another source",
+            )),
+        }
+    }
+
+    fn write_boundary(&mut self, through_sample: u64, path: PathBuf) -> io::Result<()> {
         if !self.aligned()? || through_sample != self.available_end()? {
             return Err(invalid(
                 "completion must cover the entire aligned replay stream",
@@ -390,7 +441,6 @@ impl ReplayReader {
             first_sample: self.first_sample(),
             through_sample,
         };
-        let path = self.header.source.completion_path(&self.dir);
         let temporary = path.with_extension(format!(
             "part-{}-{}",
             std::process::id(),
@@ -416,26 +466,38 @@ impl ReplayReader {
     /// Whether a bounded, valid proof matches this source's current saved end.
     /// This is a status snapshot; retirement also acquires exclusive ownership.
     pub fn is_complete(&self) -> io::Result<bool> {
-        let file = match File::open(self.header.source.completion_path(&self.dir)) {
+        self.sealed_end()?;
+        match self.read_boundary(self.header.source.completion_path(&self.dir))? {
+            Some(boundary) => self.matches_boundary(&boundary),
+            None => Ok(false),
+        }
+    }
+
+    fn read_boundary(&self, path: PathBuf) -> io::Result<Option<Completion>> {
+        let file = match File::open(path) {
             Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
         let mut bytes = Vec::new();
         file.take(MAX_HEADER_BYTES as u64 + 1)
             .read_to_end(&mut bytes)?;
         if bytes.len() > MAX_HEADER_BYTES {
-            return Err(invalid("completion proof exceeds size limit"));
+            return Err(invalid("replay boundary proof exceeds size limit"));
         }
-        let complete: Completion = serde_json::from_slice(&bytes)?;
-        if complete.schema != 1 {
-            return Err(invalid("unsupported completion proof"));
+        let boundary: Completion = serde_json::from_slice(&bytes)?;
+        if boundary.schema != 1 {
+            return Err(invalid("unsupported replay boundary proof"));
         }
+        Ok(Some(boundary))
+    }
+
+    fn matches_boundary(&self, boundary: &Completion) -> io::Result<bool> {
         Ok(self.aligned()?
-            && complete.session_id == self.header.session_id
-            && complete.source == self.header.source
-            && complete.first_sample == self.first_sample()
-            && complete.through_sample == self.available_end()?)
+            && boundary.session_id == self.header.session_id
+            && boundary.source == self.header.source
+            && boundary.first_sample == self.first_sample()
+            && boundary.through_sample == self.available_end()?)
     }
 
     fn aligned(&self) -> io::Result<bool> {

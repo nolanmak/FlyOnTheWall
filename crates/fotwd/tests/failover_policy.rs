@@ -104,12 +104,12 @@ fn confirmed_final_resets_speech_deadline_and_session_limit_is_not_a_failure() {
 fn rate_pressure_honors_retry_after_within_a_bounded_wait_budget() {
     let mut policy = HandoffPolicy::new(HandoffLimits::default());
     assert_eq!(
-        policy.error(100, &error(Class::RateLimit).with_retry_after_ms(20_000)),
+        policy.error(100, &error(Class::RateLimit).with_retry_after_ms(10_000)),
         Decision::KeepCloud
     );
-    assert_eq!(policy.tick(15_100, 0), Decision::KeepCloud);
+    assert_eq!(policy.tick(15_099, 0), Decision::KeepCloud);
     assert_eq!(
-        policy.tick(30_100, 0),
+        policy.tick(15_100, 0),
         Decision::Switch(SwitchReason::RateLimitBudget)
     );
     let mut policy = HandoffPolicy::new(HandoffLimits::default());
@@ -191,5 +191,35 @@ fn configured_budgets_replace_the_defaults() {
     assert_eq!(
         policy.tick(1, 1_600),
         Decision::Switch(SwitchReason::SpeechStall)
+    );
+}
+
+#[test]
+fn pressure_never_extends_the_fifteen_second_retry_budget() {
+    let mut policy = HandoffPolicy::new(HandoffLimits::default());
+    assert_eq!(
+        policy.error(100, &error(Class::RateLimit).with_retry_after_ms(10_000)),
+        Decision::KeepCloud
+    );
+    assert_eq!(policy.tick(15_099, 0), Decision::KeepCloud);
+    assert_eq!(
+        policy.tick(15_100, 0),
+        Decision::Switch(SwitchReason::RateLimitBudget)
+    );
+    let mut policy = HandoffPolicy::new(HandoffLimits::default());
+    assert_eq!(
+        policy.error(100, &error(Class::Concurrency).with_retry_after_ms(20_000)),
+        Decision::Switch(SwitchReason::RateLimitBudget)
+    );
+}
+
+#[test]
+fn repeated_pressure_uses_remaining_retry_time_instead_of_restarting_the_budget() {
+    let mut policy = HandoffPolicy::new(HandoffLimits::default());
+    policy.state(0, StreamState::Connecting);
+    policy.error(0, &error(Class::Network));
+    assert_eq!(
+        policy.error(10_000, &error(Class::RateLimit).with_retry_after_ms(8_000)),
+        Decision::Switch(SwitchReason::RateLimitBudget)
     );
 }

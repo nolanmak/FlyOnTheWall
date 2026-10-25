@@ -1,6 +1,6 @@
 //! One durable cloud-to-local source. Disk IO and native inference run on a
-//! dedicated worker; the capture pump only appends canonical audio. This is
-//! not enabled in recording until pending-session retention is connected.
+//! dedicated worker; the capture pump only appends canonical audio. The session
+//! API supports this runtime; app settings/startup recovery are separate wiring.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,7 +16,7 @@ use fotw_stt::{
 use tokio::sync::{mpsc, watch};
 
 use super::coverage::{
-    CommitOutcome, CoverageJournal, EngineDescriptor, ProviderEpoch, SwitchReason,
+    CommitOutcome, CoverageJournal, EngineDescriptor, LocalPlan, ProviderEpoch, SwitchReason,
 };
 use super::policy::{Decision, HandoffLimits, HandoffPolicy};
 
@@ -72,6 +72,54 @@ impl FailoverConfig {
             stop_timeout: Duration::from_secs(30),
         }
     }
+}
+
+impl FailoverConfig {
+    fn local_plan(&self) -> LocalPlan {
+        LocalPlan {
+            engine: EngineDescriptor {
+                provider: fotw_stt::local::PROVIDER.into(),
+                model: self.local.model().into(),
+                revision: self.local_revision.clone(),
+                capabilities: self.local_capabilities.clone(),
+            },
+            language: self.local.language().map(str::to_owned),
+            endpoint: self.endpoint,
+        }
+    }
+}
+
+/// Explicit local recovery request. It has no cloud key, endpoint, or policy.
+/// The model revision and factory language must match the saved ready plan.
+pub struct LocalResumeConfig {
+    /// Original WAL identity.
+    pub session_id: String,
+    /// Source whose pending canonical audio is being recovered.
+    pub source: Source,
+    /// Installed local model, independently preflighted by the caller.
+    pub local: Arc<dyn RecognizerFactory>,
+    /// Verified installed revision/checksum, not the current settings preference.
+    pub revision: Option<String>,
+    /// Bounded inference drain; unresolved native ownership remains observable.
+    pub stop_timeout: Duration,
+}
+
+struct WorkerConfig {
+    session_id: String,
+    source: Source,
+    local: Arc<dyn RecognizerFactory>,
+    plan: LocalPlan,
+    limits: HandoffLimits,
+    cloud_queue_samples: usize,
+    cloud_settle: Duration,
+    stop_timeout: Duration,
+}
+
+struct SourceInputs {
+    writer: ReplayWriter,
+    journal: CoverageJournal,
+    reader: ReplayReader,
+    recognizer: Option<Box<dyn Recognizer>>,
 }
 
 /// Handoff-aware event stream. Only this source's final Closed is terminal.
@@ -241,6 +289,10 @@ impl FailoverStream {
                 "handoff requires canonical 16 kHz mono PCM16 and matching provider model metadata",
             ));
         }
+        config
+            .local_plan()
+            .validate()
+            .map_err(|e| failure(e.to_string()))?;
         let local = Arc::clone(&config.local);
         let recognizer = tokio::task::spawn_blocking(move || local.create())
             .await
@@ -266,36 +318,159 @@ impl FailoverStream {
             revision: None,
             capabilities: SttCapabilities::deepgram(),
         };
+        let fallback = config.local_plan();
         let directory = dir.to_owned();
         let (writer, journal, reader, recognizer) = tokio::task::spawn_blocking(move || {
             let writer = ReplayWriter::create(&directory, &session_id, source(leg), anchor)
                 .map_err(|e| failure(e.to_string()))?;
-            let journal = CoverageJournal::create(&directory, &session_id, leg, initial)
-                .map_err(|e| failure(e.to_string()))?;
+            let journal = CoverageJournal::create_with_fallback(
+                &directory,
+                &session_id,
+                leg,
+                initial,
+                Some(fallback),
+            )
+            .map_err(|e| failure(e.to_string()))?;
             let reader = ReplayReader::open(&directory, &session_id, source(leg))
                 .map_err(|e| failure(e.to_string()))?;
             Ok::<_, SttError>((writer, journal, reader, recognizer))
         })
         .await
         .map_err(|e| failure(e.to_string()))??;
+        let (cloud, cloud_events) =
+            DeepgramStream::open(config.cloud.clone().with_confirmed_finals());
+        let worker_config = WorkerConfig {
+            session_id: config.cloud.normalizer.session_id.clone(),
+            source: config.cloud.normalizer.source,
+            local: Arc::clone(&config.local),
+            plan: config.local_plan(),
+            limits: config.limits,
+            cloud_queue_samples: config.cloud_queue_samples,
+            cloud_settle: config.cloud_settle,
+            stop_timeout: config.stop_timeout,
+        };
+        Self::launch(
+            worker_config,
+            SourceInputs {
+                writer,
+                journal,
+                reader,
+                recognizer: Some(recognizer),
+            },
+            Some((cloud, cloud_events)),
+        )
+    }
+
+    /// Recover only pending local speech against a frozen canonical file. This
+    /// path cannot construct cloud transport or accept new live input. A busy
+    /// native owner, unavailable/mismatched model or corrupt journal is refused.
+    pub async fn resume_local(
+        dir: &Path,
+        request: LocalResumeConfig,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), SttError> {
+        let directory = dir.to_owned();
+        let (config, inputs) = tokio::task::spawn_blocking(move || {
+            let snapshot =
+                CoverageJournal::snapshot(&directory, &request.session_id, request.source)
+                    .map_err(|e| failure(e.to_string()))?;
+            let plan = snapshot.fallback.ok_or_else(|| {
+                failure("saved local recovery plan is unavailable; source audio retained")
+            })?;
+            if plan.engine.model != request.local.model()
+                || plan.engine.revision != request.revision
+                || plan.language.as_deref() != request.local.language()
+            {
+                return Err(failure(
+                    "installed recovery model, revision or language does not match the saved plan",
+                ));
+            }
+            let mut writer =
+                ReplayWriter::resume(&directory, &request.session_id, source(request.source))
+                    .map_err(|e| failure(e.to_string()))?;
+            let mut journal =
+                CoverageJournal::open(&directory, &request.session_id, request.source)
+                    .map_err(|e| failure(e.to_string()))?;
+            let end = writer.end_sample();
+            if journal.committed_through() > end {
+                return Err(failure("saved coverage exceeds frozen audio"));
+            }
+            let pending = journal.committed_through() < end;
+            let recognizer = if pending {
+                Some(request.local.create()?)
+            } else {
+                None
+            };
+            writer.seal().map_err(|e| failure(e.to_string()))?;
+            if pending {
+                journal
+                    .switch(plan.engine.clone(), SwitchReason::ResumePending)
+                    .map_err(|e| failure(e.to_string()))?;
+            }
+            let reader =
+                ReplayReader::open(&directory, &request.session_id, source(request.source))
+                    .map_err(|e| failure(e.to_string()))?;
+            let config = WorkerConfig {
+                session_id: request.session_id,
+                source: request.source,
+                local: request.local,
+                plan,
+                limits: HandoffLimits::default(),
+                cloud_queue_samples: 0,
+                cloud_settle: Duration::ZERO,
+                stop_timeout: request.stop_timeout,
+            };
+            Ok::<_, SttError>((
+                config,
+                SourceInputs {
+                    writer,
+                    journal,
+                    reader,
+                    recognizer,
+                },
+            ))
+        })
+        .await
+        .map_err(|e| failure(e.to_string()))??;
+        Self::launch(config, inputs, None)
+    }
+
+    fn launch(
+        config: WorkerConfig,
+        inputs: SourceInputs,
+        transport: Option<(DeepgramStream, mpsc::UnboundedReceiver<StreamEvent>)>,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), SttError> {
+        let SourceInputs {
+            writer,
+            journal,
+            reader,
+            recognizer,
+        } = inputs;
+        let anchor = journal.committed_through();
+        let end = writer.end_sample();
+        let resuming = transport.is_none();
+        let (cloud, cloud_events) = match transport {
+            Some((cloud, events)) => (Some(Arc::new(cloud)), Some(events)),
+            None => (None, None),
+        };
+        let abort_on_failure = cloud.clone();
         let (events, receiver) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             writer: Mutex::new(Writer {
                 audio: writer,
                 last_sync: Instant::now(),
             }),
-            end: AtomicU64::new(anchor),
-            stop_requested: AtomicBool::new(false),
-            input_closed: AtomicBool::new(false),
+            end: AtomicU64::new(end),
+            stop_requested: AtomicBool::new(resuming),
+            input_closed: AtomicBool::new(resuming),
             done: AtomicBool::new(false),
             gate: Mutex::new(Publication {
                 fenced: false,
                 status: Status {
-                    phase: Phase::Cloud,
+                    phase: if resuming { Phase::Local } else { Phase::Cloud },
                     epoch: journal.current_epoch().clone(),
                     committed_sample: anchor,
-                    written_sample: anchor,
-                    lag_samples: 0,
+                    written_sample: end,
+                    lag_samples: end.saturating_sub(anchor),
                     worker_running: true,
                     error: None,
                 },
@@ -304,10 +479,11 @@ impl FailoverStream {
             wait: Mutex::new(()),
             events,
         });
-        let (cloud, cloud_events) =
-            DeepgramStream::open(config.cloud.clone().with_confirmed_finals());
-        let cloud = Arc::new(cloud);
-        let abort_on_failure = Arc::clone(&cloud);
+        if resuming && anchor < end {
+            let _ = shared
+                .events
+                .send(Event::ProviderSwitch(journal.current_epoch().clone()));
+        }
         let stop_timeout = config.stop_timeout;
         let (done_sender, done) = watch::channel(false);
         let worker_shared = Arc::clone(&shared);
@@ -317,11 +493,11 @@ impl FailoverStream {
             .spawn(move || {
                 let mut worker = Worker {
                     policy: HandoffPolicy::new(config.limits),
-                    vad: Endpointer::new(config.endpoint),
-                    local_endpoint: None,
-                    recognizer: Some(recognizer),
-                    cloud: Some(cloud),
-                    cloud_events: Some(cloud_events),
+                    vad: Endpointer::new(config.plan.endpoint),
+                    local_endpoint: resuming.then(|| Endpointer::new(config.plan.endpoint)),
+                    recognizer,
+                    cloud,
+                    cloud_events,
                     cloud_cursor: anchor,
                     vad_cursor: anchor,
                     local_cursor: anchor,
@@ -346,7 +522,9 @@ impl FailoverStream {
                 let _ = done_sender.send(true);
             })
             .map_err(|e| {
-                abort_on_failure.abort();
+                if let Some(cloud) = abort_on_failure {
+                    cloud.abort();
+                }
                 failure(e.to_string())
             })?;
         Ok((
@@ -401,7 +579,7 @@ impl FailoverStream {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .audio
-                    .sync();
+                    .seal();
                 if let Err(error) = result {
                     shared.terminal(Some(failure(error.to_string())));
                 }
@@ -461,7 +639,7 @@ impl Drop for FailoverStream {
 
 struct Worker {
     shared: Arc<Shared>,
-    config: FailoverConfig,
+    config: WorkerConfig,
     journal: CoverageJournal,
     reader: ReplayReader,
     cloud: Option<Arc<DeepgramStream>>,
@@ -661,15 +839,15 @@ impl Worker {
                 EngineDescriptor {
                     provider: fotw_stt::local::PROVIDER.into(),
                     model: self.config.local.model().into(),
-                    revision: self.config.local_revision.clone(),
-                    capabilities: self.config.local_capabilities.clone(),
+                    revision: self.config.plan.engine.revision.clone(),
+                    capabilities: self.config.plan.engine.capabilities.clone(),
                 },
                 reason,
             )
             .map_err(|e| failure(e.to_string()))?;
         self.local_base = self.journal.committed_through();
         self.local_cursor = self.local_base;
-        self.local_endpoint = Some(Endpointer::new(self.config.endpoint));
+        self.local_endpoint = Some(Endpointer::new(self.config.plan.endpoint));
         let mut gate = self.shared.gate.lock().unwrap_or_else(|p| p.into_inner());
         if !gate.fenced {
             gate.status.phase = Phase::Local;
@@ -695,11 +873,8 @@ impl Worker {
         if self.shared.fenced() {
             return Err(failure("late native inference fenced"));
         }
-        let config = LocalStreamConfig::new(
-            self.config.cloud.normalizer.session_id.clone(),
-            self.config.cloud.normalizer.source,
-        )
-        .with_session_offset_ms(self.local_base / 16);
+        let config = LocalStreamConfig::new(self.config.session_id.clone(), self.config.source)
+            .with_session_offset_ms(self.local_base / 16);
         let segments = segments_for(
             &config,
             self.config.local.model(),

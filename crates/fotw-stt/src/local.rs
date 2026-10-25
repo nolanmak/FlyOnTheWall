@@ -51,7 +51,8 @@ const MAX_QUEUED_COMMANDS: usize = 8192;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Where the [`Endpointer`] cuts.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EndpointConfig {
     /// Analysis frame. 30 ms is the usual VAD frame.
     pub frame_ms: u64,

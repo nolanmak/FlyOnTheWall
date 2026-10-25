@@ -280,8 +280,26 @@ async fn auth_handoff_replays_more_than_thirty_seconds_and_preserves_the_session
         Arc::new(ReadyOnceFactory(std::sync::atomic::AtomicBool::new(false))),
     );
     config.limits.speech_samples_without_final = 90 * 16_000;
+    config.local_revision = Some("fixture-local-checksum".into());
     let dir = tempfile::tempdir().unwrap();
     let (stream, mut events) = FailoverStream::open(dir.path(), config).await.unwrap();
+    let header: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(dir.path().join("system.stt-coverage.jsonl"))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        header["header"]["fallback"]["engine"]["model"],
+        "fixture-local"
+    );
+    assert_eq!(
+        header["header"]["fallback"]["engine"]["revision"],
+        "fixture-local-checksum"
+    );
+    assert_eq!(header["header"]["fallback"]["language"], "en");
     let pcm: Vec<i16> = (0..73 * 16_000)
         .map(|n| if (n / 480) % 2 == 0 { 1_000 } else { 8_000 })
         .collect();
@@ -659,7 +677,7 @@ async fn installed_whisper_recovers_a_public_clip_after_reconnect_budget_exhaust
     .with_endpoint(DeepgramEndpoint::loopback(port))
     .with_backoff(fotw_stt::BackoffPolicy::fast());
     let engine = Arc::new(fotw_stt::WhisperEngine::new(model, Some("en".into())));
-    let mut config = FailoverConfig::new(cloud, engine);
+    let mut config = FailoverConfig::new(cloud, engine.clone());
     config.local_revision =
         Some("sha256:c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d".into());
     let dir = tempfile::tempdir().unwrap();
@@ -706,4 +724,358 @@ async fn installed_whisper_recovers_a_public_clip_after_reconnect_budget_exhaust
         .await
         .unwrap()
         .unwrap();
+    // Reopen a separately persisted pre-demotion source using only its saved
+    // local plan and the verified installed model. No cloud transport exists.
+    let plan = CoverageJournal::snapshot(dir.path(), "s", Source::System)
+        .unwrap()
+        .fallback
+        .unwrap();
+    let pending = tempfile::tempdir().unwrap();
+    let mut writer = fotw_pipeline::replay::ReplayWriter::create(
+        pending.path(),
+        "native-restart",
+        fotw_pipeline::replay::ReplaySource::System,
+        0,
+    )
+    .unwrap();
+    writer.append(&pcm).unwrap();
+    writer.sync().unwrap();
+    drop(writer);
+    let journal = CoverageJournal::create_with_fallback(
+        pending.path(),
+        "native-restart",
+        Source::System,
+        fotwd::failover::coverage::EngineDescriptor {
+            provider: "deepgram".into(),
+            model: "nova-3".into(),
+            revision: None,
+            capabilities: fotw_stt::SttCapabilities::deepgram(),
+        },
+        Some(plan.clone()),
+    )
+    .unwrap();
+    drop(journal);
+    let began = std::time::Instant::now();
+    let (recovered, mut events) = FailoverStream::resume_local(
+        pending.path(),
+        fotwd::failover::stream::LocalResumeConfig {
+            session_id: "native-restart".into(),
+            source: Source::System,
+            local: engine,
+            revision: plan.engine.revision,
+            stop_timeout: Duration::from_secs(30),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(recovered.finish().await, "{:?}", recovered.status());
+    let mut text = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let Event::Transcript(StreamEvent::Final(segment)) = event {
+            text.push(segment.text);
+        }
+    }
+    let transcript = text.join(" ");
+    assert!(
+        transcript.to_ascii_lowercase().contains("country"),
+        "{transcript}"
+    );
+    assert_eq!(recovered.status().committed_sample, pcm.len() as u64);
+    assert_eq!(
+        recovered.status().epoch.reason,
+        Some(SwitchReason::ResumePending)
+    );
+    eprintln!(
+        "{}",
+        serde_json::json!({"fixture":"public-jfk-sha256-verified","mode":"local-restart","elapsed_ms":began.elapsed().as_millis(),"samples":pcm.len(),"transcript":transcript})
+    );
+}
+
+struct PendingFixture {
+    _root: tempfile::TempDir,
+    dir: std::path::PathBuf,
+    session: String,
+    anchor: u64,
+    end: u64,
+    outcome: fotwd::SessionOutcome,
+}
+
+fn pending_fixture(seal: bool) -> PendingFixture {
+    use fotw_pipeline::replay::{ReplaySource, ReplayWriter};
+    use fotwd::failover::coverage::{EngineDescriptor, LocalPlan};
+    let root = tempfile::tempdir().unwrap();
+    let mut wal = fotw_pipeline::wal::SessionWal::create(root.path(), 16_000, 1).unwrap();
+    let dir = wal.dir().to_owned();
+    let session = dir.file_name().unwrap().to_str().unwrap().to_owned();
+    let pcm: Vec<i16> = (0u32..73 * 16_000)
+        .map(|n| {
+            if (n / 3_200).is_multiple_of(2) {
+                1000
+            } else {
+                8000
+            }
+        })
+        .collect();
+    wal.write_system(
+        &pcm.iter()
+            .map(|v| f32::from(*v) / 32768.0)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    wal.finalize().unwrap();
+    let anchor = 137 * 16;
+    let mut writer = ReplayWriter::create(&dir, &session, ReplaySource::System, anchor).unwrap();
+    writer.append(&pcm).unwrap();
+    writer.sync().unwrap();
+    if seal {
+        writer.seal().unwrap();
+    }
+    let end = writer.end_sample();
+    let factory: Arc<dyn RecognizerFactory> = Arc::new(Factory);
+    let local = FailoverConfig::new(
+        DeepgramStreamConfig::new(
+            "unused-fixture",
+            fotw_stt::deepgram::DeepgramConfig::new(&session, Source::System),
+        ),
+        factory,
+    );
+    let plan = LocalPlan {
+        engine: EngineDescriptor {
+            provider: fotw_stt::local::PROVIDER.into(),
+            model: "fixture-local".into(),
+            revision: Some("fixture-local-checksum".into()),
+            capabilities: local.local_capabilities,
+        },
+        language: Some("en".into()),
+        endpoint: local.endpoint,
+    };
+    let mut journal = CoverageJournal::create_with_fallback(
+        &dir,
+        &session,
+        Source::System,
+        EngineDescriptor {
+            provider: "deepgram".into(),
+            model: "nova-3".into(),
+            revision: None,
+            capabilities: fotw_stt::SttCapabilities::deepgram(),
+        },
+        Some(plan),
+    )
+    .unwrap();
+    let mut original =
+        fotw_stt::TranscriptSegment::new(&session, Source::System, "deepgram", "nova-3");
+    original.id = "stable-original-prefix".into();
+    original.text = "original committed prefix".into();
+    original.is_final = true;
+    original.start_ms = 137;
+    original.end_ms = 10_137;
+    journal
+        .commit(0, anchor, anchor + 10 * 16_000, vec![original.clone()])
+        .unwrap();
+    drop(journal);
+    drop(writer);
+    let outcome = fotwd::SessionOutcome {
+        dir: dir.clone(),
+        started_at_ms: 1_000,
+        capture_ended_at_ms: Some(74_137),
+        system_samples: pcm.len() as u64,
+        segments: vec![original],
+        ..Default::default()
+    };
+    PendingFixture {
+        _root: root,
+        dir,
+        session,
+        anchor,
+        end,
+        outcome,
+    }
+}
+fn resume_request(fixture: &PendingFixture) -> fotwd::failover::stream::LocalResumeConfig {
+    fotwd::failover::stream::LocalResumeConfig {
+        session_id: fixture.session.clone(),
+        source: Source::System,
+        local: Arc::new(Factory),
+        revision: Some("fixture-local-checksum".into()),
+        stop_timeout: Duration::from_secs(5),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_restart_recovers_only_pending_audio_and_projects_once_without_replacing_edits() {
+    for sealed in [false, true] {
+        let fixture = pending_fixture(sealed);
+        let key = fotw_store::DbKey::from_bytes([0x29; 32]);
+        let database = fixture._root.path().join("owned.sqlite3");
+        let mut db = fotw_store::Db::open(&database, &key).unwrap();
+        let meeting =
+            fotwd::persist::persist_session(&mut db, &fixture.outcome, "Owned recovery").unwrap();
+        db.conn()
+            .execute(
+                "UPDATE segments SET text='owned correction' WHERE id='stable-original-prefix'",
+                [],
+            )
+            .unwrap();
+        drop(db);
+        let original_pcm = std::fs::read(fixture.dir.join("system.pcm")).unwrap();
+        let original_canonical = std::fs::read(fixture.dir.join("system.stt16")).unwrap();
+        let (stream, mut events) =
+            FailoverStream::resume_local(&fixture.dir, resume_request(&fixture))
+                .await
+                .unwrap();
+        assert!(
+            stream.write(&[123]).is_err(),
+            "resumed input must stay frozen"
+        );
+        assert!(stream.finish().await, "{:?}", stream.status());
+        assert_eq!(stream.status().written_sample, fixture.end);
+        assert_eq!(stream.status().committed_sample, fixture.end);
+        let mut finals = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let Event::Transcript(StreamEvent::Final(segment)) = event {
+                finals.push(segment);
+            }
+        }
+        assert!(!finals.is_empty());
+        assert!(
+            finals
+                .iter()
+                .all(|s| s.start_ms >= 10_137 && s.provider == fotw_stt::local::PROVIDER)
+        );
+        assert_eq!(finals.last().unwrap().end_ms, 73_137);
+        drop(stream);
+        assert_eq!(
+            std::fs::read(fixture.dir.join("system.pcm")).unwrap(),
+            original_pcm
+        );
+        assert_eq!(
+            std::fs::read(fixture.dir.join("system.stt16")).unwrap(),
+            original_canonical
+        );
+        let snapshot =
+            CoverageJournal::snapshot(&fixture.dir, &fixture.session, Source::System).unwrap();
+        assert_eq!(snapshot.epochs.len(), 2);
+        assert_eq!(snapshot.epochs[1].from_sample, fixture.anchor + 10 * 16_000);
+        assert_eq!(snapshot.epochs[1].reason, Some(SwitchReason::ResumePending));
+        let mut db = fotw_store::Db::open(&database, &key).unwrap();
+        assert_eq!(
+            fotwd::persist::persist_session(&mut db, &fixture.outcome, "Ignored retry title")
+                .unwrap(),
+            meeting
+        );
+        let saved = db.export_meeting(&meeting).unwrap();
+        assert_eq!(
+            saved
+                .segments
+                .iter()
+                .filter(|s| s.id == "stable-original-prefix")
+                .count(),
+            1
+        );
+        assert_eq!(
+            saved
+                .segments
+                .iter()
+                .find(|s| s.id == "stable-original-prefix")
+                .unwrap()
+                .text,
+            "owned correction"
+        );
+        assert_eq!(saved.segments.len(), finals.len() + 1);
+        assert_eq!(saved.speech_epochs.len(), 2);
+        // Another recovery attempt has nothing to infer and adds no fake switch.
+        let (complete, _events) =
+            FailoverStream::resume_local(&fixture.dir, resume_request(&fixture))
+                .await
+                .unwrap();
+        assert!(complete.finish().await);
+        drop(complete);
+        assert_eq!(
+            fotwd::persist::persist_session(&mut db, &fixture.outcome, "Ignored retry").unwrap(),
+            meeting
+        );
+        assert_eq!(db.export_meeting(&meeting).unwrap(), saved);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_restart_refuses_changed_model_revision_or_language_and_retains_pending_input() {
+    struct WrongFactory(&'static str, Option<&'static str>);
+    impl RecognizerFactory for WrongFactory {
+        fn model(&self) -> &str {
+            self.0
+        }
+        fn language(&self) -> Option<&str> {
+            self.1
+        }
+        fn create(&self) -> Result<Box<dyn Recognizer>, SttError> {
+            panic!("mismatch must be refused before native allocation")
+        }
+    }
+    for mismatch in ["model", "revision", "language"] {
+        let fixture = pending_fixture(false);
+        let paths = [
+            fixture.dir.join("system.stt16"),
+            fixture.dir.join("system.stt-coverage.jsonl"),
+        ];
+        let before: Vec<_> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+        let mut request = resume_request(&fixture);
+        match mismatch {
+            "model" => request.local = Arc::new(WrongFactory("different-model", Some("en"))),
+            "revision" => request.revision = Some("different-checksum".into()),
+            "language" => request.local = Arc::new(WrongFactory("fixture-local", Some("fr"))),
+            _ => unreachable!(),
+        }
+        assert!(
+            FailoverStream::resume_local(&fixture.dir, request)
+                .await
+                .is_err()
+        );
+        for (path, bytes) in paths.iter().zip(before) {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+        assert!(!fixture.dir.join("system.stt-sealed.json").exists());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_restart_refuses_a_still_owned_source_and_unavailable_native_state() {
+    use fotw_pipeline::replay::{ReplaySource, ReplayWriter};
+    let fixture = pending_fixture(false);
+    let owner = ReplayWriter::resume(&fixture.dir, &fixture.session, ReplaySource::System).unwrap();
+    assert!(
+        FailoverStream::resume_local(&fixture.dir, resume_request(&fixture))
+            .await
+            .is_err()
+    );
+    drop(owner);
+    struct Unavailable;
+    impl RecognizerFactory for Unavailable {
+        fn model(&self) -> &str {
+            "fixture-local"
+        }
+        fn language(&self) -> Option<&str> {
+            Some("en")
+        }
+        fn create(&self) -> Result<Box<dyn Recognizer>, SttError> {
+            Err(SttError::new(
+                fotw_stt::SttErrorClass::Server,
+                "fixture",
+                "native model unavailable",
+            ))
+        }
+    }
+    let before = std::fs::read(fixture.dir.join("system.stt-coverage.jsonl")).unwrap();
+    let mut request = resume_request(&fixture);
+    request.local = Arc::new(Unavailable);
+    assert!(
+        FailoverStream::resume_local(&fixture.dir, request)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(fixture.dir.join("system.stt-coverage.jsonl")).unwrap(),
+        before
+    );
+    assert!(!fixture.dir.join("system.stt-complete.json").exists());
 }

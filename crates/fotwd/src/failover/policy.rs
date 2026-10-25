@@ -27,7 +27,7 @@ impl Default for HandoffLimits {
             retry_budget_ms: 15_000,
             speech_samples_without_final: 45 * 16_000,
             healthy_open_ms: 3_000,
-            rate_pressure_budget_ms: 30_000,
+            rate_pressure_budget_ms: 15_000,
         }
     }
 }
@@ -111,7 +111,7 @@ impl HandoffPolicy {
                 // would exceed this policy's budget, use local immediately.
                 if error
                     .retry_after_ms
-                    .is_some_and(|wait| wait > self.limits.rate_pressure_budget_ms)
+                    .is_some_and(|wait| wait > self.pressure_remaining(now_ms))
                 {
                     self.decision = Decision::Switch(SwitchReason::RateLimitBudget);
                 }
@@ -166,21 +166,42 @@ impl HandoffPolicy {
         {
             self.recovered();
         }
-        if self
+        let transport_expired = self
             .transport_since
-            .is_some_and(|start| now_ms.saturating_sub(start) >= self.limits.retry_budget_ms)
-        {
-            self.decision = Decision::Switch(SwitchReason::TransportBudget);
-        } else if self.pressure_since.is_some_and(|start| {
-            now_ms.saturating_sub(start) >= self.limits.rate_pressure_budget_ms
-        }) {
+            .is_some_and(|start| now_ms.saturating_sub(start) >= self.limits.retry_budget_ms);
+        let pressure_expired = self.pressure_since.is_some_and(|start| {
+            now_ms.saturating_sub(start)
+                >= self
+                    .limits
+                    .rate_pressure_budget_ms
+                    .min(self.limits.retry_budget_ms)
+        });
+        if self.pressure_since.is_some() && (pressure_expired || transport_expired) {
             self.decision = Decision::Switch(SwitchReason::RateLimitBudget);
+        } else if transport_expired {
+            self.decision = Decision::Switch(SwitchReason::TransportBudget);
         } else if voiced_samples.saturating_sub(self.speech_at_final)
             >= self.limits.speech_samples_without_final
         {
             self.decision = Decision::Switch(SwitchReason::SpeechStall);
         }
         self.decision
+    }
+
+    fn pressure_remaining(&self, now_ms: u64) -> u64 {
+        let budget = self
+            .limits
+            .rate_pressure_budget_ms
+            .min(self.limits.retry_budget_ms);
+        let pressure = budget.saturating_sub(
+            self.pressure_since
+                .map_or(0, |start| now_ms.saturating_sub(start)),
+        );
+        let transport = self.limits.retry_budget_ms.saturating_sub(
+            self.transport_since
+                .map_or(0, |start| now_ms.saturating_sub(start)),
+        );
+        pressure.min(transport)
     }
 
     fn recovered(&mut self) {
