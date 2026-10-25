@@ -27,7 +27,9 @@ language, capabilities and endpoint configuration before cloud opens. It syncs
 audio before a bounded transcript receipt and syncs that receipt before publishing
 its finals. Coverage is contiguous and source-specific on the original absolute
 sample clock. Provider epochs fence stale results; identical words on different
-sources are not duplicates.
+sources are not duplicates. If a reconnect would replay only a clipped provider
+ring, the opted-in transport stops before sending that tail. A final for clipped
+audio cannot acknowledge the evicted prefix; local disk replay recovers it.
 
 Default policy demotes immediately on authentication/quota failures, or after
 three failed reconnect cycles or a 15-second retry episode. Rate/concurrency

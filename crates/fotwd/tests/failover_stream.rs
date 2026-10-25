@@ -1079,3 +1079,88 @@ async fn local_restart_refuses_a_still_owned_source_and_unavailable_native_state
     );
     assert!(!fixture.dir.join("system.stt-complete.json").exists());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn truncated_provider_replay_cannot_acknowledge_an_untranscribed_prefix() {
+    use futures_util::{SinkExt, StreamExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+        let mut received = 0;
+        while received < 3 * 16_000 * 2 {
+            match socket.next().await {
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(bytes))) => {
+                    received += bytes.len()
+                }
+                Some(Ok(_)) => {}
+                other => panic!("fixture closed before all canonical input was sent: {other:?}"),
+            }
+        }
+        drop(socket); // no provider-confirmed final before the reconnect
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+        // A correct durable transport refuses this clipped replay before sending
+        // it. The old transport sends only the final second, then publishes a
+        // final that incorrectly certifies the missing first two seconds too.
+        if let Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(_))) = socket.next().await {
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::text(
+                    serde_json::json!({
+                        "type":"Results","channel_index":[0,1],"start":0.0,"duration":1.0,
+                        "is_final":true,"speech_final":true,"channel":{"alternatives":[{
+                            "transcript":"only the clipped tail","confidence":0.9,"words":[]
+                        }]}
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+        }
+    });
+    let mut cloud = DeepgramStreamConfig::new(
+        "fixture-not-a-key",
+        fotw_stt::deepgram::DeepgramConfig::new("s", Source::System),
+    )
+    .with_endpoint(DeepgramEndpoint::loopback(port))
+    .with_backoff(fotw_stt::BackoffPolicy::fast());
+    cloud.replay_window_ms = 1_000;
+    let dir = tempfile::tempdir().unwrap();
+    let (stream, mut events) =
+        FailoverStream::open(dir.path(), FailoverConfig::new(cloud, Arc::new(Factory)))
+            .await
+            .unwrap();
+    wait_open(&mut events).await;
+    let pcm: Vec<i16> = (0u32..3 * 16_000)
+        .map(|n| {
+            if (n / 3_200).is_multiple_of(2) {
+                1000
+            } else {
+                8000
+            }
+        })
+        .collect();
+    stream.write(&pcm).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stream.finish().await, "{:?}", stream.status());
+    let mut finals = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let Event::Transcript(StreamEvent::Final(segment)) = event {
+            finals.push(segment);
+        }
+    }
+    assert!(!finals.is_empty());
+    assert!(
+        finals
+            .iter()
+            .all(|segment| segment.provider == fotw_stt::local::PROVIDER),
+        "clipped cloud replay was treated as complete coverage: {finals:?}"
+    );
+    assert_eq!(finals[0].start_ms, 0);
+    assert_eq!(finals.last().unwrap().end_ms, 3_000);
+    assert_eq!(stream.status().committed_sample, pcm.len() as u64);
+}

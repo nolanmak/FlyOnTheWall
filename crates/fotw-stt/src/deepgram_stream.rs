@@ -493,6 +493,22 @@ impl Driver {
             // its prefix would remove words that have never been committed.
             self.dedupe_armed = !self.config.confirmed_finals_only;
             if replay.lost_audio() {
+                if self.config.confirmed_finals_only {
+                    // A final from clipped replay cannot acknowledge the evicted
+                    // prefix. Stop before sending it; the durable controller
+                    // recovers the entire pending interval from canonical audio.
+                    return Outcome::Failed(
+                        SttError::new(
+                            SttErrorClass::Network,
+                            PROVIDER,
+                            "cloud replay cannot cover all pending audio",
+                        )
+                        .not_retryable(format!(
+                            "{} ms were evicted; durable source replay is required",
+                            replay.truncated_ms,
+                        )),
+                    );
+                }
                 self.emit(StreamEvent::Error(
                     SttError::new(
                         SttErrorClass::Network,
