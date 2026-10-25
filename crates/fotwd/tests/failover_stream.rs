@@ -11,6 +11,25 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct Factory;
 struct Model;
+struct ReadyOnceFactory(std::sync::atomic::AtomicBool);
+impl RecognizerFactory for ReadyOnceFactory {
+    fn model(&self) -> &str {
+        "fixture-local"
+    }
+    fn language(&self) -> Option<&str> {
+        Some("en")
+    }
+    fn create(&self) -> Result<Box<dyn Recognizer>, SttError> {
+        if self.0.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return Err(SttError::new(
+                fotw_stt::SttErrorClass::Server,
+                "fixture",
+                "another native state cannot be allocated",
+            ));
+        }
+        Ok(Box::new(Model))
+    }
+}
 impl RecognizerFactory for Factory {
     fn model(&self) -> &str {
         "fixture-local"
@@ -59,7 +78,10 @@ async fn auth_handoff_replays_more_than_thirty_seconds_and_preserves_the_session
     )
     .with_endpoint(DeepgramEndpoint::loopback(port))
     .with_session_offset_ms(137);
-    let mut config = FailoverConfig::new(cloud, Arc::new(Factory));
+    let mut config = FailoverConfig::new(
+        cloud,
+        Arc::new(ReadyOnceFactory(std::sync::atomic::AtomicBool::new(false))),
+    );
     config.limits.speech_samples_without_final = 90 * 16_000;
     let dir = tempfile::tempdir().unwrap();
     let (stream, mut events) = FailoverStream::open(dir.path(), config).await.unwrap();
@@ -345,6 +367,124 @@ async fn a_full_minute_of_silence_stays_on_cloud_and_stop_accounts_for_the_quiet
             _ => {}
         }
     }
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+/// Opt-in installed-model smoke. Only the checksum-verified public JFK fixture
+/// is accepted; this never opens a capture device or a paid provider connection.
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires cached public small.en weights and checksum-verified JFK WAV"]
+async fn installed_whisper_recovers_a_public_clip_after_reconnect_budget_exhaustion() {
+    use sha2::{Digest, Sha256};
+    let model = std::path::PathBuf::from(
+        std::env::var_os("FOTW_NATIVE_HANDOFF_MODEL").expect("set FOTW_NATIVE_HANDOFF_MODEL"),
+    );
+    let wav = std::path::PathBuf::from(
+        std::env::var_os("FOTW_NATIVE_HANDOFF_WAV").expect("set FOTW_NATIVE_HANDOFF_WAV"),
+    );
+    let checked_model = model.clone();
+    tokio::task::spawn_blocking(move || {
+        let known = fotwd::stt::verify_model(&checked_model)
+            .unwrap()
+            .expect("only published known weights are allowed");
+        assert_eq!(known.name, "small.en");
+    })
+    .await
+    .unwrap();
+    let bytes = std::fs::read(wav).unwrap();
+    assert_eq!(
+        Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        "59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e",
+        "this smoke accepts only the public JFK fixture, never user audio"
+    );
+    let mut offset = 12;
+    let pcm = loop {
+        let length = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        let start = offset + 8;
+        if &bytes[offset..offset + 4] == b"data" {
+            break bytes[start..start + length]
+                .chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]))
+                .collect::<Vec<_>>();
+        }
+        offset = start + length + length % 2;
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        for _ in 0..4 {
+            // initial failure plus three failed reconnect cycles.
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0; 1];
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 8_192);
+            }
+            socket
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        }
+    });
+    let cloud = DeepgramStreamConfig::new(
+        "fixture-not-a-key",
+        fotw_stt::deepgram::DeepgramConfig::new("s", Source::System),
+    )
+    .with_endpoint(DeepgramEndpoint::loopback(port))
+    .with_backoff(fotw_stt::BackoffPolicy::fast());
+    let engine = Arc::new(fotw_stt::WhisperEngine::new(model, Some("en".into())));
+    let mut config = FailoverConfig::new(cloud, engine);
+    config.local_revision =
+        Some("sha256:c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d".into());
+    let dir = tempfile::tempdir().unwrap();
+    let began = std::time::Instant::now();
+    let (stream, mut events) = FailoverStream::open(dir.path(), config).await.unwrap();
+    stream.write(&pcm).unwrap();
+    let mut finals = Vec::new();
+    let epoch = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match events.recv().await.unwrap() {
+                Event::ProviderSwitch(epoch) => break epoch,
+                Event::Transcript(StreamEvent::Final(segment)) => finals.push(segment),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(epoch.reason, Some(SwitchReason::TransportBudget));
+    assert!(stream.finish().await, "{:?}", stream.status());
+    while let Ok(event) = events.try_recv() {
+        if let Event::Transcript(StreamEvent::Final(segment)) = event {
+            finals.push(segment);
+        }
+    }
+    let transcript = finals
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        transcript.to_ascii_lowercase().contains("country"),
+        "{transcript}"
+    );
+    assert_eq!(stream.status().committed_sample, pcm.len() as u64);
+    assert_eq!(stream.status().lag_samples, 0);
+    eprintln!(
+        "{}",
+        serde_json::json!({"fixture":"public-jfk-sha256-verified", "elapsed_ms":began.elapsed().as_millis(),
+        "reason":epoch.reason, "model":epoch.engine.model, "revision":epoch.engine.revision,
+        "samples":pcm.len(), "transcript":transcript})
+    );
     tokio::time::timeout(Duration::from_secs(5), server)
         .await
         .unwrap()

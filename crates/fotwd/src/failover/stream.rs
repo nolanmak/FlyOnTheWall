@@ -228,15 +228,17 @@ impl FailoverStream {
         };
         let directory = dir.to_owned();
         let local = Arc::clone(&config.local);
-        let (writer, journal, reader) = tokio::task::spawn_blocking(move || {
-            drop(local.create()?); // load real weights/state before any cloud socket.
+        let (writer, journal, reader, recognizer) = tokio::task::spawn_blocking(move || {
+            // Keep the prepared state ready; a second allocation during an
+            // outage might fail even though admission had succeeded.
+            let recognizer = local.create()?;
             let writer = ReplayWriter::create(&directory, &session_id, source(leg), anchor)
                 .map_err(|e| failure(e.to_string()))?;
             let journal = CoverageJournal::create(&directory, &session_id, leg, initial)
                 .map_err(|e| failure(e.to_string()))?;
             let reader = ReplayReader::open(&directory, &session_id, source(leg))
                 .map_err(|e| failure(e.to_string()))?;
-            Ok::<_, SttError>((writer, journal, reader))
+            Ok::<_, SttError>((writer, journal, reader, recognizer))
         })
         .await
         .map_err(|e| failure(e.to_string()))??;
@@ -281,7 +283,7 @@ impl FailoverStream {
                     policy: HandoffPolicy::new(config.limits),
                     vad: Endpointer::new(config.endpoint),
                     local_endpoint: None,
-                    recognizer: None,
+                    recognizer: Some(recognizer),
                     cloud: Some(cloud),
                     cloud_events: Some(cloud_events),
                     cloud_cursor: anchor,
@@ -626,7 +628,6 @@ impl Worker {
             let _ = self.shared.events.send(Event::ProviderSwitch(epoch));
         }
         drop(gate);
-        self.recognizer = Some(self.config.local.create()?);
         if self.shared.fenced() {
             return Err(failure("late native initialization fenced"));
         }
