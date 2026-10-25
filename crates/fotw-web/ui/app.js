@@ -2020,6 +2020,8 @@ async function main() {
     if (el.ghSettings.open) loadGithubRepos();
   });
   await loadSpeech();
+  const modelSetup = document.getElementById("model-setup-mount");
+  if (modelSetup && typeof FOTWModels !== "undefined") FOTWModels.mount(modelSetup, api);
   await loadMeetings();
   await loadNoteDraftControl();
   await loadGithub();

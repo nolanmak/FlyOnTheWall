@@ -228,6 +228,9 @@ fn routes(state: AppState) -> Router {
             get(api::github_settings).post(api::github_set_settings),
         )
         .route("/api/settings/github/repos", get(api::github_repos))
+        .route("/api/models", get(crate::model_setup::read))
+        .route("/api/models/install", post(crate::model_setup::start))
+        .route("/api/models/cancel", post(crate::model_setup::cancel))
         .route(
             "/api/settings/speech",
             get(crate::speech::get).post(crate::speech::post),

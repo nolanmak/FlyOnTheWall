@@ -1079,3 +1079,29 @@ mod alias_tests {
         assert!(WorkLease::capture(&alias.join("custom-sessions")).is_ok());
     }
 }
+
+// Exercise dashboard ownership against the real installer using tiny synthetic
+// catalog bytes, without downloading or requiring model weights in CI.
+#[cfg(test)]
+pub(crate) fn install_dashboard_fixture(
+    root: &Path,
+    control: &Control,
+    source: Box<dyn Read + Send>,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<PathBuf, String> {
+    let artifact = Artifact {
+        name: "fixture".into(),
+        revision: "0".repeat(40),
+        sha256: digest(Sha256::new_with_prefix(b"fixture model")),
+        bytes: 13,
+        license: "MIT".into(),
+    };
+    install_with_progress(
+        root,
+        &artifact,
+        control,
+        |_| Ok(u64::MAX),
+        || Ok(source),
+        progress,
+    )
+}
