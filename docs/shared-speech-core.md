@@ -29,13 +29,17 @@ The producer runs these contracts in its own tests as well.
 
 ## Compatibility and upgrade policy
 
-`.github/workflows/murmur-compatibility.yml` checks immutable Murmur migration
-commit `85df901f00a5d68e55466f0717cf68694373b48b` on macOS and Linux. It replaces
+`.github/workflows/murmur-compatibility.yml` checks immutable Murmur consumer
+commit `0cb5d7e5968ffd4a016833c7c13fe3e90147c22d` (Murmur #82) on macOS and Linux. It replaces
 that consumer's four Git dependencies with the exact producer crates under
 review and runs its workspace tests. Cargo may update source entries in this
 disposable checkout; ordinary consumer builds retain their committed lockfile.
-This is a pinned migration consumer, not a claim that Murmur main has already
-removed its vendor snapshot or that every later consumer revision is compatible.
+This consumer includes the successful-Stop route-notification fix, alongside
+its removed vendor snapshot, native
+readiness/cleanup ownership, whole-utterance fallback, vocabulary and opt-in text
+cleanup. Both its Deepgram CloseStream/Metadata drain and external local helper
+remain application-owned. Future consumer revisions require another deliberate
+pin update; passing this job is evidence for this exact consumer only.
 
 For a consumer upgrade, review a full producer commit SHA, update dependency
 and dev-dependency pins together with Cargo.lock, and run both repositories'
@@ -44,9 +48,13 @@ a moving branch as the dependency version. Advance the compatibility consumer
 pin deliberately as migrations ship. Preserve both repositories' Apache-2.0
 LICENSE/NOTICE files.
 
-Complete capability negotiation, consumer vendor removal and newer
-consumer coverage remain tracked in #119. Shared source does not share loaded
-model memory: a shared inference worker remains separate #120 work, conditional
+Provider capabilities are explicit in `fotw-stt::SttCapabilities` (streaming,
+batch, timestamps, vocabulary, diarization and language detection), with runtime
+language validation in the Whisper adapter. Murmur now consumes these contracts
+without keeping vendored copies. Its ordinary locked CI checks the producer pin
+in its manifest; this workflow checks the producer under review against the
+current pinned consumer, including the consumer-owned transport regressions.
+Shared source does not share loaded model memory: a shared inference worker remains separate #120 work, conditional
 on measured contention.
 
 ## Shared PCM processing
@@ -71,8 +79,10 @@ English-only model accepts English and resolves automatic selection to English;
 other explicit languages produce a non-retryable Unsupported error. The local
 setup command loads and validates the selected model/language before saving the
 configuration. Session workers repeat validation when creating a recognizer.
-This does not yet implement a full pre-capture readiness gate for every meeting
-entry point, or the shared language/capability UI.
+Meeting entry points now prepare native model states before capture or provider
+connection, and the dashboard shows model/language and live/saved source
+capabilities. Preparation timeout retains ownership until actual cleanup.
+Physical-device and paired model-quality acceptance remain separate release gates.
 
 Validation: the new normalization/capability test failed before implementation;
 local adapter unit tests and settings regressions pass after the change. The
