@@ -575,10 +575,13 @@ impl SavedSpeechRecovery {
         if sources.is_empty() && clock_is_final {
             return Err(RecoveryError::NotFound);
         }
-        if !clock_is_final && status.can_retry {
-            if let Some(message) = status.message.as_mut() {
-                message.push_str(" Available saved speech can be recovered locally; other audio remains pending.");
-            }
+        if !clock_is_final
+            && status.can_retry
+            && let Some(message) = status.message.as_mut()
+        {
+            message.push_str(
+                " Available saved speech can be recovered locally; other audio remains pending.",
+            );
         }
         if !clock_is_final
             && !status.can_retry
