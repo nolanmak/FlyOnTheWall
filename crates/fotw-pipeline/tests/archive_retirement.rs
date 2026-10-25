@@ -52,7 +52,7 @@ fn an_io_error_reading_the_second_track_preserves_both_previous_archives_and_man
     let permissions = std::fs::metadata(dir.join("mic.pcm"))
         .unwrap()
         .permissions();
-    std::fs::set_permissions(dir.join("mic.pcm"), std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(dir.join("mic.pcm"), std::fs::Permissions::from_mode(0o000)).unwrap();
     assert_eq!(
         std::fs::File::open(dir.join("mic.pcm")).unwrap_err().kind(),
         std::io::ErrorKind::PermissionDenied
