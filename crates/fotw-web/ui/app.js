@@ -1013,7 +1013,7 @@ function renderRecording(body) {
       (recState === "preparing" ? "Preparation: "
         : recState === "starting" ? "Capture setup: "
         : recState === "finishing" ? "Transcription failed during this meeting: "
-        : Array.isArray(body.speech_status) && body.speech_status.length ? "Recording notice: "
+        : Array.isArray(body.speech_status) && body.speech_status.some((status) => status.epoch !== null && status.epoch !== undefined) ? "Recording notice: "
         : "Recording, but transcription is failing: ") + body.transcription_error,
     );
   }
@@ -1057,7 +1057,7 @@ function renderSpeechHealth(body) {
       speechRows.set(source.source, entry); el.speechHealth.appendChild(row);
     }
     const label = source.source === "system" ? "System audio" : "Microphone";
-    const provider = ({deepgram: "Deepgram", "local-whisper": "Whisper", "whisper.cpp": "Whisper"})[source.provider] || String(source.provider || "Unknown provider");
+    const provider = ({deepgram: "Deepgram", whispercpp: "Whisper", "local-whisper": "Whisper", "whisper.cpp": "Whisper"})[source.provider] || String(source.provider || "Unknown provider");
     const heading = label + " · " + provider + " / " + String(source.model || "Unknown model");
     if (entry.heading.textContent !== heading) entry.heading.textContent = heading;
     const parts = [states[source.state] || "Status unavailable"];

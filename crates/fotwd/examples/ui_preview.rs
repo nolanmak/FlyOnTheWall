@@ -415,7 +415,7 @@ impl fotw_web::RecorderControl for SpeechPreview {
         };
         let mut mic = system.clone();
         mic.source = CaptureSource::Mic;
-        mic.provider = "local-whisper".into();
+        mic.provider = fotw_stt::local::PROVIDER.into();
         mic.model = "fixture-small.en".into();
         mic.state = SpeechState::Local;
         mic.epoch = Some(1);
@@ -424,7 +424,7 @@ impl fotw_web::RecorderControl for SpeechPreview {
         mic.word_timestamps_supported = Some(false);
         mic.diarization_supported = Some(false);
         let status = if let Some((at, _)) = ended {
-            system.provider = "local-whisper".into();
+            system.provider = fotw_stt::local::PROVIDER.into();
             system.model = "fixture-small.en".into();
             system.state = SpeechState::Incomplete;
             system.epoch = Some(1);

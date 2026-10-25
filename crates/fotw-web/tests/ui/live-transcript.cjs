@@ -343,14 +343,14 @@ test('live source status follows the actual fallback engine, original clock and 
  h.ctx.renderRecording({state:'recording',session_id:'engine-A',started_at_ms:1000,speech_status:[speechStatus()]});
  const panel=h.nodes.get('speech-health');assert.equal(panel.hidden,false);
  assert.match(panel.textContent,/System audio.*deepgram.*nova-3/i);assert.match(panel.textContent,/3.2s.*pending/i);
- h.ctx.renderRecording({state:'recording',session_id:'engine-A',started_at_ms:1000,speech_status:[speechStatus({provider:'local-whisper',model:'small.en',state:'local',epoch:1,from_ms:17000,switch_reason:'transport_budget',word_timestamps_supported:false,diarization_supported:false})]});
+ h.ctx.renderRecording({state:'recording',session_id:'engine-A',started_at_ms:1000,speech_status:[speechStatus({provider:'whispercpp',model:'small.en',state:'local',epoch:1,from_ms:17000,switch_reason:'transport_budget',word_timestamps_supported:false,diarization_supported:false})]});
  assert.match(panel.textContent,/small.en/);assert.doesNotMatch(panel.textContent,/nova-3/);
  assert.match(panel.textContent,/network retry budget/i);assert.match(panel.textContent,/audio.*17/);
  assert.match(panel.textContent,/no remote speaker labels/i);
 });
 test('incomplete native work remains visible after Stop and disappears on Idle',()=>{
  const h=harness();h.ctx.refreshLibrary=()=>{};
- h.ctx.renderRecording({state:'finishing',session_id:'engine-A',started_at_ms:1000,ended_at_ms:41000,elapsed_ms:40000,speech_status:[speechStatus({provider:'local-whisper',model:'small.en',state:'incomplete',worker_running:true,error:'inference timed out'})]});
+ h.ctx.renderRecording({state:'finishing',session_id:'engine-A',started_at_ms:1000,ended_at_ms:41000,elapsed_ms:40000,speech_status:[speechStatus({provider:'whispercpp',model:'small.en',state:'incomplete',worker_running:true,error:'inference timed out'})]});
  const panel=h.nodes.get('speech-health');assert.equal(panel.hidden,false);assert.match(panel.textContent,/incomplete/i);assert.match(panel.textContent,/Start waits for cleanup/i);
  h.ctx.renderRecording({state:'idle',speech_status:[speechStatus()]});assert.equal(panel.hidden,true);assert.equal(panel.textContent,'');
 });
@@ -369,4 +369,16 @@ test('source details stay expanded and focused controls are preserved across sta
  h.ctx.renderRecording({...body,speech_status:[speechStatus({pending_audio_ms:700})]});
  const updated=h.all(h.nodes.get('speech-health')).find(node=>node.tagName==='details');
  assert.equal(updated,details);assert.equal(updated.open,true);
+});
+
+test('the actual whisper.cpp provider ID renders the friendly engine name',()=>{
+ const h=harness();h.ctx.renderRecording({state:'recording',session_id:'real-provider',started_at_ms:1000,speech_status:[speechStatus({provider:'whispercpp',model:'small.en',state:'local'})]});
+ const panel=h.nodes.get('speech-health');assert.match(panel.textContent,/Whisper \/ small.en/);assert.doesNotMatch(panel.textContent,/whispercpp/);
+});
+test('legacy failures retain their warning while a durable epoch zero uses a recovery notice',()=>{
+ const h=harness();const base={state:'recording',session_id:'errors',started_at_ms:1000,transcription_error:'The API key was rejected'};
+ h.ctx.renderRecording({...base,speech_status:[speechStatus({epoch:null,from_ms:null,pending_audio_ms:null,state:'closed',worker_running:null})]});
+ assert.match(h.nodes.get('status').textContent,/Recording, but transcription is failing:/);
+ h.ctx.renderRecording({...base,speech_status:[speechStatus({epoch:0})]});
+ assert.match(h.nodes.get('status').textContent,/^Recording notice:/);
 });
