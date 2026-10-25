@@ -261,6 +261,16 @@ async fn main() -> Result<(), String> {
                 Arc::new(RecoveryPreview::new()) as Arc<dyn fotw_web::recorder::RecorderControl>
             })
     });
+    let recorder = recorder.or_else(|| {
+        std::env::args()
+            .any(|arg| arg == "--speech-status")
+            .then(|| {
+                Arc::new(SpeechPreview {
+                    started: (fotw_store::now_ms() as u64).saturating_sub(40_000),
+                    ended: std::sync::Mutex::new(None),
+                }) as Arc<dyn fotw_web::RecorderControl>
+            })
+    });
     let server = fotw_web::WebServer::bind_with_recorder(0, source, recorder)
         .await
         .map_err(|e| format!("bind: {e}"))?;
@@ -363,5 +373,77 @@ impl fotw_web::RecorderControl for RecoveryPreview {
                 retry_in_ms: None,
             },
         }))
+    }
+}
+
+/// Synthetic speech-status states only: no capture, model or provider is opened.
+struct SpeechPreview {
+    started: u64,
+    ended: std::sync::Mutex<Option<(u64, std::time::Instant)>>,
+}
+impl fotw_web::RecorderControl for SpeechPreview {
+    fn start(&self) -> Result<fotw_web::RecordingStatus, fotw_web::RecorderError> {
+        Err(fotw_web::RecorderError::AlreadyRecording)
+    }
+    fn stop(&self) -> Result<fotw_web::RecordingStatus, fotw_web::RecorderError> {
+        self.ended
+            .lock()
+            .unwrap()
+            .get_or_insert((fotw_store::now_ms() as u64, std::time::Instant::now()));
+        Ok(self.status())
+    }
+    fn status(&self) -> fotw_web::RecordingStatus {
+        use fotw_web::recorder::{CaptureSource, RecordingStatus, SpeechSourceStatus, SpeechState};
+        let ended = *self.ended.lock().unwrap();
+        if ended.is_some_and(|(_, at)| at.elapsed() >= std::time::Duration::from_secs(8)) {
+            return RecordingStatus::idle();
+        }
+        let mut system = SpeechSourceStatus {
+            source: CaptureSource::System,
+            provider: "deepgram".into(),
+            model: "nova-3".into(),
+            revision: None,
+            state: SpeechState::Cloud,
+            epoch: Some(0),
+            from_ms: Some(0),
+            switch_reason: None,
+            pending_audio_ms: Some(3200),
+            word_timestamps_supported: Some(true),
+            diarization_supported: Some(true),
+            worker_running: Some(true),
+            error: None,
+        };
+        let mut mic = system.clone();
+        mic.source = CaptureSource::Mic;
+        mic.provider = "local-whisper".into();
+        mic.model = "fixture-small.en".into();
+        mic.state = SpeechState::Local;
+        mic.epoch = Some(1);
+        mic.switch_reason = Some("auth".into());
+        mic.pending_audio_ms = Some(0);
+        mic.word_timestamps_supported = Some(false);
+        mic.diarization_supported = Some(false);
+        let status = if let Some((at, _)) = ended {
+            system.provider = "local-whisper".into();
+            system.model = "fixture-small.en".into();
+            system.state = SpeechState::Incomplete;
+            system.epoch = Some(1);
+            system.from_ms = Some(17_000);
+            system.switch_reason = Some("transport_budget".into());
+            system.word_timestamps_supported = Some(false);
+            system.diarization_supported = Some(false);
+            system.error = Some("Synthetic fixture: native cleanup still outstanding".into());
+            mic.state = SpeechState::Complete;
+            mic.worker_running = Some(false);
+            RecordingStatus::finishing(self.started, at)
+        } else {
+            RecordingStatus::recording(
+                self.started,
+                (fotw_store::now_ms() as u64).saturating_sub(self.started),
+            )
+        };
+        status
+            .with_session_id(Some("synthetic-speech-status".into()))
+            .with_speech_status(vec![system, mic])
     }
 }

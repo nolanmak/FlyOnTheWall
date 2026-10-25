@@ -16,7 +16,7 @@ function harness(notes) {
     addEventListener(k,f){this.listeners[k]=f;} setAttribute(k,v){this[k]=v;}
   }
   const root=new Element('body');
-  const nodes=new Map(['list','detail','status','record','live','elapsed','consent','consent-label','recording','recording-limit','return-live','capture-health'].map(id=>{let n=root.appendChild(new Element('div'));n.id=id;return [id,n];}));
+  const nodes=new Map(['list','detail','status','record','live','elapsed','consent','consent-label','recording','recording-limit','return-live','capture-health','speech-health'].map(id=>{let n=root.appendChild(new Element('div'));n.id=id;return [id,n];}));
   const all=(n=root)=>[n,...n.children.flatMap(all)];
   const document={createElement:t=>new Element(t),getElementById:id=>all().find(n=>n.id===id)||null};
   const ctx=vm.createContext({FOTWNotes:notes,document,Date,Intl,Set,Map,URLSearchParams,window:{location:{search:''}},localStorage:{getItem:()=>null},setInterval:()=>1,clearInterval(){},setTimeout(){},XMLSerializer:class {serializeToString(n){return n.textContent;}}});
@@ -335,4 +335,38 @@ test('setup diagnostics never claim a recording or transcription failure before 
  h.ctx.renderRecording({state:'preparing',transcription_error:'Model unavailable'});
  assert.match(h.nodes.get('status').textContent,/^Preparation:/);
  assert.doesNotMatch(h.nodes.get('status').textContent,/Recording, but/);
+});
+
+const speechStatus=(overrides={})=>({source:'system',provider:'deepgram',model:'nova-3',revision:null,state:'cloud',epoch:0,from_ms:0,switch_reason:null,pending_audio_ms:3200,word_timestamps_supported:true,diarization_supported:true,worker_running:true,error:null,...overrides});
+test('live source status follows the actual fallback engine, original clock and pending coverage',()=>{
+ const h=harness();
+ h.ctx.renderRecording({state:'recording',session_id:'engine-A',started_at_ms:1000,speech_status:[speechStatus()]});
+ const panel=h.nodes.get('speech-health');assert.equal(panel.hidden,false);
+ assert.match(panel.textContent,/System audio.*deepgram.*nova-3/i);assert.match(panel.textContent,/3.2s.*pending/i);
+ h.ctx.renderRecording({state:'recording',session_id:'engine-A',started_at_ms:1000,speech_status:[speechStatus({provider:'local-whisper',model:'small.en',state:'local',epoch:1,from_ms:17000,switch_reason:'transport_budget',word_timestamps_supported:false,diarization_supported:false})]});
+ assert.match(panel.textContent,/small.en/);assert.doesNotMatch(panel.textContent,/nova-3/);
+ assert.match(panel.textContent,/network retry budget/i);assert.match(panel.textContent,/audio.*17/);
+ assert.match(panel.textContent,/no remote speaker labels/i);
+});
+test('incomplete native work remains visible after Stop and disappears on Idle',()=>{
+ const h=harness();h.ctx.refreshLibrary=()=>{};
+ h.ctx.renderRecording({state:'finishing',session_id:'engine-A',started_at_ms:1000,ended_at_ms:41000,elapsed_ms:40000,speech_status:[speechStatus({provider:'local-whisper',model:'small.en',state:'incomplete',worker_running:true,error:'inference timed out'})]});
+ const panel=h.nodes.get('speech-health');assert.equal(panel.hidden,false);assert.match(panel.textContent,/incomplete/i);assert.match(panel.textContent,/Start waits for cleanup/i);
+ h.ctx.renderRecording({state:'idle',speech_status:[speechStatus()]});assert.equal(panel.hidden,true);assert.equal(panel.textContent,'');
+});
+test('legacy unknown coverage never renders as zero pending or confirmed complete, and model text is inert',()=>{
+ const h=harness();h.ctx.renderRecording({state:'recording',session_id:'legacy',started_at_ms:1000,speech_status:[speechStatus({model:'<img src=x>',state:'closed',pending_audio_ms:null,epoch:null,from_ms:null,worker_running:null})]});
+ const panel=h.nodes.get('speech-health');assert.match(panel.textContent,/coverage.*not measured/i);assert.doesNotMatch(panel.textContent,/0s.*pending|transcription complete/i);
+ assert.match(panel.textContent,/<img src=x>/);assert.ok(h.all(panel).every(node=>node.tagName!=='img'));
+});
+
+test('source details stay expanded and focused controls are preserved across status polls',()=>{
+ const h=harness();
+ const body={state:'recording',session_id:'engine-A',started_at_ms:1000,speech_status:[speechStatus()]};
+ h.ctx.renderRecording(body);
+ const details=h.all(h.nodes.get('speech-health')).find(node=>node.tagName==='details');
+ details.open=true;
+ h.ctx.renderRecording({...body,speech_status:[speechStatus({pending_audio_ms:700})]});
+ const updated=h.all(h.nodes.get('speech-health')).find(node=>node.tagName==='details');
+ assert.equal(updated,details);assert.equal(updated.open,true);
 });

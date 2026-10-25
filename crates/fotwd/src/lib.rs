@@ -182,3 +182,6 @@ pub mod capture_health;
 
 /// Dashboard transcription settings.
 pub mod speech_control;
+
+/// Content-free live transcription provenance.
+pub mod speech_status;

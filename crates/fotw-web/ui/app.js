@@ -40,6 +40,7 @@ const el = {
   recording: document.getElementById("recording"),
   recordingLimit: document.getElementById("recording-limit"),
   captureHealth: document.getElementById("capture-health"),
+  speechHealth: document.getElementById("speech-health"),
   ghSettings: document.getElementById("gh-settings"),
   ghRepo: document.getElementById("gh-repo"),
   ghBranch: document.getElementById("gh-branch"),
@@ -932,6 +933,7 @@ function renderRecording(body) {
     ["preparing", "starting", "recording", "finishing"].includes(body.state) ? body.state : "idle";
   preparationCancelRequested = (recState === "preparing" || recState === "starting") && Boolean(body.preparation_cancel_requested);
   renderCaptureHealth(body);
+  renderSpeechHealth(body);
   mountLiveNotes();
   paintLiveNavigation();
   adoptSavedLive();
@@ -1011,9 +1013,78 @@ function renderRecording(body) {
       (recState === "preparing" ? "Preparation: "
         : recState === "starting" ? "Capture setup: "
         : recState === "finishing" ? "Transcription failed during this meeting: "
+        : Array.isArray(body.speech_status) && body.speech_status.length ? "Recording notice: "
         : "Recording, but transcription is failing: ") + body.transcription_error,
     );
   }
+}
+
+// Actual streams, independent of the preference saved for the next recording.
+const speechRows = new Map();
+let speechSession = null;
+function renderSpeechHealth(body) {
+  if (!el.speechHealth) return;
+  const sources = Array.isArray(body.speech_status) ? body.speech_status : [];
+  if (recState === "idle" || !sources.length) {
+    clear(el.speechHealth); speechRows.clear(); speechSession = null;
+    el.speechHealth.hidden = true;
+    return;
+  }
+  if (speechSession !== (body.session_id || null)) {
+    clear(el.speechHealth); speechRows.clear(); speechSession = body.session_id || null;
+  }
+  const states = {cloud: "Cloud stream selected", local: "Local transcription", connecting: "Connecting", open: "Stream open", reconnecting: "Reconnecting", closed: "Stream closed", complete: "Transcription complete", incomplete: "Transcription incomplete — audio retained"};
+  const reasons = {auth: "credentials refused", quota: "quota exhausted", transport_budget: "network retry budget exhausted", rate_limit_budget: "provider retry budget exhausted", speech_stall: "no final during speech", manual: "manual engine change", resume_pending: "resumed saved audio", finishing_tail: "finishing unconfirmed audio locally"};
+  const seen = new Set();
+  for (const source of sources) {
+    if (!["system", "mic"].includes(source.source) || seen.has(source.source)) continue;
+    seen.add(source.source);
+    let entry = speechRows.get(source.source);
+    if (!entry) {
+      const row = text("article", "", "speech-source");
+      const heading = text("strong", "", "speech-engine");
+      heading.id = "speech-source-" + source.source;
+      row.setAttribute("aria-labelledby", heading.id);
+      const summary = text("p", "", "speech-summary");
+      const reason = text("p", "", "speech-explanation");
+      const cleanup = text("p", "", "speech-explanation");
+      const details = text("details", "", "speech-details");
+      details.appendChild(text("summary", "Transcription details"));
+      const explanation = text("p", "", "speech-explanation");
+      details.appendChild(explanation);
+      for (const child of [heading, summary, reason, cleanup, details]) row.appendChild(child);
+      entry = {row, heading, summary, reason, cleanup, details, explanation};
+      speechRows.set(source.source, entry); el.speechHealth.appendChild(row);
+    }
+    const label = source.source === "system" ? "System audio" : "Microphone";
+    const provider = ({deepgram: "Deepgram", "local-whisper": "Whisper", "whisper.cpp": "Whisper"})[source.provider] || String(source.provider || "Unknown provider");
+    const heading = label + " · " + provider + " / " + String(source.model || "Unknown model");
+    if (entry.heading.textContent !== heading) entry.heading.textContent = heading;
+    const parts = [states[source.state] || "Status unavailable"];
+    if (typeof source.pending_audio_ms === "number" && Number.isFinite(source.pending_audio_ms) && source.pending_audio_ms >= 0) {
+      parts.push((source.pending_audio_ms / 1000).toFixed(1) + "s audio pending");
+    } else parts.push("Coverage not measured");
+    if (source.source === "system" && source.diarization_supported === false) parts.push("No remote speaker labels");
+    const summary = parts.join(" · ");
+    if (entry.summary.textContent !== summary) entry.summary.textContent = summary;
+    const from = typeof source.from_ms === "number" ? "Coverage from audio " + formatElapsed(source.from_ms) + ": " : "Provider change: ";
+    const reason = source.switch_reason ? from + (reasons[source.switch_reason] || "provider changed") : "";
+    if (entry.reason.textContent !== reason) entry.reason.textContent = reason;
+    entry.reason.hidden = !reason;
+    const cleanup = source.worker_running === true && ["complete", "incomplete"].includes(source.state)
+      ? "Finishing transcription work; Start waits for cleanup." : "";
+    if (entry.cleanup.textContent !== cleanup) entry.cleanup.textContent = cleanup;
+    entry.cleanup.hidden = !cleanup;
+    const extra = [];
+    if (source.word_timestamps_supported === false) extra.push("Utterance timing only");
+    if (source.switch_reason && source.source === "system") extra.push("Speaker identities are separate for each engine");
+    if (source.error) extra.push("Notice: " + String(source.error));
+    extra.push(source.revision ? "Model revision: " + source.revision : "Model revision not recorded");
+    const explanation = extra.join(" · ");
+    if (entry.explanation.textContent !== explanation) entry.explanation.textContent = explanation;
+  }
+  for (const [key, entry] of speechRows) if (!seen.has(key)) { entry.row.remove(); speechRows.delete(key); }
+  el.speechHealth.hidden = seen.size === 0;
 }
 
 // Keep rows mounted between polls so status refreshes preserve keyboard focus.
