@@ -218,7 +218,7 @@ generation publication/retirement. An existing approved public JFK/small.en
 fixture also checks real Whisper recovery from a finalized generation after
 raw retirement. These checks do not establish physical power-loss behavior.
 
-## Mapped raw suffix reconstruction
+## Mapped raw input reconstruction
 
 New durable local/fallback captures save a source/session/format/sample-anchor
 processing recipe before the pump accepts raw audio. The transcription pump
@@ -229,11 +229,15 @@ the suppressive echo-gate path does not claim this reconstruction capability.
 Route normalization and gap padding happen before the raw write and therefore
 remain part of the same saved input and source clock.
 
-On startup, a matching recipe can reconstruct a missing canonical suffix for
-an unindexed or already indexed capture. Processing uses bounded chunks and a
+On startup, a matching recipe can reconstruct a missing canonical file or suffix
+for an unindexed or already indexed capture, including data lost inside an
+already committed or sealed interval. Processing uses bounded chunks and a
 temporary candidate on disk. Every source is leased and preflighted; each
 existing complete canonical sample must match the candidate exactly before
-any suffix is appended. Conflicting audio, changed identity/processing/format,
+any suffix is appended. The original coverage journal and existing proof
+boundaries must validate against the full candidate before publication. A missing
+file is published exclusively; a newly appearing destination is never replaced.
+Conflicting audio, changed identity/processing/format,
 busy owners and malformed source evidence refuse reconstruction. Only an
 uncommitted torn half-sample can be trimmed after successful validation.
 Cancellation retains the normal capture/source ownership until work returns.
@@ -243,12 +247,13 @@ Native recovery then uses the original saved local plan and existing coverage
 journal. Committed words, notes and aliases remain intact. A proven original
 Stop stays authoritative; an unknown end stays unknown with Partial recovery.
 Explicit deletion is checked before reconstruction as well as normal database
-publication. Already completed canonical input does not need raw reconstruction,
-and retired raw audio is never replaced with lossy archive audio.
+publication. Existing completion and projection proofs are preserved without
+granting new authority, and retired raw audio is never replaced with lossy
+archive audio.
 
 The current recipe is qualified against rubato 5.0.0; a dependency change requires
-an explicit compatibility review. Captures without this recipe, lost canonical
-headers/files and legacy unindexed identities still need separate admission
+an explicit compatibility review. Captures without this recipe, malformed
+retained canonical headers and legacy unindexed identities still need separate admission
 work. This is not a claim that arbitrary older raw audio can be replayed through
 today's filters with its original timing.
 
@@ -256,6 +261,9 @@ Tests exercise the actual pump at 16 kHz, 44.1 kHz and stereo 48 kHz, including
 silence and an audible final tail. Reprocessing persisted WAL samples with
 different chunk boundaries reproduces canonical samples exactly. Synthetic
 startup cases cover stopped/unknown clocks, existing aliases, deletion and
-refusals; the approved public JFK/small.en fixture verifies real inference after
-reconstruction. Physical capture, device failure and power-loss validation
+refusals, missing files and committed-interval truncation. Cancellation,
+publication collisions, candidate path replacement and conflicting proof metadata
+are also covered. The approved public JFK/small.en fixture verifies real inference
+after both suffix reconstruction and whole-file restoration. Physical capture,
+device failure and power-loss validation
 remain separate acceptance work.

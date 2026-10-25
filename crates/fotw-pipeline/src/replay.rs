@@ -121,6 +121,242 @@ struct Header {
     first_sample: u64,
 }
 
+/// Exclusive offline restoration of one canonical source. The caller must
+/// validate the original capture, raw-processing recipe and coverage
+/// journal before publishing. No ordinary append or completion capability is
+/// exposed, and an existing malformed header is never replaced.
+pub struct ReconstructionOwner {
+    _owner: OwnerLock,
+    dir: PathBuf,
+    expected: Header,
+    original: Option<ReplayReader>,
+}
+impl ReconstructionOwner {
+    /// Reserve the source's normal sidecar lease without creating an audio
+    /// file. Missing input stays absent until a validated candidate is ready.
+    pub fn reserve(
+        dir: &Path,
+        session: &str,
+        source: ReplaySource,
+        first_sample: u64,
+    ) -> io::Result<Self> {
+        if session.is_empty() || session.len() > 512 {
+            return Err(invalid("invalid restoration session"));
+        }
+        let owner = source.lock(dir)?;
+        let path = source.path(dir);
+        let original = match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_file() => Some(ReplayReader::open(dir, session, source)?),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+            _ => return Err(invalid("restoration source is not an ordinary file")),
+        };
+        let expected = Header {
+            session_id: session.into(),
+            source,
+            sample_rate: SAMPLE_RATE,
+            first_sample,
+        };
+        if original.as_ref().is_some_and(|r| r.header != expected) {
+            return Err(invalid("retained canonical identity differs"));
+        }
+        Ok(Self {
+            _owner: owner,
+            dir: dir.into(),
+            expected,
+            original,
+        })
+    }
+    /// Observe the complete retained prefix; absence is distinct from empty.
+    pub fn retained_end(&self) -> io::Result<Option<u64>> {
+        self.original
+            .as_ref()
+            .map(ReplayReader::complete_prefix_end)
+            .transpose()
+    }
+    /// Validate existing proof files against healthy retained input, without
+    /// modifying them. Damaged input is instead checked against the candidate.
+    pub fn validate_current_markers(&self) -> io::Result<()> {
+        validate_reconstruction_markers(
+            &self.dir,
+            self.original
+                .as_ref()
+                .ok_or_else(|| invalid("canonical source is absent"))?,
+        )
+    }
+    /// Check identity, alignment, all retained samples and existing proof
+    /// boundaries. The candidate never grants new completion authority.
+    pub fn validate_candidate(
+        &mut self,
+        candidate: &mut ReplayReader,
+        stop: &AtomicBool,
+    ) -> io::Result<u64> {
+        if stop.load(Ordering::Acquire) {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        checked_candidate_path(candidate, stop)?;
+        if candidate.header != self.expected {
+            return Err(invalid("candidate restoration identity differs"));
+        }
+        let target = candidate.saved_end()?;
+        if let Some(original) = &mut self.original {
+            let end = original.complete_prefix_end()?;
+            if end > target {
+                return Err(invalid("candidate would shorten retained audio"));
+            }
+            let mut at = original.first_sample();
+            while at < end {
+                if stop.load(Ordering::Acquire) {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let count = (end - at).min(MAX_READ_SAMPLES as u64) as usize;
+                let retained = original.read_from(at, count)?;
+                if retained.len() != count || candidate.read_from(at, count)? != retained {
+                    return Err(invalid(
+                        "candidate would replace retained canonical samples",
+                    ));
+                }
+                at += count as u64;
+            }
+        }
+        validate_reconstruction_markers(&self.dir, candidate)?;
+        Ok(target)
+    }
+    /// Restore only validated missing bytes, checking cancellation between
+    /// bounded copies. A missing file is published with a same-filesystem
+    /// create-new hard link, so a concurrently appearing path is never replaced.
+    /// Existing proof files and the original header are left unchanged.
+    pub fn restore(&mut self, candidate: &mut ReplayReader, stop: &AtomicBool) -> io::Result<u64> {
+        let target = self.validate_candidate(candidate, stop)?;
+        if stop.load(Ordering::Acquire) {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        if let Some(original) = &mut self.original {
+            let mut at = original.complete_prefix_end()?;
+            original
+                .file
+                .set_len(original.audio_offset + (at - original.first_sample()) * 2)?;
+            original.file.seek(SeekFrom::End(0))?;
+            while at < target {
+                if stop.load(Ordering::Acquire) {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let count = (target - at).min(MAX_READ_SAMPLES as u64) as usize;
+                let pcm = candidate.read_from(at, count)?;
+                if pcm.len() != count {
+                    return Err(invalid("candidate shortened during restoration"));
+                }
+                let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+                original.file.write_all(&bytes)?;
+                at += count as u64;
+            }
+            original.file.sync_all()?;
+        } else {
+            candidate.file.sync_all()?;
+            let path = checked_candidate_path(candidate, stop)?;
+            std::fs::hard_link(path, self.expected.source.path(&self.dir))?;
+            self.original = Some(ReplayReader::open(
+                &self.dir,
+                &self.expected.session_id,
+                self.expected.source,
+            )?);
+        }
+        sync_directory(&self.dir)?;
+        Ok(target)
+    }
+}
+
+fn checked_candidate_path(candidate: &mut ReplayReader, stop: &AtomicBool) -> io::Result<PathBuf> {
+    let path = candidate.header.source.path(&candidate.dir);
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if !metadata.file_type().is_file() {
+        return Err(invalid("candidate path is not an ordinary file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let retained = candidate.file.metadata()?;
+        if metadata.dev() != retained.dev() || metadata.ino() != retained.ino() {
+            return Err(invalid(
+                "candidate path no longer refers to validated input",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let mut current = ReplayReader::open(
+            &candidate.dir,
+            &candidate.header.session_id,
+            candidate.header.source,
+        )?;
+        if current.header != candidate.header || current.saved_end()? != candidate.saved_end()? {
+            return Err(invalid("candidate path identity changed"));
+        }
+        let end = candidate.saved_end()?;
+        let mut at = candidate.first_sample();
+        while at < end {
+            if stop.load(Ordering::Acquire) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let count = (end - at).min(MAX_READ_SAMPLES as u64) as usize;
+            if current.read_from(at, count)? != candidate.read_from(at, count)? {
+                return Err(invalid("candidate path content changed"));
+            }
+            at += count as u64;
+        }
+    }
+    if stop.load(Ordering::Acquire) {
+        return Err(io::ErrorKind::Interrupted.into());
+    }
+    Ok(path)
+}
+
+fn validate_reconstruction_markers(dir: &Path, candidate: &ReplayReader) -> io::Result<()> {
+    let source = candidate.header.source;
+    let end = candidate.saved_end()?;
+    let matches = |b: &Completion, full: bool| {
+        b.schema == 1
+            && b.session_id == candidate.header.session_id
+            && b.source == source
+            && b.first_sample == candidate.first_sample()
+            && b.through_sample >= candidate.first_sample()
+            && if full {
+                b.through_sample == end
+            } else {
+                b.through_sample <= end
+            }
+    };
+    for path in [
+        source.sealed_path(dir),
+        source.completion_path(dir),
+        source.projected_path(dir),
+        source.prefix_projected_path(dir),
+    ] {
+        match std::fs::symlink_metadata(path) {
+            Ok(m) if m.file_type().is_file() => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+            _ => return Err(invalid("restoration proof is not an ordinary file")),
+        }
+    }
+    for path in [source.sealed_path(dir), source.completion_path(dir)] {
+        if read_marker::<Completion>(path)?.is_some_and(|b| !matches(&b, true)) {
+            return Err(invalid("restoration conflicts with frozen source proof"));
+        }
+    }
+    if read_marker::<ProjectionProof>(source.projected_path(dir))?
+        .is_some_and(|p| !matches(&p.boundary, true) || p.journal_bytes == 0)
+    {
+        return Err(invalid("restoration projection identity differs"));
+    }
+    if read_marker::<PrefixProjection>(source.prefix_projected_path(dir))?.is_some_and(|p| {
+        p.scope != "saved-prefix-projection" || !matches(&p.boundary, false) || p.journal_bytes == 0
+    }) {
+        return Err(invalid("restoration prefix proof differs"));
+    }
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Completion {
@@ -544,6 +780,11 @@ pub struct ReplayReader {
 }
 
 impl ReplayReader {
+    /// Whether this already validated reader belongs to the expected source.
+    #[must_use]
+    pub fn has_identity(&self, session: &str, source: ReplaySource) -> bool {
+        self.header.session_id == session && self.header.source == source
+    }
     /// Open one track, refusing another session's audio or an unknown format.
     /// Requires write access so [`Self::sync_through`] also works on Windows.
     /// No method on this reader modifies the audio or header.

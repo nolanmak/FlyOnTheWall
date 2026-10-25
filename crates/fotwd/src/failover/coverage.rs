@@ -330,6 +330,22 @@ impl CoverageJournal {
     /// the journal. Never repairs/truncates a live writer's incomplete line.
     pub fn snapshot(dir: &Path, session_id: &str, source: Source) -> io::Result<CoverageSnapshot> {
         let journal = Self::load(dir, session_id, source, false)?;
+        Self::snapshot_loaded(journal)
+    }
+
+    /// Validate the original journal against a validated private candidate
+    /// before restoring lost canonical input. Never repairs the journal.
+    pub(crate) fn snapshot_with_audio(
+        dir: &Path,
+        session_id: &str,
+        source: Source,
+        audio: ReplayReader,
+    ) -> io::Result<CoverageSnapshot> {
+        let journal = Self::load_with_audio(dir, session_id, source, false, audio)?;
+        Self::snapshot_loaded(journal)
+    }
+
+    fn snapshot_loaded(journal: Self) -> io::Result<CoverageSnapshot> {
         // A complete line may become readable before the writer's own fsync
         // returns. Flush the validated prefix before projecting it into SQLite.
         journal.file.sync_data()?;
@@ -343,6 +359,19 @@ impl CoverageJournal {
 
     fn load(dir: &Path, session_id: &str, source: Source, repair: bool) -> io::Result<Self> {
         let audio = ReplayReader::open(dir, session_id, replay_source(source))?;
+        Self::load_with_audio(dir, session_id, source, repair, audio)
+    }
+
+    fn load_with_audio(
+        dir: &Path,
+        session_id: &str,
+        source: Source,
+        repair: bool,
+        audio: ReplayReader,
+    ) -> io::Result<Self> {
+        if !audio.has_identity(session_id, replay_source(source)) {
+            return Err(invalid("candidate audio identity mismatch"));
+        }
         let path = journal_path(dir, source);
         let owner = if repair { Some(lock(&path)?) } else { None };
         let file = OpenOptions::new().read(true).write(true).open(&path)?;

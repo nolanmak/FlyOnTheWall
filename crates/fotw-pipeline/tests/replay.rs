@@ -1,4 +1,5 @@
 //! Durable canonical audio, independent of provider reconnect ring capacity.
+use fotw_pipeline::replay::ReconstructionOwner;
 use fotw_pipeline::replay::{MAX_READ_SAMPLES, ReplayReader, ReplaySource, ReplayWriter};
 use std::path::PathBuf;
 
@@ -15,6 +16,132 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+fn reconstruction_candidate(dir: &std::path::Path, pcm: &[i16]) -> ReplayReader {
+    let mut writer = ReplayWriter::create(dir, "s", ReplaySource::System, 11).unwrap();
+    writer.append(pcm).unwrap();
+    writer.sync().unwrap();
+    drop(writer);
+    ReplayReader::open(dir, "s", ReplaySource::System).unwrap()
+}
+
+#[test]
+fn missing_source_publication_is_exclusive_cancellable_and_never_replaces_a_new_path() {
+    use std::sync::atomic::AtomicBool;
+    let fixture = Fixture::new("missing-publication");
+    let private = tempfile::tempdir_in(&fixture.0).unwrap();
+    let mut candidate = reconstruction_candidate(private.path(), &[1, 2, 3]);
+    let mut owner =
+        ReconstructionOwner::reserve(&fixture.0, "s", ReplaySource::System, 11).unwrap();
+    assert!(ReconstructionOwner::reserve(&fixture.0, "s", ReplaySource::System, 11).is_err());
+    assert!(
+        owner
+            .restore(&mut candidate, &AtomicBool::new(true))
+            .is_err()
+    );
+    assert!(!fixture.0.join("system.stt16").exists());
+    std::fs::write(
+        fixture.0.join("system.stt16"),
+        b"concurrently appearing input",
+    )
+    .unwrap();
+    assert!(
+        owner
+            .restore(&mut candidate, &AtomicBool::new(false))
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(fixture.0.join("system.stt16")).unwrap(),
+        b"concurrently appearing input"
+    );
+}
+
+#[test]
+fn valid_restoration_preserves_old_proofs_and_creates_no_new_authority() {
+    use std::sync::atomic::AtomicBool;
+    for prior_proofs in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir_in(root.path()).unwrap();
+        let mut candidate = reconstruction_candidate(private.path(), &[1, 2, 3, 4, 5]);
+        let mut proofs = Vec::new();
+        if prior_proofs {
+            let mut writer =
+                ReplayWriter::create(root.path(), "s", ReplaySource::System, 11).unwrap();
+            writer.append(&[1, 2, 3, 4, 5]).unwrap();
+            writer.seal().unwrap();
+            drop(writer);
+            let mut original = ReplayReader::open(root.path(), "s", ReplaySource::System).unwrap();
+            original.mark_complete(16).unwrap();
+            std::fs::write(
+                root.path().join("system.stt-coverage.jsonl"),
+                b"fixture receipt\n",
+            )
+            .unwrap();
+            original.mark_projected(16, 16).unwrap();
+            for file in [
+                "system.stt-sealed.json",
+                "system.stt-complete.json",
+                "system.stt-projected.json",
+            ] {
+                proofs.push((file, std::fs::read(root.path().join(file)).unwrap()));
+            }
+            let length = std::fs::metadata(root.path().join("system.stt16"))
+                .unwrap()
+                .len();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(root.path().join("system.stt16"))
+                .unwrap()
+                .set_len(length - 6)
+                .unwrap();
+        }
+        let mut owner =
+            ReconstructionOwner::reserve(root.path(), "s", ReplaySource::System, 11).unwrap();
+        assert_eq!(
+            owner
+                .restore(&mut candidate, &AtomicBool::new(false))
+                .unwrap(),
+            16
+        );
+        assert!(ReplayWriter::resume_prefix(root.path(), "s", ReplaySource::System).is_err());
+        let mut restored = ReplayReader::open(root.path(), "s", ReplaySource::System).unwrap();
+        assert_eq!(restored.read_from(11, 10).unwrap(), vec![1, 2, 3, 4, 5]);
+        for file in [
+            "system.stt-sealed.json",
+            "system.stt-complete.json",
+            "system.stt-projected.json",
+        ] {
+            if let Some((_, bytes)) = proofs.iter().find(|(name, _)| *name == file) {
+                assert_eq!(&std::fs::read(root.path().join(file)).unwrap(), bytes);
+            } else {
+                assert!(!root.path().join(file).exists());
+            }
+        }
+    }
+}
+
+#[test]
+fn rebinding_a_private_candidate_path_cannot_publish_different_audio() {
+    use std::sync::atomic::AtomicBool;
+    let root = tempfile::tempdir().unwrap();
+    let private = tempfile::tempdir_in(root.path()).unwrap();
+    let mut candidate = reconstruction_candidate(private.path(), &[1, 2, 3]);
+    std::fs::rename(
+        private.path().join("system.stt16"),
+        private.path().join("validated-original"),
+    )
+    .unwrap();
+    drop(reconstruction_candidate(private.path(), &[9, 9, 9]));
+    let mut owner =
+        ReconstructionOwner::reserve(root.path(), "s", ReplaySource::System, 11).unwrap();
+    assert!(
+        owner
+            .restore(&mut candidate, &AtomicBool::new(false))
+            .is_err(),
+        "publication must use the validated candidate inode"
+    );
+    assert!(!root.path().join("system.stt16").exists());
 }
 
 #[test]
