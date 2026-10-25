@@ -264,6 +264,16 @@ async fn main() -> Result<(), String> {
     let server = fotw_web::WebServer::bind_with_recorder(0, source, recorder)
         .await
         .map_err(|e| format!("bind: {e}"))?;
+    // The real speech settings controller over this throwaway library only.
+    // It never reads credentials or opens capture devices.
+    let speech_db = Db::open(root.join("db.sqlite3"), &DbKey::from_bytes(PREVIEW_KEY))
+        .map_err(|e| e.to_string())?;
+    server
+        .state()
+        .set_speech(Arc::new(fotwd::speech_control::SpeechSettingsControl::new(
+            speech_db,
+            root.clone(),
+        )));
     let state = server.state().clone();
     if let Some(recorder) = fixture_recorder {
         recorder.attach_hub(state.hub().clone());

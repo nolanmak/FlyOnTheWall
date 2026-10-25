@@ -32,6 +32,31 @@
     </header>
     <p id="recording-limit" class="recording-limit" hidden></p>
     <section id="capture-health" class="capture-health" aria-label="Audio capture health" hidden></section>
+    <details id="speech-settings" class="gh-settings speech-settings" hidden>
+      <summary>Transcription</summary>
+      <p class="gh-note">Choose how the next recording becomes text. Changes apply to new recordings.</p>
+      <label class="gh-field">Speech mode
+        <select id="speech-mode">
+          <option value="">Choose a mode</option>
+          <option value="local">Fully offline speech — on this Mac</option>
+          <option value="deepgram">Deepgram — cloud speech</option>
+          <option value="fallback">Deepgram with offline backup</option>
+        </select>
+      </label>
+      <p id="speech-disclosure" class="gh-note"></p>
+      <div id="speech-local-fields">
+        <label class="gh-field">Installed model name or full path
+          <input id="speech-model" type="text" maxlength="4096" placeholder="small.en or /path/to/ggml-model.bin" autocomplete="off" spellcheck="false" />
+        </label>
+        <label class="gh-field">Language
+          <input id="speech-language" type="text" maxlength="16" placeholder="auto or en" autocomplete="off" spellcheck="false" />
+        </label>
+        <p class="gh-note">Import an installed whisper.cpp model by its full path, or use a model already in the app’s models folder. No download starts here. English-only models require English; other models can detect supported languages.</p>
+      </div>
+      <button id="speech-save" type="button" disabled>Save transcription</button>
+      <button id="speech-reload" type="button">Reload saved choice</button>
+      <p id="speech-status" class="gh-note" role="status"></p>
+    </details>
     <main>
       <nav id="list" aria-label="Meetings"></nav>
       <section id="detail" aria-label="Meeting details" aria-live="polite"></section>

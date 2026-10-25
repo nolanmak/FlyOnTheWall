@@ -50,6 +50,15 @@ const el = {
   ghRepoList: document.getElementById("gh-repo-list"),
   ghPublic: document.getElementById("gh-public"),
   ghWholeLibrary: document.getElementById("gh-whole-library"),
+  speechSettings: document.getElementById("speech-settings"),
+  speechMode: document.getElementById("speech-mode"),
+  speechModel: document.getElementById("speech-model"),
+  speechLanguage: document.getElementById("speech-language"),
+  speechDisclosure: document.getElementById("speech-disclosure"),
+  speechLocalFields: document.getElementById("speech-local-fields"),
+  speechSave: document.getElementById("speech-save"),
+  speechReload: document.getElementById("speech-reload"),
+  speechStatus: document.getElementById("speech-status"),
   sumSettings: document.getElementById("sum-settings"),
   sumKind: document.getElementById("sum-kind"),
   sumBinary: document.getElementById("sum-binary"),
@@ -1357,6 +1366,73 @@ async function onGithubSave() {
   el.ghSave.disabled = false;
 }
 
+// -------------------------------------------------- transcription settings
+let speechSaving = false;
+function paintSpeechPolicy() {
+  const mode = el.speechMode.value;
+  el.speechSave.disabled = speechSaving || !["local", "deepgram", "fallback"].includes(mode);
+  el.speechLocalFields.hidden = mode === "deepgram" || !mode;
+  el.speechDisclosure.textContent = mode === "local"
+    ? "Speech recognition stays on this Mac. Summaries and GitHub export have separate settings below and may send text elsewhere."
+    : mode === "fallback"
+    ? "Audio initially streams to Deepgram (api.deepgram.com). After a bounded provider outage, pending speech is transcribed locally for the rest of the meeting. Start refuses recording if the offline backup cannot prepare. Summaries are configured separately."
+    : mode === "deepgram"
+    ? "Audio streams to Deepgram (api.deepgram.com) using your configured key. There is no automatic offline backup in this mode. Summaries are configured separately."
+    : "Choose a mode explicitly to repair the saved transcription choice.";
+}
+function renderSpeechSettings(body) {
+  const settings = body.settings;
+  el.speechMode.value = settings?.engine || "";
+  el.speechModel.value = settings?.model || "";
+  el.speechLanguage.value = settings?.language || "";
+  const messages = {
+    present_unchecked: "Model file found. Start verifies its contents and prepares native memory before capture in backup mode.",
+    missing: "Model file missing. Choose an installed model. Offline backup refuses Start until repaired.",
+    unsupported: "Local speech is currently supported only on macOS.",
+    not_required: "Deepgram requires a configured key. No local model is used.",
+    unknown: "The saved speech choice cannot be read. Select a mode to repair it.",
+  };
+  const savedMode = {local: "Fully offline speech", deepgram: "Deepgram", fallback: "Deepgram with offline backup"}[settings?.engine];
+  el.speechStatus.textContent = body.error || ((savedMode ? "Saved choice: " + savedMode + ". " : "") + (messages[body.model_availability] || "Start checks model readiness."));
+  el.speechSettings.hidden = false;
+  paintSpeechPolicy();
+}
+async function loadSpeech() {
+  if (!el.speechSettings || speechSaving) return;
+  try {
+    renderSpeechSettings(await api("/api/settings/speech"));
+  } catch (e) {
+    el.speechSettings.hidden = e.status === 404;
+    if (e.status !== 404) el.speechStatus.textContent = "Could not load transcription settings. Retry with Reload saved choice.";
+  }
+}
+async function onSpeechSave() {
+  if (speechSaving || !["local", "deepgram", "fallback"].includes(el.speechMode.value)) return;
+  speechSaving = true;
+  const controls = [el.speechMode, el.speechModel, el.speechLanguage, el.speechReload];
+  controls.forEach(control => { control.disabled = true; });
+  paintSpeechPolicy();
+  el.speechStatus.textContent = "Checking the selected model and saving…";
+  try {
+    const body = await api("/api/settings/speech", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({engine: el.speechMode.value, model: el.speechModel.value, language: el.speechLanguage.value}),
+    });
+    if (body.error) {
+      el.speechStatus.textContent = "Not saved. " + body.error;
+    } else {
+      renderSpeechSettings(body);
+      el.speechStatus.textContent = "Saved for the next recording. " + el.speechStatus.textContent;
+    }
+  } catch (_) {
+    el.speechStatus.textContent = "Save could not be confirmed. Reload saved choice to check what is stored; your draft is still here.";
+  } finally {
+    speechSaving = false;
+    controls.forEach(control => { control.disabled = false; });
+    paintSpeechPolicy();
+  }
+}
+
 // ------------------------------------------- issue #74, summarization engine
 
 // Same "404 means the feature is absent" convention as the GitHub section.
@@ -1765,6 +1841,9 @@ async function main() {
       el.ghPublic.checked = false;
     }
   });
+  el.speechSave?.addEventListener("click", onSpeechSave);
+  el.speechReload?.addEventListener("click", loadSpeech);
+  el.speechMode?.addEventListener("change", paintSpeechPolicy);
   el.sumSave.addEventListener("click", onSummarizeSave);
   // The disclosure differs per engine, so it follows the picker rather than
   // waiting for a save.
@@ -1772,6 +1851,7 @@ async function main() {
   el.ghSettings.addEventListener("toggle", function () {
     if (el.ghSettings.open) loadGithubRepos();
   });
+  await loadSpeech();
   await loadMeetings();
   await loadNoteDraftControl();
   await loadGithub();

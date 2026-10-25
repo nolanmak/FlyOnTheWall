@@ -23,8 +23,13 @@ automatically. Startup deadlines retain native ownership for every speech mode;
 new Start requests are refused until that setup actually exits. A deadline can
 bound the app's wait but cannot force a blocked OS call to return.
 
-Graphical provider selection, live engine/provenance status, startup native
-recovery and retry UI remain part of
+The dashboard Transcription panel saves the same policy, model and language.
+It reports file availability without treating it as native readiness, validates
+local model metadata on explicit save, and preserves the previous policy on
+failure. Model work runs outside the library mutex. Summary and export settings
+remain independent of speech recognition.
+
+Live engine/provenance status, startup native recovery and retry UI remain part of
 [#12](https://github.com/nolanmak/FlyOnTheWall/issues/12). The backend APIs below
 support these remaining app features.
 
