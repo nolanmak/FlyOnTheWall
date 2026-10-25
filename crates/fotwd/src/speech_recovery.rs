@@ -125,6 +125,13 @@ impl SavedSpeechRecovery {
         state.set_speech_recovery(owner.clone());
         owner.start_pending()
     }
+    /// Index retained recordings without scheduling inference. Intended for
+    /// inventory and preview callers; normal startup uses `start_pending`.
+    /// Proven stopped input may be frozen, but unknown end times remain unknown.
+    pub fn index_captures(&self) -> Result<(), RecoveryError> {
+        let stop = self.state().startup_stop.clone();
+        self.import_stopped_captures(&stop)
+    }
     /// Start one local-only pass over saved recordings, off the server runtime.
     pub fn start_pending(&self) -> std::io::Result<Option<StartupRecovery>> {
         let stop = {
@@ -198,12 +205,7 @@ impl SavedSpeechRecovery {
                 }
                 if !self.load(&meeting).is_ok_and(|capture| {
                     capture.status.phase == RecoveryPhase::Incomplete
-                        || (capture.prefix_only
-                            && capture.status.can_retry
-                            && !capture
-                                .sources
-                                .iter()
-                                .any(|s| s.pending && s.plan.is_some()))
+                        || (capture.prefix_only && capture.status.can_retry)
                 }) {
                     continue;
                 }

@@ -6,6 +6,7 @@
 //!     cargo run -p fotwd --example ui_preview -- --saved-speech-recovery
 //!     cargo run -p fotwd --example ui_preview -- --interrupted-capture
 //!     cargo run -p fotwd --example ui_preview -- --interrupted-prefix
+//!     cargo run -p fotwd --example ui_preview -- --automatic-prefix
 //!
 //! Every other way into the library goes through audio capture — a TCC grant,
 //! a signed build, and an actual meeting to record — so the web UI was
@@ -247,7 +248,9 @@ async fn main() -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
-    let prefix_preview = std::env::args().any(|arg| arg == "--interrupted-prefix");
+    let automatic_prefix = std::env::args().any(|arg| arg == "--automatic-prefix");
+    let prefix_preview =
+        automatic_prefix || std::env::args().any(|arg| arg == "--interrupted-prefix");
     if prefix_preview || std::env::args().any(|arg| arg == "--interrupted-capture") {
         let mut wal = fotw_pipeline::wal::SessionWal::create(root.join("sessions"), 16000, 1)
             .map_err(|e| e.to_string())?;
@@ -344,7 +347,7 @@ async fn main() -> Result<(), String> {
             }
             let db = Db::open(root.join("db.sqlite3"), &DbKey::from_bytes(PREVIEW_KEY))
                 .map_err(|e| e.to_string())?;
-            fotwd::speech_recovery::SavedSpeechRecovery::with_parts(
+            let recovery = fotwd::speech_recovery::SavedSpeechRecovery::with_parts(
                 db,
                 root.clone(),
                 Arc::new(move |plan, _| {
@@ -359,9 +362,16 @@ async fn main() -> Result<(), String> {
                 }),
                 std::time::Duration::from_secs(2),
                 std::time::Duration::from_secs(2),
-            )
-            .install(&state)
-            .map_err(|e| e.to_string())?
+            );
+            if prefix_preview && !automatic_prefix {
+                // Keep the manual Retry fixture available; normal app startup
+                // and --automatic-prefix use the automatic pass below.
+                recovery.index_captures().map_err(|e| format!("{e:?}"))?;
+                state.set_speech_recovery(Arc::new(recovery));
+                None
+            } else {
+                recovery.install(&state).map_err(|e| e.to_string())?
+            }
         } else {
             None
         };
