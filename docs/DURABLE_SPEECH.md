@@ -15,8 +15,13 @@ shows Preparing without a recording clock or red badge and offers Cancel.
 Cancellation retains ownership until native preparation finishes; a late result
 cannot start capture. No model is downloaded automatically.
 
-Graphical provider selection, live engine/provenance status, startup native
-recovery and retry UI remain part of
+The dashboard Transcription panel saves the same policy, model and language.
+It reports file availability without treating it as native readiness, validates
+local model metadata on explicit save, and preserves the previous policy on
+failure. Model work runs outside the library mutex. Summary and export settings
+remain independent of speech recognition.
+
+Live engine/provenance status, startup native recovery and retry UI remain part of
 [#12](https://github.com/nolanmak/FlyOnTheWall/issues/12). The backend APIs below
 support these remaining app features.
 

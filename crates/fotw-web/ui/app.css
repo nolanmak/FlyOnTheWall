@@ -725,3 +725,22 @@ button, summary { min-height: 36px; }
 .capture-source .meta:empty { display: none; }
 .capture-source button { grid-column: 2; grid-row: 1 / span 2; align-self: center; min-height: 36px; }
 @media (max-width: 760px) { .capture-health { grid-template-columns: 1fr; } }
+
+/* Speech policy is next to Start; keep model paths and complete mode labels legible. */
+.speech-settings { padding: 14px 24px; }
+.speech-settings summary { color: var(--fg); font-size: 14px; }
+.speech-settings .gh-note { max-width: 85ch; line-height: 1.5; }
+.speech-settings .gh-field {
+  display: grid;
+  grid-template-columns: 210px minmax(0, 1fr);
+  max-width: 780px;
+  gap: 12px;
+  margin: 12px 0;
+}
+.speech-settings .gh-field input,
+.speech-settings .gh-field select { width: 100%; min-width: 0; box-sizing: border-box; padding: 8px 10px; }
+#speech-save, #speech-reload { margin: 4px 6px 4px 0; }
+@media (max-width: 640px) {
+  .speech-settings { padding: 12px 16px; }
+  .speech-settings .gh-field { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+}

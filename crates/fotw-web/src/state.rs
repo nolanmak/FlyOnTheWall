@@ -37,6 +37,7 @@ struct Inner {
     /// Bound after construction, unlike every control above it — see
     /// [`AppState::set_health`].
     health: OnceLock<Arc<dyn DaemonHealth>>,
+    speech: OnceLock<Arc<dyn crate::speech::SpeechControl>>,
     documents: OnceLock<Arc<dyn crate::documents::DocumentControl>>,
 }
 
@@ -78,6 +79,16 @@ impl std::fmt::Debug for dyn MeetingSource {
 }
 
 impl AppState {
+    /// Attach transcription settings before serving requests.
+    pub fn set_speech(&self, control: Arc<dyn crate::speech::SpeechControl>) {
+        let _ = self.inner.speech.set(control);
+    }
+
+    /// Transcription settings are absent on read-only servers.
+    pub fn speech(&self) -> Option<Arc<dyn crate::speech::SpeechControl>> {
+        self.inner.speech.get().cloned()
+    }
+
     /// Attach the document generator before serving requests.
     pub fn set_documents(&self, control: Arc<dyn crate::documents::DocumentControl>) {
         let _ = self.inner.documents.set(control);
@@ -148,6 +159,7 @@ impl AppState {
                 summarize,
                 health: OnceLock::new(),
                 documents: OnceLock::new(),
+                speech: OnceLock::new(),
                 tickets: TokenTable::new(WS_TICKET_TTL),
                 handoff: TokenTable::new(HANDOFF_TTL),
                 hub: Arc::new(DeltaHub::new()),

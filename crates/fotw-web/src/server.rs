@@ -216,6 +216,10 @@ fn routes(state: AppState) -> Router {
             get(api::github_settings).post(api::github_set_settings),
         )
         .route("/api/settings/github/repos", get(api::github_repos))
+        .route(
+            "/api/settings/speech",
+            get(crate::speech::get).post(crate::speech::post),
+        )
         // Inside `routes()` like every other API path, so the ingress guard
         // wraps it: a route added outside would answer without a bearer.
         .route(

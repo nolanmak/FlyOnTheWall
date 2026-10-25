@@ -478,6 +478,15 @@ async fn serve_until_stopped(root: PathBuf, launch: Launch, port: u16) -> Result
     .await
     .map_err(|e| format!("could not bind 127.0.0.1: {e}"))?;
 
+    if let Ok(db) = crate::open_library(&root) {
+        server
+            .state()
+            .set_speech(Arc::new(crate::speech_control::SpeechSettingsControl::new(
+                db,
+                root.parent().unwrap_or(&root).to_owned(),
+            )));
+    }
+
     if let (Ok(db), Ok(store)) = (crate::open_library(&root), crate::secrets::keystore()) {
         server
             .state()
