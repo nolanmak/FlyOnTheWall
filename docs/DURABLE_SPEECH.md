@@ -349,6 +349,10 @@ retains its original observed prefix without inventing a Stop or a recovery-time
 end. Legacy recordings without this evidence remain unavailable to this new
 ownership protocol; their audio is preserved.
 
+A checkpoint metadata failure reports one capture warning and does not stop the
+raw-audio pump. Later successful checkpoints can restore evidence; missing or
+stale evidence cannot certify the uncheckpointed audio after a crash.
+
 These primitives and their production checkpoints prepare unfinished-WAL
 recovery. They do not yet enable automatic startup inference or reconstruct
 canonical speech audio from raw PCM; the saved-meeting retry requirements above

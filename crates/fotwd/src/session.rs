@@ -2828,7 +2828,7 @@ struct PumpStop<'a> {
 }
 
 impl PumpStop<'_> {
-    fn checkpoint(&self, wal: &mut SessionWal) -> Result<(), String> {
+    fn checkpoint(&self, wal: &mut SessionWal, warnings: &mut Vec<String>) {
         if let Some(capture) = self.capture {
             // Sample now before observing Stop: a concurrent first Stop cannot
             // be earlier than a live checkpoint sampled after that observation.
@@ -2837,10 +2837,15 @@ impl PumpStop<'_> {
             let elapsed = stop
                 .unwrap_or(now)
                 .saturating_sub(wal.manifest().started_at_ms);
-            wal.checkpoint_capture(elapsed, stop.is_some())
-                .map_err(|e| format!("capture clock checkpoint failed: {e}"))?;
+            if let Err(error) = wal.checkpoint_capture(elapsed, stop.is_some())
+                && warnings.is_empty()
+            {
+                // Metadata failure must not stop the raw capture pump. Keep
+                // its first diagnostic bounded; recovery will refuse absent
+                // evidence or expose bytes beyond the last valid checkpoint.
+                warnings.push(format!("capture clock checkpoint failed: {error}"));
+            }
         }
-        Ok(())
     }
 }
 
@@ -2972,7 +2977,8 @@ fn pump_drain(
     stop: PumpStop<'_>,
     mut supervision: Option<Supervision>,
 ) -> Result<PumpCounts, String> {
-    stop.checkpoint(&mut wal)?;
+    let mut capture_warnings = Vec::new();
+    stop.checkpoint(&mut wal, &mut capture_warnings);
     let mut last_capture_checkpoint = Instant::now();
     let mut scratch = vec![0.0f32; 48_000];
     let (mut sys_written, mut mic_written) = (0u64, 0u64);
@@ -3119,7 +3125,7 @@ fn pump_drain(
         }
 
         if last_capture_checkpoint.elapsed() >= Duration::from_secs(2) {
-            stop.checkpoint(&mut wal)?;
+            stop.checkpoint(&mut wal, &mut capture_warnings);
             last_capture_checkpoint = Instant::now();
         }
 
@@ -3166,7 +3172,7 @@ fn pump_drain(
             transcription.feed(LegChannel::Mic, &tail)?;
         }
     }
-    stop.checkpoint(&mut wal)?;
+    stop.checkpoint(&mut wal, &mut capture_warnings);
     wal.flush().map_err(|e| format!("flush failed: {e}"))?;
     // Finalize stamps `ended_at_ms`. Without it every cleanly-ended meeting
     // looks crashed and reappears in the recovery list forever, which trains
@@ -3177,7 +3183,7 @@ fn pump_drain(
     // taken while the taps were still delivering. Both legs are summed: the
     // caller's field is one number, and either leg falling behind means the
     // same thing about this machine.
-    let mut archive_warnings = Vec::new();
+    let mut archive_warnings = capture_warnings;
     if let Some(sup) = &supervision {
         for meta in std::iter::once(&sup.system).chain(sup.mic.iter()) {
             for warning in meta
@@ -3710,6 +3716,54 @@ mod pump_clock_tests {
             leg_anchors(fed.system_t0_ns, fed.mic_t0_ns),
             LegAnchors::default()
         );
+    }
+
+    #[test]
+    fn unavailable_clock_checkpoint_preserves_raw_capture_and_reports_degradation() {
+        let root = tmp_root("clock-write-failure");
+        let wal = SessionWal::create(&root, CAPTURE_RATE, CHANNELS).unwrap();
+        let dir = wal.dir().to_owned();
+        let ready = ReadySignal::default();
+        ready.signal_capture(wal.manifest().id.clone(), wal.manifest().started_at_ms);
+        ready.signal_capture_stopped(wal.manifest().started_at_ms + 25);
+        // Refuse checkpoint publication without affecting either raw track.
+        std::fs::remove_file(dir.join("capture-clock.json")).unwrap();
+        std::fs::create_dir(dir.join("capture-clock.json")).unwrap();
+        let (mut producer, system) = AudioRing::with_capacity_frames(4096);
+        producer.push_block(&[0.25; 960]);
+        let (_producer, mic) = AudioRing::with_capacity_frames(4096);
+        let stopped = AtomicBool::new(true);
+        let counts = pump_loop(
+            wal,
+            system,
+            mic,
+            capture_format(),
+            Some(capture_format()),
+            SttFeeds {
+                system: None,
+                mic: None,
+                echo_gate: None,
+            },
+            PumpStop {
+                capture: Some(&ready),
+                stopped: &stopped,
+                drain: GENEROUS_DRAIN,
+            },
+        )
+        .expect("clock metadata failure must not stop raw recording");
+        assert_eq!(counts.system_samples, 960);
+        assert_eq!(
+            std::fs::metadata(dir.join("system.pcm")).unwrap().len(),
+            1920
+        );
+        assert_eq!(counts.archive_warnings.len(), 1);
+        assert!(counts.archive_warnings[0].contains("capture clock checkpoint failed"));
+        assert!(
+            fotw_pipeline::wal::SessionState::read(&dir)
+                .unwrap()
+                .is_finalized()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
