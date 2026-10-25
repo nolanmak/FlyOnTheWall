@@ -419,3 +419,72 @@ async fn anchored_notes_receive_only_their_own_meetings_capture_window() {
     assert!(!text.contains("late excluded"));
     assert!(!request.to_string().contains("OTHER MEETING MUST NOT LEAK"));
 }
+
+#[tokio::test]
+async fn summary_calls_receive_saved_engine_limits_without_turning_metadata_into_evidence() {
+    use fotw_store::{
+        NewMeeting, NewSegment, SpeechCommit, SpeechEpoch, SpeechSegment, SpeechSource,
+    };
+    let mut db = Db::open_in_memory(&DbKey::from_bytes([0x11; 32])).unwrap();
+    let id = db
+        .finalize_speech_capture(
+            "summary-engine-fixture",
+            NewMeeting::new("fixture", "UTC").started_at_ms(1000),
+            3000,
+            &[SpeechSource {
+                source: "system".into(),
+                epochs: vec![SpeechEpoch {
+                    number: 0,
+                    from_sample: 0,
+                    provider: "whispercpp".into(),
+                    model: "fixture-small.en".into(),
+                    revision: Some("fixture-revision".into()),
+                    capabilities: serde_json::json!({"diarization":"none","wordTimestamps":"none"}),
+                    reason: None,
+                }],
+                commits: vec![SpeechCommit {
+                    epoch: 0,
+                    from_sample: 0,
+                    through_sample: 32000,
+                    segments: vec![SpeechSegment {
+                        id: "summary-original".into(),
+                        timestamp_source: "estimated".into(),
+                        words: vec![],
+                        row: NewSegment::new(0, 500, 1500, "We should ship this.")
+                            .channel("system"),
+                    }],
+                }],
+            }],
+        )
+        .unwrap();
+    let response = |text: &str| serde_json::json!({"content":[{"type":"text","text":text}],"usage":{"input_tokens":100,"output_tokens":10},"stop_reason":"end_turn"});
+    let mock = Arc::new(MockTransport::new().with_json(response("Ship this.")).with_json(response(r#"{"action_items":[],"decisions":[],"open_questions":[],"follow_ups":[],"topics":[]}"#)));
+    summarize::summarize_meeting_with(&mut db, &anthropic(), &id, &general(), mock.clone())
+        .await
+        .unwrap();
+    assert_eq!(mock.call_count(), 2);
+    for request in mock.requests() {
+        let content = request.body["messages"][0]["content"].as_array().unwrap();
+        let instruction = content.last().unwrap()["text"].as_str().unwrap();
+        assert!(
+            instruction.contains("Recorded transcription metadata"),
+            "{instruction}"
+        );
+        assert!(
+            instruction.contains("fixture-small.en") && instruction.contains("fixture-revision"),
+            "{instruction}"
+        );
+        assert!(
+            instruction.contains("diarization") && instruction.contains("none"),
+            "{instruction}"
+        );
+        assert!(instruction.contains("not spoken evidence"), "{instruction}");
+        assert!(
+            !request.body["system"]
+                .to_string()
+                .contains("fixture-small.en")
+        );
+        assert!(!content[0].to_string().contains("fixture-small.en"));
+        assert!(content[0].to_string().contains("We should ship this."));
+    }
+}
