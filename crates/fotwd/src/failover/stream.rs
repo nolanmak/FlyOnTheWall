@@ -191,6 +191,27 @@ pub struct FailoverStream {
     stop_timeout: Duration,
 }
 
+/// An already allocated native state. Constructed before capture admission;
+/// opening the source binds its eventual WAL identity without reallocating.
+pub struct PreparedSource {
+    config: FailoverConfig,
+    recognizer: Box<dyn Recognizer>,
+}
+
+impl PreparedSource {
+    /// Bind a prepared source to the capture's authoritative clock and identity.
+    pub async fn open(
+        mut self,
+        dir: &Path,
+        session_id: &str,
+        offset_ms: u64,
+    ) -> Result<(FailoverStream, mpsc::UnboundedReceiver<Event>), SttError> {
+        self.config.cloud.normalizer.session_id = session_id.to_owned();
+        self.config.cloud.session_offset_ms = offset_ms;
+        FailoverStream::open_prepared(dir, self).await
+    }
+}
+
 impl FailoverStream {
     /// Prepare durable source files and preflight the real local model before
     /// opening cloud transport. Session admission must call this before capture
@@ -199,6 +220,13 @@ impl FailoverStream {
         dir: &Path,
         config: FailoverConfig,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), SttError> {
+        let prepared = Self::prepare(config).await?;
+        Self::open_prepared(dir, prepared).await
+    }
+
+    /// Allocate and retain the actual local state before opening any capture or
+    /// cloud transport. Failure refuses fallback admission.
+    pub async fn prepare(config: FailoverConfig) -> Result<PreparedSource, SttError> {
         if config.cloud_queue_samples < MAX_READ_SAMPLES {
             return Err(failure("cloud queue must hold one replay chunk"));
         }
@@ -213,6 +241,18 @@ impl FailoverStream {
                 "handoff requires canonical 16 kHz mono PCM16 and matching provider model metadata",
             ));
         }
+        let local = Arc::clone(&config.local);
+        let recognizer = tokio::task::spawn_blocking(move || local.create())
+            .await
+            .map_err(|e| failure(e.to_string()))??;
+        Ok(PreparedSource { config, recognizer })
+    }
+
+    async fn open_prepared(
+        dir: &Path,
+        prepared: PreparedSource,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), SttError> {
+        let PreparedSource { config, recognizer } = prepared;
         let session_id = config.cloud.normalizer.session_id.clone();
         let leg = config.cloud.normalizer.source;
         let anchor = config
@@ -227,11 +267,7 @@ impl FailoverStream {
             capabilities: SttCapabilities::deepgram(),
         };
         let directory = dir.to_owned();
-        let local = Arc::clone(&config.local);
         let (writer, journal, reader, recognizer) = tokio::task::spawn_blocking(move || {
-            // Keep the prepared state ready; a second allocation during an
-            // outage might fail even though admission had succeeded.
-            let recognizer = local.create()?;
             let writer = ReplayWriter::create(&directory, &session_id, source(leg), anchor)
                 .map_err(|e| failure(e.to_string()))?;
             let journal = CoverageJournal::create(&directory, &session_id, leg, initial)
@@ -545,7 +581,7 @@ impl Worker {
                 }
                 if self.cloud.is_some() && self.shared.input_closed.load(Ordering::Acquire) {
                     if self.journal.committed_through() == end {
-                        return Ok(());
+                        return self.complete(end);
                     }
                     if self.stop_since.is_none() {
                         self.stop_since = Some(Instant::now());
@@ -582,7 +618,7 @@ impl Worker {
                     if end > self.journal.committed_through() {
                         self.commit(end, Vec::new())?;
                     }
-                    return Ok(());
+                    return self.complete(end);
                 }
             }
             if !moved {
@@ -599,6 +635,19 @@ impl Worker {
     fn read(&mut self, cursor: u64, end: u64) -> Result<Vec<i16>, SttError> {
         self.reader
             .read_from(cursor, (end - cursor).min(MAX_READ_SAMPLES as u64) as usize)
+            .map_err(|e| failure(e.to_string()))
+    }
+    fn complete(&mut self, end: u64) -> Result<(), SttError> {
+        if self.shared.fenced()
+            || !self.shared.input_closed.load(Ordering::Acquire)
+            || self.journal.committed_through() != end
+        {
+            return Err(failure(
+                "source completion requires frozen, fully committed input",
+            ));
+        }
+        self.reader
+            .mark_complete(end)
             .map_err(|e| failure(e.to_string()))
     }
     fn demote_local(&mut self, reason: SwitchReason) -> Result<(), SttError> {

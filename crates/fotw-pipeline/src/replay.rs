@@ -14,12 +14,14 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8; 8] = b"FOTWRPL1";
 const MAX_HEADER_BYTES: usize = 4096;
 const SAMPLE_RATE: u32 = 16_000;
+static NEXT_COMPLETION: AtomicU64 = AtomicU64::new(0);
 
 /// Largest catchup read: one second of mono PCM16, independent of outage length.
 pub const MAX_READ_SAMPLES: usize = SAMPLE_RATE as usize;
@@ -35,6 +37,12 @@ pub enum ReplaySource {
 }
 
 impl ReplaySource {
+    fn completion_path(self, dir: &Path) -> PathBuf {
+        dir.join(match self {
+            Self::System => "system.stt-complete.json",
+            Self::Mic => "mic.stt-complete.json",
+        })
+    }
     fn path(self, dir: &Path) -> PathBuf {
         dir.join(match self {
             Self::System => "system.stt16",
@@ -77,6 +85,56 @@ struct Header {
     first_sample: u64,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Completion {
+    schema: u8,
+    session_id: String,
+    source: ReplaySource,
+    first_sample: u64,
+    through_sample: u64,
+}
+
+fn sync_directory(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// Held across the atomic retirement rename, so another process cannot resume
+/// appending between completion validation and removal. Drop before unlinking.
+pub(crate) struct ReplayRetirementGuard {
+    _owners: Vec<OwnerLock>,
+}
+
+pub(crate) fn retirement_guard(
+    dir: &Path,
+    session_id: &str,
+) -> io::Result<Option<ReplayRetirementGuard>> {
+    let mut owners = Vec::new();
+    for source in [ReplaySource::System, ReplaySource::Mic] {
+        if !source.path(dir).try_exists()? {
+            if source.completion_path(dir).try_exists()? {
+                return Err(invalid("completion proof has no replay audio"));
+            }
+            continue;
+        }
+        let owner = match source.lock(dir) {
+            Ok(owner) => owner,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let reader = ReplayReader::open(dir, session_id, source)?;
+        if !reader.is_complete()? {
+            return Ok(None);
+        }
+        owners.push(owner);
+    }
+    Ok(Some(ReplayRetirementGuard { _owners: owners }))
+}
+
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -87,6 +145,8 @@ pub struct ReplayWriter {
     file: File,
     end_sample: u64,
     failed: bool,
+    dir: PathBuf,
+    source: ReplaySource,
 }
 
 impl ReplayWriter {
@@ -140,6 +200,8 @@ impl ReplayWriter {
             file,
             end_sample: first_sample,
             failed: false,
+            dir: dir.to_owned(),
+            source,
         })
     }
 
@@ -154,7 +216,7 @@ impl ReplayWriter {
             .read(true)
             .write(true)
             .open(source.path(dir))?;
-        let mut reader = ReplayReader::from_file(file, session_id, source)?;
+        let mut reader = ReplayReader::from_file(dir, file, session_id, source)?;
         let length = reader.file.metadata()?.len();
         let audio_bytes = length
             .checked_sub(reader.audio_offset)
@@ -174,6 +236,8 @@ impl ReplayWriter {
             file: reader.file,
             end_sample,
             failed: false,
+            dir: dir.to_owned(),
+            source,
         })
     }
 
@@ -184,10 +248,28 @@ impl ReplayWriter {
     /// must continue independently and surface an incomplete-transcript error.
     pub fn append(&mut self, pcm: &[i16]) -> io::Result<()> {
         self.check_healthy()?;
+        if pcm.is_empty() {
+            return Ok(());
+        }
         let next = self
             .end_sample
             .checked_add(pcm.len() as u64)
             .ok_or_else(|| invalid("replay sample clock overflow"))?;
+        // Invalidate before accepting any new audio. A stale completion must
+        // never authorize retirement of an extended stream, including after a crash.
+        match std::fs::remove_file(self.source.completion_path(&self.dir)) {
+            Ok(()) => {
+                if let Err(error) = sync_directory(&self.dir) {
+                    self.failed = true;
+                    return Err(error);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                self.failed = true;
+                return Err(error);
+            }
+        }
         let mut bytes = [0u8; 2048];
         for chunk in pcm.chunks(bytes.len() / 2) {
             for (sample, encoded) in chunk.iter().zip(bytes.chunks_exact_mut(2)) {
@@ -233,6 +315,7 @@ pub struct ReplayReader {
     file: File,
     header: Header,
     audio_offset: u64,
+    dir: PathBuf,
 }
 
 impl ReplayReader {
@@ -244,10 +327,15 @@ impl ReplayReader {
             .read(true)
             .write(true)
             .open(source.path(dir))?;
-        Self::from_file(file, session_id, source)
+        Self::from_file(dir, file, session_id, source)
     }
 
-    fn from_file(mut file: File, session_id: &str, source: ReplaySource) -> io::Result<Self> {
+    fn from_file(
+        dir: &Path,
+        mut file: File,
+        session_id: &str,
+        source: ReplaySource,
+    ) -> io::Result<Self> {
         if !file.metadata()?.is_file() {
             return Err(invalid("replay is not a regular file"));
         }
@@ -275,6 +363,7 @@ impl ReplayReader {
             file,
             header,
             audio_offset: 12 + length as u64,
+            dir: dir.to_owned(),
         })
     }
 
@@ -282,6 +371,81 @@ impl ReplayReader {
     #[must_use]
     pub const fn first_sample(&self) -> u64 {
         self.header.first_sample
+    }
+
+    /// Persist completion only after input is frozen and inference has durably
+    /// accounted for every saved sample. Partial coverage and torn samples are
+    /// refused. The caller establishes inference coverage; this verifies audio.
+    pub fn mark_complete(&mut self, through_sample: u64) -> io::Result<()> {
+        if !self.aligned()? || through_sample != self.available_end()? {
+            return Err(invalid(
+                "completion must cover the entire aligned replay stream",
+            ));
+        }
+        self.sync_through(through_sample)?;
+        let completion = Completion {
+            schema: 1,
+            session_id: self.header.session_id.clone(),
+            source: self.header.source,
+            first_sample: self.first_sample(),
+            through_sample,
+        };
+        let path = self.header.source.completion_path(&self.dir);
+        let temporary = path.with_extension(format!(
+            "part-{}-{}",
+            std::process::id(),
+            NEXT_COMPLETION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(&serde_json::to_vec(&completion)?)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temporary, &path)?;
+            sync_directory(&self.dir)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(temporary);
+        }
+        result
+    }
+
+    /// Whether a bounded, valid proof matches this source's current saved end.
+    /// This is a status snapshot; retirement also acquires exclusive ownership.
+    pub fn is_complete(&self) -> io::Result<bool> {
+        let file = match File::open(self.header.source.completion_path(&self.dir)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let mut bytes = Vec::new();
+        file.take(MAX_HEADER_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_HEADER_BYTES {
+            return Err(invalid("completion proof exceeds size limit"));
+        }
+        let complete: Completion = serde_json::from_slice(&bytes)?;
+        if complete.schema != 1 {
+            return Err(invalid("unsupported completion proof"));
+        }
+        Ok(self.aligned()?
+            && complete.session_id == self.header.session_id
+            && complete.source == self.header.source
+            && complete.first_sample == self.first_sample()
+            && complete.through_sample == self.available_end()?)
+    }
+
+    fn aligned(&self) -> io::Result<bool> {
+        let length = self
+            .file
+            .metadata()?
+            .len()
+            .checked_sub(self.audio_offset)
+            .ok_or_else(|| invalid("replay header truncated"))?;
+        Ok(length % 2 == 0)
     }
 
     /// Make the prefix ending at `through_sample` durable before journaling a

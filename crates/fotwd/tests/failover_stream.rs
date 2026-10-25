@@ -52,6 +52,186 @@ impl Recognizer for Model {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unavailable_second_local_state_refuses_admission_before_any_cloud_connection() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let factory: Arc<dyn RecognizerFactory> =
+        Arc::new(ReadyOnceFactory(std::sync::atomic::AtomicBool::new(false)));
+    let config = |source| {
+        FailoverConfig::new(
+            DeepgramStreamConfig::new(
+                "fixture-not-a-key",
+                fotw_stt::deepgram::DeepgramConfig::new("placeholder", source),
+            )
+            .with_endpoint(DeepgramEndpoint::loopback(port)),
+            Arc::clone(&factory),
+        )
+    };
+    assert!(
+        fotwd::session::FailoverLegs::prepare(config(Source::System), Some(config(Source::Mic)))
+            .await
+            .is_err()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_pump_recovers_both_tracks_without_losing_original_capture_formats() {
+    use fotw_audio::platform::file::{FileAudioSource, ReplaySpeed};
+    use fotw_audio::{AudioTap, SampleFormat, StreamFormat, TapId};
+    use fotw_pipeline::replay::{ReplayReader, ReplaySource};
+    use fotwd::session::{self, FailoverLegs, Transcription};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let accepts = Arc::clone(&accepted);
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            accepts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0; 1];
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 8_192);
+            }
+            socket
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        }
+    });
+    let config = |source| {
+        let cloud = DeepgramStreamConfig::new(
+            "fixture-not-a-key",
+            fotw_stt::deepgram::DeepgramConfig::new("placeholder", source),
+        )
+        .with_endpoint(DeepgramEndpoint::loopback(port));
+        FailoverConfig::new(cloud, Arc::new(Factory))
+    };
+    let legs = FailoverLegs::prepare(config(Source::System), Some(config(Source::Mic)))
+        .await
+        .unwrap();
+    // Preparing local states must not open either cloud connection.
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 0);
+    fn tap(rate: u32, channels: u16, source: Source) -> Box<dyn AudioTap> {
+        let samples = (0..rate * 2)
+            .flat_map(|i| {
+                let amplitude = if (i / (rate / 20)).is_multiple_of(2) {
+                    0.1
+                } else {
+                    0.6
+                };
+                let value =
+                    (i as f32 * 440.0 * std::f32::consts::TAU / rate as f32).sin() * amplitude;
+                std::iter::repeat_n(value, channels as usize)
+            })
+            .collect();
+        let id = match source {
+            Source::System => TapId::system_default(),
+            Source::Mic => TapId::mic("fixture-mic"),
+        };
+        Box::new(FileAudioSource::from_wav(
+            id,
+            fotw_audio::wav::WavData {
+                format: StreamFormat::new(rate, channels, SampleFormat::I16),
+                samples,
+            },
+            ReplaySpeed::Realtime,
+        ))
+    }
+    let root = tempfile::tempdir().unwrap();
+    let outcome = session::run(
+        root.path(),
+        tap(48_000, 2, Source::System),
+        Some(tap(44_100, 1, Source::Mic)),
+        Transcription::Failover(Box::new(legs)),
+        Duration::from_millis(1_200),
+    )
+    .await
+    .unwrap();
+    server.await.unwrap();
+    let state = fotw_pipeline::wal::SessionState::read(&outcome.dir).unwrap();
+    assert!(state.is_finalized());
+    assert_eq!(
+        state.manifest.system_format,
+        Some(fotw_pipeline::wal::TrackFormat::new(48_000, 2))
+    );
+    assert_eq!(
+        state.manifest.mic_format,
+        Some(fotw_pipeline::wal::TrackFormat::new(44_100, 1))
+    );
+    assert_eq!(
+        std::fs::metadata(outcome.dir.join("system.pcm"))
+            .unwrap()
+            .len(),
+        outcome.system_samples * 2
+    );
+    assert_eq!(
+        std::fs::metadata(outcome.dir.join("mic.pcm"))
+            .unwrap()
+            .len(),
+        outcome.mic_samples * 2
+    );
+    assert!(outcome.system_samples > 48_000);
+    assert!(outcome.mic_samples > 22_050);
+    let session_id = outcome.dir.file_name().unwrap().to_str().unwrap();
+    for (source, replay_source) in [
+        (Source::System, ReplaySource::System),
+        (Source::Mic, ReplaySource::Mic),
+    ] {
+        let finals: Vec<_> = outcome
+            .segments
+            .iter()
+            .filter(|segment| segment.source == source)
+            .collect();
+        assert!(
+            !finals.is_empty(),
+            "no local result for {source:?}: {:?}",
+            outcome.stt_errors
+        );
+        assert!(
+            finals
+                .iter()
+                .all(|s| s.provider == fotw_stt::local::PROVIDER)
+        );
+        let mut reader = ReplayReader::open(&outcome.dir, session_id, replay_source).unwrap();
+        assert!(reader.is_complete().unwrap());
+        let mut cursor = reader.first_sample();
+        let mut canonical = Vec::new();
+        loop {
+            let chunk = reader.read_from(cursor, 16_000).unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            cursor += chunk.len() as u64;
+            canonical.extend(chunk);
+        }
+        assert!(
+            canonical
+                .iter()
+                .filter(|sample| sample.unsigned_abs() > 10)
+                .count()
+                * 10
+                > canonical.len() * 8,
+            "{source:?} canonical replay replaced original speech with echo-gate silence"
+        );
+        let journal = CoverageJournal::open(&outcome.dir, session_id, source).unwrap();
+        assert_eq!(journal.current_epoch().reason, Some(SwitchReason::Auth));
+        assert!(
+            finals
+                .iter()
+                .all(|segment| segment.session_id == session_id)
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auth_handoff_replays_more_than_thirty_seconds_and_preserves_the_session_clock() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -121,6 +301,16 @@ async fn auth_handoff_replays_more_than_thirty_seconds_and_preserves_the_session
     assert_eq!(
         stream.status().committed_sample,
         137 * 16 + pcm.len() as u64
+    );
+    assert!(
+        fotw_pipeline::replay::ReplayReader::open(
+            dir.path(),
+            "s",
+            fotw_pipeline::replay::ReplaySource::System
+        )
+        .unwrap()
+        .is_complete()
+        .unwrap()
     );
     server.await.unwrap();
     drop(stream);
@@ -256,6 +446,16 @@ async fn stop_is_bounded_and_fences_a_native_result_that_returns_after_its_deadl
     drop(stream);
     let pending = CoverageJournal::open(dir.path(), "s", Source::System).unwrap();
     assert_eq!(pending.committed_through(), 0);
+    assert!(
+        !fotw_pipeline::replay::ReplayReader::open(
+            dir.path(),
+            "s",
+            fotw_pipeline::replay::ReplaySource::System
+        )
+        .unwrap()
+        .is_complete()
+        .unwrap()
+    );
 }
 
 async fn silent_provider() -> (

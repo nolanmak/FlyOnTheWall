@@ -898,6 +898,40 @@ impl LocalLegs {
     }
 }
 
+/// Both local states prepared before capture admission. Configuration fields stay
+/// private so a recording cannot bypass native-state readiness.
+pub struct FailoverLegs {
+    system: crate::failover::stream::PreparedSource,
+    mic: Option<crate::failover::stream::PreparedSource>,
+}
+
+impl FailoverLegs {
+    /// Prepare each configured source before starting any audio tap or cloud
+    /// connection. Failure drops already prepared states and refuses admission.
+    pub async fn prepare(
+        system: crate::failover::stream::FailoverConfig,
+        mic: Option<crate::failover::stream::FailoverConfig>,
+    ) -> Result<Self, fotw_stt::SttError> {
+        if system.cloud.normalizer.source != Source::System
+            || mic
+                .as_ref()
+                .is_some_and(|c| c.cloud.normalizer.source != Source::Mic)
+        {
+            return Err(fotw_stt::SttError::new(
+                fotw_stt::SttErrorClass::BadRequest,
+                "handoff",
+                "fallback source configuration does not match its capture track",
+            ));
+        }
+        let system = crate::failover::stream::FailoverStream::prepare(system).await?;
+        let mic = match mic {
+            Some(config) => Some(crate::failover::stream::FailoverStream::prepare(config).await?),
+            None => None,
+        };
+        Ok(Self { system, mic })
+    }
+}
+
 /// Whether the mic leg should be transcribed, from `FOTW_MIC_STT`.
 ///
 /// Unset means on. Only the documented `off` and the spellings muscle memory
@@ -1227,6 +1261,8 @@ pub enum Transcription {
     Deepgram(DeepgramLegs),
     /// Transcribe on this machine as the meeting runs, one worker per leg.
     Local(LocalLegs),
+    /// Prefer cloud and durably finish pending speech locally after a bounded outage.
+    Failover(Box<FailoverLegs>),
 }
 
 impl Transcription {
@@ -1236,6 +1272,7 @@ impl Transcription {
             Self::Disabled => false,
             Self::Deepgram(legs) => legs.mic.is_some(),
             Self::Local(legs) => legs.mic.is_some(),
+            Self::Failover(legs) => legs.mic.is_some(),
         }
     }
 }
@@ -1246,6 +1283,7 @@ impl std::fmt::Debug for Transcription {
             Self::Disabled => write!(f, "Disabled"),
             Self::Deepgram(_) => write!(f, "Deepgram(..)"),
             Self::Local(_) => write!(f, "Local(..)"),
+            Self::Failover(_) => write!(f, "Failover(..)"),
         }
     }
 }
@@ -1677,16 +1715,28 @@ pub async fn run_with_control(
         .expect("session directory")
         .to_string_lossy()
         .into_owned();
-    let (sys_stt, sys_events, mic_stt, mic_events) =
-        open_legs(transcription, &session_id, anchors, mic_format.is_some());
+    let (sys_stt, sys_events, mic_stt, mic_events) = open_legs(
+        transcription,
+        &dir,
+        &session_id,
+        anchors,
+        mic_format.is_some(),
+        control.errors.clone(),
+    )
+    .await;
 
     let stop = Arc::new(AtomicBool::new(false));
     let pump_stop = Arc::clone(&stop);
     let feeds = SttFeeds {
         system: sys_stt.clone().map(|s| s as Arc<dyn PcmFeed>),
         mic: mic_stt.clone().map(|s| s as Arc<dyn PcmFeed>),
+        // Durable replay must retain original near-end speech, including
+        // speaker overlap. The suppressive gate substitutes silence and cannot
+        // run before the canonical spool; genuine AEC is a separate stage.
         echo_gate: (sys_stt.is_some()
             && mic_stt.is_some()
+            && !sys_stt.as_ref().is_some_and(|s| s.requires_original_pcm())
+            && !mic_stt.as_ref().is_some_and(|s| s.requires_original_pcm())
             && echo_gate_enabled(std::env::var("FOTW_ECHO_GATE").ok().as_deref()))
         .then(|| fotw_pipeline::echo::EchoGate::new(16_000)),
     };
@@ -2070,16 +2120,28 @@ pub async fn run_supervised(
         .expect("session directory")
         .to_string_lossy()
         .into_owned();
-    let (sys_stt, sys_events, mic_stt, mic_events) =
-        open_legs(transcription, &session_id, anchors, true);
+    let (sys_stt, sys_events, mic_stt, mic_events) = open_legs(
+        transcription,
+        &dir,
+        &session_id,
+        anchors,
+        true,
+        control.errors.clone(),
+    )
+    .await;
 
     let stop = Arc::new(AtomicBool::new(false));
     let pump_stop = Arc::clone(&stop);
     let feeds = SttFeeds {
         system: sys_stt.clone().map(|s| s as Arc<dyn PcmFeed>),
         mic: mic_stt.clone().map(|s| s as Arc<dyn PcmFeed>),
+        // Durable replay must retain original near-end speech, including
+        // speaker overlap. The suppressive gate substitutes silence and cannot
+        // run before the canonical spool; genuine AEC is a separate stage.
         echo_gate: (sys_stt.is_some()
             && mic_stt.is_some()
+            && !sys_stt.as_ref().is_some_and(|s| s.requires_original_pcm())
+            && !mic_stt.as_ref().is_some_and(|s| s.requires_original_pcm())
             && echo_gate_enabled(std::env::var("FOTW_ECHO_GATE").ok().as_deref()))
         .then(|| fotw_pipeline::echo::EchoGate::new(16_000)),
     };
@@ -2372,9 +2434,18 @@ trait PcmFeed: Send + Sync {
 enum LegStream {
     Deepgram(DeepgramStream),
     Local(LocalStream),
+    Failover {
+        stream: crate::failover::stream::FailoverStream,
+        errors: SttErrors,
+        write_failed: AtomicBool,
+    },
 }
 
 impl LegStream {
+    fn requires_original_pcm(&self) -> bool {
+        matches!(self, Self::Failover { .. })
+    }
+
     /// Let the engine finish what it has heard, then close it.
     ///
     /// Deepgram is asked to finalize first so the utterance in flight is not
@@ -2390,6 +2461,19 @@ impl LegStream {
             Self::Local(stream) => {
                 let _ = stream.close().await;
             }
+            Self::Failover { stream, errors, .. } => {
+                if !stream.finish().await {
+                    let status = stream.status();
+                    errors.record(format!(
+                        "transcription incomplete: {} samples pending; {}",
+                        status.lag_samples,
+                        status
+                            .error
+                            .as_deref()
+                            .unwrap_or("native cleanup outstanding")
+                    ));
+                }
+            }
         }
     }
 }
@@ -2399,6 +2483,19 @@ impl PcmFeed for LegStream {
         match self {
             Self::Deepgram(stream) => stream.write(pcm),
             Self::Local(stream) => stream.write(pcm),
+            Self::Failover {
+                stream,
+                errors,
+                write_failed,
+            } => {
+                if let Err(error) = stream.write(pcm)
+                    && !write_failed.swap(true, Ordering::AcqRel)
+                {
+                    errors.record(format!(
+                        "canonical transcription input failed; original audio retained: {error}"
+                    ));
+                }
+            }
         }
     }
 }
@@ -2423,11 +2520,13 @@ type OpenLegs = (
 /// The mic leg is additionally gated on the mic tap having actually started: a
 /// stream for a device that is not there would be fed nothing — and, for
 /// Deepgram, still billed for the socket.
-fn open_legs(
+async fn open_legs(
     transcription: Transcription,
+    dir: &Path,
     session_id: &str,
     anchors: LegAnchors,
     mic_started: bool,
+    errors: SttErrors,
 ) -> OpenLegs {
     match transcription {
         Transcription::Disabled => (None, None, None, None),
@@ -2460,6 +2559,68 @@ fn open_legs(
                 _ => (None, None),
             };
             (Some(Arc::new(LegStream::Local(s))), Some(s_rx), m, m_rx)
+        }
+        Transcription::Failover(legs) => {
+            let FailoverLegs { system, mic } = *legs;
+            let system =
+                open_failover_source(system, dir, session_id, anchors.system_ms, errors.clone())
+                    .await;
+            let mic = match mic {
+                Some(config) if mic_started => {
+                    open_failover_source(config, dir, session_id, anchors.mic_ms, errors).await
+                }
+                _ => (None, None),
+            };
+            (system.0, system.1, mic.0, mic.1)
+        }
+    }
+}
+
+async fn open_failover_source(
+    prepared: crate::failover::stream::PreparedSource,
+    dir: &Path,
+    session_id: &str,
+    offset_ms: u64,
+    errors: SttErrors,
+) -> (Option<Arc<LegStream>>, Option<LegEvents>) {
+    match prepared.open(dir, session_id, offset_ms).await {
+        Ok((stream, mut events)) => {
+            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let notices = errors.clone();
+            tokio::spawn(async move {
+                while let Some(event) = events.recv().await {
+                    match event {
+                        crate::failover::stream::Event::Transcript(event) => {
+                            if sender.send(event).is_err() {
+                                break;
+                            }
+                        }
+                        crate::failover::stream::Event::ProviderSwitch(epoch) => {
+                            notices.record(format!(
+                                "transcription switched to {} / {} at {} ms ({:?})",
+                                epoch.engine.provider,
+                                epoch.engine.model,
+                                epoch.from_sample / 16,
+                                epoch.reason
+                            ));
+                        }
+                    }
+                }
+            });
+            (
+                Some(Arc::new(LegStream::Failover {
+                    stream,
+                    errors,
+                    write_failed: AtomicBool::new(false),
+                })),
+                Some(receiver),
+            )
+        }
+        Err(error) => {
+            errors.record(format!(
+                "durable fallback source unavailable; original audio retained: {error}"
+            ));
+            (None, None)
         }
     }
 }
