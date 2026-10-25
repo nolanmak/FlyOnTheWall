@@ -467,12 +467,7 @@ function renderDetail(detail) {
   transcript.appendChild(text("p", "Time since first speech", "meta"));
   const body = document.createElement("div");
   body.id = "segments";
-  let lastSpeaker = null;
-  const origin = speechOrigin(detail.segments);
-  for (const seg of orderedSegments(detail.segments)) {
-    body.appendChild(segmentRow(seg.channel, seg.start_ms - origin, seg.speaker, seg.text, lastSpeaker));
-    lastSpeaker = seg.speaker || lastSpeaker;
-  }
+  mountSavedTranscript(transcript, body, detail.segments);
   transcript.appendChild(body);
   el.detail.appendChild(transcript);
   paintLiveNavigation();
@@ -577,6 +572,66 @@ function segmentRow(channel, startMs, speaker, words, lastSpeaker) {
   }
   line.appendChild(text("span", words, "words"));
   return line;
+}
+
+// Page saved history rather than attaching a whole meeting to the layout tree.
+// The complete immutable detail still backs copy/export; each page uses the
+// same first-speech origin. Stable controls preserve keyboard focus on changes.
+function mountSavedTranscript(section, body, segments) {
+  const ordered = orderedSegments(segments), origin = ordered[0]?.start_ms ?? 0;
+  const pageSize = 200, pages = Math.ceil(ordered.length / pageSize);
+  let page = 0, controls, field, previous, next, range;
+  const paint = () => {
+    clear(body);
+    let lastSpeaker = null;
+    const start = page * pageSize, end = Math.min(start + pageSize, ordered.length);
+    for (let index = start; index < end; index++) {
+      const seg = ordered[index];
+      body.appendChild(segmentRow(seg.channel, seg.start_ms - origin, seg.speaker, seg.text, lastSpeaker));
+      lastSpeaker = seg.speaker || lastSpeaker;
+    }
+    if (controls) {
+      field.value = String(page + 1);
+      // Disabling a focused button can clear focus in WebKit. Transfer it
+      // before updating boundary state; ordinary page changes keep focus.
+      if ((page === 0 && document.activeElement === previous)
+          || (page === pages - 1 && document.activeElement === next)) field.focus();
+      previous.disabled = page === 0;
+      next.disabled = page === pages - 1;
+      range.textContent = "Lines " + (start + 1) + "–" + end + " of " + ordered.length
+        + " · " + offset(ordered[start].start_ms - origin) + "–" + offset(ordered[end - 1].start_ms - origin);
+    }
+  };
+  const select = requested => {
+    if (!Number.isFinite(requested) || !Number.isInteger(requested)) { field.value = String(page + 1); return; }
+    const selected = Math.max(0, Math.min(pages - 1, requested));
+    if (selected === page) { field.value = String(page + 1); return; }
+    page = selected; paint();
+    controls.scrollIntoView({block: "nearest"});
+  };
+  if (pages > 1) {
+    controls = text("nav", "", "transcript-pages");
+    controls.setAttribute("aria-label", "Saved transcript pages");
+    previous = text("button", "Previous"); previous.type = "button";
+    previous.setAttribute("aria-label", "Previous transcript page");
+    next = text("button", "Next"); next.type = "button";
+    next.setAttribute("aria-label", "Next transcript page");
+    const label = text("label", "Page ");
+    field = document.createElement("input"); field.type = "number";
+    field.min = "1"; field.max = String(pages); field.step = "1";
+    field.setAttribute("aria-label", "Transcript page");
+    label.appendChild(field); label.appendChild(text("span", " of " + pages));
+    range = text("p", "", "meta"); range.setAttribute("role", "status");
+    field.addEventListener("change", () => select(field.value.trim() === "" ? NaN : Number(field.value) - 1));
+    field.addEventListener("keydown", event => {
+      if (event.key === "Enter") { event.preventDefault(); select(field.value.trim() === "" ? NaN : Number(field.value) - 1); }
+    });
+    previous.addEventListener("click", () => select(page - 1));
+    next.addEventListener("click", () => select(page + 1));
+    for (const child of [previous, label, next, range]) controls.appendChild(child);
+    section.appendChild(controls);
+  }
+  paint();
 }
 
 // ------------------------------------------------------------------ data

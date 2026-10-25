@@ -97,3 +97,65 @@ UI tests passed. Timing is one owned synthetic run, not a hardware-wide latency
 guarantee. This validates partial updates only: saved full-transcript rendering,
 long-history memory, final-arrival trimming while reading, active-window keyboard
 and zoom acceptance remain open for #123.
+
+
+## Saved transcript paging
+
+Saved meetings now render 200 lines at a time with Previous/Next and a labeled
+page number. The range states both line numbers and speech-relative times. All
+lines remain reachable in order, page changes retain the same controls for
+keyboard focus, and each page keeps the full meeting's original speech origin.
+Short meetings retain their single transcript surface. Copy/export still uses
+the complete source detail, including lines outside the current page; browser
+Find searches the mounted page, while the existing meeting search indexes all
+saved text. Paging does not reduce the complete source data held for copy.
+
+The runtime regression first failed because opening 4,001 lines constructed all
+rows and there was no keyboard-accessible page selector. It now traverses every
+page, verifies exact ordered coverage, bounds row construction for each action,
+checks full copy, original input identity, invalid input, short/empty meetings,
+and stable control identity. All 130 UI tests and full local `just ci` pass.
+
+An owned nonpersistent, nonactivating WKWebView on macOS 26.4 loaded the actual
+UI from a temporary encrypted `ui_preview` library. The in-memory fixture
+replaced the selected synthetic meeting's segments with 12,001 long Unicode
+lines; notes, GitHub and document cards were isolated from asynchronous requests.
+The committed [browser fixture](../crates/fotw-web/tests/fixtures/saved-transcript-webkit.js)
+measures real element construction and forced layout, reaches the final page,
+checks full copy, preserves the 600:00 final offset, and sends a native Tab only
+to its own window. Baseline `renderDetail` came from commit
+895a5adeab7cd43f6980ef52bb98197e8189c4d7. No capture, models, provider access,
+clipboard, global input or user library was involved.
+
+| 12,001-line opening, one 390px light run | Before | After |
+| --- | ---: | ---: |
+| Created elements, including detail chrome | 48,016 | 819 |
+| Attached transcript rows | 12,001 | 200 |
+| Script plus forced layout | 659 ms | 41 ms |
+
+These timings describe one fixture run, not a general latency guarantee or a
+process-memory measurement. The final six width/appearance checks and actual
+200% WebKit page zoom passed; the latter exposed a search-field minimum width
+that was corrected to fit its available space. A CSS `zoom` experiment was
+replaced with real `WKWebView.pageZoom` so responsive media queries were tested
+at the correct effective viewport. The first preview readiness probe timed out
+before exercising the renderer; subsequent fresh one-use launches completed.
+
+[All measured results](dashboard-refresh/saved-transcript-results.json),
+[390px light](dashboard-refresh/saved-transcript-390-light.png),
+[1440px dark](dashboard-refresh/saved-transcript-1440-dark.png), and
+[390px at 200% page zoom](dashboard-refresh/saved-transcript-390-pagezoom.png)
+record the final candidate. Native Tab selected Next and page changes retained
+the focused field. This non-key window does not match `:focus-visible`, so it
+cannot prove active-window focus-ring acceptance; no activation was attempted.
+The existing focus rule remains. Long-history process memory/GC, active-window
+keyboard/screen-reader acceptance, and the full live recording/zoom matrix remain
+open for #123. All owned fixture processes and temporary libraries were removed.
+
+Review followup: a behavioral RED reproduced losing control focus when Next or
+Previous became disabled at a page boundary. The renderer now moves focus to
+the page field before disabling the activated button. The native fixture
+confirms both boundaries in every final width/appearance/zoom run, and the
+runtime copy assertion checks all 4,001 copied lines in order. The browser
+fixture is a standard async function; pass its source followed by
+`return await runSavedTranscriptFixture();` to `WKWebView.callAsyncJavaScript`.

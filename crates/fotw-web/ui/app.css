@@ -72,7 +72,7 @@ h1 {
 #search {
   flex: 1;
   padding: 10px 14px;
-  min-width: 180px;
+  min-width: min(180px, 100%);
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--bg);
@@ -348,6 +348,21 @@ button, summary { min-height: 36px; }
 .segment .words {
   grid-column: 3;
 }
+
+.transcript-pages {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  overflow: visible;
+}
+.transcript-pages label { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.transcript-pages input { width: 5rem; min-width: 0; }
+.transcript-pages .meta { flex-basis: 100%; margin: 0; }
 
 /* The user's own lines (#64). A tinted band rather than bold text: bolding
    alone disappears in a long transcript, and the band reads at a glance
