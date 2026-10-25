@@ -8,6 +8,7 @@
 
 #![warn(missing_docs)]
 
+pub mod capture_clock;
 pub mod echo;
 pub mod opus;
 pub mod promote;

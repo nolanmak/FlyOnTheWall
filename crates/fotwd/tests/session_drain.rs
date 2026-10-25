@@ -153,13 +153,13 @@ impl AudioTap for NeverStoppingTap {
 /// Ten milliseconds of 48 kHz stereo: what the fixture delivers while healthy.
 const BLOCK_SAMPLES: usize = 960;
 
-/// What the runaway delivers instead: a whole ring at a time.
+/// What the runaway delivers instead: half a ring at a time.
 ///
 /// `session.rs` sizes the ring at ten seconds of 48 kHz stereo. Pushing that
-/// much per call is what makes the fixture *deterministically* faster than the
-/// pump: a producer that merely kept pace would leave the ring empty between
-/// passes, and an empty ring is the one case the pump always handled.
-const RUNAWAY_SAMPLES: usize = 48_000 * 2 * 10;
+/// much per call makes the producer faster than the pump. Capture sinks admit
+/// only whole callbacks: a ring-sized callback would be dropped whenever even
+/// one healthy sample remained, so it could not establish an abandoned tail.
+const RUNAWAY_SAMPLES: usize = 48_000 * 2 * 5;
 
 /// How long the runaway pauses between deliveries.
 const RUNAWAY_PACE: Duration = Duration::from_micros(200);
@@ -188,17 +188,23 @@ struct RelentlessTap {
     /// Blocks delivered since `stop()`, so `stop()` can wait for the runaway
     /// to be genuinely under way before it answers.
     runaway: Arc<AtomicU64>,
-    worker: Option<std::thread::JoinHandle<()>>,
+    worker: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 
 impl RelentlessTap {
+    fn guard(&self) -> RunawayOwner {
+        RunawayOwner {
+            released: self.released.clone(),
+            worker: self.worker.clone(),
+        }
+    }
     fn new() -> Self {
         Self {
             id: TapId::system_default(),
             stopped: Arc::new(AtomicBool::new(false)),
             released: Arc::new(AtomicBool::new(false)),
             runaway: Arc::new(AtomicU64::new(0)),
-            worker: None,
+            worker: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -217,7 +223,7 @@ impl AudioTap for RelentlessTap {
         let stopped = Arc::clone(&self.stopped);
         let released = Arc::clone(&self.released);
         let runaway = Arc::clone(&self.runaway);
-        self.worker = Some(std::thread::spawn(move || {
+        *self.worker.lock().unwrap() = Some(std::thread::spawn(move || {
             // Audible, so the leg does not additionally report itself silent
             // and muddy the assertion about the abandoned tail.
             let wave = |n: usize| -> Vec<f32> {
@@ -268,11 +274,18 @@ impl AudioTap for RelentlessTap {
     }
 }
 
-impl Drop for RelentlessTap {
+// The test owns the callback worker beyond the tap's acknowledged teardown.
+// Dropping the tap used to stop callbacks before the pump saw its stop latch,
+// making the purported runaway fixture race a perfectly healthy empty ring.
+struct RunawayOwner {
+    released: Arc<AtomicBool>,
+    worker: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
+}
+impl Drop for RunawayOwner {
     fn drop(&mut self) {
         self.released.store(true, Ordering::Relaxed);
-        if let Some(w) = self.worker.take() {
-            let _ = w.join();
+        if let Some(worker) = self.worker.lock().unwrap().take() {
+            worker.join().unwrap();
         }
     }
 }
@@ -399,14 +412,14 @@ async fn a_wedged_close_frees_the_recorder_for_the_next_meeting() {
 async fn a_pump_that_gives_up_draining_reports_the_tail_it_dropped() {
     let root = tmpdir("relentless");
     let tap = RelentlessTap::new();
-    let released = Arc::clone(&tap.released);
+    let runaway_owner = tap.guard();
     let mut control = SessionControl::new();
     control.deadlines = FinishDeadlines {
         // Effectively "as soon as the pump notices". The rings are saturated
         // at that moment — `RelentlessTap::stop` does not answer until they
         // are — so the abandoned tail is guaranteed rather than hoped for,
         // and the fixture writes a megabyte rather than a gigabyte.
-        drain: Duration::from_millis(1),
+        drain: Duration::ZERO,
         ..FinishDeadlines::default()
     };
     let ready = control.ready.clone();
@@ -420,7 +433,7 @@ async fn a_pump_that_gives_up_draining_reports_the_tail_it_dropped() {
     stop.stop();
 
     let ended = finished.recv_timeout(Duration::from_secs(20));
-    released.store(true, Ordering::Relaxed);
+    drop(runaway_owner);
 
     let outcome = ended
         .expect("a tap that kept delivering after stop() wedged the pump (#85)")

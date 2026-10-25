@@ -1856,6 +1856,7 @@ pub async fn run_with_control(
     // clock; the handle is dropped, so a pump still inside a syscall nothing
     // can cancel is detached rather than waited for.
     let (pump_done, pump_counts) = tokio::sync::oneshot::channel();
+    let pump_clock = control.ready.clone();
     let _pump = std::thread::spawn(move || {
         let counts = pump_loop(
             wal,
@@ -1865,6 +1866,7 @@ pub async fn run_with_control(
             mic_format,
             feeds,
             PumpStop {
+                capture: Some(&pump_clock),
                 stopped: &pump_stop,
                 drain: deadlines.drain,
             },
@@ -2312,6 +2314,7 @@ pub async fn run_supervised(
     // counts come back over a channel so a wedged pump is detached rather than
     // joined, for the same reason as [`run_with_control`] (#85).
     let (pump_done, pump_counts) = tokio::sync::oneshot::channel();
+    let pump_clock = control.ready.clone();
     let _pump = std::thread::spawn(move || {
         let counts = pump_drain(
             wal,
@@ -2321,6 +2324,7 @@ pub async fn run_supervised(
             Some(mic_archive),
             feeds,
             PumpStop {
+                capture: Some(&pump_clock),
                 stopped: &pump_stop,
                 drain: deadlines.drain,
             },
@@ -2813,12 +2817,31 @@ struct SttFeeds {
 /// means anything alone — a latch with nothing bounding it is #85, and a
 /// deadline with no latch is nothing at all.
 struct PumpStop<'a> {
+    /// Original live clock, shared with the accepted Stop request.
+    capture: Option<&'a ReadySignal>,
     /// Tripped by the session once the taps have been asked to close.
     stopped: &'a AtomicBool,
     /// How long the pump keeps draining after it *notices*, rather than after
     /// the store: the session cannot know when the pump will next look, so the
     /// clock has to start on the pump's side.
     drain: Duration,
+}
+
+impl PumpStop<'_> {
+    fn checkpoint(&self, wal: &mut SessionWal) -> Result<(), String> {
+        if let Some(capture) = self.capture {
+            // Sample now before observing Stop: a concurrent first Stop cannot
+            // be earlier than a live checkpoint sampled after that observation.
+            let now = crate::recording::now_ms();
+            let stop = capture.capture_ended_at_ms();
+            let elapsed = stop
+                .unwrap_or(now)
+                .saturating_sub(wal.manifest().started_at_ms);
+            wal.checkpoint_capture(elapsed, stop.is_some())
+                .map_err(|e| format!("capture clock checkpoint failed: {e}"))?;
+        }
+        Ok(())
+    }
 }
 
 /// A drain deadline the pump's tests are not meant to reach.
@@ -2949,6 +2972,8 @@ fn pump_drain(
     stop: PumpStop<'_>,
     mut supervision: Option<Supervision>,
 ) -> Result<PumpCounts, String> {
+    stop.checkpoint(&mut wal)?;
+    let mut last_capture_checkpoint = Instant::now();
     let mut scratch = vec![0.0f32; 48_000];
     let (mut sys_written, mut mic_written) = (0u64, 0u64);
     // What a suppressed mic chunk is fed as. Kept across iterations because
@@ -3093,6 +3118,11 @@ fn pump_drain(
             transcription.feed(LegChannel::Mic, pcm)?;
         }
 
+        if last_capture_checkpoint.elapsed() >= Duration::from_secs(2) {
+            stop.checkpoint(&mut wal)?;
+            last_capture_checkpoint = Instant::now();
+        }
+
         match drain_by {
             // Still recording. Nothing to do but wait for more audio.
             None if !moved => std::thread::sleep(IDLE_POLL),
@@ -3136,6 +3166,7 @@ fn pump_drain(
             transcription.feed(LegChannel::Mic, &tail)?;
         }
     }
+    stop.checkpoint(&mut wal)?;
     wal.flush().map_err(|e| format!("flush failed: {e}"))?;
     // Finalize stamps `ended_at_ms`. Without it every cleanly-ended meeting
     // looks crashed and reappears in the recovery list forever, which trains
@@ -3422,6 +3453,7 @@ mod pump_clock_tests {
             Some(capture_format()),
             feeds,
             PumpStop {
+                capture: None,
                 stopped: &stop,
                 drain: GENEROUS_DRAIN,
             },
@@ -3680,6 +3712,47 @@ mod pump_clock_tests {
         );
     }
 
+    #[test]
+    fn pump_persists_original_stop_clock_before_later_finalization() {
+        let root = tmp_root("capture-clock");
+        let wal = SessionWal::create(&root, CAPTURE_RATE, CHANNELS).unwrap();
+        let dir = wal.dir().to_owned();
+        let start = wal.manifest().started_at_ms;
+        let ready = ReadySignal::default();
+        ready.signal_capture(wal.manifest().id.clone(), start);
+        ready.signal_capture_stopped(start + 25);
+        ready.signal_capture_stopped(start + 9999);
+        let (mut producer, system) = AudioRing::with_capacity_frames(4096);
+        producer.push_block(&[0.25; 960]);
+        let (_producer, mic) = AudioRing::with_capacity_frames(4096);
+        let stopped = AtomicBool::new(true);
+        pump_loop(
+            wal,
+            system,
+            mic,
+            capture_format(),
+            Some(capture_format()),
+            SttFeeds {
+                system: None,
+                mic: None,
+                echo_gate: None,
+            },
+            PumpStop {
+                capture: Some(&ready),
+                stopped: &stopped,
+                drain: GENEROUS_DRAIN,
+            },
+        )
+        .unwrap();
+        let snapshot = fotw_pipeline::capture_clock::CaptureOwner::recover(&dir)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(snapshot.frozen_capture_clock(), Some((start, start + 25)));
+        assert_eq!(snapshot.checkpoint.system_bytes, 1920);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// Ring drops were counted and then thrown away: the pump returned a
     /// hardcoded zero, so mic frames lost at a full ring reached no field, no
     /// log line and no human (#79).
@@ -3711,6 +3784,7 @@ mod pump_clock_tests {
                 echo_gate: None,
             },
             PumpStop {
+                capture: None,
                 stopped: &stop,
                 drain: GENEROUS_DRAIN,
             },
@@ -3798,6 +3872,7 @@ mod pump_drain_tests {
             Some(capture_format()),
             no_feeds(),
             PumpStop {
+                capture: None,
                 stopped: &stop,
                 drain: Duration::ZERO,
             },
@@ -3844,6 +3919,7 @@ mod pump_drain_tests {
             Some(capture_format()),
             no_feeds(),
             PumpStop {
+                capture: None,
                 stopped: &stop,
                 drain: GENEROUS_DRAIN,
             },
@@ -4220,6 +4296,7 @@ mod supervised_recovery_tests {
                 echo_gate: None,
             },
             PumpStop {
+                capture: None,
                 stopped: &stop,
                 drain: GENEROUS_DRAIN,
             },
@@ -4570,6 +4647,7 @@ mod supervised_recovery_tests {
                         echo_gate: None,
                     },
                     PumpStop {
+                        capture: None,
                         stopped: &stopped,
                         drain: GENEROUS_DRAIN,
                     },
