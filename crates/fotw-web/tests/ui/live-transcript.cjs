@@ -10,6 +10,7 @@ function harness(notes) {
     get textContent(){return (this.ownText||'')+this.children.map(c=>c.textContent).join('');}
     set textContent(t){this.ownText=String(t);this.children=[];}
     appendChild(n){n.parent=this;this.children.push(n);return n;}
+    insertBefore(n,ref){if(n.parent)n.parent.removeChild(n);const i=ref?this.children.indexOf(ref):this.children.length;this.children.splice(i,0,n);n.parent=this;return n;}
     removeChild(n){this.children.splice(this.children.indexOf(n),1);n.parent=null;}
     remove(){this.parent?.removeChild(this);}
     replaceWith(n){let p=this.parent,i=p.children.indexOf(this);p.children[i]=n;n.parent=p;}
@@ -412,4 +413,25 @@ test('closed local-only streams explain that native cleanup still blocks Start',
  h.ctx.renderRecording({state:'finishing',session_id:'legacy-local',started_at_ms:1000,ended_at_ms:2000,speech_status:[speechStatus({provider:'whispercpp',model:'small.en',state:'closed',epoch:null,from_ms:null,pending_audio_ms:null,worker_running:true})]});
  const panel=h.nodes.get('speech-health');assert.match(panel.textContent,/Start waits for cleanup/);assert.match(panel.textContent,/Coverage not measured/);
  h.ctx.renderRecording({state:'idle'});assert.equal(panel.hidden,true);
+});
+
+
+test('partial updates retain committed rows and do bounded rendering work with long history',()=>{
+ const h=harness();start(h);
+ h.ctx.appendDeltas(Array.from({length:10000},(_,i)=>d(i,17000+i*1000,'line'+i)));
+ h.ctx.appendDeltas([{...d(-1,10018000,'first partial'),is_final:false}]);
+ const body=h.document.getElementById('segments'),first=body.children[0];
+ let rows=0,sortedSamples=0;const render=h.ctx.segmentRow,order=h.ctx.orderedSegments;
+ h.ctx.segmentRow=(...args)=>{rows++;return render(...args);};
+ h.ctx.orderedSegments=segments=>{sortedSamples+=segments.length;return order(segments);};
+ h.nodes.get('detail').scrollTop=20;
+ for(let i=0;i<40;i++)h.ctx.appendDeltas([{...d(-1,10018000,'partial '+i),is_final:false}]);
+ assert.equal(body.children[0],first,'stable committed speech must retain its node');
+ assert.equal(body.children.length,200);
+ assert.equal(rows,40,'only the changing partial should be rendered');
+ assert.equal(sortedSamples,0,'partial updates must not rescan/sort committed history');
+ assert.equal(h.nodes.get('detail').scrollTop,20,'reading position must be retained');
+ assert.match(body.textContent,/partial 39/);
+ assert.match(h.ctx.livePayload().text,/line0\n/,'copy still includes offscreen history');
+ assert.doesNotMatch(h.ctx.livePayload().text,/partial 39/);
 });

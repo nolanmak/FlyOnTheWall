@@ -68,3 +68,32 @@ provider/recovery states, IME/mobile selection and long-transcript performance
 acceptance also remain open. This first visual increment does not close #123.
 The earlier Chrome CDP endpoint returned 404; no Chrome profile or setting was
 changed to obtain these WebKit screenshots.
+
+
+## Incremental live transcript rendering
+
+Partial speech updates reuse the mounted finalized rows and replace only changed
+rows. Committed history is re-sorted when finals change, rather than on each
+partial. The 200-row display budget and complete finalized-only copy source stay
+separate; late earlier finals can still update the displayed speech origin.
+Navigation discards the rendering cache with its DOM.
+
+A synthetic 10,000-segment fixture with 40 changing partials reproduced the old
+behavior before the change. An isolated, nonpersistent WebKit view ran the real
+HTML/CSS/JavaScript against owned loopback static assets, with no app/provider
+credentials, capture, clipboard or global input. Each update forced layout.
+
+| Measured work across 40 partial updates | Before | After |
+| --- | ---: | ---: |
+| Segment rows constructed | 8,000 | 40 |
+| History entries passed through ordering | 800,000 | 0 |
+| Elapsed script and forced layout in this run | 115 ms | 9 ms |
+| Visible segment rows | 200 | 200 |
+
+The fixture retained scrollTop 40, complete copy text (including offscreen first
+and last finals), and excluded the partial from copy. The new runtime regression
+also checks stable final-node identity and bounded rendering work; all 106 Node
+UI tests passed. Timing is one owned synthetic run, not a hardware-wide latency
+guarantee. This validates partial updates only: saved full-transcript rendering,
+long-history memory, final-arrival trimming while reading, active-window keyboard
+and zoom acceptance remain open for #123.
