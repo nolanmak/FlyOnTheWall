@@ -437,17 +437,34 @@ impl<W: Write> OpusOggWriter<W> {
     /// end-of-stream, flush.
     ///
     /// The final granule position is the *true* sample count, not the padded
-    /// one, so a decoder trims the padding back off (RFC 7845 §4.1
+    /// one, so a decoder trims the padding back off (RFC 7845 §4.4
     /// end-trimming). Without that a 1.31-second meeting would play back as
     /// 1.32 seconds, and every duration in the UI would be quietly wrong.
     pub fn finish(mut self) -> Result<OpusStats, OpusError> {
-        // Always emit one final frame, even from an empty `pending`: the Ogg
-        // end-of-stream flag lives on a page, a page needs a packet to carry
-        // it, and end-trimming makes the padding free.
-        let mut frame = std::mem::take(&mut self.pending);
-        frame.resize(self.frame_samples, 0);
+        // Decoding discards pre-skip before returning any real audio. A nearly
+        // full trailing frame therefore needs another packet to release its
+        // delayed samples. Keep an EOS packet even for empty input.
+        let mut tail = std::mem::take(&mut self.pending);
+        let lookahead = (self.pre_skip / self.granule_per_sample) as usize;
+        let frames = (tail.len() + lookahead).div_ceil(self.frame_samples).max(1);
+        tail.resize(frames * self.frame_samples, 0);
         let final_granule = self.pre_skip + self.input_samples * self.granule_per_sample;
-        self.encode_frame(&frame, PacketWriteEndInfo::EndStream, final_granule)?;
+        for (index, frame) in tail.chunks_exact(self.frame_samples).enumerate() {
+            let final_packet = index + 1 == frames;
+            let end = if final_packet {
+                PacketWriteEndInfo::EndStream
+            } else if self.frames_in_page + 1 >= self.frames_per_page {
+                PacketWriteEndInfo::EndPage
+            } else {
+                PacketWriteEndInfo::NormalPacket
+            };
+            let granule = if final_packet {
+                final_granule
+            } else {
+                (self.packets + 1) * self.frame_samples as u64 * self.granule_per_sample
+            };
+            self.encode_frame(frame, end, granule)?;
+        }
         self.ogg.inner_mut().flush()?;
         Ok(self.stats())
     }
@@ -477,7 +494,7 @@ impl<W: Write> OpusOggWriter<W> {
             buf.extend(self.pending.drain(..self.frame_samples));
 
             let consumed = self.consumed_samples();
-            let granule = self.pre_skip + consumed * self.granule_per_sample;
+            let granule = consumed * self.granule_per_sample;
             let end = if self.frames_in_page + 1 >= self.frames_per_page {
                 PacketWriteEndInfo::EndPage
             } else {
