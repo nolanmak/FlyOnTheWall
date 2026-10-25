@@ -250,9 +250,22 @@ impl Manifest {
         }
 
         let bytes = |name: &str| {
-            std::fs::metadata(dir.join(name))
-                .map(|m| m.len())
-                .unwrap_or(0)
+            match std::fs::metadata(dir.join(name)) {
+                Ok(metadata) => metadata.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // Retired PCM still has its original byte counts in the
+                    // completed encode. Preserve the same legacy inference on
+                    // retries instead of treating both legs as empty files.
+                    self.encoded.as_ref().map_or(0, |encoded| {
+                        if name == LEGS[0].0 {
+                            encoded.system.pcm_bytes
+                        } else {
+                            encoded.mic.pcm_bytes
+                        }
+                    })
+                }
+                Err(_) => 0,
+            }
         };
         SessionFormats {
             system,
@@ -739,6 +752,7 @@ pub fn recover(root: impl AsRef<Path>) -> std::io::Result<Vec<SessionState>> {
 /// `.pcm` still holds everything, so the encode can simply be re-run.
 pub fn encode_session(dir: impl AsRef<Path>) -> Result<EncodedSession, OpusError> {
     let dir = dir.as_ref();
+    let _owner = archive_owner(dir)?;
     let mut manifest = read_manifest(dir)?;
 
     // Validate both inputs before opening either output. Retrying an already
@@ -808,18 +822,29 @@ pub fn encode_session(dir: impl AsRef<Path>) -> Result<EncodedSession, OpusError
 
 /// Unlink a session's raw PCM, returning the bytes reclaimed.
 ///
-/// Refuses if the manifest does not record an encode, because the PCM is the
-/// only copy of the meeting until something else demonstrably is. That check
-/// is the difference between "reclaim space" and "lose the meeting".
+/// Requires two verified complete replacement archives and exact retained raw
+/// byte counts. Validates both legs before removing either; extra raw samples,
+/// corrupt archives or a live modern capture/recovery owner prevent deletion.
 pub fn discard_pcm(dir: impl AsRef<Path>) -> std::io::Result<u64> {
     let dir = dir.as_ref();
+    let _owner = archive_owner(dir)?;
     let manifest = read_manifest(dir)?;
-    if manifest.encoded.is_none() {
-        return Err(std::io::Error::new(
+    let encoded = manifest.encoded.as_ref().ok_or_else(|| {
+        std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "refusing to unlink PCM: the manifest records no Opus encode",
-        ));
+        )
+    })?;
+    let formats = manifest.track_formats(dir);
+    // Check BOTH replacement artifacts and raw counts before unlinking either
+    // source. A new tail must be encoded again, never discarded as old audio.
+    for ((_, opus), track, format) in [
+        (LEGS[0], &encoded.system, formats.system),
+        (LEGS[1], &encoded.mic, formats.mic),
+    ] {
+        verify_encoded_track(dir, opus, track, Some(format))?;
     }
+    verify_retained_pcm(dir, encoded)?;
     let mut freed = 0u64;
     for (pcm, _) in LEGS {
         let p = dir.join(pcm);
@@ -831,6 +856,116 @@ pub fn discard_pcm(dir: impl AsRef<Path>) -> std::io::Result<u64> {
         }
     }
     Ok(freed)
+}
+
+/// Refuse retirement of any raw source not exactly covered by the encode.
+pub(crate) fn verify_retained_pcm(dir: &Path, encoded: &EncodedSession) -> std::io::Result<()> {
+    for ((pcm, _), track) in [(LEGS[0], &encoded.system), (LEGS[1], &encoded.mic)] {
+        match std::fs::symlink_metadata(dir.join(pcm)) {
+            Ok(metadata) if metadata.file_type().is_file() && metadata.len() == track.pcm_bytes => {
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "raw audio differs from the completed archive",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Retain modern capture ownership throughout archive mutation. Legacy captures
+/// without this sidecar still require full artifact verification before deletion;
+/// never create a new sidecar as evidence of original recorder ownership.
+pub(crate) fn archive_owner(
+    dir: &Path,
+) -> std::io::Result<Option<crate::capture_clock::CaptureOwner>> {
+    match std::fs::symlink_metadata(dir.join("capture-owner.lock")) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            crate::capture_clock::CaptureOwner::recover(dir).map(Some)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "archive capture ownership is not an ordinary file",
+        )),
+    }
+}
+
+/// Verify the complete artifact against its original input frame count. Callers
+/// bind `track.pcm_bytes` to their checkpoint or retained raw source separately.
+pub(crate) fn verify_encoded_track(
+    dir: &Path,
+    name: &str,
+    track: &EncodedTrack,
+    format: Option<TrackFormat>,
+) -> std::io::Result<()> {
+    let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
+    if track.file != name || !SUPPORTED_RATES.contains(&track.sample_rate_hz) {
+        return Err(invalid("archive does not match its declared source"));
+    }
+    let encoded_frames = if let Some(format) = format {
+        if format.sample_rate_hz == 0
+            || format.channels == 0
+            || !track
+                .pcm_bytes
+                .is_multiple_of(u64::from(format.channels) * 2)
+        {
+            return Err(invalid(
+                "archive source format or frame alignment is invalid",
+            ));
+        }
+        let expected_rate = if SUPPORTED_RATES.contains(&format.sample_rate_hz) {
+            format.sample_rate_hz
+        } else {
+            TARGET_RATE
+        };
+        if track.sample_rate_hz != expected_rate {
+            return Err(invalid("archive encoder rate differs from original format"));
+        }
+        u128::from(track.pcm_bytes / 2 / u64::from(format.channels))
+            * u128::from(track.sample_rate_hz)
+            / u128::from(format.sample_rate_hz)
+    } else if track.pcm_bytes == 0 {
+        0
+    } else {
+        return Err(invalid("nonempty archive has no original source format"));
+    };
+    let expected_ticks = u64::try_from(encoded_frames * u128::from(48000 / track.sample_rate_hz))
+        .map_err(|_| invalid("archive sample count overflow"))?;
+    let path = dir.join(name);
+    if !std::fs::symlink_metadata(&path)?.file_type().is_file() {
+        return Err(invalid("archive must be an ordinary file"));
+    }
+    let mut options = crate::opus::archive_open_options();
+    options.read(true);
+    #[cfg(windows)]
+    options.write(true);
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() || file.metadata()?.len() != track.opus_bytes {
+        return Err(invalid("archive size differs from completion metadata"));
+    }
+    let observed = crate::opus::inspect_complete_archive(
+        (&file).take(
+            track
+                .opus_bytes
+                .checked_add(1)
+                .ok_or_else(|| invalid("archive size overflow"))?,
+        ),
+    )
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if observed.bytes != track.opus_bytes
+        || observed.input_rate_hz != track.sample_rate_hz
+        || observed.pcm_samples_48k != expected_ticks
+        || observed.duration_ms() != track.duration_ms
+    {
+        return Err(invalid("archive timing differs from original audio"));
+    }
+    file.sync_all()
 }
 
 /// Read a session's manifest.

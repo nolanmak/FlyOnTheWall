@@ -87,8 +87,7 @@ and playable interrupted prefixes) and full local `just ci` pass. These tests
 run the actual native codec over synthetic audio without capture, credentials,
 providers or user recordings. The change prevents new archive tails from being
 lost; existing archived bytes are not rewritten or repaired. Archived-input
-verification and finalized-but-unindexed capture recovery remain separate #12
-work.
+verification and finalized-but-unindexed recovery are described below.
 
 ## Archive conversion and retry integrity
 
@@ -105,9 +104,9 @@ manifest. An absent, never-recorded microphone with no archive remains valid.
 On Unix both destination opens also refuse final-component symlinks at open
 time, including a link introduced after preflight. Manifest publication syncs
 the session directory after renaming the synced manifest, before PCM retirement.
-Seven synthetic integration tests and full local `just ci` pass. These checks do
-not establish active-writer exclusion or transactional replacement after an I/O
-failure; complete-archive validation before destructive retirement remains open.
+Seven synthetic integration tests and full local `just ci` pass. Writer exclusion
+and verification before retirement are described below. Transactional replacement
+after an encoding I/O failure remains open.
 
 ## Recovering finalized captures and retired PCM
 
@@ -139,5 +138,30 @@ canonical tails, cancellation, source contention, idempotence and legacy retry.
 The opt-in native fixture uses only the checksum-pinned public JFK WAV and
 cached `small.en` model. Neither fixture establishes physical-device recovery
 or transcription quality. Raw-only/canonical reconstruction, unknown-end and
-legacy unindexed capture admission, and archive verification before destructive
-retirement remain open #12 requirements.
+legacy unindexed capture admission remain open #12 requirements.
+
+## Verification before destructive archive retirement
+
+Raw PCM retirement now decodes and verifies both completed replacement archives
+before unlinking either source. Header rate, complete Ogg/Opus framing, exact
+sample duration and file length must agree with the original frame counts;
+retained raw lengths must match the completed encode exactly. Missing/corrupt
+replacement audio and newly appended or truncated raw samples preserve both
+sources. A healthy repeated retirement remains idempotent.
+
+The same verifier is shared by capture-clock proof and media promotion. Publishing
+checks both source archives before opening media outputs. Directory retirement
+verifies both published native-decoded artifacts, their channel/path/metadata
+identity and retained raw counts before renaming or deleting the session. A
+same-size CRC-corrupt media file no longer passes a size-only check. Existing
+canonical-source completion and database-projection acknowledgements remain
+required independently.
+
+Encoding, publishing and destructive retirement retain the existing modern
+capture lease, so a capture or local recovery worker prevents competing mutation.
+The lease is not manufactured for legacy sessions that have no ownership sidecar.
+Verification uses bounded reusable buffers and runs off the capture callback.
+Tests use synthetic owned recordings; they do not establish physical power-loss
+or device-recovery behavior. Transactional replacement of an existing archive
+after an encoding I/O error, raw/canonical reconstruction and unknown-end capture
+admission remain separate work.

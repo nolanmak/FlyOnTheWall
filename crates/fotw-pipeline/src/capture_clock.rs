@@ -162,58 +162,10 @@ impl CaptureOwner {
                 Err(e) => return Err(e),
             }
             let track = encoded.ok_or_else(|| invalid("retired PCM has no completed archive"))?;
-            if track.file != opus
-                || track.pcm_bytes != count
-                || !crate::opus::SUPPORTED_RATES.contains(&track.sample_rate_hz)
-            {
+            if track.pcm_bytes != count {
                 return Err(invalid("archive does not match checkpointed source"));
             }
-            let encoded_frames = if let Some(format) = format {
-                let expected_rate = if crate::opus::SUPPORTED_RATES.contains(&format.sample_rate_hz)
-                {
-                    format.sample_rate_hz
-                } else {
-                    16000
-                };
-                if track.sample_rate_hz != expected_rate {
-                    return Err(invalid("archive encoder rate differs from capture format"));
-                }
-                u128::from(count / 2 / u64::from(format.channels))
-                    * u128::from(track.sample_rate_hz)
-                    / u128::from(format.sample_rate_hz)
-            } else {
-                0
-            };
-            let expected_ticks =
-                u64::try_from(encoded_frames * u128::from(48000 / track.sample_rate_hz))
-                    .map_err(|_| invalid("archive sample count overflow"))?;
-            let path = self.dir.join(opus);
-            ordinary(&path)?;
-            let mut options = OpenOptions::new();
-            options.read(true);
-            #[cfg(windows)]
-            options.write(true);
-            let file = options.open(path)?;
-            if !file.metadata()?.is_file() || file.metadata()?.len() != track.opus_bytes {
-                return Err(invalid("archive size differs from completed manifest"));
-            }
-            let observed = crate::opus::inspect_complete_archive(
-                (&file).take(
-                    track
-                        .opus_bytes
-                        .checked_add(1)
-                        .ok_or_else(|| invalid("archive size overflow"))?,
-                ),
-            )
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            if observed.bytes != track.opus_bytes
-                || observed.input_rate_hz != track.sample_rate_hz
-                || observed.pcm_samples_48k != expected_ticks
-                || observed.duration_ms() != track.duration_ms
-            {
-                return Err(invalid("archive timing differs from checkpointed audio"));
-            }
-            file.sync_all()?;
+            crate::wal::verify_encoded_track(&self.dir, opus, track, format)?;
             Ok(0)
         };
         let system_tail_bytes = tail(
