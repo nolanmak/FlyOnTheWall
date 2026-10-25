@@ -13,7 +13,7 @@
 //! from everyone else (seam rule 2). The two are reconciled after the fact
 //! through `host_ns`, which both legs stamp from the same monotonic clock.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use cidre::{blocks, cat, core_audio::System, dispatch};
@@ -43,6 +43,7 @@ pub struct MicTap {
 struct Running {
     format: StreamFormat,
     capture: CaptureOwner<NativeAssets>,
+    format_changed: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for MicTap {
@@ -79,51 +80,60 @@ impl MicTap {
         let device = System::default_input_device()
             .map_err(|e| TapError::platform(format!("no default input device: {e:?}")))?;
 
-        // Read the format every time. A Bluetooth headset engaging HFP drops
-        // the input to 16 or 24 kHz mid-session, and a converter configured
-        // once at session start would then be silently wrong (CAP-07).
-        // Live rate-change notification/rebuild remains separate from probing.
-        let asbd = device.input_asbd().map_err(|e| {
-            TapError::platform(format!("Cannot read microphone stream format: {e:?}"))
-        })?;
-        let format = capture_format(&asbd)?;
-
-        self.state.device_frames.store(0, Ordering::Release);
-        {
-            let mut guard = self
+        let changed = Arc::new(AtomicBool::new(false));
+        let (owner, format) = CaptureOwner::prepare(NativeAssets::mic(device), |assets| {
+            assets.watch_mic_format(changed.clone())?;
+            // Listeners precede the format read. A topology/rate change during
+            // preparation invalidates this generation before native Start.
+            let asbd = device.input_asbd().map_err(|e| {
+                TapError::platform(format!("Cannot read microphone stream format: {e:?}"))
+            })?;
+            let format = capture_format(&asbd)?;
+            self.state.device_frames.store(0, Ordering::Release);
+            *self
                 .state
                 .sink
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            *guard = Some(sink);
-        }
-
-        let queue = dispatch::Queue::serial_with_ar_pool();
-        let state = Arc::clone(&self.state);
-        let channels = u64::from(format.channels.max(1));
-
-        let block = blocks::EscBlock::new5(
-            move |_now: &cat::AudioTimeStamp,
-                  input: &cat::AudioBufList<1>,
-                  _input_time: &cat::AudioTimeStamp,
-                  _output: &mut cat::AudioBufList<1>,
-                  _output_time: &cat::AudioTimeStamp| {
-                on_io(&state, input, channels);
-            },
-        );
-
-        let capture = CaptureOwner::start(NativeAssets::mic(device, block, queue))?;
-        Ok(Running { format, capture })
+                .unwrap_or_else(PoisonError::into_inner) = Some(sink);
+            let queue = dispatch::Queue::serial_with_ar_pool();
+            let state = self.state.clone();
+            let observed = changed.clone();
+            let channels = u64::from(format.channels.max(1));
+            let block = blocks::EscBlock::new5(
+                move |_now: &cat::AudioTimeStamp,
+                      input: &cat::AudioBufList<1>,
+                      _input_time: &cat::AudioTimeStamp,
+                      _output: &mut cat::AudioBufList<1>,
+                      _output_time: &cat::AudioTimeStamp| {
+                    on_io(&state, input, channels, &observed);
+                },
+            );
+            assets.set_callback(block, queue);
+            if changed.load(Ordering::Acquire) {
+                return Err(TapError::StreamFormatChanged);
+            }
+            Ok(format)
+        })?;
+        let capture = owner.start_prepared()?;
+        Ok(Running {
+            format,
+            capture,
+            format_changed: changed,
+        })
     }
 }
 
-fn on_io(state: &IoState, input: &cat::AudioBufList<1>, channels: u64) {
+fn on_io(state: &IoState, input: &cat::AudioBufList<1>, channels: u64, changed: &AtomicBool) {
     let Ok(mut guard) = state.sink.try_lock() else {
         return;
     };
     let Some(sink) = guard.as_mut() else {
         return;
     };
+    if changed.load(Ordering::Acquire) {
+        sink.on_error(TapError::StreamFormatChanged);
+        return;
+    }
     // The ASBD was validated before starting. Never reinterpret a changed
     // buffer layout using the old channel count, including partial frames.
     // A typed error does not count as a delivered buffer in watchdog health.
@@ -171,7 +181,9 @@ impl crate::tap::AudioTap for MicTap {
     }
 
     fn format_is_authoritative(&self) -> bool {
-        self.running.is_some()
+        self.running
+            .as_ref()
+            .is_some_and(|running| !running.format_changed.load(Ordering::Acquire))
     }
 
     fn start(&mut self, sink: Box<dyn FrameSink>) -> Result<StreamFormat, TapError> {
@@ -221,7 +233,12 @@ impl crate::tap::AudioTap for MicTap {
             return Err(failure.error());
         }
         let result = match self.running.take() {
-            Some(mut running) => running.capture.close_observed(stopped),
+            Some(mut running) => {
+                let closed = running.capture.close_observed(stopped);
+                // Listener removal/queue drain precedes this observation, so a
+                // format notification with no subsequent IO still fails Stop.
+                format_result(running.format_changed.load(Ordering::Acquire), closed)
+            }
             None => {
                 stopped();
                 Ok(())
@@ -231,6 +248,15 @@ impl crate::tap::AudioTap for MicTap {
             self.cleanup_failure = Failure::from_error(error);
         }
         result
+    }
+}
+
+fn format_result(changed: bool, result: Result<(), TapError>) -> Result<(), TapError> {
+    result?;
+    if changed {
+        Err(TapError::FormatChangedAfterStop)
+    } else {
+        Ok(())
     }
 }
 
@@ -257,6 +283,60 @@ fn capture_format(asbd: &cat::AudioStreamBasicDesc) -> Result<StreamFormat, TapE
     Ok(format)
 }
 
+// Run the actual native-block -> atomic -> IO guard path without a device.
+#[cfg(any(test, feature = "conformance"))]
+pub(super) fn input_format_contract() {
+    use std::sync::atomic::AtomicUsize;
+    struct Counters {
+        samples: Arc<AtomicUsize>,
+        errors: Arc<AtomicUsize>,
+    }
+    impl FrameSink for Counters {
+        fn on_frames(&mut self, pcm: &[f32], _: CaptureTimestamp, _: FrameFlags) {
+            self.samples.fetch_add(pcm.len(), Ordering::AcqRel);
+        }
+        fn on_error(&mut self, error: TapError) {
+            assert!(matches!(error, TapError::StreamFormatChanged));
+            self.errors.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    let changed = Arc::new(AtomicBool::new(false));
+    let mut watch = super::input_format::InputFormatWatch::new(changed.clone());
+    let samples = Arc::new(AtomicUsize::new(0));
+    let errors = Arc::new(AtomicUsize::new(0));
+    let state = IoState {
+        sink: Mutex::new(Some(Box::new(Counters {
+            samples: samples.clone(),
+            errors: errors.clone(),
+        }))),
+        device_frames: AtomicU64::new(0),
+    };
+    let mut pcm = [0.25_f32, -0.25];
+    let input = cat::AudioBufList {
+        number_buffers: 1,
+        buffers: [cat::AudioBuf {
+            number_channels: 1,
+            data_bytes_size: 8,
+            data: pcm.as_mut_ptr().cast(),
+        }],
+    };
+    on_io(&state, &input, 1, &changed);
+    assert_eq!(samples.load(Ordering::Acquire), 2);
+    watch.notify_for_conformance();
+    on_io(&state, &input, 1, &changed);
+    assert_eq!(
+        samples.load(Ordering::Acquire),
+        2,
+        "rate-only change must not append samples"
+    );
+    assert_eq!(state.device_frames.load(Ordering::Acquire), 2);
+    assert_eq!(errors.load(Ordering::Acquire), 1);
+    assert!(matches!(
+        format_result(changed.load(Ordering::Acquire), Ok(())),
+        Err(TapError::FormatChangedAfterStop)
+    ));
+}
+
 #[cfg(test)]
 mod format_tests {
     use super::*;
@@ -281,6 +361,111 @@ mod format_tests {
             self.0.lock().unwrap().format_errors += 1;
         }
     }
+
+    #[test]
+    #[ignore = "requires an installed default input; registers metadata listeners only, never starts capture"]
+    fn installed_input_listener_registration_without_capture() {
+        let device = System::default_input_device().expect("installed default input is required");
+        assert_ne!(
+            device.0.0, 0,
+            "no default input available; physical listener probe is unperformed"
+        );
+        let (mut owner, ()) = CaptureOwner::prepare(NativeAssets::mic(device), |assets| {
+            assets.watch_mic_format(Arc::new(AtomicBool::new(false)))
+        })
+        .expect("input rate/configuration/stream listeners must register");
+        // Deliberately never call start_prepared: this probes metadata listener
+        // registration/removal without opening an IOProc or collecting audio.
+        owner
+            .close()
+            .expect("all input listeners must unregister and drain");
+    }
+
+    #[test]
+    fn known_invalidated_format_is_not_reported_as_authoritative() {
+        let changed = Arc::new(AtomicBool::new(false));
+        let (capture, ()) = CaptureOwner::prepare(
+            NativeAssets::mic(cidre::core_audio::Device(cidre::core_audio::Obj(77))),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let mut tap = MicTap {
+            id: TapId::mic("fixture"),
+            hint: StreamFormat::new(16000, 1, SampleFormat::F32),
+            running: Some(Running {
+                format: StreamFormat::new(16000, 1, SampleFormat::F32),
+                capture,
+                format_changed: changed.clone(),
+            }),
+            cleanup_failure: None,
+            state: Arc::new(IoState {
+                sink: Mutex::new(None),
+                device_frames: AtomicU64::new(0),
+            }),
+        };
+        assert!(crate::AudioTap::format_is_authoritative(&tap));
+        changed.store(true, Ordering::Release);
+        assert!(
+            !crate::AudioTap::format_is_authoritative(&tap),
+            "known stale input format cannot be authoritative"
+        );
+        assert!(matches!(
+            crate::AudioTap::stop(&mut tap),
+            Err(TapError::FormatChangedAfterStop)
+        ));
+    }
+    #[test]
+    fn finalized_format_invalidation_preserves_positive_release_evidence_for_next_attempt() {
+        let error = format_result(true, Ok(())).unwrap_err();
+        assert_eq!(
+            error.cleanup_state(),
+            Some(crate::CleanupState::Released),
+            "a format fault after full cleanup must not permanently fence the next dictation"
+        );
+    }
+    #[test]
+    fn format_change_without_further_io_fails_finalization_but_preserves_cleanup_failure() {
+        assert!(matches!(
+            format_result(true, Ok(())),
+            Err(TapError::FormatChangedAfterStop)
+        ));
+        assert!(format_result(false, Ok(())).is_ok());
+        let cleanup = TapError::Cleanup {
+            state: crate::CleanupState::Stopped,
+            message: "fixture retained listener".into(),
+        };
+        assert!(matches!(
+            format_result(true, Err(cleanup)),
+            Err(TapError::Cleanup {
+                state: crate::CleanupState::Stopped,
+                ..
+            })
+        ));
+    }
+    #[test]
+    fn rate_invalidation_rejects_an_unchanged_buffer_layout_before_advancing_the_clock() {
+        let seen = Arc::new(Mutex::new(Observed::default()));
+        let state = IoState {
+            sink: Mutex::new(Some(Box::new(FixtureSink(seen.clone())))),
+            device_frames: AtomicU64::new(0),
+        };
+        let mut pcm = [0.25_f32, -0.25];
+        let input = cat::AudioBufList {
+            number_buffers: 1,
+            buffers: [cat::AudioBuf {
+                number_channels: 1,
+                data_bytes_size: 8,
+                data: pcm.as_mut_ptr().cast(),
+            }],
+        };
+        on_io(&state, &input, 1, &AtomicBool::new(true));
+        assert!(
+            seen.lock().unwrap().samples.is_empty(),
+            "changed rate must not be delivered using stale ASBD"
+        );
+        assert_eq!(state.device_frames.load(Ordering::Acquire), 0);
+        assert_eq!(seen.lock().unwrap().format_errors, 1);
+    }
     #[test]
     fn changed_channel_layout_is_not_delivered_under_the_old_format() {
         let seen = Arc::new(Mutex::new(Observed::default()));
@@ -297,10 +482,10 @@ mod format_tests {
                 data: pcm.as_mut_ptr().cast(),
             }],
         };
-        on_io(&state, &input, 2);
+        on_io(&state, &input, 2, &AtomicBool::new(false));
         assert_eq!(state.device_frames.load(Ordering::Acquire), 2);
         input.buffers[0].number_channels = 1;
-        on_io(&state, &input, 2);
+        on_io(&state, &input, 2, &AtomicBool::new(false));
         let seen = seen.lock().unwrap();
         assert_eq!(
             seen.samples, pcm,

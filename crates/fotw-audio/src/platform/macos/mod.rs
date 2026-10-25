@@ -35,6 +35,7 @@ mod activity;
 mod capture_assets;
 pub(crate) mod capture_clock;
 mod capture_lifecycle;
+mod input_format;
 mod listeners;
 mod mic;
 mod tap;
@@ -214,4 +215,9 @@ fn mic_authorization() -> PermissionState {
         // cannot work; the honest answer is that we cannot see it.
         Err(_) => PermissionState::Unobservable,
     }
+}
+
+#[cfg(any(test, feature = "conformance"))]
+pub(crate) fn input_format_contract() {
+    mic::input_format_contract();
 }

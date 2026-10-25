@@ -221,3 +221,40 @@ Tests use a real temporary library and fake transports, including bounded hostil
 metadata, map/reduce/extraction propagation, unknown history and context rejection.
 No paid-provider attribution evaluation is claimed. Native restart/retry,
 provisioning, AEC and the original physical/quality acceptance remain unfinished.
+
+## Microphone format invalidation
+
+The native microphone capture owner installs device-rate, input stream-list and
+input configuration listeners before reading the ASBD, and virtual-format
+listeners on every enumerated input stream. These listeners belong to that
+capture generation; their callbacks only latch an atomic invalidation flag.
+An invalidated generation emits `StreamFormatChanged` before accepting more IO
+under the old sample rate, even if the channel layout did not change. It never
+retimes that buffer under stale metadata. Startup rejects already observed
+invalidation, and Stop reports invalidation after listener removal/queue drain
+even when no subsequent IO arrived. `FormatChangedAfterStop` carries positive
+Released evidence only after complete teardown, so the invalid utterance is
+rejected without permanently fencing a fresh deliberate attempt. A known
+invalidated format is no longer reported as authoritative. A fresh attempt
+reads a new format.
+
+These listeners belong to the existing native capture resource bundle. Partial
+setup unwinds through its owner. A removal failure retains the bundle and the
+process microphone fence with typed cleanup evidence; it cannot be reported as
+fully released. Successful teardown drains the listener queue before freeing
+callback state. The system-audio leg does not receive a synthetic global route
+change from this microphone-only guard.
+
+The shared `conformance::formats()` contract on macOS drives the actual native
+block, latch, IO guard and finalization check using synthetic PCM. It opens no
+capture device. Additional tests cover registration-prefix ownership, failed
+removal, queued notification drainage and generation isolation. The opt-in
+`installed_input_listener_registration_without_capture` probe only registers and
+removes metadata listeners; it never creates or starts an IOProc. On this Mac it
+reported no installed default input, so real input registration and physical
+USB/Bluetooth/rate-change capture validation remain unperformed.
+
+Apple documents the [device nominal rate](https://developer.apple.com/documentation/coreaudio/kaudiodevicepropertynominalsamplerate)
+and [stream virtual format](https://developer.apple.com/documentation/coreaudio/kaudiostreampropertyvirtualformat)
+properties. A listener notification is treated conservatively as invalidation;
+this feature does not prove real-device timing or automatic readiness recovery.

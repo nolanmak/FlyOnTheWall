@@ -68,6 +68,14 @@ pub enum TapError {
     #[error("audio stream format changed; rebuild capture before accepting more samples")]
     StreamFormatChanged,
 
+    /// Format invalidation reported only after native capture stopped and all
+    /// IO/listener registrations and resources were positively released.
+    /// The utterance is invalid, but a new deliberate capture may be admitted.
+    #[error(
+        "audio stream format changed; capture stopped and resources released; start a new dictation"
+    )]
+    FormatChangedAfterStop,
+
     /// The device cannot produce anything usable for this request.
     ///
     /// A *hint* that is not honoured is not this error — that is normal, and
@@ -124,6 +132,7 @@ impl TapError {
     pub const fn cleanup_state(&self) -> Option<CleanupState> {
         match self {
             Self::Cleanup { state, .. } => Some(*state),
+            Self::FormatChangedAfterStop => Some(CleanupState::Released),
             _ => None,
         }
     }
@@ -168,7 +177,10 @@ impl TapError {
     pub fn is_transient_device_fault(&self) -> bool {
         matches!(
             self,
-            Self::DeviceInvalidated(_) | Self::DeviceNotFound(_) | Self::StreamFormatChanged
+            Self::DeviceInvalidated(_)
+                | Self::DeviceNotFound(_)
+                | Self::StreamFormatChanged
+                | Self::FormatChangedAfterStop
         )
     }
 }
