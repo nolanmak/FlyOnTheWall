@@ -187,6 +187,7 @@ pub mod capture_health;
 pub mod speech_control;
 
 mod interrupted_capture;
+mod raw_replay;
 /// Owned saved-audio transcription recovery.
 pub mod speech_recovery;
 /// Content-free live transcription provenance.

@@ -201,6 +201,191 @@ fn voice_fixture(stopped: bool) -> Fixture {
 }
 
 #[test]
+fn startup_reconstructs_a_mapped_raw_suffix_without_replacing_committed_canonical_audio() {
+    for stopped in [true, false] {
+        let raw: Vec<f32> = (0u32..48000)
+            .map(|n| {
+                if (n / 3200).is_multiple_of(2) {
+                    1000.0 / 32767.0
+                } else {
+                    8000.0 / 32767.0
+                }
+            })
+            .collect();
+        let canonical = fotw_pipeline::resample::Downmixer::to_i16(&raw);
+        let mut f = fixture_audio(
+            stopped,
+            canonical[..16000].to_vec(),
+            raw,
+            "fixture-local",
+            "fixture-revision",
+        );
+        drop(f.wal.take());
+        std::fs::write(f.dir.join("system.stt-raw-plan.json"), serde_json::to_vec(&serde_json::json!({
+            "recipe":"wal-i16-archive-converter-rubato5-v1", "session_id":f.session, "source":"system",
+            "format":{"sample_rate_hz":16000,"channels":1}, "first_sample":137*16
+        })).unwrap()).unwrap();
+        let original = std::fs::read(f.dir.join("system.stt16")).unwrap();
+        let raw = std::fs::read(f.dir.join("system.pcm")).unwrap();
+        startup(&owner(&f));
+        let mut db = Db::open(&f.database, &f.key).unwrap();
+        let id = db
+            .session_note_meeting(&f.session)
+            .unwrap()
+            .expect("mapped raw audio must reach startup recovery");
+        let reader = ReplayReader::open(&f.dir, &f.session, ReplaySource::System).unwrap();
+        assert_eq!(
+            reader.complete_prefix_end().unwrap(),
+            137 * 16 + 48000,
+            "recovery must reconstruct the missing mapped suffix"
+        );
+        assert!(
+            std::fs::read(f.dir.join("system.stt16"))
+                .unwrap()
+                .starts_with(&original)
+        );
+        assert_eq!(std::fs::read(f.dir.join("system.pcm")).unwrap(), raw);
+        let doc = db.export_meeting(&id).unwrap();
+        assert!(
+            doc.segments
+                .iter()
+                .any(|s| s.text == "original committed words")
+        );
+        assert!(
+            doc.segments
+                .iter()
+                .any(|s| s.text == "recovered after process exit")
+        );
+        assert_eq!(
+            db.meetings().get(&id).unwrap().ended_at_ms.is_some(),
+            stopped
+        );
+        if !stopped {
+            assert!(!f.dir.join("system.stt-sealed.json").exists());
+        }
+    }
+}
+
+#[test]
+fn raw_reconstruction_refuses_changed_identity_conflicting_audio_and_other_source_owners() {
+    for mode in [
+        "recipe",
+        "source",
+        "format",
+        "anchor",
+        "conflict",
+        "busy",
+        "corrupt-other",
+    ] {
+        let mut f = voice_fixture(true);
+        drop(f.wal.take());
+        let mut plan = serde_json::json!({"recipe":"wal-i16-archive-converter-rubato5-v1","session_id":f.session,"source":"system","format":{"sample_rate_hz":16000,"channels":1},"first_sample":137*16});
+        // Shorten only the uncommitted canonical tail; the retained prefix
+        // deliberately differs from raw in conflict mode.
+        let path = f.dir.join("system.stt16");
+        let mut reader = ReplayReader::open(&f.dir, &f.session, ReplaySource::System).unwrap();
+        let full = std::fs::metadata(&path).unwrap().len();
+        let samples = reader.read_from(137 * 16, 16000).unwrap();
+        assert_eq!(samples.len(), 16000);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(full - 32000 * 2)
+            .unwrap();
+        match mode {
+            "recipe" => plan["recipe"] = "unknown-processing".into(),
+            "source" => plan["source"] = "mic".into(),
+            "format" => plan["format"]["sample_rate_hz"] = 48000.into(),
+            "anchor" => plan["first_sample"] = 0.into(),
+            _ => {}
+        }
+        std::fs::write(
+            f.dir.join("system.stt-raw-plan.json"),
+            serde_json::to_vec(&plan).unwrap(),
+        )
+        .unwrap();
+        let other = if mode == "busy" || mode == "corrupt-other" {
+            Some(ReplayWriter::create(&f.dir, &f.session, ReplaySource::Mic, 0).unwrap())
+        } else {
+            None
+        };
+        if mode == "corrupt-other" {
+            drop(other);
+            std::fs::write(
+                f.dir.join("mic.stt-coverage.jsonl"),
+                b"invalid complete record\n",
+            )
+            .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        let raw = std::fs::read(f.dir.join("system.pcm")).unwrap();
+        startup(&owner(&f));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "refused reconstruction mutated input in {mode}"
+        );
+        assert_eq!(std::fs::read(f.dir.join("system.pcm")).unwrap(), raw);
+        assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+        assert!(!f.dir.join("system.stt-sealed.json").exists());
+    }
+}
+
+#[test]
+fn startup_reconstructs_an_already_indexed_prefix_and_respects_explicit_deletion() {
+    for deleted in [false, true] {
+        let raw: Vec<f32> = (0u32..48000)
+            .map(|n| {
+                if (n / 3200).is_multiple_of(2) {
+                    1000.0 / 32767.0
+                } else {
+                    8000.0 / 32767.0
+                }
+            })
+            .collect();
+        let pcm = fotw_pipeline::resample::Downmixer::to_i16(&raw);
+        let mut f = fixture_audio(
+            false,
+            pcm[..16000].to_vec(),
+            raw,
+            "fixture-local",
+            "fixture-revision",
+        );
+        drop(f.wal.take());
+        index(&owner(&f));
+        let mut db = Db::open(&f.database, &f.key).unwrap();
+        let id = db.session_note_meeting(&f.session).unwrap().unwrap();
+        if deleted {
+            let held = f.root.path().join("held-capture");
+            std::fs::rename(&f.dir, &held).unwrap();
+            db.delete_meeting(&id).unwrap();
+            std::fs::rename(held, &f.dir).unwrap();
+        }
+        std::fs::write(f.dir.join("system.stt-raw-plan.json"),serde_json::to_vec(&serde_json::json!({"recipe":"wal-i16-archive-converter-rubato5-v1","session_id":f.session,"source":"system","format":{"sample_rate_hz":16000,"channels":1},"first_sample":137*16})).unwrap()).unwrap();
+        let before = std::fs::read(f.dir.join("system.stt16")).unwrap();
+        startup(&owner(&f));
+        if deleted {
+            assert_eq!(
+                std::fs::read(f.dir.join("system.stt16")).unwrap(),
+                before,
+                "explicit deletion must prevent even reconstruction"
+            );
+            assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+        } else {
+            assert_eq!(
+                ReplayReader::open(&f.dir, &f.session, ReplaySource::System)
+                    .unwrap()
+                    .complete_prefix_end()
+                    .unwrap(),
+                137 * 16 + 48000
+            );
+            assert_eq!(db.session_note_meeting(&f.session).unwrap(), Some(id));
+        }
+    }
+}
+
+#[test]
 fn startup_recovers_an_eligible_unknown_end_prefix_once_without_finalizing_the_capture() {
     let mut f = voice_fixture(false);
     wal_tail(&mut f);
@@ -949,25 +1134,32 @@ fn cancelling_a_blocked_local_prepare_retains_the_interrupted_capture_lease_unti
 #[test]
 #[ignore = "requires cached public small.en weights and checksum-verified JFK WAV"]
 fn installed_model_recovers_an_unindexed_stopped_wal_without_changing_settings_or_audio() {
-    native_capture_recovery(false, false);
+    native_capture_recovery(false, false, false);
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires cached public small.en weights and checksum-verified JFK WAV"]
 fn installed_model_recovers_a_finalized_archive_after_pcm_retirement() {
-    native_capture_recovery(true, false);
+    native_capture_recovery(true, false, false);
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires cached public small.en weights and checksum-verified JFK WAV"]
 fn installed_model_recovers_a_saved_prefix_without_manufacturing_a_capture_end() {
-    native_capture_recovery(false, true);
+    native_capture_recovery(false, true, false);
 }
 
 #[cfg(target_os = "macos")]
-fn native_capture_recovery(archived: bool, prefix_only: bool) {
+#[test]
+#[ignore = "requires cached public small.en weights and checksum-verified JFK WAV"]
+fn installed_model_recovers_a_reconstructed_raw_suffix() {
+    native_capture_recovery(false, false, true);
+}
+
+#[cfg(target_os = "macos")]
+fn native_capture_recovery(archived: bool, prefix_only: bool, reconstruct: bool) {
     use fotw_web::speech_recovery::{RecoveryPhase, SpeechRecoveryControl};
     use sha2::{Digest, Sha256};
     let model = PathBuf::from(
@@ -993,11 +1185,24 @@ fn native_capture_recovery(archived: bool, prefix_only: bool) {
     let decoded = fotw_audio::wav::parse(&bytes).unwrap();
     assert_eq!(decoded.format.sample_rate_hz, 16000);
     assert_eq!(decoded.format.channels, 1);
-    let canonical = decoded
-        .samples
-        .iter()
-        .map(|s| (s * 32768.0).round() as i16)
-        .collect();
+    let canonical: Vec<i16> = if reconstruct {
+        let raw = fotw_pipeline::resample::Downmixer::to_i16(&decoded.samples);
+        let raw: Vec<f32> = raw.iter().map(|&s| f32::from(s) / 32767.0).collect();
+        let mut converter =
+            fotw_pipeline::resample::ArchiveConverter::new(16000, 1, 16000, 1).unwrap();
+        let mut canonical =
+            fotw_pipeline::resample::Downmixer::to_i16(&converter.process(&raw).unwrap());
+        canonical.extend(fotw_pipeline::resample::Downmixer::to_i16(
+            &converter.finish().unwrap(),
+        ));
+        canonical[..16000].to_vec()
+    } else {
+        decoded
+            .samples
+            .iter()
+            .map(|s| (s * 32768.0).round() as i16)
+            .collect()
+    };
     let mut f = fixture_audio(
         !prefix_only,
         canonical,
@@ -1013,6 +1218,9 @@ fn native_capture_recovery(archived: bool, prefix_only: bool) {
         fotw_pipeline::wal::discard_pcm(&f.dir).unwrap();
     } else {
         drop(f.wal.take());
+    }
+    if reconstruct {
+        std::fs::write(f.dir.join("system.stt-raw-plan.json"),serde_json::to_vec(&serde_json::json!({"recipe":"wal-i16-archive-converter-rubato5-v1","session_id":f.session,"source":"system","format":{"sample_rate_hz":16000,"channels":1},"first_sample":137*16})).unwrap()).unwrap();
     }
     let audio_before = std::fs::read(f.dir.join("system.stt16")).unwrap();
     let retained_path = if archived {
@@ -1086,10 +1294,13 @@ fn native_capture_recovery(archived: bool, prefix_only: bool) {
         "public speech must actually be transcribed"
     );
     assert_eq!(fotwd::stt::SttSettings::read(&db).unwrap(), settings);
-    assert_eq!(
-        std::fs::read(f.dir.join("system.stt16")).unwrap(),
-        audio_before
-    );
+    let canonical_after = std::fs::read(f.dir.join("system.stt16")).unwrap();
+    if reconstruct {
+        assert!(canonical_after.starts_with(&audio_before));
+        assert!(canonical_after.len() > audio_before.len());
+    } else {
+        assert_eq!(canonical_after, audio_before);
+    }
     assert_eq!(std::fs::read(retained_path).unwrap(), retained_before);
     assert_eq!(
         std::fs::read(f.dir.join("manifest.json")).unwrap(),
@@ -1106,7 +1317,7 @@ fn native_capture_recovery(archived: bool, prefix_only: bool) {
     }
     println!(
         "{}",
-        serde_json::json!({"fixture":"public-jfk","unindexed_stopped_wal":!prefix_only,"raw_retired":archived,"phase":if prefix_only{"partial"}else{"complete"},"canonical_unchanged":true,"settings_unchanged":true,"elapsed_ms":began.elapsed().as_millis(),"model":"small.en"})
+        serde_json::json!({"fixture":"public-jfk","unindexed_stopped_wal":!prefix_only&&!archived,"raw_retired":archived,"phase":if prefix_only{"partial"}else{"complete"},"canonical_unchanged":!reconstruct,"canonical_prefix_unchanged":true,"raw_suffix_reconstructed":reconstruct,"settings_unchanged":true,"elapsed_ms":began.elapsed().as_millis(),"model":"small.en"})
     );
 }
 

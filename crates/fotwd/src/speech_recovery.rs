@@ -255,11 +255,27 @@ impl SavedSpeechRecovery {
             if !entry.file_type().is_ok_and(|m| m.is_dir()) {
                 continue;
             }
-            if entry.file_name().to_str().is_some_and(|session| {
-                self.db()
-                    .session_note_meeting(session)
-                    .is_ok_and(|id| id.is_some())
-            }) {
+            let session = entry.file_name();
+            let Some(session) = session.to_str() else {
+                continue;
+            };
+            let (deleted, indexed) = {
+                let db = self.db();
+                (
+                    db.capture_session_was_deleted(session)
+                        .map_err(|_| RecoveryError::Invalid)?,
+                    db.session_note_meeting(session)
+                        .map_err(|_| RecoveryError::Invalid)?
+                        .is_some(),
+                )
+            };
+            if deleted {
+                continue;
+            }
+            if indexed {
+                if crate::interrupted_capture::reconstruct_saved(&entry.path(), stop).is_err() {
+                    needs_reconciliation = true;
+                }
                 continue;
             }
             match crate::interrupted_capture::prepare(&entry.path(), stop) {

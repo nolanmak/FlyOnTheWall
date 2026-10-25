@@ -14,7 +14,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -112,7 +112,7 @@ impl Drop for OwnerLock {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Header {
     session_id: String,
@@ -453,6 +453,77 @@ impl ReplayWriter {
     #[must_use]
     pub const fn end_sample(&self) -> u64 {
         self.end_sample
+    }
+
+    /// Validate a separately reconstructed candidate without modifying this
+    /// stream. The caller must verify its raw-input processing provenance.
+    /// Identity and every existing complete sample must agree; sealed input
+    /// cannot be extended. Cancellation is checked between bounded reads.
+    pub fn validate_reconstructed_suffix(
+        &self,
+        candidate: &mut ReplayReader,
+        stop: &AtomicBool,
+    ) -> io::Result<u64> {
+        self.check_healthy()?;
+        let mut original = ReplayReader::open(&self.dir, &self.session_id, self.source)?;
+        if original.header != candidate.header
+            || original.sealed_end()?.is_some()
+            || original.complete_prefix_end()? != self.end_sample
+            || candidate.complete_prefix_end()? < self.end_sample
+        {
+            return Err(invalid("reconstructed input identity or boundary differs"));
+        }
+        let mut at = original.first_sample();
+        while at < self.end_sample {
+            if stop.load(Ordering::Acquire) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let count = (self.end_sample - at).min(MAX_READ_SAMPLES as u64) as usize;
+            let retained = original.read_from(at, count)?;
+            if retained.len() != count || candidate.read_from(at, count)? != retained {
+                return Err(invalid(
+                    "reconstruction would replace retained canonical audio",
+                ));
+            }
+            at += count as u64;
+        }
+        candidate.complete_prefix_end()
+    }
+
+    /// Append only a validated missing suffix while retaining this owner's
+    /// lease. Existing complete samples are never overwritten. A torn half
+    /// sample is removed only after validation. This grants no ordinary append,
+    /// seal, completion or retirement capability to a prefix-only owner.
+    pub fn restore_reconstructed_suffix(
+        &mut self,
+        candidate: &mut ReplayReader,
+        stop: &AtomicBool,
+    ) -> io::Result<u64> {
+        let target = self.validate_reconstructed_suffix(candidate, stop)?;
+        if stop.load(Ordering::Acquire) {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        let original = ReplayReader::open(&self.dir, &self.session_id, self.source)?;
+        self.file
+            .set_len(original.audio_offset + (self.end_sample - original.first_sample()) * 2)?;
+        self.file.seek(SeekFrom::End(0))?;
+        while self.end_sample < target {
+            if stop.load(Ordering::Acquire) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let count = (target - self.end_sample).min(MAX_READ_SAMPLES as u64) as usize;
+            let pcm = candidate.read_from(self.end_sample, count)?;
+            if pcm.len() != count {
+                return Err(invalid("reconstructed input shortened"));
+            }
+            let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+            if let Err(error) = self.file.write_all(&bytes) {
+                self.failed = true;
+                return Err(error);
+            }
+            self.end_sample += pcm.len() as u64;
+        }
+        self.sync()
     }
 
     fn check_healthy(&self) -> io::Result<()> {

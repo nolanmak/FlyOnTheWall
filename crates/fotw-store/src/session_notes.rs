@@ -25,6 +25,11 @@ pub struct SessionNoteDraftSummary {
 }
 
 impl Db {
+    /// Whether explicit deletion prevents automatic work on a retained capture.
+    /// An explicitly restored meeting/alias supersedes its old tombstone.
+    pub fn capture_session_was_deleted(&self, session: &str) -> Result<bool> {
+        capture_was_deleted(self.conn(), session)
+    }
     /// Discover durable drafts, newest capture first; at most 100 rows per page.
     pub fn session_note_drafts(
         &self,
@@ -369,19 +374,22 @@ pub(crate) fn deleted_capture_sessions(
 }
 
 fn ensure_capture_not_deleted(conn: &rusqlite::Connection, session: &str) -> Result<()> {
+    if capture_was_deleted(conn, session)? {
+        return Err(invalid("capture was explicitly deleted"));
+    }
+    Ok(())
+}
+fn capture_was_deleted(conn: &rusqlite::Connection, session: &str) -> Result<bool> {
     // An explicit archive import can restore the original meeting and alias.
     // Automatic finalization cannot create that alias until after this guard.
     if read_link(conn, session)?.is_some() {
-        return Ok(());
+        return Ok(false);
     }
     let prefix = format!("capture:{session}:");
     let deleted: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM tombstones WHERE kind='capture_session' AND substr(id,1,?1)=?2)",
         rusqlite::params![prefix.len() as i64, prefix], |row| row.get(0))?;
-    if deleted {
-        return Err(invalid("capture was explicitly deleted"));
-    }
-    Ok(())
+    Ok(deleted)
 }
 
 /// The capture/notes handoff inside a caller-owned projection transaction.

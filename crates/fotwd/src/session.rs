@@ -36,7 +36,7 @@ use fotw_audio::{
     AudioPlatform, AudioTap, CaptureTimestamp, DeviceId, FormatRequest, FrameFlags, FrameSink,
     PlatformProbe, StreamFormat, SystemScope, TapError, TapId,
 };
-use fotw_pipeline::resample::{CaptureArchive, Downmixer, Resampler16k};
+use fotw_pipeline::resample::{CaptureArchive, Downmixer};
 use fotw_pipeline::ring::{AudioRing, RingConsumer, RingProducer};
 use fotw_pipeline::wal::{SessionWal, SttRecord, TrackFormat};
 use fotw_stt::deepgram::DeepgramConfig;
@@ -2565,6 +2565,9 @@ fn spawn_leg_collector(
 trait PcmFeed: Send + Sync {
     /// Hand the provider 16-bit little-endian mono PCM.
     fn write_pcm(&self, pcm: &[i16]);
+    fn durable_replay(&self) -> bool {
+        false
+    }
 }
 
 /// One leg's open transcription, whichever engine is behind it.
@@ -2616,6 +2619,9 @@ impl LegStream {
 }
 
 impl PcmFeed for LegStream {
+    fn durable_replay(&self) -> bool {
+        self.requires_original_pcm()
+    }
     fn write_pcm(&self, pcm: &[i16]) {
         match self {
             Self::Deepgram(stream) => stream.write(pcm),
@@ -2901,72 +2907,79 @@ fn pump_loop(
 
 struct PumpTranscription {
     stt: SttFeeds,
-    resampler: Resampler16k,
-    mic_resampler: Option<(Resampler16k, u16)>,
-    system_channels: u16,
+    resampler: crate::raw_replay::CanonicalInput,
+    mic_resampler: Option<crate::raw_replay::CanonicalInput>,
     hush: Vec<i16>,
 }
 impl PumpTranscription {
     fn feed(&mut self, channel: LegChannel, pcm: &[f32]) -> Result<(), String> {
+        let mono = match channel {
+            LegChannel::System if self.stt.system.is_some() => self.resampler.process(pcm)?,
+            LegChannel::Mic => match self.mic_resampler.as_mut() {
+                Some(r) => r.process(pcm)?,
+                None => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+        self.deliver(channel, &mono);
+        Ok(())
+    }
+    fn finish(&mut self) -> Result<(), String> {
+        let mono = self.resampler.finish()?;
+        self.deliver(LegChannel::System, &mono);
+        if let Some(r) = self.mic_resampler.as_mut() {
+            let mono = r.finish()?;
+            self.deliver(LegChannel::Mic, &mono);
+        }
+        Ok(())
+    }
+    fn deliver(&mut self, channel: LegChannel, mono: &[f32]) {
+        if mono.is_empty() {
+            return;
+        }
         match channel {
             LegChannel::System => {
                 if let Some(h) = self.stt.system.as_ref() {
-                    let resampled = self
-                        .resampler
-                        .process_all(pcm)
-                        .map_err(|e| format!("resample failed: {e}"))?;
-                    if !resampled.is_empty() {
-                        let mono = Downmixer::to_mono(&resampled, self.system_channels);
-                        // The gate's reference: what the speakers are playing is
-                        // exactly what the system feed carries.
-                        if let Some(gate) = self.stt.echo_gate.as_mut() {
-                            gate.push_system(&mono);
-                        }
-                        h.write_pcm(&Downmixer::to_i16(&mono));
+                    // The gate's reference: what the speakers are playing is
+                    // exactly what the system feed carries.
+                    if let Some(gate) = self.stt.echo_gate.as_mut() {
+                        gate.push_system(mono);
                     }
+                    h.write_pcm(&Downmixer::to_i16(mono));
                 }
             }
             LegChannel::Mic => {
-                if let (Some(h), Some((r, channels))) =
-                    (self.stt.mic.as_ref(), self.mic_resampler.as_mut())
-                {
-                    let resampled = r
-                        .process_all(pcm)
-                        .map_err(|e| format!("mic resample failed: {e}"))?;
-                    if !resampled.is_empty() {
-                        let mono = Downmixer::to_mono(&resampled, *channels);
-                        // CAP-11 v1: on speakers the mic is mostly a copy of the
-                        // system leg — transcribing it again costs money and
-                        // attributes the far end's words to the user. Withheld
-                        // from the FEED only; the WAL above already has the raw
-                        // audio, so this is revertible in principle (the same
-                        // text-not-audio stance Descript documents for its
-                        // mic-bleed fix).
-                        let suppress = self.stt.echo_gate.as_mut().is_some_and(|g| {
-                            g.assess(&mono) == fotw_pipeline::echo::GateVerdict::Suppress
-                        });
-                        if suppress {
-                            // Silence, not absence (#79). This leg's clock is the
-                            // amount of PCM its socket has swallowed — Deepgram
-                            // stamps every segment from it — so withholding a
-                            // chunk does not skip a second, it *deletes* one, and
-                            // every word after it is stamped a second early.
-                            // Suppression's effect survives the change because
-                            // silence transcribes as nothing; what it stops
-                            // costing is time. Feeding zeros also keeps the socket
-                            // from going quiet through sustained far-end speech,
-                            // which is the audio-starvation half of #70.
-                            self.hush.clear();
-                            self.hush.resize(mono.len(), 0);
-                            h.write_pcm(&self.hush);
-                        } else {
-                            h.write_pcm(&Downmixer::to_i16(&mono));
-                        }
+                if let Some(h) = self.stt.mic.as_ref() {
+                    // CAP-11 v1: on speakers the mic is mostly a copy of the
+                    // system leg — transcribing it again costs money and
+                    // attributes the far end's words to the user. Withheld
+                    // from the FEED only; the WAL above already has the raw
+                    // audio, so this is revertible in principle (the same
+                    // text-not-audio stance Descript documents for its
+                    // mic-bleed fix).
+                    let suppress = self.stt.echo_gate.as_mut().is_some_and(|g| {
+                        g.assess(mono) == fotw_pipeline::echo::GateVerdict::Suppress
+                    });
+                    if suppress {
+                        // Silence, not absence (#79). This leg's clock is the
+                        // amount of PCM its socket has swallowed — Deepgram
+                        // stamps every segment from it — so withholding a
+                        // chunk does not skip a second, it *deletes* one, and
+                        // every word after it is stamped a second early.
+                        // Suppression's effect survives the change because
+                        // silence transcribes as nothing; what it stops
+                        // costing is time. Feeding zeros also keeps the socket
+                        // from going quiet through sustained far-end speech,
+                        // which is the audio-starvation half of #70.
+                        self.hush.clear();
+                        self.hush.resize(mono.len(), 0);
+                        h.write_pcm(&self.hush);
+                    } else {
+                        h.write_pcm(&Downmixer::to_i16(mono));
                     }
                 }
             }
         }
-        Ok(())
     }
 }
 
@@ -2997,19 +3010,21 @@ fn pump_drain(
     // chunk sizes settle: after the first few rounds this stops growing.
     let hush: Vec<i16> = Vec::new();
 
-    let resampler = Resampler16k::new(sys_format.sample_rate_hz, sys_format.channels)
-        .map_err(|e| format!("resampler: {e}"))?;
+    let resampler = crate::raw_replay::CanonicalInput::new(TrackFormat::new(
+        sys_format.sample_rate_hz,
+        sys_format.channels,
+    ))
+    .map_err(|e| format!("resampler: {e}"))?;
 
     // The mic gets its own resampler because its format is its own: the
     // system tap is 48k stereo, a USB headset mic is whatever it is, and
     // reusing the system resampler was never an option — which is exactly why
     // the old single-stream code had a `let _ = mic_format;` here.
     let mic_resampler = match (&stt.mic, mic_format) {
-        (Some(_), Some(f)) => Some((
-            Resampler16k::new(f.sample_rate_hz, f.channels)
+        (Some(_), Some(f)) => Some(
+            crate::raw_replay::CanonicalInput::new(TrackFormat::new(f.sample_rate_hz, f.channels))
                 .map_err(|e| format!("mic resampler: {e}"))?,
-            f.channels,
-        )),
+        ),
         _ => None,
     };
 
@@ -3017,9 +3032,39 @@ fn pump_drain(
         stt,
         resampler,
         mic_resampler,
-        system_channels: sys_format.channels,
         hush,
     };
+
+    // The durable path preserves original microphone speech (no suppressive
+    // gate). Save its exact processing recipe before accepting any raw input.
+    if transcription.stt.echo_gate.is_none() {
+        for (source, feed, format) in [
+            (
+                fotw_pipeline::replay::ReplaySource::System,
+                transcription.stt.system.as_ref(),
+                Some(sys_format),
+            ),
+            (
+                fotw_pipeline::replay::ReplaySource::Mic,
+                transcription.stt.mic.as_ref(),
+                mic_format,
+            ),
+        ] {
+            if feed.is_some_and(|h| h.durable_replay())
+                && let Some(format) = format
+                && let Err(error) = crate::raw_replay::save_plan(
+                    wal.dir(),
+                    &wal.manifest().id,
+                    source,
+                    TrackFormat::new(format.sample_rate_hz, format.channels),
+                )
+            {
+                capture_warnings.push(format!(
+                    "raw transcription reconstruction unavailable: {error}"
+                ));
+            }
+        }
+    }
 
     // Armed on the pass that first sees the latch, and the only thing that
     // ends this loop. The latch used to be read solely in the idle branch, so
@@ -3183,6 +3228,7 @@ fn pump_drain(
             transcription.feed(LegChannel::Mic, &tail)?;
         }
     }
+    transcription.finish()?;
     stop.checkpoint(&mut wal, &mut capture_warnings);
     wal.flush().map_err(|e| format!("flush failed: {e}"))?;
     // Finalize stamps `ended_at_ms`. Without it every cleanly-ended meeting
@@ -3246,6 +3292,105 @@ pub fn append_segments(dir: &Path, segments: &[TranscriptSegment]) -> std::io::R
         )?;
     }
     f.sync_data()
+}
+
+#[cfg(test)]
+mod raw_reconstruction_pump_tests {
+    use super::*;
+    use fotw_pipeline::replay::{ReplayReader, ReplaySource, ReplayWriter};
+    struct Feed(std::sync::Mutex<ReplayWriter>);
+    impl PcmFeed for Feed {
+        fn durable_replay(&self) -> bool {
+            true
+        }
+        fn write_pcm(&self, pcm: &[i16]) {
+            self.0.lock().unwrap().append(pcm).unwrap();
+        }
+    }
+    #[test]
+    fn real_pump_records_the_recipe_and_flushes_every_source_frame_at_native_rates() {
+        for (rate, channels) in [(16000, 1), (44100, 1), (48000, 2)] {
+            let root = tempfile::tempdir().unwrap();
+            let format = TrackFormat::new(rate, channels);
+            let wal = SessionWal::create_with_formats(root.path(), format, None).unwrap();
+            let dir = wal.dir().to_owned();
+            let session = wal.manifest().id.clone();
+            let feed = Arc::new(Feed(std::sync::Mutex::new(
+                ReplayWriter::create(&dir, &session, ReplaySource::System, 2192).unwrap(),
+            )));
+            let frames = rate as usize + 17;
+            let pcm: Vec<f32> = (0..frames)
+                .flat_map(|n| {
+                    std::iter::repeat_n(
+                        if (rate as usize / 3..rate as usize / 2).contains(&n) {
+                            0.0
+                        } else {
+                            0.3 * (std::f32::consts::TAU * 440.0 * n as f32 / rate as f32).sin()
+                        },
+                        channels as usize,
+                    )
+                })
+                .collect();
+            let (mut producer, consumer) = AudioRing::with_capacity_frames(pcm.len() + 16);
+            producer.push_complete_block(&pcm);
+            let (_, mic) = AudioRing::with_capacity_frames(32);
+            let stopped = AtomicBool::new(true);
+            pump_loop(
+                wal,
+                consumer,
+                mic,
+                StreamFormat::new(rate, channels, fotw_audio::SampleFormat::F32),
+                None,
+                SttFeeds {
+                    system: Some(feed.clone()),
+                    mic: None,
+                    echo_gate: None,
+                },
+                PumpStop {
+                    capture: None,
+                    stopped: &stopped,
+                    drain: Duration::from_secs(1),
+                },
+            )
+            .unwrap();
+            feed.0.lock().unwrap().sync().unwrap();
+            let mut reader = ReplayReader::open(&dir, &session, ReplaySource::System).unwrap();
+            let expected = frames as u64 * 16000 / u64::from(rate);
+            assert_eq!(reader.complete_prefix_end().unwrap(), 2192 + expected);
+            let plan: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(dir.join("system.stt-raw-plan.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(plan["first_sample"], 2192);
+            assert_eq!(plan["format"]["sample_rate_hz"], rate);
+            // Re-run the persisted i16 WAL through the same recipe with
+            // deliberately different input chunk boundaries.
+            let raw = std::fs::read(dir.join("system.pcm")).unwrap();
+            let decoded: Vec<f32> = raw
+                .chunks_exact(2)
+                .map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32767.0)
+                .collect();
+            let mut converter =
+                fotw_pipeline::resample::ArchiveConverter::new(rate, channels, 16000, 1).unwrap();
+            let mut expected_pcm = Vec::new();
+            for chunk in decoded.chunks(777) {
+                expected_pcm.extend(Downmixer::to_i16(&converter.process(chunk).unwrap()));
+            }
+            expected_pcm.extend(Downmixer::to_i16(&converter.finish().unwrap()));
+            let mut actual = Vec::new();
+            let mut at = 2192;
+            while at < 2192 + expected {
+                let chunk = reader.read_from(at, 16000).unwrap();
+                at += chunk.len() as u64;
+                actual.extend(chunk);
+            }
+            assert_eq!(actual, expected_pcm);
+            assert!(
+                actual.last().is_some_and(|s| s.abs() > 100),
+                "audible final tail must survive"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

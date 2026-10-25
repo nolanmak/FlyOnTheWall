@@ -1,7 +1,7 @@
 //! Admit stopped WALs using the saved clock, verified retained audio and canonical input.
 //!
-//! Raw PCM has no persisted reconstruction map for the live filter's state and
-//! route boundaries. It is validation evidence, never replacement STT input.
+//! Compatible declared raw-processing recipes can restore verified missing
+//! canonical suffixes. Older unmapped raw PCM remains validation evidence.
 //! Unknown clocks and extra raw tails can be indexed as interrupted with no
 //! final duration; their files remain unchanged for later reconciliation.
 //! Missing canonical identities and live ownership still refuse admission.
@@ -126,6 +126,18 @@ fn snapshot(dir: &Path) -> io::Result<(CaptureOwner, CaptureSnapshot)> {
     let proof = owner.snapshot()?;
     Ok((owner, proof))
 }
+
+/// Reconcile mapped raw input on the blocking startup worker for an existing
+/// library alias. Retired raw input is never decoded from a lossy archive.
+pub(crate) fn reconstruct_saved(dir: &Path, stop: &AtomicBool) -> io::Result<()> {
+    if !["system", "mic"].iter().any(|s| {
+        dir.join(format!("{s}.stt-raw-plan.json")).exists() && dir.join(format!("{s}.pcm")).exists()
+    }) {
+        return Ok(());
+    }
+    let (_owner, proof) = snapshot(dir)?;
+    crate::raw_replay::repair(dir, &proof, stop)
+}
 fn boundaries(dir: &Path, proof: &CaptureSnapshot) -> io::Result<Vec<Boundary>> {
     let clock_end = proof
         .checkpoint
@@ -209,9 +221,11 @@ fn boundaries(dir: &Path, proof: &CaptureSnapshot) -> io::Result<Vec<Boundary>> 
 }
 
 /// Freeze existing canonical input under all leases before projecting a stopped WAL.
-/// This never reconstructs PCM, stamps a clean manifest, or guesses a capture end.
+/// Reconcile eligible mapped suffixes before admission. This never stamps a
+/// clean manifest or guesses a capture end.
 pub(crate) fn prepare(dir: &Path, stop: &AtomicBool) -> io::Result<Option<StoppedCapture>> {
     let (owner, proof) = snapshot(dir)?;
+    crate::raw_replay::repair(dir, &proof, stop)?;
     let Some((started, ended)) = proof.frozen_capture_clock() else {
         let retained = retained_sources(dir, &proof.checkpoint.session_id)?;
         if stop.load(Ordering::Acquire) {

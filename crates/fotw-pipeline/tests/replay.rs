@@ -57,6 +57,56 @@ fn a_prefix_projection_ack_never_authorizes_whole_source_retirement() {
 }
 
 #[test]
+fn reconstructed_suffix_validation_preserves_prefix_ownership_and_torn_input_on_refusal() {
+    use std::{io::Write, sync::atomic::AtomicBool};
+    let fixture = Fixture::new("reconstructed-suffix");
+    let candidate = tempfile::tempdir().unwrap();
+    let mut original = ReplayWriter::create(&fixture.0, "s", ReplaySource::System, 11).unwrap();
+    original.append(&[1, 2, 3]).unwrap();
+    original.sync().unwrap();
+    drop(original);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(fixture.0.join("system.stt16"))
+        .unwrap()
+        .write_all(&[0xff])
+        .unwrap();
+    let before = std::fs::read(fixture.0.join("system.stt16")).unwrap();
+    let mut rebuilt =
+        ReplayWriter::create(candidate.path(), "s", ReplaySource::System, 11).unwrap();
+    rebuilt.append(&[1, 2, 3, 4, 5]).unwrap();
+    rebuilt.sync().unwrap();
+    drop(rebuilt);
+    let mut owner = ReplayWriter::resume_prefix(&fixture.0, "s", ReplaySource::System).unwrap();
+    let mut reader = ReplayReader::open(candidate.path(), "s", ReplaySource::System).unwrap();
+    assert!(
+        owner
+            .restore_reconstructed_suffix(&mut reader, &AtomicBool::new(true))
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(fixture.0.join("system.stt16")).unwrap(),
+        before
+    );
+    assert_eq!(
+        owner
+            .restore_reconstructed_suffix(&mut reader, &AtomicBool::new(false))
+            .unwrap(),
+        16
+    );
+    assert!(owner.append(&[6]).is_err());
+    assert!(owner.seal().is_err());
+    assert_eq!(
+        ReplayReader::open(&fixture.0, "s", ReplaySource::System)
+            .unwrap()
+            .read_from(11, 10)
+            .unwrap(),
+        vec![1, 2, 3, 4, 5]
+    );
+    assert!(!fixture.0.join("system.stt-sealed.json").exists());
+}
+
+#[test]
 fn replays_an_outage_longer_than_the_provider_ring_from_original_sample_offsets() {
     let fixture = Fixture::new("long-outage");
     let anchor = 7_201_337;
