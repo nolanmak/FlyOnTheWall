@@ -323,7 +323,8 @@ fn infer_mic_channels(global_channels: u16, sys_bytes: u64, mic_bytes: u64) -> u
 /// One transcoded leg of a session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EncodedTrack {
-    /// File name within the session directory, e.g. `system.opus`.
+    /// Relative path within the session directory: a legacy `system.opus` or
+    /// the same source name inside an immutable `.archive-<identity>` directory.
     pub file: String,
     /// Size of the PCM it came from. Kept after the PCM is unlinked so the
     /// compression ratio remains reportable.
@@ -749,7 +750,8 @@ pub fn recover(root: impl AsRef<Path>) -> std::io::Result<Vec<SessionState>> {
 ///
 /// The muxing is incremental (CAP-10): a kill part-way through leaves both
 /// `.opus` files playable up to their last whole Ogg page, and the untouched
-/// `.pcm` still holds everything, so the encode can simply be re-run.
+/// `.pcm` still holds everything, so the encode can simply be re-run. A retry
+/// writes a separate generation; the manifest atomically selects both tracks.
 pub fn encode_session(dir: impl AsRef<Path>) -> Result<EncodedSession, OpusError> {
     let dir = dir.as_ref();
     let _owner = archive_owner(dir)?;
@@ -811,13 +813,83 @@ pub fn encode_session(dir: impl AsRef<Path>) -> Result<EncodedSession, OpusError
         );
     }
 
-    let system = encode_track(dir, LEGS[0].0, LEGS[0].1, formats.system)?;
-    let mic = encode_track(dir, LEGS[1].0, LEGS[1].1, formats.mic)?;
+    // Never overwrite an existing playable artifact, even an interrupted
+    // first encode whose manifest has not yet recorded completion. Retrying
+    // uses immutable generations so publishing one manifest commits both legs.
+    let replacement =
+        manifest.encoded.is_some() || LEGS.iter().any(|(_, name)| dir.join(name).exists());
+    let mut generation = if replacement {
+        let (_, path) = reserve_session_dir(dir, || format!(".archive-{}", session_id()))?;
+        Some(ArchiveGeneration { path, keep: false })
+    } else {
+        None
+    };
+    let output = generation.as_ref().map_or(dir, |g| g.path.as_path());
+    let mut system = encode_track(dir, output, LEGS[0].0, LEGS[0].1, formats.system)?;
+    let mut mic = encode_track(dir, output, LEGS[1].0, LEGS[1].1, formats.mic)?;
+    if let Some(generation) = &generation {
+        let prefix = generation.path.file_name().unwrap().to_string_lossy();
+        system.file = format!("{prefix}/system.opus");
+        mic.file = format!("{prefix}/mic.opus");
+        #[cfg(unix)]
+        File::open(&generation.path)?.sync_all()?;
+    }
     let encoded = EncodedSession { system, mic };
 
     manifest.encoded = Some(encoded.clone());
+    // After publication is attempted a directory-sync error may mean the
+    // new manifest is visible already. Keep both generations in that case;
+    // never leave a manifest referring to files removed by error cleanup.
+    if let Some(generation) = &mut generation {
+        generation.keep = true;
+    }
     write_manifest_at(dir, &manifest)?;
     Ok(encoded)
+}
+
+struct ArchiveGeneration {
+    path: PathBuf,
+    keep: bool,
+}
+impl Drop for ArchiveGeneration {
+    fn drop(&mut self) {
+        if !self.keep {
+            for (_, name) in LEGS {
+                let _ = std::fs::remove_file(self.path.join(name));
+            }
+            let _ = std::fs::remove_dir(&self.path);
+        }
+    }
+}
+
+/// Resolve only a source's legacy filename or an app-reserved generation.
+/// Reject links and traversal before following a manifest-supplied path.
+pub(crate) fn archive_path(dir: &Path, source: &str, file: &str) -> std::io::Result<PathBuf> {
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid archive source path",
+        )
+    };
+    if file == source {
+        return Ok(dir.join(source));
+    }
+    let Some((generation, name)) = file.split_once('/') else {
+        return Err(invalid());
+    };
+    let Some(identity) = generation.strip_prefix(".archive-") else {
+        return Err(invalid());
+    };
+    if name != source
+        || identity.is_empty()
+        || !identity.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+        || !std::fs::symlink_metadata(dir.join(generation))?
+            .file_type()
+            .is_dir()
+    {
+        return Err(invalid());
+    }
+    Ok(dir.join(generation).join(name))
 }
 
 /// Unlink a session's raw PCM, returning the bytes reclaimed.
@@ -905,9 +977,10 @@ pub(crate) fn verify_encoded_track(
     format: Option<TrackFormat>,
 ) -> std::io::Result<()> {
     let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
-    if track.file != name || !SUPPORTED_RATES.contains(&track.sample_rate_hz) {
+    if !SUPPORTED_RATES.contains(&track.sample_rate_hz) {
         return Err(invalid("archive does not match its declared source"));
     }
+    let path = archive_path(dir, name, &track.file)?;
     let encoded_frames = if let Some(format) = format {
         if format.sample_rate_hz == 0
             || format.channels == 0
@@ -937,7 +1010,6 @@ pub(crate) fn verify_encoded_track(
     };
     let expected_ticks = u64::try_from(encoded_frames * u128::from(48000 / track.sample_rate_hz))
         .map_err(|_| invalid("archive sample count overflow"))?;
-    let path = dir.join(name);
     if !std::fs::symlink_metadata(&path)?.file_type().is_file() {
         return Err(invalid("archive must be an ordinary file"));
     }
@@ -988,7 +1060,22 @@ pub(crate) fn write_manifest_at(dir: &Path, manifest: &Manifest) -> std::io::Res
     let json = serde_json::to_vec_pretty(manifest)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     {
-        let mut f = create(&tmp)?;
+        match std::fs::symlink_metadata(&tmp) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "manifest staging must be an ordinary file",
+                ));
+            }
+        }
+        let mut f = crate::opus::archive_open_options()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
         f.write_all(&json)?;
         f.sync_all()?;
     }
@@ -1019,12 +1106,13 @@ pub(crate) fn write_manifest_at(dir: &Path, manifest: &Manifest) -> std::io::Res
 ///   size here is chosen for I/O efficiency alone.
 fn encode_track(
     dir: &Path,
+    output: &Path,
     pcm_name: &str,
     opus_name: &str,
     format: TrackFormat,
 ) -> Result<EncodedTrack, OpusError> {
     let pcm_path = dir.join(pcm_name);
-    let opus_path = dir.join(opus_name);
+    let opus_path = output.join(opus_name);
     let pcm_bytes = std::fs::metadata(&pcm_path).map(|m| m.len()).unwrap_or(0);
 
     let TrackFormat {
