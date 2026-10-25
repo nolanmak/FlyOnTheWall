@@ -744,3 +744,11 @@ button, summary { min-height: 36px; }
   .speech-settings { padding: 12px 16px; }
   .speech-settings .gh-field { grid-template-columns: minmax(0, 1fr); gap: 6px; }
 }
+
+.speech-health { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; padding: 8px 16px; border-bottom: 1px solid var(--line); }
+.speech-source { min-width: 0; padding: 12px 16px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); color: var(--muted); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.speech-engine { display: block; color: var(--fg); }
+.speech-summary, .speech-explanation { margin: 6px 0 0; }
+.speech-details { margin-top: 6px; }
+.speech-details summary { cursor: pointer; }
+@media (max-width: 760px) { .speech-health { grid-template-columns: 1fr; } }

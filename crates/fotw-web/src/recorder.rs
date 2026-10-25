@@ -99,6 +99,59 @@ pub struct CaptureHealth {
     pub mic: SourceCaptureStatus,
 }
 
+/// Current source lifecycle. Closed legacy streams do not prove full coverage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeechState {
+    /// Cloud is selected by the durable runtime; not a socket-health assertion.
+    Cloud,
+    /// Sticky local inference is selected by the durable runtime.
+    Local,
+    /// A legacy stream has not yet opened.
+    Connecting,
+    /// A legacy stream reports Open.
+    Open,
+    /// A legacy cloud stream is retrying.
+    Reconnecting,
+    /// A legacy stream closed; durable coverage is not measured.
+    Closed,
+    /// Durable coverage accounts for all frozen input.
+    Complete,
+    /// Audio is retained with pending or failed transcription.
+    Incomplete,
+}
+
+/// Content-free engine provenance and coverage on one original audio source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeechSourceStatus {
+    /// Microphone or computer output, never an inferred speaker identity.
+    pub source: CaptureSource,
+    /// Actual stream's provider and model, not the next-recording preference.
+    pub provider: String,
+    /// Actual engine model identity.
+    pub model: String,
+    /// Verified revision when the runtime recorded one.
+    pub revision: Option<String>,
+    /// Stream lifecycle, separate from capture lifecycle.
+    pub state: SpeechState,
+    /// Per-source provider epoch and original audio offset. None for legacy streams.
+    pub epoch: Option<u64>,
+    /// Epoch boundary on the original audio clock.
+    pub from_ms: Option<u64>,
+    /// Stable switch-reason code. None for an initial engine.
+    pub switch_reason: Option<String>,
+    /// Uncommitted audio duration; None when the runtime cannot measure it.
+    pub pending_audio_ms: Option<u64>,
+    /// Backend streaming capabilities; None means unknown, not supported.
+    pub word_timestamps_supported: Option<bool>,
+    /// Whether this backend supports streaming speaker labels.
+    pub diarization_supported: Option<bool>,
+    /// Native worker liveness when measured. None for older runtimes.
+    pub worker_running: Option<bool>,
+    /// Actionable current failure without transcript content or credentials.
+    pub error: Option<String>,
+}
+
 /// What the recorder is doing, with the timings the UI renders.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingStatus {
@@ -147,6 +200,9 @@ pub struct RecordingStatus {
     /// Stop/cancel is waiting for owned model or capture setup to finish.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub preparation_cancel_requested: bool,
+    /// Actual active-source transcription telemetry; older recorders omit it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speech_status: Vec<SpeechSourceStatus>,
 }
 
 impl RecordingStatus {
@@ -163,6 +219,7 @@ impl RecordingStatus {
             transcription_error: None,
             capture_health: None,
             preparation_cancel_requested: false,
+            speech_status: Vec::new(),
         }
     }
 
@@ -197,6 +254,7 @@ impl RecordingStatus {
             transcription_error: None,
             capture_health: None,
             preparation_cancel_requested: false,
+            speech_status: Vec::new(),
         }
     }
 
@@ -217,6 +275,7 @@ impl RecordingStatus {
             transcription_error: None,
             capture_health: None,
             preparation_cancel_requested: false,
+            speech_status: Vec::new(),
         }
     }
 
@@ -238,6 +297,13 @@ impl RecordingStatus {
     #[must_use]
     pub fn with_transcription_error(mut self, error: Option<String>) -> Self {
         self.transcription_error = error.filter(|e| !e.trim().is_empty());
+        self
+    }
+
+    /// Attach actual stream metadata, independently of capture health.
+    #[must_use]
+    pub fn with_speech_status(mut self, status: Vec<SpeechSourceStatus>) -> Self {
+        self.speech_status = status;
         self
     }
 
