@@ -5,6 +5,12 @@
 version: 2
 updates:
   - package-ecosystem: cargo
+    directory: /tools/aec-eval
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 1
+
+  - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly

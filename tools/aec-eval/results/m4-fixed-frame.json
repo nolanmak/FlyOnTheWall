@@ -1,0 +1,133 @@
+{
+  "audio_seconds_per_case": 20,
+  "backend_tail_drained": false,
+  "candidate_selected_for_app": false,
+  "fixed_frame_probe_only": true,
+  "hardware": "Apple M4",
+  "ns_agc_disabled": true,
+  "results": [
+    {
+      "backend": "passthrough",
+      "case": "near-only",
+      "metrics": {
+        "fixed_delay_samples": 0,
+        "near_gain": 1.0,
+        "near_gain_db": 0.0,
+        "near_snr_db": 98.18506809281436,
+        "output_buffer_samples": 320000,
+        "residual_reduction_db": null
+      },
+      "wall_ms": 0.082458
+    },
+    {
+      "backend": "passthrough",
+      "case": "echo-only",
+      "metrics": {
+        "fixed_delay_samples": 0,
+        "near_gain": null,
+        "near_gain_db": null,
+        "near_snr_db": null,
+        "output_buffer_samples": 320000,
+        "residual_reduction_db": 0.0
+      },
+      "wall_ms": 0.080541
+    },
+    {
+      "backend": "passthrough",
+      "case": "double-talk",
+      "metrics": {
+        "fixed_delay_samples": 0,
+        "near_gain": 1.0069537165137277,
+        "near_gain_db": 0.06019018317491597,
+        "near_snr_db": 3.7208386840996694,
+        "output_buffer_samples": 320000,
+        "residual_reduction_db": 0.0004946264825366649
+      },
+      "wall_ms": 0.017708
+    },
+    {
+      "backend": "gate-100ms",
+      "case": "near-only",
+      "metrics": {
+        "fixed_delay_samples": 0,
+        "near_gain": 1.0,
+        "near_gain_db": 0.0,
+        "near_snr_db": 98.18506809281436,
+        "output_buffer_samples": 320000,
+        "residual_reduction_db": null
+      },
+      "wall_ms": 3.1961250000000003
+    },
+    {
+      "backend": "gate-100ms",
+      "case": "echo-only",
+      "metrics": {
+        "fixed_delay_samples": 0,
+        "near_gain": null,
+        "near_gain_db": null,
+        "near_snr_db": null,
+        "output_buffer_samples": 320000,
+        "residual_reduction_db": 94.46472403519722
+      },
+      "wall_ms": 22.590208
+    },
+    {
+      "backend": "gate-100ms",
+      "case": "double-talk",
+      "metrics": {
+        "fixed_delay_samples": 0,
+        "near_gain": 0.9915287053521414,
+        "near_gain_db": -0.07389416380641095,
+        "near_snr_db": 3.7766398684004825,
+        "output_buffer_samples": 320000,
+        "residual_reduction_db": 0.05629581078334941
+      },
+      "wall_ms": 22.612791
+    },
+    {
+      "backend": "sonora-0.2.0-aec3",
+      "case": "near-only",
+      "metrics": {
+        "fixed_delay_samples": 128,
+        "near_gain": 1.0000000112554561,
+        "near_gain_db": 9.77636495716607e-08,
+        "near_snr_db": 98.18506809281436,
+        "output_buffer_samples": 320000,
+        "residual_reduction_db": null
+      },
+      "wall_ms": 51.042790999999994
+    },
+    {
+      "backend": "sonora-0.2.0-aec3",
+      "case": "echo-only",
+      "metrics": {
+        "fixed_delay_samples": 128,
+        "near_gain": null,
+        "near_gain_db": null,
+        "near_snr_db": null,
+        "output_buffer_samples": 320000,
+        "residual_reduction_db": 28.56221813086877
+      },
+      "wall_ms": 75.04575
+    },
+    {
+      "backend": "sonora-0.2.0-aec3",
+      "case": "double-talk",
+      "metrics": {
+        "fixed_delay_samples": 128,
+        "near_gain": 0.6366961162884733,
+        "near_gain_db": -3.921355984649644,
+        "near_snr_db": 7.439053434920436,
+        "output_buffer_samples": 320000,
+        "residual_reduction_db": 3.7187093773033038
+      },
+      "wall_ms": 72.26112499999999
+    }
+  ],
+  "sample_rate_hz": 16000,
+  "synthetic_only": true,
+  "warmup_seconds": 8,
+  "measured_on": "2026-10-25",
+  "hardware_model": "Mac16,10",
+  "physical_memory_bytes": 17179869184
+}

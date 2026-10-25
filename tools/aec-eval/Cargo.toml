@@ -1,0 +1,15 @@
+[package]
+name = "fotw-aec-eval"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+publish = false
+
+# Evaluation is explicitly separate from the shipped app and its dependencies.
+[workspace]
+
+[dependencies]
+fotw-pipeline = { path = "../../crates/fotw-pipeline" }
+sonora = "=0.2.0"
+serde_json = "1"
