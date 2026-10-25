@@ -83,6 +83,8 @@ pub(super) fn run(args: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
         "sonora-0.2.0-adapted",
         #[cfg(feature = "native-webrtc")]
         "native-webrtc-2.1.0-aec3",
+        #[cfg(feature = "native-webrtc")]
+        "native-webrtc-2.1.0-conservative",
     ] {
         let control = super::run(backend, &zero, &near);
         let lag = delay(&near, &control);
@@ -166,6 +168,7 @@ pub(super) fn run(args: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
         "{}",
         serde_json::json!({"fixture":"approved-public-jfk","wav_sha256":WAV_SHA,
         "hardware":super::hardware(),"recognizer":"fotw-stt WhisperEngine / whisper-rs 0.16.0",
+        "native_conservative_parameters":super::native_profile_description(),
         "model":"small.en","model_sha256":MODEL_SHA,"reference":REFERENCE,
         "reference_source":"public-domain JFK inaugural address excerpt in approved whisper.cpp JFK fixture",
         "far_end":"seeded generated signal 127 through the existing linear room fixture",

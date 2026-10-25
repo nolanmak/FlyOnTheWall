@@ -1,0 +1,1507 @@
+{
+  "aggregate": [
+    {
+      "all_fixture_signal_gates_pass": false,
+      "app_backend_selected": false,
+      "backend": "gate-100ms"
+    },
+    {
+      "all_fixture_signal_gates_pass": false,
+      "app_backend_selected": false,
+      "backend": "native-webrtc-2.1.0-aec3"
+    },
+    {
+      "all_fixture_signal_gates_pass": false,
+      "app_backend_selected": false,
+      "backend": "native-webrtc-2.1.0-conservative"
+    },
+    {
+      "all_fixture_signal_gates_pass": false,
+      "app_backend_selected": false,
+      "backend": "passthrough"
+    },
+    {
+      "all_fixture_signal_gates_pass": false,
+      "app_backend_selected": false,
+      "backend": "sonora-0.2.0-adapted"
+    },
+    {
+      "all_fixture_signal_gates_pass": false,
+      "app_backend_selected": false,
+      "backend": "sonora-0.2.0-aec3"
+    }
+  ],
+  "candidate_selected_for_app": false,
+  "fixtures": [
+    {
+      "audio_seconds_per_case": 20,
+      "callback_adapter_evaluated": true,
+      "candidate_selected_for_app": false,
+      "drift_ppm": 0.0,
+      "far_seed": 127,
+      "fixture": "original",
+      "hardware": "Apple M4",
+      "native_conservative_parameters": {
+        "backend": "native-webrtc-2.1.0-conservative",
+        "clock_drift_resampling": false,
+        "emr_thresholds_changed": false,
+        "enr_threshold_scale": 16.0,
+        "experimental_aec3_api": true,
+        "filter_block_samples": 64,
+        "filter_length_blocks": 32
+      },
+      "native_webrtc_evaluated": true,
+      "near_seed": 915,
+      "ns_agc_disabled": true,
+      "results": [
+        {
+          "backend": "passthrough",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 1.0,
+            "near_gain_db": 0.0,
+            "near_snr_db": 98.18506809281436,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 0.105834
+        },
+        {
+          "backend": "passthrough",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 0.0
+          },
+          "wall_ms": 0.082958
+        },
+        {
+          "backend": "passthrough",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 1.0069537165137277,
+            "near_gain_db": 0.06019018317491597,
+            "near_snr_db": 3.781028867274585,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 0.0004946264825366649
+          },
+          "wall_ms": 0.014667
+        },
+        {
+          "backend": "gate-100ms",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 1.0,
+            "near_gain_db": 0.0,
+            "near_snr_db": 98.18506809281436,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 3.286
+        },
+        {
+          "backend": "gate-100ms",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 94.46472403519722
+          },
+          "wall_ms": 23.705917
+        },
+        {
+          "backend": "gate-100ms",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 0.9915287053521414,
+            "near_gain_db": -0.07389416380641095,
+            "near_snr_db": 3.7027457045940713,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 0.05629581078334941
+          },
+          "wall_ms": 22.209459000000003
+        },
+        {
+          "backend": "sonora-0.2.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 1.0000000112554561,
+            "near_gain_db": 9.77636495716607e-08,
+            "near_snr_db": 98.18506819057801,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 52.142042
+        },
+        {
+          "backend": "sonora-0.2.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 28.56221813086877
+          },
+          "wall_ms": 78.943583
+        },
+        {
+          "backend": "sonora-0.2.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 0.6366961162884733,
+            "near_gain_db": -3.921355984649644,
+            "near_snr_db": 3.517697450270792,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 3.7187093773033038
+          },
+          "wall_ms": 73.34504199999999
+        },
+        {
+          "backend": "sonora-0.2.0-adapted",
+          "backend_tail_drained": true,
+          "callback_adapter": true,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 1.0000000112554561,
+            "near_gain_db": 9.77636495716607e-08,
+            "near_snr_db": 98.18506819057801,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 55.223915999999996
+        },
+        {
+          "backend": "sonora-0.2.0-adapted",
+          "backend_tail_drained": true,
+          "callback_adapter": true,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 28.56221813086877
+          },
+          "wall_ms": 81.376583
+        },
+        {
+          "backend": "sonora-0.2.0-adapted",
+          "backend_tail_drained": true,
+          "callback_adapter": true,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 0.6366961162884733,
+            "near_gain_db": -3.921355984649644,
+            "near_snr_db": 3.517697450270792,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 3.7187093773033038
+          },
+          "wall_ms": 77.09579099999999
+        },
+        {
+          "backend": "native-webrtc-2.1.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 1.0000000109698235,
+            "near_gain_db": 9.528267613722606e-08,
+            "near_snr_db": 98.18506818809703,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 166.962541
+        },
+        {
+          "backend": "native-webrtc-2.1.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 19.87711269905097
+          },
+          "wall_ms": 282.06187500000004
+        },
+        {
+          "backend": "native-webrtc-2.1.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 0.6447940448905262,
+            "near_gain_db": -3.811579643759271,
+            "near_snr_db": 3.685612135468914,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 3.7768477216110528
+          },
+          "wall_ms": 275.52925
+        },
+        {
+          "backend": "native-webrtc-2.1.0-conservative",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 1.0000000109698235,
+            "near_gain_db": 9.528267613722606e-08,
+            "near_snr_db": 98.18506818809703,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 172.739666
+        },
+        {
+          "backend": "native-webrtc-2.1.0-conservative",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 19.996687813705673
+          },
+          "wall_ms": 287.561667
+        },
+        {
+          "backend": "native-webrtc-2.1.0-conservative",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 0.925483983757226,
+            "near_gain_db": -0.6726218532090034,
+            "near_snr_db": 10.418894405484338,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 7.3711722010762095
+          },
+          "wall_ms": 287.37258399999996
+        }
+      ],
+      "room_taps": [
+        [
+          640,
+          0.6000000238418579
+        ],
+        [
+          1120,
+          0.25
+        ],
+        [
+          1560,
+          0.10000000149011612
+        ]
+      ],
+      "sample_rate_hz": 16000,
+      "signal_qualification": [
+        {
+          "app_backend_selected": false,
+          "backend": "passthrough",
+          "echo_reduction": false,
+          "near_only": true,
+          "overlap_gain": true,
+          "overlap_snr": false,
+          "signal_gates_pass": false
+        },
+        {
+          "app_backend_selected": false,
+          "backend": "gate-100ms",
+          "echo_reduction": true,
+          "near_only": true,
+          "overlap_gain": true,
+          "overlap_snr": false,
+          "signal_gates_pass": false
+        },
+        {
+          "app_backend_selected": false,
+          "backend": "sonora-0.2.0-aec3",
+          "echo_reduction": true,
+          "near_only": true,
+          "overlap_gain": false,
+          "overlap_snr": false,
+          "signal_gates_pass": false
+        },
+        {
+          "app_backend_selected": false,
+          "backend": "sonora-0.2.0-adapted",
+          "echo_reduction": true,
+          "near_only": true,
+          "overlap_gain": false,
+          "overlap_snr": false,
+          "signal_gates_pass": false
+        },
+        {
+          "app_backend_selected": false,
+          "backend": "native-webrtc-2.1.0-aec3",
+          "echo_reduction": true,
+          "near_only": true,
+          "overlap_gain": false,
+          "overlap_snr": false,
+          "signal_gates_pass": false
+        },
+        {
+          "app_backend_selected": false,
+          "backend": "native-webrtc-2.1.0-conservative",
+          "echo_reduction": true,
+          "near_only": true,
+          "overlap_gain": true,
+          "overlap_snr": true,
+          "signal_gates_pass": true
+        }
+      ],
+      "synthetic_only": true,
+      "undrained_controls_present": true,
+      "warmup_seconds": 8
+    },
+    {
+      "audio_seconds_per_case": 20,
+      "callback_adapter_evaluated": true,
+      "candidate_selected_for_app": false,
+      "drift_ppm": 0.0,
+      "far_seed": 621,
+      "fixture": "unseen-short",
+      "hardware": "Apple M4",
+      "native_conservative_parameters": {
+        "backend": "native-webrtc-2.1.0-conservative",
+        "clock_drift_resampling": false,
+        "emr_thresholds_changed": false,
+        "enr_threshold_scale": 16.0,
+        "experimental_aec3_api": true,
+        "filter_block_samples": 64,
+        "filter_length_blocks": 32
+      },
+      "native_webrtc_evaluated": true,
+      "near_seed": 8901,
+      "ns_agc_disabled": true,
+      "results": [
+        {
+          "backend": "passthrough",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 1.0,
+            "near_gain_db": 0.0,
+            "near_snr_db": 98.3945116181755,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 0.025834
+        },
+        {
+          "backend": "passthrough",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 0.0
+          },
+          "wall_ms": 0.027292
+        },
+        {
+          "backend": "passthrough",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 1.0005481556504114,
+            "near_gain_db": 0.004759915015953761,
+            "near_snr_db": 4.5060110407315115,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 3.6800609080442513e-06
+          },
+          "wall_ms": 0.019292
+        },
+        {
+          "backend": "gate-100ms",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 1.0,
+            "near_gain_db": 0.0,
+            "near_snr_db": 98.3945116181755,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 3.2635419999999997
+        },
+        {
+          "backend": "gate-100ms",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 93.89326417252084
+          },
+          "wall_ms": 23.005625
+        },
+        {
+          "backend": "gate-100ms",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 0.531094631753008,
+            "near_gain_db": -5.496561767204861,
+            "near_snr_db": -1.8031092720173416,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": -0.8077949504671299
+          },
+          "wall_ms": 23.465792
+        },
+        {
+          "backend": "sonora-0.2.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 1.0000000102822177,
+            "near_gain_db": 8.931020763981966e-08,
+            "near_snr_db": 98.39451170748569,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 51.719458
+        },
+        {
+          "backend": "sonora-0.2.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 28.785697159003934
+          },
+          "wall_ms": 79.192667
+        },
+        {
+          "backend": "sonora-0.2.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 0.7052363294414917,
+            "near_gain_db": -3.0333064722762333,
+            "near_snr_db": 4.842108421443459,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 3.3741674480650423
+          },
+          "wall_ms": 73.724708
+        },
+        {
+          "backend": "sonora-0.2.0-adapted",
+          "backend_tail_drained": true,
+          "callback_adapter": true,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 1.0000000102822177,
+            "near_gain_db": 8.931020763981966e-08,
+            "near_snr_db": 98.39451170748569,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 54.367
+        },
+        {
+          "backend": "sonora-0.2.0-adapted",
+          "backend_tail_drained": true,
+          "callback_adapter": true,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 28.785697159003934
+          },
+          "wall_ms": 81.412084
+        },
+        {
+          "backend": "sonora-0.2.0-adapted",
+          "backend_tail_drained": true,
+          "callback_adapter": true,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 0.7052363294414917,
+            "near_gain_db": -3.0333064722762333,
+            "near_snr_db": 4.842108421443459,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 3.3741674480650423
+          },
+          "wall_ms": 77.103042
+        },
+        {
+          "backend": "native-webrtc-2.1.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 1.000000010301028,
+            "near_gain_db": 8.947359171045988e-08,
+            "near_snr_db": 98.39451170764909,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 166.357833
+        },
+        {
+          "backend": "native-webrtc-2.1.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 19.473287333580423
+          },
+          "wall_ms": 276.744875
+        },
+        {
+          "backend": "native-webrtc-2.1.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 0.7253050810321623,
+            "near_gain_db": -2.789585602660809,
+            "near_snr_db": 5.334779284836245,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 3.6231174418424033
+          },
+          "wall_ms": 274.212625
+        },
+        {
+          "backend": "native-webrtc-2.1.0-conservative",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 1.000000010301028,
+            "near_gain_db": 8.947359171045988e-08,
+            "near_snr_db": 98.39451170764909,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 174.81787500000002
+        },
+        {
+          "backend": "native-webrtc-2.1.0-conservative",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 19.60836535570581
+          },
+          "wall_ms": 293.366375
+        },
+        {
+          "backend": "native-webrtc-2.1.0-conservative",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 0.9694604906926776,
+            "near_gain_db": -0.2693977084727309,
+            "near_snr_db": 12.704453486476513,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 8.472603749294592
+          },
+          "wall_ms": 281.66745799999995
+        }
+      ],
+      "room_taps": [
+        [
+          96,
+          0.5
+        ],
+        [
+          512,
+          0.23999999463558197
+        ],
+        [
+          1408,
+          0.07999999821186066
+        ]
+      ],
+      "sample_rate_hz": 16000,
+      "signal_qualification": [
+        {
+          "app_backend_selected": false,
+          "backend": "passthrough",
+          "echo_reduction": false,
+          "near_only": true,
+          "overlap_gain": true,
+          "overlap_snr": false,
+          "signal_gates_pass": false
+        },
+        {
+          "app_backend_selected": false,
+          "backend": "gate-100ms",
+          "echo_reduction": true,
+          "near_only": true,
+          "overlap_gain": false,
+          "overlap_snr": false,
+          "signal_gates_pass": false
+        },
+        {
+          "app_backend_selected": false,
+          "backend": "sonora-0.2.0-aec3",
+          "echo_reduction": true,
+          "near_only": true,
+          "overlap_gain": false,
+          "overlap_snr": false,
+          "signal_gates_pass": false
+        },
+        {
+          "app_backend_selected": false,
+          "backend": "sonora-0.2.0-adapted",
+          "echo_reduction": true,
+          "near_only": true,
+          "overlap_gain": false,
+          "overlap_snr": false,
+          "signal_gates_pass": false
+        },
+        {
+          "app_backend_selected": false,
+          "backend": "native-webrtc-2.1.0-aec3",
+          "echo_reduction": true,
+          "near_only": true,
+          "overlap_gain": false,
+          "overlap_snr": false,
+          "signal_gates_pass": false
+        },
+        {
+          "app_backend_selected": false,
+          "backend": "native-webrtc-2.1.0-conservative",
+          "echo_reduction": true,
+          "near_only": true,
+          "overlap_gain": true,
+          "overlap_snr": true,
+          "signal_gates_pass": true
+        }
+      ],
+      "synthetic_only": true,
+      "undrained_controls_present": true,
+      "warmup_seconds": 8
+    },
+    {
+      "audio_seconds_per_case": 20,
+      "callback_adapter_evaluated": true,
+      "candidate_selected_for_app": false,
+      "drift_ppm": 0.0,
+      "far_seed": 7311,
+      "fixture": "unseen-long",
+      "hardware": "Apple M4",
+      "native_conservative_parameters": {
+        "backend": "native-webrtc-2.1.0-conservative",
+        "clock_drift_resampling": false,
+        "emr_thresholds_changed": false,
+        "enr_threshold_scale": 16.0,
+        "experimental_aec3_api": true,
+        "filter_block_samples": 64,
+        "filter_length_blocks": 32
+      },
+      "native_webrtc_evaluated": true,
+      "near_seed": 8932,
+      "ns_agc_disabled": true,
+      "results": [
+        {
+          "backend": "passthrough",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 1.0,
+            "near_gain_db": 0.0,
+            "near_snr_db": 98.64177991482323,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 0.024375
+        },
+        {
+          "backend": "passthrough",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 0.0
+          },
+          "wall_ms": 0.0255
+        },
+        {
+          "backend": "passthrough",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 0.9989332630271816,
+            "near_gain_db": -0.009270505093581181,
+            "near_snr_db": 6.000770438528247,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 1.9719083203711118e-05
+          },
+          "wall_ms": 0.014834
+        },
+        {
+          "backend": "gate-100ms",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 1.0,
+            "near_gain_db": 0.0,
+            "near_snr_db": 98.64177991482323,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 3.261083
+        },
+        {
+          "backend": "gate-100ms",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 1.9681287647856551
+          },
+          "wall_ms": 23.358417
+        },
+        {
+          "backend": "gate-100ms",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 0.6867541858987446,
+            "near_gain_db": -3.26397369582005,
+            "near_snr_db": 0.8553514800895711,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": -1.8906960486290039
+          },
+          "wall_ms": 23.484541
+        },
+        {
+          "backend": "sonora-0.2.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 1.0000000114297507,
+            "near_gain_db": 9.927755301302429e-08,
+            "near_snr_db": 98.6417800141008,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 51.544582999999996
+        },
+        {
+          "backend": "sonora-0.2.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 24.626853037982702
+          },
+          "wall_ms": 78.578125
+        },
+        {
+          "backend": "sonora-0.2.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 0.6061719031213025,
+            "near_gain_db": -4.348083952643073,
+            "near_snr_db": 2.7159506477169137,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 1.054013375821362
+          },
+          "wall_ms": 72.518458
+        },
+        {
+          "backend": "sonora-0.2.0-adapted",
+          "backend_tail_drained": true,
+          "callback_adapter": true,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 1.0000000114297507,
+            "near_gain_db": 9.927755301302429e-08,
+            "near_snr_db": 98.6417800141008,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 54.568917
+        },
+        {
+          "backend": "sonora-0.2.0-adapted",
+          "backend_tail_drained": true,
+          "callback_adapter": true,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 24.626853037982702
+          },
+          "wall_ms": 81.632333
+        },
+        {
+          "backend": "sonora-0.2.0-adapted",
+          "backend_tail_drained": true,
+          "callback_adapter": true,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 0.6061719031213025,
+            "near_gain_db": -4.348083952643073,
+            "near_snr_db": 2.7159506477169137,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 1.054013375821362
+          },
+          "wall_ms": 77.75104200000001
+        },
+        {
+          "backend": "native-webrtc-2.1.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 1.0000000102652513,
+            "near_gain_db": 8.916283911940904e-08,
+            "near_snr_db": 98.64178000398609,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 166.01179199999999
+        },
+        {
+          "backend": "native-webrtc-2.1.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 17.932395057814194
+          },
+          "wall_ms": 275.821334
+        },
+        {
+          "backend": "native-webrtc-2.1.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 0.769640501820635,
+            "near_gain_db": -2.274241718199643,
+            "near_snr_db": 5.787258186710325,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 2.051478680371343
+          },
+          "wall_ms": 271.67858299999995
+        },
+        {
+          "backend": "native-webrtc-2.1.0-conservative",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 1.0000000102652513,
+            "near_gain_db": 8.916283911940904e-08,
+            "near_snr_db": 98.64178000398609,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 174.588417
+        },
+        {
+          "backend": "native-webrtc-2.1.0-conservative",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 18.80243159766752
+          },
+          "wall_ms": 284.61825
+        },
+        {
+          "backend": "native-webrtc-2.1.0-conservative",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 0.9577087490472219,
+            "near_gain_db": -0.3753309022092647,
+            "near_snr_db": 12.184142741657578,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 6.549452419328218
+          },
+          "wall_ms": 284.536292
+        }
+      ],
+      "room_taps": [
+        [
+          224,
+          0.44999998807907104
+        ],
+        [
+          992,
+          0.25
+        ],
+        [
+          2016,
+          0.14000000059604645
+        ]
+      ],
+      "sample_rate_hz": 16000,
+      "signal_qualification": [
+        {
+          "app_backend_selected": false,
+          "backend": "passthrough",
+          "echo_reduction": false,
+          "near_only": true,
+          "overlap_gain": true,
+          "overlap_snr": false,
+          "signal_gates_pass": false
+        },
+        {
+          "app_backend_selected": false,
+          "backend": "gate-100ms",
+          "echo_reduction": false,
+          "near_only": true,
+          "overlap_gain": false,
+          "overlap_snr": false,
+          "signal_gates_pass": false
+        },
+        {
+          "app_backend_selected": false,
+          "backend": "sonora-0.2.0-aec3",
+          "echo_reduction": true,
+          "near_only": true,
+          "overlap_gain": false,
+          "overlap_snr": false,
+          "signal_gates_pass": false
+        },
+        {
+          "app_backend_selected": false,
+          "backend": "sonora-0.2.0-adapted",
+          "echo_reduction": true,
+          "near_only": true,
+          "overlap_gain": false,
+          "overlap_snr": false,
+          "signal_gates_pass": false
+        },
+        {
+          "app_backend_selected": false,
+          "backend": "native-webrtc-2.1.0-aec3",
+          "echo_reduction": true,
+          "near_only": true,
+          "overlap_gain": false,
+          "overlap_snr": false,
+          "signal_gates_pass": false
+        },
+        {
+          "app_backend_selected": false,
+          "backend": "native-webrtc-2.1.0-conservative",
+          "echo_reduction": true,
+          "near_only": true,
+          "overlap_gain": true,
+          "overlap_snr": true,
+          "signal_gates_pass": true
+        }
+      ],
+      "synthetic_only": true,
+      "undrained_controls_present": true,
+      "warmup_seconds": 8
+    },
+    {
+      "audio_seconds_per_case": 20,
+      "callback_adapter_evaluated": true,
+      "candidate_selected_for_app": false,
+      "drift_ppm": 80.0,
+      "far_seed": 217,
+      "fixture": "unseen-drift",
+      "hardware": "Apple M4",
+      "native_conservative_parameters": {
+        "backend": "native-webrtc-2.1.0-conservative",
+        "clock_drift_resampling": false,
+        "emr_thresholds_changed": false,
+        "enr_threshold_scale": 16.0,
+        "experimental_aec3_api": true,
+        "filter_block_samples": 64,
+        "filter_length_blocks": 32
+      },
+      "native_webrtc_evaluated": true,
+      "near_seed": 501,
+      "ns_agc_disabled": true,
+      "results": [
+        {
+          "backend": "passthrough",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 1.0,
+            "near_gain_db": 0.0,
+            "near_snr_db": 98.1102425211327,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 0.024333
+        },
+        {
+          "backend": "passthrough",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 0.0
+          },
+          "wall_ms": 0.025417000000000002
+        },
+        {
+          "backend": "passthrough",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 0.9997889349206636,
+            "near_gain_db": -0.0018334814843305887,
+            "near_snr_db": 4.24172176441235,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 5.14383139026498e-07
+          },
+          "wall_ms": 0.01825
+        },
+        {
+          "backend": "gate-100ms",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 1.0,
+            "near_gain_db": 0.0,
+            "near_snr_db": 98.1102425211327,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 3.258959
+        },
+        {
+          "backend": "gate-100ms",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 7.651593001950107
+          },
+          "wall_ms": 23.023542000000003
+        },
+        {
+          "backend": "gate-100ms",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 0.661852540608077,
+            "near_gain_db": -3.58477519409926,
+            "near_snr_db": -0.676510834757717,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": -1.3352903721719995
+          },
+          "wall_ms": 23.357833000000003
+        },
+        {
+          "backend": "sonora-0.2.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 1.0000000112300373,
+            "near_gain_db": 9.754286487450283e-08,
+            "near_snr_db": 98.11024261867557,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 51.155833
+        },
+        {
+          "backend": "sonora-0.2.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 21.06097962919109
+          },
+          "wall_ms": 79.050875
+        },
+        {
+          "backend": "sonora-0.2.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 0.6652306590766545,
+            "near_gain_db": -3.5405548655093306,
+            "near_snr_db": 3.15904936617118,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 2.456049500166968
+          },
+          "wall_ms": 74.715333
+        },
+        {
+          "backend": "sonora-0.2.0-adapted",
+          "backend_tail_drained": true,
+          "callback_adapter": true,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 1.0000000112300373,
+            "near_gain_db": 9.754286487450283e-08,
+            "near_snr_db": 98.11024261867557,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 54.907833000000004
+        },
+        {
+          "backend": "sonora-0.2.0-adapted",
+          "backend_tail_drained": true,
+          "callback_adapter": true,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 21.06097962919109
+          },
+          "wall_ms": 81.39708399999999
+        },
+        {
+          "backend": "sonora-0.2.0-adapted",
+          "backend_tail_drained": true,
+          "callback_adapter": true,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 0,
+            "near_gain": 0.6652306590766545,
+            "near_gain_db": -3.5405548655093306,
+            "near_snr_db": 3.15904936617118,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 2.456049500166968
+          },
+          "wall_ms": 76.556708
+        },
+        {
+          "backend": "native-webrtc-2.1.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 1.0000000110019047,
+            "near_gain_db": 9.556133012449372e-08,
+            "near_snr_db": 98.11024261669404,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 166.02375
+        },
+        {
+          "backend": "native-webrtc-2.1.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 20.269255378032494
+          },
+          "wall_ms": 276.978958
+        },
+        {
+          "backend": "native-webrtc-2.1.0-aec3",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 0.6555216048978826,
+            "near_gain_db": -3.6682598023365616,
+            "near_snr_db": 2.988782400441851,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 2.4134874712648706
+          },
+          "wall_ms": 275.35954200000003
+        },
+        {
+          "backend": "native-webrtc-2.1.0-conservative",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "near-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 1.0000000110019047,
+            "near_gain_db": 9.556133012449372e-08,
+            "near_snr_db": 98.11024261669404,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": null
+          },
+          "wall_ms": 173.289167
+        },
+        {
+          "backend": "native-webrtc-2.1.0-conservative",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "echo-only",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": null,
+            "near_gain_db": null,
+            "near_snr_db": null,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 14.553531777464318
+          },
+          "wall_ms": 283.90408299999996
+        },
+        {
+          "backend": "native-webrtc-2.1.0-conservative",
+          "backend_tail_drained": false,
+          "callback_adapter": false,
+          "case": "double-talk",
+          "metrics": {
+            "fixed_delay_samples": 128,
+            "near_gain": 0.9638207004416134,
+            "near_gain_db": -0.320075007655685,
+            "near_snr_db": 5.7813936156491454,
+            "output_buffer_samples": 320000,
+            "residual_reduction_db": 1.8579138917912883
+          },
+          "wall_ms": 279.263875
+        }
+      ],
+      "room_taps": [
+        [
+          416,
+          0.550000011920929
+        ],
+        [
+          1216,
+          0.20000000298023224
+        ],
+        [
+          1904,
+          0.10000000149011612
+        ]
+      ],
+      "sample_rate_hz": 16000,
+      "signal_qualification": [
+        {
+          "app_backend_selected": false,
+          "backend": "passthrough",
+          "echo_reduction": false,
+          "near_only": true,
+          "overlap_gain": true,
+          "overlap_snr": false,
+          "signal_gates_pass": false
+        },
+        {
+          "app_backend_selected": false,
+          "backend": "gate-100ms",
+          "echo_reduction": false,
+          "near_only": true,
+          "overlap_gain": false,
+          "overlap_snr": false,
+          "signal_gates_pass": false
+        },
+        {
+          "app_backend_selected": false,
+          "backend": "sonora-0.2.0-aec3",
+          "echo_reduction": true,
+          "near_only": true,
+          "overlap_gain": false,
+          "overlap_snr": false,
+          "signal_gates_pass": false
+        },
+        {
+          "app_backend_selected": false,
+          "backend": "sonora-0.2.0-adapted",
+          "echo_reduction": true,
+          "near_only": true,
+          "overlap_gain": false,
+          "overlap_snr": false,
+          "signal_gates_pass": false
+        },
+        {
+          "app_backend_selected": false,
+          "backend": "native-webrtc-2.1.0-aec3",
+          "echo_reduction": true,
+          "near_only": true,
+          "overlap_gain": false,
+          "overlap_snr": false,
+          "signal_gates_pass": false
+        },
+        {
+          "app_backend_selected": false,
+          "backend": "native-webrtc-2.1.0-conservative",
+          "echo_reduction": false,
+          "near_only": true,
+          "overlap_gain": true,
+          "overlap_snr": false,
+          "signal_gates_pass": false
+        }
+      ],
+      "synthetic_only": true,
+      "undrained_controls_present": true,
+      "warmup_seconds": 8
+    }
+  ],
+  "route_reset_and_callback_drift_qualified": false,
+  "synthetic_only": true
+}

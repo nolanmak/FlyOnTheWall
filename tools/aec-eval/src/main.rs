@@ -1,4 +1,5 @@
 //! AEC comparison with generated signals or opt-in approved public speech.
+mod quality;
 #[cfg(all(target_os = "macos", feature = "speech-retention"))]
 mod speech;
 #[cfg(any(all(target_os = "macos", feature = "speech-retention"), test))]
@@ -12,6 +13,10 @@ const RATE: usize = 16000;
 const FRAME: usize = RATE / 100;
 const SAMPLES: usize = RATE * 20;
 const WARMUP: usize = RATE * 8;
+#[cfg(feature = "native-webrtc")]
+const CONSERVATIVE_ENR_SCALE: f32 = 16.0;
+#[cfg(feature = "native-webrtc")]
+const CONSERVATIVE_FILTER_BLOCKS: usize = 32;
 
 fn sonora_processor() -> AudioProcessing {
     AudioProcessing::builder()
@@ -78,12 +83,29 @@ fn signal(seed: u32) -> Vec<f32> {
         .collect()
 }
 
+#[cfg(any(all(target_os = "macos", feature = "speech-retention"), test))]
 fn room(far: &[f32]) -> Vec<f32> {
+    room_response(far, &[(640, 0.6), (1120, 0.25), (1560, 0.1)], 0.0)
+}
+
+fn room_response(far: &[f32], taps: &[(usize, f32)], drift_ppm: f64) -> Vec<f32> {
     (0..far.len())
         .map(|i| {
-            [(640, 0.6), (1120, 0.25), (1560, 0.1)]
-                .iter()
-                .map(|(delay, gain)| i.checked_sub(*delay).map_or(0.0, |j| far[j] * gain))
+            taps.iter()
+                .map(|(delay, gain)| {
+                    if drift_ppm == 0.0 {
+                        return i.checked_sub(*delay).map_or(0.0, |j| far[j] * gain);
+                    }
+                    let position = i as f64 * (1.0 + drift_ppm / 1_000_000.0) - *delay as f64;
+                    if position < 0.0 {
+                        return 0.0;
+                    }
+                    let at = position.floor() as usize;
+                    let fraction = (position - at as f64) as f32;
+                    let a = far.get(at).copied().unwrap_or(0.0);
+                    let b = far.get(at + 1).copied().unwrap_or(0.0);
+                    (a + fraction * (b - a)) * gain
+                })
                 .sum()
         })
         .collect()
@@ -122,19 +144,50 @@ fn run(backend: &str, far: &[f32], mic: &[f32]) -> Vec<f32> {
         "sonora-0.2.0-adapted" => run_streaming(far, mic),
         #[cfg(feature = "native-webrtc")]
         "native-webrtc-2.1.0-aec3" => run_native(far, mic),
+        #[cfg(feature = "native-webrtc")]
+        "native-webrtc-2.1.0-conservative" => run_native_profile(far, mic, true),
         _ => panic!("unknown evaluation backend"),
     }
 }
 
 #[cfg(feature = "native-webrtc")]
 fn run_native(far: &[f32], mic: &[f32]) -> Vec<f32> {
+    run_native_profile(far, mic, false)
+}
+
+#[cfg(feature = "native-webrtc")]
+fn run_native_profile(far: &[f32], mic: &[f32], conservative: bool) -> Vec<f32> {
     use webrtc_audio_processing::{Config, Processor, config::EchoCanceller};
     assert_eq!(far.len(), mic.len());
     assert!(
         mic.len().is_multiple_of(FRAME),
         "fixed-frame control cannot drop a tail"
     );
-    let processor = Processor::new(RATE as u32).unwrap();
+    let processor = if conservative {
+        let mut config = webrtc_audio_processing::experimental::EchoCanceller3Config::default();
+        // 32 * 64 samples covers 128 ms of the echo path at 16 kHz.
+        config.filter.refined.length_blocks = CONSERVATIVE_FILTER_BLOCKS;
+        config.filter.coarse.length_blocks = CONSERVATIVE_FILTER_BLOCKS;
+        config.filter.refined_initial.length_blocks = CONSERVATIVE_FILTER_BLOCKS;
+        config.filter.coarse_initial.length_blocks = CONSERVATIVE_FILTER_BLOCKS;
+        let suppressor = &mut config.suppressor;
+        for tuning in [
+            &mut suppressor.normal_tuning,
+            &mut suppressor.nearend_tuning,
+        ] {
+            for mask in [&mut tuning.mask_lf, &mut tuning.mask_hf] {
+                mask.enr_transparent *= CONSERVATIVE_ENR_SCALE;
+                mask.enr_suppress *= CONSERVATIVE_ENR_SCALE;
+            }
+        }
+        assert!(
+            config.validate(),
+            "conservative parameters must be accepted unchanged"
+        );
+        Processor::with_aec3_config(RATE as u32, config).unwrap()
+    } else {
+        Processor::new(RATE as u32).unwrap()
+    };
     assert_eq!(processor.num_samples_per_frame(), FRAME);
     processor.set_config(Config {
         echo_canceller: Some(EchoCanceller::Full {
@@ -273,18 +326,136 @@ fn hardware() -> Option<String> {
     }
 }
 
+fn quality_report(results: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let value = |backend: &str, case: &str, metric: &str| {
+        results
+            .iter()
+            .find(|r| r["backend"] == backend && r["case"] == case)
+            .and_then(|r| r["metrics"][metric].as_f64())
+            .unwrap_or(f64::NAN)
+    };
+    let raw_snr = value("passthrough", "double-talk", "near_snr_db");
+    results
+        .iter()
+        .filter(|r| r["case"] == "near-only")
+        .map(|r| {
+            let backend = r["backend"].as_str().unwrap();
+            let gates = quality::assess(
+                value(backend, "near-only", "near_gain_db"),
+                value(backend, "echo-only", "residual_reduction_db"),
+                value(backend, "double-talk", "near_gain_db"),
+                value(backend, "double-talk", "near_snr_db"),
+                raw_snr,
+            );
+            serde_json::json!({"backend":backend,"echo_reduction":gates.echo_reduction,
+            "near_only":gates.near_only,"overlap_gain":gates.overlap_gain,
+            "overlap_snr":gates.overlap_snr,"signal_gates_pass":gates.pass(),
+            "app_backend_selected":false})
+        })
+        .collect()
+}
+
+fn aggregate_quality(fixtures: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let backends: std::collections::BTreeSet<_> = fixtures
+        .iter()
+        .filter_map(|f| f["signal_qualification"].as_array())
+        .flatten()
+        .filter_map(|q| q["backend"].as_str())
+        .collect();
+    backends.into_iter().map(|backend| {
+        let pass = fixtures.iter().all(|f| f["signal_qualification"].as_array().is_some_and(|rows|
+            rows.iter().any(|q| q["backend"] == backend && q["signal_gates_pass"] == true)));
+        serde_json::json!({"backend":backend,"all_fixture_signal_gates_pass":pass,"app_backend_selected":false})
+    }).collect()
+}
+
+fn native_profile_description() -> Option<serde_json::Value> {
+    #[cfg(feature = "native-webrtc")]
+    {
+        Some(
+            serde_json::json!({"backend":"native-webrtc-2.1.0-conservative",
+        "experimental_aec3_api":true,"filter_length_blocks":CONSERVATIVE_FILTER_BLOCKS,
+        "filter_block_samples":64,"enr_threshold_scale":CONSERVATIVE_ENR_SCALE,
+        "emr_thresholds_changed":false,"clock_drift_resampling":false}),
+        )
+    }
+    #[cfg(not(feature = "native-webrtc"))]
+    {
+        None
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if !args.is_empty() {
+        if args.len() == 1 && args[0] == "--heldout-signals" {
+            let fixtures = vec![
+                signal_probe(
+                    "original",
+                    127,
+                    915,
+                    &[(640, 0.6), (1120, 0.25), (1560, 0.1)],
+                    0.0,
+                ),
+                signal_probe(
+                    "unseen-short",
+                    621,
+                    8901,
+                    &[(96, 0.5), (512, 0.24), (1408, 0.08)],
+                    0.0,
+                ),
+                signal_probe(
+                    "unseen-long",
+                    7311,
+                    8932,
+                    &[(224, 0.45), (992, 0.25), (2016, 0.14)],
+                    0.0,
+                ),
+                signal_probe(
+                    "unseen-drift",
+                    217,
+                    501,
+                    &[(416, 0.55), (1216, 0.2), (1904, 0.1)],
+                    80.0,
+                ),
+            ];
+            let aggregate = aggregate_quality(&fixtures);
+            println!(
+                "{}",
+                serde_json::json!({"synthetic_only":true,"fixtures":fixtures,"aggregate":aggregate,
+                "candidate_selected_for_app":false,"route_reset_and_callback_drift_qualified":false})
+            );
+            return Ok(());
+        }
         #[cfg(all(target_os = "macos", feature = "speech-retention"))]
         if args[0] == "--speech-retention" {
             return speech::run(&args[1..]);
         }
-        return Err("use no arguments for generated signals, or --speech-retention WAV MODEL with the speech-retention feature on macOS".into());
+        return Err("use no arguments or --heldout-signals for generated signals, or --speech-retention WAV MODEL with the speech-retention feature on macOS".into());
     }
-    let far = signal(127);
-    let near = signal(915);
-    let echo = room(&far);
+    println!(
+        "{}",
+        signal_probe(
+            "original",
+            127,
+            915,
+            &[(640, 0.6), (1120, 0.25), (1560, 0.1)],
+            0.0
+        )
+    );
+    Ok(())
+}
+
+fn signal_probe(
+    label: &str,
+    far_seed: u32,
+    near_seed: u32,
+    taps: &[(usize, f32)],
+    drift_ppm: f64,
+) -> serde_json::Value {
+    let far = signal(far_seed);
+    let near = signal(near_seed);
+    let echo = room_response(&far, taps, drift_ppm);
     let zero = vec![0.0; SAMPLES];
     let hardware = hardware();
     let mut results = Vec::new();
@@ -295,6 +466,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "sonora-0.2.0-adapted",
         #[cfg(feature = "native-webrtc")]
         "native-webrtc-2.1.0-aec3",
+        #[cfg(feature = "native-webrtc")]
+        "native-webrtc-2.1.0-conservative",
     ];
     for backend in backends {
         let adapted = backend == "sonora-0.2.0-adapted";
@@ -315,20 +488,79 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "callback_adapter":adapted,"backend_tail_drained":adapted}));
         }
     }
-    println!(
-        "{}",
-        serde_json::json!({"synthetic_only":true, "hardware":hardware,
+    let qualification = quality_report(&results);
+    serde_json::json!({"synthetic_only":true, "hardware":hardware,
+        "fixture":label,"far_seed":far_seed,"near_seed":near_seed,"room_taps":taps,"drift_ppm":drift_ppm,
         "sample_rate_hz":RATE, "audio_seconds_per_case":20,"warmup_seconds":8,
         "ns_agc_disabled":true,"candidate_selected_for_app":false,
+        "native_conservative_parameters":native_profile_description(),
         "native_webrtc_evaluated":cfg!(feature = "native-webrtc"),
-        "undrained_controls_present":true,"callback_adapter_evaluated":true,"results":results})
-    );
-    Ok(())
+        "undrained_controls_present":true,"callback_adapter_evaluated":true,
+        "signal_qualification":qualification,"results":results})
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_passing_calibration_cannot_hide_a_failed_or_missing_validation_fixture() {
+        let pass = serde_json::json!({"signal_qualification":[{"backend":"candidate","signal_gates_pass":true}]});
+        let fail = serde_json::json!({"signal_qualification":[{"backend":"candidate","signal_gates_pass":false}]});
+        let missing = serde_json::json!({"signal_qualification":[]});
+        for validation in [fail, missing.clone()] {
+            assert_eq!(
+                aggregate_quality(&[pass.clone(), validation])[0]["all_fixture_signal_gates_pass"],
+                false
+            );
+        }
+        assert_eq!(
+            aggregate_quality(&[missing, pass.clone()])[0]["all_fixture_signal_gates_pass"],
+            false
+        );
+        assert_eq!(
+            aggregate_quality(&[pass.clone(), pass])[0]["all_fixture_signal_gates_pass"],
+            true
+        );
+    }
+    #[test]
+    fn generated_room_preserves_integer_delays_and_interpolates_drift_without_changing_duration() {
+        let source = [0.0, 1.0, 2.0, 3.0, 4.0];
+        assert_eq!(
+            room_response(&source, &[(1, 0.5)], 0.0),
+            [0.0, 0.0, 0.5, 1.0, 1.5]
+        );
+        assert_eq!(
+            room_response(&source, &[(1, 0.5)], 500000.0),
+            [0.0, 0.25, 1.0, 1.75, 0.0]
+        );
+    }
+    #[cfg(feature = "native-webrtc")]
+    #[test]
+    fn conservative_profile_meets_the_original_signal_gates_without_changing_them() {
+        let far = signal(127);
+        let near = signal(915);
+        let echo = room(&far);
+        let zero = vec![0.0; SAMPLES];
+        let backend = "native-webrtc-2.1.0-conservative";
+        let control = run(backend, &zero, &near);
+        let lag = delay(&near, &control);
+        let near_metrics = metrics(&near, &zero, &control, lag);
+        let echo_metrics = metrics(&zero, &echo, &run(backend, &far, &echo), lag);
+        let mic: Vec<_> = near.iter().zip(&echo).map(|(n, e)| n + e).collect();
+        let overlap = metrics(&near, &echo, &run(backend, &far, &mic), lag);
+        let raw = metrics(&near, &echo, &mic, 0);
+        let gates = quality::assess(
+            near_metrics["near_gain_db"].as_f64().unwrap(),
+            echo_metrics["residual_reduction_db"].as_f64().unwrap(),
+            overlap["near_gain_db"].as_f64().unwrap(),
+            overlap["near_snr_db"].as_f64().unwrap(),
+            raw["near_snr_db"].as_f64().unwrap(),
+        );
+        assert!(
+            gates.pass(),
+            "profile lost signal preservation: {gates:?}; near {near_metrics}, echo {echo_metrics}, overlap {overlap}, raw {raw}"
+        );
+    }
     #[cfg(feature = "native-webrtc")]
     #[test]
     fn native_aec_reduces_echo_without_mutating_its_render_reference() {
