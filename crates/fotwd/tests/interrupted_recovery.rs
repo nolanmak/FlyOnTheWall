@@ -83,14 +83,24 @@ fn fixture_audio(
     audio.append(&canonical).unwrap();
     audio.sync().unwrap();
     drop(audio);
-    let mut local = EngineDescriptor {
+    let local = EngineDescriptor {
         provider: fotw_stt::local::PROVIDER.into(),
         model: model.into(),
         revision: Some(revision.into()),
-        capabilities: fotw_stt::SttCapabilities::deepgram(),
+        capabilities: fotw_stt::SttCapabilities {
+            streaming: true,
+            batch: false,
+            word_timestamps: fotw_stt::FeatureAvailability::None,
+            diarization: fotw_stt::FeatureAvailability::None,
+            language_detection: false,
+            custom_vocabulary: fotw_stt::CustomVocabulary::None,
+            max_file_bytes: 0,
+            max_file_seconds: 0,
+            native_rates: vec![16000],
+            retention_control: fotw_stt::RetentionControl::None,
+            supports_replay_faster_than_realtime: true,
+        },
     };
-    local.capabilities.custom_vocabulary = fotw_stt::CustomVocabulary::None;
-    local.capabilities.diarization = fotw_stt::FeatureAvailability::None;
     let cloud = EngineDescriptor {
         provider: "deepgram".into(),
         model: "nova-3".into(),
@@ -464,6 +474,15 @@ fn installed_model_recovers_an_unindexed_stopped_wal_without_changing_settings_o
         .expect("interrupted WAL must become discoverable");
     assert_eq!(c.read(&meeting).unwrap().phase, RecoveryPhase::Complete);
     let snapshot = CoverageJournal::snapshot(&f.dir, &f.session, Source::System).unwrap();
+    let recovered_capabilities = &snapshot.epochs.last().unwrap().engine.capabilities;
+    assert_eq!(
+        recovered_capabilities.word_timestamps,
+        fotw_stt::FeatureAvailability::None
+    );
+    assert_eq!(
+        recovered_capabilities.diarization,
+        fotw_stt::FeatureAvailability::None
+    );
     let text = snapshot
         .commits
         .iter()
