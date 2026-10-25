@@ -1415,6 +1415,7 @@ struct ReadyInner {
     ready: std::sync::Mutex<bool>,
     failure: std::sync::OnceLock<String>,
     preparing: AtomicBool,
+    capture_setup: AtomicBool,
     woke: std::sync::Condvar,
 }
 
@@ -1423,6 +1424,25 @@ impl ReadySignal {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Serialize capture admission with cancellation. Once setup wins, the
+    /// caller must describe Stop as potentially retaining captured audio.
+    pub(crate) fn begin_capture_setup(&self, stop: &StopSignal) -> bool {
+        let _ready = self.0.ready.lock().unwrap_or_else(|e| e.into_inner());
+        if stop.is_stopped() || self.0.failure.get().is_some() {
+            return false;
+        }
+        self.0.capture_setup.store(true, Ordering::Release);
+        true
+    }
+    pub(crate) fn capture_setup_started(&self) -> bool {
+        self.0.capture_setup.load(Ordering::Acquire)
+    }
+    pub(crate) fn request_stop(&self, stop: &StopSignal) -> bool {
+        let _ready = self.0.ready.lock().unwrap_or_else(|e| e.into_inner());
+        stop.stop();
+        self.capture_setup_started()
     }
 
     pub(crate) fn set_preparing(&self, value: bool) {
@@ -1464,8 +1484,13 @@ impl ReadySignal {
     }
     /// Publish capture identity and its authoritative start before readiness.
     pub fn signal_capture(&self, session_id: String, started_at_ms: u64) {
+        let mut ready = self.0.ready.lock().unwrap_or_else(|e| e.into_inner());
         let _ = self.0.capture_started_at_ms.set(started_at_ms);
-        self.signal_session(session_id);
+        let _ = self.0.session_id.set(session_id);
+        // A Stop/timeout during a native start must not suppress the fact that
+        // capture subsequently returned and its audio is being finalized.
+        *ready = true;
+        self.0.woke.notify_all();
     }
     /// Freeze the first capture-stop request.
     pub fn signal_capture_stopped(&self, ended_at_ms: u64) {
@@ -1733,6 +1758,9 @@ pub async fn run_with_control(
     control: SessionControl,
 ) -> Result<SessionOutcome, String> {
     let transcription = transcription.prepare(&control).await?;
+    if !control.ready.begin_capture_setup(&control.stop) {
+        return Err("recording cancelled before capture setup".into());
+    }
     let stop_signal = control.stop;
     let deadlines = control.deadlines;
     // One pair per leg, both held here. The mic's used to be constructed
@@ -2081,6 +2109,9 @@ pub async fn run_supervised(
     control: SessionControl,
 ) -> Result<SessionOutcome, String> {
     let transcription = transcription.prepare(&control).await?;
+    if !control.ready.begin_capture_setup(&control.stop) {
+        return Err("recording cancelled before capture setup".into());
+    }
     let stop_signal = control.stop;
     let deadlines = control.deadlines;
     // The session's view of each leg, held here for anchoring and the final
@@ -4602,5 +4633,28 @@ mod local_collector_shutdown_tests {
             completed,
             "stalled inference sender must not hold a closed session collector alive"
         );
+    }
+}
+
+#[cfg(test)]
+mod capture_admission_tests {
+    use super::*;
+    #[test]
+    fn stop_before_capture_admission_prevents_all_setup() {
+        let control = SessionControl::new();
+        assert!(!control.ready.request_stop(&control.stop));
+        assert!(!control.ready.begin_capture_setup(&control.stop));
+        assert!(!control.ready.capture_setup_started());
+    }
+    #[test]
+    fn stop_after_capture_admission_cannot_hide_late_capture_readiness() {
+        let control = SessionControl::new();
+        assert!(control.ready.begin_capture_setup(&control.stop));
+        assert!(control.ready.request_stop(&control.stop));
+        control.ready.fail("capture setup stop requested".into());
+        control.ready.signal_capture("owned-capture".into(), 1000);
+        assert!(control.ready.is_ready());
+        assert_eq!(control.ready.session_id().as_deref(), Some("owned-capture"));
+        assert_eq!(control.ready.capture_started_at_ms(), Some(1000));
     }
 }

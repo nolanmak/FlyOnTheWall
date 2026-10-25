@@ -308,3 +308,58 @@ async fn installed_backup_prepares_both_sources_without_cloud_or_capture() {
     );
     drop(legs);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_during_capture_setup_reports_possible_audio_and_retains_ownership() {
+    let root = tempfile::tempdir().unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let announce = entered.clone();
+    let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let release = gate.clone();
+    let recorder = Arc::new(DaemonRecorder::with_parts(
+        root.path().join("sessions"),
+        tokio::runtime::Handle::current(),
+        Default::default(),
+        Default::default(),
+        Box::new(move || {
+            announce.notify_one();
+            let (lock, wake) = &*gate;
+            let ready = lock.lock().unwrap();
+            let _ready = wake.wait_while(ready, |released| !*released).unwrap();
+            Err("fixture capture opener released".into())
+        }),
+        Box::new(|| Transcription::Disabled),
+        Box::new(|_, _| panic!("fixture opens no real capture")),
+        Duration::from_secs(1),
+        Duration::from_secs(5),
+    ));
+    let requested = recorder.clone();
+    let starting = tokio::task::spawn_blocking(move || requested.start());
+    tokio::time::timeout(Duration::from_secs(3), entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(recorder.status().state, RecordingState::Starting);
+    let stopped = recorder.stop().unwrap();
+    assert_eq!(stopped.state, RecordingState::Starting);
+    assert!(stopped.preparation_cancel_requested);
+    assert!(
+        stopped
+            .transcription_error
+            .unwrap()
+            .contains("buffered audio")
+    );
+    assert!(starting.await.unwrap().is_err());
+    assert!(matches!(
+        recorder.start(),
+        Err(RecorderError::AlreadyRecording)
+    ));
+    *release.0.lock().unwrap() = true;
+    release.1.notify_all();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while recorder.status().state != RecordingState::Idle {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
