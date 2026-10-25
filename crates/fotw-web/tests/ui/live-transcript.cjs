@@ -382,3 +382,11 @@ test('legacy failures retain their warning while a durable epoch zero uses a rec
  h.ctx.renderRecording({...base,speech_status:[speechStatus({epoch:0})]});
  assert.match(h.nodes.get('status').textContent,/^Recording notice:/);
 });
+
+
+test('closed local-only streams explain that native cleanup still blocks Start',()=>{
+ const h=harness();h.ctx.refreshLibrary=()=>{};
+ h.ctx.renderRecording({state:'finishing',session_id:'legacy-local',started_at_ms:1000,ended_at_ms:2000,speech_status:[speechStatus({provider:'whispercpp',model:'small.en',state:'closed',epoch:null,from_ms:null,pending_audio_ms:null,worker_running:true})]});
+ const panel=h.nodes.get('speech-health');assert.match(panel.textContent,/Start waits for cleanup/);assert.match(panel.textContent,/Coverage not measured/);
+ h.ctx.renderRecording({state:'idle'});assert.equal(panel.hidden,true);
+});
