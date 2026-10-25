@@ -311,9 +311,9 @@ test accepts only checksum-pinned public small.en/JFK assets and runs through th
 production app controller, including refusal of a different revision. It is a
 functional smoke, not a paired ASR quality or resource benchmark.
 
-This entry point currently requires a finalized capture, its saved meeting alias
-and frozen clock, and the original local plan. Automatic startup scheduling,
-unfinished raw-WAL clock recovery, model provisioning and physical signed-app
+Manual and startup recovery currently require a finalized capture, its saved
+meeting alias and frozen clock, and the original local plan for pending inference.
+Unfinished raw-WAL clock recovery, model provisioning and physical signed-app
 Wi-Fi/device acceptance remain separate unfinished work under #12/#33/#124.
 
 The `ui_preview --saved-speech-recovery` fixture supplies synthetic metadata only
@@ -325,6 +325,36 @@ physical-device acceptance:
 ![Local retry with pending saved audio](speech-recovery/pending-mobile.png)
 
 ![Recovered text waits for explicit reload](speech-recovery/completed-mobile.png)
+
+### Startup local recovery
+
+After the unlocked library and loopback server are available, the daemon
+registers the same recovery controller used by the API and starts one background
+pass. It reads saved session IDs in pages of 32 under a fixed upper session-ID
+boundary. No scan, model construction or inference runs on the server runtime;
+no SQL mutex spans filesystem or native work. Completed work does not reload a
+model. Invalid captures and unavailable saved model revisions retain their audio
+and do not prevent later saved work from being considered.
+
+The pass uses each source's saved local plan, including revision and language,
+without changing today's ASR policy or contacting a cloud provider. It admits
+one recovery job at a time and waits through actual native cleanup before the
+next job. Preparation and durable-progress deadlines remain the same as manual
+recovery; they cannot revoke ownership of a blocked native call. Each candidate
+is considered once in this pass, rather than retried in a loop.
+
+Explicit Retry or Cancel ends the remaining automatic pass. Cancel also fences
+the active job's output. The daemon retains a lifetime guard: dropping it during
+shutdown stops scheduling and revokes an automatic job without blocking shutdown
+on native cleanup or cancelling a later manual job. A new daemon startup may
+attempt retained incomplete work again; Cancel stops the current pass.
+
+Device-free tests cross page boundaries, reopen a completed library without
+loading models, retain edits/audio/clocks, skip unavailable work, enforce the
+startup boundary and prove cancel/shutdown ownership. The checksum-pinned public
+small.en/JFK smoke exercises actual automatic local recovery and rejects a wrong
+saved revision. These are functional checks, not physical Wi-Fi/device,
+concurrent-app resource or paired transcription-quality acceptance.
 
 ### Capture ownership and clock evidence
 
@@ -354,7 +384,7 @@ raw-audio pump. Later successful checkpoints can restore evidence; missing or
 stale evidence cannot certify the uncheckpointed audio after a crash.
 
 These primitives and their production checkpoints prepare unfinished-WAL
-recovery. They do not yet enable automatic startup inference or reconstruct
-canonical speech audio from raw PCM; the saved-meeting retry requirements above
-still apply. Device-free contracts include hard process kill/reacquisition,
+recovery. They do not reconstruct canonical speech audio from raw PCM; the
+saved-meeting requirements above still apply to startup inference. Device-free
+contracts include hard process kill/reacquisition,
 live-owner exclusion, Stop/drain clock preservation, tails and corrupt evidence.

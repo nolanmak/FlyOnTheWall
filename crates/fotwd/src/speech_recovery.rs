@@ -12,7 +12,7 @@ use fotw_web::speech_recovery::{
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -20,8 +20,41 @@ use std::time::{Duration, Instant};
 pub type ModelResolver =
     dyn Fn(&LocalPlan, &Path) -> Result<Arc<dyn RecognizerFactory>, String> + Send + Sync;
 
+/// Lifetime of the bounded, local-only startup pass.
+pub struct StartupRecovery {
+    owner: SavedSpeechRecovery,
+    running: Arc<AtomicBool>,
+}
+impl StartupRecovery {
+    /// Whether the startup pass still owns scheduling work.
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Acquire)
+    }
+}
+impl Drop for StartupRecovery {
+    fn drop(&mut self) {
+        let state = self.owner.state();
+        state.startup_stop.store(true, Ordering::Release);
+        if let Some(job) = &state.job
+            && job.automatic
+            && job.status.worker_running
+        {
+            let _ = job
+                .stop
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+}
+struct StartupRunning(Arc<AtomicBool>);
+impl Drop for StartupRunning {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 struct Job {
     meeting: String,
+    automatic: bool,
     status: RecoveryStatus,
     entered: Duration,
     stop: Arc<AtomicU8>, // 1: explicit cancellation, 2: deadline
@@ -30,6 +63,8 @@ struct Job {
 #[derive(Default)]
 struct State {
     job: Option<Job>,
+    startup_started: bool,
+    startup_stop: Arc<AtomicBool>,
 }
 
 /// One saved-audio job at a time; no capture or cloud-credential capability.
@@ -74,6 +109,114 @@ fn regular(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
 }
 impl SavedSpeechRecovery {
+    /// Register manual controls and start the same owned local startup pass.
+    pub fn install(self, state: &fotw_web::AppState) -> std::io::Result<Option<StartupRecovery>> {
+        let owner = Arc::new(self);
+        state.set_speech_recovery(owner.clone());
+        owner.start_pending()
+    }
+    /// Start one local-only pass over saved recordings, off the server runtime.
+    pub fn start_pending(&self) -> std::io::Result<Option<StartupRecovery>> {
+        let stop = {
+            let mut state = self.state();
+            if state.startup_started || state.startup_stop.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            state.startup_started = true;
+            state.startup_stop.clone()
+        };
+        let running = Arc::new(AtomicBool::new(true));
+        let completion = StartupRunning(running.clone());
+        let owned = self.clone();
+        let worker = std::thread::Builder::new()
+            .name("startup-speech-recovery".into())
+            .spawn(move || {
+                let _completion = completion;
+                if owned.pending_pass(&stop).is_err() {
+                    crate::journal::record(
+                        "speech recovery: startup scan could not finish; saved audio retained",
+                    );
+                }
+            });
+        if let Err(error) = worker {
+            self.state().startup_started = false;
+            return Err(error);
+        }
+        Ok(Some(StartupRecovery {
+            owner: self.clone(),
+            running,
+        }))
+    }
+    fn pending_pass(&self, stop: &AtomicBool) -> Result<(), RecoveryError> {
+        if stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // A fixed upper boundary excludes later sessions, with at most one
+        // page of IDs retained. Filesystem and native work never own this SQL lock.
+        let upper: Option<String> = self
+            .db()
+            .conn()
+            .query_row("SELECT max(session_id) FROM session_note_links", [], |r| {
+                r.get(0)
+            })
+            .map_err(|_| RecoveryError::Invalid)?;
+        let Some(upper) = upper else {
+            return Ok(());
+        };
+        let mut cursor = String::new();
+        while !stop.load(Ordering::Acquire) {
+            let page = {
+                let db = self.db();
+                let mut query = db.conn().prepare("SELECT session_id,meeting_id FROM session_note_links WHERE session_id>?1 AND session_id<=?2 ORDER BY session_id LIMIT 32")
+                    .map_err(|_| RecoveryError::Invalid)?;
+                let rows = query
+                    .query_map([&cursor, &upper], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })
+                    .map_err(|_| RecoveryError::Invalid)?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| RecoveryError::Invalid)?
+            };
+            if page.is_empty() {
+                break;
+            }
+            for (session, meeting) in page {
+                cursor = session;
+                if stop.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                if !self
+                    .load(&meeting)
+                    .is_ok_and(|capture| capture.status.phase == RecoveryPhase::Incomplete)
+                {
+                    continue;
+                }
+                match self.start_job(&meeting, true) {
+                    Ok(_) => {}
+                    // Explicit user control owns the pass from here. Never
+                    // queue another native owner behind a retained worker.
+                    Err(RecoveryError::Busy) => return Ok(()),
+                    Err(_) => continue,
+                }
+                loop {
+                    self.check();
+                    if stop.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    if !self
+                        .state()
+                        .job
+                        .as_ref()
+                        .is_some_and(|j| j.status.worker_running)
+                    {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+        Ok(())
+    }
     /// Production resolver checks the saved revision, never the current provider.
     pub fn new(db: Db, data_root: PathBuf) -> Self {
         let models = data_root.clone();
@@ -242,6 +385,64 @@ impl SavedSpeechRecovery {
             sources,
             status,
         })
+    }
+    fn start_job(&self, meeting: &str, automatic: bool) -> Result<RecoveryStatus, RecoveryError> {
+        if meeting.is_empty() || meeting.len() > 128 {
+            return Err(RecoveryError::NotFound);
+        }
+        {
+            let mut state = self.state();
+            if automatic {
+                if state.startup_stop.load(Ordering::Acquire) {
+                    return Err(RecoveryError::Busy);
+                }
+            } else {
+                state.startup_stop.store(true, Ordering::Release);
+            }
+            if state
+                .job
+                .as_ref()
+                .is_some_and(|job| job.status.worker_running)
+            {
+                return Err(RecoveryError::Busy);
+            }
+            state.job = Some(Job {
+                meeting: meeting.into(),
+                automatic,
+                status: RecoveryStatus {
+                    worker_running: true,
+                    can_retry: false,
+                    ..initial(RecoveryPhase::Preparing)
+                },
+                entered: (self.clock)(),
+                stop: Arc::new(AtomicU8::new(0)),
+                observed: None,
+            });
+        }
+        let owned = self.clone();
+        let id = meeting.to_owned();
+        let worker = std::thread::Builder::new()
+            .name("saved-speech-recovery".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|_| RecoveryError::Invalid)?;
+                    let result = runtime.block_on(owned.recover(&id));
+                    // Runtime drop joins any owned blocking cleanup before admission
+                    // is released, including a late constructor or file flush.
+                    drop(runtime);
+                    result
+                }))
+                .unwrap_or(Err(RecoveryError::Invalid));
+                owned.ended(result);
+            });
+        if worker.is_err() {
+            self.ended(Err(RecoveryError::Invalid));
+            return Err(RecoveryError::Invalid);
+        }
+        self.read(meeting)
     }
     fn stage(&self, phase: RecoveryPhase, sources: Option<Vec<RecoverySource>>) {
         if let Some(job) = self.state().job.as_mut() {
@@ -467,54 +668,7 @@ impl SpeechRecoveryControl for SavedSpeechRecovery {
         Ok(status)
     }
     fn retry(&self, meeting: &str) -> Result<RecoveryStatus, RecoveryError> {
-        if meeting.is_empty() || meeting.len() > 128 {
-            return Err(RecoveryError::NotFound);
-        }
-        {
-            let mut state = self.state();
-            if state
-                .job
-                .as_ref()
-                .is_some_and(|job| job.status.worker_running)
-            {
-                return Err(RecoveryError::Busy);
-            }
-            state.job = Some(Job {
-                meeting: meeting.into(),
-                status: RecoveryStatus {
-                    worker_running: true,
-                    can_retry: false,
-                    ..initial(RecoveryPhase::Preparing)
-                },
-                entered: (self.clock)(),
-                stop: Arc::new(AtomicU8::new(0)),
-                observed: None,
-            });
-        }
-        let owned = self.clone();
-        let id = meeting.to_owned();
-        let worker = std::thread::Builder::new()
-            .name("saved-speech-recovery".into())
-            .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|_| RecoveryError::Invalid)?;
-                    let result = runtime.block_on(owned.recover(&id));
-                    // Runtime drop joins any owned blocking cleanup before admission
-                    // is released, including a late constructor or file flush.
-                    drop(runtime);
-                    result
-                }))
-                .unwrap_or(Err(RecoveryError::Invalid));
-                owned.ended(result);
-            });
-        if worker.is_err() {
-            self.ended(Err(RecoveryError::Invalid));
-            return Err(RecoveryError::Invalid);
-        }
-        self.read(meeting)
+        self.start_job(meeting, false)
     }
     fn cancel(&self, meeting: &str) -> Result<RecoveryStatus, RecoveryError> {
         {
@@ -524,6 +678,7 @@ impl SpeechRecoveryControl for SavedSpeechRecovery {
                 .as_ref()
                 .filter(|j| j.meeting == meeting)
                 .ok_or(RecoveryError::NotFound)?;
+            state.startup_stop.store(true, Ordering::Release);
             if job.status.worker_running {
                 let _ = job
                     .stop
