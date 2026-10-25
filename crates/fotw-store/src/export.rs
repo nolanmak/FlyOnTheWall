@@ -882,12 +882,15 @@ impl MeetingDoc {
         self.primary_segments().first().map(|s| s.start_ms)
     }
 
-    fn primary_segments(&self) -> Vec<&SegmentRow> {
-        let primary = self
-            .transcripts
+    fn primary_transcript(&self) -> Option<&TranscriptRow> {
+        self.transcripts
             .iter()
             .find(|t| t.is_primary != 0)
-            .or_else(|| self.transcripts.first());
+            .or_else(|| self.transcripts.first())
+    }
+
+    fn primary_segments(&self) -> Vec<&SegmentRow> {
+        let primary = self.primary_transcript();
         let mut rows: Vec<_> = self
             .segments
             .iter()
@@ -1037,6 +1040,7 @@ impl MeetingDoc {
             out.push('\n');
         }
 
+        out.push_str(&self.speech_history_text(true));
         if !self.segments.is_empty() {
             out.push_str("## Transcript\n\n");
             out.push_str(&self.transcript_lines("- "));
@@ -1059,7 +1063,103 @@ impl MeetingDoc {
             },
             iso_date(m.started_at_ms)
         ));
+        out.push_str(&self.speech_history_text(false));
         out.push_str(&self.transcript_lines(""));
+        out
+    }
+
+    // Actual recorded facts only; this section never becomes transcript words.
+    fn speech_history_text(&self, markdown: bool) -> String {
+        let mut epochs: Vec<_> = self
+            .speech_epochs
+            .iter()
+            .filter(|e| {
+                self.primary_transcript()
+                    .is_some_and(|t| e.transcript_id == t.id)
+                    && e.meeting_id == self.meeting.id
+            })
+            .collect();
+        epochs.sort_by(|a, b| (&a.source, a.epoch).cmp(&(&b.source, b.epoch)));
+        let mut out = String::from(if markdown {
+            "## Transcription sources\n\n"
+        } else {
+            "Transcription sources\n\n"
+        });
+        if epochs.is_empty() {
+            out.push_str("Engine history was not recorded for this transcript.\n\n");
+            return out;
+        }
+        out.push_str("Times use the original recording clock. Processed audio does not guarantee a complete or accurate transcript.\n\n");
+        let mut boundaries = std::collections::BTreeMap::<&str, i64>::new();
+        for receipt in &self.speech_receipts {
+            if receipt.meeting_id == self.meeting.id
+                && self
+                    .primary_transcript()
+                    .is_some_and(|t| receipt.transcript_id == t.id)
+            {
+                boundaries
+                    .entry(receipt.epoch_id.as_str())
+                    .and_modify(|end| *end = (*end).max(receipt.through_sample))
+                    .or_insert(receipt.through_sample);
+            }
+        }
+        let field = |value: &str| export_metadata(value, markdown);
+        for epoch in epochs {
+            let source = if epoch.source == "mic" {
+                "Microphone"
+            } else {
+                "System audio"
+            };
+            out.push_str(&format!(
+                "- {source}: {} / {}. ",
+                field(&epoch.provider),
+                field(&epoch.model)
+            ));
+            let from = hms(epoch.from_sample / 16);
+            if let Some(through) = boundaries
+                .get(epoch.id.as_str())
+                .filter(|end| **end > epoch.from_sample)
+            {
+                out.push_str(&format!("Audio processed {from}–{}. ", hms(through / 16)));
+            } else {
+                out.push_str(&format!(
+                    "Engine selected at {from}; no confirmed processed audio. "
+                ));
+            }
+            if let Some(reason) = &epoch.reason {
+                let friendly = match reason.as_str() {
+                    "transport_budget" => "network retry budget exhausted",
+                    "terminal_provider" => "provider refused the request",
+                    "provider_configuration" => "provider configuration failed",
+                    "replay_gap" => "cloud replay coverage unavailable",
+                    "manual" => "manual provider change",
+                    _ => reason,
+                };
+                out.push_str(&format!("Provider change: {}. ", field(friendly)));
+            }
+            if let Ok(capabilities) =
+                serde_json::from_str::<serde_json::Value>(&epoch.capabilities_json)
+            {
+                if capabilities["diarization"] == "none" {
+                    out.push_str("Speaker labels unavailable. ");
+                }
+                if capabilities["wordTimestamps"] == "none" {
+                    out.push_str("Word timing unavailable. ");
+                }
+            } else {
+                out.push_str("Capability metadata unavailable. ");
+            }
+            if epoch.epoch > 0 && epoch.source == "system" {
+                out.push_str("Speaker identities are separate for each engine. ");
+            }
+            if let Some(revision) = &epoch.revision {
+                out.push_str(&format!("Model revision: {}.", field(revision)));
+            } else {
+                out.push_str("Model revision not recorded.");
+            }
+            out.push('\n');
+        }
+        out.push('\n');
         out
     }
 
@@ -1249,6 +1349,26 @@ fn admonition_label(line: &str) -> Option<&'static str> {
         "[!NOTE]" => Some("Note"),
         _ => None,
     }
+}
+
+// A metadata value is one scalar, never a new Markdown block or raw HTML.
+fn export_metadata(value: &str, markdown: bool) -> String {
+    let value = value.replace(['\n', '\r'], " ");
+    if !markdown {
+        return value;
+    }
+    let escaped = escape_html(&value);
+    let mut out = String::new();
+    for ch in escaped.chars() {
+        if matches!(
+            ch,
+            '\\' | '`' | '*' | '_' | '[' | ']' | '(' | ')' | '!' | '#' | '|' | '~'
+        ) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn escape_html(s: &str) -> String {
