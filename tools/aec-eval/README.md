@@ -1,7 +1,8 @@
 # AEC signal probe
 
 This isolated evaluation tool compares the existing production `EchoGate` with
-passthrough and Sonora 0.2.0's Rust WebRTC AEC3 port. It does not enable an app
+passthrough and Sonora 0.2.0's Rust WebRTC AEC3 port, directly and through the
+shared pipeline frame adapter. It does not enable an app
 backend, use capture devices, fetch models, access credentials or contact speech
 providers. No new speech/model assets are required. The dependency is confined
 to this tool's own workspace and lockfile.
@@ -29,6 +30,14 @@ render processed before capture. Render input is immutable; its processed copy
 is discarded. Additional noise suppression, AGC and enforced high-pass filtering
 are disabled to isolate echo processing.
 
+The fourth backend, `sonora-0.2.0-adapted`, receives nonuniform callback chunks
+of 37, 243, 79 and 211 samples. It uses the pipeline adapter's declared 160-sample
+frame and 128-sample backend delay, with 320 waiting-mic and 640 reference samples
+as explicit probe budgets. Its output intervals are checked against the original
+clock; the delayed tail is drained without publishing padding. A real-backend
+partial-Stop test first returned only 16,000 samples for 16,159 input samples;
+the adapted path now retains every sample and verifies the near-only tail values.
+
 Metrics exclude eight seconds of adaptation. A fixed backend delay is estimated
 from its independent near-only control and reused for the other cases. Near gain
 is the signed least-squares projection onto the known near signal. Residual
@@ -44,13 +53,14 @@ quality when both speech and interference are attenuated. A calibration test
 first observed 6.02 dB where equal retained signal/noise powers require 0 dB;
 it now verifies the corrected result.
 
-This is a fixed-frame signal probe. It does not flush backend delay, establish
-source-tail preservation, handle arbitrary callback chunks, jitter, drift,
-reference loss or route changes, measure words retained or validate real rooms.
-Equal input/output buffer lengths do not establish complete audio duration when
-the backend delays samples. The result explicitly says that no app candidate
-has been selected. Sonora's delay and overlap attenuation must be addressed or
-accepted with stronger comparative evidence before product integration.
+The direct controls remain fixed-frame, undrained probes. The adapted path
+compensates delay and drains the tail; per-result flags distinguish these modes.
+Pipeline fake-backend tests cover independent/jittered delivery, missing and
+evicted references, error/non-finite output, resets and bounded retained input.
+This still does not establish physical-device timing, acoustic drift handling,
+word retention or real-room quality. Equal buffer lengths alone do not establish
+source-tail preservation. No app candidate is selected: overlap attenuation and
+quality gates still need qualifying comparative evidence before integration.
 
 ## First M4 observation
 
@@ -82,6 +92,21 @@ This candidate fails both overlap gates: gain -3.92 dB and retained-near SNR
 3.52 dB versus passthrough's 3.78 dB (a 0.26 dB regression). It is not selected
 for the app. Native WebRTC/LocalVQE comparison,
 approved speech word retention and real-room trials remain required by #72.
+
+## M4 adapter observation
+
+`results/m4-adapter.json` adds the adapted path while retaining the direct controls.
+Its compensated output delay measures zero samples, while the direct path still
+measures 128. This corrects source positions, not wall-clock latency: the adapter
+still buffers callbacks and the declared backend delay. Echo-only reduction
+(28.56 dB), overlap near gain (-3.92 dB) and
+retained-near SNR (3.52 dB versus raw 3.78 dB) are unchanged: framing fixes do not
+make an acoustically unqualified backend acceptable.
+
+The adapted path processed each 20-second case in 62.61 ms (near-only), 84.72 ms
+(echo-only) and 77.37 ms (overlap). The whole already-built twelve-case probe plus
+metrics used 14,204,928 bytes maximum RSS, 0.79 seconds user CPU and 1.05 seconds
+elapsed. This remains a synthetic worker probe, not app/model resource evidence.
 
 ## Pinned sources and provenance
 
