@@ -1,0 +1,34 @@
+{
+  "profile": {
+    "version": 1,
+    "language": "fr-CA",
+    "recognition_hints": ["Zoë & Sons", "C++", "PostgreSQL 16", "IPv6", "東京"],
+    "snippets": [
+      {"name":"signature", "text":"Thanks,\nZoë"},
+      {"name":"signature long", "text":"Thanks,\nZoë\nExample team"},
+      {"name":"postgres 16", "text":"SELECT version(); -- PostgreSQL 16\n"},
+      {"name":"salut café", "text":"Bonjour café 👋"},
+      {"name":"東京", "text":"東京・2026年"},
+      {"name":"repeated", "text":"go go go; insert snippet signature"}
+    ]
+  },
+  "cases": [
+    {"input":"INSERT SNIPPET SIGNATURE.","output":"Thanks,\nZoë"},
+    {"input":"  insert snippet signature long!  ","output":"Thanks,\nZoë\nExample team"},
+    {"input":"insert snippet postgres 16?","output":"SELECT version(); -- PostgreSQL 16\n"},
+    {"input":"Insert snippet SALUT CAFÉ.","output":"Bonjour café 👋"},
+    {"input":"insert snippet 東京","output":"東京・2026年"},
+    {"input":"insert snippet repeated","output":"go go go; insert snippet signature"},
+    {"input":"please insert snippet signature","output":"please insert snippet signature"},
+    {"input":"insert snippet signatures","output":"insert snippet signatures"},
+    {"input":"insert snippet signature long long","output":"insert snippet signature long long"},
+    {"input":"insert snippet signature. insert snippet signature.","output":"insert snippet signature. insert snippet signature."},
+    {"input":"print(\"insert snippet signature\")","output":"print(\"insert snippet signature\")"},
+    {"input":"let snippet = \"signature\";","output":"let snippet = \"signature\";"},
+    {"input":"insert snippet signature\nmore text","output":"insert snippet signature\nmore text"},
+    {"input":"don't insert snippet signature","output":"don't insert snippet signature"},
+    {"input":"insert snippet signature...","output":"insert snippet signature..."},
+    {"input":"insert snippet salut café","output":"insert snippet salut café"},
+    {"input":"C++ PostgreSQL 16 IPv6 Zoë & Sons","output":"C++ PostgreSQL 16 IPv6 Zoë & Sons"}
+  ]
+}

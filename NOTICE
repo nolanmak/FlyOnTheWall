@@ -28,3 +28,11 @@ in FlyOnTheWall.app statically links Rust crates and the C libraries that
 some of them compile from source (SQLCipher, SQLite, OpenSSL, libopus).
 Their copyright notices and license texts are in THIRD_PARTY_NOTICES.md,
 which `just bundle` copies into the app's Contents/Resources directory.
+
+Shared vocabulary contract
+--------------------------
+
+crates/fotw-stt/src/vocabulary.rs is adapted from Murmur src/vocabulary.rs
+and src/language.rs at revision 9c6723f07e6996dd0aeca87919211cc5519cc7cc.
+Copyright 2026 The Murmur Contributors. Licensed under Apache-2.0.
+Filesystem persistence and native editing remain in Murmur.
