@@ -3,7 +3,7 @@ use crate::failover::{
     coverage::{CoverageJournal, LocalPlan},
     stream::{FailoverStream, LocalResumeConfig},
 };
-use fotw_pipeline::replay::{ReplayReader, ReplaySource};
+use fotw_pipeline::replay::{ReplayReader, ReplaySource, ReplayWriter};
 use fotw_store::Db;
 use fotw_stt::{RecognizerFactory, Source};
 use fotw_web::speech_recovery::{
@@ -25,6 +25,7 @@ struct Job {
     status: RecoveryStatus,
     entered: Duration,
     stop: Arc<AtomicU8>, // 1: explicit cancellation, 2: deadline
+    observed: Option<(Source, crate::failover::stream::StatusReader)>,
 }
 #[derive(Default)]
 struct State {
@@ -38,7 +39,7 @@ pub struct SavedSpeechRecovery {
     data_root: PathBuf,
     resolver: Arc<ModelResolver>,
     prepare_timeout: Duration,
-    inference_timeout: Duration,
+    progress_timeout: Duration,
     state: Arc<Mutex<State>>,
     clock: Arc<dyn Fn() -> Duration + Send + Sync>,
 }
@@ -49,7 +50,7 @@ impl std::fmt::Debug for SavedSpeechRecovery {
 }
 struct SavedSource {
     source: Source,
-    plan: LocalPlan,
+    plan: Option<LocalPlan>,
     pending: bool,
     complete: bool,
 }
@@ -92,7 +93,7 @@ impl SavedSpeechRecovery {
         data_root: PathBuf,
         resolver: Arc<ModelResolver>,
         prepare_timeout: Duration,
-        inference_timeout: Duration,
+        progress_timeout: Duration,
     ) -> Self {
         let origin = Instant::now();
         Self {
@@ -100,7 +101,7 @@ impl SavedSpeechRecovery {
             data_root,
             resolver,
             prepare_timeout,
-            inference_timeout,
+            progress_timeout,
             state: Arc::new(Mutex::new(State::default())),
             clock: Arc::new(move || origin.elapsed()),
         }
@@ -192,7 +193,7 @@ impl SavedSpeechRecovery {
             }
             let snapshot = CoverageJournal::snapshot(&dir, &session, source)
                 .map_err(|_| RecoveryError::Invalid)?;
-            let plan = snapshot.fallback.ok_or(RecoveryError::Invalid)?;
+            let plan = snapshot.fallback;
             let reader =
                 ReplayReader::open(&dir, &session, replay).map_err(|_| RecoveryError::Invalid)?;
             reader.sealed_end().map_err(|_| RecoveryError::Invalid)?;
@@ -206,14 +207,22 @@ impl SavedSpeechRecovery {
             }
             let complete =
                 reader.is_complete().map_err(|_| RecoveryError::Invalid)? && through == end;
-            if !complete {
+            if through < end && plan.is_none() {
+                return Err(RecoveryError::Invalid);
+            }
+            let engine = plan
+                .as_ref()
+                .map(|plan| &plan.engine)
+                .or_else(|| snapshot.epochs.last().map(|epoch| &epoch.engine))
+                .ok_or(RecoveryError::Invalid)?;
+            if !complete || !reader.is_projected().map_err(|_| RecoveryError::Invalid)? {
                 status.phase = RecoveryPhase::Incomplete;
                 status.can_retry = true;
             }
             status.sources.push(RecoverySource {
                 source: name.into(),
-                model: plan.engine.model.clone(),
-                revision: plan.engine.revision.clone(),
+                model: engine.model.clone(),
+                revision: engine.revision.clone(),
                 pending_audio_ms: (end - through) / 16,
             });
             sources.push(SavedSource {
@@ -238,6 +247,9 @@ impl SavedSpeechRecovery {
         if let Some(job) = self.state().job.as_mut() {
             job.entered = (self.clock)();
             job.status.phase = phase;
+            if matches!(phase, RecoveryPhase::Preparing | RecoveryPhase::Complete) {
+                job.observed = None;
+            }
             if let Some(sources) = sources {
                 job.status.sources = sources;
             }
@@ -248,9 +260,12 @@ impl SavedSpeechRecovery {
         let Some(job) = state.job.as_mut() else {
             return true;
         };
+        if let Some((source, reader)) = job.observed.clone() {
+            Self::update_progress(job, source, &reader, (self.clock)());
+        }
         let limit = match job.status.phase {
             RecoveryPhase::Preparing => Some(self.prepare_timeout),
-            RecoveryPhase::Transcribing => Some(self.inference_timeout),
+            RecoveryPhase::Transcribing => Some(self.progress_timeout),
             _ => None,
         };
         if limit.is_some_and(|limit| (self.clock)().saturating_sub(job.entered) >= limit) {
@@ -267,17 +282,57 @@ impl SavedSpeechRecovery {
         }
         stopped
     }
-    fn progress(&self, source: Source, reader: &crate::failover::stream::StatusReader) {
+    fn update_progress(
+        job: &mut Job,
+        source: Source,
+        reader: &crate::failover::stream::StatusReader,
+        now: Duration,
+    ) {
         let lag = reader.read().lag_samples / 16;
         let name = match source {
             Source::System => "system",
             Source::Mic => "mic",
         };
-        if let Some(job) = self.state().job.as_mut()
-            && let Some(source) = job.status.sources.iter_mut().find(|s| s.source == name)
-        {
+        if let Some(source) = job.status.sources.iter_mut().find(|s| s.source == name) {
+            // Only a durably committed coverage advance renews the stall budget.
+            // Status polling, native activity and uncommitted buffers do not.
+            if lag < source.pending_audio_ms
+                && job.status.phase == RecoveryPhase::Transcribing
+                && job.stop.load(Ordering::Acquire) == 0
+            {
+                job.entered = now;
+            }
             source.pending_audio_ms = lag;
         }
+    }
+    fn progress(&self, source: Source, reader: &crate::failover::stream::StatusReader) {
+        if let Some(job) = self.state().job.as_mut() {
+            Self::update_progress(job, source, reader, (self.clock)());
+        }
+    }
+    fn complete_confirmed_source(
+        &self,
+        dir: &Path,
+        session: &str,
+        source: Source,
+    ) -> Result<(), RecoveryError> {
+        let replay = match source {
+            Source::System => ReplaySource::System,
+            Source::Mic => ReplaySource::Mic,
+        };
+        let mut audio =
+            ReplayWriter::resume(dir, session, replay).map_err(|_| RecoveryError::Invalid)?;
+        let journal =
+            CoverageJournal::open(dir, session, source).map_err(|_| RecoveryError::Invalid)?;
+        if journal.committed_through() != audio.end_sample() || self.check() {
+            return Err(RecoveryError::Invalid);
+        }
+        let end = audio.seal().map_err(|_| RecoveryError::Invalid)?;
+        let mut reader =
+            ReplayReader::open(dir, session, replay).map_err(|_| RecoveryError::Invalid)?;
+        reader
+            .mark_complete(end)
+            .map_err(|_| RecoveryError::Invalid)
     }
     fn ended(&self, result: Result<(), RecoveryError>) {
         if let Some(job) = self.state().job.as_mut() {
@@ -292,6 +347,7 @@ impl SavedSpeechRecovery {
             job.status.message = match job.status.phase {
                 RecoveryPhase::Complete => Some("Saved speech recovered locally. Existing corrections and recording times preserved.".into()),
                 RecoveryPhase::Cancelled => Some("Local recovery cancelled. Audio retained for retry.".into()),
+                _ if job.stop.load(Ordering::Acquire) == 2 => Some("Local recovery made no timely preparation or durable transcription progress. Audio retained for retry.".into()),
                 _ => Some("Local recovery could not finish. Check that the original model revision is installed, then retry; audio retained.".into()),
             };
         }
@@ -307,12 +363,13 @@ impl SavedSpeechRecovery {
                 continue;
             }
             self.stage(RecoveryPhase::Preparing, None);
-            let factory = if saved.pending {
-                (self.resolver)(&saved.plan, &capture.model_path)
-                    .map_err(|_| RecoveryError::Invalid)?
-            } else {
-                Arc::new(MetadataFactory(saved.plan.clone())) as Arc<dyn RecognizerFactory>
-            };
+            if !saved.pending {
+                self.complete_confirmed_source(&capture.dir, &capture.session, saved.source)?;
+                continue;
+            }
+            let plan = saved.plan.ok_or(RecoveryError::Invalid)?;
+            let factory =
+                (self.resolver)(&plan, &capture.model_path).map_err(|_| RecoveryError::Invalid)?;
             let stop = self.state().job.as_ref().unwrap().stop.clone();
             let factory = Arc::new(GuardedFactory {
                 inner: factory,
@@ -325,8 +382,8 @@ impl SavedSpeechRecovery {
                 session_id: capture.session.clone(),
                 source: saved.source,
                 local: factory,
-                revision: saved.plan.engine.revision,
-                stop_timeout: self.inference_timeout,
+                revision: plan.engine.revision,
+                stop_timeout: self.progress_timeout,
             };
             // Never abandon a native constructor on cancellation/timeout. Wait
             // for this same admission, then fence its stream before releasing it.
@@ -345,14 +402,22 @@ impl SavedSpeechRecovery {
                 false
             } else {
                 self.stage(RecoveryPhase::Transcribing, None);
-                let finish = stream.finish();
-                tokio::pin!(finish);
+                if let Some(job) = self.state().job.as_mut() {
+                    job.observed = Some((saved.source, reader.clone()));
+                }
+                // resume_local freezes input before launch. Its worker drains
+                // and completes by itself; finish() would add an unrelated total
+                // drain timeout that incorrectly truncates healthy long jobs.
                 loop {
-                    tokio::select! {
-                        biased;
-                        _ = tick.tick() => { self.progress(saved.source, &reader); if self.check() { break false; } }
-                        complete = &mut finish => break complete,
+                    self.progress(saved.source, &reader);
+                    if self.check() {
+                        break false;
                     }
+                    let status = reader.read();
+                    if !status.worker_running {
+                        break status.phase == crate::failover::stream::Phase::Complete;
+                    }
+                    tick.tick().await;
                 }
             };
             self.progress(saved.source, &reader);
@@ -375,6 +440,9 @@ impl SavedSpeechRecovery {
         crate::persist::refresh_speech_projection(&mut self.db(), &capture.dir, meeting)
             .map_err(|_| RecoveryError::Invalid)?;
         let refreshed = self.load(meeting)?;
+        if refreshed.status.phase != RecoveryPhase::Complete {
+            return Err(RecoveryError::Invalid);
+        }
         self.stage(RecoveryPhase::Complete, Some(refreshed.status.sources));
         Ok(())
     }
@@ -420,6 +488,7 @@ impl SpeechRecoveryControl for SavedSpeechRecovery {
                 },
                 entered: (self.clock)(),
                 stop: Arc::new(AtomicU8::new(0)),
+                observed: None,
             });
         }
         let owned = self.clone();
@@ -464,23 +533,6 @@ impl SpeechRecoveryControl for SavedSpeechRecovery {
         self.read(meeting)
     }
 }
-struct MetadataFactory(LocalPlan);
-impl RecognizerFactory for MetadataFactory {
-    fn model(&self) -> &str {
-        &self.0.engine.model
-    }
-    fn language(&self) -> Option<&str> {
-        self.0.language.as_deref()
-    }
-    fn create(&self) -> Result<Box<dyn fotw_stt::Recognizer>, fotw_stt::SttError> {
-        Err(fotw_stt::SttError::new(
-            fotw_stt::SttErrorClass::Unsupported,
-            "local",
-            "completed coverage needs no inference",
-        ))
-    }
-}
-
 struct GuardedFactory {
     inner: Arc<dyn RecognizerFactory>,
     stop: Arc<AtomicU8>,
