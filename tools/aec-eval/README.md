@@ -117,7 +117,7 @@ elapsed. This remains a synthetic worker probe, not app/model resource evidence.
   matches FlyOnTheWall. See `SONORA-LICENSE` and the repository's
   `THIRD_PARTY_NOTICES.md` for dependency notices.
 - [Native WebRTC binding 2.1.0](https://docs.rs/crate/webrtc-audio-processing/2.1.0):
-  the existing #49 direction; it is not executed by this probe. Its bundled
+  the existing #49 direction; the optional comparison below executes it. Its bundled
   build requires a C++ toolchain and Meson/Ninja/pkg-config, with additional
   build-cache/provisioning concerns recorded in #49. This probe is not evidence
   that the Rust port matches that binding's quality.
@@ -131,3 +131,70 @@ elapsed. This remains a synthetic worker probe, not app/model resource evidence.
 The probe and fixtures are written for this repository. Existing gate behavior
 is called through the maintained pipeline crate, without copying its detector.
 The observations advance #72/#118/#124; they do not complete their criteria.
+
+## Optional native WebRTC comparison
+
+`--features native-webrtc` adds the pinned `webrtc-audio-processing` 2.1.0
+binding with bundled C++ WebRTC AudioProcessing 2.1. It is confined to this
+evaluation workspace and is disabled by default. The shipped app and root
+lockfile do not gain a native dependency. Upstream's Rust wrapper and WebRTC use
+BSD-3-Clause; Abseil uses Apache-2.0. Additional bundled notices and the WebRTC
+patent grant are retained in [NATIVE-NOTICES.md](NATIVE-NOTICES.md).
+
+Provision Rust 1.95 with `rustup component add llvm-tools-preview`, a C++17
+toolchain/libclang, Python, Meson 1.11.1 and Ninja. On the measured Mac, Meson
+1.11.1 and Ninja 1.13.2 were already present; LLVM tools were added to the existing
+toolchain. CI provisions Meson 1.11.1/Ninja 1.13.0 in an isolated virtualenv and
+checks both macOS and Linux. The upstream build invokes Ninja itself, so CI and
+the local probe wrap Ninja with `-j3` as well as setting `CARGO_BUILD_JOBS=3`.
+
+```sh
+cargo test --manifest-path tools/aec-eval/Cargo.toml --locked --features native-webrtc
+cargo clippy --manifest-path tools/aec-eval/Cargo.toml --locked --features native-webrtc --all-targets -- -D warnings
+cargo build --release --manifest-path tools/aec-eval/Cargo.toml --locked --features native-webrtc
+/usr/bin/time -l tools/aec-eval/target/release/fotw-aec-eval
+```
+
+First builds fetch public build dependencies: the Cargo lockfile pins the Rust
+crates, and upstream's Meson wrap pins Abseil 20240722.0 source and patch archives
+by SHA-256. No speech/model assets are fetched. `cargo --offline` does not govern
+Meson's downloader: offline rebuilds require preserving the native Cargo target
+and Meson source/package cache, not just the Cargo registry. A clean native
+build without those archives needs provisioning. Ordinary evaluation remains
+pure Rust and does not require these tools. The measured native binary links
+only macOS system libraries/frameworks; no Homebrew native library is needed at
+runtime. The native libraries are statically linked into this evaluation binary.
+
+The native control uses 16 kHz mono, 160 samples per 10 ms frame, as reported by
+the pinned runtime. It analyzes the immutable render reference before each
+capture frame, with full AEC3, automatic delay estimation and no NS/AGC/high-pass
+filter. It deliberately refuses partial frames instead of silently truncating
+them. Its output has a measured 128-sample delay; this fixed-frame control does
+not drain the source tail or claim callback/route/reset qualification. Those
+limitations remain explicit in each result's flags.
+
+`results/m4-native.json` records one 2026-10-25 Apple M4 run over the same
+fixtures, adaptation window, metrics and engineering gates defined above:
+
+| Backend | Echo-only reduction | Overlap near gain | Overlap retained-near SNR | Overlap processing time / 20s |
+| --- | ---: | ---: | ---: | ---: |
+| Passthrough | 0.00 dB | +0.06 dB | 3.78 dB | 0.01 ms |
+| Sonora 0.2.0 direct | 28.56 dB | -3.92 dB | 3.52 dB | 71.88 ms |
+| Native WebRTC 2.1.0 | 19.88 dB | -3.81 dB | 3.69 dB | 271.94 ms |
+
+Both AEC implementations preserve near-only unity gain. Native WebRTC passes
+the 15 dB echo-only gate but fails the same overlap requirements: near gain must
+stay within 1 dB, and retained-near SNR must improve by 6 dB over passthrough.
+It is **not selected for the app**. No gate was relaxed to accept this backend.
+The probe test first failed with 0 dB echo reduction, then passed after actual
+native render-before-capture processing was connected; its separate near-only
+control prevents muting everything from passing that test.
+
+The already-built fifteen-case probe plus metrics used 20,021,248 bytes maximum
+RSS, 1.52 seconds user CPU and 1.77 seconds elapsed. The binary was 1,976,800
+bytes. Rust used its release profile; upstream Meson used `debugoptimized`
+(`-O2`), not an assumed matching Rust optimization setting. These are whole
+probe observations, not isolated backend memory or app/transcription-model
+resource estimates. Synthetic signals cannot establish word retention or
+real-room quality. LocalVQE/model provisioning, approved speech comparisons,
+drift/route qualification and physical trials remain open under #72/#118/#124.
