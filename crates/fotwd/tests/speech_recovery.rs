@@ -326,6 +326,16 @@ fn timeout_or_cancel_retains_one_native_owner_and_fences_late_constructor_or_inf
         if cancel {
             c.cancel(&f.meeting).unwrap();
         } else {
+            if !in_create {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while c.read(&f.meeting).unwrap().phase != RecoveryPhase::Transcribing {
+                    assert!(
+                        Instant::now() < deadline,
+                        "inference phase was never admitted"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
             clock.store(if in_create { 50 } else { 6000 }, Ordering::Release);
         }
         let pending = c.read(&f.meeting).unwrap();
