@@ -786,11 +786,13 @@ async function recoverLiveHistory() {
   }
 }
 function liveOrigin() {
-  const current = speechOrigin(liveSegments);
+  // liveSegments is already sorted when a final changes; partials do not alter it.
+  const current = liveSegments[0]?.start_ms ?? null;
   if (liveSnapshotOrigin === null) return current;
   return current === null ? liveSnapshotOrigin : Math.min(current, liveSnapshotOrigin);
 }
 function appendDeltas(deltas) {
+  let finalsChanged = false;
   for (const d of deltas) {
     if (!liveSessionId || d.meeting_id !== liveSessionId) continue;
     if (d.is_final === false) {
@@ -799,28 +801,49 @@ function appendDeltas(deltas) {
     } else {
       const partial = livePartials.get(d.channel);
       if (!partial || partial.start_ms < d.end_ms) livePartials.delete(d.channel);
-      if (d.text.trim()) liveFinals.set(d.idx, { ...d, speaker: d.channel === "mic" ? "me" : null });
+      if (d.text.trim()) {
+        liveFinals.set(d.idx, { ...d, speaker: d.channel === "mic" ? "me" : null });
+        finalsChanged = true;
+      }
     }
   }
-  liveSegments = orderedSegments(Array.from(liveFinals.values()));
+  if (finalsChanged) liveSegments = orderedSegments(Array.from(liveFinals.values()));
   renderLiveTranscript();
 }
+// The cache belongs to the mounted transcript, so navigation/session replacement
+// releases it with that DOM. Stable finals keep their nodes across partials.
+const liveTranscriptRows = new WeakMap();
 function renderLiveTranscript() {
   if (!liveIsShowing()) return;
   const body = document.getElementById("segments");
   const follow = isNearBottom(el.detail);
   const scrollTop = el.detail.scrollTop;
   const origin = liveOrigin();
-  clear(body);
-  for (const d of liveSegments.slice(-(MAX_ROWS - livePartials.size))) {
-    body.appendChild(segmentRow(d.channel, d.start_ms - origin, d.speaker, d.text, null));
-  }
-  for (const d of livePartials.values()) {
+  const previous = liveTranscriptRows.get(body) || new Map();
+  const next = new Map();
+  const visible = liveSegments.slice(-(MAX_ROWS - livePartials.size))
+    .map(d => ({key: "final:" + d.idx, d, partial: false}));
+  for (const [channel, d] of livePartials) visible.push({key: "partial:" + channel, d, partial: true});
+  for (const {key, d, partial} of visible) {
     const at = origin !== null && d.start_ms >= origin ? d.start_ms - origin : null;
-    const row = segmentRow(d.channel, at, d.channel === "mic" ? "me" : null, d.text, null);
-    row.classList.add("pending");
-    body.appendChild(row);
+    const speaker = partial && d.channel === "mic" ? "me" : d.speaker;
+    const signature = JSON.stringify([d.channel, at, speaker, d.text, partial]);
+    let cached = previous.get(key);
+    if (!cached || cached.signature !== signature) {
+      const row = segmentRow(d.channel, at, speaker, d.text, null);
+      if (partial) row.classList.add("pending");
+      if (cached) cached.row.replaceWith(row);
+      cached = {signature, row};
+    }
+    next.set(key, cached);
   }
+  for (const [key, cached] of previous) if (!next.has(key)) cached.row.remove();
+  let index = 0;
+  for (const {row} of next.values()) {
+    const current = body.children[index++];
+    if (current !== row) body.insertBefore(row, current || null);
+  }
+  liveTranscriptRows.set(body, next);
   const copyRow = document.getElementById("live-copy");
   if (copyRow) copyRow.hidden = liveSegments.length === 0;
   const history = document.getElementById("live-history");
