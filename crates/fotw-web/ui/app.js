@@ -458,6 +458,7 @@ function renderDetail(detail) {
   const transcript = document.createElement("section");
   transcript.className = "transcript";
   transcript.appendChild(text("h3", "Transcript"));
+  transcript.appendChild(renderSavedSpeechProvenance(detail.speech_provenance));
   transcript.appendChild(text("p", "Time since first speech", "meta"));
   const body = document.createElement("div");
   body.id = "segments";
@@ -470,6 +471,41 @@ function renderDetail(detail) {
   transcript.appendChild(body);
   el.detail.appendChild(transcript);
   paintLiveNavigation();
+}
+
+// Recorded engine history is independent of the next recording's settings.
+// Receipt boundaries use original audio samples; they never shift to first speech.
+function renderSavedSpeechProvenance(history) {
+  const section = text("section", "", "saved-speech");
+  if (!Array.isArray(history) || history.length === 0) {
+    section.appendChild(text("p", "Engine history was not recorded for this transcript.", "meta"));
+    return section;
+  }
+  const details = document.createElement("details");
+  details.appendChild(text("summary", "Transcription sources"));
+  details.appendChild(text("p", "Times use the original recording clock. Processed audio does not guarantee a complete or accurate transcript.", "meta"));
+  const reasons = {transport_budget: "network retry budget exhausted", terminal_provider: "provider refused the request", provider_configuration: "provider configuration failed", replay_gap: "cloud replay coverage unavailable", manual: "manual provider change"};
+  for (const epoch of history) {
+    const row = text("article", "", "speech-source");
+    const label = epoch.source === "mic" ? "Microphone" : "System audio";
+    row.appendChild(text("strong", label + " · " + speechProviderName(epoch.provider) + " / " + String(epoch.model || "Unknown model"), "speech-engine"));
+    const from = formatElapsed(Math.floor(epoch.from_sample / 16));
+    row.appendChild(text("p", typeof epoch.through_sample === "number"
+      ? "Audio processed " + from + "–" + formatElapsed(Math.floor(epoch.through_sample / 16))
+      : "Engine selected at " + from + "; no confirmed processed audio."));
+    if (epoch.reason) row.appendChild(text("p", reasons[epoch.reason] || "Provider changed"));
+    const caps = epoch.capabilities || {};
+    if (caps.diarization === "none") row.appendChild(text("p", "Speaker labels unavailable"));
+    if (caps.wordTimestamps === "none") row.appendChild(text("p", "Word timing unavailable"));
+    if (epoch.epoch > 0 && epoch.source === "system") row.appendChild(text("p", "Speaker identities are separate for each engine."));
+    row.appendChild(text("p", epoch.revision ? "Model revision: " + epoch.revision : "Model revision not recorded", "meta"));
+    details.appendChild(row);
+  }
+  section.appendChild(details);
+  return section;
+}
+function speechProviderName(provider) {
+  return new Map([["deepgram", "Deepgram"], ["whispercpp", "Whisper"], ["local-whisper", "Whisper"], ["whisper.cpp", "Whisper"]]).get(provider) || String(provider || "Unknown provider");
 }
 
 // Why this meeting has no summary, in words, or null to stay silent.
@@ -1057,7 +1093,7 @@ function renderSpeechHealth(body) {
       speechRows.set(source.source, entry); el.speechHealth.appendChild(row);
     }
     const label = source.source === "system" ? "System audio" : "Microphone";
-    const provider = ({deepgram: "Deepgram", whispercpp: "Whisper", "local-whisper": "Whisper", "whisper.cpp": "Whisper"})[source.provider] || String(source.provider || "Unknown provider");
+    const provider = speechProviderName(source.provider);
     const heading = label + " · " + provider + " / " + String(source.model || "Unknown model");
     if (entry.heading.textContent !== heading) entry.heading.textContent = heading;
     const parts = [states[source.state] || "Status unavailable"];

@@ -241,3 +241,48 @@ fn receipt_identity_uses_original_words_instead_of_compression_bytes() {
     data.commits[0].segments[0].words[0]["text"] = "different word".into();
     assert!(save(&mut db, &[data]).is_err());
 }
+
+#[test]
+fn primary_provenance_preserves_source_switch_and_confirmed_silence_without_payloads() {
+    let mut db = Db::open_in_memory(&common::test_key()).unwrap();
+    let mut system = source("system");
+    system.commits[0].segments.clear();
+    system.epochs.push(SpeechEpoch {
+        number: 1,
+        from_sample: 16_000,
+        provider: "whispercpp".into(),
+        model: "small.en".into(),
+        revision: Some("fixture-sha".into()),
+        capabilities: serde_json::json!({"diarization":"none"}),
+        reason: Some("transport_budget".into()),
+    });
+    system.commits.push(SpeechCommit {
+        epoch: 1,
+        from_sample: 16_000,
+        through_sample: 32_000,
+        segments: vec![],
+    });
+    let meeting = save(&mut db, &[system, source("mic")]).unwrap();
+    let history = db.speech_provenance(&meeting).unwrap();
+    assert_eq!(
+        history.len(),
+        3,
+        "engine history must survive a silent receipt"
+    );
+    assert_eq!(history[0].source, "mic");
+    assert_eq!(history[1].source, "system");
+    assert_eq!(history[1].through_sample, Some(16_000));
+    assert_eq!(history[2].epoch, 1);
+    assert_eq!(history[2].from_sample, 16_000);
+    assert_eq!(history[2].through_sample, Some(32_000));
+    assert_eq!(history[2].revision.as_deref(), Some("fixture-sha"));
+    assert_eq!(history[2].capabilities["diarization"], "none");
+    assert_eq!(history[2].reason.as_deref(), Some("transport_budget"));
+    db.meetings()
+        .create_transcript(&meeting, "replacement", "other-model", true)
+        .unwrap();
+    assert!(
+        db.speech_provenance(&meeting).unwrap().is_empty(),
+        "another primary transcript must not inherit stale engine history"
+    );
+}

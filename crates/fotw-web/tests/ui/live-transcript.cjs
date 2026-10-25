@@ -384,6 +384,29 @@ test('legacy failures retain their warning while a durable epoch zero uses a rec
 });
 
 
+test('saved meetings retain actual source engine boundaries on the recording clock',()=>{
+ const h=harness();h.ctx.actionsRow=()=>null;h.ctx.mountGithubSync=()=>{};h.ctx.mountSharingDocument=()=>{};
+ h.ctx.renderDetail({meeting:{id:'saved',title:'Synthetic',started_at_ms:1000},segments:[],speech_provenance:[
+ {source:'system',epoch:0,from_sample:0,through_sample:272000,provider:'deepgram',model:'nova-3',revision:null,reason:null,capabilities:{diarization:'both',wordTimestamps:'both'}},
+ {source:'system',epoch:1,from_sample:272000,through_sample:480000,provider:'whispercpp',model:'small.en',revision:'fixture-sha',reason:'transport_budget',capabilities:{diarization:'none',wordTimestamps:'none'}}]});
+ const content=h.nodes.get('detail').textContent;
+ assert.match(content,/Transcription sources/);assert.match(content,/Deepgram \/ nova-3/);assert.match(content,/Whisper \/ small.en/);
+ assert.match(content,/0:17/);assert.match(content,/0:30/);assert.match(content,/network retry budget/i);assert.match(content,/Speaker labels unavailable/);
+ assert.match(content,/original recording clock/i);assert.doesNotMatch(content,/All audio transcribed/);
+});
+test('old meeting details explicitly preserve unknown engine history',()=>{
+ const h=harness();h.ctx.actionsRow=()=>null;h.ctx.mountGithubSync=()=>{};h.ctx.mountSharingDocument=()=>{};
+ h.ctx.renderDetail({meeting:{id:'old',title:'Synthetic',started_at_ms:1000},segments:[]});
+ assert.match(h.nodes.get('detail').textContent,/Engine history was not recorded/);
+});
+
+
+test('unconfirmed saved epochs never claim processed audio and metadata remains text',()=>{
+ const h=harness();const panel=h.ctx.renderSavedSpeechProvenance([{source:'system',epoch:0,from_sample:16000,through_sample:null,provider:'constructor',model:'<img src=x onerror=alert(1)>',revision:null,reason:null,capabilities:{}}]);
+ assert.match(panel.textContent,/no confirmed processed audio/);assert.doesNotMatch(panel.textContent,/Audio processed/);
+ assert.match(panel.textContent,/constructor \/ <img/);assert.equal(h.all(panel).some(n=>n.tagName==='img'),false);
+});
+
 test('closed local-only streams explain that native cleanup still blocks Start',()=>{
  const h=harness();h.ctx.refreshLibrary=()=>{};
  h.ctx.renderRecording({state:'finishing',session_id:'legacy-local',started_at_ms:1000,ended_at_ms:2000,speech_status:[speechStatus({provider:'whispercpp',model:'small.en',state:'closed',epoch:null,from_ms:null,pending_audio_ms:null,worker_running:true})]});

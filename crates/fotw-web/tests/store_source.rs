@@ -185,3 +185,46 @@ fn a_meeting_with_no_note_is_not_an_error() {
     assert!(detail.note_md.is_none());
     assert!(detail.segments.is_empty(), "no transcript is not an error");
 }
+
+#[test]
+fn saved_engine_history_comes_from_the_primary_transcript_in_the_real_store() {
+    use fotw_store::{SpeechEpoch, SpeechSource};
+    let mut db = Db::open_in_memory(&DbKey::from_bytes([0x33; 32])).unwrap();
+    let id = db
+        .finalize_speech_capture(
+            "saved-source-fixture",
+            NewMeeting::new("fixture", "UTC").started_at_ms(1000),
+            2000,
+            &[SpeechSource {
+                source: "system".into(),
+                epochs: vec![SpeechEpoch {
+                    number: 0,
+                    from_sample: 0,
+                    provider: "whispercpp".into(),
+                    model: "small.en".into(),
+                    revision: Some("fixture-sha".into()),
+                    capabilities: serde_json::json!({"diarization":"none"}),
+                    reason: None,
+                }],
+                commits: vec![],
+            }],
+        )
+        .unwrap();
+    let source = StoreSource::new(db);
+    let detail = source.detail(&id).unwrap().unwrap();
+    let value = serde_json::to_value(detail).unwrap();
+    let epoch = &value["speech_provenance"][0];
+    assert_eq!(epoch["provider"], "whispercpp");
+    assert_eq!(epoch["revision"], "fixture-sha");
+    assert_eq!(
+        epoch["through_sample"],
+        serde_json::Value::Null,
+        "selected engine has no confirmed receipt yet"
+    );
+    assert_eq!(epoch["capabilities"]["diarization"], "none");
+    assert_eq!(
+        value["segments"],
+        serde_json::json!([]),
+        "metadata must not become fabricated transcript text"
+    );
+}

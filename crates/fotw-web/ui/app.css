@@ -752,3 +752,8 @@ button, summary { min-height: 36px; }
 .speech-details { margin-top: 6px; }
 .speech-details summary { cursor: pointer; }
 @media (max-width: 760px) { .speech-health { grid-template-columns: 1fr; } }
+
+.saved-speech { margin: 12px 0; }
+.saved-speech > details > summary { cursor: pointer; color: var(--muted); }
+.saved-speech .speech-source { margin-top: 8px; }
+.saved-speech .speech-source p { margin: 4px 0 0; }
