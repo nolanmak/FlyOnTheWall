@@ -176,6 +176,127 @@ fn startup(c: &SavedSpeechRecovery) {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+fn index(c: &SavedSpeechRecovery) {
+    c.index_captures().unwrap();
+}
+
+fn voice_fixture(stopped: bool) -> Fixture {
+    let pcm = (0u32..48000)
+        .map(|n| {
+            if (n / 3200).is_multiple_of(2) {
+                1000
+            } else {
+                8000
+            }
+        })
+        .collect();
+    fixture_audio(
+        stopped,
+        pcm,
+        vec![0.2; 48000],
+        "fixture-local",
+        "fixture-revision",
+    )
+}
+
+#[test]
+fn startup_recovers_an_eligible_unknown_end_prefix_once_without_finalizing_the_capture() {
+    let mut f = voice_fixture(false);
+    wal_tail(&mut f);
+    drop(f.wal.take());
+    let raw = std::fs::read(f.dir.join("system.pcm")).unwrap();
+    let canonical = std::fs::read(f.dir.join("system.stt16")).unwrap();
+    let manifest = std::fs::read(f.dir.join("manifest.json")).unwrap();
+    startup(&owner(&f));
+    assert_eq!(
+        f.calls.load(Ordering::SeqCst),
+        1,
+        "startup must schedule eligible saved-prefix inference"
+    );
+    let mut db = Db::open(&f.database, &f.key).unwrap();
+    let id = db.session_note_meeting(&f.session).unwrap().unwrap();
+    assert!(
+        db.export_meeting(&id)
+            .unwrap()
+            .segments
+            .iter()
+            .any(|s| s.text == "recovered after process exit")
+    );
+    assert_eq!(db.meetings().get(&id).unwrap().ended_at_ms, None);
+    assert_eq!(db.session_note_clock(&f.session).unwrap(), None);
+    for path in [
+        "system.stt-sealed.json",
+        "system.stt-complete.json",
+        "system.stt-projected.json",
+    ] {
+        assert!(!f.dir.join(path).exists());
+    }
+    assert_eq!(std::fs::read(f.dir.join("system.pcm")).unwrap(), raw);
+    assert_eq!(
+        std::fs::read(f.dir.join("system.stt16")).unwrap(),
+        canonical
+    );
+    assert_eq!(
+        std::fs::read(f.dir.join("manifest.json")).unwrap(),
+        manifest
+    );
+    db.conn()
+        .execute(
+            "UPDATE segments SET text='retained correction' WHERE id='committed-prefix'",
+            [],
+        )
+        .unwrap();
+    let count = db.export_meeting(&id).unwrap().segments.len();
+    startup(&owner(&f));
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    let doc = db.export_meeting(&id).unwrap();
+    assert_eq!(doc.segments.len(), count);
+    assert_eq!(
+        doc.segments
+            .iter()
+            .find(|s| s.id == "committed-prefix")
+            .unwrap()
+            .text,
+        "retained correction"
+    );
+}
+
+#[test]
+fn unavailable_original_model_is_attempted_once_per_startup_and_retains_unknown_end_audio() {
+    use fotw_web::speech_recovery::{RecoveryPhase, SpeechRecoveryControl};
+    let mut f = voice_fixture(false);
+    drop(f.wal.take());
+    let raw = std::fs::read(f.dir.join("system.pcm")).unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let observed = attempts.clone();
+    let c = SavedSpeechRecovery::with_parts(
+        Db::open(&f.database, &f.key).unwrap(),
+        f.root.path().to_owned(),
+        Arc::new(move |_, _| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Err("Original model not installed".into())
+        }),
+        Duration::from_secs(2),
+        Duration::from_secs(5),
+    );
+    startup(&c);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "an eligible missing model must surface a bounded failed attempt"
+    );
+    assert!(c.start_pending().unwrap().is_none());
+    let db = Db::open(&f.database, &f.key).unwrap();
+    let id = db.session_note_meeting(&f.session).unwrap().unwrap();
+    let status = c.read(&id).unwrap();
+    assert_eq!(status.phase, RecoveryPhase::Failed);
+    assert!(status.can_retry);
+    assert!(!status.worker_running);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(std::fs::read(f.dir.join("system.pcm")).unwrap(), raw);
+    assert_eq!(db.session_note_clock(&f.session).unwrap(), None);
+}
 #[test]
 fn startup_discovers_a_stopped_unfinalized_capture_and_recovers_pending_speech_once() {
     let mut f = fixture(true, 48000);
@@ -279,7 +400,7 @@ fn an_unfrozen_clock_or_uncheckpointed_tail_never_manufactures_a_saved_end() {
             .expect("retained capture is visible");
         assert_eq!(db.meetings().get(&id).unwrap().ended_at_ms, None);
         assert_eq!(db.session_note_clock(&f.session).unwrap(), None);
-        assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(f.calls.load(Ordering::SeqCst), 1);
         assert!(
             !fotw_pipeline::wal::SessionState::read(&f.dir)
                 .unwrap()
@@ -317,7 +438,7 @@ fn saved_prefix_recovery_preserves_unknown_capture_time_and_unmapped_original_ta
     let raw = std::fs::read(f.dir.join("system.pcm")).unwrap();
     let canonical = std::fs::read(f.dir.join("system.stt16")).unwrap();
     let manifest = std::fs::read(f.dir.join("manifest.json")).unwrap();
-    startup(&owner(&f));
+    index(&owner(&f));
     let mut db = Db::open(&f.database, &f.key).unwrap();
     let id = db.session_note_meeting(&f.session).unwrap().unwrap();
     db.conn()
@@ -425,7 +546,7 @@ fn one_unavailable_source_does_not_hide_the_other_sources_recovered_speech() {
         CoverageJournal::create_with_fallback(&f.dir, &f.session, Source::Mic, engine, None)
             .unwrap(),
     );
-    startup(&owner(&f));
+    index(&owner(&f));
     let db = Db::open(&f.database, &f.key).unwrap();
     let id = db.session_note_meeting(&f.session).unwrap().unwrap();
     let control = owner(&f);
@@ -483,7 +604,7 @@ fn a_failed_prefix_projection_can_retry_saved_receipts_without_running_inference
         "fixture-revision",
     );
     drop(f.wal.take());
-    startup(&owner(&f));
+    index(&owner(&f));
     let db = Db::open(&f.database, &f.key).unwrap();
     let id = db.session_note_meeting(&f.session).unwrap().unwrap();
     db.conn().execute_batch("CREATE TRIGGER fail_prefix BEFORE INSERT ON speech_receipts BEGIN SELECT RAISE(ABORT,'injected projection failure'); END;").unwrap();
@@ -545,7 +666,7 @@ fn startup_repairs_a_missing_prefix_projection_ack_without_repeating_native_work
         "fixture-revision",
     );
     drop(f.wal.take());
-    startup(&owner(&f));
+    index(&owner(&f));
     let db = Db::open(&f.database, &f.key).unwrap();
     let id = db.session_note_meeting(&f.session).unwrap().unwrap();
     let control = owner(&f);
@@ -601,16 +722,13 @@ fn interrupted_audio_is_visible_without_inventing_a_capture_end_or_sealing_input
         db.note_document(&id).unwrap().body_md,
         "durable note before crash"
     );
-    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
     assert!(!f.dir.join("system.stt-sealed.json").exists());
     assert_eq!(std::fs::read(f.dir.join("system.stt16")).unwrap(), original);
     let control = owner(&f);
     use fotw_web::speech_recovery::{RecoveryPhase, SpeechRecoveryControl};
-    assert_eq!(control.read(&id).unwrap().phase, RecoveryPhase::Retained);
-    assert!(
-        control.read(&id).unwrap().can_retry,
-        "a saved plan may recover its bounded canonical prefix"
-    );
+    assert_eq!(control.read(&id).unwrap().phase, RecoveryPhase::Partial);
+    assert!(!control.read(&id).unwrap().can_retry);
     assert_eq!(
         std::fs::read(f.dir.join("manifest.json")).unwrap(),
         manifest
@@ -662,7 +780,7 @@ fn retained_indexing_waits_for_all_source_owners_and_never_repairs_torn_input() 
     let mut f = fixture(false, 48000);
     drop(f.wal.take());
     let held = CoverageJournal::open(&f.dir, &f.session, Source::System).unwrap();
-    startup(&owner(&f));
+    index(&owner(&f));
     assert!(
         Db::open(&f.database, &f.key)
             .unwrap()
@@ -684,7 +802,7 @@ fn retained_indexing_waits_for_all_source_owners_and_never_repairs_torn_input() 
     }
     let journal = std::fs::read(f.dir.join("system.stt-coverage.jsonl")).unwrap();
     let canonical = std::fs::read(f.dir.join("system.stt16")).unwrap();
-    startup(&owner(&f));
+    index(&owner(&f));
     let db = Db::open(&f.database, &f.key).unwrap();
     let id = db.session_note_meeting(&f.session).unwrap().unwrap();
     assert_eq!(db.export_meeting(&id).unwrap().segments.len(), 1);
@@ -766,11 +884,11 @@ fn corrupt_second_source_is_validated_before_the_first_source_is_frozen() {
 fn cancelling_a_blocked_local_prepare_retains_the_interrupted_capture_lease_until_it_returns() {
     use fotw_web::speech_recovery::SpeechRecoveryControl;
     use std::sync::{Mutex, mpsc};
-    for stopped in [true, false] {
+    for (stopped, automatic) in [(true, true), (false, false), (false, true)] {
         let mut f = fixture(stopped, 48000);
         drop(f.wal.take());
-        if !stopped {
-            startup(&owner(&f));
+        if !automatic {
+            index(&owner(&f));
         }
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
@@ -791,7 +909,7 @@ fn cancelling_a_blocked_local_prepare_retains_the_interrupted_capture_lease_unti
             Duration::from_secs(2),
             Duration::from_secs(5),
         );
-        let pass = if stopped {
+        let pass = if automatic {
             Some(c.start_pending().unwrap().unwrap())
         } else {
             let db = Db::open(&f.database, &f.key).unwrap();
@@ -804,7 +922,7 @@ fn cancelling_a_blocked_local_prepare_retains_the_interrupted_capture_lease_unti
         let db = Db::open(&f.database, &f.key).unwrap();
         let meeting = db.session_note_meeting(&f.session).unwrap().unwrap();
         drop(pass);
-        if !stopped {
+        if !automatic {
             c.cancel(&meeting).unwrap();
         }
         assert!(
@@ -926,11 +1044,6 @@ fn native_capture_recovery(archived: bool, prefix_only: bool) {
         .unwrap()
         .expect("interrupted WAL must become discoverable");
     if prefix_only {
-        c.retry(&meeting).unwrap();
-        while c.read(&meeting).unwrap().worker_running {
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(10));
-        }
         assert_eq!(c.read(&meeting).unwrap().phase, RecoveryPhase::Partial);
         assert_eq!(db.session_note_clock(&f.session).unwrap(), None);
         for name in [

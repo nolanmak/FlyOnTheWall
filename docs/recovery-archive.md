@@ -165,3 +165,24 @@ Tests use synthetic owned recordings; they do not establish physical power-loss
 or device-recovery behavior. Transactional replacement of an existing archive
 after an encoding I/O error, raw/canonical reconstruction and unknown-end capture
 admission remain separate work.
+
+## Automatic recovery of unknown-end canonical prefixes
+
+Startup now attempts eligible saved canonical prefixes even when a capture has
+no provable final Stop. Each startup controller makes one serial pass, using
+only the model, revision and language in the original saved local plan. It
+does not choose a new provider or download a missing model. Missing-model
+preparation fails visibly and leaves a manual retry available; cancelling the
+pass keeps ownership until the retained worker has actually returned.
+
+Successful prefix recovery remains Partial: the capture end and duration stay
+unknown, raw and canonical audio remain retained, and whole-input seal,
+completion and projection markers are not created. A later startup reconciles
+the prefix acknowledgement without repeating inference or overwriting existing
+transcript edits. Raw-only captures without a canonical plan remain visible
+without an inference attempt; reconstruction is still separate work.
+
+`ui_preview --automatic-prefix` exercises the normal startup pass over synthetic
+audio with fake inference. `--interrupted-prefix` intentionally indexes without
+starting inference so reviewers can still exercise manual Retry. Normal app
+startup always uses the automatic pass.
