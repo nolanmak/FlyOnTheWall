@@ -1,4 +1,4 @@
-//! Admit interrupted WALs only with a saved first-Stop clock and intact canonical input.
+//! Admit stopped WALs using the saved clock, verified retained audio and canonical input.
 //!
 //! Raw PCM has no persisted reconstruction map for the live filter's state and
 //! route boundaries. It is validation evidence, never replacement STT input.
@@ -150,15 +150,6 @@ fn boundaries(dir: &Path, proof: &CaptureSnapshot) -> io::Result<Vec<Boundary>> 
 /// Freeze existing canonical input under all leases before projecting a stopped WAL.
 /// This never reconstructs PCM, stamps a clean manifest, or guesses a capture end.
 pub(crate) fn prepare(dir: &Path, stop: &AtomicBool) -> io::Result<Option<StoppedCapture>> {
-    ordinary(&dir.join("manifest.json"))?;
-    if std::fs::metadata(dir.join("manifest.json"))?.len() > 1024 * 1024 {
-        return Err(invalid("capture manifest exceeds size bound"));
-    }
-    let manifest: fotw_pipeline::wal::Manifest =
-        serde_json::from_slice(&std::fs::read(dir.join("manifest.json"))?)?;
-    if manifest.ended_at_ms.is_some() {
-        return Ok(None);
-    }
     let (owner, proof) = snapshot(dir)?;
     let Some((started, ended)) = proof.frozen_capture_clock() else {
         return Err(invalid("interrupted capture has no proven end"));

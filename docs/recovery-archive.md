@@ -108,3 +108,36 @@ the session directory after renaming the synced manifest, before PCM retirement.
 Seven synthetic integration tests and full local `just ci` pass. These checks do
 not establish active-writer exclusion or transactional replacement after an I/O
 failure; complete-archive validation before destructive retirement remains open.
+
+## Recovering finalized captures and retired PCM
+
+Startup recovery now admits an unindexed finalized capture through the same
+saved first-Stop clock and canonical-source checks used for an interrupted WAL.
+Already indexed sessions use their saved database clock and ordinary retry path;
+startup does not repeatedly decode their archives during discovery. Existing
+legacy indexed sessions without modern capture-ownership sidecars remain usable.
+
+If a checkpointed raw track has been retired, recovery requires its completed
+archive. A streaming verifier checks Ogg checksums, sequence and continuation,
+the app's mono Opus headers, every packet through libopus, final EOS and timing,
+and absence of trailing or chained data. It uses bounded reusable page, packet
+and decoded-frame storage. Observed file length, original input rate, exact
+sample count and duration must agree with the manifest and original checkpoint.
+Consistent older app page clocks are accepted without rewriting stored bytes.
+
+Retained raw evidence takes precedence: an uncheckpointed tail still prevents
+inventing a capture end, even when an archive exists. Corrupt/truncated archives,
+metadata mismatches, linked files and an unknown original Stop are refused.
+All configured canonical sources are validated and leased before any are sealed
+or projected. Capture ownership survives cancellation and native runtime cleanup.
+Recovery preserves the manifest, retained audio, settings, notes and first-Stop
+clock; archive audio is evidence, not reconstructed transcription input.
+
+Synthetic contracts exercise clean and interrupted retired captures, exact
+44.1 kHz frame conversion, corruption including valid-CRC timing edits, missing
+canonical tails, cancellation, source contention, idempotence and legacy retry.
+The opt-in native fixture uses only the checksum-pinned public JFK WAV and
+cached `small.en` model. Neither fixture establishes physical-device recovery
+or transcription quality. Raw-only/canonical reconstruction, unknown-end and
+legacy unindexed capture admission, and archive verification before destructive
+retirement remain open #12 requirements.
