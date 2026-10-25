@@ -1,0 +1,338 @@
+[
+  {
+    "appearance": "light",
+    "physicalWidth": 390,
+    "physicalHeight": 1000,
+    "before": {
+      "afterStop": {
+        "utteranceHeight": 126,
+        "visibleReadingHeight": 64.6796875
+      },
+      "beforeStop": {
+        "utteranceHeight": 126,
+        "visibleReadingHeight": 79.3046875
+      },
+      "copyReachable": true,
+      "cssHeight": 500,
+      "cssWidth": 195,
+      "returnReachable": true,
+      "savedSelectionPreserved": true,
+      "startReachable": true,
+      "stopReachable": true
+    },
+    "after": {
+      "afterStop": {
+        "utteranceHeight": 126,
+        "visibleReadingHeight": 375
+      },
+      "beforeStop": {
+        "utteranceHeight": 126,
+        "visibleReadingHeight": 375
+      },
+      "copyReachable": true,
+      "cssHeight": 500,
+      "cssWidth": 195,
+      "returnReachable": true,
+      "savedSelectionPreserved": true,
+      "startReachable": true,
+      "stopReachable": true
+    },
+    "normal": {
+      "afterStop": {
+        "utteranceHeight": 63,
+        "visibleReadingHeight": 479
+      },
+      "beforeStop": {
+        "utteranceHeight": 63,
+        "visibleReadingHeight": 479
+      },
+      "copyReachable": true,
+      "cssHeight": 1000,
+      "cssWidth": 390,
+      "returnReachable": true,
+      "savedSelectionPreserved": true,
+      "startReachable": true,
+      "stopReachable": true
+    }
+  },
+  {
+    "appearance": "light",
+    "physicalWidth": 768,
+    "physicalHeight": 1000,
+    "before": {
+      "afterStop": {
+        "utteranceHeight": 42,
+        "visibleReadingHeight": 146.90625
+      },
+      "beforeStop": {
+        "utteranceHeight": 42,
+        "visibleReadingHeight": 160.5546875
+      },
+      "copyReachable": true,
+      "cssHeight": 500,
+      "cssWidth": 384,
+      "returnReachable": true,
+      "savedSelectionPreserved": true,
+      "startReachable": true,
+      "stopReachable": true
+    },
+    "after": {
+      "afterStop": {
+        "utteranceHeight": 42,
+        "visibleReadingHeight": 375
+      },
+      "beforeStop": {
+        "utteranceHeight": 42,
+        "visibleReadingHeight": 375
+      },
+      "copyReachable": true,
+      "cssHeight": 500,
+      "cssWidth": 384,
+      "returnReachable": true,
+      "savedSelectionPreserved": true,
+      "startReachable": true,
+      "stopReachable": true
+    },
+    "normal": {
+      "afterStop": {
+        "utteranceHeight": 63,
+        "visibleReadingHeight": 569
+      },
+      "beforeStop": {
+        "utteranceHeight": 63,
+        "visibleReadingHeight": 569
+      },
+      "copyReachable": true,
+      "cssHeight": 1000,
+      "cssWidth": 768,
+      "returnReachable": true,
+      "savedSelectionPreserved": true,
+      "startReachable": true,
+      "stopReachable": true
+    }
+  },
+  {
+    "appearance": "light",
+    "physicalWidth": 1440,
+    "physicalHeight": 1000,
+    "before": {
+      "afterStop": {
+        "utteranceHeight": 84,
+        "visibleReadingHeight": 262
+      },
+      "beforeStop": {
+        "utteranceHeight": 84,
+        "visibleReadingHeight": 305
+      },
+      "copyReachable": true,
+      "cssHeight": 500,
+      "cssWidth": 720,
+      "returnReachable": true,
+      "savedSelectionPreserved": true,
+      "startReachable": true,
+      "stopReachable": true
+    },
+    "after": {
+      "afterStop": {
+        "utteranceHeight": 84,
+        "visibleReadingHeight": 262
+      },
+      "beforeStop": {
+        "utteranceHeight": 84,
+        "visibleReadingHeight": 305
+      },
+      "copyReachable": true,
+      "cssHeight": 500,
+      "cssWidth": 720,
+      "returnReachable": true,
+      "savedSelectionPreserved": true,
+      "startReachable": true,
+      "stopReachable": true
+    },
+    "normal": {
+      "afterStop": {
+        "utteranceHeight": 21,
+        "visibleReadingHeight": 383
+      },
+      "beforeStop": {
+        "utteranceHeight": 21,
+        "visibleReadingHeight": 383
+      },
+      "copyReachable": true,
+      "cssHeight": 1000,
+      "cssWidth": 1440,
+      "returnReachable": true,
+      "savedSelectionPreserved": true,
+      "startReachable": true,
+      "stopReachable": true
+    }
+  },
+  {
+    "appearance": "dark",
+    "physicalWidth": 390,
+    "physicalHeight": 1000,
+    "before": {
+      "afterStop": {
+        "utteranceHeight": 126,
+        "visibleReadingHeight": 64.6796875
+      },
+      "beforeStop": {
+        "utteranceHeight": 126,
+        "visibleReadingHeight": 79.3046875
+      },
+      "copyReachable": true,
+      "cssHeight": 500,
+      "cssWidth": 195,
+      "returnReachable": true,
+      "savedSelectionPreserved": true,
+      "startReachable": true,
+      "stopReachable": true
+    },
+    "after": {
+      "afterStop": {
+        "utteranceHeight": 126,
+        "visibleReadingHeight": 375
+      },
+      "beforeStop": {
+        "utteranceHeight": 126,
+        "visibleReadingHeight": 375
+      },
+      "copyReachable": true,
+      "cssHeight": 500,
+      "cssWidth": 195,
+      "returnReachable": true,
+      "savedSelectionPreserved": true,
+      "startReachable": true,
+      "stopReachable": true
+    },
+    "normal": {
+      "afterStop": {
+        "utteranceHeight": 63,
+        "visibleReadingHeight": 479
+      },
+      "beforeStop": {
+        "utteranceHeight": 63,
+        "visibleReadingHeight": 479
+      },
+      "copyReachable": true,
+      "cssHeight": 1000,
+      "cssWidth": 390,
+      "returnReachable": true,
+      "savedSelectionPreserved": true,
+      "startReachable": true,
+      "stopReachable": true
+    }
+  },
+  {
+    "appearance": "dark",
+    "physicalWidth": 768,
+    "physicalHeight": 1000,
+    "before": {
+      "afterStop": {
+        "utteranceHeight": 42,
+        "visibleReadingHeight": 146.90625
+      },
+      "beforeStop": {
+        "utteranceHeight": 42,
+        "visibleReadingHeight": 160.5546875
+      },
+      "copyReachable": true,
+      "cssHeight": 500,
+      "cssWidth": 384,
+      "returnReachable": true,
+      "savedSelectionPreserved": true,
+      "startReachable": true,
+      "stopReachable": true
+    },
+    "after": {
+      "afterStop": {
+        "utteranceHeight": 42,
+        "visibleReadingHeight": 375
+      },
+      "beforeStop": {
+        "utteranceHeight": 42,
+        "visibleReadingHeight": 375
+      },
+      "copyReachable": true,
+      "cssHeight": 500,
+      "cssWidth": 384,
+      "returnReachable": true,
+      "savedSelectionPreserved": true,
+      "startReachable": true,
+      "stopReachable": true
+    },
+    "normal": {
+      "afterStop": {
+        "utteranceHeight": 63,
+        "visibleReadingHeight": 569
+      },
+      "beforeStop": {
+        "utteranceHeight": 63,
+        "visibleReadingHeight": 569
+      },
+      "copyReachable": true,
+      "cssHeight": 1000,
+      "cssWidth": 768,
+      "returnReachable": true,
+      "savedSelectionPreserved": true,
+      "startReachable": true,
+      "stopReachable": true
+    }
+  },
+  {
+    "appearance": "dark",
+    "physicalWidth": 1440,
+    "physicalHeight": 1000,
+    "before": {
+      "afterStop": {
+        "utteranceHeight": 84,
+        "visibleReadingHeight": 262
+      },
+      "beforeStop": {
+        "utteranceHeight": 84,
+        "visibleReadingHeight": 305
+      },
+      "copyReachable": true,
+      "cssHeight": 500,
+      "cssWidth": 720,
+      "returnReachable": true,
+      "savedSelectionPreserved": true,
+      "startReachable": true,
+      "stopReachable": true
+    },
+    "after": {
+      "afterStop": {
+        "utteranceHeight": 84,
+        "visibleReadingHeight": 262
+      },
+      "beforeStop": {
+        "utteranceHeight": 84,
+        "visibleReadingHeight": 305
+      },
+      "copyReachable": true,
+      "cssHeight": 500,
+      "cssWidth": 720,
+      "returnReachable": true,
+      "savedSelectionPreserved": true,
+      "startReachable": true,
+      "stopReachable": true
+    },
+    "normal": {
+      "afterStop": {
+        "utteranceHeight": 21,
+        "visibleReadingHeight": 383
+      },
+      "beforeStop": {
+        "utteranceHeight": 21,
+        "visibleReadingHeight": 383
+      },
+      "copyReachable": true,
+      "cssHeight": 1000,
+      "cssWidth": 1440,
+      "returnReachable": true,
+      "savedSelectionPreserved": true,
+      "startReachable": true,
+      "stopReachable": true
+    }
+  }
+]

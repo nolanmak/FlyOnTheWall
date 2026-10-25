@@ -152,6 +152,47 @@ The existing focus rule remains. Long-history process memory/GC, active-window
 keyboard/screen-reader acceptance, and the full live recording/zoom matrix remain
 open for #123. All owned fixture processes and temporary libraries were removed.
 
+### Reading room at 200% zoom
+
+The narrow layout now grows beyond the viewport instead of dividing the space
+left beneath wrapped controls into two shrinking panes. The meeting list stays
+bounded, and the detail pane receives a viewport-relative height with a minimum
+reading height. It retains its own scroll container, which the live transcript
+uses for following new speech and preserving history position.
+
+The [WebKit fixture](../crates/fotw-web/tests/fixtures/zoom-reading-webkit.js)
+first reproduced a clipped complete utterance at actual 200% page zoom: a
+390px-wide window has an effective 195px viewport, where the detail pane was
+only 79 CSS pixels high. The 126px utterance could not fit even after scrolling
+it into view. The same check passes after the change, including before and after
+synthetic Stop. It checks Start, Stop, Return to recording and Copy transcript
+visibility/focus, horizontal reflow and saved-meeting selection while another
+synthetic meeting records. Copy is focused, never invoked.
+
+Owned nonpersistent, nonactivating WebKit windows loaded the actual UI from
+`ui_preview --live-notes` with an explicit debug asset override. Both appearances
+passed at physical widths 390, 768 and 1440px, height 1000px, at 100% and actual
+200% `WKWebView.pageZoom`. Before screenshots use the CSS from
+`21c4cc1c65150839284b0695b6204d97ecc0f0b1`; all other UI assets are identical.
+The baseline capture records the clipped geometry without asserting success;
+the unchanged assertion fails on that baseline and passes on the candidate.
+
+| 200% zoom | Before | After |
+| --- | --- | --- |
+| 390px light | [Before](dashboard-refresh/zoom-reading/before-light-390.png) | [After](dashboard-refresh/zoom-reading/after-light-390.png) |
+| 768px light | [Before](dashboard-refresh/zoom-reading/before-light-768.png) | [After](dashboard-refresh/zoom-reading/after-light-768.png) |
+| 1440px light | [Before](dashboard-refresh/zoom-reading/before-light-1440.png) | [After](dashboard-refresh/zoom-reading/after-light-1440.png) |
+| 390px dark | [Before](dashboard-refresh/zoom-reading/before-dark-390.png) | [After](dashboard-refresh/zoom-reading/after-dark-390.png) |
+| 768px dark | [Before](dashboard-refresh/zoom-reading/before-dark-768.png) | [After](dashboard-refresh/zoom-reading/after-dark-768.png) |
+| 1440px dark | [Before](dashboard-refresh/zoom-reading/before-dark-1440.png) | [After](dashboard-refresh/zoom-reading/after-dark-1440.png) |
+
+[Measured results](dashboard-refresh/zoom-reading/results.json) cover all cases.
+The 1440px/200% case retains the desktop layout at effective width 720px.
+This is partial #123 evidence, not active-window keyboard, screen-reader,
+memory/GC or physical recording acceptance. No capture devices, provider keys,
+clipboard, global input or user library were used. All fixture servers were
+stopped and their one-use URL files removed.
+
 Review followup: a behavioral RED reproduced losing control focus when Next or
 Previous became disabled at a page boundary. The renderer now moves focus to
 the page field before disabling the activated button. The native fixture

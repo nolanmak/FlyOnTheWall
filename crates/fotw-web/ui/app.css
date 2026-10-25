@@ -578,10 +578,18 @@ button, summary { min-height: 36px; }
 
 /* ------------------------------------------------------------- small screens
    One breakpoint (#66). Below it the two columns stack: the meeting list
-   becomes a bounded strip that scrolls on its own above the detail pane, and
+   becomes a bounded strip that scrolls on its own above the detail content, and
    the header wraps instead of pushing the record controls off-screen. The
    desktop layout above this line is untouched. */
 @media (max-width: 700px) {
+  /* Wrapped controls can consume most of a zoomed viewport. Let the page
+     grow so reading content does not become a few clipped lines beneath it. */
+  body {
+    height: auto;
+    min-height: 100vh;
+    min-height: 100dvh;
+  }
+
   header {
     flex-wrap: wrap;
     row-gap: 8px;
@@ -595,17 +603,27 @@ button, summary { min-height: 36px; }
   }
 
   main {
-    grid-template-columns: 1fr;
-    grid-template-rows: minmax(0, 35%) 1fr;
+    display: block;
+    flex: none;
   }
 
   nav {
+    max-height: 35vh;
+    max-height: 35dvh;
     border-right: 0;
     border-bottom: 1px solid var(--line);
   }
 
   section {
     padding: 12px 14px;
+  }
+
+  #detail {
+    /* Keep the transcript's own scroll owner for live following/history,
+       while giving it usable room even below a tall wrapped header. */
+    height: 75vh;
+    height: 75dvh;
+    min-height: 18rem;
   }
 
   .segment {
