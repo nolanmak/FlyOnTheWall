@@ -26,8 +26,8 @@ fn a_fresh_database_lands_on_the_latest_version() {
     let db = Db::open(&path, &test_key()).unwrap();
     assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
     assert_eq!(
-        LATEST_SCHEMA_VERSION, 6,
-        "0001 initial schema, 0002 fts5 search indexes, 0003 enrich report, 0004 sharing documents, 0005 session notes, 0006 note handoff aliases"
+        LATEST_SCHEMA_VERSION, 7,
+        "0001 initial schema, 0002 fts5 search indexes, 0003 enrich report, 0004 sharing documents, 0005 session notes, 0006 note handoff aliases, 0007 durable speech receipts"
     );
 }
 
@@ -320,4 +320,36 @@ fn a_v5_library_keeps_unsaved_recording_notes_when_aliases_are_added() {
     assert_eq!(draft.note.revision, 3);
     assert_eq!(draft.started_at_ms, 1000);
     assert_eq!(db.session_note_meeting("capture-A").unwrap(), None);
+}
+
+#[test]
+fn v6_notes_and_capture_alias_survive_the_speech_receipt_migration() {
+    let (_dir, path) = tmp_db();
+    {
+        let conn = raw(&path);
+        for sql in [
+            include_str!("../src/schema/0001_initial.sql"),
+            include_str!("../src/schema/0002_fts.sql"),
+            include_str!("../src/schema/0003_enrich_report.sql"),
+            include_str!("../src/schema/0004_documents.sql"),
+            include_str!("../src/schema/0005_session_notes.sql"),
+            include_str!("../src/schema/0006_session_note_links.sql"),
+        ] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch("INSERT INTO meetings(id,title,started_at_ms,tz,state,created_at,updated_at,origin_device_id) VALUES('saved-meeting','owned title',1000,'UTC','ready',0,0,'fixture'); INSERT INTO session_note_links(session_id,meeting_id,started_at_ms,elapsed_ms) VALUES('saved-capture','saved-meeting',1000,1000); INSERT INTO notes(id,meeting_id,body_md,created_at,updated_at,origin_device_id) VALUES('owned-note','saved-meeting','owned notes',0,0,'fixture'); PRAGMA user_version=6;").unwrap();
+    }
+    let mut db = Db::open(&path, &test_key()).unwrap();
+    assert_eq!(db.schema_version().unwrap(), 7);
+    assert_eq!(
+        db.session_note_meeting("saved-capture").unwrap().as_deref(),
+        Some("saved-meeting")
+    );
+    assert_eq!(
+        db.note_document("saved-meeting").unwrap().body_md,
+        "owned notes"
+    );
+    let doc = db.export_meeting("saved-meeting").unwrap();
+    assert_eq!(doc.meeting.title, "owned title");
+    assert!(doc.speech_epochs.is_empty() && doc.speech_receipts.is_empty());
 }

@@ -77,8 +77,8 @@ use crate::error::{Result, StoreError};
 use crate::export::{
     ActionItemRow, AppMetaRow, DeviceRow, DocumentRow, FolderRow, MeetingDoc, MeetingRow,
     MeetingTagRow, NoteAnchorRow, NoteRow, ParticipantRow, PersonRow, RecordingRow, SegmentRow,
-    SessionNoteLinkRow, SessionNoteRow, SettingRow, SummaryRow, TableRow, TagRow, TemplateRow,
-    TombstoneRow, TranscriptRow,
+    SessionNoteLinkRow, SessionNoteRow, SettingRow, SpeechEpochRow, SpeechReceiptRow, SummaryRow,
+    TableRow, TagRow, TemplateRow, TombstoneRow, TranscriptRow,
 };
 use crate::migrations::LATEST_SCHEMA_VERSION;
 
@@ -485,6 +485,8 @@ impl Db {
             insert_rows(&tx, &doc.meeting_tags, &mut report)?;
             insert_rows(&tx, &doc.transcripts, &mut report)?;
             insert_rows(&tx, &doc.segments, &mut report)?;
+            insert_rows(&tx, &doc.speech_epochs, &mut report)?;
+            insert_rows(&tx, &doc.speech_receipts, &mut report)?;
             insert_rows(&tx, &doc.notes, &mut report)?;
             insert_rows(&tx, &doc.note_anchors, &mut report)?;
             insert_rows(&tx, &doc.summaries, &mut report)?;
@@ -782,6 +784,8 @@ pub fn archived_tables() -> BTreeSet<&'static str> {
         MeetingTagRow::TABLE_NAME,
         TranscriptRow::TABLE_NAME,
         SegmentRow::TABLE_NAME,
+        SpeechEpochRow::TABLE_NAME,
+        SpeechReceiptRow::TABLE_NAME,
         NoteRow::TABLE_NAME,
         NoteAnchorRow::TABLE_NAME,
         SummaryRow::TABLE_NAME,
@@ -821,10 +825,10 @@ mod tests {
 
     #[test]
     fn the_archive_covers_every_table_the_schema_has() {
-        // 18 initial tables plus sharing documents, session notes and session aliases; FTS excluded (derived, rebuildable --
+        // 18 initial tables plus documents, session notes/aliases and speech provenance; FTS excluded (derived, rebuildable --
         // §9.7 invariant 6). A new table added without an archive home fails
         // `every_column_of_every_table_appears_in_the_archive`; this is the
         // cheap unit-level version of the same guard.
-        assert_eq!(archived_tables().len(), 21);
+        assert_eq!(archived_tables().len(), 23);
     }
 }

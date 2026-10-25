@@ -58,6 +58,8 @@ const ALL_TABLES: &[&str] = &[
     "session_note_links",
     "session_notes",
     "settings",
+    "speech_epochs",
+    "speech_receipts",
     "summaries",
     "tags",
     "templates",
@@ -352,6 +354,11 @@ VALUES ('mtg-3', 'Historic', -86400000, 4102444800000, 4102531200000, 'Pacific/K
 -- drops the row and the provenance with it.
 INSERT INTO transcripts (id, meeting_id, provider, model, is_primary, language, audio_ms, cost_micros, raw_response_rel_path, created_at, updated_at, lamport, origin_device_id)
 VALUES ('tr-3', 'mtg-3', 'deepgram', 'nova-3', 1, NULL, 0, 0, '', 120, 121, 0, 'dev-2');
+
+INSERT INTO speech_epochs(id,meeting_id,transcript_id,session_id,source,epoch,from_sample,provider,model,revision,capabilities_json,reason)
+VALUES ('fixture-epoch','mtg-1','tr-1','saved-fixture','system',0,0,'fixture-provider','fixture-model','fixture-checksum','{"diarization":"none"}',NULL);
+INSERT INTO speech_receipts(id,meeting_id,transcript_id,epoch_id,from_sample,through_sample,payload_json)
+VALUES ('fixture-receipt','mtg-1','tr-1','fixture-epoch',0,16000,'{"epoch":0,"from_sample":0,"through_sample":16000,"segments":[]}');
 
 INSERT INTO session_note_links(session_id,meeting_id,started_at_ms,elapsed_ms)
 VALUES ('saved-fixture','mtg-1',1000,500);
@@ -1109,6 +1116,8 @@ fn every_column_of_every_table_appears_in_the_archive() {
         ("meeting_tags", &meeting, "meeting_tags"),
         ("transcripts", &meeting, "transcripts"),
         ("segments", &meeting, "segments"),
+        ("speech_epochs", &meeting, "speech_epochs"),
+        ("speech_receipts", &meeting, "speech_receipts"),
         ("notes", &meeting, "notes"),
         ("note_anchors", &meeting, "note_anchors"),
         ("summaries", &meeting, "summaries"),

@@ -37,6 +37,50 @@ fn audio(dir: &std::path::Path, source: ReplaySource, anchor: u64) -> ReplayWrit
 }
 
 #[test]
+fn projection_snapshot_keeps_all_epochs_without_taking_native_worker_ownership_or_repairing_its_tail()
+ {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let _audio = audio(dir.path(), ReplaySource::System, 0);
+    let mut journal = CoverageJournal::create(
+        dir.path(),
+        "s",
+        Source::System,
+        engine("deepgram", "nova-3"),
+    )
+    .unwrap();
+    journal
+        .commit(
+            0,
+            0,
+            16_000,
+            vec![final_segment("cloud-first", "deepgram", "nova-3", 0, 1_000)],
+        )
+        .unwrap();
+    journal
+        .switch(engine(LOCAL, "small.en"), SwitchReason::Auth)
+        .unwrap();
+    assert!(
+        CoverageJournal::open(dir.path(), "s", Source::System).is_err(),
+        "writer ownership remains exclusive"
+    );
+    let path = journal.path();
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    file.write_all(b"{\"kind\":\"committed\"").unwrap();
+    let length = std::fs::metadata(path).unwrap().len();
+    let snapshot = CoverageJournal::snapshot(dir.path(), "s", Source::System).unwrap();
+    assert_eq!(snapshot.epochs.len(), 2);
+    assert_eq!(snapshot.epochs[0].engine.provider, "deepgram");
+    assert_eq!(snapshot.epochs[1].reason, Some(SwitchReason::Auth));
+    assert_eq!(snapshot.commits.len(), 1);
+    assert_eq!(
+        std::fs::metadata(path).unwrap().len(),
+        length,
+        "snapshot must never truncate the writer's tail"
+    );
+}
+
+#[test]
 fn handoff_keeps_committed_text_and_replays_uncommitted_audio_after_a_crash() {
     let dir = tempfile::tempdir().unwrap();
     let _audio = audio(dir.path(), ReplaySource::System, 137 * 16);

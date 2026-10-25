@@ -182,18 +182,27 @@ fn read_line(reader: &mut impl BufRead) -> io::Result<Vec<u8>> {
     Ok(line)
 }
 
+/// Read-only validated journal prefix for database projection after bounded Stop.
+pub struct CoverageSnapshot {
+    /// Initial engine and every durable switch in order.
+    pub epochs: Vec<ProviderEpoch>,
+    /// Only complete validated receipt lines; never an in-flight publication.
+    pub commits: Vec<CommittedAudio>,
+}
+
 /// Exclusive owner of one source's append-only coverage journal.
 ///
 /// The journal is session data, not diagnostic logging. Keep it and canonical
 /// replay audio until pending transcription is resolved. Never call from an
 /// audio callback or async executor; the handoff worker owns blocking IO.
 pub struct CoverageJournal {
-    _owner: OwnerLock,
+    _owner: Option<OwnerLock>,
     file: File,
     path: PathBuf,
     audio: ReplayReader,
     header: Header,
     epoch: ProviderEpoch,
+    epochs: Vec<ProviderEpoch>,
     commits: Vec<CommittedAudio>,
     ids: HashSet<String>,
     committed: u64,
@@ -224,7 +233,7 @@ impl CoverageJournal {
             .write(true)
             .create_new(true)
             .open(&path)?;
-        let mut journal = Self::from_header(owner, file, path, audio, header);
+        let mut journal = Self::from_header(Some(owner), file, path, audio, header);
         let initialized = journal
             .append(&Entry::Opened {
                 header: journal.header.clone(),
@@ -246,9 +255,26 @@ impl CoverageJournal {
     /// Recover committed payloads and the current provider epoch after a crash.
     /// Only an incomplete final line is truncated, after prior records validate.
     pub fn open(dir: &Path, session_id: &str, source: Source) -> io::Result<Self> {
+        Self::load(dir, session_id, source, true)
+    }
+
+    /// Read the validated durable prefix while a native worker may still own
+    /// the journal. Never repairs/truncates a live writer's incomplete line.
+    pub fn snapshot(dir: &Path, session_id: &str, source: Source) -> io::Result<CoverageSnapshot> {
+        let journal = Self::load(dir, session_id, source, false)?;
+        // A complete line may become readable before the writer's own fsync
+        // returns. Flush the validated prefix before projecting it into SQLite.
+        journal.file.sync_data()?;
+        Ok(CoverageSnapshot {
+            epochs: journal.epochs,
+            commits: journal.commits,
+        })
+    }
+
+    fn load(dir: &Path, session_id: &str, source: Source, repair: bool) -> io::Result<Self> {
         let audio = ReplayReader::open(dir, session_id, replay_source(source))?;
         let path = journal_path(dir, source);
-        let owner = lock(&path)?;
+        let owner = if repair { Some(lock(&path)?) } else { None };
         let file = OpenOptions::new().read(true).write(true).open(&path)?;
         let mut reader = BufReader::new(file.try_clone()?);
         let first = read_line(&mut reader)?;
@@ -282,6 +308,7 @@ impl CoverageJournal {
                 Entry::Opened { .. } => return Err(invalid("duplicate coverage header")),
                 Entry::Switched { epoch } => {
                     journal.validate_switch(&epoch)?;
+                    journal.epochs.push(epoch.clone());
                     journal.epoch = epoch;
                 }
                 Entry::Committed { commit } => {
@@ -292,7 +319,7 @@ impl CoverageJournal {
             valid_bytes += line.len() as u64;
         }
         drop(reader);
-        if torn {
+        if torn && repair {
             journal.file.set_len(valid_bytes)?;
             journal.file.sync_data()?;
         }
@@ -301,7 +328,7 @@ impl CoverageJournal {
     }
 
     fn from_header(
-        owner: OwnerLock,
+        owner: Option<OwnerLock>,
         file: File,
         path: PathBuf,
         audio: ReplayReader,
@@ -318,6 +345,12 @@ impl CoverageJournal {
                 reason: None,
                 engine: header.initial.clone(),
             },
+            epochs: vec![ProviderEpoch {
+                number: 0,
+                from_sample: header.first_sample,
+                reason: None,
+                engine: header.initial.clone(),
+            }],
             committed: header.first_sample,
             header,
             commits: Vec::new(),
@@ -408,6 +441,7 @@ impl CoverageJournal {
         self.append(&Entry::Switched {
             epoch: epoch.clone(),
         })?;
+        self.epochs.push(epoch.clone());
         self.epoch = epoch.clone();
         Ok(epoch)
     }
@@ -511,7 +545,7 @@ mod owner_release_tests {
             },
         )
         .unwrap();
-        let inherited = journal._owner.0.try_clone().unwrap();
+        let inherited = journal._owner.as_ref().unwrap().0.try_clone().unwrap();
         drop(journal);
         let recovered = CoverageJournal::open(dir.path(), "s", Source::System);
         assert!(

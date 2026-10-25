@@ -229,6 +229,23 @@ async fn session_pump_recovers_both_tracks_without_losing_original_capture_forma
                 .all(|segment| segment.session_id == session_id)
         );
     }
+    let mut db =
+        fotw_store::Db::open_in_memory(&fotw_store::DbKey::from_bytes([0x28; 32])).unwrap();
+    let meeting = fotwd::persist::persist_session(&mut db, &outcome, "Synthetic handoff").unwrap();
+    let saved = db.export_meeting(&meeting).unwrap();
+    assert_eq!(
+        saved.speech_epochs.len(),
+        4,
+        "both source/provider histories must survive persistence"
+    );
+    assert!(!saved.speech_receipts.is_empty());
+    assert_eq!(saved.segments.len(), outcome.segments.len());
+    assert!(
+        outcome
+            .segments
+            .iter()
+            .all(|s| saved.segments.iter().any(|row| row.id == s.id))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
