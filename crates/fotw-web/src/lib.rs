@@ -116,3 +116,4 @@ pub use crate::store_source::StoreSource;
 
 /// Transcription policy settings and daemon control seam.
 pub mod speech;
+pub mod speech_recovery;

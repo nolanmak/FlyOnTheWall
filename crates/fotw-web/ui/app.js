@@ -413,6 +413,10 @@ function renderDetail(detail) {
 
   mountSharingDocument(detail, el.detail);
 
+  if (typeof FOTWSpeechRecovery !== "undefined") {
+    FOTWSpeechRecovery.mount(detail.meeting.id, el.detail, api, () => openMeeting(detail.meeting.id));
+  }
+
   // Notes first, and above the summary, because they are the user's own words
   // and the summary is a derived artifact. Search has always indexed notes, so
   // before this they could be matched but never read.

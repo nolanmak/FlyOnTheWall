@@ -185,6 +185,18 @@ fn routes(state: AppState) -> Router {
         .route("/api/meetings", get(api::list_meetings))
         .route("/api/meetings/{id}", get(api::get_meeting))
         .route(
+            "/api/meetings/{id}/speech-recovery",
+            get(crate::speech_recovery::read),
+        )
+        .route(
+            "/api/meetings/{id}/speech-recovery/retry",
+            post(crate::speech_recovery::retry),
+        )
+        .route(
+            "/api/meetings/{id}/speech-recovery/cancel",
+            post(crate::speech_recovery::cancel),
+        )
+        .route(
             "/api/meetings/{id}/notes",
             get(crate::notes::load).post(crate::notes::save),
         )

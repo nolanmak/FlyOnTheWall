@@ -3,6 +3,7 @@
 //!     cargo run -p fotwd --example ui_preview
 //!     cargo run -p fotwd --example ui_preview -- --live-notes
 //!     cargo run -p fotwd --example ui_preview -- --speech-history
+//!     cargo run -p fotwd --example ui_preview -- --saved-speech-recovery
 //!
 //! Every other way into the library goes through audio capture — a TCC grant,
 //! a signed build, and an actual meeting to record — so the web UI was
@@ -290,6 +291,11 @@ async fn main() -> Result<(), String> {
             root.clone(),
         )));
     let state = server.state().clone();
+    if std::env::args().any(|arg| arg == "--saved-speech-recovery") {
+        state.set_speech_recovery(Arc::new(SavedRecoveryPreview(
+            std::sync::atomic::AtomicU8::new(0),
+        )));
+    }
     if let Some(recorder) = fixture_recorder {
         recorder.attach_hub(state.hub().clone());
     }
@@ -298,6 +304,77 @@ async fn main() -> Result<(), String> {
     println!("\n  {}", state.launch_url());
     println!("\n  Ctrl-C to stop. The library is thrown away on the next run.");
     server.serve().await.map_err(|e| format!("server: {e}"))
+}
+
+/// Synthetic metadata only. This fixture has no model, capture or provider.
+#[derive(Debug)]
+struct SavedRecoveryPreview(std::sync::atomic::AtomicU8);
+impl SavedRecoveryPreview {
+    fn snapshot(&self) -> fotw_web::speech_recovery::RecoveryStatus {
+        use fotw_web::speech_recovery::{RecoveryPhase as Phase, RecoverySource, RecoveryStatus};
+        let phase = match self.0.load(std::sync::atomic::Ordering::Acquire) {
+            1 => Phase::Preparing,
+            2 => Phase::Transcribing,
+            3 => Phase::Complete,
+            4 => Phase::Stopping,
+            5 => Phase::Cancelled,
+            _ => Phase::Incomplete,
+        };
+        RecoveryStatus {
+            phase,
+            worker_running: matches!(
+                phase,
+                Phase::Preparing | Phase::Transcribing | Phase::Stopping
+            ),
+            can_retry: matches!(phase, Phase::Incomplete | Phase::Cancelled),
+            message: None,
+            sources: vec![
+                RecoverySource {
+                    source: "system".into(),
+                    model: "fixture-small.en".into(),
+                    revision: None,
+                    pending_audio_ms: if phase == Phase::Complete { 0 } else { 42000 },
+                },
+                RecoverySource {
+                    source: "mic".into(),
+                    model: "fixture-small.en".into(),
+                    revision: None,
+                    pending_audio_ms: if phase == Phase::Complete { 0 } else { 3800 },
+                },
+            ],
+        }
+    }
+}
+impl fotw_web::speech_recovery::SpeechRecoveryControl for SavedRecoveryPreview {
+    fn read(
+        &self,
+        _: &str,
+    ) -> Result<fotw_web::speech_recovery::RecoveryStatus, fotw_web::speech_recovery::RecoveryError>
+    {
+        let status = self.snapshot();
+        use std::sync::atomic::Ordering;
+        let stage = self.0.load(Ordering::Acquire);
+        if matches!(stage, 1 | 2 | 4) {
+            self.0.store(stage + 1, Ordering::Release);
+        }
+        Ok(status)
+    }
+    fn retry(
+        &self,
+        _: &str,
+    ) -> Result<fotw_web::speech_recovery::RecoveryStatus, fotw_web::speech_recovery::RecoveryError>
+    {
+        self.0.store(1, std::sync::atomic::Ordering::Release);
+        Ok(self.snapshot())
+    }
+    fn cancel(
+        &self,
+        _: &str,
+    ) -> Result<fotw_web::speech_recovery::RecoveryStatus, fotw_web::speech_recovery::RecoveryError>
+    {
+        self.0.store(4, std::sync::atomic::Ordering::Release);
+        Ok(self.snapshot())
+    }
 }
 
 /// Synthetic health UI fixture. No microphone, system tap, or provider opens.
