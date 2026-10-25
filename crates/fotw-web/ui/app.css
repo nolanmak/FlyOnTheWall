@@ -763,3 +763,7 @@ button, summary { min-height: 36px; }
 .speech-recovery p { margin: 8px 0; }
 .recovery-sources { color: var(--muted); font-size: 12px; }
 .recovery-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+
+/* Reachable from a paused history viewport without scrolling past new speech. */
+.live-latest { position: sticky; bottom: 1rem; margin: .5rem 0; }
+.live-latest[hidden] { display: none; }

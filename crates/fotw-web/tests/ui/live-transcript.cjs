@@ -417,7 +417,7 @@ test('closed local-only streams explain that native cleanup still blocks Start',
 
 
 test('partial updates retain committed rows and do bounded rendering work with long history',()=>{
- const h=harness();start(h);
+ const h=harness();start(h);h.nodes.get('detail').scrollTop=900;
  h.ctx.appendDeltas(Array.from({length:10000},(_,i)=>d(i,17000+i*1000,'line'+i)));
  h.ctx.appendDeltas([{...d(-1,10018000,'first partial'),is_final:false}]);
  const body=h.document.getElementById('segments'),first=body.children[0];
@@ -434,4 +434,38 @@ test('partial updates retain committed rows and do bounded rendering work with l
  assert.match(body.textContent,/partial 39/);
  assert.match(h.ctx.livePayload().text,/line0\n/,'copy still includes offscreen history');
  assert.doesNotMatch(h.ctx.livePayload().text,/partial 39/);
+});
+
+
+test('new finals and first partial cannot evict speech while reading live history',()=>{
+ const h=harness();start(h);h.nodes.get('detail').scrollTop=900;
+ h.ctx.appendDeltas(Array.from({length:220},(_,i)=>d(i,i*1000,'line'+i)));
+ const body=h.document.getElementById('segments'),anchor=body.children[0];
+ h.nodes.get('detail').scrollTop=20;
+ h.ctx.appendDeltas([{...d(-1,220000,'new partial'),is_final:false}]);
+ assert.equal(body.children[0],anchor,'adding a partial cannot trim the row under the reader');
+ for(let i=220;i<240;i++)h.ctx.appendDeltas([d(i,i*1000,'line'+i)]);
+ assert.equal(body.children[0],anchor,'incoming finals cannot advance the visible history window');
+ assert.equal(h.nodes.get('detail').scrollTop,20);
+ assert.ok(body.children.length<=200);
+ assert.match(h.ctx.livePayload().text,/line239/,'copy includes new finals outside the frozen viewport');
+ const latest=h.document.getElementById('live-latest');assert.ok(latest);assert.equal(latest.hidden,false);
+ latest.listeners.click();
+ assert.match(body.textContent,/line239/);assert.notEqual(body.children[0],anchor,'resuming follow advances the bounded window');
+ assert.equal(h.nodes.get('detail').scrollTop,h.nodes.get('detail').scrollHeight);
+ assert.ok(body.children.length<=200);assert.equal(latest.hidden,true);
+});
+
+
+test('scrolling back to the bottom resumes finals, and navigation cannot reuse a paused window',()=>{
+ const h=harness();start(h);h.nodes.get('detail').scrollTop=900;
+ h.ctx.appendDeltas(Array.from({length:205},(_,i)=>d(i,i*1000,'row'+i)));
+ h.nodes.get('detail').scrollTop=20;h.ctx.appendDeltas([d(205,205000,'newest final')]);
+ const paused=h.document.getElementById('segments');assert.doesNotMatch(paused.textContent,/newest final/);
+ h.nodes.get('detail').scrollTop=900;h.nodes.get('detail').onscroll();
+ assert.match(paused.textContent,/newest final/);
+ h.nodes.get('detail').scrollTop=20;h.ctx.appendDeltas([d(206,206000,'after pause')]);
+ h.old();h.ctx.appendDeltas([d(207,207000,'while away')]);h.ctx.showLive();
+ assert.match(h.document.getElementById('segments').textContent,/while away/);
+ assert.notEqual(h.document.getElementById('segments'),paused);
 });
