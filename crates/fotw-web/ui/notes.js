@@ -101,6 +101,7 @@
       this.id=id; this.api=api; this.notify=notify;this.options=options;this.savedMeetingId=null;
       this.body=''; this.anchors=[]; this.revision=0; this.dirty=false;
       this.status='loading'; this.version=0; this.pending=null; this.loaded=false;
+      this.composing=false;this.view=null;this.captureElapsed=null;
     }
     path() { return '/api/'+(this.options.session?'sessions':'meetings')+'/'+encodeURIComponent(this.id)+'/notes'; }
     document(response) {
@@ -109,7 +110,8 @@
       if(this.savedMeetingId && Number.isFinite(response.elapsed_ms)) {
         // A final status may arrive after typing. Preserve the text, but do not
         // pretend blocks typed beyond capture's end were spoken during it.
-        const bounded=this.anchors.filter(a=>a.typed_at_ms<=response.elapsed_ms);
+        this.captureElapsed=response.elapsed_ms;
+        const bounded=this.anchors.filter(a=>a.typed_at_ms<=this.captureElapsed);
         if(bounded.length!==this.anchors.length) {this.anchors=bounded;this.version++;this.dirty=true;}
       }
       if(this.savedMeetingId)linkSession(this.id,this.savedMeetingId);
@@ -117,22 +119,31 @@
     }
     changed() { this.notify(this); }
     async load() {
-      if (this.dirty) return;
+      if (this.dirty || this.composing) return;
+      const version=this.version, previousStatus=this.status;
       this.status='loading';this.changed();
       try {
         const d=this.document(await this.api(this.path()));
+        if(this.version!==version || this.dirty || this.composing) {
+          if(this.status==='loading')this.status=this.dirty?'unsaved':previousStatus;
+          this.changed();return;
+        }
         this.body=d.body_md;this.revision=d.revision;this.anchors=d.anchors;
         this.loaded=true;this.status='saved';
       } catch (_) { this.status='error'; }
       this.changed();
     }
-    edit(body, selection) {
+    edit(body, selection, checkpoint) {
       if (!this.loaded || body===this.body) return;
       // Track unanchored old blocks too: loading/editing old text must never
       // manufacture its first-keystroke time. Only genuinely new blocks anchor.
-      const tracked=blocks(this.body).map((block,index)=>this.anchors.find(a=>a.block_idx===index)
+      const before=checkpoint?.body ?? this.body;
+      const sourceAnchors=checkpoint?.anchors ?? this.anchors;
+      // A final clock learned during composition also bounds its older checkpoint.
+      const anchors=Number.isFinite(this.captureElapsed)?sourceAnchors.filter(a=>a.typed_at_ms<=this.captureElapsed):sourceAnchors;
+      const tracked=blocks(before).map((block,index)=>anchors.find(a=>a.block_idx===index)
         || {id:null,block_idx:index,block_text:block.text,typed_at_ms:null});
-      const mapped=remapAnchors(this.body,body,tracked,selection);
+      const mapped=remapAnchors(before,body,tracked,before===this.body?selection:null);
       this.anchors=mapped.filter(a=>a.id!==null);
       const offset=this.options.session && !this.savedMeetingId ? this.options.clock?.() : null;
       if(Number.isFinite(offset) && offset>=0) {
@@ -162,14 +173,21 @@
       if(this.status!=='conflict')this.status='unsaved';
       this.changed();return true;
     }
-    async flush() {
-      if (this.pending) return this.pending;
-      if (!this.dirty || this.status==='conflict' || !this.loaded) return;
+    async flush(force=false) {
+      if(force)this.view?.prepare();
+      if (this.pending) {
+        await this.pending;
+        // A composition can commit after saveLoop exits but before its owner
+        // clears pending. Drain that committed edit, never a failed/conflicted save.
+        if(this.dirty && !this.composing && this.status==='unsaved')return this.flush();
+        return;
+      }
+      if (this.composing || !this.dirty || this.status==='conflict' || !this.loaded) return;
       this.pending=this.saveLoop();
       try { await this.pending; } finally { this.pending=null;this.changed(); }
     }
     async saveLoop() {
-      while (this.dirty) {
+      while (this.dirty && !this.composing) {
         const version=this.version;
         const payload={revision:this.revision,body_md:this.body,anchors:this.anchors};
         this.status='saving';this.changed();
@@ -224,7 +242,13 @@
     const draft=drafts.get('session:'+sessionId);
     if(draft)await draft.retrySave();
   }
-  function flushAll() { return Promise.all([...new Set(drafts.values())].map(d=>d.flush())); }
+  function flushAll() { return Promise.all([...new Set(drafts.values())].map(d=>d.flush(true))); }
+  function release(parent) {
+    return Promise.all([...new Set(drafts.values())].map(d=>{
+      const view=d.view;
+      if(view && (view.parent===parent || parent.contains?.(view.section)))return view.release();
+    }));
+  }
   function mount(id, parent, api, options = {}) {
     const make=(tag,text)=>{const n=document.createElement(tag);if(text)n.textContent=text;return n;};
     const section=make('section');section.className='notes note-editor';
@@ -244,36 +268,81 @@
     const key=(options.session?'session:':'meeting:')+id;
     let draft=drafts.get(key);
     if(!draft){draft=new Draft(id,api,()=>{},options);drafts.set(key,draft);}
+    if(draft.view)draft.view.release();
+    let composing=false, checkpoint=null;const view={parent,section};draft.view=view;
+    const active=()=>draft.view===view && section.isConnected!==false;
     let delay=null, maximum=null;
     const cancelTimers=()=>{clearTimeout(delay);clearTimeout(maximum);delay=maximum=null;};
     const flush=()=>{cancelTimers();return draft.flush();};
+    const schedule=()=>{clearTimeout(delay);delay=setTimeout(flush,500);if(maximum===null)maximum=setTimeout(flush,5000);};
     const selectedBlock=()=>blocks(draft.body).findIndex(b=>input.selectionStart>=b.start && input.selectionStart<=b.end);
     const updateMovement=()=>{
       const index=selectedBlock(), count=blocks(draft.body).length;
-      up.disabled=!draft.loaded || index<=0;
-      down.disabled=!draft.loaded || index<0 || index>=count-1;
+      up.disabled=composing || !draft.loaded || index<=0;
+      down.disabled=composing || !draft.loaded || index<0 || index>=count-1;
     };
     const labels={loading:'Loading notes…',saved:'Saved',unsaved:'Unsaved changes',saving:'Saving…',error:'Could not save or load notes. Your unsaved draft is kept in this tab.',conflict:'Another tab changed these notes. Your draft is kept; choose which version to use.'};
     draft.notify=()=>{
-      if(input.value!==draft.body)input.value=draft.body;
+      if(!active())return;
+      if(!composing && input.value!==draft.body)input.value=draft.body;
       input.disabled=!draft.loaded;
-      status.textContent=labels[draft.status];
-      retry.disabled=draft.status==='saving'||draft.status==='loading'||draft.status==='conflict';
-      overwrite.hidden=draft.status!=='conflict';
+      status.textContent=composing?'Composing… Your draft is kept in this tab until committed. '+(draft.status==='conflict'?labels.conflict:''):labels[draft.status];
+      retry.disabled=composing||draft.status==='saving'||draft.status==='loading'||draft.status==='conflict';
+      overwrite.hidden=draft.status!=='conflict';overwrite.disabled=composing;
       reload.hidden=!draft.dirty;
-      reload.disabled=!!draft.pending;
+      reload.disabled=composing||!!draft.pending;
       updateMovement();
     };
     let selection=null;
-    input.addEventListener('beforeinput',()=>{
+    const beginComposition=()=>{
+      composing=draft.composing=true;checkpoint={body:draft.body,anchors:draft.anchors};
+      cancelTimers();draft.changed();
+    };
+    input.addEventListener('beforeinput',event=>{
+      if(!active())return;
+      if(event?.isComposing && !composing)beginComposition();
       selection={start:input.selectionStart,end:input.selectionEnd};
     });
-    input.addEventListener('input',()=>{
-      draft.edit(input.value,selection);selection=null;clearTimeout(delay);delay=setTimeout(flush,500);
-      if(maximum===null)maximum=setTimeout(flush,5000);
+    const editVisible=()=>{
+      draft.edit(input.value,selection,composing?checkpoint:undefined);selection=null;
+      // IMEs can temporarily remove the marked range before inserting a commit.
+      // Retain the last complete block mapping through that deletion, including
+      // old unanchored blocks. Grow the checkpoint when new blocks appear.
+      if(composing && (!checkpoint || (blocks(draft.body).length>=blocks(checkpoint.body).length
+          && checkpoint.anchors.every(a=>draft.anchors.some(b=>b.id===a.id))))) {
+        checkpoint={body:draft.body,anchors:draft.anchors};
+      }
+    };
+    view.prepare=()=>{
+      if(draft.view!==view)return;
+      draft.composing=false;
+      if(section.isConnected!==false)editVisible();
+      selection=null;cancelTimers();
+    };
+    view.release=()=>{
+      if(draft.view!==view)return;
+      view.prepare();composing=false;checkpoint=null;draft.view=null;draft.notify=()=>{};
+      return draft.flush();
+    };
+    input.addEventListener('compositionstart',()=>{
+      if(!active())return;
+      beginComposition();
+    });
+    input.addEventListener('input',event=>{
+      if(!active())return;
+      if(event?.isComposing && !composing)beginComposition();
+      editVisible();
+      if(composing){cancelTimers();return;}
+      schedule();
+    });
+    input.addEventListener('compositionend',()=>{
+      if(!active())return;
+      editVisible();composing=draft.composing=false;checkpoint=null;
+      draft.changed();flush();
     });
     for(const event of ['select','click','keyup'])input.addEventListener(event,updateMovement);
     const move=direction=>{
+      if(!active() || composing)return;
       const index=selectedBlock();
       if(draft.moveBlock(index,direction)) {
         const block=blocks(draft.body)[index+direction];
@@ -283,10 +352,10 @@
     };
     up.addEventListener('click',()=>move(-1));
     down.addEventListener('click',()=>move(1));
-    input.addEventListener('blur',flush);
-    retry.addEventListener('click',()=>{cancelTimers();return draft.loaded?draft.retrySave():draft.load();});
-    overwrite.addEventListener('click',()=>draft.overwrite());
-    reload.addEventListener('click',()=>{cancelTimers();draft.discard();});
+    input.addEventListener('blur',()=>{if(active()){cancelTimers();return draft.flush(true);}});
+    retry.addEventListener('click',()=>{if(!active()||composing)return;cancelTimers();return draft.loaded?draft.retrySave():draft.load();});
+    overwrite.addEventListener('click',()=>{if(active()&&!composing)return draft.overwrite();});
+    reload.addEventListener('click',()=>{if(!active()||composing)return;cancelTimers();draft.discard();});
     draft.notify();
     if(!draft.loaded)draft.load();
     return draft;
@@ -365,10 +434,10 @@
     md.addEventListener('click',()=>download('md'));json.addEventListener('click',()=>download('json'));
     retry.addEventListener('click',load);load();return {load};
   }
-  root.FOTWNotes={Draft,RecordingClock,mount,flushAll,linkSession,finishSession,mountRecovery,mountRecovered,blocks,remapAnchors};
+  root.FOTWNotes={Draft,RecordingClock,mount,flushAll,release,linkSession,finishSession,mountRecovery,mountRecovered,blocks,remapAnchors};
   if(typeof window!=='undefined' && window.addEventListener) {
     window.addEventListener('beforeunload',e=>{
-      if([...drafts.values()].some(d=>d.dirty)) { e.preventDefault();e.returnValue=''; }
+      if([...drafts.values()].some(d=>d.dirty||d.pending||d.composing)) { e.preventDefault();e.returnValue=''; }
     });
   }
   if (typeof module !== 'undefined') module.exports=root.FOTWNotes;

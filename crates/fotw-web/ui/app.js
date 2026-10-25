@@ -129,6 +129,7 @@ function text(tag, value, className) {
 }
 
 function clear(node) {
+  if (typeof FOTWNotes !== "undefined") FOTWNotes.release?.(node);
   while (node.firstChild) node.removeChild(node.firstChild);
 }
 
