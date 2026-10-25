@@ -1,6 +1,7 @@
 //! The connection, and the bootstrap sequence that is the only way to get one.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use rusqlite::Connection;
 
@@ -56,7 +57,7 @@ impl Db {
                 .map_err(|e| StoreError::io("creating the data root", parent, e))?;
         }
 
-        let conn = Connection::open(&path)?;
+        let conn = open_connection(|| Connection::open(&path))?;
         let mut db = Self::finish_open(conn, Some(path), Some(key))?;
         migrations::migrate(&mut db.conn, db.path.as_deref(), Some(key))?;
         Ok(db)
@@ -67,7 +68,7 @@ impl Db {
     /// For tests and for the schema-lint pass. There is no backup step because
     /// there is no file to back up.
     pub fn open_in_memory(key: &DbKey) -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
+        let conn = open_connection(Connection::open_in_memory)?;
         let mut db = Self::finish_open(conn, None, Some(key))?;
         migrations::migrate(&mut db.conn, None, Some(key))?;
         Ok(db)
@@ -84,7 +85,7 @@ impl Db {
     #[cfg(test)]
     pub(crate) fn open_plaintext(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let conn = Connection::open(&path)?;
+        let conn = open_connection(|| Connection::open(&path))?;
         let mut db = Self::finish_open(conn, Some(path), None)?;
         migrations::migrate(&mut db.conn, db.path.as_deref(), None)?;
         Ok(db)
@@ -117,6 +118,19 @@ impl Db {
         bootstrap(&conn, key)?;
         Ok(Self { conn, path })
     }
+}
+
+// SQLite marks its base initialization complete before calling SQLCipher's
+// SQLITE_EXTRA_INIT hook. A second first-open can therefore reach PRAGMA key
+// while SQLCipher is still initializing. Serialize connection construction at
+// our database boundary; the guard ends before keying, migrations or any use.
+// Internal migration/backup connections exist only after this boundary succeeds.
+fn open_connection(open: impl FnOnce() -> rusqlite::Result<Connection>) -> Result<Connection> {
+    static OPEN: Mutex<()> = Mutex::new(());
+    let _guard = OPEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(open()?)
 }
 
 /// Set `PRAGMA key` (and the page size it pairs with) on a freshly opened
