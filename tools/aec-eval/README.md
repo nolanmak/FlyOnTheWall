@@ -198,3 +198,86 @@ probe observations, not isolated backend memory or app/transcription-model
 resource estimates. Synthetic signals cannot establish word retention or
 real-room quality. LocalVQE/model provisioning, approved speech comparisons,
 drift/route qualification and physical trials remain open under #72/#118/#124.
+
+## Opt-in public speech retention probe
+
+On macOS, `speech-retention` adds the existing maintained `fotw-stt`
+WhisperEngine. It never fetches weights or audio. Supply the already provisioned
+public whisper.cpp JFK WAV and small.en weights explicitly:
+
+```sh
+cargo build --release --manifest-path tools/aec-eval/Cargo.toml --locked --features speech-retention,native-webrtc
+/usr/bin/time -l tools/aec-eval/target/release/fotw-aec-eval --speech-retention /path/to/approved-jfk.wav /path/to/ggml-small.en.bin
+```
+
+The probe checks exact file lengths and SHA-256 identities before audio decode
+or model construction. The accepted WAV is 352,078 bytes, SHA-256
+`59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e`;
+the accepted model is 487,614,201 bytes, SHA-256
+`c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d`.
+Model hashing uses a bounded read buffer. Nothing writes to either input file.
+The speech feature uses the same whisper-rs 0.16.0 / whisper.cpp 1.8.3 bindings
+as the app. Their complete license texts are retained in the repository's
+[third-party notices](../../THIRD_PARTY_NOTICES.md#whispercpp-and-ggml); include
+those notices along with this tool's native notices if distributing this build.
+
+The 11-second public-domain JFK excerpt is the near voice; independent seeded
+generated audio is the far-end reference through the existing simulated linear
+room. This is not a two-human-speaker or real-room corpus. Eight seconds of
+far-only adaptation precede the speech. A one-second postroll lets each measured
+fixed-delay control expose the entire original speech window; near-only sample
+error and the exact 176,000-sample crop are checked before inference. This
+window check does not qualify arbitrary callback tails or route resets.
+
+Echo power is calibrated over the speech window to equal near-speech RMS and
+to exceed it by 6 dB. One common gain applies to clean speech, references and all
+mixtures, with input peak checks; there is no clipping or per-backend output
+normalization. The model is loaded once and cases decode serially with separate
+recognizer states. Actual app endpointing, streaming, diarization and insertion
+are outside this probe.
+
+Results include recognized public text, reference-word count, matches,
+substitutions, deletions, insertions, word error rate and aligned reference-word
+recall. Normalization splits on non-alphanumeric characters and lowercases;
+equal-cost alignments prefer diagonal, deletion, then insertion. Insertions
+count toward WER, which may exceed 100%; muted output cannot score as retained
+speech. An actual muted-input control must not recognize more than a quarter of
+the reference words. No prompt or preceding transcript is given to Whisper.
+
+CI compiles/tests this optional path and the word metric without obtaining any
+weights or speech assets. Native inference is an explicit local measurement.
+The existing synthetic overlap gates remain unchanged: a good result on this
+single public sentence cannot override a failed gate, select an app backend or
+establish quality across accents, names, noise and physical devices.
+
+### M4 public speech observation
+
+[Recorded results](results/m4-public-speech.json) contain 13 serial cases using
+the approved small.en model on an Apple M4. All near-only controls recognized
+the 22 reference words without errors. Delay-aligned near-only samples differed
+by less than `8e-8`; the full speech window remained present.
+
+| Control | Equal echo/near power WER | Echo 6 dB above near WER |
+| --- | ---: | ---: |
+| Passthrough | 0.00% | 68.18% |
+| Existing gate, 100 ms cadence | 95.45% | 331.82% |
+| Sonora 0.2.0, adapted | 0.00% | 59.09% |
+| Native WebRTC 2.1.0, fixed-frame control | 0.00% | 63.64% |
+
+The gate's strong-echo output included a repetition hallucination: insertions
+make WER exceed 100%, not a claim that more than all source words were deleted.
+The actual muted-input control recognized only "you": WER 95.45%, one matched
+word out of 22. That coincidental match is not evidence of retained speech.
+
+Both AEC paths retained the sentence at equal power, where passthrough also
+worked. All paths performed poorly in the stronger-echo case. These results
+support the overlap concern but do not establish a generally useful AEC backend
+or a production error rate for the gate. The signal-level overlap failures from
+the earlier comparisons still stand; neither candidate is selected for the app.
+
+The final already-built process used 779,190,272 bytes maximum RSS, 2.96 seconds
+user CPU, 0.40 seconds system CPU and 7.69 seconds elapsed across all cases,
+model hashing/loading and metrics. Recorded model load was 175.84 ms; file,
+GPU and compiler-cache state was uncontrolled, so this is not a cold-load or
+cold/warm acceptance measurement. These are whole-probe resources, including
+the shared Whisper context, not isolated model/backend or concurrent-app memory.

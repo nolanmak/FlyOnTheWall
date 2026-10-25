@@ -1,4 +1,8 @@
-//! Deterministic signal-level AEC comparison. No capture, network, models or user audio.
+//! AEC comparison with generated signals or opt-in approved public speech.
+#[cfg(all(target_os = "macos", feature = "speech-retention"))]
+mod speech;
+#[cfg(any(all(target_os = "macos", feature = "speech-retention"), test))]
+mod word_error;
 use fotw_pipeline::aec::{Adapter, Backend, Config as AdapterConfig, OutputKind};
 use fotw_pipeline::echo::{EchoGate, GateVerdict};
 use sonora::{AudioProcessing, Config, StreamConfig, config::EchoCanceller};
@@ -256,20 +260,33 @@ fn metrics(near: &[f32], echo: &[f32], output: &[f32], lag: usize) -> serde_json
     })
 }
 
-fn main() {
-    let far = signal(127);
-    let near = signal(915);
-    let echo = room(&far);
-    let zero = vec![0.0; SAMPLES];
-    let hardware = if cfg!(target_os = "macos") {
+fn hardware() -> Option<String> {
+    if cfg!(target_os = "macos") {
         std::process::Command::new("sysctl")
             .args(["-n", "machdep.cpu.brand_string"])
             .output()
             .ok()
+            .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
     } else {
         None
-    };
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if !args.is_empty() {
+        #[cfg(all(target_os = "macos", feature = "speech-retention"))]
+        if args[0] == "--speech-retention" {
+            return speech::run(&args[1..]);
+        }
+        return Err("use no arguments for generated signals, or --speech-retention WAV MODEL with the speech-retention feature on macOS".into());
+    }
+    let far = signal(127);
+    let near = signal(915);
+    let echo = room(&far);
+    let zero = vec![0.0; SAMPLES];
+    let hardware = hardware();
     let mut results = Vec::new();
     let backends = [
         "passthrough",
@@ -306,6 +323,7 @@ fn main() {
         "native_webrtc_evaluated":cfg!(feature = "native-webrtc"),
         "undrained_controls_present":true,"callback_adapter_evaluated":true,"results":results})
     );
+    Ok(())
 }
 
 #[cfg(test)]
