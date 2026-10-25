@@ -225,15 +225,21 @@ row_type!(
 );
 
 row_type!(
-    /// Durable session-to-meeting note alias and frozen recording clock.
+    /// Durable session alias with an observed or final recording clock.
     SessionNoteLinkRow, "session_note_links",
     pk = ["session_id"], exclusive = ["meeting_id"], {
         session_id: String,
         meeting_id: String,
         started_at_ms: i64,
         elapsed_ms: i64,
+        #[serde(default = "final_clock_default")]
+        clock_is_final: i64,
     }
 );
+
+fn final_clock_default() -> i64 {
+    1
+}
 
 row_type!(
     /// Immutable source/provider provenance for a durable speech transcript.
@@ -966,10 +972,10 @@ impl MeetingDoc {
             yaml_scalar(&iso_date(m.started_at_ms))
         ));
         out.push_str(&format!("started_at_ms: {}\n", m.started_at_ms));
-        out.push_str(&format!(
-            "duration: {}\n",
-            yaml_scalar(&hms(m.duration_ms.unwrap_or(0)))
-        ));
+        match m.duration_ms {
+            Some(duration) => out.push_str(&format!("duration: {}\n", yaml_scalar(&hms(duration)))),
+            None => out.push_str("duration: null\n"),
+        }
         out.push_str(&format!("timezone: {}\n", yaml_scalar(&m.tz)));
         out.push_str("attendees:\n");
         for p in &self.participants {

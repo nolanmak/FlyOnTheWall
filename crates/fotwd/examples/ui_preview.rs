@@ -4,6 +4,7 @@
 //!     cargo run -p fotwd --example ui_preview -- --live-notes
 //!     cargo run -p fotwd --example ui_preview -- --speech-history
 //!     cargo run -p fotwd --example ui_preview -- --saved-speech-recovery
+//!     cargo run -p fotwd --example ui_preview -- --interrupted-capture
 //!
 //! Every other way into the library goes through audio capture — a TCC grant,
 //! a signed build, and an actual meeting to record — so the web UI was
@@ -245,6 +246,28 @@ async fn main() -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
+    if std::env::args().any(|arg| arg == "--interrupted-capture") {
+        let mut wal = fotw_pipeline::wal::SessionWal::create(root.join("sessions"), 16000, 1)
+            .map_err(|e| e.to_string())?;
+        wal.write_system(&vec![0.1; 16000])
+            .map_err(|e| e.to_string())?;
+        wal.checkpoint_capture(1200, false)
+            .map_err(|e| e.to_string())?;
+        db.save_session_note(
+            &fotw_store::SessionNoteDocument {
+                session_id: wal.manifest().id.clone(),
+                started_at_ms: wal.manifest().started_at_ms as i64,
+                note: fotw_store::NoteDocument {
+                    revision: 0,
+                    body_md: "Synthetic note preserved after interruption".into(),
+                    anchors: vec![],
+                },
+            },
+            1200,
+        )
+        .map_err(|e| e.to_string())?;
+        drop(wal);
+    }
     // The real server, the real ingress policy, the real embedded assets.
     let source = Arc::new(fotw_web::StoreSource::new(db));
     if std::env::args().any(|arg| arg == "--live-notes")
@@ -296,6 +319,24 @@ async fn main() -> Result<(), String> {
             std::sync::atomic::AtomicU8::new(0),
         )));
     }
+    let _interrupted_pass = if std::env::args().any(|arg| arg == "--interrupted-capture") {
+        if std::env::args().any(|arg| arg == "--saved-speech-recovery") {
+            return Err("Choose one saved-recovery preview mode".into());
+        }
+        let db = Db::open(root.join("db.sqlite3"), &DbKey::from_bytes(PREVIEW_KEY))
+            .map_err(|e| e.to_string())?;
+        fotwd::speech_recovery::SavedSpeechRecovery::with_parts(
+            db,
+            root.clone(),
+            Arc::new(|_, _| Err("No model capability in this raw-only preview".into())),
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(2),
+        )
+        .install(&state)
+        .map_err(|e| e.to_string())?
+    } else {
+        None
+    };
     if let Some(recorder) = fixture_recorder {
         recorder.attach_hub(state.hub().clone());
     }

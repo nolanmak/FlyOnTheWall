@@ -456,6 +456,42 @@ fn a_library_survives_export_and_import_into_a_fresh_one() {
 }
 
 #[test]
+fn an_interrupted_unknown_clock_survives_a_library_archive_without_becoming_a_frozen_end() {
+    let (f, mut source) = fixture();
+    let id = source
+        .retain_interrupted_capture(
+            "interrupted-fixture",
+            fotw_store::NewMeeting::new("fixture-device", "UTC").started_at_ms(1000),
+            2000,
+            &[],
+        )
+        .unwrap();
+    source
+        .export_library(&f.archive, &ArchiveOptions::default(), &mut |_| {})
+        .unwrap();
+    let mut dest = open_at(&f.fresh.join("db.sqlite3"));
+    dest.import_library(&f.archive).unwrap();
+    assert_eq!(
+        dest.session_note_meeting("interrupted-fixture").unwrap(),
+        Some(id.clone())
+    );
+    assert_eq!(
+        dest.session_note_clock("interrupted-fixture").unwrap(),
+        None
+    );
+    let meeting = dest.meetings().get(&id).unwrap();
+    assert_eq!(meeting.ended_at_ms, None);
+    assert_eq!(meeting.duration_ms, None);
+    assert_eq!(meeting.state, "interrupted");
+    let markdown = dest.export_meeting(&id).unwrap().to_markdown();
+    assert!(
+        markdown.contains("duration: null\n"),
+        "unknown duration must not become a zero-length meeting: {markdown}"
+    );
+    assert_same_library(&source, &dest);
+}
+
+#[test]
 fn importing_the_same_archive_twice_changes_nothing() {
     // "Idempotent on conflict" (issue #37). The second run must not duplicate
     // rows, must not fail, and must not report a conflict for a row that is

@@ -131,7 +131,7 @@ pub struct MeetingRow {
     pub started_at_ms: i64,
     /// Wall-clock length, once the meeting has ended.
     pub duration_ms: Option<i64>,
-    /// `recording`, `transcribing` or `ready`.
+    /// `recording`, `transcribing`, `ready`, `failed` or `interrupted`.
     pub state: String,
 }
 

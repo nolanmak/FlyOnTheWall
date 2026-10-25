@@ -2,8 +2,9 @@
 //!
 //! Raw PCM has no persisted reconstruction map for the live filter's state and
 //! route boundaries. It is validation evidence, never replacement STT input.
-//! Unknown clocks, extra raw tails, missing canonical input and live ownership
-//! retain all files for the separate raw-prefix recovery path.
+//! Unknown clocks and extra raw tails can be indexed as interrupted with no
+//! final duration; their files remain unchanged for later reconciliation.
+//! Missing canonical identities and live ownership still refuse admission.
 use crate::failover::coverage::CoverageJournal;
 use fotw_pipeline::{
     capture_clock::{CaptureOwner, CaptureSnapshot},
@@ -20,12 +21,63 @@ pub(crate) struct StoppedCapture {
     pub dir: PathBuf,
     pub session: String,
     pub started: u64,
-    pub ended: u64,
+    pub ended: Option<u64>,
+    pub observed_elapsed: u64,
     // Hold every lease until the database projection has returned.
     _audio: Vec<ReplayWriter>,
     _journals: Vec<CoverageJournal>,
+    _retained: Vec<RetainedLease>,
     // Struct fields drop in order: release the outer lease last.
     _capture: CaptureOwner,
+}
+struct RetainedLease(std::fs::File);
+impl Drop for RetainedLease {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+// Indexing must not repair/truncate a replay or journal. Acquire their same
+// sidecar leases and validate read-only while retaining the outer capture lease.
+fn retained_sources(dir: &Path, session: &str) -> io::Result<Vec<RetainedLease>> {
+    let mut leases = Vec::new();
+    for (name, source, replay) in [
+        ("system", Source::System, ReplaySource::System),
+        ("mic", Source::Mic, ReplaySource::Mic),
+    ] {
+        for suffix in [
+            "stt16",
+            "stt-coverage.jsonl",
+            "stt-sealed.json",
+            "stt-complete.json",
+            "stt-projected.json",
+        ] {
+            optional_ordinary(&dir.join(format!("{name}.{suffix}")))?;
+        }
+        for suffix in ["stt16.lock", "stt-coverage.jsonl.lock"] {
+            let path = dir.join(format!("{name}.{suffix}"));
+            optional_ordinary(&path)?;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)?;
+            file.try_lock().map_err(io::Error::from)?;
+            leases.push(RetainedLease(file));
+        }
+        if present(&dir.join(format!("{name}.stt16")))? {
+            let reader = ReplayReader::open(dir, session, replay)?;
+            // The complete prefix can validate committed receipts even when
+            // the last write left half a sample. Indexing never repairs it or
+            // claims a final replay boundary.
+            reader.sealed_end()?;
+        }
+        if present(&dir.join(format!("{name}.stt-coverage.jsonl")))? {
+            CoverageJournal::snapshot(dir, session, source)?;
+        }
+    }
+    Ok(leases)
 }
 struct Boundary {
     source: Source,
@@ -152,7 +204,21 @@ fn boundaries(dir: &Path, proof: &CaptureSnapshot) -> io::Result<Vec<Boundary>> 
 pub(crate) fn prepare(dir: &Path, stop: &AtomicBool) -> io::Result<Option<StoppedCapture>> {
     let (owner, proof) = snapshot(dir)?;
     let Some((started, ended)) = proof.frozen_capture_clock() else {
-        return Err(invalid("interrupted capture has no proven end"));
+        let retained = retained_sources(dir, &proof.checkpoint.session_id)?;
+        if stop.load(Ordering::Acquire) {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        return Ok(Some(StoppedCapture {
+            dir: dir.to_owned(),
+            session: proof.checkpoint.session_id,
+            started: proof.checkpoint.started_at_ms,
+            ended: None,
+            observed_elapsed: proof.checkpoint.elapsed_ms,
+            _audio: vec![],
+            _journals: vec![],
+            _retained: retained,
+            _capture: owner,
+        }));
     };
     let bounds = boundaries(dir, &proof)?;
     if bounds.is_empty() {
@@ -183,10 +249,12 @@ pub(crate) fn prepare(dir: &Path, stop: &AtomicBool) -> io::Result<Option<Stoppe
         dir: dir.to_owned(),
         session: proof.checkpoint.session_id,
         started,
-        ended,
+        ended: Some(ended),
+        observed_elapsed: proof.checkpoint.elapsed_ms,
         _capture: owner,
         _audio: audio,
         _journals: journals,
+        _retained: vec![],
     }))
 }
 

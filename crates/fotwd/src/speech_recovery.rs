@@ -259,18 +259,28 @@ impl SavedSpeechRecovery {
                     let outcome = crate::session::SessionOutcome {
                         dir: capture.dir.clone(),
                         started_at_ms: capture.started,
-                        capture_ended_at_ms: Some(capture.ended),
+                        capture_ended_at_ms: capture.ended,
                         ..Default::default()
                     };
                     let newly_indexed = self
                         .db()
                         .session_note_meeting(&capture.session)
                         .is_ok_and(|id| id.is_none());
-                    match crate::persist::persist_session(
-                        &mut self.db(),
-                        &outcome,
-                        "Recovered recording",
-                    ) {
+                    let projected = if capture.ended.is_some() {
+                        crate::persist::persist_session(
+                            &mut self.db(),
+                            &outcome,
+                            "Recovered recording",
+                        )
+                    } else {
+                        crate::persist::persist_interrupted(
+                            &mut self.db(),
+                            &capture.dir,
+                            capture.started,
+                            capture.observed_elapsed,
+                        )
+                    };
+                    match projected {
                         Ok(id) if newly_indexed => {
                             if let Some(hub) = &self.hub {
                                 // Refresh the library without registering old sessions
@@ -358,18 +368,19 @@ impl SavedSpeechRecovery {
         held_capture: Option<&fotw_pipeline::capture_clock::CaptureOwner>,
     ) -> Result<SavedCapture, RecoveryError> {
         // Release SQL ownership before any filesystem or native work.
-        let (session, started, elapsed, model_path) = {
+        let (session, started, elapsed, clock_is_final, model_path) = {
             let mut db = self.db();
             db.meetings()
                 .get(meeting)
                 .map_err(|_| RecoveryError::NotFound)?;
-            let mut query = db.conn().prepare("SELECT session_id,started_at_ms,elapsed_ms FROM session_note_links WHERE meeting_id=?1 LIMIT 2").map_err(|_| RecoveryError::Invalid)?;
+            let mut query = db.conn().prepare("SELECT session_id,started_at_ms,elapsed_ms,clock_is_final FROM session_note_links WHERE meeting_id=?1 LIMIT 2").map_err(|_| RecoveryError::Invalid)?;
             let rows = query
                 .query_map([meeting], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, i64>(1)?,
                         r.get::<_, i64>(2)?,
+                        r.get::<_, bool>(3)?,
                     ))
                 })
                 .map_err(|_| RecoveryError::Invalid)?
@@ -378,12 +389,12 @@ impl SavedSpeechRecovery {
             if rows.len() != 1 {
                 return Err(RecoveryError::NotFound);
             }
-            let (session, start, elapsed) = rows.into_iter().next().unwrap();
+            let (session, start, elapsed, clock_is_final) = rows.into_iter().next().unwrap();
             let candidate = crate::stt::SttSettings::read(&db)
                 .ok()
                 .map(|s| s.model_path(&self.data_root))
                 .unwrap_or_default();
-            (session, start, elapsed, candidate)
+            (session, start, elapsed, clock_is_final, candidate)
         };
         if started < 0
             || elapsed < 0
@@ -410,6 +421,12 @@ impl SavedSpeechRecovery {
             fotw_pipeline::wal::SessionState::read(&dir).map_err(|_| RecoveryError::Invalid)?;
         if wal.manifest.id != session || wal.manifest.started_at_ms != started as u64 {
             return Err(RecoveryError::Invalid);
+        }
+        if !clock_is_final {
+            return Ok(SavedCapture { dir, session, model_path, sources: vec![], capture_owner: None,
+                status: RecoveryStatus { phase: RecoveryPhase::Retained, sources: vec![],
+                    worker_running: false, can_retry: false,
+                    message: Some("Recording interrupted. The final recording time is unknown. Your audio and notes are retained, along with any saved transcript. Transcription cannot resume automatically.".into()) } });
         }
         // An unfinished WAL must prove the original Stop. Saved finalized clocks
         // remain authoritative, with modern capture ownership retained through
@@ -527,6 +544,12 @@ impl SavedSpeechRecovery {
         if meeting.is_empty() || meeting.len() > 128 {
             return Err(RecoveryError::NotFound);
         }
+        let retained: bool = self.db().conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_note_links WHERE meeting_id=?1 AND clock_is_final=0)",
+            [meeting], |r| r.get(0)).map_err(|_| RecoveryError::Invalid)?;
+        if retained {
+            return Err(RecoveryError::Invalid);
+        }
         {
             let mut state = self.state();
             if automatic {
@@ -563,6 +586,9 @@ impl SavedSpeechRecovery {
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let mut capture = owned.load(&id)?;
+                    if capture.status.phase == RecoveryPhase::Retained {
+                        return Err(RecoveryError::Invalid);
+                    }
                     // Declare this BEFORE the runtime: unwinding drops the
                     // runtime and joins blocking cleanup before releasing it.
                     let capture_owner = capture.capture_owner.take();
