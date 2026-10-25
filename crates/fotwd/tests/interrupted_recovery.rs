@@ -433,6 +433,58 @@ fn invalid_missing_source_evidence_is_refused_before_publication_or_inference() 
 }
 
 #[test]
+fn unknown_end_mapped_input_with_a_torn_last_sample_still_recovers_its_complete_prefix() {
+    let canonical: Vec<i16> = (0u32..48000)
+        .map(|n| {
+            if (n / 3200).is_multiple_of(2) {
+                1000
+            } else {
+                8000
+            }
+        })
+        .collect();
+    let raw = canonical.iter().map(|&s| f32::from(s) / 32767.0).collect();
+    let mut f = fixture_audio(false, canonical, raw, "fixture-local", "fixture-revision");
+    drop(f.wal.take());
+    std::fs::write(f.dir.join("system.stt-raw-plan.json"), serde_json::to_vec(&serde_json::json!({
+        "recipe":"wal-i16-archive-converter-rubato5-v1", "session_id":f.session, "source":"system",
+        "format":{"sample_rate_hz":16000,"channels":1}, "first_sample":137*16
+    })).unwrap()).unwrap();
+    let path = f.dir.join("system.stt16");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.push(0x42);
+    std::fs::write(&path, &bytes).unwrap();
+    let o = owner(&f);
+    startup(&o);
+    let mut db = Db::open(&f.database, &f.key).unwrap();
+    let id = db
+        .session_note_meeting(&f.session)
+        .unwrap()
+        .expect("torn tail must not block complete-prefix recovery");
+    let doc = db.export_meeting(&id).unwrap();
+    assert!(
+        doc.segments
+            .iter()
+            .any(|s| s.text == "original committed words")
+    );
+    assert!(
+        doc.segments
+            .iter()
+            .any(|s| s.text == "recovered after process exit")
+    );
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        bytes,
+        "prefix recovery does not trim retained input"
+    );
+    for suffix in ["sealed", "complete", "projected"] {
+        assert!(!f.dir.join(format!("system.stt-{suffix}.json")).exists());
+    }
+    assert!(db.meetings().get(&id).unwrap().ended_at_ms.is_none());
+}
+
+#[test]
 fn startup_reconstructs_a_mapped_raw_suffix_without_replacing_committed_canonical_audio() {
     for stopped in [true, false] {
         let raw: Vec<f32> = (0u32..48000)

@@ -313,7 +313,10 @@ fn checked_candidate_path(candidate: &mut ReplayReader, stop: &AtomicBool) -> io
 
 fn validate_reconstruction_markers(dir: &Path, candidate: &ReplayReader) -> io::Result<()> {
     let source = candidate.header.source;
-    let end = candidate.saved_end()?;
+    // Retained input can have an incomplete final sample. Proofs describe
+    // complete samples only; fresh candidates are checked for alignment by
+    // validate_candidate before reaching this shared marker check.
+    let end = candidate.complete_prefix_end()?;
     let matches = |b: &Completion, full: bool| {
         b.schema == 1
             && b.session_id == candidate.header.session_id

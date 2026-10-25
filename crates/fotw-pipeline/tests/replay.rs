@@ -28,6 +28,7 @@ fn reconstruction_candidate(dir: &std::path::Path, pcm: &[i16]) -> ReplayReader 
 
 #[test]
 fn missing_source_publication_is_exclusive_cancellable_and_never_replaces_a_new_path() {
+    use std::io::Write;
     use std::sync::atomic::AtomicBool;
     let fixture = Fixture::new("missing-publication");
     let private = tempfile::tempdir_in(&fixture.0).unwrap();
@@ -41,6 +42,27 @@ fn missing_source_publication_is_exclusive_cancellable_and_never_replaces_a_new_
             .is_err()
     );
     assert!(!fixture.0.join("system.stt16").exists());
+    let candidate_path = private.path().join("system.stt16");
+    let aligned_length = std::fs::metadata(&candidate_path).unwrap().len();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&candidate_path)
+        .unwrap()
+        .write_all(&[0xab])
+        .unwrap();
+    assert!(
+        owner
+            .restore(&mut candidate, &AtomicBool::new(false))
+            .is_err(),
+        "a new candidate must remain sample-aligned even though retained proofs use complete samples"
+    );
+    assert!(!fixture.0.join("system.stt16").exists());
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&candidate_path)
+        .unwrap()
+        .set_len(aligned_length)
+        .unwrap();
     std::fs::write(
         fixture.0.join("system.stt16"),
         b"concurrently appearing input",
