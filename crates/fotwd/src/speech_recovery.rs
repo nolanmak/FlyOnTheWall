@@ -259,15 +259,16 @@ impl SavedSpeechRecovery {
             let Some(session) = session.to_str() else {
                 continue;
             };
-            let (deleted, indexed) = {
+            let lookup = {
                 let db = self.db();
-                (
-                    db.capture_session_was_deleted(session)
-                        .map_err(|_| RecoveryError::Invalid)?,
+                db.capture_session_was_deleted(session).and_then(|deleted| {
                     db.session_note_meeting(session)
-                        .map_err(|_| RecoveryError::Invalid)?
-                        .is_some(),
-                )
+                        .map(|meeting| (deleted, meeting.is_some()))
+                })
+            };
+            let Ok((deleted, indexed)) = lookup else {
+                needs_reconciliation = true;
+                continue;
             };
             if deleted {
                 continue;

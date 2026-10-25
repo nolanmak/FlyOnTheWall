@@ -3309,14 +3309,25 @@ mod raw_reconstruction_pump_tests {
     }
     #[test]
     fn real_pump_records_the_recipe_and_flushes_every_source_frame_at_native_rates() {
-        for (rate, channels) in [(16000, 1), (44100, 1), (48000, 2)] {
+        for (rate, channels, source) in [
+            (16000, 1, ReplaySource::System),
+            (44100, 1, ReplaySource::System),
+            (48000, 2, ReplaySource::System),
+            (16000, 1, ReplaySource::Mic),
+            (44100, 1, ReplaySource::Mic),
+            (48000, 2, ReplaySource::Mic),
+        ] {
+            let is_mic = source == ReplaySource::Mic;
+            let prefix = if is_mic { "mic" } else { "system" };
             let root = tempfile::tempdir().unwrap();
             let format = TrackFormat::new(rate, channels);
-            let wal = SessionWal::create_with_formats(root.path(), format, None).unwrap();
+            let wal =
+                SessionWal::create_with_formats(root.path(), format, is_mic.then_some(format))
+                    .unwrap();
             let dir = wal.dir().to_owned();
             let session = wal.manifest().id.clone();
             let feed = Arc::new(Feed(std::sync::Mutex::new(
-                ReplayWriter::create(&dir, &session, ReplaySource::System, 2192).unwrap(),
+                ReplayWriter::create(&dir, &session, source, 2192).unwrap(),
             )));
             let frames = rate as usize + 17;
             let pcm: Vec<f32> = (0..frames)
@@ -3333,17 +3344,26 @@ mod raw_reconstruction_pump_tests {
                 .collect();
             let (mut producer, consumer) = AudioRing::with_capacity_frames(pcm.len() + 16);
             producer.push_complete_block(&pcm);
-            let (_, mic) = AudioRing::with_capacity_frames(32);
+            let (_, empty) = AudioRing::with_capacity_frames(32);
+            let (system, mic) = if is_mic {
+                (empty, consumer)
+            } else {
+                (consumer, empty)
+            };
             let stopped = AtomicBool::new(true);
             pump_loop(
                 wal,
-                consumer,
+                system,
                 mic,
                 StreamFormat::new(rate, channels, fotw_audio::SampleFormat::F32),
-                None,
+                is_mic.then_some(StreamFormat::new(
+                    rate,
+                    channels,
+                    fotw_audio::SampleFormat::F32,
+                )),
                 SttFeeds {
-                    system: Some(feed.clone()),
-                    mic: None,
+                    system: (!is_mic).then(|| feed.clone() as Arc<dyn PcmFeed>),
+                    mic: is_mic.then(|| feed.clone() as Arc<dyn PcmFeed>),
                     echo_gate: None,
                 },
                 PumpStop {
@@ -3354,18 +3374,18 @@ mod raw_reconstruction_pump_tests {
             )
             .unwrap();
             feed.0.lock().unwrap().sync().unwrap();
-            let mut reader = ReplayReader::open(&dir, &session, ReplaySource::System).unwrap();
+            let mut reader = ReplayReader::open(&dir, &session, source).unwrap();
             let expected = frames as u64 * 16000 / u64::from(rate);
             assert_eq!(reader.complete_prefix_end().unwrap(), 2192 + expected);
             let plan: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(dir.join("system.stt-raw-plan.json")).unwrap(),
+                &std::fs::read(dir.join(format!("{prefix}.stt-raw-plan.json"))).unwrap(),
             )
             .unwrap();
             assert_eq!(plan["first_sample"], 2192);
             assert_eq!(plan["format"]["sample_rate_hz"], rate);
             // Re-run the persisted i16 WAL through the same recipe with
             // deliberately different input chunk boundaries.
-            let raw = std::fs::read(dir.join("system.pcm")).unwrap();
+            let raw = std::fs::read(dir.join(format!("{prefix}.pcm"))).unwrap();
             let decoded: Vec<f32> = raw
                 .chunks_exact(2)
                 .map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32767.0)

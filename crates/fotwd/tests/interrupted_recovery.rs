@@ -177,6 +177,28 @@ fn startup(c: &SavedSpeechRecovery) {
     }
 }
 
+#[test]
+fn stray_session_directories_do_not_abort_recovery_of_valid_recordings() {
+    for stray in ["foo.bak", "folder with spaces"] {
+        let mut f = voice_fixture(true);
+        drop(f.wal.take());
+        std::fs::create_dir(f.root.path().join("sessions").join(stray)).unwrap();
+        startup(&owner(&f));
+        assert_eq!(
+            f.calls.load(Ordering::SeqCst),
+            1,
+            "a stray directory must not stop valid local recovery"
+        );
+        assert!(
+            Db::open(&f.database, &f.key)
+                .unwrap()
+                .session_note_meeting(&f.session)
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
 fn index(c: &SavedSpeechRecovery) {
     c.index_captures().unwrap();
 }
@@ -277,8 +299,23 @@ fn raw_reconstruction_refuses_changed_identity_conflicting_audio_and_other_sourc
         "busy",
         "corrupt-other",
     ] {
-        let mut f = voice_fixture(true);
+        let pcm: Vec<i16> = (0u32..48000)
+            .map(|n| {
+                if (n / 3200).is_multiple_of(2) {
+                    1000
+                } else {
+                    8000
+                }
+            })
+            .collect();
+        let raw = pcm.iter().map(|&s| f32::from(s) / 32767.0).collect();
+        let mut f = fixture_audio(true, pcm, raw, "fixture-local", "fixture-revision");
         drop(f.wal.take());
+        if mode == "conflict" {
+            let mut bytes = std::fs::read(f.dir.join("system.pcm")).unwrap();
+            bytes[200..202].copy_from_slice(&0i16.to_le_bytes());
+            std::fs::write(f.dir.join("system.pcm"), bytes).unwrap();
+        }
         let mut plan = serde_json::json!({"recipe":"wal-i16-archive-converter-rubato5-v1","session_id":f.session,"source":"system","format":{"sample_rate_hz":16000,"channels":1},"first_sample":137*16});
         // Shorten only the uncommitted canonical tail; the retained prefix
         // deliberately differs from raw in conflict mode.
