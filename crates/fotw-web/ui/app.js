@@ -813,17 +813,30 @@ function appendDeltas(deltas) {
 // The cache belongs to the mounted transcript, so navigation/session replacement
 // releases it with that DOM. Stable finals keep their nodes across partials.
 const liveTranscriptRows = new WeakMap();
-function renderLiveTranscript() {
+function renderLiveTranscript(forceFollow = false) {
   if (!liveIsShowing()) return;
   const body = document.getElementById("segments");
-  const follow = isNearBottom(el.detail);
+  const follow = forceFollow || isNearBottom(el.detail);
   const scrollTop = el.detail.scrollTop;
   const origin = liveOrigin();
   const previous = liveTranscriptRows.get(body) || new Map();
   const next = new Map();
-  const visible = liveSegments.slice(-(MAX_ROWS - livePartials.size))
-    .map(d => ({key: "final:" + d.idx, d, partial: false}));
-  for (const [channel, d] of livePartials) visible.push({key: "partial:" + channel, d, partial: true});
+  // Keeping scrollTop alone is insufficient: trimming a row above the reader
+  // shifts the words at that position. Freeze the mounted window until the
+  // reader resumes following; finals still accumulate for copy and saved replay.
+  const paused = !follow && previous.size > 0;
+  const visible = [];
+  if (paused) {
+    for (const key of previous.keys()) {
+      const partial = key.startsWith("partial:");
+      const d = partial ? livePartials.get(key.slice(8)) : liveFinals.get(Number(key.slice(6)));
+      if (d) visible.push({key, d, partial});
+    }
+  } else {
+    visible.push(...liveSegments.slice(-(MAX_ROWS - livePartials.size))
+      .map(d => ({key: "final:" + d.idx, d, partial: false})));
+    for (const [channel, d] of livePartials) visible.push({key: "partial:" + channel, d, partial: true});
+  }
   for (const {key, d, partial} of visible) {
     const at = origin !== null && d.start_ms >= origin ? d.start_ms - origin : null;
     const speaker = partial && d.channel === "mic" ? "me" : d.speaker;
@@ -844,6 +857,8 @@ function renderLiveTranscript() {
     if (current !== row) body.insertBefore(row, current || null);
   }
   liveTranscriptRows.set(body, next);
+  const latest = document.getElementById("live-latest");
+  if (latest) latest.hidden = !paused;
   const copyRow = document.getElementById("live-copy");
   if (copyRow) copyRow.hidden = liveSegments.length === 0;
   const history = document.getElementById("live-history");
@@ -1281,6 +1296,23 @@ function showLive() {
   body.id = "segments";
   transcript.appendChild(body);
   el.detail.appendChild(transcript);
+  const latest = text("button", "Jump to latest", "live-latest");
+  latest.id = "live-latest";
+  latest.type = "button";
+  latest.hidden = true;
+  latest.addEventListener("click", () => {
+    renderLiveTranscript(true);
+    // Focus the newest speech, not the start of a long section. WebKit can
+    // scroll focused sections into view even with preventScroll requested.
+    const last = body.lastElementChild;
+    if (last) { last.tabIndex = -1; last.focus({preventScroll: true}); }
+    el.detail.scrollTop = el.detail.scrollHeight;
+  });
+  el.detail.appendChild(latest);
+  // Replace the handler on navigation; no listener accumulates per mount.
+  el.detail.onscroll = () => {
+    if (liveIsShowing() && isNearBottom(el.detail) && !latest.hidden) renderLiveTranscript(true);
+  };
   renderLiveTranscript();
   mountLiveNotes();
   paintLiveNavigation();
