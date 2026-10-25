@@ -1,7 +1,7 @@
 //! Reconstruct missing canonical suffixes from a declared WAL processing recipe.
 use fotw_pipeline::{
     capture_clock::CaptureSnapshot,
-    replay::{ReplayReader, ReplaySource, ReplayWriter},
+    replay::{ReconstructionOwner, ReplayReader, ReplaySource, ReplayWriter},
     resample::{ArchiveConverter, Downmixer},
     wal::TrackFormat,
 };
@@ -128,7 +128,7 @@ impl Drop for Lease {
     }
 }
 struct Candidate {
-    writer: ReplayWriter,
+    writer: ReconstructionOwner,
     reader: ReplayReader,
     _directory: tempfile::TempDir,
 }
@@ -145,6 +145,7 @@ pub(crate) fn repair(dir: &Path, proof: &CaptureSnapshot, stop: &AtomicBool) -> 
     let session = &proof.checkpoint.session_id;
     let mut writers = Vec::new();
     let mut leases = Vec::new();
+    let mut retained_writers = Vec::new();
     for source in [ReplaySource::System, ReplaySource::Mic] {
         let prefix = name(source);
         for suffix in [
@@ -174,51 +175,50 @@ pub(crate) fn repair(dir: &Path, proof: &CaptureSnapshot, stop: &AtomicBool) -> 
             .open(path)?;
         file.try_lock().map_err(io::Error::from)?;
         leases.push(Lease(file));
-        if dir.join(format!("{prefix}.stt16")).exists() {
+        let plan_path = dir.join(format!("{prefix}.stt-raw-plan.json"));
+        if plan_path.exists() {
+            let mut bytes = Vec::new();
+            open(&plan_path)?.take(4097).read_to_end(&mut bytes)?;
+            if bytes.len() > 4096 {
+                return Err(invalid("raw reconstruction plan exceeds bound"));
+            }
+            let plan: Plan = serde_json::from_slice(&bytes)?;
+            let format = match source {
+                ReplaySource::System => Some(proof.checkpoint.system_format),
+                ReplaySource::Mic => proof.checkpoint.mic_format,
+            };
+            if plan.recipe != RECIPE
+                || plan.session_id != *session
+                || plan.source != source
+                || Some(plan.format) != format
+            {
+                return Err(invalid("raw reconstruction processing identity differs"));
+            }
+            let writer = ReconstructionOwner::reserve(dir, session, source, plan.first_sample)?;
+            writers.push((source, plan, writer));
+        } else if dir.join(format!("{prefix}.stt16")).exists() {
             let writer = ReplayWriter::resume_prefix(dir, session, source)?;
             let stt = match source {
                 ReplaySource::System => fotw_stt::Source::System,
                 ReplaySource::Mic => fotw_stt::Source::Mic,
             };
             crate::failover::coverage::CoverageJournal::snapshot(dir, session, stt)?;
-            writers.push((source, writer));
-        } else if dir.join(format!("{prefix}.stt-raw-plan.json")).exists() {
-            return Err(invalid(
-                "missing canonical identity requires separate admission",
-            ));
+            retained_writers.push(writer);
+        } else if dir.join(format!("{prefix}.stt-coverage.jsonl")).exists() {
+            return Err(invalid("missing canonical input has no processing recipe"));
         }
     }
     let mut candidates = Vec::new();
-    let mut retained_writers = Vec::new();
-    for (source, writer) in writers {
+    let mut retained_mapped = Vec::new();
+    for (source, plan, mut writer) in writers {
         if stop.load(Ordering::Acquire) {
             return Err(io::ErrorKind::Interrupted.into());
         }
         let prefix = name(source);
-        let plan_path = dir.join(format!("{prefix}.stt-raw-plan.json"));
-        if !plan_path.exists() {
-            retained_writers.push(writer);
-            continue;
-        }
-        let mut bytes = Vec::new();
-        open(&plan_path)?.take(4097).read_to_end(&mut bytes)?;
-        if bytes.len() > 4096 {
-            return Err(invalid("raw reconstruction plan exceeds bound"));
-        }
-        let plan: Plan = serde_json::from_slice(&bytes)?;
-        let format = match source {
-            ReplaySource::System => Some(proof.checkpoint.system_format),
-            ReplaySource::Mic => proof.checkpoint.mic_format,
+        let stt = match source {
+            ReplaySource::System => fotw_stt::Source::System,
+            ReplaySource::Mic => fotw_stt::Source::Mic,
         };
-        let original = ReplayReader::open(dir, session, source)?;
-        if plan.recipe != RECIPE
-            || plan.session_id != *session
-            || plan.source != source
-            || Some(plan.format) != format
-            || plan.first_sample != original.first_sample()
-        {
-            return Err(invalid("raw reconstruction processing identity differs"));
-        }
         let mut converter = CanonicalInput::new(plan.format).map_err(|e| invalid(&e))?;
         let raw_path = dir.join(format!("{prefix}.pcm"));
         let checkpoint_bytes = match source {
@@ -238,9 +238,11 @@ pub(crate) fn repair(dir: &Path, proof: &CaptureSnapshot, stop: &AtomicBool) -> 
             .ok_or_else(|| invalid("raw reconstruction clock overflow"))?;
         if !raw_path.exists()
             && proof.frozen_capture_clock().is_some()
-            && writer.end_sample() == checkpoint_end
+            && writer.retained_end()? == Some(checkpoint_end)
         {
-            retained_writers.push(writer);
+            writer.validate_current_markers()?;
+            crate::failover::coverage::CoverageJournal::snapshot(dir, session, stt)?;
+            retained_mapped.push(writer);
             continue;
         }
         let mut raw = open(&raw_path)?;
@@ -256,22 +258,16 @@ pub(crate) fn repair(dir: &Path, proof: &CaptureSnapshot, stop: &AtomicBool) -> 
                 .map_err(|_| invalid("raw reconstruction clock overflow"))?,
             )
             .ok_or_else(|| invalid("raw reconstruction clock overflow"))?;
-        if target <= writer.end_sample() {
-            retained_writers.push(writer);
+        if writer.retained_end()?.is_some_and(|end| target <= end) {
+            writer.validate_current_markers()?;
+            crate::failover::coverage::CoverageJournal::snapshot(dir, session, stt)?;
+            retained_mapped.push(writer);
             continue;
         }
         if proof.frozen_capture_clock().is_some()
             && target > proof.checkpoint.elapsed_ms.saturating_mul(16)
         {
             return Err(invalid("raw reconstruction exceeds original capture clock"));
-        }
-        let stt = match source {
-            ReplaySource::System => fotw_stt::Source::System,
-            ReplaySource::Mic => fotw_stt::Source::Mic,
-        };
-        let saved = crate::failover::coverage::CoverageJournal::snapshot(dir, session, stt)?;
-        if saved.fallback.is_none() {
-            return Err(invalid("raw reconstruction has no saved local plan"));
         }
         let directory = tempfile::Builder::new()
             .prefix(".stt-reconstruction-")
@@ -305,8 +301,15 @@ pub(crate) fn repair(dir: &Path, proof: &CaptureSnapshot, stop: &AtomicBool) -> 
             return Err(invalid("raw reconstruction input changed"));
         }
         drop(output);
+        let audio = ReplayReader::open(directory.path(), session, source)?;
+        let saved = crate::failover::coverage::CoverageJournal::snapshot_with_audio(
+            dir, session, stt, audio,
+        )?;
+        if saved.fallback.is_none() {
+            return Err(invalid("raw reconstruction has no saved local plan"));
+        }
         let mut reader = ReplayReader::open(directory.path(), session, source)?;
-        writer.validate_reconstructed_suffix(&mut reader, stop)?;
+        writer.validate_candidate(&mut reader, stop)?;
         candidates.push(Candidate {
             writer,
             reader,
@@ -314,11 +317,10 @@ pub(crate) fn repair(dir: &Path, proof: &CaptureSnapshot, stop: &AtomicBool) -> 
         });
     }
     for mut candidate in candidates {
-        candidate
-            .writer
-            .restore_reconstructed_suffix(&mut candidate.reader, stop)?;
+        candidate.writer.restore(&mut candidate.reader, stop)?;
     }
     drop(leases);
     drop(retained_writers);
+    drop(retained_mapped);
     Ok(())
 }

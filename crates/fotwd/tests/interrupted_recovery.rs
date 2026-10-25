@@ -222,6 +222,268 @@ fn voice_fixture(stopped: bool) -> Fixture {
     )
 }
 
+fn recover_lost_canonical(missing: bool) {
+    for (stopped, indexed) in [(true, false), (false, false), (true, true), (false, true)] {
+        let pcm: Vec<i16> = (0u32..48000)
+            .map(|n| {
+                if (n / 3200).is_multiple_of(2) {
+                    1000
+                } else {
+                    8000
+                }
+            })
+            .collect();
+        let raw = pcm.iter().map(|&s| f32::from(s) / 32767.0).collect();
+        let mut f = fixture_audio(stopped, pcm, raw, "fixture-local", "fixture-revision");
+        drop(f.wal.take());
+        if indexed {
+            index(&owner(&f));
+            let db = Db::open(&f.database, &f.key).unwrap();
+            db.conn()
+                .execute(
+                    "UPDATE segments SET text='user corrected words' WHERE id='committed-prefix'",
+                    [],
+                )
+                .unwrap();
+        }
+        std::fs::write(f.dir.join("system.stt-raw-plan.json"),serde_json::to_vec(&serde_json::json!({
+            "recipe":"wal-i16-archive-converter-rubato5-v1","session_id":f.session,"source":"system",
+            "format":{"sample_rate_hz":16000,"channels":1},"first_sample":137*16
+        })).unwrap()).unwrap();
+        let path = f.dir.join("system.stt16");
+        let canonical = std::fs::read(&path).unwrap();
+        let raw = std::fs::read(f.dir.join("system.pcm")).unwrap();
+        let manifest = std::fs::read(f.dir.join("manifest.json")).unwrap();
+        let journal = std::fs::read(f.dir.join("system.stt-coverage.jsonl")).unwrap();
+        if missing {
+            std::fs::remove_file(&path).unwrap();
+        } else {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(canonical.len() as u64 - 44000 * 2)
+                .unwrap();
+        }
+        startup(&owner(&f));
+        let mut db = Db::open(&f.database, &f.key).unwrap();
+        let id = db
+            .session_note_meeting(&f.session)
+            .unwrap()
+            .expect("lost canonical input must recover from validated raw provenance");
+        assert_eq!(std::fs::read(&path).unwrap(), canonical);
+        assert_eq!(std::fs::read(f.dir.join("system.pcm")).unwrap(), raw);
+        assert_eq!(
+            std::fs::read(f.dir.join("manifest.json")).unwrap(),
+            manifest
+        );
+        assert!(
+            std::fs::read(f.dir.join("system.stt-coverage.jsonl"))
+                .unwrap()
+                .starts_with(&journal)
+        );
+        let document = db.export_meeting(&id).unwrap();
+        assert_eq!(
+            document
+                .segments
+                .iter()
+                .find(|s| s.id == "committed-prefix")
+                .unwrap()
+                .text,
+            if indexed {
+                "user corrected words"
+            } else {
+                "original committed words"
+            }
+        );
+        assert!(
+            document
+                .segments
+                .iter()
+                .any(|s| s.text == "recovered after process exit")
+        );
+        assert_eq!(
+            db.meetings().get(&id).unwrap().ended_at_ms.is_some(),
+            stopped
+        );
+        assert_eq!(
+            db.note_document(&id).unwrap().body_md,
+            "durable note before crash"
+        );
+        if !stopped {
+            for name in [
+                "system.stt-sealed.json",
+                "system.stt-complete.json",
+                "system.stt-projected.json",
+            ] {
+                assert!(!f.dir.join(name).exists());
+            }
+        }
+    }
+}
+
+#[test]
+fn startup_recovers_a_missing_canonical_file_without_replacing_saved_words() {
+    recover_lost_canonical(true);
+}
+
+#[test]
+fn startup_recovers_canonical_audio_lost_inside_a_committed_interval() {
+    recover_lost_canonical(false);
+}
+
+#[test]
+fn invalid_missing_source_evidence_is_refused_before_publication_or_inference() {
+    for mode in [
+        "journal-source",
+        "anchor",
+        "past-raw",
+        "busy-other",
+        "corrupt-header",
+        "seal",
+        "no-plan",
+    ] {
+        let pcm: Vec<i16> = (0u32..48000)
+            .map(|n| {
+                if (n / 3200).is_multiple_of(2) {
+                    1000
+                } else {
+                    8000
+                }
+            })
+            .collect();
+        let raw = pcm.iter().map(|&s| f32::from(s) / 32767.0).collect();
+        let mut f = fixture_audio(true, pcm, raw, "fixture-local", "fixture-revision");
+        drop(f.wal.take());
+        let mut plan = serde_json::json!({"recipe":"wal-i16-archive-converter-rubato5-v1","session_id":f.session,"source":"system","format":{"sample_rate_hz":16000,"channels":1},"first_sample":137*16});
+        if mode == "anchor" {
+            plan["first_sample"] = 0.into();
+        }
+        std::fs::write(
+            f.dir.join("system.stt-raw-plan.json"),
+            serde_json::to_vec(&plan).unwrap(),
+        )
+        .unwrap();
+        if mode == "past-raw" {
+            let mut writer =
+                ReplayWriter::resume(&f.dir, &f.session, ReplaySource::System).unwrap();
+            writer.append(&[1000; 16000]).unwrap();
+            writer.sync().unwrap();
+            drop(writer);
+            let mut journal = CoverageJournal::open(&f.dir, &f.session, Source::System).unwrap();
+            journal
+                .commit(0, 637 * 16, 137 * 16 + 64000, vec![])
+                .unwrap();
+        }
+        if mode == "journal-source" || mode == "no-plan" {
+            let path = f.dir.join("system.stt-coverage.jsonl");
+            let data = std::fs::read_to_string(&path).unwrap();
+            let (first, rest) = data.split_once('\n').unwrap();
+            let mut header: serde_json::Value = serde_json::from_str(first).unwrap();
+            if mode == "journal-source" {
+                header["header"]["source"] = "mic".into();
+            } else {
+                header["header"]["fallback"] = serde_json::Value::Null;
+            }
+            std::fs::write(
+                path,
+                format!("{}\n{rest}", serde_json::to_string(&header).unwrap()),
+            )
+            .unwrap();
+        }
+        if mode == "seal" {
+            let mut writer =
+                ReplayWriter::resume(&f.dir, &f.session, ReplaySource::System).unwrap();
+            writer.seal().unwrap();
+            drop(writer);
+            let path = f.dir.join("system.stt-sealed.json");
+            let mut proof: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            proof["through_sample"] = (137 * 16 + 48001).into();
+            std::fs::write(path, serde_json::to_vec(&proof).unwrap()).unwrap();
+        }
+        let path = f.dir.join("system.stt16");
+        let retained = if mode == "corrupt-header" {
+            std::fs::write(&path, b"retained malformed canonical input").unwrap();
+            Some(std::fs::read(&path).unwrap())
+        } else {
+            std::fs::remove_file(&path).unwrap();
+            None
+        };
+        let _other = if mode == "busy-other" {
+            Some(ReplayWriter::create(&f.dir, &f.session, ReplaySource::Mic, 0).unwrap())
+        } else {
+            None
+        };
+        let raw = std::fs::read(f.dir.join("system.pcm")).unwrap();
+        let journal = std::fs::read(f.dir.join("system.stt-coverage.jsonl")).unwrap();
+        startup(&owner(&f));
+        assert_eq!(
+            std::fs::read(&path).ok(),
+            retained,
+            "refused {mode} must not publish canonical input"
+        );
+        assert_eq!(std::fs::read(f.dir.join("system.pcm")).unwrap(), raw);
+        assert_eq!(
+            std::fs::read(f.dir.join("system.stt-coverage.jsonl")).unwrap(),
+            journal
+        );
+        assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn unknown_end_mapped_input_with_a_torn_last_sample_still_recovers_its_complete_prefix() {
+    let canonical: Vec<i16> = (0u32..48000)
+        .map(|n| {
+            if (n / 3200).is_multiple_of(2) {
+                1000
+            } else {
+                8000
+            }
+        })
+        .collect();
+    let raw = canonical.iter().map(|&s| f32::from(s) / 32767.0).collect();
+    let mut f = fixture_audio(false, canonical, raw, "fixture-local", "fixture-revision");
+    drop(f.wal.take());
+    std::fs::write(f.dir.join("system.stt-raw-plan.json"), serde_json::to_vec(&serde_json::json!({
+        "recipe":"wal-i16-archive-converter-rubato5-v1", "session_id":f.session, "source":"system",
+        "format":{"sample_rate_hz":16000,"channels":1}, "first_sample":137*16
+    })).unwrap()).unwrap();
+    let path = f.dir.join("system.stt16");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.push(0x42);
+    std::fs::write(&path, &bytes).unwrap();
+    let o = owner(&f);
+    startup(&o);
+    let mut db = Db::open(&f.database, &f.key).unwrap();
+    let id = db
+        .session_note_meeting(&f.session)
+        .unwrap()
+        .expect("torn tail must not block complete-prefix recovery");
+    let doc = db.export_meeting(&id).unwrap();
+    assert!(
+        doc.segments
+            .iter()
+            .any(|s| s.text == "original committed words")
+    );
+    assert!(
+        doc.segments
+            .iter()
+            .any(|s| s.text == "recovered after process exit")
+    );
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        bytes,
+        "prefix recovery does not trim retained input"
+    );
+    for suffix in ["sealed", "complete", "projected"] {
+        assert!(!f.dir.join(format!("system.stt-{suffix}.json")).exists());
+    }
+    assert!(db.meetings().get(&id).unwrap().ended_at_ms.is_none());
+}
+
 #[test]
 fn startup_reconstructs_a_mapped_raw_suffix_without_replacing_committed_canonical_audio() {
     for stopped in [true, false] {
@@ -1171,32 +1433,39 @@ fn cancelling_a_blocked_local_prepare_retains_the_interrupted_capture_lease_unti
 #[test]
 #[ignore = "requires cached public small.en weights and checksum-verified JFK WAV"]
 fn installed_model_recovers_an_unindexed_stopped_wal_without_changing_settings_or_audio() {
-    native_capture_recovery(false, false, false);
+    native_capture_recovery(false, false, false, false);
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires cached public small.en weights and checksum-verified JFK WAV"]
 fn installed_model_recovers_a_finalized_archive_after_pcm_retirement() {
-    native_capture_recovery(true, false, false);
+    native_capture_recovery(true, false, false, false);
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires cached public small.en weights and checksum-verified JFK WAV"]
 fn installed_model_recovers_a_saved_prefix_without_manufacturing_a_capture_end() {
-    native_capture_recovery(false, true, false);
+    native_capture_recovery(false, true, false, false);
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires cached public small.en weights and checksum-verified JFK WAV"]
 fn installed_model_recovers_a_reconstructed_raw_suffix() {
-    native_capture_recovery(false, false, true);
+    native_capture_recovery(false, false, true, false);
 }
 
 #[cfg(target_os = "macos")]
-fn native_capture_recovery(archived: bool, prefix_only: bool, reconstruct: bool) {
+#[test]
+#[ignore = "requires cached public small.en weights and checksum-verified JFK WAV"]
+fn installed_model_recovers_a_missing_canonical_file() {
+    native_capture_recovery(false, false, true, true);
+}
+
+#[cfg(target_os = "macos")]
+fn native_capture_recovery(archived: bool, prefix_only: bool, reconstruct: bool, missing: bool) {
     use fotw_web::speech_recovery::{RecoveryPhase, SpeechRecoveryControl};
     use sha2::{Digest, Sha256};
     let model = PathBuf::from(
@@ -1260,6 +1529,9 @@ fn native_capture_recovery(archived: bool, prefix_only: bool, reconstruct: bool)
         std::fs::write(f.dir.join("system.stt-raw-plan.json"),serde_json::to_vec(&serde_json::json!({"recipe":"wal-i16-archive-converter-rubato5-v1","session_id":f.session,"source":"system","format":{"sample_rate_hz":16000,"channels":1},"first_sample":137*16})).unwrap()).unwrap();
     }
     let audio_before = std::fs::read(f.dir.join("system.stt16")).unwrap();
+    if missing {
+        std::fs::remove_file(f.dir.join("system.stt16")).unwrap();
+    }
     let retained_path = if archived {
         let encoded = fotw_pipeline::wal::SessionState::read(&f.dir)
             .unwrap()
@@ -1354,7 +1626,7 @@ fn native_capture_recovery(archived: bool, prefix_only: bool, reconstruct: bool)
     }
     println!(
         "{}",
-        serde_json::json!({"fixture":"public-jfk","unindexed_stopped_wal":!prefix_only&&!archived,"raw_retired":archived,"phase":if prefix_only{"partial"}else{"complete"},"canonical_unchanged":!reconstruct,"canonical_prefix_unchanged":true,"raw_suffix_reconstructed":reconstruct,"settings_unchanged":true,"elapsed_ms":began.elapsed().as_millis(),"model":"small.en"})
+        serde_json::json!({"fixture":"public-jfk","unindexed_stopped_wal":!prefix_only&&!archived,"raw_retired":archived,"phase":if prefix_only{"partial"}else{"complete"},"canonical_unchanged":!reconstruct,"canonical_prefix_unchanged":true,"canonical_file_restored":missing,"raw_suffix_reconstructed":reconstruct,"settings_unchanged":true,"elapsed_ms":began.elapsed().as_millis(),"model":"small.en"})
     );
 }
 
