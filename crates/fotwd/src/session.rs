@@ -1657,6 +1657,8 @@ impl SegmentTap {
 /// The latches a caller outside the session holds, and the clock on its end.
 #[derive(Clone, Debug, Default)]
 pub struct SessionControl {
+    /// Actual source/model telemetry, independent of capture health.
+    pub speech: crate::speech_status::SpeechMonitor,
     /// Independent source health and session-scoped recovery requests.
     pub capture_health: crate::capture_health::CaptureMonitor,
     /// Trip to end the session early.
@@ -1733,6 +1735,7 @@ pub async fn run_with_stop(
         transcription,
         duration,
         SessionControl {
+            speech: crate::speech_status::SpeechMonitor::default(),
             capture_health: crate::capture_health::CaptureMonitor::default(),
             stop,
             ready: ReadySignal::new(),
@@ -1822,6 +1825,7 @@ pub async fn run_with_control(
         anchors,
         mic_format.is_some(),
         control.errors.clone(),
+        control.speech.clone(),
     )
     .await;
 
@@ -1881,6 +1885,7 @@ pub async fn run_with_control(
             Arc::clone(&collected),
             control.errors.clone(),
             control.on_segment.clone(),
+            control.speech.clone(),
         )
     });
     let mic_collector = mic_events.map(|rx| {
@@ -1890,6 +1895,7 @@ pub async fn run_with_control(
             Arc::clone(&collected),
             control.errors.clone(),
             control.on_segment.clone(),
+            control.speech.clone(),
         )
     });
 
@@ -2231,6 +2237,7 @@ pub async fn run_supervised(
         anchors,
         true,
         control.errors.clone(),
+        control.speech.clone(),
     )
     .await;
 
@@ -2330,6 +2337,7 @@ pub async fn run_supervised(
             Arc::clone(&collected),
             control.errors.clone(),
             control.on_segment.clone(),
+            control.speech.clone(),
         )
     });
     let mic_collector = mic_events.map(|rx| {
@@ -2339,6 +2347,7 @@ pub async fn run_supervised(
             Arc::clone(&collected),
             control.errors.clone(),
             control.on_segment.clone(),
+            control.speech.clone(),
         )
     });
 
@@ -2492,9 +2501,18 @@ fn spawn_leg_collector(
     sink: Arc<std::sync::Mutex<Vec<TranscriptSegment>>>,
     errors: SttErrors,
     tap: SegmentTap,
+    speech: crate::speech_status::SpeechMonitor,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
+            speech.observe_legacy(
+                if leg == "system" {
+                    Source::System
+                } else {
+                    Source::Mic
+                },
+                &ev,
+            );
             match ev {
                 StreamEvent::Final(seg) => {
                     // Live first, then the buffer: a viewer watching the
@@ -2631,6 +2649,7 @@ async fn open_legs(
     anchors: LegAnchors,
     mic_started: bool,
     errors: SttErrors,
+    speech: crate::speech_status::SpeechMonitor,
 ) -> OpenLegs {
     match transcription {
         Transcription::PreparingFailover(_) => {
@@ -2638,11 +2657,25 @@ async fn open_legs(
         }
         Transcription::Disabled => (None, None, None, None),
         Transcription::Deepgram(mut legs) => {
+            speech.bind_legacy(
+                Source::System,
+                "deepgram",
+                &legs.system.normalizer.model,
+                true,
+                legs.system.normalizer.diarization_enabled,
+            );
             legs.system.normalizer.session_id = session_id.to_owned();
             legs.system.session_offset_ms = anchors.system_ms;
             let (s, s_rx) = DeepgramStream::open(*legs.system);
             let (m, m_rx) = match legs.mic {
                 Some(mut cfg) if mic_started => {
+                    speech.bind_legacy(
+                        Source::Mic,
+                        "deepgram",
+                        &cfg.normalizer.model,
+                        true,
+                        cfg.normalizer.diarization_enabled,
+                    );
                     cfg.normalizer.session_id = session_id.to_owned();
                     cfg.session_offset_ms = anchors.mic_ms;
                     let (m, rx) = DeepgramStream::open(*cfg);
@@ -2653,11 +2686,25 @@ async fn open_legs(
             (Some(Arc::new(LegStream::Deepgram(s))), Some(s_rx), m, m_rx)
         }
         Transcription::Local(mut legs) => {
+            speech.bind_legacy(
+                Source::System,
+                fotw_stt::local::PROVIDER,
+                legs.engine.model(),
+                false,
+                false,
+            );
             legs.system.session_id = session_id.to_owned();
             legs.system.session_offset_ms = anchors.system_ms;
             let (s, s_rx) = LocalStream::open(*legs.system, Arc::clone(&legs.engine));
             let (m, m_rx) = match legs.mic {
                 Some(mut cfg) if mic_started => {
+                    speech.bind_legacy(
+                        Source::Mic,
+                        fotw_stt::local::PROVIDER,
+                        legs.engine.model(),
+                        false,
+                        false,
+                    );
                     cfg.session_id = session_id.to_owned();
                     cfg.session_offset_ms = anchors.mic_ms;
                     let (m, rx) = LocalStream::open(*cfg, legs.engine);
@@ -2669,12 +2716,28 @@ async fn open_legs(
         }
         Transcription::Failover(legs) => {
             let FailoverLegs { system, mic } = *legs;
-            let system =
-                open_failover_source(system, dir, session_id, anchors.system_ms, errors.clone())
-                    .await;
+            let system = open_failover_source(
+                system,
+                dir,
+                session_id,
+                anchors.system_ms,
+                errors.clone(),
+                Source::System,
+                speech.clone(),
+            )
+            .await;
             let mic = match mic {
                 Some(config) if mic_started => {
-                    open_failover_source(config, dir, session_id, anchors.mic_ms, errors).await
+                    open_failover_source(
+                        config,
+                        dir,
+                        session_id,
+                        anchors.mic_ms,
+                        errors,
+                        Source::Mic,
+                        speech,
+                    )
+                    .await
                 }
                 _ => (None, None),
             };
@@ -2689,11 +2752,13 @@ async fn open_failover_source(
     session_id: &str,
     offset_ms: u64,
     errors: SttErrors,
+    source: Source,
+    speech: crate::speech_status::SpeechMonitor,
 ) -> (Option<Arc<LegStream>>, Option<LegEvents>) {
     match prepared.open(dir, session_id, offset_ms).await {
         Ok((stream, mut events)) => {
+            speech.bind_durable(source, stream.status_reader());
             let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-            let notices = errors.clone();
             tokio::spawn(async move {
                 while let Some(event) = events.recv().await {
                     match event {
@@ -2702,15 +2767,9 @@ async fn open_failover_source(
                                 break;
                             }
                         }
-                        crate::failover::stream::Event::ProviderSwitch(epoch) => {
-                            notices.record(format!(
-                                "transcription switched to {} / {} at {} ms ({:?})",
-                                epoch.engine.provider,
-                                epoch.engine.model,
-                                epoch.from_sample / 16,
-                                epoch.reason
-                            ));
-                        }
+                        // The durable status reader exposes this normal lifecycle
+                        // transition as typed metadata, not a transcription error.
+                        crate::failover::stream::Event::ProviderSwitch(_) => {}
                     }
                 }
             });
@@ -4621,6 +4680,7 @@ mod local_collector_shutdown_tests {
             sink,
             SttErrors::default(),
             SegmentTap::default(),
+            crate::speech_status::SpeechMonitor::default(),
         );
         sender
             .send(StreamEvent::State(fotw_stt::StreamState::Closed))

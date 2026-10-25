@@ -146,12 +146,15 @@ async fn session_pump_recovers_both_tracks_without_losing_original_capture_forma
         ))
     }
     let root = tempfile::tempdir().unwrap();
-    let outcome = session::run(
+    let control = session::SessionControl::new();
+    let speech = control.speech.clone();
+    let outcome = session::run_with_control(
         root.path(),
         tap(48_000, 2, Source::System),
         Some(tap(44_100, 1, Source::Mic)),
         Transcription::Failover(Box::new(legs)),
         Duration::from_millis(1_200),
+        control,
     )
     .await
     .unwrap();
@@ -180,6 +183,17 @@ async fn session_pump_recovers_both_tracks_without_losing_original_capture_forma
     );
     assert!(outcome.system_samples > 48_000);
     assert!(outcome.mic_samples > 22_050);
+    let status = speech.snapshot();
+    assert_eq!(status.len(), 2, "actual source engines were not published");
+    for source in &status {
+        assert_eq!(source.provider, fotw_stt::local::PROVIDER);
+        assert_eq!(source.model, "fixture-local");
+        assert_eq!(source.switch_reason.as_deref(), Some("auth"));
+        assert_eq!(source.state, fotw_web::recorder::SpeechState::Complete);
+        assert_eq!(source.pending_audio_ms, Some(0));
+        assert_eq!(source.worker_running, Some(false));
+        assert_eq!(source.diarization_supported, Some(false));
+    }
     let session_id = outcome.dir.file_name().unwrap().to_str().unwrap();
     for (source, replay_source) in [
         (Source::System, ReplaySource::System),
@@ -698,6 +712,11 @@ async fn installed_whisper_recovers_a_public_clip_after_reconnect_budget_exhaust
     .unwrap();
     assert_eq!(epoch.reason, Some(SwitchReason::TransportBudget));
     assert!(stream.finish().await, "{:?}", stream.status());
+    let telemetry = stream.status_reader().read();
+    assert_eq!(telemetry.phase, fotwd::failover::stream::Phase::Complete);
+    assert_eq!(telemetry.epoch.engine.model, "small.en");
+    assert!(!telemetry.worker_running);
+
     while let Ok(event) = events.try_recv() {
         if let Event::Transcript(StreamEvent::Final(segment)) = event {
             finals.push(segment);
@@ -1191,4 +1210,185 @@ async fn truncated_provider_replay_cannot_acknowledge_an_untranscribed_prefix() 
     assert_eq!(finals[0].start_ms, 0);
     assert_eq!(finals.last().unwrap().end_ms, 3_000);
     assert_eq!(stream.status().committed_sample, pcm.len() as u64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_reader_keeps_metadata_but_releases_canonical_ownership_with_the_stream() {
+    use fotw_pipeline::replay::{ReplaySource, ReplayWriter};
+    let fixture = pending_fixture(true);
+    let (stream, _events) = FailoverStream::resume_local(&fixture.dir, resume_request(&fixture))
+        .await
+        .unwrap();
+    let reader = stream.status_reader();
+    assert!(stream.finish().await);
+    assert!(ReplayWriter::resume(&fixture.dir, &fixture.session, ReplaySource::System).is_err());
+    drop(stream);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match ReplayWriter::resume(&fixture.dir, &fixture.session, ReplaySource::System) {
+                Ok(owner) => {
+                    drop(owner);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(Duration::from_millis(5)).await
+                }
+                Err(e) => panic!("cannot reopen source: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("read-only status retained an exclusive audio-file lease");
+    assert_eq!(
+        reader.read().phase,
+        fotwd::failover::stream::Phase::Complete
+    );
+    assert!(!reader.read().worker_running);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recorder_retains_timed_out_native_inference_without_delaying_audio_finisher() {
+    use fotw_audio::platform::file::{FileAudioSource, ReplaySpeed};
+    use fotw_audio::{SampleFormat, StreamFormat, TapId};
+    use fotw_web::{RecorderControl, RecorderError, RecordingState};
+    use fotwd::session::{FailoverLegs, Transcription};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0; 1];
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 8192);
+            }
+            socket
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        }
+    });
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let _release_on_failure = ReleaseOnDrop(release.clone());
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let observed = finished.clone();
+    let factory_release = release.clone();
+    let factory_entered = entered.clone();
+    let root = tempfile::tempdir().unwrap();
+    let recorder = Arc::new(fotwd::recording::DaemonRecorder::with_parts(
+        root.path().join("sessions"),
+        tokio::runtime::Handle::current(),
+        Default::default(),
+        Default::default(),
+        Box::new(|| {
+            Ok((
+                Box::new(FileAudioSource::from_wav(
+                    TapId::system_default(),
+                    fotw_audio::wav::WavData {
+                        format: StreamFormat::new(16_000, 1, SampleFormat::I16),
+                        samples: (0..64_000)
+                            .map(|n| if (n / 480) % 2 == 0 { 0.03 } else { 0.24 })
+                            .collect(),
+                    },
+                    ReplaySpeed::Realtime,
+                )),
+                None,
+            ))
+        }),
+        Box::new(move || {
+            let mut config = FailoverConfig::new(
+                DeepgramStreamConfig::new(
+                    "fixture-not-a-key",
+                    fotw_stt::deepgram::DeepgramConfig::new("placeholder", Source::System),
+                )
+                .with_endpoint(DeepgramEndpoint::loopback(port)),
+                Arc::new(BlockingFactory {
+                    release: factory_release.clone(),
+                    entered: factory_entered.clone(),
+                }),
+            );
+            config.endpoint.hard_max_ms = 270;
+            config.stop_timeout = Duration::from_millis(40);
+            Transcription::PreparingFailover(Box::pin(async move {
+                FailoverLegs::prepare(config, None)
+                    .await
+                    .map_err(|e| e.message)
+            }))
+        }),
+        Box::new(move |_, outcome| {
+            assert!(outcome.capture_ended_at_ms.is_some());
+            assert!(
+                std::fs::metadata(outcome.dir.join("system.pcm"))
+                    .unwrap()
+                    .len()
+                    > 0
+            );
+            observed.fetch_add(1, Ordering::SeqCst);
+            None
+        }),
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    ));
+    let requested = recorder.clone();
+    tokio::task::spawn_blocking(move || requested.start())
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while !entered.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("fake native inference did not begin");
+    recorder.stop().unwrap();
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while finished.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("native cleanup prevented the audio finisher from running");
+    let status = recorder.status();
+    assert_eq!(status.state, RecordingState::Finishing);
+    assert_eq!(status.speech_status.len(), 1);
+    assert_eq!(
+        status.speech_status[0].state,
+        fotw_web::recorder::SpeechState::Incomplete
+    );
+    assert_eq!(status.speech_status[0].worker_running, Some(true));
+    assert!(matches!(
+        recorder.start(),
+        Err(RecorderError::AlreadyRecording)
+    ));
+    *release.0.lock().unwrap() = true;
+    release.1.notify_all();
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while recorder.status().state != RecordingState::Idle {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("released native worker left the old session occupied");
+    let requested = recorder.clone();
+    tokio::task::spawn_blocking(move || requested.start())
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(4), server)
+        .await
+        .unwrap()
+        .unwrap();
+    recorder.stop().unwrap();
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while recorder.status().state != RecordingState::Idle {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
 }

@@ -29,9 +29,24 @@ local model metadata on explicit save, and preserves the previous policy on
 failure. Model work runs outside the library mutex. Summary and export settings
 remain independent of speech recognition.
 
-Live engine/provenance status, startup native recovery and retry UI remain part of
-[#12](https://github.com/nolanmak/FlyOnTheWall/issues/12). The backend APIs below
-support these remaining app features.
+The recording status API and dashboard expose the actual provider/model per
+source, verified revision when recorded, original coverage boundary, switch
+reason, pending audio and backend capabilities. These describe the active
+streams independently of the saved preference for the next recording. A durable
+Complete state proves accounted input coverage, not recognition accuracy. Legacy
+streams expose their actual connection lifecycle with unknown coverage/worker
+liveness rather than claiming zero backlog or complete inference.
+
+Read-only durable status handles retain metadata and atomics, not model or file
+leases. After a durable inference timeout, its measured native worker remains
+visible and prevents another recording until cleanup finishes. Audio finishing
+and library persistence proceed independently. This retained-worker admission
+guard applies to the durable fallback runtime; older local streams do not expose
+native-worker liveness here. The app cannot forcibly stop a native OS operation.
+
+Persisted provenance display, summary-prompt provenance, startup native recovery
+and retry controls remain part of
+[#12](https://github.com/nolanmak/FlyOnTheWall/issues/12).
 
 ## Capture and admission
 
@@ -130,3 +145,16 @@ exercises both reconnect handoff and local restart without capture devices or pa
 provider calls. These checks do not prove signed-app device recovery, human speech
 quality, cold-start performance or contention between both apps. The roadmap in
 [#124](https://github.com/nolanmak/FlyOnTheWall/issues/124) retains those gates.
+
+## Inspecting the live status UI
+
+`cargo run -p fotwd --example ui_preview -- --speech-status` serves a temporary
+synthetic library with two different source engines. Stop simulates an incomplete
+local worker, then releases the fixture after eight seconds. No capture, model,
+provider or user library is opened. The one-use launch link expires after 30 seconds.
+The preview is layout/interaction evidence; backend tests use real session pumps,
+loopback transports and a controlled blocking recognizer separately.
+
+![Synthetic live source status](speech-ui/live-desktop.png)
+
+![Synthetic retained transcription work at narrow width](speech-ui/retained-work-mobile.png)

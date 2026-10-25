@@ -221,6 +221,7 @@ impl ReadyTap {
 
 /// A recording in flight, or one still writing itself to disk.
 struct Live {
+    speech: crate::speech_status::SpeechMonitor,
     capture_health: crate::capture_health::CaptureMonitor,
     ready: crate::session::ReadySignal,
     stop: StopSignal,
@@ -651,6 +652,7 @@ impl RecorderControl for DaemonRecorder {
         let started_at_ms = now_ms();
         let capture_health = control.capture_health.clone();
         *slot = Some(Live {
+            speech: control.speech.clone(),
             capture_health: capture_health.clone(),
             ready: ready.clone(),
             stop: stop.clone(),
@@ -730,7 +732,9 @@ impl RecorderControl for DaemonRecorder {
             } else {
                 RecordingStatus::preparing(true)
             };
-            return Ok(status.with_transcription_error(live.errors.latest()));
+            return Ok(status
+                .with_transcription_error(live.errors.latest())
+                .with_speech_status(live.speech.snapshot()));
         }
         let ended_at_ms = *live.stopped_at_ms.get_or_insert(now_ms());
         // Trip and return. The task clears the slot once the meeting is on
@@ -744,6 +748,7 @@ impl RecorderControl for DaemonRecorder {
             .unwrap_or(live.started_at_ms);
         let ended_at_ms = live.ready.capture_ended_at_ms().unwrap_or(ended_at_ms);
         Ok(RecordingStatus::finishing(started_at_ms, ended_at_ms)
+            .with_speech_status(live.speech.snapshot())
             .with_capture_health(live.capture_health.snapshot())
             .with_transcription_error(live.errors.latest())
             .with_session_id(live.ready.session_id()))
@@ -804,6 +809,7 @@ impl RecorderControl for DaemonRecorder {
             // that transcription failed, or an empty transcript is
             // indistinguishable from a quiet meeting exactly when someone goes
             // looking for the words.
+            .with_speech_status(live.speech.snapshot())
             .with_capture_health(live.capture_health.snapshot())
             .with_transcription_error(live.errors.latest())
             .with_session_id(live.ready.session_id());
@@ -820,8 +826,15 @@ impl RecorderControl for DaemonRecorder {
     }
 }
 
-/// Run one session, free the slot the moment capture is safe on disk, then
-/// persist and enrich in the background with the slot already open.
+fn clear_session_slot(live: &Arc<Mutex<Option<Live>>>, ready: &crate::session::ReadySignal) {
+    let mut slot = live.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.as_ref().is_some_and(|s| s.ready.same_session(ready)) {
+        *slot = None;
+    }
+}
+
+/// Persist/enrich independently of retained native work. Release the slot
+/// when measured native-worker ownership is clear.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_session(
     root: PathBuf,
@@ -839,6 +852,7 @@ async fn spawn_session(
     // rebuilds a stalled tap in place (#101). The finishing tail below is
     // identical, so only the capture call differs.
     let capture_health = control.capture_health.clone();
+    let speech = control.speech.clone();
     let ready = control.ready.clone();
     let outcome = async {
         let transcription = transcription.prepare(&control).await?;
@@ -864,23 +878,21 @@ async fn spawn_session(
 
     capture_health.close();
 
-    // Free the slot here — the moment capture is safe on disk, before persist.
-    // `run_…` does not return until the WAL is written and the taps are
-    // closed-or-abandoned (both backends bound the wind-down with
-    // `FinishDeadlines`, #85), so the recorder owes nothing to a device or a
-    // buffer by this point. Freeing it now is the whole change: persist (Opus +
-    // SQLite, minutes on a long call) and enrichment run below with the slot
-    // already open, so the next meeting can start while this one finalizes.
-    //
-    // The ready-signal identity keeps this from clearing a *newer* session: once
-    // the slot is free a second Start may take it, and only the task that owns
-    // the current entry may retire it. Nothing frees the slot but this line, so
-    // until here it still holds our entry.
-    {
-        let mut slot = live.lock().unwrap_or_else(|e| e.into_inner());
-        if slot.as_ref().is_some_and(|s| s.ready.same_session(&ready)) {
-            *slot = None;
-        }
+    // Persistence remains independent of native inference cleanup: saved audio
+    // must be available even if a model never returns. Keep the recording slot
+    // while a measured durable worker still owns native state, so repeated
+    // Start requests cannot multiply blocked model instances.
+    if speech.has_retained_native_worker() {
+        let live = Arc::clone(&live);
+        let ready = ready.clone();
+        tokio::spawn(async move {
+            while speech.has_retained_native_worker() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            clear_session_slot(&live, &ready);
+        });
+    } else {
+        clear_session_slot(&live, &ready);
     }
 
     if let Err(error) = &outcome {
@@ -930,9 +942,8 @@ async fn spawn_session(
         }
     };
 
-    // The slot is already free (above), so persist and enrichment run here as
-    // pure background work over a file that is safe on disk — the next meeting
-    // may already be recording in the slot we let go.
+    // Persist/enrichment do not wait for a retained native worker. Once that
+    // worker releases, a fresh meeting may start while enrichment continues.
     if let Some(meeting_id) = persisted {
         enrich_and_announce(&root, &meeting_id, &on_ready).await;
     }
@@ -940,10 +951,9 @@ async fn spawn_session(
 
 /// Title, summary and action items for a meeting already in the library.
 ///
-/// Runs in the tail of the session task, after the recorder's slot has been
-/// freed, so nothing here can hold the user's clock (#77). Problems print and
-/// nothing can fail the recording: the audio and the transcript are on disk
-/// before this is called.
+/// Runs in the session tail independently of the native-cleanup watcher, so
+/// enrichment cannot retain the recording slot or capture clock. Problems print
+/// and cannot fail recording: audio and committed text are on disk first.
 ///
 /// This is the hook #78 asked for, and it is now wired: the invariant is
 /// **announce `enriched` immediately after `enrich_meeting` returns, wherever
@@ -1027,6 +1037,7 @@ mod capture_retry_tests {
         let ready = crate::session::ReadySignal::new();
         ready.signal_capture("current-fixture".into(), 1000);
         *recorder.live.lock().unwrap() = Some(Live {
+            speech: crate::speech_status::SpeechMonitor::default(),
             capture_health: monitor.clone(),
             ready,
             stop: StopSignal::new(),

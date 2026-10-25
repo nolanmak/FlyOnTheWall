@@ -163,6 +163,38 @@ pub struct Status {
     pub error: Option<String>,
 }
 
+/// Read-only telemetry detached from stream, model and canonical-file ownership.
+#[derive(Clone)]
+pub struct StatusReader {
+    gate: Arc<Mutex<Publication>>,
+    end: Arc<AtomicU64>,
+    done: Arc<AtomicBool>,
+}
+impl std::fmt::Debug for StatusReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StatusReader(<redacted>)")
+    }
+}
+impl StatusReader {
+    /// Read current metadata and coverage without IO or native work.
+    pub fn read(&self) -> Status {
+        Self::snapshot(&self.gate, &self.end, &self.done)
+    }
+    fn snapshot(gate: &Mutex<Publication>, end: &AtomicU64, done: &AtomicBool) -> Status {
+        let mut status = gate
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .status
+            .clone();
+        status.written_sample = end.load(Ordering::Acquire);
+        status.lag_samples = status
+            .written_sample
+            .saturating_sub(status.committed_sample);
+        status.worker_running = !done.load(Ordering::Acquire);
+        status
+    }
+}
+
 struct Publication {
     fenced: bool,
     status: Status,
@@ -173,11 +205,11 @@ struct Writer {
 }
 struct Shared {
     writer: Mutex<Writer>,
-    end: AtomicU64,
+    end: Arc<AtomicU64>,
     stop_requested: AtomicBool,
     input_closed: AtomicBool,
-    done: AtomicBool,
-    gate: Mutex<Publication>,
+    done: Arc<AtomicBool>,
+    gate: Arc<Mutex<Publication>>,
     wake: Condvar,
     wait: Mutex<()>,
     events: mpsc::UnboundedSender<Event>,
@@ -459,11 +491,11 @@ impl FailoverStream {
                 audio: writer,
                 last_sync: Instant::now(),
             }),
-            end: AtomicU64::new(end),
+            end: Arc::new(AtomicU64::new(end)),
             stop_requested: AtomicBool::new(resuming),
             input_closed: AtomicBool::new(resuming),
-            done: AtomicBool::new(false),
-            gate: Mutex::new(Publication {
+            done: Arc::new(AtomicBool::new(false)),
+            gate: Arc::new(Mutex::new(Publication {
                 fenced: false,
                 status: Status {
                     phase: if resuming { Phase::Local } else { Phase::Cloud },
@@ -474,7 +506,7 @@ impl FailoverStream {
                     worker_running: true,
                     error: None,
                 },
-            }),
+            })),
             wake: Condvar::new(),
             wait: Mutex::new(()),
             events,
@@ -611,19 +643,17 @@ impl FailoverStream {
     /// Current provenance, durable coverage, and pending lag.
     #[must_use]
     pub fn status(&self) -> Status {
-        let mut status = self
-            .shared
-            .gate
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .status
-            .clone();
-        status.written_sample = self.shared.end.load(Ordering::Acquire);
-        status.lag_samples = status
-            .written_sample
-            .saturating_sub(status.committed_sample);
-        status.worker_running = !self.shared.done.load(Ordering::Acquire);
-        status
+        StatusReader::snapshot(&self.shared.gate, &self.shared.end, &self.shared.done)
+    }
+
+    /// Observe lifecycle after stream drop without retaining model or file leases.
+    #[must_use]
+    pub fn status_reader(&self) -> StatusReader {
+        StatusReader {
+            gate: Arc::clone(&self.shared.gate),
+            end: Arc::clone(&self.shared.end),
+            done: Arc::clone(&self.shared.done),
+        }
     }
 }
 impl Drop for FailoverStream {
