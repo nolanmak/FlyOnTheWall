@@ -497,6 +497,11 @@ async fn serve_until_stopped(root: PathBuf, launch: Launch, port: u16) -> Result
         None
     };
 
+    server
+        .state()
+        .set_model_setup(Arc::new(crate::model_setup_control::DashboardModels::new(
+            root.parent().unwrap_or(&root).to_owned(),
+        )));
     if let Ok(db) = crate::open_library(&root) {
         server
             .state()

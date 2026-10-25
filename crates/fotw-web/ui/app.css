@@ -767,3 +767,11 @@ button, summary { min-height: 36px; }
 /* Reachable from a paused history viewport without scrolling past new speech. */
 .live-latest { position: sticky; bottom: 1rem; margin: .5rem 0; }
 .live-latest[hidden] { display: none; }
+
+.model-setup { padding: 0; margin-top: 20px; border-top: 1px solid var(--line); }
+.model-setup h3 { font-size: 15px; }
+.model-setup p { max-width: 85ch; }
+.model-metadata { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; color: var(--muted); }
+.model-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.model-setup progress { display: block; width: min(100%, 36rem); margin-top: 12px; }
+.model-setup a { color: var(--accent); }

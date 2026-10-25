@@ -37,6 +37,7 @@ struct Inner {
     /// Bound after construction, unlike every control above it — see
     /// [`AppState::set_health`].
     health: OnceLock<Arc<dyn DaemonHealth>>,
+    model_setup: OnceLock<Arc<dyn crate::model_setup::ModelSetupControl>>,
     speech: OnceLock<Arc<dyn crate::speech::SpeechControl>>,
     speech_recovery: OnceLock<Arc<dyn crate::speech_recovery::SpeechRecoveryControl>>,
     documents: OnceLock<Arc<dyn crate::documents::DocumentControl>>,
@@ -80,6 +81,15 @@ impl std::fmt::Debug for dyn MeetingSource {
 }
 
 impl AppState {
+    /// Register explicit model setup before accepting requests.
+    pub fn set_model_setup(&self, control: Arc<dyn crate::model_setup::ModelSetupControl>) {
+        let _ = self.inner.model_setup.set(control);
+    }
+    /// Read-only servers have no provisioning control.
+    pub fn model_setup(&self) -> Option<Arc<dyn crate::model_setup::ModelSetupControl>> {
+        self.inner.model_setup.get().cloned()
+    }
+
     /// Attach local saved-audio recovery before serving requests.
     pub fn set_speech_recovery(
         &self,
@@ -173,6 +183,7 @@ impl AppState {
                 summarize,
                 health: OnceLock::new(),
                 documents: OnceLock::new(),
+                model_setup: OnceLock::new(),
                 speech: OnceLock::new(),
                 speech_recovery: OnceLock::new(),
                 tickets: TokenTable::new(WS_TICKET_TTL),

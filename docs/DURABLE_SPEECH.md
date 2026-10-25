@@ -109,8 +109,8 @@ Validation uses temporary stores, actual loopback HTTP faults and a hard-killed
 owned installer process. A network-denied real CLI import and source-absent
 restart also verified the previously approved cached small.en file. These are
 file-provisioning checks, not model quality, sustained performance or physical
-capture acceptance. Progress currently appears in the CLI; an in-dashboard
-installer remains future work under #33.
+capture acceptance. Progress appears in the CLI and the dashboard’s explicit model setup panel.
+The complete model quality, resource and physical gates remain under #33/#118.
 
 ## Capture and admission
 
@@ -433,3 +433,32 @@ recovery. They do not reconstruct canonical speech audio from raw PCM; the
 saved-meeting requirements above still apply to startup inference. Device-free
 contracts include hard process kill/reacquisition,
 live-owner exclusion, Stop/drain clock preservation, tails and corrupt evidence.
+
+
+## Dashboard model setup ownership
+
+The Transcription panel reads `/api/models` without loading a model, creating
+model directories, resolving keys or starting a transfer. Its catalog contains
+the same pinned revision, byte size, SHA-256 and MIT model-card link as the CLI.
+File presence is distinct from checksum verification and native readiness.
+Only explicit Download or Verify and import actions post to `/api/models/install`.
+Import uses an absolute local path and supports cache symlinks on the read side.
+Neither setup completion nor a status poll selects a model or rewrites the
+saved speech policy. Choose the installed name/path and save transcription
+separately. No paid provider, speech request or model inference is part of setup.
+
+A daemon-owned blocking worker retains the setup job through HTTP cancellation,
+page navigation and blocked IO/source destruction. The existing installer holds
+recording exclusion through that work. One setup job can run per controller;
+the OS lease also excludes other controllers/processes using the same library.
+Cancellation carries a UUID job identity across daemon restarts, refuses stale
+jobs, and loses once verified publication begins. Stopping retains
+`worker_running` and retry refusal until the installer actually returns.
+Verified bytes can briefly be reported while cleanup still runs; this is not
+a promise of native transcription readiness. Daemon shutdown requests
+cancellation but cannot forcibly interrupt an outstanding OS call.
+
+Browser status is refreshed after uncertain actions rather than retrying them
+automatically. Reloading a page resumes observation of the daemon's job. A
+daemon restart resets in-memory progress; the verified file and the installer's
+reserved-partial/explicit-retry protocol survive. No new weights are bundled.
