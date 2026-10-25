@@ -464,6 +464,26 @@ enum Command {
     Close(oneshot::Sender<()>),
 }
 
+/// Metadata-only observer of a local worker's native resource lifetime.
+/// Keeping this reader never retains a stream, recognizer or model factory.
+#[derive(Clone, Debug)]
+pub struct LocalWorkerStatus(Arc<AtomicBool>);
+
+impl LocalWorkerStatus {
+    /// True until the worker and its recognizer have finished dropping.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+struct WorkerExit(LocalWorkerStatus);
+impl Drop for WorkerExit {
+    fn drop(&mut self) {
+        self.0.0.store(false, Ordering::Release);
+    }
+}
+
 /// One leg transcribed on this machine.
 ///
 /// The same shape as [`crate::DeepgramStream`] — `write`, `flush`, `close` and
@@ -477,6 +497,7 @@ pub struct LocalStream {
     closed: Arc<AtomicBool>,
     /// Samples written and not yet taken by the worker.
     backlog: Arc<AtomicU64>,
+    worker: LocalWorkerStatus,
 }
 
 impl LocalStream {
@@ -506,9 +527,16 @@ impl LocalStream {
             warned_behind: false,
             aborted: aborted.clone(),
         };
+        let status = LocalWorkerStatus(Arc::new(AtomicBool::new(true)));
+        let worker_exit = WorkerExit(status.clone());
         if let Err(error) = std::thread::Builder::new()
             .name(name.to_owned())
-            .spawn(move || worker.run(&mut command_rx))
+            .spawn(move || {
+                // Declared before run: unwind and ordinary return both release
+                // the recognizer and worker's factory before publishing exit.
+                let _worker_exit = worker_exit;
+                worker.run(&mut command_rx);
+            })
         {
             let _ = event_tx.send(StreamEvent::Error(
                 SttError::new(
@@ -527,9 +555,16 @@ impl LocalStream {
                 events: event_tx.downgrade(),
                 closed: Arc::new(AtomicBool::new(false)),
                 backlog,
+                worker: status,
             },
             event_rx,
         )
+    }
+
+    /// Observe native worker ownership independently of the stream handle.
+    #[must_use]
+    pub fn worker_status(&self) -> LocalWorkerStatus {
+        self.worker.clone()
     }
 
     /// Hand the worker 16 kHz mono PCM without blocking capture.

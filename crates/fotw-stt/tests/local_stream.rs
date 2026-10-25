@@ -255,8 +255,14 @@ async fn wedged_model_cannot_hold_close_or_publish_after_timeout() {
             release: Mutex::new(blocked),
         }),
     );
+    let status = stream.worker_status();
+    assert!(status.is_running());
     stream.write(&speech(1000));
     let result = stream.close().await;
+    assert!(
+        status.is_running(),
+        "timeout cannot release blocked native ownership"
+    );
     let mut announced = false;
     while let Ok(event) = events.try_recv() {
         if let StreamEvent::Error(error) = event {
@@ -276,5 +282,73 @@ async fn wedged_model_cannot_hold_close_or_publish_after_timeout() {
     assert!(
         events.iter().all(|e| e.final_segment().is_none()),
         "late results after timeout cannot be published"
+    );
+}
+
+struct DroppingRecognizer {
+    entered: Option<tokio::sync::oneshot::Sender<()>>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+impl Recognizer for DroppingRecognizer {
+    fn transcribe(&mut self, _: &[f32]) -> Result<Vec<Recognized>, SttError> {
+        Ok(Vec::new())
+    }
+}
+impl Drop for DroppingRecognizer {
+    fn drop(&mut self) {
+        let _ = self.entered.take().unwrap().send(());
+        let _ = self.release.recv_timeout(std::time::Duration::from_secs(5));
+    }
+}
+struct DroppingFactory(Mutex<Option<DroppingRecognizer>>);
+impl RecognizerFactory for DroppingFactory {
+    fn model(&self) -> &str {
+        "drop-fixture"
+    }
+    fn language(&self) -> Option<&str> {
+        None
+    }
+    fn create(&self) -> Result<Box<dyn Recognizer>, SttError> {
+        Ok(Box::new(self.0.lock().unwrap().take().unwrap()))
+    }
+}
+
+#[tokio::test]
+async fn close_ack_and_handle_drop_do_not_claim_native_resources_are_released() {
+    let (entered, dropping) = tokio::sync::oneshot::channel();
+    let (release, blocked) = std::sync::mpsc::channel();
+    let engine = Arc::new(DroppingFactory(Mutex::new(Some(DroppingRecognizer {
+        entered: Some(entered),
+        release: blocked,
+    }))));
+    let weak_engine = Arc::downgrade(&engine);
+    let (stream, _events) = LocalStream::open(
+        LocalStreamConfig::new("worker-lifetime", Source::System),
+        engine,
+    );
+    let status = stream.worker_status();
+    let observer = status.clone();
+    stream.close().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), dropping)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(stream);
+    assert!(
+        status.is_running(),
+        "close ack is not proof native destructor finished"
+    );
+    release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while status.is_running() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!observer.is_running());
+    assert!(
+        weak_engine.upgrade().is_none(),
+        "telemetry must not retain the model factory"
     );
 }
