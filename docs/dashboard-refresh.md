@@ -114,7 +114,7 @@ The runtime regression first failed because opening 4,001 lines constructed all
 rows and there was no keyboard-accessible page selector. It now traverses every
 page, verifies exact ordered coverage, bounds row construction for each action,
 checks full copy, original input identity, invalid input, short/empty meetings,
-and stable control identity. All 129 UI tests and full local `just ci` pass.
+and stable control identity. All 130 UI tests and full local `just ci` pass.
 
 An owned nonpersistent, nonactivating WKWebView on macOS 26.4 loaded the actual
 UI from a temporary encrypted `ui_preview` library. The in-memory fixture
@@ -131,7 +131,7 @@ clipboard, global input or user library was involved.
 | --- | ---: | ---: |
 | Created elements, including detail chrome | 48,016 | 819 |
 | Attached transcript rows | 12,001 | 200 |
-| Script plus forced layout | 630 ms | 40 ms |
+| Script plus forced layout | 659 ms | 41 ms |
 
 These timings describe one fixture run, not a general latency guarantee or a
 process-memory measurement. The final six width/appearance checks and actual
@@ -151,3 +151,11 @@ cannot prove active-window focus-ring acceptance; no activation was attempted.
 The existing focus rule remains. Long-history process memory/GC, active-window
 keyboard/screen-reader acceptance, and the full live recording/zoom matrix remain
 open for #123. All owned fixture processes and temporary libraries were removed.
+
+Review followup: a behavioral RED reproduced losing control focus when Next or
+Previous became disabled at a page boundary. The renderer now moves focus to
+the page field before disabling the activated button. The native fixture
+confirms both boundaries in every final width/appearance/zoom run, and the
+runtime copy assertion checks all 4,001 copied lines in order. The browser
+fixture is a standard async function; pass its source followed by
+`return await runSavedTranscriptFixture();` to `WKWebView.callAsyncJavaScript`.

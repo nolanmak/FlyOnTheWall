@@ -3,20 +3,22 @@
     "after": {
       "attached_rows": 200,
       "created_elements": 819,
-      "layout_ms": 40
+      "layout_ms": 41
     },
     "appearance": "light",
     "before": {
       "attached_rows": 12001,
       "created_elements": 48016,
-      "layout_ms": 630
+      "layout_ms": 659
     },
     "controls_fit": true,
     "copy_complete": true,
     "final_clock": "600:00",
     "final_next_disabled": true,
+    "first_boundary_focus": true,
     "focus_outline": "none",
     "focus_preserved": true,
+    "last_boundary_focus": true,
     "last_line_reachable": true,
     "native_tab_reached_next": true,
     "next_focus_visible": false,
@@ -29,15 +31,17 @@
     "after": {
       "attached_rows": 200,
       "created_elements": 819,
-      "layout_ms": 23.000000000000014
+      "layout_ms": 23
     },
     "appearance": "dark",
     "controls_fit": true,
     "copy_complete": true,
     "final_clock": "600:00",
     "final_next_disabled": true,
+    "first_boundary_focus": true,
     "focus_outline": "none",
     "focus_preserved": true,
+    "last_boundary_focus": true,
     "last_line_reachable": true,
     "native_tab_reached_next": true,
     "next_focus_visible": false,
@@ -45,27 +49,6 @@
     "range": "Lines 1\u2013200 of 12001 \u00b7 0:00\u20139:57",
     "segments": 12001,
     "width": 390
-  },
-  {
-    "after": {
-      "attached_rows": 200,
-      "created_elements": 819,
-      "layout_ms": 28
-    },
-    "appearance": "light",
-    "controls_fit": true,
-    "copy_complete": true,
-    "final_clock": "600:00",
-    "final_next_disabled": true,
-    "focus_outline": "none",
-    "focus_preserved": true,
-    "last_line_reachable": true,
-    "native_tab_reached_next": true,
-    "next_focus_visible": false,
-    "no_horizontal_overflow": true,
-    "range": "Lines 1\u2013200 of 12001 \u00b7 0:00\u20139:57",
-    "segments": 12001,
-    "width": 768
   },
   {
     "after": {
@@ -73,13 +56,15 @@
       "created_elements": 819,
       "layout_ms": 29
     },
-    "appearance": "dark",
+    "appearance": "light",
     "controls_fit": true,
     "copy_complete": true,
     "final_clock": "600:00",
     "final_next_disabled": true,
+    "first_boundary_focus": true,
     "focus_outline": "none",
     "focus_preserved": true,
+    "last_boundary_focus": true,
     "last_line_reachable": true,
     "native_tab_reached_next": true,
     "next_focus_visible": false,
@@ -92,36 +77,40 @@
     "after": {
       "attached_rows": 200,
       "created_elements": 819,
-      "layout_ms": 28
-    },
-    "appearance": "light",
-    "controls_fit": true,
-    "copy_complete": true,
-    "final_clock": "600:00",
-    "final_next_disabled": true,
-    "focus_outline": "none",
-    "focus_preserved": true,
-    "last_line_reachable": true,
-    "native_tab_reached_next": true,
-    "next_focus_visible": false,
-    "no_horizontal_overflow": true,
-    "range": "Lines 1\u2013200 of 12001 \u00b7 0:00\u20139:57",
-    "segments": 12001,
-    "width": 1440
-  },
-  {
-    "after": {
-      "attached_rows": 200,
-      "created_elements": 819,
-      "layout_ms": 25
+      "layout_ms": 30
     },
     "appearance": "dark",
     "controls_fit": true,
     "copy_complete": true,
     "final_clock": "600:00",
     "final_next_disabled": true,
+    "first_boundary_focus": true,
     "focus_outline": "none",
     "focus_preserved": true,
+    "last_boundary_focus": true,
+    "last_line_reachable": true,
+    "native_tab_reached_next": true,
+    "next_focus_visible": false,
+    "no_horizontal_overflow": true,
+    "range": "Lines 1\u2013200 of 12001 \u00b7 0:00\u20139:57",
+    "segments": 12001,
+    "width": 768
+  },
+  {
+    "after": {
+      "attached_rows": 200,
+      "created_elements": 819,
+      "layout_ms": 26
+    },
+    "appearance": "light",
+    "controls_fit": true,
+    "copy_complete": true,
+    "final_clock": "600:00",
+    "final_next_disabled": true,
+    "first_boundary_focus": true,
+    "focus_outline": "none",
+    "focus_preserved": true,
+    "last_boundary_focus": true,
     "last_line_reachable": true,
     "native_tab_reached_next": true,
     "next_focus_visible": false,
@@ -134,15 +123,40 @@
     "after": {
       "attached_rows": 200,
       "created_elements": 819,
-      "layout_ms": 38
+      "layout_ms": 27
+    },
+    "appearance": "dark",
+    "controls_fit": true,
+    "copy_complete": true,
+    "final_clock": "600:00",
+    "final_next_disabled": true,
+    "first_boundary_focus": true,
+    "focus_outline": "none",
+    "focus_preserved": true,
+    "last_boundary_focus": true,
+    "last_line_reachable": true,
+    "native_tab_reached_next": true,
+    "next_focus_visible": false,
+    "no_horizontal_overflow": true,
+    "range": "Lines 1\u2013200 of 12001 \u00b7 0:00\u20139:57",
+    "segments": 12001,
+    "width": 1440
+  },
+  {
+    "after": {
+      "attached_rows": 200,
+      "created_elements": 819,
+      "layout_ms": 39
     },
     "appearance": "light",
     "controls_fit": true,
     "copy_complete": true,
     "final_clock": "600:00",
     "final_next_disabled": true,
+    "first_boundary_focus": true,
     "focus_outline": "none",
     "focus_preserved": true,
+    "last_boundary_focus": true,
     "last_line_reachable": true,
     "native_tab_reached_next": true,
     "next_focus_visible": false,

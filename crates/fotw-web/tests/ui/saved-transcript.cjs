@@ -14,6 +14,7 @@ function harness() {
     addEventListener(k,f){this.listeners[k]=f;}
     setAttribute(k,v){this[k]=v;}
     scrollIntoView(){this.scrolled=true;}
+    focus(){document.activeElement=this;}
     click(){if(!this.disabled)this.listeners.click?.();}
   }
   const root=new Element('body'),detail=root.appendChild(new Element('section'));detail.id='detail';
@@ -41,8 +42,16 @@ test('opening a long saved transcript bounds rendering work and every line remai
  }
  assert.deepEqual(seen,segs.map(s=>s.text));
  assert.equal(h.button('Next transcript page').disabled,true);
- assert.match(h.ctx.storedTranscriptPayload({meeting:{title:'All'},segments:segs}).text,/line 0 日本語 😀/);
- assert.match(h.ctx.storedTranscriptPayload({meeting:{title:'All'},segments:segs}).text,/line 4000 日本語 😀/);
+ const copied=h.ctx.storedTranscriptPayload({meeting:{title:'All'},segments:segs}).text;
+ assert.deepEqual(copied.match(/line \d+ 日本語 😀/g),segs.map(s=>s.text));
+});
+test('boundary navigation moves focus before disabling the activated control',()=>{
+ const h=harness();render(h,segments(401));
+ const next=h.button('Next transcript page'),previous=h.button('Previous transcript page'),field=h.button('Transcript page');
+ next.focus();next.click();assert.equal(h.document.activeElement,next);
+ next.click();assert.equal(next.disabled,true);assert.equal(h.document.activeElement,field);
+ previous.focus();previous.click();assert.equal(h.document.activeElement,previous);
+ previous.click();assert.equal(previous.disabled,true);assert.equal(h.document.activeElement,field);
 });
 test('page selection uses the full speech clock, validates input and retains controls for keyboard focus',()=>{
  const h=harness(),segs=segments(601),before=JSON.stringify(segs);render(h,segs);

@@ -2,6 +2,7 @@
 // It replaces fetched meeting data in memory; it never captures audio or writes
 // fabricated meetings to the user's library. The optional baseline renderer is
 // supplied from the base commit by the external comparison runner.
+async function runSavedTranscriptFixture() {
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 const wait=async condition=>{const until=Date.now()+10000;while(!condition()){if(Date.now()>until)throw Error('saved transcript fixture timed out');await sleep(30);}};
 await wait(()=>document.querySelectorAll('#list .meeting').length===3);
@@ -31,6 +32,12 @@ result.final_clock=document.querySelector('#segments .at').textContent;
 result.copy_complete=storedTranscriptPayload(detail).text.includes('Synthetic line 0 —')&&storedTranscriptPayload(detail).text.includes('Synthetic line 12000 —');
 result.final_next_disabled=next.disabled;
 if(!result.focus_preserved||!result.last_line_reachable||!result.copy_complete||!result.final_next_disabled||result.final_clock!=='600:00')throw Error(JSON.stringify(result));
+field.value='60';field.dispatchEvent(new Event('change'));next.focus();next.click();
+result.last_boundary_focus=document.activeElement===field;
+field.value='2';field.dispatchEvent(new Event('change'));
+const previous=document.querySelector('[aria-label="Previous transcript page"]');previous.focus();previous.click();
+result.first_boundary_focus=document.activeElement===field;
+if(!result.last_boundary_focus||!result.first_boundary_focus)throw Error(JSON.stringify(result));
 field.value='1';field.dispatchEvent(new Event('change'));
 // The actual focused input receives a native Tab event within this owned window.
 field.focus();window.webkit.messageHandlers.fixtureTab.postMessage({option:true});await sleep(100);
@@ -48,3 +55,4 @@ if(!result.native_tab_reached_next||!result.controls_fit||!result.no_horizontal_
 document.querySelector('.transcript-pages').scrollIntoView({block:'start'});
 await sleep(50);
 return result;
+}

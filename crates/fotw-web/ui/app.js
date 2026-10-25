@@ -592,6 +592,10 @@ function mountSavedTranscript(section, body, segments) {
     }
     if (controls) {
       field.value = String(page + 1);
+      // Disabling a focused button can clear focus in WebKit. Transfer it
+      // before updating boundary state; ordinary page changes keep focus.
+      if ((page === 0 && document.activeElement === previous)
+          || (page === pages - 1 && document.activeElement === next)) field.focus();
       previous.disabled = page === 0;
       next.disabled = page === pages - 1;
       range.textContent = "Lines " + (start + 1) + "–" + end + " of " + ordered.length
