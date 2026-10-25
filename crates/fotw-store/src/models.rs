@@ -180,7 +180,7 @@ impl NewMeeting {
 }
 
 /// One transcript segment, as the STT layer produces them.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewSegment {
     /// Position within the transcript. Unique per transcript, and the reason
     /// re-running a provider cannot interleave with an existing run.

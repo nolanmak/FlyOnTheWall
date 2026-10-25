@@ -41,6 +41,54 @@ pub fn persist_session(db: &mut Db, outcome: &SessionOutcome, title: &str) -> St
             })
         })
         .transpose()?;
+    // A source journal is authoritative. Its original identities/receipts must
+    // bypass text dedupe and the legacy end-only capture retry path.
+    if let Some(prepared) = speech_sources(outcome)? {
+        let ended = capture_end.ok_or_else(|| {
+            fotw_store::StoreError::InvalidArgument(
+                "durable speech projection requires a frozen capture clock".into(),
+            )
+        })?;
+        let session = outcome
+            .dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                fotw_store::StoreError::InvalidArgument("capture has no session identity".into())
+            })?;
+        let mut meeting = NewMeeting::new(device_id(), timezone());
+        meeting.title = title.into();
+        meeting.started_at_ms = i64::try_from(outcome.started_at_ms).map_err(|_| {
+            fotw_store::StoreError::InvalidArgument("capture clock exceeds storage range".into())
+        })?;
+        let id = db.finalize_speech_capture(session, meeting, ended, &prepared.sources)?;
+        // The SQL commit is already durable. A failed acknowledgement can be
+        // retried idempotently; it must never authorize deleting unsaved text.
+        for checkpoint in prepared.checkpoints {
+            let path = outcome.dir.join(match checkpoint.source {
+                Source::System => "system.stt-projected.json",
+                Source::Mic => "mic.stt-projected.json",
+            });
+            let projected = (|| {
+                let source = match checkpoint.source {
+                    Source::System => fotw_pipeline::replay::ReplaySource::System,
+                    Source::Mic => fotw_pipeline::replay::ReplaySource::Mic,
+                };
+                let mut reader =
+                    fotw_pipeline::replay::ReplayReader::open(&outcome.dir, session, source)?;
+                if reader.is_complete()? && reader.saved_end()? == checkpoint.through_sample {
+                    reader.mark_projected(checkpoint.through_sample, checkpoint.journal_bytes)?;
+                }
+                Ok::<_, std::io::Error>(())
+            })();
+            projected.map_err(|source| fotw_store::StoreError::Io {
+                context: "acknowledging speech projection",
+                path,
+                source,
+            })?;
+        }
+        return Ok(id);
+    }
     // Cross-leg dedupe happens HERE, not at session end: `stt.jsonl` is the
     // crash-recovery record and stays raw, so a matcher misfire is always
     // recoverable from the session directory. The database — and everything
@@ -121,6 +169,211 @@ pub fn persist_session(db: &mut Db, outcome: &SessionOutcome, title: &str) -> St
     // library shows every finished meeting as still running.
     db.meetings().set_state(&meeting_id, "ready")?;
     Ok(meeting_id)
+}
+
+/// Refresh a claimed session's source receipts before startup promotion can
+/// retire its files. This also repairs a crash between SQL commit and the
+/// filesystem acknowledgement, using the original saved capture clock.
+pub fn refresh_speech_projection(
+    db: &mut Db,
+    dir: &std::path::Path,
+    meeting_id: &str,
+) -> StoreResult<()> {
+    let has_journal = ["system.stt-coverage.jsonl", "mic.stt-coverage.jsonl"]
+        .iter()
+        .map(|name| dir.join(name).try_exists())
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|source| fotw_store::StoreError::Io {
+            context: "inspecting pending speech",
+            path: dir.to_owned(),
+            source,
+        })?
+        .into_iter()
+        .any(|exists| exists);
+    if !has_journal {
+        return Ok(());
+    }
+    let session = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            fotw_store::StoreError::InvalidArgument("capture has no session identity".into())
+        })?;
+    if db.session_note_meeting(session)?.as_deref() != Some(meeting_id) {
+        return Err(fotw_store::StoreError::InvalidArgument(
+            "pending speech has no matching saved capture identity".into(),
+        ));
+    }
+    let (started, elapsed) = db.session_note_clock(session)?.ok_or_else(|| {
+        fotw_store::StoreError::InvalidArgument("pending speech has no saved capture clock".into())
+    })?;
+    let ended = started
+        .checked_add(elapsed)
+        .ok_or_else(|| fotw_store::StoreError::InvalidArgument("capture clock overflow".into()))?;
+    let title = db.meetings().get(meeting_id)?.title;
+    let outcome = SessionOutcome {
+        dir: dir.to_owned(),
+        started_at_ms: u64::try_from(started).map_err(|_| {
+            fotw_store::StoreError::InvalidArgument("invalid saved capture start".into())
+        })?,
+        capture_ended_at_ms: Some(u64::try_from(ended).map_err(|_| {
+            fotw_store::StoreError::InvalidArgument("invalid saved capture end".into())
+        })?),
+        ..Default::default()
+    };
+    let projected = persist_session(db, &outcome, &title)?;
+    if projected != meeting_id {
+        return Err(fotw_store::StoreError::InvalidArgument(
+            "speech projection changed capture identity".into(),
+        ));
+    }
+    Ok(())
+}
+
+struct ProjectionCheckpoint {
+    source: Source,
+    through_sample: u64,
+    journal_bytes: u64,
+}
+struct PreparedProjection {
+    sources: Vec<fotw_store::SpeechSource>,
+    checkpoints: Vec<ProjectionCheckpoint>,
+}
+
+fn speech_sources(outcome: &SessionOutcome) -> StoreResult<Option<PreparedProjection>> {
+    use crate::failover::coverage::CoverageJournal;
+    use fotw_store::{SpeechCommit, SpeechEpoch, SpeechSegment, SpeechSource, StoreError};
+    let session = outcome
+        .dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let mut sources = Vec::new();
+    let mut checkpoints = Vec::new();
+    let integer = |value| {
+        i64::try_from(value).map_err(|_| {
+            StoreError::InvalidArgument("speech sample clock exceeds storage range".into())
+        })
+    };
+    for (source, channel) in [(Source::System, "system"), (Source::Mic, "mic")] {
+        let path = outcome.dir.join(format!("{channel}.stt-coverage.jsonl"));
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(StoreError::Io {
+                    context: "inspecting speech journal",
+                    path,
+                    source,
+                });
+            }
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(StoreError::InvalidArgument(
+                    "speech journal is not an ordinary file".into(),
+                ));
+            }
+            Ok(_) => {}
+        }
+        let snapshot =
+            CoverageJournal::snapshot(&outcome.dir, session, source).map_err(|source| {
+                StoreError::Io {
+                    context: "reading speech journal",
+                    path,
+                    source,
+                }
+            })?;
+        let through_sample = snapshot.commits.last().map_or_else(
+            || snapshot.epochs[0].from_sample,
+            |commit| commit.through_sample,
+        );
+        checkpoints.push(ProjectionCheckpoint {
+            source,
+            through_sample,
+            journal_bytes: snapshot.valid_bytes,
+        });
+        let epochs = snapshot
+            .epochs
+            .iter()
+            .map(|epoch| {
+                Ok(SpeechEpoch {
+                    number: integer(epoch.number)?,
+                    from_sample: integer(epoch.from_sample)?,
+                    provider: epoch.engine.provider.clone(),
+                    model: epoch.engine.model.clone(),
+                    revision: epoch.engine.revision.clone(),
+                    capabilities: serde_json::to_value(&epoch.engine.capabilities).map_err(
+                        |_| StoreError::InvalidArgument("invalid speech capabilities".into()),
+                    )?,
+                    reason: epoch.reason.map(|reason| {
+                        serde_json::to_value(reason)
+                            .expect("switch reason is serializable")
+                            .as_str()
+                            .expect("switch reason is a string")
+                            .to_owned()
+                    }),
+                })
+            })
+            .collect::<StoreResult<Vec<_>>>()?;
+        let commits = snapshot
+            .commits
+            .iter()
+            .map(|commit| {
+                let segments = commit
+                    .segments
+                    .iter()
+                    .enumerate()
+                    .map(|(index, segment)| {
+                        let mut segment = segment.clone();
+                        let namespace = |label: &str| {
+                            if source == Source::Mic && label == "me" {
+                                "me".into()
+                            } else {
+                                format!("{channel}:e{}:{label}", commit.epoch)
+                            }
+                        };
+                        segment.speaker = segment.speaker.as_deref().map(namespace);
+                        for word in &mut segment.words {
+                            word.speaker = word.speaker.as_deref().map(namespace);
+                        }
+                        Ok(SpeechSegment {
+                            id: segment.id.clone(),
+                            words: segment
+                                .words
+                                .iter()
+                                .map(|word| {
+                                    serde_json::to_value(word).map_err(|_| {
+                                        StoreError::InvalidArgument(
+                                            "invalid speech word record".into(),
+                                        )
+                                    })
+                                })
+                                .collect::<StoreResult<Vec<_>>>()?,
+                            timestamp_source: match segment.timestamp_source {
+                                fotw_stt::TimestampSource::Provider => "provider",
+                                fotw_stt::TimestampSource::Estimated => "estimated",
+                            }
+                            .into(),
+                            row: to_row(index as i64, &segment),
+                        })
+                    })
+                    .collect::<StoreResult<Vec<_>>>()?;
+                Ok(SpeechCommit {
+                    epoch: integer(commit.epoch)?,
+                    from_sample: integer(commit.from_sample)?,
+                    through_sample: integer(commit.through_sample)?,
+                    segments,
+                })
+            })
+            .collect::<StoreResult<Vec<_>>>()?;
+        sources.push(SpeechSource {
+            source: channel.into(),
+            epochs,
+            commits,
+        });
+    }
+    Ok((!sources.is_empty()).then_some(PreparedProjection {
+        sources,
+        checkpoints,
+    }))
 }
 
 /// The primary transcript for a meeting, if it has one.

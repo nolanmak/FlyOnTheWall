@@ -134,6 +134,14 @@ impl Promotion {
 /// no error path that removes it.
 #[derive(Debug, thiserror::Error)]
 pub enum PromoteError {
+    /// Published media exists, but lossless replay still needs this directory.
+    #[error("session {dir} retained for transcription: {reason}")]
+    PendingTranscription {
+        /// Session whose input must survive.
+        dir: PathBuf,
+        /// Missing completion, active ownership, or invalid completion data.
+        reason: String,
+    },
     /// No session directory, or no manifest in it.
     #[error("no session at {dir}")]
     NoSession {
@@ -359,12 +367,25 @@ pub fn retire(
         })?;
     verify(root, promoted)?;
 
+    let replay_guard = crate::replay::retirement_guard(dir, &manifest.id)
+        .map_err(|error| PromoteError::PendingTranscription {
+            dir: dir.to_owned(),
+            reason: error.to_string(),
+        })?
+        .ok_or_else(|| PromoteError::PendingTranscription {
+            dir: dir.to_owned(),
+            reason: "transcription is pending or a source is still open".into(),
+        })?;
+
     let freed = dir_bytes(dir);
     // Rename first: `remove_dir_all` can die half-way and leave a directory
     // that no longer has a manifest to identify itself with, which a later
     // scan cannot tell from a live session. A rename cannot.
     let retired = sibling(dir, RETIRED_SUFFIX);
     std::fs::rename(dir, &retired).map_err(io("retiring the session directory", dir))?;
+    // The original path is now gone, so a new writer cannot resume there.
+    // Release handles before unlinking for platforms that defer open-file deletion.
+    drop(replay_guard);
     std::fs::remove_dir_all(&retired).map_err(io("removing the retired session", &retired))?;
     Ok(freed)
 }
@@ -395,15 +416,22 @@ pub fn promote(
     if let Some(done) = manifest.promoted.clone()
         && verify(root, &done).is_ok()
     {
-        retire(dir, root)?;
+        retire_finished_replay(dir, root)?;
         return Ok(done);
     }
 
     encode(dir)?;
     let promotion = publish(dir, root)?;
     stamp(dir, &promotion)?;
-    retire(dir, root)?;
+    retire_finished_replay(dir, root)?;
     Ok(promotion)
+}
+
+fn retire_finished_replay(dir: &Path, root: &Path) -> Result<(), PromoteError> {
+    match retire(dir, root) {
+        Ok(_) | Err(PromoteError::PendingTranscription { .. }) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Every finalized, claimed session under `sessions_root` still awaiting

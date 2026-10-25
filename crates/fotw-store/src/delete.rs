@@ -455,6 +455,7 @@ mod tests {
     /// appears in the file at all — a byte scan for it would then pass against
     /// an index that had kept every word.
     const TOKEN: &str = "vorpalsnickersnack";
+    const RECEIPT_PHRASE: &str = "original-inference-must-also-disappear";
 
     /// Build an *unencrypted* library, seed it, delete the meeting, and scan
     /// the raw file bytes.
@@ -512,6 +513,11 @@ mod tests {
                 ])
                 .unwrap();
             }
+            c.execute("INSERT INTO speech_epochs(id,meeting_id,transcript_id,session_id,source,epoch,from_sample,provider,model,capabilities_json) VALUES('fixture-epoch',?1,?2,'fixture-session','system',0,0,'fixture','fixture','{}')",params![meeting_id,transcript_id]).unwrap();
+            let payload =
+                serde_json::to_string(&serde_json::json!({"original": RECEIPT_PHRASE.repeat(300)}))
+                    .unwrap();
+            c.execute("INSERT INTO speech_receipts(id,meeting_id,transcript_id,epoch_id,from_sample,through_sample,payload_json) VALUES('fixture-receipt',?1,?2,'fixture-epoch',0,16000,?3)",params![meeting_id,transcript_id,payload]).unwrap();
         }
         db.conn()
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -519,7 +525,7 @@ mod tests {
 
         // Sanity: both needles really are in the file before the delete, so a
         // zero-hit result afterwards means something.
-        for needle in [PHRASE, TOKEN] {
+        for needle in [PHRASE, TOKEN, RECEIPT_PHRASE] {
             assert!(
                 file_contains(&path, needle.as_bytes()),
                 "fixture is broken: `{needle}` should be in the plaintext file before deletion"
@@ -568,7 +574,7 @@ mod tests {
 
         for suffix in ["", "-wal", "-shm"] {
             let p = PathBuf::from(format!("{}{suffix}", path.display()));
-            for needle in [PHRASE, TOKEN] {
+            for needle in [PHRASE, TOKEN, RECEIPT_PHRASE] {
                 assert!(
                     !file_contains(&p, needle.as_bytes()),
                     "`{needle}` survived deletion in {}",

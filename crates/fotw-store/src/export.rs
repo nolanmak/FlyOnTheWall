@@ -236,6 +236,39 @@ row_type!(
 );
 
 row_type!(
+    /// Immutable source/provider provenance for a durable speech transcript.
+    SpeechEpochRow, "speech_epochs",
+    pk = ["id"], exclusive = [], {
+        id: String,
+        meeting_id: String,
+        transcript_id: String,
+        session_id: String,
+        source: String,
+        epoch: i64,
+        from_sample: i64,
+        provider: String,
+        model: String,
+        revision: Option<String>,
+        capabilities_json: String,
+        reason: Option<String>,
+    }
+);
+
+row_type!(
+    /// Original immutable inference payload; projected text can be corrected.
+    SpeechReceiptRow, "speech_receipts",
+    pk = ["id"], exclusive = [], {
+        id: String,
+        meeting_id: String,
+        transcript_id: String,
+        epoch_id: String,
+        from_sample: i64,
+        through_sample: i64,
+        payload_json: String,
+    }
+);
+
+row_type!(
     /// A row of `folders`.
     FolderRow, "folders",
     pk = ["id"], exclusive = [], {
@@ -578,6 +611,12 @@ pub struct MeetingDoc {
     pub transcripts: Vec<TranscriptRow>,
     /// Every segment of every transcript.
     pub segments: Vec<SegmentRow>,
+    /// Source/provider history. Absent in archives preceding durable speech.
+    #[serde(default)]
+    pub speech_epochs: Vec<SpeechEpochRow>,
+    /// Original interval receipts for idempotent recovery after import.
+    #[serde(default)]
+    pub speech_receipts: Vec<SpeechReceiptRow>,
     /// The note document, if there is one.
     pub notes: Vec<NoteRow>,
     /// Its anchors.
@@ -636,6 +675,8 @@ impl Db {
                 .next(),
             transcripts: self.fetch_by_meeting("ORDER BY id", meeting_id)?,
             segments: self.fetch_by_meeting("ORDER BY transcript_id, idx", meeting_id)?,
+            speech_epochs: self.fetch_by_meeting("ORDER BY session_id,source,epoch", meeting_id)?,
+            speech_receipts: self.fetch_by_meeting("ORDER BY epoch_id,from_sample", meeting_id)?,
             notes: self.fetch_by_meeting("ORDER BY id", meeting_id)?,
             note_anchors: self.fetch_by_meeting("ORDER BY note_id, block_idx", meeting_id)?,
             summaries: self.fetch_by_meeting("ORDER BY version", meeting_id)?,
@@ -757,6 +798,8 @@ impl_table_row!(
     MeetingTagRow,
     TranscriptRow,
     SegmentRow,
+    SpeechEpochRow,
+    SpeechReceiptRow,
     NoteRow,
     NoteAnchorRow,
     SummaryRow,

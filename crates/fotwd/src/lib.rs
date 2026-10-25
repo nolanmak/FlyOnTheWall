@@ -13,6 +13,7 @@ pub mod documents;
 pub mod engine;
 pub mod engine_control;
 pub mod enrich;
+pub mod failover;
 pub mod github;
 pub mod health;
 pub mod journal;

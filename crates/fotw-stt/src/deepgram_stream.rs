@@ -38,7 +38,7 @@
 //! option alone neither extends the replay ring nor implements failover.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
@@ -175,8 +175,19 @@ impl DeepgramStreamConfig {
 }
 
 /// A command from the application to the connection driver.
+struct QueuedPcm {
+    samples: Vec<i16>,
+    pending: Arc<AtomicUsize>,
+}
+
+impl Drop for QueuedPcm {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(self.samples.len(), Ordering::AcqRel);
+    }
+}
+
 enum Command {
-    Audio(Vec<i16>),
+    Audio(QueuedPcm),
     Flush(oneshot::Sender<()>),
     Close(oneshot::Sender<()>),
 }
@@ -189,6 +200,8 @@ enum Command {
 pub struct DeepgramStream {
     commands: mpsc::UnboundedSender<Command>,
     closed: Arc<AtomicBool>,
+    pending_samples: Arc<AtomicUsize>,
+    driver_abort: tokio::task::AbortHandle,
 }
 
 impl DeepgramStream {
@@ -212,11 +225,13 @@ impl DeepgramStream {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let driver = Driver::new(config, event_tx, jitter);
-        tokio::spawn(driver.run(command_rx));
+        let task = tokio::spawn(driver.run(command_rx));
         (
             Self {
                 commands: command_tx,
                 closed: Arc::new(AtomicBool::new(false)),
+                pending_samples: Arc::new(AtomicUsize::new(0)),
+                driver_abort: task.abort_handle(),
             },
             event_rx,
         )
@@ -229,10 +244,43 @@ impl DeepgramStream {
     /// stalls its audio pipeline because a transcription socket is unhappy has
     /// turned a degraded transcript into a lost recording.
     pub fn write(&self, pcm: &[i16]) {
-        if pcm.is_empty() || self.closed.load(Ordering::SeqCst) {
-            return;
+        let _ = self.write_bounded(pcm, usize::MAX);
+    }
+
+    /// Queue audio only when the queued plus in-flight samples fit `maximum`.
+    /// False leaves the caller's durable replay cursor unchanged. The permit
+    /// remains held through a blocked socket send, not just channel dequeue.
+    pub fn write_bounded(&self, pcm: &[i16], maximum: usize) -> bool {
+        if self.closed.load(Ordering::SeqCst) || self.commands.is_closed() {
+            return false;
         }
-        let _ = self.commands.send(Command::Audio(pcm.to_vec()));
+        if pcm.is_empty() {
+            return true;
+        }
+        if self
+            .pending_samples
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                pending
+                    .checked_add(pcm.len())
+                    .filter(|next| *next <= maximum)
+            })
+            .is_err()
+        {
+            return false;
+        }
+        self.commands
+            .send(Command::Audio(QueuedPcm {
+                samples: pcm.to_vec(),
+                pending: Arc::clone(&self.pending_samples),
+            }))
+            .is_ok()
+    }
+
+    /// Cancel a wedged transport immediately. The handoff controller fences
+    /// old events itself; cancellation does not promise a terminal event.
+    pub fn abort(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.driver_abort.abort();
     }
 
     /// Force Deepgram to finalize what it has (`{"type":"Finalize"}`).
@@ -345,8 +393,11 @@ impl Driver {
                         Outcome::ClientClosed => break,
                         Outcome::Failed(error) => {
                             let retryable = error.retryable;
+                            let retry_after_ms = error.retry_after_ms;
                             self.emit(StreamEvent::Error(error));
-                            if !retryable || !self.backoff_then_retry(&mut commands).await {
+                            if !retryable
+                                || !self.backoff_then_retry(&mut commands, retry_after_ms).await
+                            {
                                 break;
                             }
                         }
@@ -354,8 +405,9 @@ impl Driver {
                 }
                 Err(error) => {
                     let retryable = error.retryable;
+                    let retry_after_ms = error.retry_after_ms;
                     self.emit(StreamEvent::Error(error));
-                    if !retryable || !self.backoff_then_retry(&mut commands).await {
+                    if !retryable || !self.backoff_then_retry(&mut commands, retry_after_ms).await {
                         break;
                     }
                 }
@@ -441,6 +493,22 @@ impl Driver {
             // its prefix would remove words that have never been committed.
             self.dedupe_armed = !self.config.confirmed_finals_only;
             if replay.lost_audio() {
+                if self.config.confirmed_finals_only {
+                    // A final from clipped replay cannot acknowledge the evicted
+                    // prefix. Stop before sending it; the durable controller
+                    // recovers the entire pending interval from canonical audio.
+                    return Outcome::Failed(
+                        SttError::new(
+                            SttErrorClass::Network,
+                            PROVIDER,
+                            "cloud replay cannot cover all pending audio",
+                        )
+                        .not_retryable(format!(
+                            "{} ms were evicted; durable source replay is required",
+                            replay.truncated_ms,
+                        )),
+                    );
+                }
                 self.emit(StreamEvent::Error(
                     SttError::new(
                         SttErrorClass::Network,
@@ -475,9 +543,9 @@ impl Driver {
                     match command {
                         None => return Outcome::ClientClosed,
                         Some(Command::Audio(pcm)) => {
-                            self.ring.push(&pcm);
+                            self.ring.push(&pcm.samples);
                             if let Err(error) =
-                                sink.send(Message::binary(to_linear16_le(&pcm))).await
+                                sink.send(Message::binary(to_linear16_le(&pcm.samples))).await
                             {
                                 return Outcome::Failed(map_transport_error(&error));
                             }
@@ -550,6 +618,7 @@ impl Driver {
     async fn backoff_then_retry(
         &mut self,
         commands: &mut mpsc::UnboundedReceiver<Command>,
+        retry_after_ms: Option<u64>,
     ) -> bool {
         let now_ms = self.started.elapsed().as_millis() as u64;
         let Some(attempt) = self.budget.try_record(now_ms) else {
@@ -568,8 +637,12 @@ impl Driver {
         };
 
         self.emit(StreamEvent::State(StreamState::Reconnecting));
-        let delay =
-            Duration::from_millis(self.config.backoff.delay_ms(attempt, self.jitter.unit()));
+        let delay = Duration::from_millis(
+            self.config
+                .backoff
+                .delay_ms(attempt, self.jitter.unit())
+                .max(retry_after_ms.unwrap_or(0)),
+        );
         self.drain_while_waiting(delay, commands).await
     }
 
@@ -578,15 +651,22 @@ impl Driver {
         delay: Duration,
         commands: &mut mpsc::UnboundedReceiver<Command>,
     ) -> bool {
-        let deadline = tokio::time::Instant::now() + delay;
+        let deadline = tokio::time::Instant::now().checked_add(delay);
         loop {
             tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => return true,
+                _ = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        // An unrepresentable server deadline must not cause a
+                        // panic or an early retry. Close/abort remain responsive.
+                        None => std::future::pending::<()>().await,
+                    }
+                } => return true,
                 command = commands.recv() => {
                     match command {
                         None => return false,
                         Some(Command::Audio(pcm)) => {
-                            self.ring.push(&pcm);
+                            self.ring.push(&pcm.samples);
                         }
                         Some(Command::Flush(ack)) => {
                             // Nothing to finalize on a socket that is not up.
@@ -748,5 +828,32 @@ pub fn map_transport_error(error: &WsError) -> SttError {
             PROVIDER,
             "the transcription socket sent a frame that looked like an attack",
         ),
+    }
+}
+
+#[cfg(test)]
+mod pending_audio_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dequeuing_does_not_release_audio_until_the_send_finishes_or_is_cancelled() {
+        let (commands, mut receiver) = mpsc::unbounded_channel();
+        let task = tokio::spawn(std::future::pending::<()>());
+        let stream = DeepgramStream {
+            commands,
+            closed: Arc::new(AtomicBool::new(false)),
+            pending_samples: Arc::new(AtomicUsize::new(0)),
+            driver_abort: task.abort_handle(),
+        };
+        assert!(stream.write_bounded(&[1, 2, 3], 4));
+        let in_flight = receiver.try_recv().unwrap();
+        assert!(!stream.write_bounded(&[4, 5], 4));
+        drop(in_flight);
+        assert!(stream.write_bounded(&[4, 5], 4));
+        drop(receiver);
+        assert_eq!(stream.pending_samples.load(Ordering::Acquire), 0);
+        assert!(!stream.write_bounded(&[6], 4));
+        stream.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
     }
 }

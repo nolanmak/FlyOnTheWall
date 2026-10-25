@@ -51,38 +51,14 @@ impl Db {
     pub fn finalize_capture(
         &mut self,
         session: &str,
-        mut meeting: crate::NewMeeting,
+        meeting: crate::NewMeeting,
         ended_at_ms: i64,
         transcript: Option<(&str, &str, &[crate::NewSegment])>,
     ) -> Result<String> {
-        validate_session(session)?;
-        let started = meeting.started_at_ms;
-        if started < 0 || ended_at_ms < started {
-            return Err(invalid("invalid recording clock"));
-        }
-        let elapsed = ended_at_ms - started;
         let tx = self
             .conn_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_capture_not_deleted(&tx, session)?;
-        if let Some(link) = read_link(&tx, session)? {
-            if link.started != started || link.elapsed != elapsed {
-                return Err(invalid("session already attached to a different clock"));
-            }
-            tx.commit()?;
-            return Ok(link.meeting);
-        }
-        meeting.state = "ready".into();
-        let id = crate::repo::insert_meeting(&tx, meeting)?;
-        if let Some((provider, model, segments)) = transcript {
-            let tid = crate::repo::insert_transcript(&tx, &id, provider, model, true)?;
-            crate::repo::insert_segments(&tx, &tid, segments)?;
-        }
-        tx.execute(
-            "UPDATE meetings SET ended_at_ms=?2,duration_ms=?3 WHERE id=?1",
-            params![id, ended_at_ms, elapsed],
-        )?;
-        promote_in_transaction(&tx, session, &id, started, elapsed)?;
+        let id = finalize_in_transaction(&tx, session, meeting, ended_at_ms, transcript)?;
         tx.commit()?;
         Ok(id)
     }
@@ -359,4 +335,39 @@ fn ensure_capture_not_deleted(conn: &rusqlite::Connection, session: &str) -> Res
         return Err(invalid("capture was explicitly deleted"));
     }
     Ok(())
+}
+
+/// The capture/notes handoff inside a caller-owned projection transaction.
+pub(crate) fn finalize_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    session: &str,
+    mut meeting: crate::NewMeeting,
+    ended_at_ms: i64,
+    transcript: Option<(&str, &str, &[crate::NewSegment])>,
+) -> Result<String> {
+    validate_session(session)?;
+    let started = meeting.started_at_ms;
+    if started < 0 || ended_at_ms < started {
+        return Err(invalid("invalid recording clock"));
+    }
+    let elapsed = ended_at_ms - started;
+    ensure_capture_not_deleted(tx, session)?;
+    if let Some(link) = read_link(tx, session)? {
+        if link.started != started || link.elapsed != elapsed {
+            return Err(invalid("session already attached to a different clock"));
+        }
+        return Ok(link.meeting);
+    }
+    meeting.state = "ready".into();
+    let id = crate::repo::insert_meeting(tx, meeting)?;
+    if let Some((provider, model, segments)) = transcript {
+        let tid = crate::repo::insert_transcript(tx, &id, provider, model, true)?;
+        crate::repo::insert_segments(tx, &tid, segments)?;
+    }
+    tx.execute(
+        "UPDATE meetings SET ended_at_ms=?2,duration_ms=?3 WHERE id=?1",
+        params![id, ended_at_ms, elapsed],
+    )?;
+    promote_in_transaction(tx, session, &id, started, elapsed)?;
+    Ok(id)
 }

@@ -49,6 +49,8 @@ const EXPECTED_TABLES: &[&str] = &[
     "session_note_links",
     "session_notes",
     "settings",
+    "speech_epochs",
+    "speech_receipts",
     "summaries",
     "tags",
     "templates",
