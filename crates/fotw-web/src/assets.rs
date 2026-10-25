@@ -328,7 +328,7 @@ mod tests {
             "the badge must take its class from the state, or finishing keeps \
              CON-02's red over a meeting whose taps are already closed"
         );
-        let finishing = css_rule(&css, ".finishing");
+        let finishing = css_rule(&css, ".finishing, .preparing");
         assert!(
             finishing.contains("var(--caution)"),
             "the finishing badge is the caution colour (#90's token): {finishing}"

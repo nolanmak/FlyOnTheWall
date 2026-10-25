@@ -1,11 +1,24 @@
 # Durable speech handoff runtime
 
-This backend supports an explicit Deepgram-to-local session through
-`session::Transcription::Failover`. App settings still select Deepgram or local
-transcription; the app does not automatically select the new runtime. Persisted
-policy selection, model resolution, startup recovery and status/retry UI remain
-part of [#12](https://github.com/nolanmak/FlyOnTheWall/issues/12). This document
-describes the backend contract, not a finished app feature.
+Select `fotwd stt fallback --model <name|absolute-path> [--language <code>]`
+to persist an explicit Deepgram preference with an on-device backup. Both CLI
+recording and dashboard Start read this choice. Deepgram remains the default;
+`fotwd stt local` keeps audio on this Mac. Fallback initially sends audio to
+Deepgram and stays local after a provider failure for the rest of the meeting.
+
+Start verifies the backup file, validates its actual model/language metadata,
+and prepares independent native states before capture or cloud connection.
+Known model filenames must match published checksums; custom files are pinned
+to their SHA-256 for recovery identity, without asserting publisher authenticity.
+An unavailable backup or missing Deepgram key refuses Start. The dashboard
+shows Preparing without a recording clock or red badge and offers Cancel.
+Cancellation retains ownership until native preparation finishes; a late result
+cannot start capture. No model is downloaded automatically.
+
+Graphical provider selection, live engine/provenance status, startup native
+recovery and retry UI remain part of
+[#12](https://github.com/nolanmak/FlyOnTheWall/issues/12). The backend APIs below
+support these remaining app features.
 
 ## Capture and admission
 

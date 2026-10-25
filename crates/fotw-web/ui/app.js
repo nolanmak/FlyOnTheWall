@@ -802,6 +802,9 @@ const FINISHING_POLL_MS = 1000;
 // the badge, the button, the clock and the poll rate, so nothing can disagree
 // with anything else.
 let recState = "idle";
+let preparationCancelRequested = false;
+let captureStartPending = false;
+let recordingAction = 0;
 const noteClock = typeof FOTWNotes !== "undefined" ? new FOTWNotes.RecordingClock() : null;
 let recordingSince = null;
 let autoStopAt = null;
@@ -900,8 +903,11 @@ function showRecordingControls(visible) {
 // box, because a user who cannot stop a recording is the worse failure.
 function paintRecordButton() {
   if (captureStopPending) { el.record.disabled = true; return; }
-  el.record.textContent = recState === "idle" ? "Start" : "Stop";
-  if (recState === "finishing") el.record.disabled = true;
+  el.record.textContent = recState === "preparing" ? (preparationCancelRequested ? "Cancelling…" : "Cancel")
+    : recState === "idle" ? (captureStartPending ? "Preparing…" : "Start") : "Stop";
+  if (recState === "preparing") el.record.disabled = preparationCancelRequested;
+  else if (captureStartPending && recState === "idle") el.record.disabled = true;
+  else if (recState === "finishing") el.record.disabled = true;
   else if (recState === "recording") el.record.disabled = false;
   else el.record.disabled = !el.consent.checked;
 }
@@ -913,7 +919,8 @@ function renderRecording(body) {
   // Anything the daemon does not name is treated as idle. An unrecognised
   // word must never be the one that leaves a clock running.
   recState =
-    body.state === "recording" || body.state === "finishing" ? body.state : "idle";
+    ["preparing", "recording", "finishing"].includes(body.state) ? body.state : "idle";
+  preparationCancelRequested = recState === "preparing" && Boolean(body.preparation_cancel_requested);
   renderCaptureHealth(body);
   mountLiveNotes();
   paintLiveNavigation();
@@ -927,13 +934,14 @@ function renderRecording(body) {
   // word has to be written *and* written back, or it sticks for the rest of
   // the tab's life and the next meeting records under a "finishing…" label.
   // ING-11: textContent, as everything in this file writes text.
-  el.recording.textContent = recState === "finishing" ? "finishing…" : "recording";
+  el.recording.textContent = recState === "preparing" ? "preparing…" : recState === "finishing" ? "finishing…" : "recording";
   // And the class with it (#91). The badge shipped permanently in `.recording`
   // — CON-02's red, which means audio is being captured *right now* — so a
   // meeting whose taps had already closed announced itself in the one colour
   // that must never be diluted. Written back for the same reason the word is:
   // a class left behind outlives the state that set it. See app.css.
-  el.recording.className = recState === "finishing" ? "finishing" : "recording";
+  el.recording.className = recState === "preparing" ? "preparing" : recState === "finishing" ? "finishing" : "recording";
+  if (recState === "preparing") lastFinalMs = null;
 
   // The session clock (#66 follow-up): a recording with no visible duration
   // is how a 37-minute accident happens. Exhaustive on purpose — a
@@ -978,7 +986,7 @@ function renderRecording(body) {
   if (was !== "idle" && recState === "idle") {
     refreshLibrary();
   }
-  if (recState === "finishing") startFinishingPoll();
+  if (recState === "finishing" || recState === "preparing") startFinishingPoll();
   else stopFinishingPoll();
 
   // Said out loud while the meeting is still running. Two Deepgram bugs each
@@ -1178,24 +1186,25 @@ function liveIsShowing() {
 }
 
 async function onRecord() {
-  // Nothing to press while the meeting is being written: capture is already
-  // over and Start is refused until the slot frees. The button is disabled in
-  // that state, so this only catches a click that raced the poll.
-  if (recState === "finishing" || captureStopPending) return;
-  const path =
-    recState === "recording"
-      ? "/api/recording/stop"
-      : "/api/recording/start?ack=all-party";
+  if (recState === "finishing" || captureStopPending || (recState === "preparing" && preparationCancelRequested)) return;
+  const stopping = recState === "recording" || recState === "preparing";
+  const path = stopping ? "/api/recording/stop" : "/api/recording/start?ack=all-party";
+  const action = ++recordingAction;
   el.record.disabled = true;
-  if (recState === "recording") {
+  captureStartPending = !stopping;
+  if (stopping) {
     captureStopPending = true;
     renderCaptureHealth({});
     noteClock?.stop();
     if (typeof FOTWNotes !== "undefined") FOTWNotes.flushAll();
   }
+  paintRecordButton();
   ++recordingRequest;
   try {
     const body = await api(path, { method: "POST" });
+    // User actions, unlike status polls, supersede older action replies.
+    // A delayed Start answer must never undo Cancel or restore its clock.
+    if (action !== recordingAction) return;
     renderRecording(body);
     if (body.error === "consent_required") {
       say("Tick the box first: everyone on the call has to have consented.");
@@ -1204,28 +1213,28 @@ async function onRecord() {
     } else if (body.state === "recording") {
       say("Recording. Tell the other participants.");
       showLive();
+    } else if (body.state === "preparing") {
+      say(body.preparation_cancel_requested ? "Cancelled. Waiting for setup to finish releasing its resources." : "Preparing recording. Audio has not started.");
     } else if (body.state === "finishing") {
-      // Stop branches on the *answer*, not on what was asked. It used to fall
-      // into the start branch, announce "Recording. Tell the other
-      // participants." and call showLive(), which wiped the pane holding the
-      // meeting's own transcript (#77).
       say("Stopped. Finishing — writing the meeting to your library.");
     } else {
       say("Stopped. The meeting is being written to your library.");
       await loadMeetings();
     }
   } catch (e) {
+    if (action !== recordingAction) return;
     noteClock?.retry();
     pollRecording();
     say("Could not reach the recorder.");
-    // Not a flat `disabled = false`: CON-01 says an idle Start stays disabled
-    // until the box is ticked.
     paintRecordButton();
   } finally {
-    const stopped = captureStopPending;
-    captureStopPending = false;
-    paintRecordButton();
-    if (stopped && recState === "recording") pollRecording();
+    if (action === recordingAction) {
+      const stopped = captureStopPending;
+      captureStopPending = false;
+      captureStartPending = false;
+      paintRecordButton();
+      if (stopped && (recState === "recording" || recState === "preparing")) pollRecording();
+    }
   }
 }
 

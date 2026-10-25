@@ -271,3 +271,34 @@ test('incomplete native cleanup explains restart and offers no retry',()=>{
  assert.match(panel.textContent,/Microphone: Audio cleanup incomplete; reopen FlyOnTheWall/);
  assert.equal(h.all(panel).some(n=>n.tagName==='button'&&!n.hidden),false);
 });
+
+test('preparation has no recording clock or red badge and Cancel does not require another consent tick',async()=>{
+ const h=harness();
+ h.ctx.renderRecording({state:'preparing',started_at_ms:1000,elapsed_ms:500});
+ assert.equal(h.nodes.get('recording').hidden,false);
+ assert.equal(h.nodes.get('recording').textContent,'preparing…');
+ assert.equal(h.nodes.get('recording').className,'preparing');
+ assert.equal(h.nodes.get('elapsed').hidden,true);
+ assert.equal(h.nodes.get('record').textContent,'Cancel');
+ assert.equal(h.nodes.get('record').disabled,false);
+ const called=[];
+ h.ctx.api=async path=>{called.push(path);return {state:'preparing',preparation_cancel_requested:true};};
+ await h.ctx.onRecord();
+ assert.equal(called[0],'/api/recording/stop');
+ assert.ok(!called.some(path=>path.includes('/start')));
+ assert.equal(h.nodes.get('record').disabled,true);
+});
+
+test('a late Start reply cannot replace the cancellation of owned preparation',async()=>{
+ const h=harness();h.nodes.get('consent').checked=true;
+ let reply, starts=0;
+ h.ctx.api=path=>path.includes('/start') && starts++===0?new Promise(resolve=>{reply=resolve;}):Promise.resolve({state:'preparing',preparation_cancel_requested:true});
+ const start=h.ctx.onRecord();
+ h.ctx.renderRecording({state:'preparing'});
+ await h.ctx.onRecord();
+ reply({state:'recording',session_id:'late-source',started_at_ms:1000});
+ await start;
+ assert.equal(h.nodes.get('recording').className,'preparing');
+ assert.equal(h.nodes.get('record').disabled,true);
+ assert.equal(h.nodes.get('elapsed').hidden,true);
+});

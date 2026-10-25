@@ -39,6 +39,8 @@ pub enum SttEngine {
     Deepgram,
     /// whisper.cpp on this machine.
     Local,
+    /// Explicit Deepgram preference with a prepared on-device backup.
+    Fallback,
 }
 
 /// The stored engine choice.
@@ -107,6 +109,70 @@ impl SttSettings {
         let code = self.language.trim().to_ascii_lowercase();
         (!code.is_empty() && code != "auto").then_some(code)
     }
+}
+
+/// Build an owned, deferred admission. No capture or cloud connection may
+/// begin until the session resolves this preparation successfully.
+pub fn fallback_transcription(
+    settings: SttSettings,
+    data_root: PathBuf,
+    cloud: Box<dyn FnOnce() -> Result<crate::session::DeepgramLegs, String> + Send>,
+) -> Transcription {
+    Transcription::PreparingFailover(Box::pin(async move {
+        let (engine, revision) =
+            tokio::task::spawn_blocking(move || pinned_local_model(&settings, &data_root))
+                .await
+                .map_err(|_| "local backup model preparation failed".to_owned())??;
+        let legs = tokio::task::spawn_blocking(cloud)
+            .await
+            .map_err(|_| "could not read the Deepgram credential".to_owned())??;
+        let config = |cloud| {
+            let mut config =
+                crate::failover::stream::FailoverConfig::new(cloud, std::sync::Arc::clone(&engine));
+            config.local_revision = Some(revision.clone());
+            config
+        };
+        crate::session::FailoverLegs::prepare(
+            config(*legs.system),
+            legs.mic.map(|mic| config(*mic)),
+        )
+        .await
+        .map_err(|e| e.message)
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn pinned_local_model(
+    settings: &SttSettings,
+    data_root: &Path,
+) -> Result<(std::sync::Arc<dyn fotw_stt::RecognizerFactory>, String), String> {
+    let path = settings.model_path(data_root);
+    if !path.is_absolute() {
+        return Err(
+            "local backup model path must be absolute; select it again with `fotwd stt fallback`"
+                .into(),
+        );
+    }
+    let known = verify_model(&path).map_err(|e| e.to_string())?;
+    let digest = match known {
+        Some(model) => model.sha256.to_owned(),
+        None => sha256_file(&path)?,
+    };
+    let engine = fotw_stt::WhisperEngine::new(&path, settings.language());
+    engine.load().map_err(|e| e.message)?;
+    // The context must correspond to the revision we will promise on restart.
+    if sha256_file(&path)? != digest {
+        return Err("local backup model changed during preparation; select it again".into());
+    }
+    Ok((std::sync::Arc::new(engine), format!("sha256:{digest}")))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pinned_local_model(
+    _settings: &SttSettings,
+    _data_root: &Path,
+) -> Result<(std::sync::Arc<dyn fotw_stt::RecognizerFactory>, String), String> {
+    Err("local backup transcription is available only on macOS; select Deepgram-only or a supported local runtime".into())
 }
 
 /// A model whose published file we can check byte for byte.
@@ -307,6 +373,19 @@ pub fn local_transcription(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_choice_survives_restart_without_changing_local_settings() {
+        let mut db = Db::open_in_memory(&fotw_store::DbKey::from_bytes([0x38; 32])).unwrap();
+        let settings = SttSettings {
+            engine: SttEngine::Fallback,
+            model: "/fixture/ggml-small.en.bin".into(),
+            language: "en".into(),
+        };
+        settings.write(&mut db).unwrap();
+        assert_eq!(SttSettings::read(&db).unwrap(), settings);
+        assert_eq!(SttSettings::default().engine, SttEngine::Deepgram);
+    }
 
     #[test]
     fn an_explicit_engine_can_omit_optional_model_and_language() {
