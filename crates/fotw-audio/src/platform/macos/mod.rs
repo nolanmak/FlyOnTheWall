@@ -53,7 +53,7 @@ use crate::tap::{AudioPlatform, AudioTap, BoxFuture, DeviceWatch, SystemScope};
 use crate::watchdog::OutputActivity;
 
 pub use listeners::{DeviceWatcher, debug_output_report, default_output_uid};
-pub use mic::MicTap;
+pub use mic::{InputSnapshot, MicTap, default_input_snapshot};
 pub use tap::SystemTap;
 
 /// The macOS backend.

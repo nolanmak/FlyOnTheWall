@@ -258,3 +258,17 @@ Apple documents the [device nominal rate](https://developer.apple.com/documentat
 and [stream virtual format](https://developer.apple.com/documentation/coreaudio/kaudiostreampropertyvirtualformat)
 properties. A listener notification is treated conservatively as invalidation;
 this feature does not prove real-device timing or automatic readiness recovery.
+# Read-only input readiness
+
+The macOS audio backend exposes `default_input_snapshot()` for background
+readiness checks. It reads the default device's real UID and input ASBD twice,
+rejects unknown identity, changing device/rate/channels and native read errors,
+and applies the same packed Float32/rate/channel validation as microphone start.
+It creates no capture stream, IOProc, property listener or audio buffer.
+
+The result is a metadata observation, not permission, live audio, a locked route
+or sustained health. Native property reads may block; callers must bound the
+handoff, retain one worker until it returns, reject stale results and revalidate
+on deliberate capture start. Repeated matching observations are the consumer's
+recovery policy. Device-free injected-read tests cover instability and errors;
+physical USB/Bluetooth and capture validation remain separate gates.

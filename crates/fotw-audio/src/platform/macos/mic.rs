@@ -26,6 +26,135 @@ use crate::format::{SampleFormat, StreamFormat};
 use crate::frames::{CaptureTimestamp, FrameFlags, FrameSink};
 use crate::ids::TapId;
 
+/// Read-only input metadata. This is not proof of permission or live audio.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputSnapshot {
+    /// Current physical input UID, suitable for comparing readiness observations.
+    pub device_uid: String,
+    /// Format validated by the same contract used before native capture starts.
+    pub format: StreamFormat,
+}
+
+/// Inspect the default input without creating a tap, listener or IOProc.
+///
+/// Core Audio property reads are synchronous and may block. Callers must own
+/// and bound their worker, and must revalidate at capture start. Two matching
+/// reads establish only an observation, never sustained health or a route lock.
+pub fn default_input_snapshot() -> Result<InputSnapshot, TapError> {
+    snapshot_with(|| {
+        let device = System::default_input_device()
+            .map_err(|e| TapError::platform(format!("no default input device: {e:?}")))?;
+        if device.0.0 == 0 {
+            return Err(TapError::DeviceNotFound(crate::DeviceId::new(
+                "default input",
+            )));
+        }
+        let uid = device
+            .uid()
+            .map_err(|e| TapError::platform(format!("cannot read input identity: {e:?}")))?;
+        let asbd = device
+            .input_asbd()
+            .map_err(|e| TapError::platform(format!("cannot read input format: {e:?}")))?;
+        Ok((device.0.0, uid.to_string(), asbd))
+    })
+}
+
+fn snapshot_with(
+    mut read: impl FnMut() -> Result<(u32, String, cat::AudioStreamBasicDesc), TapError>,
+) -> Result<InputSnapshot, TapError> {
+    let mut observed = || {
+        let (object, device_uid, asbd) = read()?;
+        if object == 0 || device_uid.trim().is_empty() {
+            return Err(TapError::DeviceNotFound(crate::DeviceId::new(
+                "default input",
+            )));
+        }
+        Ok((
+            object,
+            InputSnapshot {
+                device_uid,
+                format: capture_format(&asbd)?,
+            },
+        ))
+    };
+    let first = observed()?;
+    let second = observed()?;
+    if first != second {
+        return Err(TapError::StreamFormatChanged);
+    }
+    Ok(second.1)
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    fn raw(
+        id: u32,
+        uid: &str,
+        rate: f64,
+        channels: u32,
+    ) -> (u32, String, cat::AudioStreamBasicDesc) {
+        (
+            id,
+            uid.into(),
+            cat::AudioStreamBasicDesc::common_f32(rate, channels, true),
+        )
+    }
+    #[test]
+    fn readiness_rejects_flapping_identity_and_format_without_starting_capture() {
+        for second in [
+            raw(2, "input-a", 48000.0, 1),
+            raw(1, "input-b", 48000.0, 1),
+            raw(1, "input-a", 24000.0, 1),
+            raw(1, "input-a", 48000.0, 2),
+        ] {
+            let mut reads = vec![raw(1, "input-a", 48000.0, 1), second].into_iter();
+            assert!(
+                snapshot_with(|| Ok(reads.next().unwrap())).is_err(),
+                "a changing route cannot report ready"
+            );
+        }
+    }
+    #[test]
+    fn readiness_rejects_unknown_identity_and_uses_capture_format_validation() {
+        for (id, uid, rate, channels) in [
+            (0, "input", 48000.0, 1),
+            (1, "", 48000.0, 1),
+            (1, "input", f64::NAN, 1),
+            (1, "input", 48000.0, 0),
+        ] {
+            assert!(snapshot_with(|| Ok(raw(id, uid, rate, channels))).is_err());
+        }
+        let mut count = 0;
+        let snapshot = snapshot_with(|| {
+            count += 1;
+            Ok(raw(1, "input", 24000.0, 2))
+        })
+        .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(snapshot.device_uid, "input");
+        assert_eq!(
+            snapshot.format,
+            StreamFormat::new(24000, 2, SampleFormat::F32)
+        );
+    }
+    #[test]
+    fn readiness_does_not_hide_a_native_read_error() {
+        let mut reads = 0;
+        let result = snapshot_with(|| {
+            reads += 1;
+            if reads == 1 {
+                Ok(raw(1, "input", 48000.0, 1))
+            } else {
+                Err(TapError::DeviceNotFound(crate::DeviceId::new(
+                    "fixture disappeared",
+                )))
+            }
+        });
+        assert!(matches!(result, Err(TapError::DeviceNotFound(_))));
+    }
+}
+
 struct IoState {
     sink: Mutex<Option<Box<dyn FrameSink>>>,
     device_frames: AtomicU64,
