@@ -217,7 +217,42 @@ where
     // seam is still just its rendered body -- untrusted text that
     // `prompt::assemble` quarantines. Parsing it earlier bought a located
     // error message, not trust.
+    let history = db.speech_provenance(meeting_id)?;
+    let epochs = history
+        .into_iter()
+        .map(|epoch| {
+            let source = match epoch.source.as_str() {
+                "system" => fotw_stt::Source::System,
+                "mic" => fotw_stt::Source::Mic,
+                _ => {
+                    return Err(fotw_store::StoreError::InvalidArgument(
+                        "invalid speech source".into(),
+                    ));
+                }
+            };
+            let capability = |key| {
+                epoch
+                    .capabilities
+                    .get(key)
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok())
+            };
+            Ok(fotw_summarize::speech_context::Epoch {
+                source,
+                epoch: epoch.epoch,
+                from_sample: epoch.from_sample,
+                through_sample: epoch.through_sample,
+                word_timestamps: capability("wordTimestamps"),
+                diarization: capability("diarization"),
+                provider: epoch.provider,
+                model: epoch.model,
+                revision: epoch.revision,
+                reason: epoch.reason,
+            })
+        })
+        .collect::<Result<Vec<_>, fotw_store::StoreError>>()?;
     let pipeline = Pipeline::new(prose, extraction).with_config(PipelineConfig {
+        speech_context: Some(fotw_summarize::speech_context::SpeechContext::new(epochs)),
         template_body: template.prompt_body(),
         ..PipelineConfig::default()
     });

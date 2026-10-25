@@ -117,6 +117,8 @@ pub struct PipelineConfig {
     pub chat_session_open: bool,
     /// Cap on each response.
     pub max_output_tokens: usize,
+    /// Recorded source/engine facts, kept out of cited speech and the system prompt.
+    pub speech_context: Option<crate::speech_context::SpeechContext>,
     /// Coverage measurement settings.
     pub coverage: CoverageConfig,
     /// Evidence validator settings.
@@ -131,6 +133,7 @@ impl Default for PipelineConfig {
             meeting_date: String::new(),
             chat_session_open: false,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            speech_context: None,
             coverage: CoverageConfig::default(),
             validator: ValidatorConfig::default(),
         }
@@ -273,17 +276,28 @@ impl<'a> Pipeline<'a> {
         duration_ms: u64,
     ) -> Result<SummaryOutcome, SummarizeError> {
         let system = prompt::assemble(&self.config.template_body);
-        let capabilities = self.prose.capabilities();
+        let mut capabilities = self.prose.capabilities();
+        let metadata_bytes = self
+            .config
+            .speech_context
+            .as_ref()
+            .map_or(0, |context| context.render().len());
+        if metadata_bytes > 0 {
+            capabilities.usable_context_tokens = capabilities
+                .usable_context_tokens
+                .min(self.extraction.capabilities().usable_context_tokens);
+        }
         let mut plan = chunk::plan(document, &capabilities);
         let mut chunks = plan.chunks(document);
         // Render/check one window payload at a time, so a long meeting cannot
         // allocate every chunk's repeated notes simultaneously. Byte length is
         // a conservative token ceiling for the structured notes, not a price estimate.
-        if !anchors.is_empty() || !user_notes.trim().is_empty() {
+        if !anchors.is_empty() || !user_notes.trim().is_empty() || metadata_bytes > 0 {
             let usable = capabilities.usable_context_tokens;
             let overhead = crate::tokens::estimate_tokens(system.text())
                 .saturating_add(self.config.max_output_tokens)
-                .saturating_add(1024);
+                .saturating_add(1024)
+                .saturating_add(metadata_bytes);
             let minimum = overhead.saturating_add(user_notes.len());
             if minimum > usable {
                 return Err(SummarizeError::ContextOverflow {
@@ -395,10 +409,10 @@ impl<'a> Pipeline<'a> {
                     title: DOCUMENT_TITLE.to_string(),
                 }),
                 user_notes: notes.clone(),
-                instruction: prompt::augment_instruction(
+                instruction: self.instruction_with_speech(prompt::augment_instruction(
                     &self.config.meeting_date,
                     notes.is_some(),
-                ),
+                )),
                 // Never combined with `output_format`, which stays None here.
                 citations: capabilities.native_citations,
                 output_format: None,
@@ -453,7 +467,7 @@ impl<'a> Pipeline<'a> {
             system: system.text().to_string(),
             document: None,
             user_notes: None,
-            instruction: format!(
+            instruction: self.instruction_with_speech(format!(
                 "Meeting date: {}.\n\nBelow are notes written from consecutive parts of one \
                  meeting. Merge them into a single document following the template, removing \
                  the duplication produced by the overlap between parts.\n\nEvery `[[seg:N]]` \
@@ -463,7 +477,7 @@ impl<'a> Pipeline<'a> {
                  inference across parts.\n\n{}",
                 self.config.meeting_date,
                 sections.join("\n\n")
-            ),
+            )),
             citations: false,
             output_format: None,
             effort: self
@@ -474,6 +488,16 @@ impl<'a> Pipeline<'a> {
             max_output_tokens: self.config.max_output_tokens,
         };
 
+        if let Some(context) = &self.config.speech_context {
+            let usable = self.prose.capabilities().usable_context_tokens;
+            let needed = crate::tokens::estimate_tokens(system.text())
+                .saturating_add(crate::tokens::estimate_tokens(&request.instruction))
+                .saturating_add(context.render().len())
+                .saturating_add(self.config.max_output_tokens);
+            if needed > usable {
+                return Err(SummarizeError::ContextOverflow { needed, usable });
+            }
+        }
         let response = self.prose.complete(&request).await?;
         response.ensure_complete()?;
         Ok((parse_markers(&response.text()), response.usage))
@@ -516,10 +540,10 @@ impl<'a> Pipeline<'a> {
                 // The capability decides the wording: with no
                 // `output_format` below there is no "provided schema" to
                 // match, so the instruction has to carry the shape itself.
-                instruction: prompt::extraction_instruction(
+                instruction: self.instruction_with_speech(prompt::extraction_instruction(
                     &self.config.meeting_date,
                     capabilities.strict_json_schema,
-                ),
+                )),
                 // Citations off. Spec 8.4: mutually exclusive with the format
                 // below, and the evidence linkage is explicit instead.
                 citations: false,
@@ -549,6 +573,13 @@ impl<'a> Pipeline<'a> {
         }
 
         Ok((merged, usage, failures))
+    }
+
+    fn instruction_with_speech(&self, instruction: String) -> String {
+        match &self.config.speech_context {
+            Some(context) => format!("{}\n\n{instruction}", context.render()),
+            None => instruction,
+        }
     }
 
     /// The model id for a call: the preset's choice, or the adapter's own.
@@ -1517,6 +1548,11 @@ mod tests {
     }
 
     fn map_reduced_run() -> (SummaryOutcome, Vec<RecordedRequest>) {
+        map_reduced_run_with_speech(None)
+    }
+    fn map_reduced_run_with_speech(
+        context: Option<crate::speech_context::SpeechContext>,
+    ) -> (SummaryOutcome, Vec<RecordedRequest>) {
         let document = long_document();
         let capabilities = Capabilities {
             usable_context_tokens: 12_000,
@@ -1548,7 +1584,11 @@ mod tests {
         }
 
         let adapter = small_context_adapter(transport.clone());
-        let pipeline = Pipeline::new(&adapter, &adapter);
+        let mut pipeline = Pipeline::new(&adapter, &adapter);
+        if let Some(context) = context {
+            pipeline.config.speech_context = Some(context);
+            pipeline.config.max_output_tokens = 512;
+        }
         let outcome = block_on(pipeline.run(&document, "")).expect("map-reduce runs");
         (outcome, transport.requests())
     }
@@ -1841,6 +1881,83 @@ mod tests {
         let adapter = small_context_adapter(transport.clone());
         let pipeline = Pipeline::new(&adapter, &adapter);
         let result = block_on(pipeline.run(&document(), &"x".repeat(20_000)));
+        assert!(
+            matches!(result, Err(SummarizeError::ContextOverflow { .. })),
+            "{result:?}"
+        );
+        assert_eq!(transport.call_count(), 0);
+    }
+    fn recorded_speech_fixture() -> crate::speech_context::SpeechContext {
+        use crate::speech_context::{Epoch, SpeechContext};
+        SpeechContext::new(vec![Epoch {
+            source: fotw_stt::Source::System,
+            epoch: 1,
+            from_sample: 272000,
+            through_sample: Some(480000),
+            provider: "whispercpp".into(),
+            model: "fixture-context-model".into(),
+            revision: None,
+            reason: Some("transport_budget".into()),
+            word_timestamps: Some(fotw_stt::FeatureAvailability::None),
+            diarization: Some(fotw_stt::FeatureAvailability::None),
+        }])
+    }
+    #[test]
+    fn engine_metadata_reaches_every_map_extraction_and_reduce_instruction() {
+        let (_, requests) = map_reduced_run_with_speech(Some(recorded_speech_fixture()));
+        let mut reduced = 0;
+        for request in requests {
+            assert!(
+                !request.body["system"]
+                    .to_string()
+                    .contains("fixture-context-model")
+            );
+            let content = request.body["messages"][0]["content"].as_array().unwrap();
+            let instruction = content.last().unwrap()["text"].as_str().unwrap();
+            assert!(
+                instruction.contains("fixture-context-model")
+                    && instruction.contains("not spoken evidence"),
+                "{instruction}"
+            );
+            if content[0]["type"] == "document" {
+                assert!(!content[0].to_string().contains("fixture-context-model"));
+            } else {
+                reduced += 1;
+            }
+        }
+        assert_eq!(reduced, 1);
+    }
+    #[test]
+    fn engine_metadata_and_output_budget_are_checked_before_any_model_call() {
+        let transport = MockTransport::new();
+        let prose = AnthropicAdapter::new(transport.clone(), "fixture-prose", "fixture-key");
+        let extraction = small_context_adapter(transport.clone());
+        let pipeline = Pipeline::new(&prose, &extraction).with_config(PipelineConfig {
+            speech_context: Some(recorded_speech_fixture()),
+            max_output_tokens: 12000,
+            ..PipelineConfig::default()
+        });
+        let result = block_on(pipeline.run(&document(), ""));
+        assert!(
+            matches!(result, Err(SummarizeError::ContextOverflow { .. })),
+            "{result:?}"
+        );
+        assert_eq!(transport.call_count(), 0);
+    }
+    #[test]
+    fn engine_metadata_reducer_checks_its_own_mapped_input_before_a_model_call() {
+        let transport = MockTransport::new();
+        let adapter = small_context_adapter(transport.clone());
+        let pipeline = Pipeline::new(&adapter, &adapter).with_config(PipelineConfig {
+            speech_context: Some(recorded_speech_fixture()),
+            max_output_tokens: 512,
+            ..PipelineConfig::default()
+        });
+        let mapped = vec![parse_markers(&format!(
+            "{} [[seg:0]]",
+            "mapped ".repeat(12000)
+        ))];
+        let result = block_on(pipeline.reduce(&prompt::assemble(""), &mapped));
         assert!(
             matches!(result, Err(SummarizeError::ContextOverflow { .. })),
             "{result:?}"

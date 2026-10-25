@@ -71,6 +71,7 @@ pub mod pipeline;
 pub mod pricing;
 pub mod prompt;
 pub mod schema;
+pub mod speech_context;
 pub mod template;
 pub mod testing;
 pub mod title;
