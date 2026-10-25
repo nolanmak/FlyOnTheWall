@@ -86,7 +86,7 @@ jobs:
           workspaces: tools/aec-eval
           key: native-webrtc
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libclang-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libssl-dev pkg-config
       - name: Provision isolated native build tools
         shell: bash
         run: |
@@ -106,8 +106,8 @@ jobs:
         shell: bash
         run: |
           export PATH="$RUNNER_TEMP/aec-build-bin:$PATH"
-          cargo clippy --manifest-path tools/aec-eval/Cargo.toml --locked --features native-webrtc --all-targets
-          cargo test --manifest-path tools/aec-eval/Cargo.toml --locked --features native-webrtc
+          cargo clippy --manifest-path tools/aec-eval/Cargo.toml --locked --all-features --all-targets
+          cargo test --manifest-path tools/aec-eval/Cargo.toml --locked --all-features
           cargo run --release --manifest-path tools/aec-eval/Cargo.toml --locked --features native-webrtc
 
   keyring-interop:

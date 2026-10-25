@@ -5,6 +5,13 @@ The Rust binding/sys crates are pinned to 2.1.0; bundled WebRTC is 2.1.
 Abseil 20240722.0 is fetched using the upstream hash-checked Meson wrap.
 No third-party implementation was copied into application code.
 
+The additional `speech-retention` feature also links the repository's maintained
+Whisper runtime. Its whisper-rs/whisper-rs-sys Unlicense and whisper.cpp/ggml MIT
+license texts, together with their dependency notices, are retained in
+[the root third-party notices](../../THIRD_PARTY_NOTICES.md). Include that file
+as well when distributing an evaluation binary built with this feature.
+No model weights or speech audio are redistributed by this tool.
+
 ## Rust binding and bundled wrapper (Google BSD-3-Clause)
 
 Copyright (c) 2011, Google Inc. All rights reserved.
