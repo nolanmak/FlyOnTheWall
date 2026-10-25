@@ -316,7 +316,9 @@
     view.prepare=()=>{
       if(draft.view!==view)return;
       draft.composing=false;
-      if(section.isConnected!==false)editVisible();
+      // Native textareas normalize line endings. Only active composition can
+      // contain text not yet reported by input; never resave an untouched field.
+      if(composing && section.isConnected!==false)editVisible();
       selection=null;cancelTimers();
     };
     view.release=()=>{

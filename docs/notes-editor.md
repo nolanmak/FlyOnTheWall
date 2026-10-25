@@ -239,8 +239,9 @@ blocks can extend the checkpoint. Original unanchored text stays unanchored,
 and a finalized capture clock bounds both the current anchors and the older
 composition checkpoint. A late clock cannot restore a beyond-end timestamp.
 
-Explicit Stop/navigation/blur snapshots the latest visible text to its original
-draft identity. Clearing a pane releases its editor, cancels timers, flushes its
+Explicit Stop/navigation/blur snapshots the latest visible composition text to
+its original draft identity. Untouched notes are not read back from the textarea,
+so browser CRLF normalization cannot cause a save merely from navigation. Clearing a pane releases its editor, cancels timers, flushes its
 draft and disconnects old callbacks. Late events from detached fields cannot
 change a remounted live/saved alias or another meeting. These drafts remain in
 memory; durable text still uses the existing revision-checked encrypted store.

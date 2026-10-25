@@ -2,7 +2,7 @@ const test=require('node:test'),assert=require('node:assert/strict'),fs=require(
 function rig(api,session=false) {
  class Element {
   constructor(tag){this.tag=tag;this.children=[];this.listeners={};this.nativeValue='';this.selectionStart=0;this.selectionEnd=0;this.isConnected=true;this.writes=[];}
-  get value(){return this.nativeValue;}set value(v){this.writes.push(v);this.nativeValue=v;}
+  get value(){return this.nativeValue;}set value(v){this.writes.push(v);this.nativeValue=this.tag==='textarea'?String(v).replace(/\r\n?/g,'\n'):v;}
   appendChild(n){this.children.push(n);return n;}setAttribute(k,v){this[k]=v;}addEventListener(k,f){this.listeners[k]=f;}
   focus(){}setSelectionRange(a,b){this.selectionStart=a;this.selectionEnd=b;}
   contains(n){return this===n||this.children.some(c=>c.contains(n));}
@@ -111,4 +111,13 @@ test('beforeinput composition metadata protects native text even if compositions
  release();await saving;assert.equal(h.input.value,'oldに');assert.match(h.section.children[2].textContent,/Compos/);
  h.fire('input',{isComposing:true,inputType:'insertCompositionText'});h.input.nativeValue='old日本';h.fire('compositionend');await settle();
  assert.equal(writes.length,2);assert.equal(writes[1].body_md,'old日本');
+});
+
+
+test('navigation never rewrites untouched CRLF notes normalized by the native textarea',async()=>{
+ const original='Café\r\n\r\nSecond paragraph\r\n',writes=[];
+ const h=rig(async(_,opts)=>{if(!opts)return {revision:7,body_md:original,anchors:[]};const p=JSON.parse(opts.body);writes.push(p);return {...p,revision:8};});await settle();
+ assert.equal(h.input.value,'Café\n\nSecond paragraph\n');
+ await h.notes.flushAll();await h.notes.release(h.parent);
+ assert.equal(writes.length,0,'merely visiting or leaving notes must not save browser line-ending normalization');assert.equal(h.draft.body,original);assert.equal(h.draft.revision,7);
 });
