@@ -2696,6 +2696,7 @@ async fn open_legs(
             legs.system.session_id = session_id.to_owned();
             legs.system.session_offset_ms = anchors.system_ms;
             let (s, s_rx) = LocalStream::open(*legs.system, Arc::clone(&legs.engine));
+            speech.bind_local_worker(Source::System, s.worker_status());
             let (m, m_rx) = match legs.mic {
                 Some(mut cfg) if mic_started => {
                     speech.bind_legacy(
@@ -2708,6 +2709,7 @@ async fn open_legs(
                     cfg.session_id = session_id.to_owned();
                     cfg.session_offset_ms = anchors.mic_ms;
                     let (m, rx) = LocalStream::open(*cfg, legs.engine);
+                    speech.bind_local_worker(Source::Mic, m.worker_status());
                     (Some(Arc::new(LegStream::Local(m))), Some(rx))
                 }
                 _ => (None, None),

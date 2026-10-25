@@ -1107,7 +1107,7 @@ function renderSpeechHealth(body) {
     const reason = source.switch_reason ? from + (reasons[source.switch_reason] || "provider changed") : "";
     if (entry.reason.textContent !== reason) entry.reason.textContent = reason;
     entry.reason.hidden = !reason;
-    const cleanup = source.worker_running === true && ["complete", "incomplete"].includes(source.state)
+    const cleanup = source.worker_running === true && ["complete", "incomplete", "closed"].includes(source.state)
       ? "Finishing transcription work; Start waits for cleanup." : "";
     if (entry.cleanup.textContent !== cleanup) entry.cleanup.textContent = cleanup;
     entry.cleanup.hidden = !cleanup;

@@ -1392,3 +1392,153 @@ async fn recorder_retains_timed_out_native_inference_without_delaying_audio_fini
     .await
     .unwrap();
 }
+
+struct DroppingLocalFactory(BlockingFactory);
+struct DroppingLocalModel(BlockingFactory);
+impl RecognizerFactory for DroppingLocalFactory {
+    fn model(&self) -> &str {
+        "destructor-fixture"
+    }
+    fn language(&self) -> Option<&str> {
+        None
+    }
+    fn create(&self) -> Result<Box<dyn Recognizer>, SttError> {
+        Ok(Box::new(DroppingLocalModel(BlockingFactory {
+            release: self.0.release.clone(),
+            entered: self.0.entered.clone(),
+        })))
+    }
+}
+impl Recognizer for DroppingLocalModel {
+    fn transcribe(&mut self, _: &[f32]) -> Result<Vec<Recognized>, SttError> {
+        Ok(Vec::new())
+    }
+}
+impl Drop for DroppingLocalModel {
+    fn drop(&mut self) {
+        self.0
+            .entered
+            .store(true, std::sync::atomic::Ordering::Release);
+        let (lock, wake) = &*self.0.release;
+        let mut released = lock.lock().unwrap();
+        while !*released {
+            released = wake.wait(released).unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_only_recorder_retains_native_destructor_without_delaying_audio_finisher() {
+    use fotw_audio::platform::file::{FileAudioSource, ReplaySpeed};
+    use fotw_audio::{SampleFormat, StreamFormat, TapId};
+    use fotw_web::{RecorderControl, RecorderError, RecordingState};
+    use fotwd::session::{LocalLegs, Transcription};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let _release_on_failure = ReleaseOnDrop(release.clone());
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let observed = finished.clone();
+    let factory_release = release.clone();
+    let factory_entered = entered.clone();
+    let root = tempfile::tempdir().unwrap();
+    let recorder = Arc::new(fotwd::recording::DaemonRecorder::with_parts(
+        root.path().join("sessions"),
+        tokio::runtime::Handle::current(),
+        Default::default(),
+        Default::default(),
+        Box::new(|| {
+            Ok((
+                Box::new(FileAudioSource::from_wav(
+                    TapId::system_default(),
+                    fotw_audio::wav::WavData {
+                        format: StreamFormat::new(16_000, 1, SampleFormat::I16),
+                        samples: vec![0.0; 1600],
+                    },
+                    ReplaySpeed::Unpaced,
+                )),
+                None,
+            ))
+        }),
+        Box::new(move || {
+            Transcription::Local(LocalLegs::for_session(
+                Arc::new(DroppingLocalFactory(BlockingFactory {
+                    release: factory_release.clone(),
+                    entered: factory_entered.clone(),
+                })),
+                "fixture",
+                false,
+                false,
+            ))
+        }),
+        Box::new(move |_, outcome| {
+            assert!(outcome.capture_ended_at_ms.is_some());
+            assert!(
+                std::fs::metadata(outcome.dir.join("system.pcm"))
+                    .unwrap()
+                    .len()
+                    > 0
+            );
+            observed.fetch_add(1, Ordering::SeqCst);
+            None
+        }),
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    ));
+    let requested = recorder.clone();
+    tokio::task::spawn_blocking(move || requested.start())
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while recorder.status().state != RecordingState::Recording {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    recorder.stop().unwrap();
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while finished.load(Ordering::SeqCst) == 0 || !entered.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("local native teardown prevented the audio finisher");
+    assert_eq!(
+        recorder.status().state,
+        RecordingState::Finishing,
+        "native destructor still owns resources after the audio finisher"
+    );
+    let source = recorder.status().speech_status.pop().unwrap();
+    assert_eq!(source.provider, fotw_stt::local::PROVIDER);
+    assert_eq!(source.worker_running, Some(true));
+    assert_eq!(source.epoch, None);
+    assert_eq!(source.pending_audio_ms, None);
+    assert!(matches!(
+        recorder.start(),
+        Err(RecorderError::AlreadyRecording)
+    ));
+    *release.0.lock().unwrap() = true;
+    release.1.notify_all();
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while recorder.status().state != RecordingState::Idle {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("released local worker left the recorder occupied");
+    let requested = recorder.clone();
+    tokio::task::spawn_blocking(move || requested.start())
+        .await
+        .unwrap()
+        .unwrap();
+    recorder.stop().unwrap();
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while recorder.status().state != RecordingState::Idle {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("fresh recording failed after native teardown");
+}

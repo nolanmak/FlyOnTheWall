@@ -880,7 +880,7 @@ async fn spawn_session(
 
     // Persistence remains independent of native inference cleanup: saved audio
     // must be available even if a model never returns. Keep the recording slot
-    // while a measured durable worker still owns native state, so repeated
+    // while a measured worker still owns native state, so repeated
     // Start requests cannot multiply blocked model instances.
     if speech.has_retained_native_worker() {
         let live = Arc::clone(&live);

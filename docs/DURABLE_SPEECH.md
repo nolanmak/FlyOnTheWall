@@ -34,15 +34,17 @@ source, verified revision when recorded, original coverage boundary, switch
 reason, pending audio and backend capabilities. These describe the active
 streams independently of the saved preference for the next recording. A durable
 Complete state proves accounted input coverage, not recognition accuracy. Legacy
-streams expose their actual connection lifecycle with unknown coverage/worker
-liveness rather than claiming zero backlog or complete inference.
+streams expose their actual connection lifecycle with unknown coverage rather
+than claiming zero backlog or complete inference. Local-only streams also
+measure worker liveness; cloud-only streams have no native-worker measurement.
 
 Read-only durable status handles retain metadata and atomics, not model or file
 leases. After a durable inference timeout, its measured native worker remains
 visible and prevents another recording until cleanup finishes. Audio finishing
 and library persistence proceed independently. This retained-worker admission
-guard applies to the durable fallback runtime; older local streams do not expose
-native-worker liveness here. The app cannot forcibly stop a native OS operation.
+guard applies to both durable fallback and local-only streams, including native
+recognizer teardown after a close acknowledgement. The app cannot forcibly stop
+a native OS operation.
 
 Saved meeting details expose the primary transcript's actual engine epochs,
 recorded revisions and capabilities, switch reasons and confirmed receipt
