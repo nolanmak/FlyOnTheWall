@@ -292,6 +292,289 @@ fn wal_tail(f: &mut Fixture) {
     f.wal.as_mut().unwrap().write_system(&[0.2; 160]).unwrap();
     f.wal.as_mut().unwrap().flush().unwrap();
 }
+
+#[test]
+fn saved_prefix_recovery_preserves_unknown_capture_time_and_unmapped_original_tail() {
+    use fotw_web::speech_recovery::SpeechRecoveryControl;
+    let pcm = (0u32..48000)
+        .map(|n| {
+            if (n / 3200).is_multiple_of(2) {
+                1000
+            } else {
+                8000
+            }
+        })
+        .collect();
+    let mut f = fixture_audio(
+        false,
+        pcm,
+        vec![0.2; 48000],
+        "fixture-local",
+        "fixture-revision",
+    );
+    wal_tail(&mut f);
+    drop(f.wal.take());
+    let raw = std::fs::read(f.dir.join("system.pcm")).unwrap();
+    let canonical = std::fs::read(f.dir.join("system.stt16")).unwrap();
+    let manifest = std::fs::read(f.dir.join("manifest.json")).unwrap();
+    startup(&owner(&f));
+    let mut db = Db::open(&f.database, &f.key).unwrap();
+    let id = db.session_note_meeting(&f.session).unwrap().unwrap();
+    db.conn()
+        .execute(
+            "UPDATE segments SET text='owned correction' WHERE id='committed-prefix'",
+            [],
+        )
+        .unwrap();
+    let control = owner(&f);
+    control.retry(&id).expect(
+        "a saved, independently clocked canonical prefix can recover without a final capture end",
+    );
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while control.read(&id).unwrap().worker_running {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let doc = db.export_meeting(&id).unwrap();
+    assert!(
+        doc.segments
+            .iter()
+            .any(|s| s.text == "recovered after process exit")
+    );
+    assert_eq!(
+        doc.segments
+            .iter()
+            .find(|s| s.id == "committed-prefix")
+            .unwrap()
+            .text,
+        "owned correction"
+    );
+    assert_eq!(db.meetings().get(&id).unwrap().ended_at_ms, None);
+    assert_eq!(db.session_note_clock(&f.session).unwrap(), None);
+    for name in [
+        "system.stt-sealed.json",
+        "system.stt-complete.json",
+        "system.stt-projected.json",
+    ] {
+        assert!(!f.dir.join(name).exists());
+    }
+    assert_eq!(std::fs::read(f.dir.join("system.pcm")).unwrap(), raw);
+    assert_eq!(
+        std::fs::read(f.dir.join("system.stt16")).unwrap(),
+        canonical
+    );
+    assert_eq!(
+        std::fs::read(f.dir.join("manifest.json")).unwrap(),
+        manifest
+    );
+    let count = doc.segments.len();
+    startup(&owner(&f));
+    assert_eq!(db.export_meeting(&id).unwrap().segments.len(), count);
+    assert!(!control.read(&id).unwrap().can_retry);
+    assert_eq!(
+        control.read(&id).unwrap().phase,
+        fotw_web::speech_recovery::RecoveryPhase::Partial
+    );
+    // A later independently mapped canonical suffix must be visible to the
+    // same controller; a cached partial result cannot permanently hide retry.
+    let mut writer = ReplayWriter::resume(&f.dir, &f.session, ReplaySource::System).unwrap();
+    writer.append(&[3000; 1600]).unwrap();
+    writer.sync().unwrap();
+    drop(writer);
+    assert!(control.read(&id).unwrap().can_retry);
+    control.retry(&id).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while control.read(&id).unwrap().worker_running {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!control.read(&id).unwrap().can_retry);
+    assert_eq!(db.meetings().get(&id).unwrap().ended_at_ms, None);
+}
+
+#[test]
+fn one_unavailable_source_does_not_hide_the_other_sources_recovered_speech() {
+    use fotw_web::speech_recovery::{RecoveryPhase, SpeechRecoveryControl};
+    let pcm = (0u32..48000)
+        .map(|n| {
+            if (n / 3200).is_multiple_of(2) {
+                1000
+            } else {
+                8000
+            }
+        })
+        .collect();
+    let mut f = fixture_audio(
+        false,
+        pcm,
+        vec![0.2; 48000],
+        "fixture-local",
+        "fixture-revision",
+    );
+    drop(f.wal.take());
+    let engine = CoverageJournal::snapshot(&f.dir, &f.session, Source::System)
+        .unwrap()
+        .fallback
+        .unwrap()
+        .engine;
+    let mut writer = ReplayWriter::create(&f.dir, &f.session, ReplaySource::Mic, 137 * 16).unwrap();
+    writer.append(&[3000; 16000]).unwrap();
+    writer.sync().unwrap();
+    drop(writer);
+    drop(
+        CoverageJournal::create_with_fallback(&f.dir, &f.session, Source::Mic, engine, None)
+            .unwrap(),
+    );
+    startup(&owner(&f));
+    let db = Db::open(&f.database, &f.key).unwrap();
+    let id = db.session_note_meeting(&f.session).unwrap().unwrap();
+    let control = owner(&f);
+    control.retry(&id).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while control.read(&id).unwrap().worker_running {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let status = control.read(&id).unwrap();
+    assert_eq!(
+        status.phase,
+        RecoveryPhase::Partial,
+        "one missing source plan cannot hide the explicit reload for recovered speech"
+    );
+    assert!(!status.can_retry);
+    assert!(
+        status
+            .sources
+            .iter()
+            .any(|s| s.source == "mic" && s.pending_audio_ms == 1000)
+    );
+    assert!(
+        db.export_meeting(&id)
+            .unwrap()
+            .segments
+            .iter()
+            .any(|s| s.text == "recovered after process exit")
+    );
+    assert!(
+        CoverageJournal::snapshot(&f.dir, &f.session, Source::Mic)
+            .unwrap()
+            .commits
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_failed_prefix_projection_can_retry_saved_receipts_without_running_inference_again() {
+    use fotw_web::speech_recovery::SpeechRecoveryControl;
+    let pcm = (0u32..48000)
+        .map(|n| {
+            if (n / 3200).is_multiple_of(2) {
+                1000
+            } else {
+                8000
+            }
+        })
+        .collect();
+    let mut f = fixture_audio(
+        false,
+        pcm,
+        vec![0.2; 48000],
+        "fixture-local",
+        "fixture-revision",
+    );
+    drop(f.wal.take());
+    startup(&owner(&f));
+    let db = Db::open(&f.database, &f.key).unwrap();
+    let id = db.session_note_meeting(&f.session).unwrap().unwrap();
+    db.conn().execute_batch("CREATE TRIGGER fail_prefix BEFORE INSERT ON speech_receipts BEGIN SELECT RAISE(ABORT,'injected projection failure'); END;").unwrap();
+    let control = owner(&f);
+    control.retry(&id).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while control.read(&id).unwrap().worker_running {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        !db.export_meeting(&id)
+            .unwrap()
+            .segments
+            .iter()
+            .any(|s| s.text == "recovered after process exit")
+    );
+    db.conn()
+        .execute_batch("DROP TRIGGER fail_prefix;")
+        .unwrap();
+    control.retry(&id).expect("durable prefix receipts need a projection retry even when inference already covered the target");
+    while control.read(&id).unwrap().worker_running {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        db.export_meeting(&id)
+            .unwrap()
+            .segments
+            .iter()
+            .any(|s| s.text == "recovered after process exit")
+    );
+    assert_eq!(
+        f.calls.load(Ordering::SeqCst),
+        1,
+        "projection retry must not allocate another recognizer"
+    );
+    assert!(!control.read(&id).unwrap().can_retry);
+}
+
+#[test]
+fn startup_repairs_a_missing_prefix_projection_ack_without_repeating_native_work() {
+    use fotw_web::speech_recovery::SpeechRecoveryControl;
+    let pcm = (0u32..48000)
+        .map(|n| {
+            if (n / 3200).is_multiple_of(2) {
+                1000
+            } else {
+                8000
+            }
+        })
+        .collect();
+    let mut f = fixture_audio(
+        false,
+        pcm,
+        vec![0.2; 48000],
+        "fixture-local",
+        "fixture-revision",
+    );
+    drop(f.wal.take());
+    startup(&owner(&f));
+    let db = Db::open(&f.database, &f.key).unwrap();
+    let id = db.session_note_meeting(&f.session).unwrap().unwrap();
+    let control = owner(&f);
+    control.retry(&id).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while control.read(&id).unwrap().worker_running {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let journal = std::fs::read(f.dir.join("system.stt-coverage.jsonl")).unwrap();
+    let count = db.export_meeting(&id).unwrap().segments.len();
+    std::fs::remove_file(f.dir.join("system.stt-prefix-projected.json")).unwrap();
+    assert_eq!(
+        owner(&f).read(&id).unwrap().phase,
+        fotw_web::speech_recovery::RecoveryPhase::Retained,
+        "unacknowledged data cannot claim a saved partial projection"
+    );
+    startup(&owner(&f));
+    assert!(
+        f.dir.join("system.stt-prefix-projected.json").exists(),
+        "startup must reconcile durable receipts whose SQL commit already succeeded"
+    );
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(db.export_meeting(&id).unwrap().segments.len(), count);
+    assert_eq!(
+        std::fs::read(f.dir.join("system.stt-coverage.jsonl")).unwrap(),
+        journal
+    );
+}
 #[test]
 fn interrupted_audio_is_visible_without_inventing_a_capture_end_or_sealing_input() {
     let mut f = fixture(false, 48000);
@@ -324,10 +607,9 @@ fn interrupted_audio_is_visible_without_inventing_a_capture_end_or_sealing_input
     let control = owner(&f);
     use fotw_web::speech_recovery::{RecoveryPhase, SpeechRecoveryControl};
     assert_eq!(control.read(&id).unwrap().phase, RecoveryPhase::Retained);
-    assert!(!control.read(&id).unwrap().can_retry);
     assert!(
-        control.retry(&id).is_err(),
-        "unknown-end input cannot start inference"
+        control.read(&id).unwrap().can_retry,
+        "a saved plan may recover its bounded canonical prefix"
     );
     assert_eq!(
         std::fs::read(f.dir.join("manifest.json")).unwrap(),
@@ -365,6 +647,13 @@ fn raw_only_interrupted_audio_and_notes_are_indexed_without_a_transcription_clai
     assert_eq!(std::fs::read(f.dir.join("system.pcm")).unwrap(), raw);
     assert!(!f.dir.join("system.stt16").exists());
     assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+    use fotw_web::speech_recovery::SpeechRecoveryControl;
+    let control = owner(&f);
+    assert!(!control.read(&id).unwrap().can_retry);
+    assert!(
+        control.retry(&id).is_err(),
+        "raw-only audio has no canonical recovery plan"
+    );
 }
 
 #[test]
@@ -477,49 +766,64 @@ fn corrupt_second_source_is_validated_before_the_first_source_is_frozen() {
 fn cancelling_a_blocked_local_prepare_retains_the_interrupted_capture_lease_until_it_returns() {
     use fotw_web::speech_recovery::SpeechRecoveryControl;
     use std::sync::{Mutex, mpsc};
-    let mut f = fixture(true, 48000);
-    drop(f.wal.take());
-    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
-    let (release_tx, release_rx) = mpsc::sync_channel(1);
-    let release = Mutex::new(release_rx);
-    let calls = f.calls.clone();
-    let c = SavedSpeechRecovery::with_parts(
-        Db::open(&f.database, &f.key).unwrap(),
-        f.root.path().to_owned(),
-        Arc::new(move |_, _| {
-            entered_tx.send(()).unwrap();
-            release
-                .lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(4))
-                .map_err(|_| "fixture release timed out".to_owned())?;
-            Ok(Arc::new(Factory(calls.clone())))
-        }),
-        Duration::from_secs(2),
-        Duration::from_secs(5),
-    );
-    let pass = c.start_pending().unwrap().unwrap();
-    entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-    assert!(fotw_pipeline::capture_clock::CaptureOwner::recover(&f.dir).is_err());
-    drop(pass);
-    assert!(
-        fotw_pipeline::capture_clock::CaptureOwner::recover(&f.dir).is_err(),
-        "cancellation must not revoke a retained worker's lease"
-    );
-    release_tx.send(()).unwrap();
-    let db = Db::open(&f.database, &f.key).unwrap();
-    let meeting = db.session_note_meeting(&f.session).unwrap().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while c.read(&meeting).unwrap().worker_running {
-        assert!(Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(5));
+    for stopped in [true, false] {
+        let mut f = fixture(stopped, 48000);
+        drop(f.wal.take());
+        if !stopped {
+            startup(&owner(&f));
+        }
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let release = Mutex::new(release_rx);
+        let calls = f.calls.clone();
+        let c = SavedSpeechRecovery::with_parts(
+            Db::open(&f.database, &f.key).unwrap(),
+            f.root.path().to_owned(),
+            Arc::new(move |_, _| {
+                entered_tx.send(()).unwrap();
+                release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(4))
+                    .map_err(|_| "fixture release timed out".to_owned())?;
+                Ok(Arc::new(Factory(calls.clone())))
+            }),
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+        );
+        let pass = if stopped {
+            Some(c.start_pending().unwrap().unwrap())
+        } else {
+            let db = Db::open(&f.database, &f.key).unwrap();
+            c.retry(&db.session_note_meeting(&f.session).unwrap().unwrap())
+                .unwrap();
+            None
+        };
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(fotw_pipeline::capture_clock::CaptureOwner::recover(&f.dir).is_err());
+        let db = Db::open(&f.database, &f.key).unwrap();
+        let meeting = db.session_note_meeting(&f.session).unwrap().unwrap();
+        drop(pass);
+        if !stopped {
+            c.cancel(&meeting).unwrap();
+        }
+        assert!(
+            fotw_pipeline::capture_clock::CaptureOwner::recover(&f.dir).is_err(),
+            "cancellation must not revoke a retained worker's lease"
+        );
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while c.read(&meeting).unwrap().worker_running {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(fotw_pipeline::capture_clock::CaptureOwner::recover(&f.dir).is_ok());
+        assert_eq!(
+            f.calls.load(Ordering::SeqCst),
+            0,
+            "cancelled preparation must never construct inference"
+        );
     }
-    assert!(fotw_pipeline::capture_clock::CaptureOwner::recover(&f.dir).is_ok());
-    assert_eq!(
-        f.calls.load(Ordering::SeqCst),
-        0,
-        "cancelled preparation must never construct inference"
-    );
 }
 
 /// Only the already approved, checksum-pinned public fixture and model may run.
@@ -527,18 +831,25 @@ fn cancelling_a_blocked_local_prepare_retains_the_interrupted_capture_lease_unti
 #[test]
 #[ignore = "requires cached public small.en weights and checksum-verified JFK WAV"]
 fn installed_model_recovers_an_unindexed_stopped_wal_without_changing_settings_or_audio() {
-    native_capture_recovery(false);
+    native_capture_recovery(false, false);
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires cached public small.en weights and checksum-verified JFK WAV"]
 fn installed_model_recovers_a_finalized_archive_after_pcm_retirement() {
-    native_capture_recovery(true);
+    native_capture_recovery(true, false);
 }
 
 #[cfg(target_os = "macos")]
-fn native_capture_recovery(archived: bool) {
+#[test]
+#[ignore = "requires cached public small.en weights and checksum-verified JFK WAV"]
+fn installed_model_recovers_a_saved_prefix_without_manufacturing_a_capture_end() {
+    native_capture_recovery(false, true);
+}
+
+#[cfg(target_os = "macos")]
+fn native_capture_recovery(archived: bool, prefix_only: bool) {
     use fotw_web::speech_recovery::{RecoveryPhase, SpeechRecoveryControl};
     use sha2::{Digest, Sha256};
     let model = PathBuf::from(
@@ -570,7 +881,7 @@ fn native_capture_recovery(archived: bool) {
         .map(|s| (s * 32768.0).round() as i16)
         .collect();
     let mut f = fixture_audio(
-        true,
+        !prefix_only,
         canonical,
         decoded.samples,
         "small.en",
@@ -614,7 +925,24 @@ fn native_capture_recovery(archived: bool) {
         .session_note_meeting(&f.session)
         .unwrap()
         .expect("interrupted WAL must become discoverable");
-    assert_eq!(c.read(&meeting).unwrap().phase, RecoveryPhase::Complete);
+    if prefix_only {
+        c.retry(&meeting).unwrap();
+        while c.read(&meeting).unwrap().worker_running {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(c.read(&meeting).unwrap().phase, RecoveryPhase::Partial);
+        assert_eq!(db.session_note_clock(&f.session).unwrap(), None);
+        for name in [
+            "system.stt-sealed.json",
+            "system.stt-complete.json",
+            "system.stt-projected.json",
+        ] {
+            assert!(!f.dir.join(name).exists());
+        }
+    } else {
+        assert_eq!(c.read(&meeting).unwrap().phase, RecoveryPhase::Complete);
+    }
     let snapshot = CoverageJournal::snapshot(&f.dir, &f.session, Source::System).unwrap();
     let recovered_capabilities = &snapshot.epochs.last().unwrap().engine.capabilities;
     assert_eq!(
@@ -658,7 +986,7 @@ fn native_capture_recovery(archived: bool) {
     }
     println!(
         "{}",
-        serde_json::json!({"fixture":"public-jfk","unindexed_stopped_wal":true,"raw_retired":archived,"phase":"complete","canonical_unchanged":true,"settings_unchanged":true,"elapsed_ms":began.elapsed().as_millis(),"model":"small.en"})
+        serde_json::json!({"fixture":"public-jfk","unindexed_stopped_wal":!prefix_only,"raw_retired":archived,"phase":if prefix_only{"partial"}else{"complete"},"canonical_unchanged":true,"settings_unchanged":true,"elapsed_ms":began.elapsed().as_millis(),"model":"small.en"})
     );
 }
 

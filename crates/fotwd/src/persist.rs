@@ -254,12 +254,30 @@ pub(crate) fn persist_interrupted(
     let mut meeting = fotw_store::NewMeeting::new(device_id(), timezone());
     meeting.title = "Interrupted recording".into();
     meeting.started_at_ms = integer(started)?;
-    db.retain_interrupted_capture(
+    let id = db.retain_interrupted_capture(
         session,
         meeting,
         integer(observed_elapsed)?,
         prepared.as_ref().map_or(&[], |p| p.sources.as_slice()),
-    )
+    )?;
+    if let Some(prepared) = prepared {
+        for checkpoint in prepared.checkpoints {
+            let source = match checkpoint.source {
+                Source::System => fotw_pipeline::replay::ReplaySource::System,
+                Source::Mic => fotw_pipeline::replay::ReplaySource::Mic,
+            };
+            let result = (|| {
+                let mut reader = fotw_pipeline::replay::ReplayReader::open(dir, session, source)?;
+                reader.mark_prefix_projected(checkpoint.through_sample, checkpoint.journal_bytes)
+            })();
+            result.map_err(|source| fotw_store::StoreError::Io {
+                context: "acknowledging saved prefix projection",
+                path: dir.to_owned(),
+                source,
+            })?;
+        }
+    }
+    Ok(id)
 }
 
 struct ProjectionCheckpoint {

@@ -31,6 +31,14 @@ pub(crate) struct StoppedCapture {
     _capture: CaptureOwner,
 }
 struct RetainedLease(std::fs::File);
+pub(crate) struct ProjectionLeases {
+    _leases: Vec<RetainedLease>,
+}
+pub(crate) fn projection_leases(dir: &Path, session: &str) -> io::Result<ProjectionLeases> {
+    Ok(ProjectionLeases {
+        _leases: retained_sources(dir, session)?,
+    })
+}
 impl Drop for RetainedLease {
     fn drop(&mut self) {
         let _ = self.0.unlock();
@@ -51,6 +59,7 @@ fn retained_sources(dir: &Path, session: &str) -> io::Result<Vec<RetainedLease>>
             "stt-sealed.json",
             "stt-complete.json",
             "stt-projected.json",
+            "stt-prefix-projected.json",
         ] {
             optional_ordinary(&dir.join(format!("{name}.{suffix}")))?;
         }
@@ -256,6 +265,24 @@ pub(crate) fn prepare(dir: &Path, stop: &AtomicBool) -> io::Result<Option<Stoppe
         _journals: journals,
         _retained: vec![],
     }))
+}
+
+/// Retain capture ownership throughout local inference for an imported unfinished WAL.
+pub(crate) fn own_retained(dir: &Path, started: u64) -> io::Result<CaptureOwner> {
+    let (owner, _) = snapshot(dir)?;
+    verify_retained(dir, &owner, started)?;
+    Ok(owner)
+}
+
+pub(crate) fn verify_retained(dir: &Path, owner: &CaptureOwner, started: u64) -> io::Result<()> {
+    let proof = owner.snapshot()?;
+    if proof.checkpoint.started_at_ms != started
+        || dir.file_name().and_then(|name| name.to_str())
+            != Some(proof.checkpoint.session_id.as_str())
+    {
+        return Err(invalid("retained capture identity changed"));
+    }
+    Ok(())
 }
 
 /// Retain capture ownership throughout local inference for an imported unfinished WAL.

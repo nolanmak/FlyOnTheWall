@@ -5,8 +5,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryPhase {
-    /// Audio is indexed, but missing final-clock evidence prevents inference.
+    /// Audio is indexed with an unknown final clock. Only independently
+    /// validated canonical prefixes with a saved model plan may be retried.
     Retained,
+    /// Available saved speech was recovered; original audio/time remains unresolved.
+    Partial,
     /// Retained canonical audio has unfinished transcription.
     Incomplete,
     /// Resolving the original model and source ownership.
@@ -32,7 +35,8 @@ pub struct RecoverySource {
     pub model: String,
     /// Saved installed revision, when recorded.
     pub revision: Option<String>,
-    /// Absolute uncommitted duration; unrelated to recognized word count.
+    /// Uncommitted canonical duration; excludes unmapped original audio and is
+    /// unrelated to recognized word count or whole-recording completeness.
     pub pending_audio_ms: u64,
 }
 

@@ -27,12 +27,12 @@ globalThis.FOTWSpeechRecovery = { mount(id, parent, api, reload) {
     root.hidden=false;
     const running=state.worker_running===true;
     hasRun=hasRun||running;
-    heading.textContent=state.phase==='retained'?'Interrupted recording':state.phase==='complete'?'Transcription recovered':'Finish transcription';
-    const labels={retained:'The final recording time is unknown. Audio and notes are retained, along with any saved transcript. Transcription cannot resume automatically.',incomplete:'Some saved audio is still unconfirmed. Retry locally to finish it.',preparing:'Preparing the original local model…',
+    heading.textContent=state.phase==='partial'?'Saved speech recovered':state.phase==='retained'?'Interrupted recording':state.phase==='complete'?'Transcription recovered':'Finish transcription';
+    const labels={partial:'Available saved speech recovered. The final recording time remains unknown and additional original audio is retained.',retained:'The final recording time is unknown. Audio, notes and any saved transcript are retained.',incomplete:'Some saved audio is still unconfirmed. Retry locally to finish it.',preparing:'Preparing the original local model…',
       transcribing:'Recovering saved speech locally…',stopping:'Waiting for local work to stop. Audio is retained.',
       complete:'Recovered speech is saved. Reload the transcript when you are ready.',failed:'Local recovery did not finish. Audio is retained for retry.',cancelled:'Local recovery cancelled. Audio is retained for retry.'};
     message.textContent=state.message||labels[state.phase]||'Recovery status unavailable. Refresh to try again.';
-    explanation.hidden=state.phase==='retained';
+    explanation.hidden=state.phase==='retained'||state.phase==='partial';
     while(sources.firstChild) sources.removeChild(sources.firstChild);
     for(const source of Array.isArray(state.sources)?state.sources:[]) {
       const name=source.source==='system'?'Other participants':source.source==='mic'?'Your microphone':'Capture source';
@@ -41,7 +41,7 @@ globalThis.FOTWSpeechRecovery = { mount(id, parent, api, reload) {
     }
     retry.disabled=running||state.can_retry!==true;
     cancel.hidden=!running;cancel.disabled=state.phase==='stopping';
-    refresh.disabled=false;reloadButton.hidden=state.phase!=='complete';
+    refresh.disabled=false;reloadButton.hidden=state.phase!=='complete'&&state.phase!=='partial';
     if(state.phase==='complete'&&!hasRun) root.hidden=true;
     if(running||(state.can_retry===false&&state.phase==='incomplete')) poll();
   }

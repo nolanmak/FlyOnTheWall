@@ -922,6 +922,113 @@ fn resume_request(fixture: &PendingFixture) -> fotwd::failover::stream::LocalRes
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prefix_target_does_not_seal_or_complete_or_consume_the_remaining_original_audio() {
+    let fixture = pending_fixture(false);
+    let target = fixture.anchor + 30 * 16000;
+    let before = std::fs::read(fixture.dir.join("system.stt16")).unwrap();
+    let (stream, mut events) =
+        FailoverStream::resume_prefix(&fixture.dir, resume_request(&fixture), target)
+            .await
+            .unwrap();
+    let _ = stream.finish().await;
+    assert_eq!(
+        stream.status().committed_sample,
+        target,
+        "prefix recovery must stop at the requested source boundary"
+    );
+    assert_ne!(
+        stream.status().phase,
+        fotwd::failover::stream::Phase::Complete
+    );
+    assert!(!fixture.dir.join("system.stt-sealed.json").exists());
+    assert!(!fixture.dir.join("system.stt-complete.json").exists());
+    assert!(!fixture.dir.join("system.stt-projected.json").exists());
+    assert_eq!(
+        std::fs::read(fixture.dir.join("system.stt16")).unwrap(),
+        before
+    );
+    while let Ok(event) = events.try_recv() {
+        if let Event::Transcript(StreamEvent::Final(segment)) = event {
+            assert!(segment.start_ms >= 10137 && segment.end_ms <= 30137);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prefix_recovery_retains_torn_samples_and_refuses_invalid_targets_without_receipts() {
+    use std::io::Write;
+    let fixture = pending_fixture(false);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(fixture.dir.join("system.stt16"))
+        .unwrap()
+        .write_all(&[0xff])
+        .unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(fixture.dir.join("system.stt-coverage.jsonl"))
+        .unwrap()
+        .write_all(b"{incomplete")
+        .unwrap();
+    let before = std::fs::read(fixture.dir.join("system.stt16")).unwrap();
+    let journal = std::fs::read(fixture.dir.join("system.stt-coverage.jsonl")).unwrap();
+    for target in [fixture.anchor + 9 * 16000, fixture.end + 1] {
+        assert!(
+            FailoverStream::resume_prefix(&fixture.dir, resume_request(&fixture), target)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(fixture.dir.join("system.stt16")).unwrap(),
+            before
+        );
+        assert_eq!(
+            std::fs::read(fixture.dir.join("system.stt-coverage.jsonl")).unwrap(),
+            journal
+        );
+    }
+    let (stream, _events) =
+        FailoverStream::resume_prefix(&fixture.dir, resume_request(&fixture), fixture.end)
+            .await
+            .unwrap();
+    assert!(
+        !stream.finish().await,
+        "a recovered prefix cannot claim whole-input completion"
+    );
+    assert_eq!(
+        stream.status().phase,
+        fotwd::failover::stream::Phase::PrefixRecovered
+    );
+    drop(stream);
+    assert_eq!(
+        std::fs::read(fixture.dir.join("system.stt16")).unwrap(),
+        before
+    );
+    assert!(!fixture.dir.join("system.stt-sealed.json").exists());
+    assert!(!fixture.dir.join("system.stt-complete.json").exists());
+    let mut owner = fotw_pipeline::replay::ReplayWriter::resume_prefix(
+        &fixture.dir,
+        &fixture.session,
+        fotw_pipeline::replay::ReplaySource::System,
+    )
+    .unwrap();
+    assert!(owner.append(&[123]).is_err());
+    assert!(owner.seal().is_err());
+    drop(owner);
+    let final_journal = std::fs::read(fixture.dir.join("system.stt-coverage.jsonl")).unwrap();
+    let (stream, _events) =
+        FailoverStream::resume_prefix(&fixture.dir, resume_request(&fixture), fixture.end)
+            .await
+            .unwrap();
+    let _ = stream.finish().await;
+    assert_eq!(
+        std::fs::read(fixture.dir.join("system.stt-coverage.jsonl")).unwrap(),
+        final_journal,
+        "same completed prefix must not add another provider epoch or receipt"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_restart_recovers_only_pending_audio_and_projects_once_without_replacing_edits() {
     for sealed in [false, true] {
         let fixture = pending_fixture(sealed);
