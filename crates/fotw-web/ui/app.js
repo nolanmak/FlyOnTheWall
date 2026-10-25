@@ -813,6 +813,10 @@ function appendDeltas(deltas) {
 // The cache belongs to the mounted transcript, so navigation/session replacement
 // releases it with that DOM. Stable finals keep their nodes across partials.
 const liveTranscriptRows = new WeakMap();
+function onLiveScroll() {
+  const latest = document.getElementById("live-latest");
+  if (liveIsShowing() && isNearBottom(el.detail) && latest && !latest.hidden) renderLiveTranscript(true);
+}
 function renderLiveTranscript(forceFollow = false) {
   if (!liveIsShowing()) return;
   const body = document.getElementById("segments");
@@ -1310,9 +1314,7 @@ function showLive() {
   });
   el.detail.appendChild(latest);
   // Replace the handler on navigation; no listener accumulates per mount.
-  el.detail.onscroll = () => {
-    if (liveIsShowing() && isNearBottom(el.detail) && !latest.hidden) renderLiveTranscript(true);
-  };
+  el.detail.onscroll = onLiveScroll;
   renderLiveTranscript();
   mountLiveNotes();
   paintLiveNavigation();
