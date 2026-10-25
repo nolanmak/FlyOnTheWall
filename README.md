@@ -7,7 +7,7 @@ An open-source, local-first meeting recorder for macOS. It captures system audio
 ### Known gaps
 
 - **Audio is not encrypted at rest** ([#56](https://github.com/nolanmak/FlyOnTheWall/issues/56)). Only the database is.
-- **Two speech-to-text engines: Deepgram, or whisper.cpp on your Mac.** On-device transcription ([#33](https://github.com/nolanmak/FlyOnTheWall/issues/33)) is configured from the command line only, you download the model yourself, and Apple's SpeechAnalyzer is not used. An ordered failover chain across providers ([#12](https://github.com/nolanmak/FlyOnTheWall/issues/12)) is planned. `fotwd key set` already accepts `elevenlabs` and `openai` keys, but nothing uses them yet.
+- **Two speech-to-text engines: Deepgram, or whisper.cpp on your Mac.** Choose local Whisper, Deepgram, or Deepgram with offline backup in the dashboard’s Transcription panel. Model setup is explicit and checksum-verified ([#33](https://github.com/nolanmak/FlyOnTheWall/issues/33)); Apple’s SpeechAnalyzer is not used. Recovery work remains tracked in [#12](https://github.com/nolanmak/FlyOnTheWall/issues/12). `fotwd key set` already accepts `elevenlabs` and `openai` keys, but nothing uses them yet.
 - **No menu-bar item or floating recording indicator.** Both are written, in `fotw-shell`, but nothing in the app starts them ([#58](https://github.com/nolanmak/FlyOnTheWall/issues/58)). Recording is started, stopped and shown in the dashboard.
 - **Notes cannot be typed yet.** The library, search, summaries and exports all handle a meeting's notes, but no shipped screen or command writes them.
 - **Windows and Linux** capture backends are empty placeholders (milestone M4).
@@ -148,19 +148,22 @@ The key goes into the macOS keychain. It is looked up each time you press **Star
 
 ### Or transcribe on this Mac
 
-whisper.cpp runs inside the app, with Metal on Apple silicon, and no meeting audio leaves the machine. FlyOnTheWall does not download models itself, so fetch one first. The recommended model is large-v3-turbo, quantized (574 MB):
+whisper.cpp runs inside the app, with Metal on Apple silicon. Choose a model by language and file size; the catalog lists pinned source revision, SHA-256 and MIT license. Setup is an explicit command and never starts from a recording:
 
 ```sh
-mkdir -p ~/Library/Application\ Support/com.flyonthewall.fotw/models
-curl -L --fail -o ~/Library/Application\ Support/com.flyonthewall.fotw/models/ggml-large-v3-turbo-q5_0.bin \
-  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
-
-fotwd stt test some-recording.wav   # optional: transcribe a file to check speed and accuracy
-fotwd stt local                     # checks the file against its published SHA-256, then switches
-fotwd stt                           # which engine the next recording will use
+fotwd stt models list
+fotwd stt models install small.en       # explicit HTTPS download; byte progress in the terminal
+# Or import the exact catalog file without networking:
+fotwd stt models import small.en /path/to/ggml-small.en.bin
+fotwd stt local --model small.en --language en
+fotwd stt                             # the next recording's selected policy
 ```
 
-`fotwd stt local` with no model shows these commands and the other published models (`--model base.en`, `small.en`, `large-v3-turbo`), and `--model` also takes a path to a ggml model of your own. `--language en` skips language detection. `fotwd stt deepgram` switches back. The setting is read each time you press **Start**.
+Install/import checks free space (including 64 MiB of headroom), size and SHA-256 before atomically replacing the model. Failures or cancellation before publication preserve the previous file. Ctrl-C during transfer leaves a reserved partial that a later explicit retry reclaims. Once Installing begins, publication has won the cancellation boundary; a directory-sync failure reports that verified weights were replaced and should be checked again after restart. An already verified installation works without source access or networking. Models are stored beside the library; `--data-root <directory>` selects an explicit alternative for setup. Choose that installed path in Transcription settings afterward.
+
+Setup and capture use an OS file lease shared across CLI and daemon processes. Actual tap owners and supervised replacements retain it through native Stop and destruction, including detached work after a UI timeout. Unconfirmed Stop keeps setup blocked until the process exits. An OS call already in progress cannot be forcibly cancelled. A downloaded/verified file is separate from native model/language readiness, which is checked before capture. No speech, summary, key or export settings are changed by installation.
+
+`--model` also accepts an installed custom model path. Known catalog filenames must match their pinned bytes; custom paths remain explicitly user-supplied. `--language en` requests English; English-only models reject other languages. `fotwd stt deepgram` switches the configured speech policy back. The choice is read on each Start. Setup currently has CLI progress; an in-dashboard installer remains future work.
 
 The dashboard’s **Transcription** panel lets you select **Fully offline speech**, **Deepgram**, or **Deepgram with offline backup**, choose an installed model, and set its language. Saves apply to the next recording. Local selections validate the model before saving; a rejected save keeps the previous choice and your draft. Model file availability is shown separately from native readiness, which Start checks again. Summary and export settings are separate from speech privacy.
 
@@ -170,7 +173,7 @@ Saved meetings retain their primary transcript's recorded engine history under *
 
 For unstable Wi-Fi, select `fotwd stt fallback --model small.en --language en` after installing the model, or pass its absolute path. This mode initially sends audio to Deepgram, then finishes pending speech locally after a bounded provider outage and stays local for that meeting. Start prepares the backup before opening capture; a missing/unusable backup or missing Deepgram key refuses recording. The dashboard shows **Preparing** and offers **Cancel** until capture starts. Preparation may take several seconds. `fotwd stt local` remains the choice for keeping all audio on this Mac. See [the durable speech contract](docs/DURABLE_SPEECH.md) for recovery behavior and remaining app limitations.
 
-On-device transcription is a different trade-off from Deepgram's. Text appears once each speaker pauses, a second or two after they stop, rather than word by word. The far end of the call is not split into speakers: everything from the call audio is one voice, and your microphone is always `me`. If the model is missing or cannot load, the meeting is still recorded, the dashboard says why there is no transcript, and nothing is sent to Deepgram instead.
+On-device transcription is a different trade-off from Deepgram's. Text appears once each speaker pauses, a second or two after they stop, rather than word by word. The far end of the call is not split into speakers: everything from the call audio is one voice, and your microphone is always `me`. If the selected model is missing or cannot load, Start refuses capture and does not silently send audio to Deepgram.
 
 Local inference queues are bounded to 60 seconds of PCM and 8,192 commands per
 track. If inference cannot keep up, transcription stops with an incomplete

@@ -2292,6 +2292,7 @@ Used by:
 
 - futures-channel 0.3.33
 - futures-core 0.3.33
+- futures-io 0.3.34
 - futures-sink 0.3.34
 - futures-task 0.3.33
 - futures-util 0.3.33

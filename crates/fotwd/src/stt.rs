@@ -304,6 +304,9 @@ pub struct KnownModel {
     pub note: &'static str,
 }
 
+/// Immutable publisher revision for the catalog, including its MIT model card.
+pub const MODEL_REVISION: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
+
 /// The models `fotwd stt local` knows by name, from
 /// `huggingface.co/ggerganov/whisper.cpp`.
 pub const KNOWN_MODELS: &[KnownModel] = &[
@@ -311,25 +314,25 @@ pub const KNOWN_MODELS: &[KnownModel] = &[
         name: "large-v3-turbo-q5_0",
         bytes: 574_041_195,
         sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
-        note: "recommended: multilingual, accurate, fast with Metal",
+        note: "multilingual; Q5_0 quantized weights",
     },
     KnownModel {
         name: "large-v3-turbo",
         bytes: 1_624_555_275,
         sha256: "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
-        note: "unquantized turbo; slightly better, three times the size",
+        note: "multilingual; unquantized weights",
     },
     KnownModel {
         name: "small.en",
         bytes: 487_614_201,
         sha256: "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
-        note: "English only; for Intel Macs or a busy machine",
+        note: "English only; smaller weights",
     },
     KnownModel {
         name: "base.en",
         bytes: 147_964_211,
         sha256: "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
-        note: "English only; quick to try, noticeably less accurate",
+        note: "English only; smallest catalog download",
     },
 ];
 
@@ -338,7 +341,7 @@ impl KnownModel {
     #[must_use]
     pub fn url(&self) -> String {
         format!(
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{}",
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/{MODEL_REVISION}/{}",
             model_file_name(self.name)
         )
     }

@@ -67,6 +67,49 @@ Synthetic [desktop](speech-ui/saved-desktop.png) and
 Startup native recovery and retry controls remain part of
 [#12](https://github.com/nolanmak/FlyOnTheWall/issues/12).
 
+## Explicit model setup
+
+`fotwd stt models list` shows the immutable catalog revision, file sizes,
+SHA-256 hashes and MIT model-card license. Use `stt models install <name>` for
+an explicit HTTPS transfer, or `stt models import <name> <file>` for offline
+import of exactly those catalog bytes. `--data-root <dir>` selects a setup
+library; it does not alter the running daemon's library or speech policy.
+Setup returns before key/library lookup and runs blocking IO off the async
+runtime. There is no automatic download from recording, readiness or settings.
+
+The catalog uses publisher revision
+`5359861c739e955e79d9a303bcbc70fb988958b1`; [its model card](https://huggingface.co/ggerganov/whisper.cpp/blob/5359861c739e955e79d9a303bcbc70fb988958b1/README.md)
+and LFS metadata were checked against the pinned hashes/sizes. Transferred
+weights are bounded to their declared size and verified in 64 KiB chunks.
+Free-space admission includes 64 MiB beyond the new file's size. A private
+reserved partial is synced before atomic replacement. A retry reclaims an
+interrupted operation's partial only while holding exclusive admission. An
+already verified install does not open a download/import source. Verification
+of the file remains separate from native language/model readiness on Start.
+
+Current CLI and daemon capture paths share an OS file lease keyed by the
+canonical library directory, including custom capture folders and path aliases. Open
+platforms, tap replacements, native Stop and destructors retain it after an
+async/UI observer stops waiting. Unknown Stop evidence quarantines one lease
+per library until process exit, rather than admitting setup or multiplying
+retained descriptors per failed Stop. Older binaries do not implement this
+protocol; stop them before using setup against the same library.
+
+Cancellation is checked between IO operations and loses once Installing begins.
+An outstanding OS read/destructor cannot be forcibly interrupted; it retains
+admission until it returns. Transfers have a 15-second connect timeout and a
+15-minute total request deadline. A failed directory sync after replacement
+reports that the verified file is already present; it does not claim rollback.
+The client has no credentials/cookies/proxy discovery and permits only HTTPS,
+with at most five redirects. No audio, transcript or settings enter the request.
+
+Validation uses temporary stores, actual loopback HTTP faults and a hard-killed
+owned installer process. A network-denied real CLI import and source-absent
+restart also verified the previously approved cached small.en file. These are
+file-provisioning checks, not model quality, sustained performance or physical
+capture acceptance. Progress currently appears in the CLI; an in-dashboard
+installer remains future work under #33.
+
 ## Capture and admission
 
 `FailoverLegs::prepare` allocates an independent native state for each configured

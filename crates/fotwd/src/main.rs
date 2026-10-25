@@ -181,7 +181,7 @@ async fn main() -> ExitCode {
                  onboard | detect [seconds] | \
                  retention [dir] [--apply] [--days <n>] [--budget-gib <n>] | \
                  key <set <provider>|list> | engine [claude-cli|codex-cli|off] | \
-                 stt [local|fallback [--model <name|path>] [--language <code>]|deepgram|test <wav>] | \
+                 stt [models|local|fallback [--model <name|path>] [--language <code>]|deepgram|test <wav>] | \
                  dedupe <id|--all> [dir] [--revert <transcript-id>] | \
                  recover [dir] [--check] | \
                  retitle-legacy [dir] [--apply] | \
@@ -1510,7 +1510,7 @@ fn engine_command(args: &[String]) -> ExitCode {
     }
 }
 
-/// `fotwd stt [local|fallback [--model <name|path>] [--language <code>] | deepgram | test <wav>]`.
+/// `fotwd stt [models|local|fallback [--model <name|path>] [--language <code>] | deepgram | test <wav>]`.
 ///
 /// Which engine transcribes recordings (#33). Bare, it reports what the next
 /// Start will actually use — including a configured engine that cannot run —
@@ -1520,6 +1520,10 @@ async fn stt_command(args: &[String]) -> ExitCode {
 
     let root = default_root();
     let data_root = data_root_of(&root);
+
+    if args.first().map(String::as_str) == Some("models") {
+        return model_setup_command(&data_root, &args[1..]).await;
+    }
 
     if args.first().map(String::as_str) == Some("test") {
         let Some(wav) = positionals(&args[1..], &["--model", "--language"])
@@ -1655,10 +1659,94 @@ async fn stt_command(args: &[String]) -> ExitCode {
         }
         Some(other) => {
             eprintln!(
-                "usage: fotwd stt [local|fallback [--model <name|path>] [--language <code>] | deepgram | \
+                "usage: fotwd stt [models|local|fallback [--model <name|path>] [--language <code>] | deepgram | \
                  test <file.wav> [--model <name|path>]]"
             );
             eprintln!("fotwd: unknown stt command `{other}`");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Explicit setup runs outside the async runtime and before any library/key lookup.
+async fn model_setup_command(default_data_root: &std::path::Path, args: &[String]) -> ExitCode {
+    use fotwd::model_setup::{Control, Source};
+    if args.is_empty() || matches!(args, [action] if action=="list") {
+        println!("Pinned Whisper catalog: {}", fotwd::stt::MODEL_REVISION);
+        println!(
+            "License: MIT — https://huggingface.co/ggerganov/whisper.cpp/blob/{}/README.md",
+            fotwd::stt::MODEL_REVISION
+        );
+        for model in fotwd::stt::KNOWN_MODELS {
+            println!(
+                "{}: {} bytes; {}\n  SHA-256 {}\n  {}",
+                model.name,
+                model.bytes,
+                model.note,
+                model.sha256,
+                model.url()
+            );
+        }
+        return ExitCode::SUCCESS;
+    }
+    let mut options = args;
+    let root = if args.len() >= 2 && args[args.len() - 2] == "--data-root" {
+        options = &args[..args.len() - 2];
+        match std::path::absolute(&args[args.len() - 1]) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("fotwd: cannot resolve model setup root: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        default_data_root.to_owned()
+    };
+    let (name, source) = match options {
+        [action, name] if action == "install" => (name.clone(), Source::Download),
+        [action, name, path] if action == "import" => match std::path::absolute(path) {
+            Ok(path) => (name.clone(), Source::Import(path)),
+            Err(e) => {
+                eprintln!("fotwd: cannot resolve model import: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => {
+            eprintln!(
+                "usage: fotwd stt models list | install <name> [--data-root <dir>] | import <name> <file> [--data-root <dir>]"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let mut last = None;
+        fotwd::model_setup::install(&root, &name, source, &Control::default(), |progress| {
+            let percent = progress.bytes.saturating_mul(100) / progress.total.max(1);
+            let now = (progress.phase, percent);
+            if last != Some(now) {
+                eprintln!(
+                    "Model setup {:?}: {} / {} bytes ({percent}%)",
+                    progress.phase, progress.bytes, progress.total
+                );
+                last = Some(now);
+            }
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(path)) => {
+            println!("Verified model: {}", path.display());
+            println!(
+                "Select Fully offline speech or offline backup and this path in Transcription settings. Native model/language readiness is checked before capture."
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(Err(error)) => {
+            eprintln!("fotwd: {error}");
+            ExitCode::FAILURE
+        }
+        Err(_) => {
+            eprintln!("fotwd: model setup worker failed; retry the explicit setup command");
             ExitCode::FAILURE
         }
     }
@@ -1701,20 +1789,18 @@ fn check_model(path: &std::path::Path, data_root: &std::path::Path) -> bool {
                 .and_then(|n| n.to_str())
                 .and_then(fotwd::stt::known_model);
             eprintln!();
-            eprintln!("  No model there yet. FlyOnTheWall does not download models itself;");
+            eprintln!(
+                "  Model not ready. Explicit setup downloads/imports a pinned, verified file."
+            );
             if let Some(known) = name {
                 eprintln!(
-                    "  fetch {} ({} MB) with:",
+                    "  Install {} ({} MB, MIT) with:",
                     known.name,
                     known.bytes / 1_000_000
                 );
-                eprintln!();
-                eprintln!("    mkdir -p '{}'", path.parent().unwrap_or(path).display());
-                eprintln!("    curl -L --fail -o '{}' \\", path.display());
-                eprintln!("      {}", known.url());
-                eprintln!();
+                eprintln!("    fotwd stt models install {}", known.name);
                 eprintln!(
-                    "  then run `fotwd stt local` again; it checks the file before using it."
+                    "  Then choose the installed path. Setup is refused while capture owns the library."
                 );
             } else {
                 eprintln!("  put a ggml Whisper model at that path, or pick a published one.");

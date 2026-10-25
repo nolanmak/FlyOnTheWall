@@ -855,15 +855,26 @@ async fn spawn_session(
     let speech = control.speech.clone();
     let ready = control.ready.clone();
     let outcome = async {
+        if control.stop.is_stopped() {
+            return Err("recording preparation cancelled before capture".into());
+        }
+        let model_work = Arc::new(crate::model_setup::WorkLease::capture(&root)?);
         let transcription = transcription.prepare(&control).await?;
         if !control.ready.begin_capture_setup(&control.stop) {
             return Err("recording preparation cancelled before capture".into());
         }
         match capture {
             SessionCapture::Prebuilt(open) => {
-                let (system, mic) = tokio::task::spawn_blocking(move || open())
-                    .await
-                    .map_err(|_| "capture preparation failed".to_owned())??;
+                let open_work = model_work.clone();
+                let (system, mic) = tokio::task::spawn_blocking(move || {
+                    let (system, mic) = open()?;
+                    Ok::<_, String>((
+                        crate::model_setup::lease_tap(system, open_work.clone()),
+                        mic.map(|tap| crate::model_setup::lease_tap(tap, open_work.clone())),
+                    ))
+                })
+                .await
+                .map_err(|_| "capture preparation failed".to_owned())??;
                 if control.stop.is_stopped() {
                     return Err("recording preparation cancelled before capture".into());
                 }
