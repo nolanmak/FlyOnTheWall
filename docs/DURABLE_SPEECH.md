@@ -19,7 +19,9 @@ capture and offers Stop, warning that buffered audio may be saved. A late native
 start still publishes capture identity/clock even if Stop woke the waiting Start
 request earlier. Pending Start requests poll setup every second so Cancel does
 not wait for the normal five-second status interval. No model is downloaded
-automatically.
+automatically. Startup deadlines retain native ownership for every speech mode;
+new Start requests are refused until that setup actually exits. A deadline can
+bound the app's wait but cannot force a blocked OS call to return.
 
 Graphical provider selection, live engine/provenance status, startup native
 recovery and retry UI remain part of
