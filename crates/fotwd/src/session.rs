@@ -1760,6 +1760,12 @@ pub async fn run_with_control(
     duration: Duration,
     control: SessionControl,
 ) -> Result<SessionOutcome, String> {
+    if control.stop.is_stopped() {
+        return Err("recording cancelled before capture setup".into());
+    }
+    let model_work = Arc::new(crate::model_setup::WorkLease::capture(root)?);
+    system = crate::model_setup::lease_tap(system, model_work.clone());
+    mic = mic.map(|tap| crate::model_setup::lease_tap(tap, model_work.clone()));
     let transcription = transcription.prepare(&control).await?;
     if !control.ready.begin_capture_setup(&control.stop) {
         return Err("recording cancelled before capture setup".into());
@@ -2116,6 +2122,11 @@ pub async fn run_supervised(
     duration: Duration,
     control: SessionControl,
 ) -> Result<SessionOutcome, String> {
+    if control.stop.is_stopped() {
+        return Err("recording cancelled before capture setup".into());
+    }
+    let model_work = Arc::new(crate::model_setup::WorkLease::capture(root)?);
+    let plat = crate::model_setup::lease_platform(plat, model_work);
     let transcription = transcription.prepare(&control).await?;
     if !control.ready.begin_capture_setup(&control.stop) {
         return Err("recording cancelled before capture setup".into());

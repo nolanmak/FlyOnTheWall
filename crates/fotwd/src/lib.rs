@@ -18,6 +18,8 @@ pub mod github;
 pub mod health;
 pub mod journal;
 pub mod mcp;
+mod model_capture;
+pub mod model_setup;
 pub mod okf;
 pub mod onboard;
 pub mod persist;

@@ -50,7 +50,9 @@ tokio = { workspace = true, features = [
 # Checks a downloaded local-STT model against its published checksum (#33).
 # Already in the lock via fotw-secrets, so no new supply chain.
 sha2 = "0.11"
-reqwest = { version = "0.13.4", default-features = false, features = ["http2", "native-tls", "json", "charset"] }
+# Filesystem free-space and no-follow checks; already in Cargo.lock.
+libc = "0.2"
+reqwest = { version = "0.13.4", default-features = false, features = ["http2", "native-tls", "json", "charset", "blocking"] }
 
 [dev-dependencies]
 # This crate, on itself, purely to turn `test-guards` on for the library that
