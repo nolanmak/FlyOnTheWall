@@ -281,3 +281,72 @@ model hashing/loading and metrics. Recorded model load was 175.84 ms; file,
 GPU and compiler-cache state was uncontrolled, so this is not a cold-load or
 cold/warm acceptance measurement. These are whole-probe resources, including
 the shared Whisper context, not isolated model/backend or concurrent-app memory.
+
+## Conservative native profile and validation matrix
+
+The optional native comparison now includes
+`native-webrtc-2.1.0-conservative`, using the same pinned 2.1.0 runtime's
+experimental AEC3 configuration API. It changes two things:
+
+- Scale normal and near-end low/high-band echo-to-near transparency/suppression
+  thresholds by 16, so nonlinear suppression is less aggressive toward mixed
+  local speech. Echo-to-masker thresholds and NS/AGC/high-pass settings stay as
+  before; there is no output gain normalization.
+- Extend refined/coarse and initial adaptive filters to 32 blocks of 64 samples,
+  covering 128 ms at 16 kHz. That is filter span, not processing latency: the
+  measured fixed near-only signal offset remains 128 samples, or 8 ms.
+
+The runtime must accept the configuration without silently modifying it. The
+profile parameters are included in both generated-signal and public-speech
+JSON. A real-native regression first measured the default profile's overlap
+failure, then passed the original four gates with the configured profile.
+
+The original fixture was used to choose these parameters. They were fixed
+before evaluating three additional signal/room fixtures; no parameter was
+changed after seeing the failed validation case. Run the full matrix with:
+
+```sh
+cargo run --release --manifest-path tools/aec-eval/Cargo.toml --locked --features native-webrtc -- --heldout-signals
+```
+
+Each fixture records independent seeds, room taps and drift. The drifting room
+uses linear interpolation of the delayed far signal at +80 ppm while leaving
+the render reference on its original clock. This is a synthetic sample-clock
+challenge, not real hardware or callback scheduling. All cases retain their
+original sample count and the same eight-second adaptation exclusion.
+
+| M4 conservative profile | Echo-only reduction | Overlap near gain | SNR improvement over raw | Four signal gates |
+| --- | ---: | ---: | ---: | --- |
+| Original calibration room | 20.00 dB | -0.67 dB | +6.64 dB | Pass |
+| Unseen shorter room/seeds | 19.61 dB | -0.27 dB | +8.20 dB | Pass |
+| Unseen longer room/seeds | 18.80 dB | -0.38 dB | +6.18 dB | Pass |
+| Unseen +80 ppm room/seeds | 14.55 dB | -0.32 dB | +1.54 dB | **Fail** |
+
+The automated assessor uses the unchanged thresholds documented above and
+rejects non-finite measurements. The aggregate requires every fixture and every
+backend's entry; a failed or missing validation result cannot be hidden by a
+passing calibration. Tests reproduce that failure before the aggregation fix.
+CI executes this matrix but does not claim that every compared backend passed
+acoustic qualification merely because the tool ran successfully.
+
+The approved JFK probe now includes the conservative profile, for 16 serial
+cases. Its near-only, equal-power and +6 dB cases all recognized the 22-word
+reference with 0% WER. The stock native +6 dB control still measured 63.64% WER.
+This is an improvement on one static-room public clip, not general quality or
+drift acceptance. The pinned runtime's `has_clock_drift` path changes suppression
+decisions; it does not resample or align the reference, so it was not used as a
+substitute for clock correction.
+
+[Signal matrix](results/m4-conservative-signals.json) and
+[public speech results](results/m4-conservative-speech.json) retain the positive
+and negative evidence. The full 72-case signal process used maximum RSS
+34,340,864 bytes, 9.27 seconds user CPU and 9.50 seconds elapsed. The separate
+16-case speech process, including the shared model/hash/load/metrics, used
+766,885,888 bytes maximum RSS, 4.27 seconds user CPU, 0.41 seconds system CPU
+and 9.52 seconds elapsed. Cache state was uncontrolled; these are whole-probe
+observations, not app memory or end-to-end latency.
+
+**The aggregate fails, and no app backend is selected.** Callback/tail/drift
+alignment, capture-worker integration, route resets, LocalVQE comparison and
+physical/real-room acceptance remain separate requirements. A passing static
+signal or one public sentence cannot grant them.
