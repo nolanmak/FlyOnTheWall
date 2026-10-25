@@ -57,6 +57,66 @@ fn finished_session(root: &Path) -> PathBuf {
     wal.finalize().unwrap()
 }
 
+#[test]
+fn startup_never_republishes_deleted_audio_from_leftover_session_files() {
+    let root = tmpdir("deleted-promotion-leftovers");
+    let mut db = db_at(&root);
+    let dir = finished_session(&root);
+    let meeting = db
+        .meetings()
+        .create(NewMeeting::new("fixture", "UTC"))
+        .unwrap();
+    fotw_pipeline::promote::claim(&dir, &meeting, NOW).unwrap();
+    let snapshot: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            (
+                path.file_name().unwrap().to_owned(),
+                std::fs::read(&path).unwrap(),
+            )
+        })
+        .collect();
+    db.delete_meeting(&meeting).unwrap();
+    // Simulate deletion interrupted after the tombstone committed. Recovery
+    // must finish deletion, not republish this source before checking the DB.
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, bytes) in snapshot {
+        std::fs::write(dir.join(name), bytes).unwrap();
+    }
+    let _ = retention::resume_promotions(&mut db, &root);
+    assert!(
+        !root
+            .join(fotw_pipeline::promote::media_rel_dir(NOW, &meeting))
+            .exists(),
+        "startup recreated deleted audio"
+    );
+    assert!(!dir.exists(), "deleted source cleanup was not resumed");
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_missing_meeting_without_a_delete_tombstone_keeps_its_recoverable_source() {
+    let root = tmpdir("missing-meeting-claim");
+    let mut db = db_at(&root);
+    let dir = finished_session(&root);
+    fotw_pipeline::promote::claim(&dir, "missing-meeting", NOW).unwrap();
+    let outcomes = retention::resume_promotions(&mut db, &root);
+    assert!(outcomes.iter().any(Result::is_err));
+    assert!(dir.exists());
+    assert!(
+        !root
+            .join(fotw_pipeline::promote::media_rel_dir(
+                NOW,
+                "missing-meeting"
+            ))
+            .exists()
+    );
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// A meeting whose audio is already in the media tree, with `bytes` per leg.
 ///
 /// `transcribed` is the switch the protection tests turn off: everything else

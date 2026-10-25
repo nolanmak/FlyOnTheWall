@@ -41,7 +41,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use fotw_pipeline::promote::{self, PromoteError, Promotion};
+use fotw_pipeline::promote::{self, Promotion};
 use fotw_pipeline::retention::{
     DiskUsage, MeetingAudio, RetentionPolicy, RetentionSettings, SweepPlan, SweepWarning,
     TranscriptState, plan_sweep, usage,
@@ -290,8 +290,36 @@ pub fn promote_session(
     meeting_id: &str,
     started_at_ms: u64,
 ) -> Result<Promotion, String> {
+    if !meeting_exists(db, meeting_id)? {
+        return Err("the meeting no longer exists; refusing to publish its audio".into());
+    }
     promote::claim(session_dir, meeting_id, started_at_ms).map_err(|e| e.to_string())?;
+    publish_claimed(db, data_root, session_dir, meeting_id)
+}
+
+fn meeting_exists(db: &mut Db, meeting_id: &str) -> Result<bool, String> {
+    match db.meetings().get(meeting_id) {
+        Ok(_) => Ok(true),
+        Err(fotw_store::StoreError::NotFound { .. }) => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn publish_claimed(
+    db: &mut Db,
+    data_root: &Path,
+    session_dir: &Path,
+    meeting_id: &str,
+) -> Result<Promotion, String> {
     let promoted = promote::promote(session_dir, data_root).map_err(|e| e.to_string())?;
+    if db
+        .meeting_was_deleted(meeting_id)
+        .map_err(|e| e.to_string())?
+        && !meeting_exists(db, meeting_id)?
+    {
+        db.delete_meeting(meeting_id).map_err(|e| e.to_string())?;
+        return Err("the meeting was deleted during archiving".into());
+    }
     record(db, &promoted)?;
     Ok(promoted)
 }
@@ -302,14 +330,50 @@ pub fn promote_session(
 /// reported rather than aborting the rest.
 #[must_use]
 pub fn resume_promotions(db: &mut Db, data_root: &Path) -> Vec<Result<Promotion, String>> {
-    promote::resume(sessions_dir(data_root), data_root)
-        .into_iter()
-        .map(|r| {
-            let promoted = r.map_err(|e: PromoteError| e.to_string())?;
-            record(db, &promoted)?;
-            Ok(promoted)
-        })
-        .collect()
+    let sessions = sessions_dir(data_root);
+    match std::fs::symlink_metadata(&sessions) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return vec![Err("capture storage is not an ordinary directory".into())];
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => return vec![Err(error.to_string())],
+        Ok(_) => {}
+    }
+    promote::sweep_retired(&sessions);
+    let pending = match promote::pending(&sessions) {
+        Ok(pending) => pending,
+        Err(error) => return vec![Err(error.to_string())],
+    };
+    let mut outcomes = Vec::new();
+    for directory in pending {
+        let result = (|| {
+            let state =
+                fotw_pipeline::wal::SessionState::read(&directory).map_err(|e| e.to_string())?;
+            let claim = state
+                .manifest
+                .claim
+                .ok_or_else(|| "capture has no meeting claim".to_owned())?;
+            if !meeting_exists(db, &claim.meeting_id)? {
+                if db
+                    .meeting_was_deleted(&claim.meeting_id)
+                    .map_err(|e| e.to_string())?
+                {
+                    db.delete_meeting(&claim.meeting_id)
+                        .map_err(|e| e.to_string())?;
+                    return Ok(None);
+                }
+                return Err("capture has no saved meeting; source retained for recovery".into());
+            }
+            let promoted = publish_claimed(db, data_root, &directory, &claim.meeting_id)?;
+            Ok(Some(promoted))
+        })();
+        match result {
+            Ok(None) => {}
+            Ok(Some(promotion)) => outcomes.push(Ok(promotion)),
+            Err(error) => outcomes.push(Err(error)),
+        }
+    }
+    outcomes
 }
 
 /// Write the `recordings` rows for a promotion.

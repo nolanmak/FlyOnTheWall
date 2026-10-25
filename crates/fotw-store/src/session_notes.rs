@@ -64,6 +64,7 @@ impl Db {
         let tx = self
             .conn_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_capture_not_deleted(&tx, session)?;
         if let Some(link) = read_link(&tx, session)? {
             if link.started != started || link.elapsed != elapsed {
                 return Err(invalid("session already attached to a different clock"));
@@ -157,6 +158,7 @@ impl Db {
         let tx = self
             .conn_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_capture_not_deleted(&tx, &draft.session_id)?;
         if let Some(link) = read_link(&tx, &draft.session_id)? {
             if link.started != draft.started_at_ms
                 || draft
@@ -231,6 +233,7 @@ fn invalid(message: &str) -> StoreError {
 }
 fn read(conn: &rusqlite::Connection, session: &str) -> Result<Option<SessionNoteDocument>> {
     validate_session(session)?;
+    ensure_capture_not_deleted(conn, session)?;
     if let Some(link) = read_link(conn, session)? {
         return Ok(Some(SessionNoteDocument {
             session_id: session.into(),
@@ -275,6 +278,7 @@ fn promote_in_transaction(
     started_at_ms: i64,
     elapsed_ms: i64,
 ) -> Result<()> {
+    ensure_capture_not_deleted(tx, session)?;
     if let Some(link) = read_link(tx, session)? {
         if link.meeting != meeting || link.started != started_at_ms || link.elapsed != elapsed_ms {
             return Err(invalid(
@@ -309,5 +313,50 @@ fn promote_in_transaction(
     tx.execute("INSERT INTO session_note_links(session_id,meeting_id,started_at_ms,elapsed_ms) VALUES(?1,?2,?3,?4)",
             params![session,meeting,started_at_ms,elapsed_ms])?;
     tx.execute("DELETE FROM session_notes WHERE session_id=?1", [session])?;
+    Ok(())
+}
+
+pub(crate) fn capture_tombstone_id(session: &str, meeting: &str) -> Result<String> {
+    validate_session(session)?;
+    // Identity only, not a path or any recording/notes content. Keeping both
+    // identities lets a failed filesystem delete be retried after alias cascade.
+    Ok(format!("capture:{session}:{meeting}"))
+}
+
+pub(crate) fn deleted_capture_sessions(
+    conn: &rusqlite::Connection,
+    meeting: &str,
+) -> Result<Vec<String>> {
+    let mut statement = conn.prepare("SELECT id FROM tombstones WHERE kind='capture_session'")?;
+    let ids = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut sessions = Vec::new();
+    for id in ids {
+        if let Some((session, target)) = id
+            .strip_prefix("capture:")
+            .and_then(|id| id.split_once(':'))
+            && target == meeting
+        {
+            validate_session(session)?;
+            sessions.push(session.to_owned());
+        }
+    }
+    Ok(sessions)
+}
+
+fn ensure_capture_not_deleted(conn: &rusqlite::Connection, session: &str) -> Result<()> {
+    // An explicit archive import can restore the original meeting and alias.
+    // Automatic finalization cannot create that alias until after this guard.
+    if read_link(conn, session)?.is_some() {
+        return Ok(());
+    }
+    let prefix = format!("capture:{session}:");
+    let deleted: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tombstones WHERE kind='capture_session' AND substr(id,1,?1)=?2)",
+        rusqlite::params![prefix.len() as i64, prefix], |row| row.get(0))?;
+    if deleted {
+        return Err(invalid("capture was explicitly deleted"));
+    }
     Ok(())
 }

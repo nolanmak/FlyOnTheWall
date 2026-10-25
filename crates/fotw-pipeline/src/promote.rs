@@ -574,7 +574,10 @@ fn is_retired(path: &Path) -> bool {
         .is_some_and(|n| n.to_string_lossy().ends_with(RETIRED_SUFFIX))
 }
 
-fn sweep_retired(sessions_root: &Path) {
+/// Remove directories left after a verified session's atomic retirement rename.
+/// Callers that select promotions using database state can still run this
+/// filesystem-only cleanup without blindly republishing every claimed session.
+pub fn sweep_retired(sessions_root: &Path) {
     let Ok(entries) = std::fs::read_dir(sessions_root) else {
         return;
     };
