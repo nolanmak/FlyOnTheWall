@@ -98,7 +98,9 @@ protocol; stop them before using setup against the same library.
 Cancellation is checked between IO operations and loses once Installing begins.
 An outstanding OS read/destructor cannot be forcibly interrupted; it retains
 admission until it returns. Transfers have a 15-second connect timeout and a
-15-minute total request deadline. A failed directory sync after replacement
+15-minute timeout per blocking request/read operation (not a total transfer
+deadline). Continued read progress permits a slower large-model transfer; a
+stalled operation still times out. A failed directory sync after replacement
 reports that the verified file is already present; it does not claim rollback.
 The client has no credentials/cookies/proxy discovery and permits only HTTPS,
 with at most five redirects. No audio, transcript or settings enter the request.

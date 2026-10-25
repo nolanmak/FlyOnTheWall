@@ -386,16 +386,7 @@ pub fn install(
         free_space,
         || {
             match source {
-                Source::Import(path) => {
-                    if !path.is_absolute() {
-                        return Err("Choose an absolute import path".into());
-                    }
-                    if ordinary(&path)?.is_none() {
-                        return Err("Imported model is missing".into());
-                    }
-                    Ok(Box::new(options().read(true).open(path).map_err(io_error)?)
-                        as Box<dyn Read + Send>)
-                }
+                Source::Import(path) => open_import(&path),
                 Source::Download => {
                     // No credentials, proxy discovery, cookies, metadata lookup or cloud ASR.
                     let client = reqwest::blocking::Client::builder()
@@ -413,6 +404,24 @@ pub fn install(
         },
         progress,
     )
+}
+fn open_import(path: &Path) -> Result<Box<dyn Read + Send>, String> {
+    if !path.is_absolute() {
+        return Err("Choose an absolute import path".into());
+    }
+    // Cache snapshots may be symlinks. Only the read source is resolved;
+    // publication still verifies every byte and refuses destination symlinks.
+    let path = match path.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err("Imported model is missing".into());
+        }
+        Err(error) => return Err(io_error(error)),
+    };
+    if ordinary(&path)?.is_none() {
+        return Err("Imported model is missing".into());
+    }
+    Ok(Box::new(options().read(true).open(path).map_err(io_error)?))
 }
 fn download_response(
     client: &reqwest::blocking::Client,
@@ -473,6 +482,42 @@ mod tests {
     }
     fn reader(bytes: &[u8]) -> Box<dyn Read + Send> {
         Box::new(std::io::Cursor::new(bytes.to_vec()))
+    }
+    #[cfg(unix)]
+    #[test]
+    fn offline_cache_symlink_import_verifies_content_and_rejects_bad_targets() {
+        let source = tempfile::tempdir().unwrap();
+        let blob = source.path().join("blob");
+        let snapshot = source.path().join("snapshot.bin");
+        std::fs::write(&blob, b"fixture model").unwrap();
+        std::os::unix::fs::symlink(&blob, &snapshot).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let target = install_from(
+            root.path(),
+            &spec(),
+            &Control::default(),
+            |_| Ok(u64::MAX),
+            || open_import(&snapshot),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"fixture model");
+        std::fs::write(&target, b"previous").unwrap();
+        std::fs::write(&blob, b"corrupt model").unwrap();
+        assert!(
+            install_from(
+                root.path(),
+                &spec(),
+                &Control::default(),
+                |_| Ok(u64::MAX),
+                || open_import(&snapshot)
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"previous");
+        std::fs::remove_file(&blob).unwrap();
+        assert!(open_import(&snapshot).err().unwrap().contains("missing"));
+        std::fs::create_dir(&blob).unwrap();
+        assert!(open_import(&snapshot).is_err());
     }
     #[test]
     fn corrupt_or_truncated_source_never_replaces_the_existing_model() {
@@ -728,6 +773,49 @@ mod transfer_tests {
         worker.join().unwrap();
         assert!(result.is_err());
         assert_eq!(std::fs::read(target).unwrap(), b"previous");
+    }
+    #[test]
+    fn progressing_download_can_outlive_the_blocking_per_operation_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/progress", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).unwrap() > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            for byte in b"fixture model" {
+                std::thread::sleep(Duration::from_millis(150));
+                if socket.write_all(&[*byte]).is_err() {
+                    break;
+                }
+            }
+        });
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let began = std::time::Instant::now();
+        let result = install_from(
+            root.path(),
+            &spec(),
+            &Control::default(),
+            |_| Ok(u64::MAX),
+            || download_response(&client, &url, 13),
+        );
+        worker.join().unwrap();
+        assert!(began.elapsed() > Duration::from_secs(1));
+        let path = result.expect("continuous progress must not hit an aggregate deadline");
+        assert_eq!(std::fs::read(path).unwrap(), b"fixture model");
     }
     #[test]
     fn cancellation_of_a_blocked_source_retains_admission_and_fences_late_publication() {
