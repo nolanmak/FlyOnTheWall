@@ -128,13 +128,13 @@ async fn the_duration_still_ends_a_session_nobody_stops() {
 /// A signal already tripped before the session opens must not hang waiting for
 /// a second `stop()` that will never come.
 #[tokio::test]
-async fn a_signal_stopped_in_advance_ends_it_at_once() {
+async fn a_signal_stopped_in_advance_refuses_capture_at_once() {
     let root = tmpdir("stop-advance");
     let stop = StopSignal::new();
     stop.stop();
 
     let began = Instant::now();
-    session::run_with_stop(
+    let error = session::run_with_stop(
         &root,
         source(tone(30.0)),
         None,
@@ -143,7 +143,13 @@ async fn a_signal_stopped_in_advance_ends_it_at_once() {
         stop,
     )
     .await
-    .unwrap();
+    .unwrap_err();
+    assert!(error.contains("cancelled before capture setup"), "{error}");
+    assert_eq!(
+        std::fs::read_dir(&root).unwrap().count(),
+        0,
+        "pre-cancelled Start created a recording"
+    );
 
     assert!(
         began.elapsed() < Duration::from_secs(10),

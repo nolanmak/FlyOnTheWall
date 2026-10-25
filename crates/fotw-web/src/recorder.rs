@@ -30,6 +30,8 @@ pub enum RecordingState {
     Idle,
     /// Preparing a recording; no capture clock exists yet.
     Preparing,
+    /// Native capture setup is underway; it may already have buffered audio.
+    Starting,
     /// Capture is running.
     Recording,
     /// Capture has stopped; the meeting is still being written to the library.
@@ -107,7 +109,7 @@ pub struct RecordingStatus {
     /// recorders and while idle. Enforced by the daemon, not the browser.
     #[serde(default)]
     pub auto_stop_at_ms: Option<u64>,
-    /// Idle, preparing, recording or finishing. Never absent: the UI switches
+    /// Idle, preparing, starting, recording or finishing. Never absent: the UI switches
     /// on this word; preparing has no capture clock.
     pub state: RecordingState,
     /// Epoch milliseconds capture began; `null` while idle.
@@ -142,7 +144,7 @@ pub struct RecordingStatus {
     /// Independent capture health, absent when the backend has no monitor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_health: Option<CaptureHealth>,
-    /// Cancellation is waiting for owned native preparation to finish.
+    /// Stop/cancel is waiting for owned model or capture setup to finish.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub preparation_cancel_requested: bool,
 }
@@ -172,6 +174,14 @@ impl RecordingStatus {
             preparation_cancel_requested: cancel_requested,
             ..Self::idle()
         }
+    }
+
+    /// Native capture setup has begun. Stop may retain buffered audio.
+    #[must_use]
+    pub fn starting(stop_requested: bool) -> Self {
+        let mut status = Self::preparing(stop_requested);
+        status.state = RecordingState::Starting;
+        status
     }
 
     /// Capture running since `started_at_ms`.

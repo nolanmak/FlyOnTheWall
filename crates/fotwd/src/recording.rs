@@ -728,15 +728,22 @@ impl RecorderControl for DaemonRecorder {
         // moved this forward would make the meeting appear to grow after it
         // ended — the clock is frozen at the first Stop or it is not frozen.
         if !live.ready.is_ready() {
-            live.stop.stop();
-            let message =
+            let capture_setup = live.ready.request_stop(&live.stop);
+            let message = if capture_setup {
+                live.stopped_at_ms.get_or_insert(now_ms());
+                "stopping capture setup; any buffered audio will be saved"
+            } else {
                 "preparation cancelled; waiting for native setup to release its resources"
-                    .to_owned();
+            }
+            .to_owned();
             live.errors.record(message.clone());
             live.ready.fail(message);
-            return Ok(
-                RecordingStatus::preparing(true).with_transcription_error(live.errors.latest())
-            );
+            let status = if capture_setup {
+                RecordingStatus::starting(true)
+            } else {
+                RecordingStatus::preparing(true)
+            };
+            return Ok(status.with_transcription_error(live.errors.latest()));
         }
         let ended_at_ms = *live.stopped_at_ms.get_or_insert(now_ms());
         // Trip and return. The task clears the slot once the meeting is on
@@ -789,11 +796,17 @@ impl RecorderControl for DaemonRecorder {
                 .capture_started_at_ms()
                 .unwrap_or(live.started_at_ms);
             let status = if !live.ready.is_ready() {
-                RecordingStatus::preparing(live.stop.is_stopped())
+                if live.ready.capture_setup_started() {
+                    RecordingStatus::starting(live.stop.is_stopped())
+                } else {
+                    RecordingStatus::preparing(live.stop.is_stopped())
+                }
             } else {
                 match live.ready.capture_ended_at_ms().or(live.stopped_at_ms) {
                     // Frozen: the tap is shut, so the number cannot grow.
-                    Some(ended_at_ms) => RecordingStatus::finishing(started_at_ms, ended_at_ms),
+                    Some(ended_at_ms) => {
+                        RecordingStatus::finishing(started_at_ms, ended_at_ms.max(started_at_ms))
+                    }
                     None => RecordingStatus::recording(
                         started_at_ms,
                         now_ms().saturating_sub(started_at_ms),
@@ -842,7 +855,7 @@ async fn spawn_session(
     let ready = control.ready.clone();
     let outcome = async {
         let transcription = transcription.prepare(&control).await?;
-        if control.stop.is_stopped() {
+        if !control.ready.begin_capture_setup(&control.stop) {
             return Err("recording preparation cancelled before capture".into());
         }
         match capture {
