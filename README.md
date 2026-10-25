@@ -162,6 +162,8 @@ fotwd stt                           # which engine the next recording will use
 
 `fotwd stt local` with no model shows these commands and the other published models (`--model base.en`, `small.en`, `large-v3-turbo`), and `--model` also takes a path to a ggml model of your own. `--language en` skips language detection. `fotwd stt deepgram` switches back. The setting is read each time you press **Start**.
 
+For unstable Wi-Fi, select `fotwd stt fallback --model small.en --language en` after installing the model, or pass its absolute path. This mode initially sends audio to Deepgram, then finishes pending speech locally after a bounded provider outage and stays local for that meeting. Start prepares the backup before opening capture; a missing/unusable backup or missing Deepgram key refuses recording. The dashboard shows **Preparing** and offers **Cancel** until capture starts. Preparation may take several seconds. `fotwd stt local` remains the choice for keeping all audio on this Mac. See [the durable speech contract](docs/DURABLE_SPEECH.md) for recovery behavior and remaining app limitations.
+
 On-device transcription is a different trade-off from Deepgram's. Text appears once each speaker pauses, a second or two after they stop, rather than word by word. The far end of the call is not split into speakers: everything from the call audio is one voice, and your microphone is always `me`. If the model is missing or cannot load, the meeting is still recorded, the dashboard says why there is no transcript, and nothing is sent to Deepgram instead.
 
 Local inference queues are bounded to 60 seconds of PCM and 8,192 commands per

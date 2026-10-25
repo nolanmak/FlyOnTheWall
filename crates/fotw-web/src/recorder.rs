@@ -28,6 +28,8 @@ use serde::{Deserialize, Serialize};
 pub enum RecordingState {
     /// No capture in flight.
     Idle,
+    /// Preparing a recording; no capture clock exists yet.
+    Preparing,
     /// Capture is running.
     Recording,
     /// Capture has stopped; the meeting is still being written to the library.
@@ -105,8 +107,8 @@ pub struct RecordingStatus {
     /// recorders and while idle. Enforced by the daemon, not the browser.
     #[serde(default)]
     pub auto_stop_at_ms: Option<u64>,
-    /// Idle, recording or finishing. Never absent: the UI switches on this
-    /// word and has no fourth case to guess.
+    /// Idle, preparing, recording or finishing. Never absent: the UI switches
+    /// on this word; preparing has no capture clock.
     pub state: RecordingState,
     /// Epoch milliseconds capture began; `null` while idle.
     ///
@@ -140,6 +142,9 @@ pub struct RecordingStatus {
     /// Independent capture health, absent when the backend has no monitor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_health: Option<CaptureHealth>,
+    /// Cancellation is waiting for owned native preparation to finish.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub preparation_cancel_requested: bool,
 }
 
 impl RecordingStatus {
@@ -155,6 +160,17 @@ impl RecordingStatus {
             ended_at_ms: None,
             transcription_error: None,
             capture_health: None,
+            preparation_cancel_requested: false,
+        }
+    }
+
+    /// No audio has started; cancellation can still be requested.
+    #[must_use]
+    pub fn preparing(cancel_requested: bool) -> Self {
+        Self {
+            state: RecordingState::Preparing,
+            preparation_cancel_requested: cancel_requested,
+            ..Self::idle()
         }
     }
 
@@ -170,6 +186,7 @@ impl RecordingStatus {
             ended_at_ms: None,
             transcription_error: None,
             capture_health: None,
+            preparation_cancel_requested: false,
         }
     }
 
@@ -189,6 +206,7 @@ impl RecordingStatus {
             ended_at_ms: Some(ended_at_ms),
             transcription_error: None,
             capture_health: None,
+            preparation_cancel_requested: false,
         }
     }
 

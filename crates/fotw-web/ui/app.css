@@ -118,7 +118,7 @@ h1 {
    quieter voice, which is the half of the bug that is about *meaning* rather
    than about which red. Everything else matches `.recording` so the two read
    as one badge changing state, not as two badges swapping places. */
-.finishing {
+.finishing, .preparing {
   color: var(--caution);
   font-weight: 600;
   text-transform: uppercase;

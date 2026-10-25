@@ -181,7 +181,7 @@ async fn main() -> ExitCode {
                  onboard | detect [seconds] | \
                  retention [dir] [--apply] [--days <n>] [--budget-gib <n>] | \
                  key <set <provider>|list> | engine [claude-cli|codex-cli|off] | \
-                 stt [local [--model <name|path>] [--language <code>]|deepgram|test <wav>] | \
+                 stt [local|fallback [--model <name|path>] [--language <code>]|deepgram|test <wav>] | \
                  dedupe <id|--all> [dir] [--revert <transcript-id>] | \
                  recover [dir] [--check] | \
                  retitle-legacy [dir] [--apply] | \
@@ -649,20 +649,6 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let plat = platform::host();
-    let system = match plat.open_system(SystemScope::DefaultOutputMix, FormatRequest::any()) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("fotwd: could not open the system tap: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    // The mic is optional on purpose: a machine with no input device should
-    // still record the far end rather than refuse to start.
-    let mic = plat
-        .open_mic(&DeviceId::new("default"), FormatRequest::any())
-        .ok();
-
     // The engine `fotwd stt` stored, as the dashboard's Start reads it, and
     // failing closed the same way: an unreadable choice may have been "never
     // off this machine".
@@ -678,11 +664,6 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
     // second stream doubles the bill, so it is declinable — and the line
     // below says which legs are live, so the bill is never a surprise.
     let mic_stt = session::mic_stt_enabled(std::env::var("FOTW_MIC_STT").ok().as_deref());
-    let streams_line = || match (mic.is_some(), mic_stt) {
-        (true, true) => println!("  streams    : system + mic (FOTW_MIC_STT=off for one)"),
-        (true, false) => println!("  streams    : system only (FOTW_MIC_STT=off)"),
-        (false, _) => println!("  streams    : system only (no input device)"),
-    };
     let transcription = match settings {
         None => {
             println!("  transcribe : off (the saved engine choice could not be read)");
@@ -694,13 +675,25 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
                 "  transcribe : on this Mac, whisper.cpp ({})",
                 settings.model_path(&data_root).display()
             );
-            streams_line();
-            fotwd::stt::local_transcription(
-                &settings,
-                &data_root,
-                &session_id(),
-                mic.is_some(),
-                mic_stt,
+            fotwd::stt::local_transcription(&settings, &data_root, &session_id(), true, mic_stt)
+        }
+        Some(settings) if settings.engine == fotwd::stt::SttEngine::Fallback => {
+            println!("  transcribe : Deepgram nova-3 with a prepared local backup");
+            fotwd::stt::fallback_transcription(
+                settings,
+                data_root_of(&root),
+                Box::new(move || {
+                    let store = secrets::keystore().ok();
+                    let (secret, _) = store.as_ref()
+                        .and_then(|s| secrets::deepgram_key(*s as &dyn KeyStore))
+                        .ok_or_else(|| "Deepgram-to-local mode requires a Deepgram key; add one or explicitly choose local-only".to_owned())?;
+                    Ok(session::DeepgramLegs::for_session(
+                        secret.expose(),
+                        &session_id(),
+                        true,
+                        mic_stt,
+                    ))
+                }),
             )
         }
         Some(_) => {
@@ -717,11 +710,10 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
                         ),
                         _ => println!("  transcribe : Deepgram nova-3 (key from keychain)"),
                     }
-                    streams_line();
                     Transcription::Deepgram(session::DeepgramLegs::for_session(
                         secret.expose(),
                         &session_id(),
-                        mic.is_some(),
+                        true,
                         mic_stt,
                     ))
                 }
@@ -734,6 +726,34 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
             }
         }
     };
+
+    // Admission owns and prepares the backup before opening any capture tap.
+    let transcription = match transcription.prepare(&session::SessionControl::new()).await {
+        Ok(transcription) => transcription,
+        Err(error) => {
+            eprintln!("fotwd: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let plat = platform::host();
+    let system = match plat.open_system(SystemScope::DefaultOutputMix, FormatRequest::any()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("fotwd: could not open the system tap: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // The mic is optional on purpose: a machine with no input device should
+    // still record the far end rather than refuse to start.
+    let mic = plat
+        .open_mic(&DeviceId::new("default"), FormatRequest::any())
+        .ok();
+
+    match (mic.is_some(), mic_stt) {
+        (true, true) => println!("  streams    : system + mic (FOTW_MIC_STT=off for one)"),
+        (true, false) => println!("  streams    : system only (FOTW_MIC_STT=off)"),
+        (false, _) => println!("  streams    : system only (no input device)"),
+    }
 
     println!("  recording  : {seconds}s");
     println!("  sessions   : {}", root.display());
@@ -1490,7 +1510,7 @@ fn engine_command(args: &[String]) -> ExitCode {
     }
 }
 
-/// `fotwd stt [local [--model <name|path>] [--language <code>] | deepgram | test <wav>]`.
+/// `fotwd stt [local|fallback [--model <name|path>] [--language <code>] | deepgram | test <wav>]`.
 ///
 /// Which engine transcribes recordings (#33). Bare, it reports what the next
 /// Start will actually use — including a configured engine that cannot run —
@@ -1545,6 +1565,7 @@ async fn stt_command(args: &[String]) -> ExitCode {
     };
     let selected = match args.first().map(String::as_str) {
         Some("local") => Some(SttEngine::Local),
+        Some("fallback") => Some(SttEngine::Fallback),
         Some("deepgram") => Some(SttEngine::Deepgram),
         _ => None,
     };
@@ -1565,7 +1586,8 @@ async fn stt_command(args: &[String]) -> ExitCode {
             print_stt_status(&settings, &data_root);
             ExitCode::SUCCESS
         }
-        Some("local") => {
+        Some("local") | Some("fallback") => {
+            let fallback = selected == Some(SttEngine::Fallback);
             if !cfg!(target_os = "macos") {
                 eprintln!("fotwd: local transcription is macOS-only for now");
                 return ExitCode::FAILURE;
@@ -1599,7 +1621,11 @@ async fn stt_command(args: &[String]) -> ExitCode {
                 eprintln!("fotwd: {}", error.message);
                 return ExitCode::FAILURE;
             }
-            settings.engine = SttEngine::Local;
+            settings.engine = if fallback {
+                SttEngine::Fallback
+            } else {
+                SttEngine::Local
+            };
             settings.model = path.to_string_lossy().into_owned();
             if let Err(e) = settings.write(&mut db) {
                 eprintln!("fotwd: {e}");
@@ -1607,9 +1633,15 @@ async fn stt_command(args: &[String]) -> ExitCode {
             }
             print_stt_status(&settings, &data_root);
             println!();
-            println!("  Meetings started from now on are transcribed on this Mac; no audio is");
-            println!("  sent to Deepgram. The model loads when you press Start, so the first");
-            println!("  lines can take a few seconds longer than the rest.");
+            if fallback {
+                println!("  Meetings send audio to Deepgram until a provider failure switches");
+                println!("  to local transcription for the rest of that meeting. Start prepares");
+                println!("  the local backup first and refuses capture if preparation fails.");
+            } else {
+                println!("  Meetings started from now on are transcribed on this Mac; no audio is");
+                println!("  sent to Deepgram. The model loads when you press Start, so the first");
+                println!("  lines can take a few seconds longer than the rest.");
+            }
             ExitCode::SUCCESS
         }
         Some("deepgram") => {
@@ -1623,7 +1655,7 @@ async fn stt_command(args: &[String]) -> ExitCode {
         }
         Some(other) => {
             eprintln!(
-                "usage: fotwd stt [local [--model <name|path>] [--language <code>] | deepgram | \
+                "usage: fotwd stt [local|fallback [--model <name|path>] [--language <code>] | deepgram | \
                  test <file.wav> [--model <name|path>]]"
             );
             eprintln!("fotwd: unknown stt command `{other}`");
@@ -1727,6 +1759,21 @@ fn print_stt_status(settings: &fotwd::stt::SttSettings, data_root: &std::path::P
             } else if !path.is_file() {
                 println!("  ! the model file is missing, so meetings record without a transcript;");
                 println!("    run `fotwd stt local` to see how to fetch it");
+            }
+        }
+        fotwd::stt::SttEngine::Fallback => {
+            let path = settings.model_path(data_root);
+            println!(
+                "  engine     : Deepgram with local backup (audio initially streams to api.deepgram.com)"
+            );
+            println!("  model      : {}", path.display());
+            println!(
+                "  language   : {}",
+                settings.language().unwrap_or_else(|| "automatic".into())
+            );
+            println!("  admission  : backup model and both native states prepare before capture");
+            if !cfg!(target_os = "macos") || !path.is_file() {
+                println!("  ! backup unavailable; Start refuses recording until repaired");
             }
         }
         fotwd::stt::SttEngine::Deepgram => {

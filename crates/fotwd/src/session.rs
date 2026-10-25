@@ -1263,9 +1263,52 @@ pub enum Transcription {
     Local(LocalLegs),
     /// Prefer cloud and durably finish pending speech locally after a bounded outage.
     Failover(Box<FailoverLegs>),
+    /// Deferred admission: the session must finish preparing both native states
+    /// before opening capture. The owner remains alive through cancellation.
+    PreparingFailover(
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<FailoverLegs, String>> + Send>>,
+    ),
 }
 
 impl Transcription {
+    pub(crate) fn needs_preparation(&self) -> bool {
+        matches!(self, Self::PreparingFailover(_))
+    }
+
+    /// Resolve deferred backup admission before a caller opens capture taps.
+    /// Cancellation waits for owned native work and discards its result.
+    /// Other transcription modes pass through unchanged.
+    pub async fn prepare(self, control: &SessionControl) -> Result<Self, String> {
+        match self {
+            Self::PreparingFailover(future) => {
+                control.ready.set_preparing(true);
+                // Await the owned preparation even after cancellation. Dropping
+                // a blocking native allocation would hide outstanding resources.
+                let result = if control.stop.is_stopped() {
+                    Err("local backup preparation cancelled".into())
+                } else {
+                    use futures_util::FutureExt;
+                    std::panic::AssertUnwindSafe(future)
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err("local backup model preparation failed unexpectedly; capture was not started".into())
+                        })
+                };
+                if control.stop.is_stopped() {
+                    drop(result);
+                    control.ready.set_preparing(false);
+                    return Err(
+                        "local backup preparation cancelled; capture was not started".into(),
+                    );
+                }
+                control.ready.set_preparing(false);
+                result.map(|legs| Self::Failover(Box::new(legs)))
+            }
+            ready => Ok(ready),
+        }
+    }
+
     /// Whether the mic leg is to be transcribed, should the mic start.
     fn transcribes_mic(&self) -> bool {
         match self {
@@ -1273,6 +1316,7 @@ impl Transcription {
             Self::Deepgram(legs) => legs.mic.is_some(),
             Self::Local(legs) => legs.mic.is_some(),
             Self::Failover(legs) => legs.mic.is_some(),
+            Self::PreparingFailover(_) => unreachable!("admission must precede capture setup"),
         }
     }
 }
@@ -1284,6 +1328,7 @@ impl std::fmt::Debug for Transcription {
             Self::Deepgram(_) => write!(f, "Deepgram(..)"),
             Self::Local(_) => write!(f, "Local(..)"),
             Self::Failover(_) => write!(f, "Failover(..)"),
+            Self::PreparingFailover(_) => write!(f, "PreparingFailover(..)"),
         }
     }
 }
@@ -1368,6 +1413,8 @@ struct ReadyInner {
     capture_started_at_ms: std::sync::OnceLock<u64>,
     capture_ended_at_ms: std::sync::OnceLock<u64>,
     ready: std::sync::Mutex<bool>,
+    failure: std::sync::OnceLock<String>,
+    preparing: AtomicBool,
     woke: std::sync::Condvar,
 }
 
@@ -1376,6 +1423,24 @@ impl ReadySignal {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn set_preparing(&self, value: bool) {
+        self.0.preparing.store(value, Ordering::Release);
+    }
+    pub(crate) fn is_preparing(&self) -> bool {
+        self.0.preparing.load(Ordering::Acquire)
+    }
+    pub(crate) fn same_session(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+    pub(crate) fn failure(&self) -> Option<String> {
+        self.0.failure.get().cloned()
+    }
+    pub(crate) fn fail(&self, message: String) {
+        let _ready = self.0.ready.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self.0.failure.set(message);
+        self.0.woke.notify_all();
     }
 
     /// The WAL identity shared by status and live transcript deltas.
@@ -1416,6 +1481,9 @@ impl ReadySignal {
     /// Announce that capture is live. Idempotent.
     pub fn signal(&self) {
         let mut ready = self.0.ready.lock().unwrap_or_else(|e| e.into_inner());
+        if self.0.failure.get().is_some() {
+            return;
+        }
         *ready = true;
         // `notify_all`, not `notify_one`: the flag is level-triggered and more
         // than one thread may be waiting on a slow start.
@@ -1437,6 +1505,9 @@ impl ReadySignal {
         let deadline = std::time::Instant::now() + timeout;
         let mut ready = self.0.ready.lock().unwrap_or_else(|e| e.into_inner());
         while !*ready {
+            if self.0.failure.get().is_some() {
+                return false;
+            }
             let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
                 return false;
             };
@@ -1661,6 +1732,7 @@ pub async fn run_with_control(
     duration: Duration,
     control: SessionControl,
 ) -> Result<SessionOutcome, String> {
+    let transcription = transcription.prepare(&control).await?;
     let stop_signal = control.stop;
     let deadlines = control.deadlines;
     // One pair per leg, both held here. The mic's used to be constructed
@@ -2008,6 +2080,7 @@ pub async fn run_supervised(
     duration: Duration,
     control: SessionControl,
 ) -> Result<SessionOutcome, String> {
+    let transcription = transcription.prepare(&control).await?;
     let stop_signal = control.stop;
     let deadlines = control.deadlines;
     // The session's view of each leg, held here for anchoring and the final
@@ -2529,6 +2602,9 @@ async fn open_legs(
     errors: SttErrors,
 ) -> OpenLegs {
     match transcription {
+        Transcription::PreparingFailover(_) => {
+            unreachable!("admission must precede opening speech streams")
+        }
         Transcription::Disabled => (None, None, None, None),
         Transcription::Deepgram(mut legs) => {
             legs.system.normalizer.session_id = session_id.to_owned();

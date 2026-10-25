@@ -111,7 +111,7 @@ pub type TapOpener =
 enum CaptureMode {
     /// Taps opened once, up front, and handed to the session pre-started. No
     /// live rebuild.
-    Prebuilt(TapOpener),
+    Prebuilt(Arc<TapOpener>),
     /// The backend and clock the session builds a [`fotw_audio::supervisor::CaptureSupervisor`]
     /// per leg from, rebuilding a stalled tap for the life of the meeting.
     Supervised {
@@ -120,16 +120,11 @@ enum CaptureMode {
     },
 }
 
-/// One session's capture payload, resolved from [`CaptureMode`] at `start()` and
-/// moved onto the session task. The prebuilt taps are opened before the task is
-/// spawned so an open failure is reported synchronously; the supervised backend
-/// opens its taps inside the task, where a failure surfaces through the ready
-/// deadline exactly as a wedged prebuilt tap's would.
+/// One session's capture payload, moved onto the session task. Both paths open
+/// taps only after transcription admission. Startup failures wake the waiting
+/// caller; a wedged native operation remains bounded by the ready deadline.
 enum SessionCapture {
-    Prebuilt {
-        system: Box<dyn AudioTap>,
-        mic: Option<Box<dyn AudioTap>>,
-    },
+    Prebuilt(Arc<TapOpener>),
     Supervised {
         plat: Arc<dyn AudioPlatform>,
         clock: Arc<dyn Clock>,
@@ -348,7 +343,7 @@ impl DaemonRecorder {
             handle,
             on_segment,
             on_ready,
-            CaptureMode::Prebuilt(open_taps),
+            CaptureMode::Prebuilt(Arc::new(open_taps)),
             transcription,
             finish,
             ceiling,
@@ -437,7 +432,7 @@ fn configured_transcription(root: &Path) -> Transcription {
 fn transcription_for_choice(
     choice: Result<SttSettings, String>,
     root: &Path,
-    deepgram: impl FnOnce() -> Transcription,
+    deepgram: impl FnOnce() -> Transcription + Send + 'static,
 ) -> Transcription {
     let settings = match choice {
         Ok(settings) => settings,
@@ -450,6 +445,16 @@ fn transcription_for_choice(
     };
     match settings.engine {
         SttEngine::Deepgram => deepgram(),
+        SttEngine::Fallback => crate::stt::fallback_transcription(
+            settings,
+            root.parent().unwrap_or(root).to_owned(),
+            Box::new(move || {
+                match deepgram() {
+                Transcription::Deepgram(legs) => Ok(legs),
+                _ => Err("Deepgram-to-local mode requires a Deepgram key; add one or explicitly choose local-only".into()),
+            }
+            }),
+        ),
         SttEngine::Local => crate::stt::local_transcription(
             &settings,
             root.parent().unwrap_or(root),
@@ -625,15 +630,10 @@ impl RecorderControl for DaemonRecorder {
                 RecorderError::Failed(format!("could not write the audit log: {e}"))
             })?;
 
-        // Prebuilt taps open here so an open failure is reported synchronously,
-        // before a slot is taken; the supervised backend opens its taps inside
-        // the session task, where a start failure surfaces through the same
-        // ready deadline a wedged prebuilt tap would (below).
+        // Defer all tap opening until the session owns its slot and finishes
+        // transcription admission. Opening a tap may itself access a device.
         let capture = match &self.capture {
-            CaptureMode::Prebuilt(open_taps) => {
-                let (system, mic) = open_taps().map_err(RecorderError::Failed)?;
-                SessionCapture::Prebuilt { system, mic }
-            }
+            CaptureMode::Prebuilt(open_taps) => SessionCapture::Prebuilt(Arc::clone(open_taps)),
             CaptureMode::Supervised { plat, clock } => SessionCapture::Supervised {
                 plat: Arc::clone(plat),
                 clock: Arc::clone(clock),
@@ -641,12 +641,14 @@ impl RecorderControl for DaemonRecorder {
         };
 
         let transcription = (self.transcription)();
+        let guarded_admission = transcription.needs_preparation();
 
         let mut control = SessionControl::new();
         control.on_segment = self.on_segment.clone();
         control.deadlines = self.finish_deadlines;
         let stop = control.stop.clone();
         let ready = control.ready.clone();
+        ready.set_preparing(transcription.needs_preparation());
         let started_at_ms = now_ms();
         let capture_health = control.capture_health.clone();
         *slot = Some(Live {
@@ -681,9 +683,29 @@ impl RecorderControl for DaemonRecorder {
         // Do not answer until capture is real. Answering on spawn is what let
         // a wedged device show a RECORDING badge over an empty disk.
         if !ready.wait_timeout(self.ready_deadline) {
+            if let Some(error) = ready.failure() {
+                return Err(RecorderError::Failed(error));
+            }
+            let preparing = ready.is_preparing();
             capture_health.close();
             stop.stop();
-            *live.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            if guarded_admission {
+                let error = if preparing {
+                    "local backup model preparation timed out; capture was not started. Waiting for native preparation to release its resources."
+                } else {
+                    "recording setup timed out; waiting for native setup to release its resources before another Start"
+                }.to_owned();
+                let slot = live.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(owner) = slot.as_ref().filter(|s| s.ready.same_session(&ready)) {
+                    owner.errors.record(error.clone());
+                }
+                ready.fail(error.clone());
+                return Err(RecorderError::Failed(error));
+            }
+            let mut slot = live.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.as_ref().is_some_and(|s| s.ready.same_session(&ready)) {
+                *slot = None;
+            }
             return Err(RecorderError::Failed(
                 "the audio device did not start. This is usually a Core Audio \
                  HAL that still believes a dead client holds the device; it \
@@ -705,6 +727,17 @@ impl RecorderControl for DaemonRecorder {
         // Set once. A reloaded tab presses Stop again, and a second stop that
         // moved this forward would make the meeting appear to grow after it
         // ended — the clock is frozen at the first Stop or it is not frozen.
+        if !live.ready.is_ready() {
+            live.stop.stop();
+            let message =
+                "preparation cancelled; waiting for native setup to release its resources"
+                    .to_owned();
+            live.errors.record(message.clone());
+            live.ready.fail(message);
+            return Ok(
+                RecordingStatus::preparing(true).with_transcription_error(live.errors.latest())
+            );
+        }
         let ended_at_ms = *live.stopped_at_ms.get_or_insert(now_ms());
         // Trip and return. The task clears the slot once the meeting is on
         // disk; until then status reads `finishing`.
@@ -755,13 +788,17 @@ impl RecorderControl for DaemonRecorder {
                 .ready
                 .capture_started_at_ms()
                 .unwrap_or(live.started_at_ms);
-            match live.ready.capture_ended_at_ms().or(live.stopped_at_ms) {
-                // Frozen: the tap is shut, so the number cannot grow.
-                Some(ended_at_ms) => RecordingStatus::finishing(started_at_ms, ended_at_ms),
-                None => RecordingStatus::recording(
-                    started_at_ms,
-                    now_ms().saturating_sub(started_at_ms),
-                ),
+            let status = if !live.ready.is_ready() {
+                RecordingStatus::preparing(live.stop.is_stopped())
+            } else {
+                match live.ready.capture_ended_at_ms().or(live.stopped_at_ms) {
+                    // Frozen: the tap is shut, so the number cannot grow.
+                    Some(ended_at_ms) => RecordingStatus::finishing(started_at_ms, ended_at_ms),
+                    None => RecordingStatus::recording(
+                        started_at_ms,
+                        now_ms().saturating_sub(started_at_ms),
+                    ),
+                }
             }
             // Kept for finishing too: a tab loaded mid-finalize must still see
             // that transcription failed, or an empty transcript is
@@ -769,11 +806,16 @@ impl RecorderControl for DaemonRecorder {
             // looking for the words.
             .with_capture_health(live.capture_health.snapshot())
             .with_transcription_error(live.errors.latest())
-            .with_session_id(live.ready.session_id())
-            .with_auto_stop_at_ms(
-                started_at_ms
-                    .saturating_add(u64::try_from(self.ceiling.as_millis()).unwrap_or(u64::MAX)),
-            )
+            .with_session_id(live.ready.session_id());
+            if live.ready.is_ready() {
+                status.with_auto_stop_at_ms(
+                    started_at_ms.saturating_add(
+                        u64::try_from(self.ceiling.as_millis()).unwrap_or(u64::MAX),
+                    ),
+                )
+            } else {
+                status
+            }
         })
     }
 }
@@ -797,14 +839,28 @@ async fn spawn_session(
     // rebuilds a stalled tap in place (#101). The finishing tail below is
     // identical, so only the capture call differs.
     let capture_health = control.capture_health.clone();
-    let outcome = match capture {
-        SessionCapture::Prebuilt { system, mic } => {
-            session::run_with_control(&root, system, mic, transcription, ceiling, control).await
+    let ready = control.ready.clone();
+    let outcome = async {
+        let transcription = transcription.prepare(&control).await?;
+        if control.stop.is_stopped() {
+            return Err("recording preparation cancelled before capture".into());
         }
-        SessionCapture::Supervised { plat, clock } => {
-            session::run_supervised(&root, plat, clock, transcription, ceiling, control).await
+        match capture {
+            SessionCapture::Prebuilt(open) => {
+                let (system, mic) = tokio::task::spawn_blocking(move || open())
+                    .await
+                    .map_err(|_| "capture preparation failed".to_owned())??;
+                if control.stop.is_stopped() {
+                    return Err("recording preparation cancelled before capture".into());
+                }
+                session::run_with_control(&root, system, mic, transcription, ceiling, control).await
+            }
+            SessionCapture::Supervised { plat, clock } => {
+                session::run_supervised(&root, plat, clock, transcription, ceiling, control).await
+            }
         }
-    };
+    }
+    .await;
 
     capture_health.close();
 
@@ -816,18 +872,19 @@ async fn spawn_session(
     // SQLite, minutes on a long call) and enrichment run below with the slot
     // already open, so the next meeting can start while this one finalizes.
     //
-    // The `started_at_ms` guard keeps this from clearing a *newer* session: once
+    // The ready-signal identity keeps this from clearing a *newer* session: once
     // the slot is free a second Start may take it, and only the task that owns
     // the current entry may retire it. Nothing frees the slot but this line, so
     // until here it still holds our entry.
     {
         let mut slot = live.lock().unwrap_or_else(|e| e.into_inner());
-        if slot
-            .as_ref()
-            .is_some_and(|s| s.started_at_ms == started_at_ms)
-        {
+        if slot.as_ref().is_some_and(|s| s.ready.same_session(&ready)) {
             *slot = None;
         }
+    }
+
+    if let Err(error) = &outcome {
+        ready.fail(error.clone());
     }
 
     // The meeting's id once it is genuinely in the library. `None` covers a

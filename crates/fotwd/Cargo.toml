@@ -13,6 +13,7 @@ repository.workspace = true
 test-guards = []
 
 [dependencies]
+futures-util = { workspace = true, features = ["std"] }
 fotw-audio = { path = "../fotw-audio" }
 fotw-pipeline = { path = "../fotw-pipeline" }
 # The daemon owns the shell's state machine: meeting detection runs here, and
