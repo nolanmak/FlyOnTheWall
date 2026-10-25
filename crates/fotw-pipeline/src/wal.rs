@@ -53,7 +53,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::opus::{OpusError, OpusOggWriter, SUPPORTED_RATES};
-use crate::resample::{Downmixer, Resampler16k, TARGET_RATE};
+use crate::resample::{ArchiveConverter, Downmixer, TARGET_RATE};
 
 /// How often buffered data is forced to disk.
 ///
@@ -741,6 +741,49 @@ pub fn encode_session(dir: impl AsRef<Path>) -> Result<EncodedSession, OpusError
     let dir = dir.as_ref();
     let mut manifest = read_manifest(dir)?;
 
+    // Validate both inputs before opening either output. Retrying an already
+    // archived session must not truncate its last complete audio when raw PCM
+    // was retired or shortened. An absent unrecorded microphone is ordinary.
+    for (index, (pcm, opus)) in LEGS.iter().enumerate() {
+        match std::fs::symlink_metadata(dir.join(opus)) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "archive destination is not an ordinary file",
+                )
+                .into());
+            }
+        }
+        let minimum = manifest.encoded.as_ref().map_or(0, |encoded| {
+            if index == 0 {
+                encoded.system.pcm_bytes
+            } else {
+                encoded.mic.pcm_bytes
+            }
+        });
+        match std::fs::symlink_metadata(dir.join(pcm)) {
+            Ok(metadata) if metadata.file_type().is_file() && metadata.len() >= minimum => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && index == 1
+                    && minimum == 0
+                    && manifest.mic_format.is_none()
+                    && matches!(std::fs::symlink_metadata(dir.join(opus)), Err(e) if e.kind()==std::io::ErrorKind::NotFound) =>
+                {}
+            Err(error) => return Err(error.into()),
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "raw archive source is unavailable or shorter than the retained recording",
+                )
+                .into());
+            }
+        }
+    }
+
     let formats = manifest.track_formats(dir);
     if formats.mic_inferred {
         // Said out loud because it is a guess with a permanent consequence:
@@ -814,7 +857,12 @@ pub(crate) fn write_manifest_at(dir: &Path, manifest: &Manifest) -> std::io::Res
         f.write_all(&json)?;
         f.sync_all()?;
     }
-    std::fs::rename(tmp, dir.join("manifest.json"))
+    std::fs::rename(tmp, dir.join("manifest.json"))?;
+    // On Unix the synced file alone does not persist newly created archive
+    // names or the manifest rename. Publish the directory before raw retirement.
+    #[cfg(unix)]
+    File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 /// Encode one leg.
@@ -828,11 +876,10 @@ pub(crate) fn write_manifest_at(dir: &Path, manifest: &Manifest) -> std::io::Res
 ///   devices, and applying one leg's count to the other is #80.
 /// * **Rate.** libopus accepts only 8/12/16/24/48 kHz. The pipeline's own rate
 ///   is 16 kHz so the common path resamples nothing; anything else is put
-///   through [`Resampler16k`] rather than rejected, because a session
+///   through [`ArchiveConverter`] rather than rejected, because a session
 ///   recovered from an older or stranger capture must still be archivable.
-///   That path loses up to one 10 ms chunk at the very end — the residue the
-///   resampler is still holding — which is below the resolution of anything
-///   downstream.
+///   Its final partial block is flushed before closing the encoder, retaining
+///   the exact complete-frame duration at the destination rate.
 /// * **Framing.** The encoder re-blocks into 20 ms frames itself, so the read
 ///   size here is chosen for I/O efficiency alone.
 fn encode_track(
@@ -852,7 +899,7 @@ fn encode_track(
     let (encode_rate, mut resampler) = if SUPPORTED_RATES.contains(&track_rate) {
         (track_rate, None)
     } else {
-        let r = Resampler16k::new(track_rate, 1)
+        let r = ArchiveConverter::new(track_rate, 1, TARGET_RATE, 1)
             .map_err(|e| OpusError::Container(format!("cannot resample {track_rate} Hz: {e}")))?;
         (TARGET_RATE, Some(r))
     };
@@ -890,7 +937,7 @@ fn encode_track(
             match resampler.as_mut() {
                 Some(r) => {
                     let out = r
-                        .process_all(&mono)
+                        .process(&mono)
                         .map_err(|e| OpusError::Container(e.to_string()))?;
                     writer.push_f32(&out)?;
                 }
@@ -908,7 +955,20 @@ fn encode_track(
         }
     }
 
+    if let Some(resampler) = resampler.as_mut() {
+        let tail = resampler
+            .finish()
+            .map_err(|e| OpusError::Container(e.to_string()))?;
+        writer.push_f32(&tail)?;
+    }
     let stats = writer.finish()?;
+    // The completed manifest may authorize raw PCM retirement. Persist the
+    // archive itself before publishing that manifest or deleting its source.
+    crate::opus::archive_open_options()
+        .read(true)
+        .write(true)
+        .open(&opus_path)?
+        .sync_all()?;
     let opus_bytes = std::fs::metadata(&opus_path).map(|m| m.len()).unwrap_or(0);
 
     Ok(EncodedTrack {

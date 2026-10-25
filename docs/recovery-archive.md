@@ -89,3 +89,22 @@ providers or user recordings. The change prevents new archive tails from being
 lost; existing archived bytes are not rewritten or repaired. Archived-input
 verification and finalized-but-unindexed capture recovery remain separate #12
 work.
+
+## Archive conversion and retry integrity
+
+Unsupported input rates now use the archive converter's explicit final flush.
+A regression at 44.1 kHz first decoded 16,000 samples where 16,006 were required;
+fixtures at 11.025, 22.05, 44.1 and 96 kHz now preserve the exact complete-frame
+duration and audible tail. Each completed Opus file is synced before publishing
+the completion manifest that permits raw PCM retirement.
+
+Encoding checks both raw sources and output file types before opening either
+archive. Missing or shortened previously encoded PCM, linked destinations and
+an orphan microphone archive fail without replacing retained audio or its
+manifest. An absent, never-recorded microphone with no archive remains valid.
+On Unix both destination opens also refuse final-component symlinks at open
+time, including a link introduced after preflight. Manifest publication syncs
+the session directory after renaming the synced manifest, before PCM retirement.
+Seven synthetic integration tests and full local `just ci` pass. These checks do
+not establish active-writer exclusion or transactional replacement after an I/O
+failure; complete-archive validation before destructive retirement remains open.

@@ -49,7 +49,7 @@
 //! PCM (see [`crate::wal::encode_session`]).
 
 use std::ffi::{CStr, c_int};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, Write};
 use std::path::Path;
 
@@ -563,7 +563,11 @@ impl<W: Write> OpusOggWriter<W> {
 impl OpusOggWriter<BufWriter<File>> {
     /// Create (or truncate) `path` and encode into it.
     pub fn create(path: impl AsRef<Path>, sample_rate_hz: u32) -> Result<Self, OpusError> {
-        let f = File::create(path.as_ref())?;
+        let f = archive_open_options()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path.as_ref())?;
         Self::new(BufWriter::new(f), sample_rate_hz)
     }
 
@@ -579,6 +583,20 @@ impl OpusOggWriter<BufWriter<File>> {
         w.get_ref().sync_data()?;
         Ok(())
     }
+}
+
+/// Archive opens must reject a final-component link even if it appeared after
+/// source/destination preflight. Callers remain responsible for parent directories.
+pub(crate) fn archive_open_options() -> OpenOptions {
+    let options = OpenOptions::new();
+    #[cfg(unix)]
+    let options = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = options;
+        options.custom_flags(libc::O_NOFOLLOW);
+        options
+    };
+    options
 }
 
 /// The `OpusHead` identification packet (RFC 7845 §5.1).

@@ -738,6 +738,7 @@ name = "fotw-pipeline"
 version = "0.1.0"
 dependencies = [
  "fotw-dsp",
+ "libc",
  "ogg",
  "opusic-sys",
  "rtrb",
