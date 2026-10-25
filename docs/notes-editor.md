@@ -222,3 +222,46 @@ repacking/overflow and exclusion of another meeting's transcript. These tests
 inspect actual mock-provider requests and use no real keys or cloud calls.
 Model output quality, native timing and the remaining acceptance gates for
 #13/#122 still require validation.
+
+
+## Composition and editor ownership
+
+Notes treat native marked text as a composition transaction. Input still updates
+an in-memory draft, but the 500ms debounce/5s maximum autosave and an older save
+loop do not publish intermediate candidates. Status updates never assign the
+textarea value during composition. Movement, overwrite and discard controls are
+disabled until composition ends; the status says Composing rather than Saved.
+An uncommitted composition also triggers the unsaved-page warning.
+
+The block mapping retains a composition checkpoint through an IME's transient
+marked-range deletion, so final text keeps the first input's UUID/time. New
+blocks can extend the checkpoint. Original unanchored text stays unanchored,
+and a finalized capture clock bounds both the current anchors and the older
+composition checkpoint. A late clock cannot restore a beyond-end timestamp.
+
+Explicit Stop/navigation/blur snapshots the latest visible composition text to
+its original draft identity. Untouched notes are not read back from the textarea,
+so browser CRLF normalization cannot cause a save merely from navigation. Clearing a pane releases its editor, cancels timers, flushes its
+draft and disconnects old callbacks. Late events from detached fields cannot
+change a remounted live/saved alias or another meeting. These drafts remain in
+memory; durable text still uses the existing revision-checked encrypted store.
+Failed saves and conflicts retain the draft and require the existing explicit
+retry/overwrite choices.
+
+Behavioral tests reproduce preedit autosave, status-driven text replacement,
+stale navigation, save-loop completion races and late finalized clocks. The
+committed [WebKit trace](../crates/fotw-web/tests/fixtures/notes-ime-webkit.json) records an actual WebKit event
+sequence: deleteCompositionText temporarily empties the marked range before
+insertFromComposition supplies the final text. Node regressions replay it.
+
+On macOS 26.4, an owned nonpersistent, nonactivating WKWebView used only its own
+NSTextInputClient setMarkedText/insertText methods against
+`ui_preview --live-notes` and its temporary encrypted database. At 390px, two
+Japanese/emoji paragraphs each remained unsaved during a 5.5-second preedit,
+then produced exactly one committed POST with their initial block timestamps.
+At 1440px, Stop during a third composition preserved the visible text through
+the real event-hub saved-meeting handoff; late events on the detached field
+could not change saved notes or advance its revision. No global keyboard event,
+clipboard, system input-source change, microphone, provider or user library was
+used. This verifies the browser marked-text lifecycle; a physical keyboard/IME
+locale matrix, actual capture/device behavior and crash acceptance remain open.

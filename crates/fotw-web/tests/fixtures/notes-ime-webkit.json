@@ -1,0 +1,78 @@
+{
+  "source": "Owned nonactivating WKWebView; NSTextInputClient setMarkedText/insertText; synthetic Japanese text only",
+  "events": [
+    {
+      "event": "compositionstart",
+      "inputType": "",
+      "isComposing": false,
+      "value": ""
+    },
+    {
+      "event": "compositionupdate",
+      "inputType": "",
+      "isComposing": false,
+      "value": ""
+    },
+    {
+      "event": "beforeinput",
+      "inputType": "insertCompositionText",
+      "isComposing": true,
+      "value": ""
+    },
+    {
+      "event": "input",
+      "inputType": "insertCompositionText",
+      "isComposing": true,
+      "value": "に"
+    },
+    {
+      "event": "compositionupdate",
+      "inputType": "",
+      "isComposing": false,
+      "value": "に"
+    },
+    {
+      "event": "beforeinput",
+      "inputType": "insertCompositionText",
+      "isComposing": true,
+      "value": "に"
+    },
+    {
+      "event": "input",
+      "inputType": "insertCompositionText",
+      "isComposing": true,
+      "value": "日本"
+    },
+    {
+      "event": "beforeinput",
+      "inputType": "deleteCompositionText",
+      "isComposing": true,
+      "value": "日本"
+    },
+    {
+      "event": "input",
+      "inputType": "deleteCompositionText",
+      "isComposing": true,
+      "value": ""
+    },
+    {
+      "event": "beforeinput",
+      "inputType": "insertFromComposition",
+      "isComposing": true,
+      "value": ""
+    },
+    {
+      "event": "input",
+      "inputType": "insertFromComposition",
+      "isComposing": true,
+      "value": "日本語"
+    },
+    {
+      "event": "compositionend",
+      "inputType": "",
+      "isComposing": false,
+      "value": "日本語"
+    }
+  ],
+  "committed_text": "日本語"
+}
