@@ -28,7 +28,7 @@ globalThis.FOTWSpeechRecovery = { mount(id, parent, api, reload) {
     const running=state.worker_running===true;
     hasRun=hasRun||running;
     heading.textContent=state.phase==='partial'?'Saved speech recovered':state.phase==='retained'?'Interrupted recording':state.phase==='complete'?'Transcription recovered':'Finish transcription';
-    const labels={partial:'Available saved speech recovered. The final recording time remains unknown and additional original audio is retained.',retained:'The final recording time is unknown. Audio and notes are retained. Available saved speech may be recovered locally using its original model; other audio remains pending.',incomplete:'Some saved audio is still unconfirmed. Retry locally to finish it.',preparing:'Preparing the original local model…',
+    const labels={partial:'Available saved speech recovered. The final recording time remains unknown and additional original audio is retained.',retained:'The final recording time is unknown. Audio, notes and any saved transcript are retained.',incomplete:'Some saved audio is still unconfirmed. Retry locally to finish it.',preparing:'Preparing the original local model…',
       transcribing:'Recovering saved speech locally…',stopping:'Waiting for local work to stop. Audio is retained.',
       complete:'Recovered speech is saved. Reload the transcript when you are ready.',failed:'Local recovery did not finish. Audio is retained for retry.',cancelled:'Local recovery cancelled. Audio is retained for retry.'};
     message.textContent=state.message||labels[state.phase]||'Recovery status unavailable. Refresh to try again.';

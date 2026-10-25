@@ -503,7 +503,7 @@ impl SavedSpeechRecovery {
         });
         if !clock_is_final {
             status.can_retry = false;
-            status.message=Some("Recording interrupted. The final recording time is unknown. Original audio and notes are retained. Available saved speech may be recovered locally using its original model; other audio remains pending.".into());
+            status.message=Some("Recording interrupted. The final recording time is unknown. Your audio, notes and any saved transcript are retained.".into());
         }
         for (source, replay, name) in [
             (Source::System, ReplaySource::System, "system"),
@@ -575,7 +575,16 @@ impl SavedSpeechRecovery {
         if sources.is_empty() && clock_is_final {
             return Err(RecoveryError::NotFound);
         }
-        if !clock_is_final && !sources.is_empty() && sources.iter().all(|s| !s.pending) {
+        if !clock_is_final && status.can_retry {
+            if let Some(message) = status.message.as_mut() {
+                message.push_str(" Available saved speech can be recovered locally; other audio remains pending.");
+            }
+        }
+        if !clock_is_final
+            && !status.can_retry
+            && !sources.is_empty()
+            && sources.iter().all(|s| !s.pending)
+        {
             status.phase = RecoveryPhase::Partial;
             status.message=Some("Available saved speech is accounted for. The final recording time is unknown and additional original audio is retained.".into());
         }

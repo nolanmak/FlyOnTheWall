@@ -558,6 +558,11 @@ fn startup_repairs_a_missing_prefix_projection_ack_without_repeating_native_work
     let journal = std::fs::read(f.dir.join("system.stt-coverage.jsonl")).unwrap();
     let count = db.export_meeting(&id).unwrap().segments.len();
     std::fs::remove_file(f.dir.join("system.stt-prefix-projected.json")).unwrap();
+    assert_eq!(
+        owner(&f).read(&id).unwrap().phase,
+        fotw_web::speech_recovery::RecoveryPhase::Retained,
+        "unacknowledged data cannot claim a saved partial projection"
+    );
     startup(&owner(&f));
     assert!(
         f.dir.join("system.stt-prefix-projected.json").exists(),
