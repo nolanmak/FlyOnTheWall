@@ -61,6 +61,9 @@ A synthetic saved-history fixture uses real durable projection and the real API:
 cargo run -p fotwd --example ui_preview -- --speech-history
 ```
 
+Synthetic [desktop](speech-ui/saved-desktop.png) and
+[390px](speech-ui/saved-mobile.png) views show the real saved-history response.
+
 Rendered export and summary-prompt provenance, startup native recovery
 and retry controls remain part of
 [#12](https://github.com/nolanmak/FlyOnTheWall/issues/12).
