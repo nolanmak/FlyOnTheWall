@@ -478,14 +478,24 @@ async fn serve_until_stopped(root: PathBuf, launch: Launch, port: u16) -> Result
     .await
     .map_err(|e| format!("could not bind 127.0.0.1: {e}"))?;
 
-    if let Ok(db) = crate::open_library(&root) {
-        server.state().set_speech_recovery(Arc::new(
-            crate::speech_recovery::SavedSpeechRecovery::new(
-                db,
-                root.parent().unwrap_or(&root).to_owned(),
-            ),
-        ));
-    }
+    // Retain this guard through serve(): shutdown revokes automatic output,
+    // while any blocked native worker retains its own admission until cleanup.
+    let _speech_startup = if let Ok(db) = crate::open_library(&root) {
+        match crate::speech_recovery::SavedSpeechRecovery::new(
+            db,
+            root.parent().unwrap_or(&root).to_owned(),
+        )
+        .install(server.state())
+        {
+            Ok(pass) => pass,
+            Err(error) => {
+                diag!("  ! automatic local speech recovery could not start: {error}");
+                None // Manual recovery remains registered and audio is retained.
+            }
+        }
+    } else {
+        None
+    };
 
     if let Ok(db) = crate::open_library(&root) {
         server

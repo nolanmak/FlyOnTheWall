@@ -52,12 +52,40 @@ fn fixture() -> Fixture {
     fixture_audio(pcm, "fixture-local", "fixture-revision")
 }
 fn fixture_audio(pcm: Vec<i16>, model: &str, revision: &str) -> Fixture {
+    let root = tempfile::tempdir().unwrap();
+    let key = DbKey::from_bytes([0x6a; 32]);
+    let database = root.path().join("owned.sqlite3");
+    let (dir, meeting) = add_capture(
+        root.path(),
+        &database,
+        &key,
+        pcm,
+        model,
+        revision,
+        "saved-prefix",
+    );
+    Fixture {
+        root,
+        dir,
+        database,
+        meeting,
+        key,
+    }
+}
+fn add_capture(
+    root: &std::path::Path,
+    database: &std::path::Path,
+    key: &DbKey,
+    pcm: Vec<i16>,
+    model: &str,
+    revision: &str,
+    prefix_id: &str,
+) -> (PathBuf, String) {
     use fotw_pipeline::{
         replay::{ReplaySource, ReplayWriter},
         wal::SessionWal,
     };
-    let root = tempfile::tempdir().unwrap();
-    let mut wal = SessionWal::create(root.path().join("sessions"), 16000, 1).unwrap();
+    let mut wal = SessionWal::create(root.join("sessions"), 16000, 1).unwrap();
     let dir = wal.dir().to_owned();
     let session = dir.file_name().unwrap().to_str().unwrap();
     wal.write_system(
@@ -114,7 +142,7 @@ fn fixture_audio(pcm: Vec<i16>, model: &str, revision: &str) -> Fixture {
     .unwrap();
     let mut prefix =
         fotw_stt::TranscriptSegment::new(session, Source::System, "deepgram", "nova-3");
-    prefix.id = "saved-prefix".into();
+    prefix.id = prefix_id.into();
     prefix.text = "original prefix".into();
     prefix.is_final = true;
     prefix.start_ms = 137;
@@ -122,9 +150,7 @@ fn fixture_audio(pcm: Vec<i16>, model: &str, revision: &str) -> Fixture {
     journal.commit(0, 137 * 16, 637 * 16, vec![prefix]).unwrap();
     drop(journal);
     drop(audio);
-    let key = DbKey::from_bytes([0x6a; 32]);
-    let database = root.path().join("owned.sqlite3");
-    let mut db = Db::open(&database, &key).unwrap();
+    let mut db = Db::open(database, key).unwrap();
     let meeting = fotwd::persist::persist_session(
         &mut db,
         &fotwd::SessionOutcome {
@@ -138,17 +164,11 @@ fn fixture_audio(pcm: Vec<i16>, model: &str, revision: &str) -> Fixture {
     .unwrap();
     db.conn()
         .execute(
-            "UPDATE segments SET text='corrected prefix' WHERE id='saved-prefix'",
-            [],
+            "UPDATE segments SET text='corrected prefix' WHERE id=?1",
+            [prefix_id],
         )
         .unwrap();
-    Fixture {
-        root,
-        dir,
-        database,
-        meeting,
-        key,
-    }
+    (dir, meeting)
 }
 fn controller(f: &Fixture, calls: Arc<AtomicUsize>) -> SavedSpeechRecovery {
     SavedSpeechRecovery::with_parts(
@@ -427,13 +447,15 @@ fn installed_model_recovers_saved_public_audio_through_the_app_controller() {
         let original = std::fs::read(f.dir.join("system.stt16")).unwrap();
         let c = SavedSpeechRecovery::new(db, f.root.path().to_owned());
         let began = Instant::now();
-        c.retry(&f.meeting).unwrap();
+        let pass = c.start_pending().unwrap().unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         let status = loop {
-            let status = c.read(&f.meeting).unwrap();
-            if !status.worker_running {
-                break status;
+            if !pass.is_running() {
+                // Observe the final status after the completion barrier;
+                // a status sampled before it can still be transitional.
+                break c.read(&f.meeting).unwrap();
             }
+            let status = c.read(&f.meeting).unwrap();
             assert!(Instant::now() < deadline, "{status:?}");
             std::thread::sleep(Duration::from_millis(10));
         };
@@ -473,7 +495,7 @@ fn installed_model_recovers_saved_public_audio_through_the_app_controller() {
         }
         eprintln!(
             "{}",
-            serde_json::json!({"fixture":"public-jfk", "app_saved_retry":true, "valid_revision":valid_revision, "phase":status.phase, "elapsed_ms":began.elapsed().as_millis(), "model":"small.en"})
+            serde_json::json!({"fixture":"public-jfk", "app_startup_recovery":true, "valid_revision":valid_revision, "phase":status.phase, "elapsed_ms":began.elapsed().as_millis(), "model":"small.en"})
         );
     }
 }
@@ -662,4 +684,329 @@ fn healthy_long_recovery_outlives_one_stall_budget_while_durable_progress_contin
         "healthy long recordings must not expire on a total-time cap: {status:?}"
     );
     assert_eq!(status.sources[0].pending_audio_ms, 0);
+}
+
+fn startup_finished(pass: &fotwd::speech_recovery::StartupRecovery) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while pass.is_running() {
+        assert!(Instant::now() < deadline, "startup pass did not finish");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn startup_recovers_across_pages_once_and_reopening_skips_completed_models() {
+    let f = fixture();
+    let mut meetings = vec![f.meeting.clone()];
+    for n in 0..33 {
+        let (_, meeting) = add_capture(
+            f.root.path(),
+            &f.database,
+            &f.key,
+            vec![1000; 16000],
+            "fixture-local",
+            "fixture-revision",
+            &format!("prefix-{n}"),
+        );
+        meetings.push(meeting);
+    }
+    let original = std::fs::read(f.dir.join("system.pcm")).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = controller(&f, calls.clone());
+    let pass = c.start_pending().unwrap().unwrap();
+    startup_finished(&pass);
+    assert_eq!(calls.load(Ordering::SeqCst), meetings.len());
+    assert!(
+        c.start_pending().unwrap().is_none(),
+        "one pass per controller"
+    );
+    for meeting in &meetings {
+        assert_eq!(c.read(meeting).unwrap().phase, RecoveryPhase::Complete);
+    }
+    let reopened = controller(&f, calls.clone());
+    let next = reopened.start_pending().unwrap().unwrap();
+    startup_finished(&next);
+    assert_eq!(calls.load(Ordering::SeqCst), meetings.len());
+    assert_eq!(std::fs::read(f.dir.join("system.pcm")).unwrap(), original);
+    let db = Db::open(&f.database, &f.key).unwrap();
+    let prefix: String = db
+        .conn()
+        .query_row(
+            "SELECT text FROM segments WHERE id='saved-prefix'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(prefix, "corrected prefix");
+    assert_eq!(
+        db.session_note_clock(f.dir.file_name().unwrap().to_str().unwrap())
+            .unwrap(),
+        Some((1000, 3137))
+    );
+}
+
+#[test]
+fn startup_skips_invalid_capture_and_missing_models_without_starving_later_work() {
+    let f = fixture();
+    let (_, bad) = add_capture(
+        f.root.path(),
+        &f.database,
+        &f.key,
+        vec![1000; 16000],
+        "fixture-local",
+        "fixture-revision",
+        "bad-clock",
+    );
+    let (_, missing) = add_capture(
+        f.root.path(),
+        &f.database,
+        &f.key,
+        vec![1000; 16000],
+        "missing-model",
+        "saved-missing-revision",
+        "missing-model-prefix",
+    );
+    let (_, good) = add_capture(
+        f.root.path(),
+        &f.database,
+        &f.key,
+        vec![1000; 16000],
+        "fixture-local",
+        "fixture-revision",
+        "later-good",
+    );
+    let db = Db::open(&f.database, &f.key).unwrap();
+    db.conn()
+        .execute(
+            "UPDATE session_note_links SET started_at_ms=1001 WHERE meeting_id=?1",
+            [&bad],
+        )
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let models = calls.clone();
+    let c = SavedSpeechRecovery::with_parts(
+        db,
+        f.root.path().to_owned(),
+        Arc::new(move |plan, _| {
+            assert_eq!(plan.language.as_deref(), Some("en"));
+            if plan.engine.model == "missing-model" {
+                return Err("fixture model not installed".into());
+            }
+            assert_eq!(plan.engine.revision.as_deref(), Some("fixture-revision"));
+            Ok(Arc::new(Factory(models.clone())))
+        }),
+        Duration::from_secs(2),
+        Duration::from_secs(5),
+    );
+    let pass = c.start_pending().unwrap().unwrap();
+    startup_finished(&pass);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(c.read(&f.meeting).unwrap().phase, RecoveryPhase::Complete);
+    assert_eq!(c.read(&good).unwrap().phase, RecoveryPhase::Complete);
+    assert!(c.read(&missing).unwrap().can_retry);
+    assert!(c.read(&bad).is_err());
+}
+
+#[test]
+fn explicit_retry_before_startup_keeps_automatic_recovery_from_taking_control() {
+    let f = fixture();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = controller(&f, calls.clone());
+    c.retry(&f.meeting).unwrap();
+    assert_eq!(finished(&c, &f.meeting).phase, RecoveryPhase::Complete);
+    assert!(c.start_pending().unwrap().is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn startup_cancel_or_shutdown_fences_output_and_retains_native_admission() {
+    for cancel in [true, false] {
+        let f = fixture();
+        let (_, second) = add_capture(
+            f.root.path(),
+            &f.database,
+            &f.key,
+            vec![1000; 16000],
+            "fixture-local",
+            "fixture-revision",
+            "queued-prefix",
+        );
+        let db = Db::open(&f.database, &f.key).unwrap();
+        let first: String = db
+            .conn()
+            .query_row(
+                "SELECT meeting_id FROM session_note_links ORDER BY session_id LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let other = if first == f.meeting {
+            second
+        } else {
+            f.meeting.clone()
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (release, gate) = std::sync::mpsc::channel();
+        let (entered, began) = std::sync::mpsc::channel();
+        let factory = Arc::new(BlockingFactory {
+            calls: calls.clone(),
+            entered,
+            gate: Arc::new(std::sync::Mutex::new(gate)),
+            in_create: true,
+        });
+        let c = SavedSpeechRecovery::with_parts(
+            db,
+            f.root.path().to_owned(),
+            Arc::new(move |_, _| Ok(factory.clone())),
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+        );
+        let mut pass = c.start_pending().unwrap();
+        began
+            .recv_timeout(Duration::from_secs(3))
+            .expect("startup did not initialize the saved model");
+        assert!(c.start_pending().unwrap().is_none());
+        if cancel {
+            c.cancel(&first).unwrap();
+        } else {
+            drop(pass.take());
+        }
+        assert_eq!(c.read(&first).unwrap().phase, RecoveryPhase::Stopping);
+        assert_eq!(
+            c.retry(&other),
+            Err(fotw_web::speech_recovery::RecoveryError::Busy)
+        );
+        release.send(()).unwrap();
+        assert_eq!(finished(&c, &first).phase, RecoveryPhase::Cancelled);
+        if let Some(pass) = pass {
+            startup_finished(&pass);
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "queued work must not restart after cancellation"
+        );
+        let db = Db::open(&f.database, &f.key).unwrap();
+        let late: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM segments WHERE text='recovered pending speech'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(late, 0);
+    }
+}
+
+#[tokio::test]
+async fn daemon_install_starts_saved_work_and_exposes_the_same_controller() {
+    let f = fixture();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = controller(&f, calls.clone());
+    let server = fotw_web::WebServer::bind(0, Arc::new(fotw_web::MemorySource::new()))
+        .await
+        .unwrap();
+    let pass = c
+        .install(server.state())
+        .unwrap()
+        .expect("daemon startup must own a recovery pass");
+    startup_finished(&pass);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let control = server.state().speech_recovery().unwrap();
+    assert_eq!(
+        control.read(&f.meeting).unwrap().phase,
+        RecoveryPhase::Complete
+    );
+}
+
+#[test]
+fn startup_horizon_does_not_chase_recordings_saved_after_the_scan_begins() {
+    let f = fixture();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (release, gate) = std::sync::mpsc::channel();
+    let (entered, began) = std::sync::mpsc::channel();
+    let factory = Arc::new(BlockingFactory {
+        calls: calls.clone(),
+        entered,
+        gate: Arc::new(std::sync::Mutex::new(gate)),
+        in_create: true,
+    });
+    let c = SavedSpeechRecovery::with_parts(
+        Db::open(&f.database, &f.key).unwrap(),
+        f.root.path().to_owned(),
+        Arc::new(move |_, _| Ok(factory.clone())),
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    );
+    let pass = c.start_pending().unwrap().unwrap();
+    began.recv_timeout(Duration::from_secs(3)).unwrap();
+    let (late_dir, late) = add_capture(
+        f.root.path(),
+        &f.database,
+        &f.key,
+        vec![1000; 16000],
+        "fixture-local",
+        "fixture-revision",
+        "post-startup",
+    );
+    assert!(
+        late_dir.file_name() > f.dir.file_name(),
+        "fixture must be beyond startup's saved horizon"
+    );
+    release.send(()).unwrap();
+    startup_finished(&pass);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(c.read(&f.meeting).unwrap().phase, RecoveryPhase::Complete);
+    assert_eq!(c.read(&late).unwrap().phase, RecoveryPhase::Incomplete);
+}
+
+#[test]
+fn completed_startup_guard_cannot_cancel_a_later_explicit_retry() {
+    let f = fixture();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let block = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (release, gate) = std::sync::mpsc::channel();
+    let (entered, began) = std::sync::mpsc::channel();
+    let manual_factory = Arc::new(BlockingFactory {
+        calls: calls.clone(),
+        entered,
+        gate: Arc::new(std::sync::Mutex::new(gate)),
+        in_create: true,
+    });
+    let choose_block = block.clone();
+    let model_calls = calls.clone();
+    let c = SavedSpeechRecovery::with_parts(
+        Db::open(&f.database, &f.key).unwrap(),
+        f.root.path().to_owned(),
+        Arc::new(move |_, _| {
+            if choose_block.load(Ordering::Acquire) {
+                Ok(manual_factory.clone())
+            } else {
+                Ok(Arc::new(Factory(model_calls.clone())) as Arc<dyn RecognizerFactory>)
+            }
+        }),
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    );
+    let pass = c.start_pending().unwrap().unwrap();
+    startup_finished(&pass);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let (_, later) = add_capture(
+        f.root.path(),
+        &f.database,
+        &f.key,
+        vec![1000; 16000],
+        "fixture-local",
+        "fixture-revision",
+        "manual-after-startup",
+    );
+    block.store(true, Ordering::Release);
+    c.retry(&later).unwrap();
+    began.recv_timeout(Duration::from_secs(3)).unwrap();
+    drop(pass);
+    assert_eq!(c.read(&later).unwrap().phase, RecoveryPhase::Preparing);
+    release.send(()).unwrap();
+    assert_eq!(finished(&c, &later).phase, RecoveryPhase::Complete);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
