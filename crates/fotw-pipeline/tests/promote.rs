@@ -61,6 +61,28 @@ fn finished_session(root: &Path, meeting_id: &str) -> std::path::PathBuf {
     dir
 }
 
+// Simulates a successful DB projection in the filesystem-only pipeline tests.
+fn acknowledge_projection(
+    dir: &Path,
+    id: &str,
+    source: fotw_pipeline::replay::ReplaySource,
+    through: u64,
+) {
+    use fotw_pipeline::replay::{ReplayReader, ReplaySource};
+    let path = dir.join(match source {
+        ReplaySource::System => "system.stt-coverage.jsonl",
+        ReplaySource::Mic => "mic.stt-coverage.jsonl",
+    });
+    if !path.exists() {
+        std::fs::write(&path, b"owned fixture projection receipt\n").unwrap();
+    }
+    let bytes = std::fs::metadata(&path).unwrap().len();
+    ReplayReader::open(dir, id, source)
+        .unwrap()
+        .mark_projected(through, bytes)
+        .unwrap();
+}
+
 fn media_dir(root: &Path, meeting_id: &str) -> std::path::PathBuf {
     root.join(media_rel_dir(AUG_2026_MS, meeting_id))
 }
@@ -118,6 +140,7 @@ fn only_matching_complete_replay_with_no_live_writer_can_be_retired() {
     let mut reader = ReplayReader::open(&dir, &id, ReplaySource::System).unwrap();
     assert!(reader.mark_complete(137 * 16 + 16_000).is_err());
     reader.mark_complete(137 * 16 + 32_000).unwrap();
+    acknowledge_projection(&dir, &id, ReplaySource::System, 137 * 16 + 32_000);
     let promotion = promote::promote(&dir, &root).unwrap();
     assert!(
         dir.exists(),
@@ -143,6 +166,7 @@ fn appending_after_completion_invalidates_the_retirement_proof() {
     replay.append(&[123; 16_000]).unwrap();
     let mut reader = ReplayReader::open(&dir, &id, ReplaySource::System).unwrap();
     reader.mark_complete(16_000).unwrap();
+    acknowledge_projection(&dir, &id, ReplaySource::System, 16_000);
     replay.append(&[456; 16_000]).unwrap();
     drop(replay);
     promote::promote(&dir, &root).unwrap();
@@ -151,6 +175,7 @@ fn appending_after_completion_invalidates_the_retirement_proof() {
         "new audio must not inherit an earlier completion receipt"
     );
     reader.mark_complete(32_000).unwrap();
+    acknowledge_projection(&dir, &id, ReplaySource::System, 32_000);
     drop(reader);
     promote::promote(&dir, &root).unwrap();
     assert!(!dir.exists());
@@ -171,6 +196,7 @@ fn invalid_completion_identity_or_corruption_never_authorizes_audio_retirement()
     drop(replay);
     let mut reader = ReplayReader::open(&dir, &id, ReplaySource::System).unwrap();
     reader.mark_complete(32_000).unwrap();
+    acknowledge_projection(&dir, &id, ReplaySource::System, 32_000);
     let path = dir.join("system.stt-complete.json");
     let valid: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     for (field, value) in [
@@ -191,6 +217,7 @@ fn invalid_completion_identity_or_corruption_never_authorizes_audio_retirement()
         assert!(dir.exists(), "corrupt proof permitted retirement");
     }
     reader.mark_complete(32_000).unwrap();
+    acknowledge_projection(&dir, &id, ReplaySource::System, 32_000);
     drop(reader);
     promote::promote(&dir, &root).unwrap();
     assert!(!dir.exists());
@@ -213,10 +240,12 @@ fn both_replay_sources_must_finish_and_a_torn_sample_is_not_complete() {
     }
     let mut system = ReplayReader::open(&dir, &id, ReplaySource::System).unwrap();
     system.mark_complete(32_000).unwrap();
+    acknowledge_projection(&dir, &id, ReplaySource::System, 32_000);
     promote::promote(&dir, &root).unwrap();
     assert!(dir.exists(), "pending mic was ignored");
     let mut mic = ReplayReader::open(&dir, &id, ReplaySource::Mic).unwrap();
     mic.mark_complete(32_000).unwrap();
+    acknowledge_projection(&dir, &id, ReplaySource::Mic, 32_000);
     std::fs::OpenOptions::new()
         .append(true)
         .open(dir.join("mic.stt16"))
@@ -618,4 +647,93 @@ fn goertzel(x: &[f32], hz: f32, rate: u32) -> f32 {
         s1 = s0;
     }
     (s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0).sqrt() / x.len() as f32
+}
+
+#[test]
+fn completed_inference_without_a_durable_database_ack_cannot_retire_its_journal() {
+    use fotw_pipeline::replay::{ReplayReader, ReplaySource, ReplayWriter};
+    let root = tmpdir("unprojected-completion");
+    let dir = finished_session(&root, "unprojected-stt");
+    let id = fotw_pipeline::wal::SessionState::read(&dir)
+        .unwrap()
+        .manifest
+        .id;
+    let mut writer = ReplayWriter::create(&dir, &id, ReplaySource::System, 0).unwrap();
+    writer.append(&[123; 32_000]).unwrap();
+    let mut reader = ReplayReader::open(&dir, &id, ReplaySource::System).unwrap();
+    reader.mark_complete(32_000).unwrap();
+    std::fs::write(
+        dir.join("system.stt-coverage.jsonl"),
+        b"owned unprojected inference receipt\n",
+    )
+    .unwrap();
+    drop(reader);
+    drop(writer);
+    promote::promote(&dir, &root).unwrap();
+    assert!(
+        dir.exists(),
+        "startup promotion retired recovered words before database projection"
+    );
+    assert!(dir.join("system.stt-coverage.jsonl").is_file());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn journal_growth_or_a_live_journal_owner_invalidates_retirement_even_after_projection() {
+    use fotw_pipeline::replay::{ReplayReader, ReplaySource, ReplayWriter};
+    use std::io::Write;
+    let root = tmpdir("projection-journal-growth");
+    let dir = finished_session(&root, "projected-stt");
+    let id = fotw_pipeline::wal::SessionState::read(&dir)
+        .unwrap()
+        .manifest
+        .id;
+    let mut writer = ReplayWriter::create(&dir, &id, ReplaySource::System, 0).unwrap();
+    writer.append(&[123; 32_000]).unwrap();
+    let mut reader = ReplayReader::open(&dir, &id, ReplaySource::System).unwrap();
+    reader.mark_complete(32_000).unwrap();
+    acknowledge_projection(&dir, &id, ReplaySource::System, 32_000);
+    drop(writer);
+    assert!(reader.is_projected().unwrap());
+    let proof_path = dir.join("system.stt-projected.json");
+    let proof: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&proof_path).unwrap()).unwrap();
+    let mut wrong = proof.clone();
+    wrong["boundary"]["session_id"] = "another-session".into();
+    std::fs::write(&proof_path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+    assert!(!reader.is_projected().unwrap());
+    promote::promote(&dir, &root).unwrap();
+    assert!(dir.exists());
+    std::fs::write(&proof_path, serde_json::to_vec(&proof).unwrap()).unwrap();
+    let journal = dir.join("system.stt-coverage.jsonl");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&journal)
+        .unwrap()
+        .write_all(b"owned newer provider epoch\n")
+        .unwrap();
+    assert!(!reader.is_projected().unwrap());
+    promote::promote(&dir, &root).unwrap();
+    assert!(
+        dir.exists(),
+        "new journal metadata must be projected before retirement"
+    );
+    acknowledge_projection(&dir, &id, ReplaySource::System, 32_000);
+    let owner = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(journal.with_extension("jsonl.lock"))
+        .unwrap();
+    owner.try_lock().unwrap();
+    promote::promote(&dir, &root).unwrap();
+    assert!(
+        dir.exists(),
+        "a live journal writer must prevent retirement independently of the canonical owner"
+    );
+    owner.unlock().unwrap();
+    drop(owner);
+    drop(reader);
+    promote::promote(&dir, &root).unwrap();
+    assert!(!dir.exists());
+    std::fs::remove_dir_all(root).unwrap();
 }

@@ -311,6 +311,8 @@ fn publish_claimed(
     session_dir: &Path,
     meeting_id: &str,
 ) -> Result<Promotion, String> {
+    crate::persist::refresh_speech_projection(db, session_dir, meeting_id)
+        .map_err(|e| e.to_string())?;
     let promoted = promote::promote(session_dir, data_root).map_err(|e| e.to_string())?;
     if db
         .meeting_was_deleted(meeting_id)

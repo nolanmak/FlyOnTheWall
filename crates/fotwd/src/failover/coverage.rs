@@ -236,6 +236,8 @@ pub struct CoverageSnapshot {
     pub epochs: Vec<ProviderEpoch>,
     /// Local inference plan captured before initial cloud connection, if known.
     pub fallback: Option<LocalPlan>,
+    /// Exact byte end of the validated prefix, excluding any torn final line.
+    pub valid_bytes: u64,
     /// Only complete validated receipt lines; never an in-flight publication.
     pub commits: Vec<CommittedAudio>,
 }
@@ -257,6 +259,7 @@ pub struct CoverageJournal {
     ids: HashSet<String>,
     committed: u64,
     failed: bool,
+    valid_bytes: u64,
 }
 
 impl CoverageJournal {
@@ -334,6 +337,7 @@ impl CoverageJournal {
             epochs: journal.epochs,
             commits: journal.commits,
             fallback: journal.header.fallback,
+            valid_bytes: journal.valid_bytes,
         })
     }
 
@@ -393,6 +397,7 @@ impl CoverageJournal {
             journal.file.set_len(valid_bytes)?;
             journal.file.sync_data()?;
         }
+        journal.valid_bytes = valid_bytes;
         journal.file.seek(SeekFrom::End(0))?;
         Ok(journal)
     }
@@ -426,6 +431,7 @@ impl CoverageJournal {
             commits: Vec::new(),
             ids: HashSet::new(),
             failed: false,
+            valid_bytes: 0,
         }
     }
 
@@ -589,6 +595,10 @@ impl CoverageJournal {
             self.failed = true;
             return Err(error);
         }
+        self.valid_bytes = self
+            .valid_bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| invalid("journal length overflow"))?;
         Ok(())
     }
     fn healthy(&self) -> io::Result<()> {

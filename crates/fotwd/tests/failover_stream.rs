@@ -804,7 +804,8 @@ fn pending_fixture(seal: bool) -> PendingFixture {
     use fotw_pipeline::replay::{ReplaySource, ReplayWriter};
     use fotwd::failover::coverage::{EngineDescriptor, LocalPlan};
     let root = tempfile::tempdir().unwrap();
-    let mut wal = fotw_pipeline::wal::SessionWal::create(root.path(), 16_000, 1).unwrap();
+    let mut wal =
+        fotw_pipeline::wal::SessionWal::create(root.path().join("sessions"), 16_000, 1).unwrap();
     let dir = wal.dir().to_owned();
     let session = dir.file_name().unwrap().to_str().unwrap().to_owned();
     let pcm: Vec<i16> = (0u32..73 * 16_000)
@@ -916,6 +917,18 @@ async fn local_restart_recovers_only_pending_audio_and_projects_once_without_rep
                 [],
             )
             .unwrap();
+        fotwd::retention::promote_session(
+            &mut db,
+            fixture._root.path(),
+            &fixture.dir,
+            &meeting,
+            fixture.outcome.started_at_ms,
+        )
+        .unwrap();
+        assert!(
+            fixture.dir.exists(),
+            "initial partial projection must retain canonical input"
+        );
         drop(db);
         let original_pcm = std::fs::read(fixture.dir.join("system.pcm")).unwrap();
         let original_canonical = std::fs::read(fixture.dir.join("system.stt16")).unwrap();
@@ -957,11 +970,31 @@ async fn local_restart_recovers_only_pending_audio_and_projects_once_without_rep
         assert_eq!(snapshot.epochs.len(), 2);
         assert_eq!(snapshot.epochs[1].from_sample, fixture.anchor + 10 * 16_000);
         assert_eq!(snapshot.epochs[1].reason, Some(SwitchReason::ResumePending));
+        // Crash after inference, before projection: the filesystem-only
+        // publisher cannot retire these newly recovered words yet.
+        fotw_pipeline::promote::promote(&fixture.dir, fixture._root.path()).unwrap();
+        assert!(fixture.dir.join("system.stt-coverage.jsonl").exists());
+        // A duplicate inference attempt adds no artificial switch or text.
+        let (complete, _events) =
+            FailoverStream::resume_local(&fixture.dir, resume_request(&fixture))
+                .await
+                .unwrap();
+        assert!(complete.finish().await);
+        drop(complete);
         let mut db = fotw_store::Db::open(&database, &key).unwrap();
         assert_eq!(
-            fotwd::persist::persist_session(&mut db, &fixture.outcome, "Ignored retry title")
-                .unwrap(),
-            meeting
+            db.export_meeting(&meeting).unwrap().segments.len(),
+            1,
+            "local inference alone must not masquerade as a committed DB projection"
+        );
+        // Startup projects complete receipts using the saved capture clock,
+        // acknowledges that exact prefix, then may retire the canonical files.
+        for result in fotwd::retention::resume_promotions(&mut db, fixture._root.path()) {
+            result.unwrap();
+        }
+        assert!(
+            !fixture.dir.exists(),
+            "complete, durably projected sources should retire"
         );
         let saved = db.export_meeting(&meeting).unwrap();
         assert_eq!(
@@ -983,13 +1016,8 @@ async fn local_restart_recovers_only_pending_audio_and_projects_once_without_rep
         );
         assert_eq!(saved.segments.len(), finals.len() + 1);
         assert_eq!(saved.speech_epochs.len(), 2);
-        // Another recovery attempt has nothing to infer and adds no fake switch.
-        let (complete, _events) =
-            FailoverStream::resume_local(&fixture.dir, resume_request(&fixture))
-                .await
-                .unwrap();
-        assert!(complete.finish().await);
-        drop(complete);
+        assert_eq!(saved.meeting.duration_ms, Some(73_137));
+        assert!(fotwd::retention::resume_promotions(&mut db, fixture._root.path()).is_empty());
         assert_eq!(
             fotwd::persist::persist_session(&mut db, &fixture.outcome, "Ignored retry").unwrap(),
             meeting

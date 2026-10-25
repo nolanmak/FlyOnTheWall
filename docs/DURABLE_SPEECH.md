@@ -40,9 +40,11 @@ for every acoustic environment. Demotion remains local for the meeting.
 
 Stop syncs and seals the input before bounded drain. An input seal fixes the
 source identity and final sample, and survives restart; it is distinct from proof
-that transcription completed. A separate completion proof permits retirement only
-when the entire aligned canonical stream was accounted for. Promotion can publish
-playable media while retaining incomplete raw/canonical sources.
+that transcription completed. Retirement also requires a separate acknowledgement
+written after the database transaction commits, bound to the exact append-only
+journal prefix. Both canonical and journal owner leases are held across retirement.
+A newer journal record invalidates the acknowledgement. Promotion can publish
+playable media while retaining untranscribed or unprojected raw/canonical sources.
 
 A blocked native inference cannot be forcibly cancelled. Deadline expiry fences
 late output, reports incomplete transcription, and leaves native ownership visible.
@@ -63,7 +65,12 @@ are refusals; audio remains available for recovery. Older source journals withou
 a saved fallback plan remain readable for projection but cannot automatically
 choose a recovery model. Asset resolution/checksum verification belongs to the
 caller; a current app setting is not evidence of the original recording's choice.
-The API does not implement an automatic daemon-startup recovery workflow.
+The API does not implement automatic native inference at daemon startup. Existing
+startup promotion does refresh already committed journal receipts into the database
+using the original saved capture clock before acknowledging and retiring sources.
+This repairs a crash after inference or SQL commit without reopening cloud or
+replacing edits. Recovering an actively recording, unfinalized raw WAL still needs
+the app's capture-clock/recovery orchestration; this source API does not finalize it.
 
 ## Library projection and exports
 

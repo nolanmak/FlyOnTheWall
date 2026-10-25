@@ -37,6 +37,29 @@ pub enum ReplaySource {
 }
 
 impl ReplaySource {
+    fn projected_path(self, dir: &Path) -> PathBuf {
+        dir.join(match self {
+            Self::System => "system.stt-projected.json",
+            Self::Mic => "mic.stt-projected.json",
+        })
+    }
+    fn coverage_path(self, dir: &Path) -> PathBuf {
+        dir.join(match self {
+            Self::System => "system.stt-coverage.jsonl",
+            Self::Mic => "mic.stt-coverage.jsonl",
+        })
+    }
+    fn lock_coverage(self, dir: &Path) -> io::Result<OwnerLock> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.coverage_path(dir).with_extension("jsonl.lock"))?;
+        file.try_lock().map_err(io::Error::from)?;
+        Ok(OwnerLock(file))
+    }
+
     fn sealed_path(self, dir: &Path) -> PathBuf {
         dir.join(match self {
             Self::System => "system.stt-sealed.json",
@@ -102,6 +125,51 @@ struct Completion {
     through_sample: u64,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectionProof {
+    boundary: Completion,
+    journal_bytes: u64,
+}
+
+fn write_marker<T: Serialize>(dir: &Path, path: PathBuf, marker: &T) -> io::Result<()> {
+    let temporary = path.with_extension(format!(
+        "part-{}-{}",
+        std::process::id(),
+        NEXT_COMPLETION.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(&serde_json::to_vec(marker)?)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, &path)?;
+        sync_directory(dir)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
+
+fn read_marker<T: serde::de::DeserializeOwned>(path: PathBuf) -> io::Result<Option<T>> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_HEADER_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_HEADER_BYTES {
+        return Err(invalid("replay boundary proof exceeds size limit"));
+    }
+    Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
 fn sync_directory(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     File::open(dir)?.sync_all()?;
@@ -133,11 +201,17 @@ pub(crate) fn retirement_guard(
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
             Err(error) => return Err(error),
         };
+        let journal_owner = match source.lock_coverage(dir) {
+            Ok(owner) => owner,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let reader = ReplayReader::open(dir, session_id, source)?;
-        if !reader.is_complete()? {
+        if !reader.is_complete()? || !reader.is_projected()? {
             return Ok(None);
         }
         owners.push(owner);
+        owners.push(journal_owner);
     }
     Ok(Some(ReplayRetirementGuard { _owners: owners }))
 }
@@ -274,17 +348,22 @@ impl ReplayWriter {
             .ok_or_else(|| invalid("replay sample clock overflow"))?;
         // Invalidate before accepting any new audio. A stale completion must
         // never authorize retirement of an extended stream, including after a crash.
-        match std::fs::remove_file(self.source.completion_path(&self.dir)) {
-            Ok(()) => {
-                if let Err(error) = sync_directory(&self.dir) {
+        for proof in [
+            self.source.completion_path(&self.dir),
+            self.source.projected_path(&self.dir),
+        ] {
+            match std::fs::remove_file(proof) {
+                Ok(()) => {
+                    if let Err(error) = sync_directory(&self.dir) {
+                        self.failed = true;
+                        return Err(error);
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
                     self.failed = true;
                     return Err(error);
                 }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                self.failed = true;
-                return Err(error);
             }
         }
         let mut bytes = [0u8; 2048];
@@ -402,6 +481,14 @@ impl ReplayReader {
         self.header.first_sample
     }
 
+    /// Current aligned saved end, without implying completed inference.
+    pub fn saved_end(&self) -> io::Result<u64> {
+        if !self.aligned()? {
+            return Err(invalid("replay ends in a torn sample"));
+        }
+        self.available_end()
+    }
+
     /// Persist completion only after input is frozen and inference has durably
     /// accounted for every saved sample. Partial coverage and torn samples are
     /// refused. The caller establishes inference coverage; this verifies audio.
@@ -428,39 +515,68 @@ impl ReplayReader {
     }
 
     fn write_boundary(&mut self, through_sample: u64, path: PathBuf) -> io::Result<()> {
+        let boundary = self.boundary(through_sample)?;
+        write_marker(&self.dir, path, &boundary)
+    }
+
+    fn boundary(&mut self, through_sample: u64) -> io::Result<Completion> {
         if !self.aligned()? || through_sample != self.available_end()? {
             return Err(invalid(
                 "completion must cover the entire aligned replay stream",
             ));
         }
         self.sync_through(through_sample)?;
-        let completion = Completion {
+        Ok(Completion {
             schema: 1,
             session_id: self.header.session_id.clone(),
             source: self.header.source,
             first_sample: self.first_sample(),
             through_sample,
-        };
-        let temporary = path.with_extension(format!(
-            "part-{}-{}",
-            std::process::id(),
-            NEXT_COMPLETION.fetch_add(1, Ordering::Relaxed)
-        ));
-        let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?;
-            file.write_all(&serde_json::to_vec(&completion)?)?;
-            file.sync_all()?;
-            drop(file);
-            std::fs::rename(&temporary, &path)?;
-            sync_directory(&self.dir)
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(temporary);
+        })
+    }
+
+    /// Acknowledge an already committed database projection of the complete
+    /// source and this exact append-only journal prefix. Call only after the
+    /// library transaction succeeds; growing journals invalidate the proof.
+    pub fn mark_projected(&mut self, through_sample: u64, journal_bytes: u64) -> io::Result<()> {
+        if !self.is_complete()? {
+            return Err(invalid("inference is not complete"));
         }
-        result
+        let journal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.header.source.coverage_path(&self.dir))?;
+        if !journal.metadata()?.is_file() || journal.metadata()?.len() != journal_bytes {
+            return Err(invalid("projection does not cover the current journal"));
+        }
+        journal.sync_data()?;
+        let proof = ProjectionProof {
+            boundary: self.boundary(through_sample)?,
+            journal_bytes,
+        };
+        write_marker(
+            &self.dir,
+            self.header.source.projected_path(&self.dir),
+            &proof,
+        )
+    }
+
+    /// Whether inference and the current journal were durably projected.
+    /// Retirement separately acquires both canonical and journal owner leases.
+    pub fn is_projected(&self) -> io::Result<bool> {
+        if !self.is_complete()? {
+            return Ok(false);
+        }
+        let Some(proof): Option<ProjectionProof> =
+            read_marker(self.header.source.projected_path(&self.dir))?
+        else {
+            return Ok(false);
+        };
+        if proof.boundary.schema != 1 || !self.matches_boundary(&proof.boundary)? {
+            return Ok(false);
+        }
+        let journal = File::open(self.header.source.coverage_path(&self.dir))?;
+        Ok(journal.metadata()?.is_file() && journal.metadata()?.len() == proof.journal_bytes)
     }
 
     /// Whether a bounded, valid proof matches this source's current saved end.
@@ -474,18 +590,9 @@ impl ReplayReader {
     }
 
     fn read_boundary(&self, path: PathBuf) -> io::Result<Option<Completion>> {
-        let file = match File::open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
+        let Some(boundary): Option<Completion> = read_marker(path)? else {
+            return Ok(None);
         };
-        let mut bytes = Vec::new();
-        file.take(MAX_HEADER_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > MAX_HEADER_BYTES {
-            return Err(invalid("replay boundary proof exceeds size limit"));
-        }
-        let boundary: Completion = serde_json::from_slice(&bytes)?;
         if boundary.schema != 1 {
             return Err(invalid("unsupported replay boundary proof"));
         }
