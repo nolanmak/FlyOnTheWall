@@ -292,6 +292,16 @@ impl ReferenceBuffer {
                 .frame
                 .checked_sub((self.taps / 2 - 1) as u64)
                 .ok_or(Error::MissingReference)?;
+            let right = left
+                .checked_add(self.taps as u64 - 1)
+                .ok_or(Error::Positions)?;
+            // Every filter tap must belong to the qualified clock interval,
+            // including when its center has already crossed a recovery fence.
+            if request.render.host_at_frame(left).is_none()
+                || request.render.host_at_frame(right).is_none()
+            {
+                return Err(Error::Clock);
+            }
             let index = left
                 .checked_sub(self.start)
                 .and_then(|v| usize::try_from(v).ok())

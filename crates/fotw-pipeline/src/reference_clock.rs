@@ -42,12 +42,13 @@ pub struct Estimate {
     intercept: f64,
     last_frame: u64,
     latest_host: u64,
+    trusted_from_frame: u64,
 }
 impl Estimate {
     /// Map an accepted mono frame into (integer host epoch ns, relative seconds).
     /// Keeping the epoch separate avoids losing precision at large host counters.
     pub fn host_at_frame(&self, frame: u64) -> Option<(u64, f64)> {
-        if frame < self.origin_frame || frame > self.last_frame {
+        if frame < self.trusted_from_frame || frame > self.last_frame {
             return None;
         }
         Some((
@@ -88,8 +89,12 @@ impl Estimate {
         } else {
             delta
         };
+        let frame = self.origin_frame.checked_add(delta.floor() as u64)?;
+        if frame < self.trusted_from_frame {
+            return None;
+        }
         Some(Position {
-            frame: self.origin_frame.checked_add(delta.floor() as u64)?,
+            frame,
             fraction: delta.fract(),
         })
     }
@@ -105,8 +110,19 @@ pub struct Tracker {
     last: Option<CaptureObservation>,
     points: VecDeque<CaptureObservation>,
     fit: Option<Estimate>,
+    timestamp_recovery: bool,
+    pending_timestamp: Option<(CaptureObservation, CaptureObservation)>,
+    trusted_from: Option<u64>,
 }
 impl Tracker {
+    /// Experimental isolated-timestamp recovery; ordinary `new` stays strict.
+    /// A fault remains unqualified until a fresh contiguous native timestamp
+    /// agrees with prior calibration, without mapping any pre-fault frames.
+    pub fn with_timestamp_recovery(nominal: u32, channels: u16) -> Result<Self, Rejection> {
+        let mut tracker = Self::new(nominal, channels)?;
+        tracker.timestamp_recovery = true;
+        Ok(tracker)
+    }
     /// Number of retained observations, always bounded by 64.
     pub fn retained_observations(&self) -> usize {
         self.points.len()
@@ -124,6 +140,9 @@ impl Tracker {
             last: None,
             points: VecDeque::with_capacity(64),
             fit: None,
+            timestamp_recovery: false,
+            pending_timestamp: None,
+            trusted_from: None,
         })
     }
     /// Admit coherent latest-value evidence. Repeated snapshots do not extend
@@ -149,6 +168,29 @@ impl Tracker {
             self.clear();
             return Err(Rejection::Stale);
         }
+        let mut revalidated = false;
+        if let Some((before, fault)) = self.pending_timestamp {
+            if o == fault {
+                return Err(Rejection::Fault);
+            }
+            if o.flags & !1 != 0
+                || o.timing_faults != fault.timing_faults
+                || o.dropped_samples != fault.dropped_samples
+                || !self.contiguous(fault, o)
+                || o.host_ns
+                    .checked_sub(before.host_ns)
+                    .is_none_or(|age| age > 100_000_000)
+            {
+                self.clear();
+                return Err(Rejection::Fault);
+            }
+            // Keep only the pre-fault calibration points. The flagged timestamp
+            // never enters the regression; a fresh good point must still pass
+            // the ordinary rate/residual gates below. Lookup starts after fault.
+            self.pending_timestamp = None;
+            self.trusted_from = Some(o.sample_start / u64::from(self.channels));
+            revalidated = true;
+        }
         if let Some(last) = self.last {
             if o.sequence < last.sequence {
                 return Err(Rejection::Superseded);
@@ -160,7 +202,21 @@ impl Tracker {
                 self.clear();
                 return Err(Rejection::Positions);
             }
-            if o.timing_faults != last.timing_faults || o.dropped_samples != last.dropped_samples {
+            if self.timestamp_recovery
+                && !revalidated
+                && self.fit.is_some_and(|fit| fit.is_fresh(now_ns))
+                && o.flags & !1 == 4
+                && last.timing_faults.checked_add(1) == Some(o.timing_faults)
+                && last.dropped_samples == o.dropped_samples
+                && self.contiguous(last, o)
+            {
+                self.pending_timestamp = Some((last, o));
+                self.fit = None;
+                return Err(Rejection::Fault);
+            }
+            if (!revalidated && o.timing_faults != last.timing_faults)
+                || o.dropped_samples != last.dropped_samples
+            {
                 self.clear();
                 return Err(Rejection::Fault);
             }
@@ -262,6 +318,7 @@ impl Tracker {
             intercept,
             last_frame: o.sample_start / channels + o.sample_count as u64 / channels - 1,
             latest_host: o.host_ns,
+            trusted_from_frame: self.trusted_from.unwrap_or(origin).max(origin),
         };
         self.fit = Some(fit);
         Ok(Some(fit))
@@ -270,5 +327,25 @@ impl Tracker {
         self.last = None;
         self.points.clear();
         self.fit = None;
+        self.pending_timestamp = None;
+        self.trusted_from = None;
+    }
+    fn contiguous(&self, before: CaptureObservation, after: CaptureObservation) -> bool {
+        let channels = u64::from(self.channels);
+        before.sequence.checked_add(1) == Some(after.sequence)
+            && before.sample_start.checked_add(before.sample_count as u64)
+                == Some(after.sample_start)
+            && before
+                .device_frames
+                .checked_add(before.sample_count as u64 / channels)
+                == Some(after.device_frames)
+            && after.sample_count > 0
+            && after.sample_count as u64 <= u64::from(self.nominal) * channels
+            && after.sample_start.is_multiple_of(channels)
+            && (after.sample_count as u64).is_multiple_of(channels)
+            && after
+                .sample_start
+                .checked_add(after.sample_count as u64)
+                .is_some()
     }
 }

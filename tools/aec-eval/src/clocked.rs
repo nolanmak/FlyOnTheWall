@@ -86,7 +86,7 @@ fn run_clocked(
     render_trace: &[CaptureObservation],
     mic_trace: &[CaptureObservation],
 ) -> (Vec<f32>, serde_json::Value) {
-    run_with_reference(far, mic, render_trace, mic_trace, false)
+    run_with_reference(far, mic, render_trace, mic_trace, false, false)
 }
 
 fn run_with_reference(
@@ -95,6 +95,7 @@ fn run_with_reference(
     render_trace: &[CaptureObservation],
     mic_trace: &[CaptureObservation],
     bandlimited: bool,
+    timestamp_recovery: bool,
 ) -> (Vec<f32>, serde_json::Value) {
     let reference_config = ReferenceConfig {
         render_rate_hz: RATE as u32,
@@ -112,8 +113,15 @@ fn run_with_reference(
     let mut history = bandlimited.then(|| ReferenceBuffer::new(reference_config).unwrap());
     let (mut loaded, mut max_retained) = (0, 0);
     let mut epoch = 1;
-    let mut render_clock = Tracker::new(RATE as u32, 1).unwrap();
-    let mut mic_clock = Tracker::new(RATE as u32, 1).unwrap();
+    let tracker = || {
+        if timestamp_recovery {
+            Tracker::with_timestamp_recovery(RATE as u32, 1).unwrap()
+        } else {
+            Tracker::new(RATE as u32, 1).unwrap()
+        }
+    };
+    let mut render_clock = tracker();
+    let mut mic_clock = tracker();
     assert_eq!(far.len(), mic.len());
     assert!(mic.len().is_multiple_of(FRAME));
     assert_eq!(render_trace.len(), mic.len() / FRAME);
@@ -244,7 +252,7 @@ fn run_with_reference(
         "missing_reference_frames":bypass,"raw_passthrough_samples":stats.raw_samples,"processed_samples":stats.cleaned_samples,
         "backend_failures":stats.backend_failures,"backend_tail_drained":true,"callback_adapter":true,
         "observation_lead_ms":80,"minimum_acquisition_delivery_ms":20,"linear_interpolation_evaluation_only":!bandlimited,
-        "bandlimited_reference":bandlimited,"maximum_retained_native_reference_frames":max_retained,"reference_history_resets":epoch-1}),
+        "bandlimited_reference":bandlimited,"isolated_timestamp_recovery":timestamp_recovery,"maximum_retained_native_reference_frames":max_retained,"reference_history_resets":epoch-1}),
     )
 }
 
@@ -276,6 +284,7 @@ fn probe_with_reference(bandlimited: bool) -> serde_json::Value {
         ];
         if bandlimited {
             backends.push("native-webrtc-2.1.0-bandlimited-eval");
+            backends.push("native-webrtc-2.1.0-recovery-eval");
         }
         for backend in backends {
             let mut lag = 0;
@@ -292,8 +301,10 @@ fn probe_with_reference(bandlimited: bool) -> serde_json::Value {
                 let start = Instant::now();
                 let (out, clocks) = if backend == "passthrough" {
                     (mic.clone(), serde_json::Value::Null)
+                } else if backend.ends_with("recovery-eval") {
+                    run_with_reference(render, &mic, &r, &m, true, true)
                 } else if backend.ends_with("bandlimited-eval") {
-                    run_with_reference(render, &mic, &r, &m, true)
+                    run_with_reference(render, &mic, &r, &m, true, false)
                 } else if backend.ends_with("clocked-eval") {
                     run_clocked(render, &mic, &r, &m)
                 } else {
@@ -416,6 +427,24 @@ mod tests {
             assert_eq!(row["phase_gate_pass"], true);
         }
         for f in report["fixtures"].as_array().unwrap() {
+            let recovery = f["signal_qualification"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|q| q["backend"] == "native-webrtc-2.1.0-recovery-eval")
+                .unwrap();
+            assert_eq!(recovery["app_backend_selected"], false);
+            assert_eq!(recovery["near_only"], true);
+            assert_eq!(recovery["echo_reduction"], true);
+            assert_eq!(
+                recovery["signal_gates_pass"],
+                f["injected_timing_fault"] == false,
+                "isolated clock recovery does not qualify post-reset overlap"
+            );
+            if f["injected_timing_fault"] == true {
+                assert_eq!(recovery["overlap_gain"], false);
+                assert_eq!(recovery["overlap_snr"], false);
+            }
             let q = f["signal_qualification"]
                 .as_array()
                 .unwrap()
@@ -455,8 +484,14 @@ mod tests {
     fn bandlimited_history_fences_faults_and_retains_the_original_near_clock() {
         let near = signal(501);
         let zero = vec![0.0; SAMPLES];
-        let (out, stats) =
-            run_with_reference(&zero, &near, &trace(80.0, true), &trace(0.0, false), true);
+        let (out, stats) = run_with_reference(
+            &zero,
+            &near,
+            &trace(80.0, true),
+            &trace(0.0, false),
+            true,
+            false,
+        );
         assert_eq!(stats["reference_history_resets"], 1);
         assert!(
             stats["maximum_retained_native_reference_frames"]

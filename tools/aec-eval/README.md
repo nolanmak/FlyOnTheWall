@@ -419,6 +419,29 @@ measurements, not isolated backend/app costs.
 The shared ArchiveConverter accessor reports existing phase; it does not shift
 stored audio or change the existing reconstruction recipe. An eventual AEC
 integration needs its own persisted processing/clock provenance and cannot reuse
-the plain raw-to-canonical recipe for cleaned output. Production scheduling,
-late-output fencing, source archival, speech retention and physical/room evidence
-remain unfinished; no app backend is selected.
+the plain raw-to-canonical recipe for cleaned output. The recording path now has
+an explicit optional processing worker with bounded scheduling, late-output
+fencing, source archival and durable processing provenance. Its integration tests
+use an injected processor; they do not qualify this native backend. Native
+speech retention and physical/room evidence remain unfinished; no app backend
+is selected.
+
+## Isolated timestamp recovery experiment
+
+The bandlimited probe also compares `native-webrtc-2.1.0-recovery-eval`.
+It opts into `Tracker::with_timestamp_recovery`; recording continues to use the
+strict default tracker. Only a single observed timestamp-error callback between
+contiguous callbacks can retain prior fresh calibration. The next timestamp must
+pass the existing rate/residual limits, with unchanged drop counters. Repeated
+faults, skipped callbacks, changed device counters, stale evidence, or a new
+generation require ordinary reacquisition. Neither the faulty callback nor any
+pre-recovery frame can be mapped. Every reference filter tap must lie within the
+qualified interval, and a rejected request leaves caller output unchanged.
+
+The [recovery report](results/m4-isolated-timestamp-recovery.json) retains strict
+controls and unchanged quality gates. In the timing-fault fixture, missing
+reference frames fall from 404 to 212 and echo-only reduction improves from
+12.22 to 17.63 dB. However, double-talk gain worsens from -1.31 to -2.30 dB and
+SNR from 5.68 to 3.75 dB (raw: 4.24 dB). Aggregate acceptance remains false.
+Faster clock recovery alone does not solve native filter relearning during
+overlapping speech. This experiment does not enable or select an app backend.
