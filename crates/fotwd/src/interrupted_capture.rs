@@ -60,6 +60,7 @@ fn retained_sources(dir: &Path, session: &str) -> io::Result<Vec<RetainedLease>>
             "stt-complete.json",
             "stt-projected.json",
             "stt-prefix-projected.json",
+            "stt-processing.jsonl",
         ] {
             optional_ordinary(&dir.join(format!("{name}.{suffix}")))?;
         }
@@ -76,7 +77,8 @@ fn retained_sources(dir: &Path, session: &str) -> io::Result<Vec<RetainedLease>>
             leases.push(RetainedLease(file));
         }
         if present(&dir.join(format!("{name}.stt16")))? {
-            let reader = ReplayReader::open(dir, session, replay)?;
+            let mut reader = ReplayReader::open(dir, session, replay)?;
+            crate::failover::processing::validate(dir, session, replay, &mut reader)?;
             // The complete prefix can validate committed receipts even when
             // the last write left half a sample. Indexing never repairs it or
             // claims a final replay boundary.
@@ -254,7 +256,11 @@ pub(crate) fn prepare(dir: &Path, stop: &AtomicBool) -> io::Result<Option<Stoppe
         if stop.load(Ordering::Acquire) {
             return Err(io::ErrorKind::Interrupted.into());
         }
-        let writer = ReplayWriter::resume(dir, &proof.checkpoint.session_id, boundary.replay)?;
+        let session = &proof.checkpoint.session_id;
+        let replay = boundary.replay;
+        let writer = ReplayWriter::resume_validated(dir, session, replay, |reader| {
+            crate::failover::processing::validate(dir, session, replay, reader).map(|_| ())
+        })?;
         let journal = CoverageJournal::open(dir, &proof.checkpoint.session_id, boundary.source)?;
         if writer.end_sample() != boundary.end || journal.committed_through() > boundary.end {
             return Err(invalid("source changed during recovery admission"));
@@ -335,4 +341,93 @@ fn verify_stopped_snapshot(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod processing_tests {
+    use super::*;
+    use crate::failover::{
+        coverage::EngineDescriptor,
+        processing::{Descriptor, Journal},
+    };
+    use fotw_pipeline::{aec::OutputKind, wal::SessionWal};
+
+    #[test]
+    fn frozen_processing_evidence_is_validated_before_any_seal_is_written() {
+        for fault in ["missing", "changed", "valid"] {
+            let root = tempfile::tempdir().unwrap();
+            let mut wal = SessionWal::create(root.path(), 16000, 1).unwrap();
+            let dir = wal.dir().to_path_buf();
+            let session = wal.manifest().id.clone();
+            wal.write_system(&[0.25; 160]).unwrap();
+            wal.checkpoint_capture(10, true).unwrap();
+            drop(wal);
+            let descriptor = Descriptor {
+                backend: "fixture-aec".into(),
+                version: "1.0".into(),
+                profile: "profile-v1".into(),
+            };
+            let mut audio = ReplayWriter::create_with_processing(
+                &dir,
+                &session,
+                ReplaySource::System,
+                0,
+                &descriptor.fingerprint().unwrap(),
+            )
+            .unwrap();
+            let mut processing =
+                Journal::create(&dir, &session, ReplaySource::System, 0, descriptor).unwrap();
+            processing
+                .record(1, 0, OutputKind::Cleaned, &[2000; 160])
+                .unwrap();
+            processing.sync().unwrap();
+            audio.append(&[2000; 160]).unwrap();
+            audio.sync().unwrap();
+            drop(audio);
+            drop(processing);
+            let mut coverage = CoverageJournal::create(
+                &dir,
+                &session,
+                Source::System,
+                EngineDescriptor {
+                    provider: "deepgram".into(),
+                    model: "nova-3".into(),
+                    revision: None,
+                    capabilities: fotw_stt::SttCapabilities::deepgram(),
+                },
+            )
+            .unwrap();
+            coverage.commit(0, 0, 160, vec![]).unwrap();
+            drop(coverage);
+            let sidecar = dir.join("system.stt-processing.jsonl");
+            match fault {
+                "missing" => std::fs::remove_file(&sidecar).unwrap(),
+                "changed" => std::fs::write(&sidecar, b"corrupt evidence\n").unwrap(),
+                _ => {}
+            }
+            let audio_before = std::fs::read(dir.join("system.stt16")).unwrap();
+            let coverage_before = std::fs::read(dir.join("system.stt-coverage.jsonl")).unwrap();
+            let evidence_before = std::fs::read(&sidecar).ok();
+            let result = prepare(&dir, &AtomicBool::new(false));
+            if fault == "valid" {
+                assert!(result.unwrap().is_some());
+                assert!(dir.join("system.stt-sealed.json").exists());
+            } else {
+                assert!(
+                    result.is_err(),
+                    "{fault} processing evidence was admitted for frozen capture"
+                );
+                assert!(!dir.join("system.stt-sealed.json").exists());
+            }
+            assert_eq!(
+                std::fs::read(dir.join("system.stt16")).unwrap(),
+                audio_before
+            );
+            assert_eq!(
+                std::fs::read(dir.join("system.stt-coverage.jsonl")).unwrap(),
+                coverage_before
+            );
+            assert_eq!(std::fs::read(sidecar).ok(), evidence_before);
+        }
+    }
 }

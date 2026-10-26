@@ -32,7 +32,8 @@ pub trait Backend {
     fn reset(&mut self) -> Result<(), Self::Error>;
 }
 /// Why original microphone samples were passed through.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BypassReason {
     /// A usable, aligned reference did not arrive within the retained budget.
     MissingReference,
@@ -48,7 +49,8 @@ pub enum BypassReason {
     WorkerCancelled,
 }
 /// Provenance of one output interval.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "reason", rename_all = "snake_case")]
 pub enum OutputKind {
     /// Successfully processed and delay-compensated samples.
     Cleaned,

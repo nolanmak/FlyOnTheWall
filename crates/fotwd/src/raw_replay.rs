@@ -18,6 +18,57 @@ const RECIPE: &str = "wal-i16-archive-converter-rubato5-v1";
 #[cfg(test)]
 mod compatibility {
     #[test]
+    fn processed_header_without_its_sidecar_still_refuses_a_raw_recipe() {
+        use fotw_pipeline::{
+            replay::{ReplaySource, ReplayWriter},
+            wal::TrackFormat,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let _audio = ReplayWriter::create_with_processing(
+            dir.path(),
+            "fixture",
+            ReplaySource::Mic,
+            0,
+            &"0".repeat(64),
+        )
+        .unwrap();
+        assert!(
+            super::save_plan(
+                dir.path(),
+                "fixture",
+                ReplaySource::Mic,
+                TrackFormat::new(16000, 1)
+            )
+            .is_err()
+        );
+        assert!(!dir.path().join("mic.stt-raw-plan.json").exists());
+    }
+    #[test]
+    fn processed_declarations_cannot_acquire_a_raw_reconstruction_recipe() {
+        use fotw_pipeline::{
+            replay::{ReplaySource, ReplayWriter},
+            wal::TrackFormat,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let _audio = ReplayWriter::create(dir.path(), "fixture", ReplaySource::Mic, 0).unwrap();
+        std::fs::write(
+            dir.path().join("mic.stt-processing.jsonl"),
+            b"incomplete declaration",
+        )
+        .unwrap();
+        assert!(
+            super::save_plan(
+                dir.path(),
+                "fixture",
+                ReplaySource::Mic,
+                TrackFormat::new(16000, 1)
+            )
+            .is_err(),
+            "even invalid processing evidence must prevent an ordinary raw recipe"
+        );
+        assert!(!dir.path().join("mic.stt-raw-plan.json").exists());
+    }
+    #[test]
     fn processing_dependency_changes_require_an_explicit_recipe_compatibility_review() {
         let lock = include_str!("../../../Cargo.lock");
         let dependency = lock
@@ -95,7 +146,17 @@ pub(crate) fn save_plan(
     source: ReplaySource,
     format: TrackFormat,
 ) -> io::Result<()> {
+    if crate::failover::processing::present(dir, source)? {
+        return Err(invalid(
+            "processed input cannot use a raw reconstruction recipe",
+        ));
+    }
     let reader = ReplayReader::open(dir, session, source)?;
+    if reader.processing_id().is_some() {
+        return Err(invalid(
+            "processed canonical input cannot acquire a raw reconstruction recipe",
+        ));
+    }
     let plan = Plan {
         recipe: RECIPE.into(),
         session_id: session.into(),
@@ -136,6 +197,20 @@ struct Candidate {
 /// Called only while the original capture lease is held. Preflight every
 /// source and candidate before appending any missing samples.
 pub(crate) fn repair(dir: &Path, proof: &CaptureSnapshot, stop: &AtomicBool) -> io::Result<()> {
+    for source in [ReplaySource::System, ReplaySource::Mic] {
+        if crate::failover::processing::present(dir, source)? {
+            match std::fs::symlink_metadata(dir.join(format!("{}.stt-raw-plan.json", name(source))))
+            {
+                Ok(_) => {
+                    return Err(invalid(
+                        "processed input conflicts with a raw reconstruction recipe",
+                    ));
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
     if !["system", "mic"]
         .iter()
         .any(|n| dir.join(format!("{n}.stt-raw-plan.json")).exists())
@@ -197,7 +272,9 @@ pub(crate) fn repair(dir: &Path, proof: &CaptureSnapshot, stop: &AtomicBool) -> 
             let writer = ReconstructionOwner::reserve(dir, session, source, plan.first_sample)?;
             writers.push((source, plan, writer));
         } else if dir.join(format!("{prefix}.stt16")).exists() {
-            let writer = ReplayWriter::resume_prefix(dir, session, source)?;
+            let writer = ReplayWriter::resume_prefix_validated(dir, session, source, |reader| {
+                crate::failover::processing::validate(dir, session, source, reader).map(|_| ())
+            })?;
             let stt = match source {
                 ReplaySource::System => fotw_stt::Source::System,
                 ReplaySource::Mic => fotw_stt::Source::Mic,
