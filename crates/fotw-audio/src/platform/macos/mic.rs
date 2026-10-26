@@ -19,11 +19,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 use cidre::{blocks, cat, core_audio::System, dispatch};
 
 use super::capture_assets::NativeAssets;
+use super::capture_clock::CaptureSink;
 use super::capture_lifecycle::{CaptureOwner, Failure};
 use crate::clock;
 use crate::error::TapError;
 use crate::format::{SampleFormat, StreamFormat};
-use crate::frames::{CaptureTimestamp, FrameFlags, FrameSink};
+#[cfg(any(test, feature = "conformance"))]
+use crate::frames::CaptureTimestamp;
+use crate::frames::{FrameFlags, FrameSink};
 use crate::ids::TapId;
 
 /// Read-only input metadata. This is not proof of permission or live audio.
@@ -156,7 +159,7 @@ mod snapshot_tests {
 }
 
 struct IoState {
-    sink: Mutex<Option<Box<dyn FrameSink>>>,
+    sink: Mutex<Option<CaptureSink>>,
     device_frames: AtomicU64,
 }
 
@@ -223,7 +226,7 @@ impl MicTap {
                 .state
                 .sink
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner) = Some(sink);
+                .unwrap_or_else(PoisonError::into_inner) = Some(CaptureSink::new(sink));
             let queue = dispatch::Queue::serial_with_ar_pool();
             let state = self.state.clone();
             let observed = changed.clone();
@@ -231,10 +234,10 @@ impl MicTap {
             let block = blocks::EscBlock::new5(
                 move |_now: &cat::AudioTimeStamp,
                       input: &cat::AudioBufList<1>,
-                      _input_time: &cat::AudioTimeStamp,
+                      input_time: &cat::AudioTimeStamp,
                       _output: &mut cat::AudioBufList<1>,
                       _output_time: &cat::AudioTimeStamp| {
-                    on_io(&state, input, channels, &observed);
+                    on_io(&state, input, channels, input_time, &observed);
                 },
             );
             assets.set_callback(block, queue);
@@ -252,7 +255,13 @@ impl MicTap {
     }
 }
 
-fn on_io(state: &IoState, input: &cat::AudioBufList<1>, channels: u64, changed: &AtomicBool) {
+fn on_io(
+    state: &IoState,
+    input: &cat::AudioBufList<1>,
+    channels: u64,
+    input_time: &cat::AudioTimeStamp,
+    changed: &AtomicBool,
+) {
     let Ok(mut guard) = state.sink.try_lock() else {
         return;
     };
@@ -290,7 +299,7 @@ fn on_io(state: &IoState, input: &cat::AudioBufList<1>, channels: u64, changed: 
     let mut flags = FrameFlags::empty();
     flags.set(FrameFlags::SILENT, pcm.iter().all(|s| *s == 0.0));
 
-    sink.on_frames(pcm, CaptureTimestamp::new(before, clock::host_ns()), flags);
+    sink.on_input(pcm, input_time, before, frames, flags);
 }
 
 impl Drop for MicTap {
@@ -434,10 +443,10 @@ pub(super) fn input_format_contract() {
     let samples = Arc::new(AtomicUsize::new(0));
     let errors = Arc::new(AtomicUsize::new(0));
     let state = IoState {
-        sink: Mutex::new(Some(Box::new(Counters {
+        sink: Mutex::new(Some(CaptureSink::new(Box::new(Counters {
             samples: samples.clone(),
             errors: errors.clone(),
-        }))),
+        })))),
         device_frames: AtomicU64::new(0),
     };
     let mut pcm = [0.25_f32, -0.25];
@@ -449,10 +458,10 @@ pub(super) fn input_format_contract() {
             data: pcm.as_mut_ptr().cast(),
         }],
     };
-    on_io(&state, &input, 1, &changed);
+    on_io(&state, &input, 1, &cat::AudioTimeStamp::invalid(), &changed);
     assert_eq!(samples.load(Ordering::Acquire), 2);
     watch.notify_for_conformance();
-    on_io(&state, &input, 1, &changed);
+    on_io(&state, &input, 1, &cat::AudioTimeStamp::invalid(), &changed);
     assert_eq!(
         samples.load(Ordering::Acquire),
         2,
@@ -575,7 +584,7 @@ mod format_tests {
     fn rate_invalidation_rejects_an_unchanged_buffer_layout_before_advancing_the_clock() {
         let seen = Arc::new(Mutex::new(Observed::default()));
         let state = IoState {
-            sink: Mutex::new(Some(Box::new(FixtureSink(seen.clone())))),
+            sink: Mutex::new(Some(CaptureSink::new(Box::new(FixtureSink(seen.clone()))))),
             device_frames: AtomicU64::new(0),
         };
         let mut pcm = [0.25_f32, -0.25];
@@ -587,7 +596,13 @@ mod format_tests {
                 data: pcm.as_mut_ptr().cast(),
             }],
         };
-        on_io(&state, &input, 1, &AtomicBool::new(true));
+        on_io(
+            &state,
+            &input,
+            1,
+            &cat::AudioTimeStamp::invalid(),
+            &AtomicBool::new(true),
+        );
         assert!(
             seen.lock().unwrap().samples.is_empty(),
             "changed rate must not be delivered using stale ASBD"
@@ -596,10 +611,37 @@ mod format_tests {
         assert_eq!(seen.lock().unwrap().format_errors, 1);
     }
     #[test]
+    fn missing_native_time_is_flagged_without_losing_input_audio() {
+        let seen = Arc::new(Mutex::new(Observed::default()));
+        let state = IoState {
+            sink: Mutex::new(Some(CaptureSink::new(Box::new(FixtureSink(seen.clone()))))),
+            device_frames: AtomicU64::new(0),
+        };
+        let mut pcm = [0.25_f32, -0.25];
+        let input = cat::AudioBufList {
+            number_buffers: 1,
+            buffers: [cat::AudioBuf {
+                number_channels: 1,
+                data_bytes_size: 8,
+                data: pcm.as_mut_ptr().cast(),
+            }],
+        };
+        on_io(
+            &state,
+            &input,
+            1,
+            &cat::AudioTimeStamp::invalid(),
+            &AtomicBool::new(false),
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.samples, pcm);
+        assert!(seen.flags[0].contains(FrameFlags::TIMESTAMP_ERROR));
+    }
+    #[test]
     fn changed_channel_layout_is_not_delivered_under_the_old_format() {
         let seen = Arc::new(Mutex::new(Observed::default()));
         let state = IoState {
-            sink: Mutex::new(Some(Box::new(FixtureSink(seen.clone())))),
+            sink: Mutex::new(Some(CaptureSink::new(Box::new(FixtureSink(seen.clone()))))),
             device_frames: AtomicU64::new(0),
         };
         let mut pcm = [0.25_f32, -0.25, 0.5, -0.5];
@@ -611,10 +653,22 @@ mod format_tests {
                 data: pcm.as_mut_ptr().cast(),
             }],
         };
-        on_io(&state, &input, 2, &AtomicBool::new(false));
+        on_io(
+            &state,
+            &input,
+            2,
+            &cat::AudioTimeStamp::invalid(),
+            &AtomicBool::new(false),
+        );
         assert_eq!(state.device_frames.load(Ordering::Acquire), 2);
         input.buffers[0].number_channels = 1;
-        on_io(&state, &input, 2, &AtomicBool::new(false));
+        on_io(
+            &state,
+            &input,
+            2,
+            &cat::AudioTimeStamp::invalid(),
+            &AtomicBool::new(false),
+        );
         let seen = seen.lock().unwrap();
         assert_eq!(
             seen.samples, pcm,

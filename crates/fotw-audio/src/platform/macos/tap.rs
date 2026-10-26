@@ -37,16 +37,17 @@ use cidre::{
 };
 
 use super::capture_assets::NativeAssets;
+use super::capture_clock::CaptureSink;
 use super::capture_lifecycle::{CaptureOwner, Failure};
 use crate::clock;
 use crate::error::TapError;
 use crate::format::{SampleFormat, StreamFormat};
-use crate::frames::{CaptureTimestamp, FrameFlags, FrameSink};
+use crate::frames::{FrameFlags, FrameSink};
 use crate::ids::{AppRef, TapId};
 
 /// Everything the IOProc block needs, allocated before the tap starts.
 struct IoState {
-    sink: Mutex<Option<Box<dyn FrameSink>>>,
+    sink: Mutex<Option<CaptureSink>>,
     device_frames: AtomicU64,
 }
 
@@ -191,7 +192,7 @@ impl SystemTap {
                     .sink
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                *guard = Some(sink);
+                *guard = Some(CaptureSink::new(sink));
             }
 
             let queue = dispatch::Queue::serial_with_ar_pool();
@@ -201,10 +202,10 @@ impl SystemTap {
             let block = blocks::EscBlock::new5(
                 move |_now: &cat::AudioTimeStamp,
                       input: &cat::AudioBufList<1>,
-                      _input_time: &cat::AudioTimeStamp,
+                      input_time: &cat::AudioTimeStamp,
                       _output: &mut cat::AudioBufList<1>,
                       _output_time: &cat::AudioTimeStamp| {
-                    on_io(&state, input, channels);
+                    on_io(&state, input, channels, input_time);
                 },
             );
 
@@ -221,7 +222,12 @@ impl SystemTap {
 /// Runs on a Core Audio real-time thread. It must not allocate, lock for long,
 /// log, or do I/O. The `Mutex` here is only ever contended at start/stop, and
 /// `try_lock` means the audio thread never waits on the control thread.
-fn on_io(state: &IoState, input: &cat::AudioBufList<1>, channels: u32) {
+fn on_io(
+    state: &IoState,
+    input: &cat::AudioBufList<1>,
+    channels: u32,
+    input_time: &cat::AudioTimeStamp,
+) {
     let Ok(mut guard) = state.sink.try_lock() else {
         // Start or stop is in progress. Dropping one buffer is strictly better
         // than blocking a real-time thread.
@@ -250,7 +256,7 @@ fn on_io(state: &IoState, input: &cat::AudioBufList<1>, channels: u32) {
     let mut flags = FrameFlags::empty();
     flags.set(FrameFlags::SILENT, pcm.iter().all(|s| *s == 0.0));
 
-    sink.on_frames(pcm, CaptureTimestamp::new(before, clock::host_ns()), flags);
+    sink.on_input(pcm, input_time, before, frames, flags);
 }
 
 fn asbd_to_format(asbd: &cat::AudioStreamBasicDesc) -> Result<StreamFormat, TapError> {

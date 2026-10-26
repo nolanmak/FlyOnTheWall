@@ -22,7 +22,10 @@ pub struct CaptureTimestamp {
     /// [`FrameFlags::DISCONTINUITY`].
     pub device_frames: u64,
     /// Nanoseconds on the process-wide monotonic host clock, stamped at the
-    /// tap boundary.
+    /// tap boundary. macOS maps valid native input timestamps into that epoch;
+    /// unavailable/untrusted native timing falls back to callback arrival with
+    /// [`FrameFlags::TIMESTAMP_ERROR`]. Delivered frame count remains separate
+    /// from native sample time; native sample gaps set DISCONTINUITY.
     pub host_ns: u64,
 }
 
