@@ -48,10 +48,17 @@ impl NativeDetection {
             self.detector
                 .poll(now, Err("activity sample expired"), &NoCalendar)
         });
-        match self.receiver.try_recv() {
-            Ok(sample) => self.latest = Some(sample),
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.latest = None,
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        // One mailbox slot plus a closure check: a final queued sample must
+        // not conceal that its publisher has already stopped. Keep UI work bounded.
+        for _ in 0..2 {
+            match self.receiver.try_recv() {
+                Ok(sample) => self.latest = Some(sample),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.latest = None;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            }
         }
         let observation = self.latest.as_ref().filter(|sample| {
             sample.captured_at_ns <= wall
@@ -196,6 +203,21 @@ mod tests {
             input.poll_at(Monotonic::from_secs(22), wall + 22_000_000_000),
             Detection::Clear
         );
+    }
+    #[test]
+    fn closed_publisher_with_a_final_queued_sample_withdraws_the_offer() {
+        let (mut input, sender) = NativeDetection::channel(DetectorConfig {
+            dwell: Duration::ZERO,
+            ..Default::default()
+        });
+        offer(&sender, 0);
+        assert!(matches!(
+            input.poll_at(Monotonic::ZERO, 0),
+            Detection::Arm(_)
+        ));
+        offer(&sender, 1);
+        drop(sender);
+        assert_eq!(input.poll_at(Monotonic::ZERO, 1), Detection::Clear);
     }
     #[tokio::test(flavor = "multi_thread")]
     async fn blocked_probe_cannot_block_polling_or_shutdown_or_spawn_more_queries() {

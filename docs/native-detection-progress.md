@@ -31,8 +31,10 @@ Two detector-inbox regressions and the native offer regression were RED before
 wiring, then GREEN. A separate audit regression was RED until the detected
 metadata crossed the shared admission path. A click-boundary regression was RED
 when a sampler closed after the last tick could still admit a pending Start;
-revalidating the existing offer before consent actions makes it GREEN. All 18 native bridge regressions,
-three inbox/sampler checks and strict all-target daemon Clippy passed. The blocked
+revalidating the existing offer before consent actions makes it GREEN. A final
+queued-sample regression also proved that a closed publisher must withdraw rather
+than retain the offer; the bounded mailbox read now checks that closure. All 18 native bridge regressions,
+four inbox/sampler checks and strict all-target daemon Clippy passed. The blocked
 probe test releases and joins its own synthetic query without touching devices.
 
 The owned native_consent_fixture now exercises menu, hotkey and injected detector
