@@ -1,8 +1,9 @@
 # Connected native shell implementation
 
 This branch contains the recorder bridge, native interaction model and AppKit
-renderer seam. Product launch/daemon bootstrap, lifetime ownership and coordinated
-Quit/finalization are still unfinished. The normal app launch still uses the
+renderer seam. Product launch/daemon bootstrap and coordinated Quit/finalization are still
+unfinished. The daemon lifetime lock is implemented; the native shell must still
+share and retain that ownership. The normal app launch still uses the
 dashboard. Acceptance in #58, #57 and #124 remains open.
 
 ## Implemented contracts
@@ -47,3 +48,20 @@ launched. A production launch must additionally bind one daemon/shell owner,
 connect background menu actions and close HTTP admission before coordinated
 Stop/drain/persistence shutdown. The current bridge Drop requests Stop; it does
 not prove finalization or authorize immediate process exit.
+
+## Lifetime ownership progress
+
+`InstanceOwner` holds an OS file lock in the canonical library directory for the
+whole serving lifetime. A second daemon cannot bypass it with another port or a
+different sessions subdirectory. The file remains after exit; its unlocked inode
+is reused rather than unlinked. New files are private on Unix and opening a
+symlink lock is refused. Existing UI reentry runs first; a process losing the
+startup race retries reentry for a bounded interval and refuses a second daemon.
+The guard is acquired before keys, library and background work are initialized.
+
+Regression RED reproduced duplicate handles and canonical aliases. Green checks
+also cover separate libraries, relative path resolution and an owned subprocess:
+its live lock excludes a second owner, and both normal exit and forced termination
+release the OS lock. These tests do not launch the installed app or access a real
+library. Native shell bootstrap must retain the same owner before creating global
+controls; ordinary reentry must not flash a second tray item.

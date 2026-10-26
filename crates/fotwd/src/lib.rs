@@ -195,6 +195,8 @@ pub mod speech_recovery;
 /// Content-free live transcription provenance.
 pub mod speech_status;
 
+/// Lifetime ownership for a single daemon/native shell per library.
+pub mod instance;
 /// Nonblocking native command/status bridge and render admission.
 pub mod native_bridge;
 /// Recorder-driven interaction model for the connected native shell.

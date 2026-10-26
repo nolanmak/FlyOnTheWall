@@ -173,7 +173,7 @@ pub enum Launch {
 /// The caller proves it may ask by presenting the bearer from the 0600 state
 /// file — the same file the CLI has always read. Any failure — nothing
 /// listening, a foreign service on a reused port, a stale token — is an
-/// `Err`, and the caller starts a daemon of its own instead.
+/// `Err`. Starting a daemon additionally requires lifetime library ownership.
 ///
 /// # Errors
 ///
@@ -206,6 +206,36 @@ pub async fn fetch_fresh_launch_url(port: u16, token: &str) -> Result<String, St
 async fn reopen_running_ui(root: &Path) -> Option<String> {
     let state = fotw_web::read_state_file(&state_file_path(root)).ok()?;
     fetch_fresh_launch_url(state.port, &state.token).await.ok()
+}
+
+async fn reopen_for_launch(root: &Path, launch: Launch) -> bool {
+    let Some(url) = reopen_running_ui(root).await else {
+        return false;
+    };
+    match launch {
+        Launch::OpenBrowser => {
+            let opened = tokio::time::timeout(
+                Duration::from_secs(3),
+                tokio::process::Command::new("open")
+                    .arg(&url)
+                    .kill_on_drop(true)
+                    .status(),
+            )
+            .await;
+            match opened {
+                Ok(Ok(status)) if status.success() => {
+                    println!("  already running — opened a new authorized tab")
+                }
+                _ => println!("  already running — run `fotwd serve --print-url` for a link"),
+            }
+        }
+        Launch::PrintUrl => {
+            println!("  already running — open this once, it expires in 30s:");
+            println!("{url}");
+        }
+        Launch::Nothing => println!("  already running"),
+    }
+    true
 }
 
 /// Run the loopback server until the process is stopped.
@@ -255,22 +285,28 @@ async fn serve_until_stopped(root: PathBuf, launch: Launch, port: u16) -> Result
     // problem is solved by a fresh one-time link from it — no keychain read,
     // no bind, no new process. This is also what makes the app icon behave
     // like an app: launching it again brings the UI back.
-    if let Some(url) = reopen_running_ui(&root).await {
-        match launch {
-            Launch::OpenBrowser => match std::process::Command::new("open").arg(&url).status() {
-                Ok(s) if s.success() => {
-                    println!("  already running — opened a new authorized tab");
-                }
-                _ => println!("  already running — run `fotwd serve --print-url` for a link"),
-            },
-            Launch::PrintUrl => {
-                println!("  already running — open this once, it expires in 30s:");
-                println!("{url}");
-            }
-            Launch::Nothing => println!("  already running"),
-        }
+    if reopen_for_launch(&root, launch).await {
         return Ok(());
     }
+    // A launch URL check cannot exclude another process that has not bound yet.
+    // Hold canonical-library ownership before opening keys, DB or background work
+    // and retain it for this whole serving lifetime, independent of port choice.
+    let _owner = match crate::instance::InstanceOwner::acquire(&root) {
+        Ok(owner) => owner,
+        Err(crate::instance::InstanceError::Busy) => {
+            let reopened = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if reopen_for_launch(&root, launch).await {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await;
+            return reopened.map_err(|_| crate::instance::InstanceError::Busy.to_string());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
 
     // The durable half of every diagnostic below (#101). Opened before the
     // library, because "the daemon will not start" is the failure most in need
