@@ -5,10 +5,7 @@ use fotw_web::recorder::{CaptureSource, SpeechSourceStatus, SpeechState};
 use std::sync::{Arc, Mutex};
 
 enum Reader {
-    Legacy(
-        SpeechSourceStatus,
-        Option<fotw_stt::local::LocalWorkerStatus>,
-    ),
+    Legacy(SpeechSourceStatus),
     Durable(StatusReader),
 }
 #[derive(Default)]
@@ -72,11 +69,7 @@ impl SpeechMonitor {
             .readers
             .iter()
             .map(|(source, read)| match read {
-                Reader::Legacy(status, worker) => {
-                    let mut status = status.clone();
-                    status.worker_running = worker.as_ref().map(|worker| worker.is_running());
-                    status
-                }
+                Reader::Legacy(status) => status.clone(),
                 Reader::Durable(reader) => durable(*source, reader),
             })
             .collect()
@@ -90,9 +83,7 @@ impl SpeechMonitor {
             .iter()
             .any(|(_, reader)| match reader {
                 Reader::Durable(reader) => reader.read().worker_running,
-                Reader::Legacy(_, worker) => {
-                    worker.as_ref().is_some_and(|worker| worker.is_running())
-                }
+                Reader::Legacy(_) => false,
             })
     }
     fn register(&self, source: Source, reader: Reader) {
@@ -114,43 +105,26 @@ impl SpeechMonitor {
     ) {
         self.register(
             source,
-            Reader::Legacy(
-                SpeechSourceStatus {
-                    source: capture_source(source),
-                    provider: provider.into(),
-                    model: model.into(),
-                    revision: None,
-                    state: SpeechState::Connecting,
-                    epoch: None,
-                    from_ms: None,
-                    switch_reason: None,
-                    pending_audio_ms: None,
-                    word_timestamps_supported: Some(words),
-                    diarization_supported: Some(speakers),
-                    worker_running: None,
-                    error: None,
-                },
-                None,
-            ),
+            Reader::Legacy(SpeechSourceStatus {
+                source: capture_source(source),
+                provider: provider.into(),
+                model: model.into(),
+                revision: None,
+                state: SpeechState::Connecting,
+                epoch: None,
+                from_ms: None,
+                switch_reason: None,
+                pending_audio_ms: None,
+                word_timestamps_supported: Some(words),
+                diarization_supported: Some(speakers),
+                worker_running: None,
+                error: None,
+            }),
         );
-    }
-    pub(crate) fn bind_local_worker(
-        &self,
-        source: Source,
-        worker: fotw_stt::local::LocalWorkerStatus,
-    ) {
-        let mut inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((_, Reader::Legacy(_, slot))) = inner
-            .readers
-            .iter_mut()
-            .find(|(s, _)| *s == capture_source(source))
-        {
-            *slot = Some(worker);
-        }
     }
     pub(crate) fn observe_legacy(&self, source: Source, event: &StreamEvent) {
         let mut inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let Some((_, Reader::Legacy(status, _))) = inner
+        let Some((_, Reader::Legacy(status))) = inner
             .readers
             .iter_mut()
             .find(|(s, _)| *s == capture_source(source))

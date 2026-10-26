@@ -128,6 +128,29 @@ async fn a_local_session_is_transcribed_by_the_time_it_returns() {
         outcome.dir.file_name().unwrap().to_string_lossy()
     );
     assert!(outcome.stt_errors.is_empty(), "{:?}", outcome.stt_errors);
+    let session = outcome.dir.file_name().unwrap().to_string_lossy();
+    let reader = fotw_pipeline::replay::ReplayReader::open(
+        &outcome.dir,
+        &session,
+        fotw_pipeline::replay::ReplaySource::System,
+    )
+    .expect("local-only recording must preserve its exact canonical speech input");
+    let saved = fotwd::failover::coverage::CoverageJournal::snapshot(
+        &outcome.dir,
+        &session,
+        fotw_stt::Source::System,
+    )
+    .unwrap();
+    assert_eq!(saved.epochs[0].engine.provider, PROVIDER);
+    assert_eq!(saved.epochs[0].reason, None);
+    assert_eq!(
+        saved.commits.last().unwrap().through_sample,
+        reader.saved_end().unwrap()
+    );
+    assert!(
+        saved.fallback.is_some(),
+        "local input needs its saved restart plan"
+    );
 }
 
 #[tokio::test]
@@ -141,5 +164,121 @@ async fn a_model_that_will_not_load_keeps_the_audio_and_says_why() {
         outcome.stt_errors[0].contains("model is missing"),
         "{:?}",
         outcome.stt_errors
+    );
+}
+
+#[tokio::test]
+async fn cancelling_local_identity_preparation_waits_for_owned_work_and_never_starts_capture() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let notify = entered.clone();
+    let waiting = release.clone();
+    let transcription = Transcription::PreparingLocal(Box::pin(async move {
+        notify.notify_one();
+        waiting.notified().await;
+        Ok(LocalLegs::for_session(
+            Arc::new(Engine { loads: true }),
+            "fixture",
+            false,
+            false,
+        ))
+    }));
+    let control = SessionControl::new();
+    let stop = control.stop.clone();
+    let mut task = tokio::spawn(async move { transcription.prepare(&control).await });
+    entered.notified().await;
+    stop.stop();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), &mut task)
+            .await
+            .is_err(),
+        "owned preparation must remain accounted for after Cancel"
+    );
+    release.notify_one();
+    assert!(task.await.unwrap().err().unwrap().contains("cancelled"));
+}
+
+/// Opt-in real local-only session. Hash guards allow only the approved cached
+/// small.en model and public JFK fixture; no device or provider is opened.
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires approved cached small.en/JFK assets"]
+async fn installed_local_only_session_preserves_public_audio_and_its_verified_restart_identity() {
+    use sha2::{Digest, Sha256};
+    let model = std::path::PathBuf::from(
+        std::env::var_os("FOTW_NATIVE_LOCAL_MODEL").expect("set FOTW_NATIVE_LOCAL_MODEL"),
+    );
+    let wav = std::path::PathBuf::from(
+        std::env::var_os("FOTW_NATIVE_LOCAL_WAV").expect("set FOTW_NATIVE_LOCAL_WAV"),
+    );
+    assert_eq!(std::fs::metadata(&wav).unwrap().len(), 352078);
+    let bytes = std::fs::read(wav).unwrap();
+    assert_eq!(
+        Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+        "59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e"
+    );
+    let checked = model.clone();
+    tokio::task::spawn_blocking(move || {
+        assert_eq!(
+            fotwd::stt::verify_model(&checked).unwrap().unwrap().name,
+            "small.en"
+        )
+    })
+    .await
+    .unwrap();
+    let decoded = fotw_audio::wav::parse(&bytes).unwrap();
+    assert_eq!(decoded.frames(), 176000);
+    let root = tempfile::tempdir().unwrap();
+    let settings = fotwd::stt::SttSettings {
+        engine: fotwd::stt::SttEngine::Local,
+        model: model.to_string_lossy().into_owned(),
+        language: "en".into(),
+    };
+    let transcription =
+        fotwd::stt::local_transcription(&settings, root.path(), "placeholder", false, false);
+    let began = std::time::Instant::now();
+    let outcome = session::run_with_control(
+        root.path(),
+        Box::new(FileAudioSource::from_wav(
+            TapId::system_default(),
+            decoded,
+            ReplaySpeed::Realtime,
+        )),
+        None,
+        transcription,
+        Duration::from_secs(12),
+        SessionControl::new(),
+    )
+    .await
+    .unwrap();
+    assert!(outcome.stt_errors.is_empty(), "{:?}", outcome.stt_errors);
+    let text = outcome.transcript_text();
+    assert!(text.to_ascii_lowercase().contains("country"), "{text}");
+    let id = outcome.dir.file_name().unwrap().to_string_lossy();
+    let reader = fotw_pipeline::replay::ReplayReader::open(
+        &outcome.dir,
+        &id,
+        fotw_pipeline::replay::ReplaySource::System,
+    )
+    .unwrap();
+    assert_eq!(reader.saved_end().unwrap(), 176000);
+    let saved = fotwd::failover::coverage::CoverageJournal::snapshot(
+        &outcome.dir,
+        &id,
+        fotw_stt::Source::System,
+    )
+    .unwrap();
+    let revision = "sha256:c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d";
+    assert_eq!(
+        saved.fallback.unwrap().engine.revision.as_deref(),
+        Some(revision)
+    );
+    assert_eq!(saved.commits.last().unwrap().through_sample, 176000);
+    eprintln!(
+        "{}",
+        serde_json::json!({"fixture":"approved-public-jfk","mode":"local-only","elapsed_ms":began.elapsed().as_millis(),"canonical_samples":176000,"revision":revision,"transcript":text,"tokens":fotw_stt::normalize_tokens(&text)})
     );
 }

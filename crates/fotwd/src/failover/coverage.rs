@@ -30,8 +30,9 @@ pub struct EngineDescriptor {
     pub capabilities: SttCapabilities,
 }
 
-/// Ready local inference plan, persisted before cloud starts. No credential or
-/// model path is stored; recovery resolves the installed revision explicitly.
+/// Saved local inference identity and endpointing policy. Cloud-fallback
+/// admission additionally preflights native readiness before capture. No
+/// credential or model path is stored; recovery resolves the installed revision.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalPlan {

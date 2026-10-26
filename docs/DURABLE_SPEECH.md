@@ -1,5 +1,47 @@
 # Durable speech handoff runtime
 
+## Local-only recording and restart
+
+Local-only recording now writes the same canonical 16 kHz source input and
+coverage journal used by durable fallback. Its first provider epoch is local,
+with no switch reason. Each source retains its original session offset, endpoint
+policy, language and model revision. `LocalSourceConfig` has no cloud transport
+or credential fields; a failed local model cannot silently select a provider.
+
+Before capture, an owned preparation task resolves file identity. Native model
+loading remains on the source worker after capture starts. Known files must
+match their published checksum; custom files are pinned to their SHA-256. The
+worker checks the pinned file before and after native creation. An unavailable
+model still permits audio recording and emits a source error. For a known
+catalog model, the saved revision is its expected published checksum even when
+the file is unavailable; this identifies a later recovery candidate and does
+not assert verification or native readiness. An unavailable custom file has no
+invented revision.
+
+Local Stop waits for inference publication under its bounded deadline. Data
+owners release before native destruction, allowing finished audio to be saved
+while cleanup remains visible. A separate per-source `stt-native.lock` stays
+held through actual native destruction, excluding overlapping restart. The
+recorder continues refusing a new recording while that native worker remains
+alive. A blocked constructor or inference call cannot be forcibly interrupted;
+Stop can time out while the original audio and canonical input remain retained.
+
+The local durable path preserves microphone overlap instead of applying the
+old suppressive echo gate to its canonical input. Transcript deduplication is
+unchanged. This does not enable acoustic echo cancellation; live processing
+integration and physical overlap-quality acceptance remain unfinished.
+
+Device-free tests cover exact retained input and restart after inference
+failure, initialization deadlines, cancellation before capture, data/native
+ownership separation and the actual session recording path. The macOS opt-in
+`installed_local_only_session_preserves_public_audio_and_its_verified_restart_identity`
+test uses `FOTW_NATIVE_LOCAL_MODEL` and `FOTW_NATIVE_LOCAL_WAV`, verifies the
+approved small.en/JFK hashes, and opens no physical capture device or provider.
+One uncontrolled-cache run retained all 176,000 samples and recognized all 22
+words, with 724,811,776 bytes maximum process RSS and 19.71 seconds whole-process
+elapsed time. These are single-source smoke measurements, not isolated inference
+latency, concurrent-app resources or representative transcription accuracy.
+
 ## Processed input and replay identity
 
 The durable stream can explicitly declare `FailoverConfig::processing` before
@@ -199,8 +241,9 @@ playable media while retaining untranscribed or unprojected raw/canonical source
 
 A blocked native inference cannot be forcibly cancelled. Deadline expiry fences
 late output, reports incomplete transcription, and leaves native ownership visible.
-Exclusive source/journal leases prevent another attempt from reusing those files
-while the previous worker is still alive.
+Source/journal leases protect active data work. The separate native-source lease
+prevents another inference attempt while the previous native worker is still
+alive, including after data publication releases those data leases.
 
 ## Explicit local restart API
 

@@ -41,8 +41,8 @@ use fotw_pipeline::ring::{AudioRing, RingConsumer, RingProducer};
 use fotw_pipeline::wal::{SessionWal, SttRecord, TrackFormat};
 use fotw_stt::deepgram::DeepgramConfig;
 use fotw_stt::{
-    DeepgramStream, DeepgramStreamConfig, LocalStream, LocalStreamConfig, RecognizerFactory,
-    Source, StreamEvent, TranscriptSegment,
+    DeepgramStream, DeepgramStreamConfig, LocalStreamConfig, RecognizerFactory, Source,
+    StreamEvent, TranscriptSegment,
 };
 
 /// Ring capacity per leg, in samples. Ten seconds at 48 kHz stereo.
@@ -866,6 +866,8 @@ impl DeepgramLegs {
 /// that meant "do not transcribe my side" should not stop meaning it because
 /// the engine changed.
 pub struct LocalLegs {
+    /// Pinned model revision, or the expected published revision when unavailable.
+    pub revision: Option<String>,
     /// The model both legs share. It loads on the first leg's worker thread.
     pub engine: Arc<dyn RecognizerFactory>,
     /// The far end: everybody else on the call. Always transcribed.
@@ -885,6 +887,7 @@ impl LocalLegs {
         mic_enabled: bool,
     ) -> Self {
         Self {
+            revision: None,
             engine,
             system: Box::new(LocalStreamConfig::new(session_id, Source::System)),
             mic: (mic_present && mic_enabled)
@@ -1263,11 +1266,16 @@ pub enum Transcription {
     PreparingFailover(
         std::pin::Pin<Box<dyn std::future::Future<Output = Result<FailoverLegs, String>> + Send>>,
     ),
+    /// Resolve local model identity without blocking the capture callback or
+    /// silently enabling a provider when model preparation fails.
+    PreparingLocal(
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<LocalLegs, String>> + Send>>,
+    ),
 }
 
 impl Transcription {
     pub(crate) fn needs_preparation(&self) -> bool {
-        matches!(self, Self::PreparingFailover(_))
+        matches!(self, Self::PreparingFailover(_) | Self::PreparingLocal(_))
     }
 
     /// Resolve deferred backup admission before a caller opens capture taps.
@@ -1275,6 +1283,22 @@ impl Transcription {
     /// Other transcription modes pass through unchanged.
     pub async fn prepare(self, control: &SessionControl) -> Result<Self, String> {
         match self {
+            Self::PreparingLocal(future) => {
+                control.ready.set_preparing(true);
+                let result = if control.stop.is_stopped() {
+                    Err("local model preparation cancelled".into())
+                } else {
+                    use futures_util::FutureExt;
+                    std::panic::AssertUnwindSafe(future).catch_unwind().await.unwrap_or_else(|_|Err("local model preparation failed unexpectedly; capture was not started".into()))
+                };
+                if control.stop.is_stopped() {
+                    drop(result);
+                    control.ready.set_preparing(false);
+                    return Err("local model preparation cancelled; capture was not started".into());
+                }
+                control.ready.set_preparing(false);
+                result.map(Self::Local)
+            }
             Self::PreparingFailover(future) => {
                 control.ready.set_preparing(true);
                 // Await the owned preparation even after cancellation. Dropping
@@ -1311,7 +1335,9 @@ impl Transcription {
             Self::Deepgram(legs) => legs.mic.is_some(),
             Self::Local(legs) => legs.mic.is_some(),
             Self::Failover(legs) => legs.mic.is_some(),
-            Self::PreparingFailover(_) => unreachable!("admission must precede capture setup"),
+            Self::PreparingFailover(_) | Self::PreparingLocal(_) => {
+                unreachable!("admission must precede capture setup")
+            }
         }
     }
 }
@@ -1324,6 +1350,7 @@ impl std::fmt::Debug for Transcription {
             Self::Local(_) => write!(f, "Local(..)"),
             Self::Failover(_) => write!(f, "Failover(..)"),
             Self::PreparingFailover(_) => write!(f, "PreparingFailover(..)"),
+            Self::PreparingLocal(_) => write!(f, "PreparingLocal(..)"),
         }
     }
 }
@@ -2568,7 +2595,11 @@ trait PcmFeed: Send + Sync {
 /// One leg's open transcription, whichever engine is behind it.
 enum LegStream {
     Deepgram(DeepgramStream),
-    Local(LocalStream),
+    DurableLocal {
+        stream: crate::failover::stream::FailoverStream,
+        errors: SttErrors,
+        write_failed: AtomicBool,
+    },
     Failover {
         stream: crate::failover::stream::FailoverStream,
         errors: SttErrors,
@@ -2578,7 +2609,7 @@ enum LegStream {
 
 impl LegStream {
     fn requires_original_pcm(&self) -> bool {
-        matches!(self, Self::Failover { .. })
+        matches!(self, Self::Failover { .. } | Self::DurableLocal { .. })
     }
 
     /// Let the engine finish what it has heard, then close it.
@@ -2593,8 +2624,8 @@ impl LegStream {
                 let _ = stream.flush().await;
                 let _ = stream.close().await;
             }
-            Self::Local(stream) => {
-                let _ = stream.close().await;
+            Self::DurableLocal { stream, .. } => {
+                let _ = stream.finish().await;
             }
             Self::Failover { stream, errors, .. } => {
                 if !stream.finish().await {
@@ -2620,8 +2651,12 @@ impl PcmFeed for LegStream {
     fn write_pcm(&self, pcm: &[i16]) {
         match self {
             Self::Deepgram(stream) => stream.write(pcm),
-            Self::Local(stream) => stream.write(pcm),
             Self::Failover {
+                stream,
+                errors,
+                write_failed,
+            }
+            | Self::DurableLocal {
                 stream,
                 errors,
                 write_failed,
@@ -2668,7 +2703,7 @@ async fn open_legs(
     speech: crate::speech_status::SpeechMonitor,
 ) -> OpenLegs {
     match transcription {
-        Transcription::PreparingFailover(_) => {
+        Transcription::PreparingFailover(_) | Transcription::PreparingLocal(_) => {
             unreachable!("admission must precede opening speech streams")
         }
         Transcription::Disabled => (None, None, None, None),
@@ -2702,35 +2737,38 @@ async fn open_legs(
             (Some(Arc::new(LegStream::Deepgram(s))), Some(s_rx), m, m_rx)
         }
         Transcription::Local(mut legs) => {
-            speech.bind_legacy(
-                Source::System,
-                fotw_stt::local::PROVIDER,
-                legs.engine.model(),
-                false,
-                false,
-            );
             legs.system.session_id = session_id.to_owned();
             legs.system.session_offset_ms = anchors.system_ms;
-            let (s, s_rx) = LocalStream::open(*legs.system, Arc::clone(&legs.engine));
-            speech.bind_local_worker(Source::System, s.worker_status());
-            let (m, m_rx) = match legs.mic {
+            let mut config = crate::failover::stream::LocalSourceConfig::new(
+                *legs.system,
+                Arc::clone(&legs.engine),
+            );
+            config.revision = legs.revision.clone();
+            let system = bind_durable_source(
+                crate::failover::stream::FailoverStream::open_local(dir, config).await,
+                errors.clone(),
+                Source::System,
+                speech.clone(),
+                true,
+            );
+            let mic = match legs.mic {
                 Some(mut cfg) if mic_started => {
-                    speech.bind_legacy(
-                        Source::Mic,
-                        fotw_stt::local::PROVIDER,
-                        legs.engine.model(),
-                        false,
-                        false,
-                    );
                     cfg.session_id = session_id.to_owned();
                     cfg.session_offset_ms = anchors.mic_ms;
-                    let (m, rx) = LocalStream::open(*cfg, legs.engine);
-                    speech.bind_local_worker(Source::Mic, m.worker_status());
-                    (Some(Arc::new(LegStream::Local(m))), Some(rx))
+                    let mut config =
+                        crate::failover::stream::LocalSourceConfig::new(*cfg, legs.engine);
+                    config.revision = legs.revision;
+                    bind_durable_source(
+                        crate::failover::stream::FailoverStream::open_local(dir, config).await,
+                        errors,
+                        Source::Mic,
+                        speech,
+                        true,
+                    )
                 }
                 _ => (None, None),
             };
-            (Some(Arc::new(LegStream::Local(s))), Some(s_rx), m, m_rx)
+            (system.0, system.1, mic.0, mic.1)
         }
         Transcription::Failover(legs) => {
             let FailoverLegs { system, mic } = *legs;
@@ -2773,7 +2811,29 @@ async fn open_failover_source(
     source: Source,
     speech: crate::speech_status::SpeechMonitor,
 ) -> (Option<Arc<LegStream>>, Option<LegEvents>) {
-    match prepared.open(dir, session_id, offset_ms).await {
+    bind_durable_source(
+        prepared.open(dir, session_id, offset_ms).await,
+        errors,
+        source,
+        speech,
+        false,
+    )
+}
+
+fn bind_durable_source(
+    opened: Result<
+        (
+            crate::failover::stream::FailoverStream,
+            tokio::sync::mpsc::UnboundedReceiver<crate::failover::stream::Event>,
+        ),
+        fotw_stt::SttError,
+    >,
+    errors: SttErrors,
+    source: Source,
+    speech: crate::speech_status::SpeechMonitor,
+    local_only: bool,
+) -> (Option<Arc<LegStream>>, Option<LegEvents>) {
+    match opened {
         Ok((stream, mut events)) => {
             speech.bind_durable(source, stream.status_reader());
             let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -2791,18 +2851,24 @@ async fn open_failover_source(
                     }
                 }
             });
-            (
-                Some(Arc::new(LegStream::Failover {
+            let stream = if local_only {
+                LegStream::DurableLocal {
                     stream,
                     errors,
                     write_failed: AtomicBool::new(false),
-                })),
-                Some(receiver),
-            )
+                }
+            } else {
+                LegStream::Failover {
+                    stream,
+                    errors,
+                    write_failed: AtomicBool::new(false),
+                }
+            };
+            (Some(Arc::new(stream)), Some(receiver))
         }
         Err(error) => {
             errors.record(format!(
-                "durable fallback source unavailable; original audio retained: {error}"
+                "durable speech source unavailable; original audio retained: {error}"
             ));
             (None, None)
         }
