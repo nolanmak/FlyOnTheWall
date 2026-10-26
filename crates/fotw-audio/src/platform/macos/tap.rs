@@ -81,6 +81,42 @@ impl std::fmt::Debug for SystemTap {
     }
 }
 
+// Builds only an owned descriptor; does not create a process tap or capture.
+fn exclusion_description(excluded: &[AppRef]) -> Result<arc::R<TapDesc>, TapError> {
+    let bundle_supported = cidre::api::macos_available("26.0");
+    let plan = crate::system_exclusions::resolve(excluded, bundle_supported, |pid| {
+        let pid = i32::try_from(pid)
+            .map_err(|_| TapError::unsupported("process ID exceeds platform range"))?;
+        ca::Process::with_pid(pid)
+            .map(|process| process.0.0)
+            .map_err(|e| TapError::platform(format!("could not resolve audio process: {e:?}")))
+    })?;
+    let objects: Vec<_> = plan
+        .process_objects
+        .iter()
+        .map(|id| ns::Number::with_u32(*id))
+        .collect();
+    let refs: Vec<&ns::Number> = objects.iter().map(|n| n.as_ref()).collect();
+    let exclude = ns::Array::from_slice(&refs);
+    let mut desc = TapDesc::with_stereo_global_tap_excluding_processes(&exclude);
+    if !plan.bundle_ids.is_empty() {
+        let bundles: Vec<_> = plan
+            .bundle_ids
+            .iter()
+            .map(|id| ns::String::with_str(id))
+            .collect();
+        let refs: Vec<&ns::String> = bundles.iter().map(|id| id.as_ref()).collect();
+        let bundles = ns::Array::from_slice(&refs);
+        // SAFETY: resolve refuses bundle selectors below macOS 26, and
+        // the runtime check above establishes availability of both selectors.
+        unsafe {
+            desc.set_bundle_ids(&bundles);
+            desc.set_process_restore_enabled(true);
+        }
+    }
+    Ok(desc)
+}
+
 impl SystemTap {
     /// Prepare a tap. Nothing is created until [`crate::AudioTap::start`].
     pub fn new(id: TapId, excluded: &[AppRef]) -> Result<Self, TapError> {
@@ -100,20 +136,7 @@ impl SystemTap {
 
     fn build(&mut self, sink: Box<dyn FrameSink>) -> Result<Running, TapError> {
         // --- 1. Describe the tap -----------------------------------------
-        let pids: Vec<arc::R<ns::Number>> = self
-            .excluded
-            .iter()
-            .filter_map(|a| match a {
-                AppRef::Pid(pid) => Some(ns::Number::with_i32(*pid as i32)),
-                // Bundle-ID and name exclusion need CATapDescription.bundleIDs
-                // (macOS 26+); open_system rejects those scopes already.
-                _ => None,
-            })
-            .collect();
-        let refs: Vec<&ns::Number> = pids.iter().map(|n| n.as_ref()).collect();
-        let exclude = ns::Array::from_slice(&refs);
-
-        let mut desc = TapDesc::with_stereo_global_tap_excluding_processes(&exclude);
+        let mut desc = exclusion_description(&self.excluded)?;
         desc.set_name(Some(ns::str!(c"FlyOnTheWall system audio")));
         // Private: keeps the tap out of the user's Sound settings and Audio
         // MIDI Setup.
@@ -352,5 +375,28 @@ impl crate::tap::AudioTap for SystemTap {
             self.cleanup_failure = Failure::from_error(error);
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod exclusion_tests {
+    use super::*;
+    #[test]
+    fn owned_bundle_descriptor_preserves_stable_selectors_without_opening_capture() {
+        if !cidre::api::macos_available("26.0") {
+            return;
+        }
+        let desc = exclusion_description(&[
+            AppRef::BundleId("com.spotify.client".into()),
+            AppRef::BundleId("com.brave.Browser.helper".into()),
+        ])
+        .unwrap();
+        assert!(desc.processes().is_empty());
+        // SAFETY: availability was checked; these getters read only our own descriptor.
+        unsafe {
+            assert!(desc.is_process_restore_enabled());
+            let ids: Vec<_> = desc.bundle_ids().iter().map(|id| id.to_string()).collect();
+            assert_eq!(ids, ["com.brave.Browser.helper", "com.spotify.client"]);
+        }
     }
 }
