@@ -41,6 +41,33 @@ fn pcm(index: u64, mic: bool) -> Vec<f32> {
         .map(|n| far(index * 160 + n) + if mic { index as f32 * 0.0001 } else { 0.0 })
         .collect()
 }
+fn capture_epoch(between_reads: impl FnOnce()) -> (Instant, u64) {
+    // Read the native epoch first. A scheduling pause may make timestamps older,
+    // but must never move the callback deadline before its declared sample time.
+    let host_origin = fotw_audio::clock::host_ns();
+    between_reads();
+    let deadline_origin = Instant::now();
+    (deadline_origin, host_origin)
+}
+
+#[test]
+fn fixture_epoch_cannot_put_native_timestamps_in_the_future_after_a_scheduling_pause() {
+    let (deadline_origin, host_origin) =
+        capture_epoch(|| std::thread::sleep(Duration::from_millis(100)));
+    // This is the exact first two callback deadlines/timestamps of PulseTap.
+    // A descheduling pause between clock reads must not consume delivery lead.
+    for i in 0..2 {
+        let deadline = deadline_origin + Duration::from_millis(20 + i * 10);
+        if let Some(wait) = deadline.checked_duration_since(Instant::now()) {
+            std::thread::sleep(wait);
+        }
+        let timestamp = host_origin + i * 10_000_000;
+        assert!(
+            timestamp <= fotw_audio::clock::host_ns(),
+            "fixture callback timestamp is in the future"
+        );
+    }
+}
 struct PulseTap {
     id: TapId,
     mic: bool,
@@ -97,8 +124,7 @@ impl AudioTap for PulseTap {
             if stopped.load(Ordering::Acquire) {
                 return;
             }
-            let epoch =
-                *shared_epoch.get_or_init(|| (Instant::now(), fotw_audio::clock::host_ns()));
+            let epoch = *shared_epoch.get_or_init(|| capture_epoch(|| {}));
             for i in 0..400 {
                 let deadline = epoch.0 + Duration::from_millis(20 + i * 10);
                 if let Some(wait) = deadline.checked_duration_since(Instant::now()) {

@@ -3,6 +3,191 @@ use fotw_pipeline::{
     ring::CaptureObservation,
 };
 
+fn callback(i: u64) -> CaptureObservation {
+    CaptureObservation {
+        sequence: i + 1,
+        sample_start: i * 160,
+        sample_count: 160,
+        device_frames: i * 160,
+        host_ns: 1_000_000_000 + i * 10_000_000,
+        flags: 0,
+        dropped_samples: 0,
+        timing_faults: 0,
+    }
+}
+fn recoverable() -> Tracker {
+    let mut t = Tracker::with_timestamp_recovery(16000, 1).unwrap();
+    for i in 0..241 {
+        let o = callback(i);
+        t.observe(1, o, o.host_ns + 20_000_000).unwrap();
+    }
+    t
+}
+#[test]
+fn an_isolated_timestamp_can_revalidate_calibration_but_never_map_old_frames() {
+    let mut t = recoverable();
+    let mut fault = callback(241);
+    fault.flags = 4;
+    fault.timing_faults = 1;
+    fault.host_ns += 5_000_000;
+    assert_eq!(
+        t.observe(1, fault, fault.host_ns + 20_000_000).unwrap_err(),
+        Rejection::Fault
+    );
+    assert_eq!(
+        t.observe(1, fault, fault.host_ns + 20_000_000).unwrap_err(),
+        Rejection::Fault
+    );
+    let mut good = callback(242);
+    good.timing_faults = 1;
+    let fit = t
+        .observe(1, good, good.host_ns + 20_000_000)
+        .unwrap()
+        .expect("fresh consistent evidence should revalidate the calibrated rate");
+    assert!(fit.host_at_frame(241 * 160).is_none());
+    assert!(fit.host_at_frame(242 * 160).is_some());
+    let mut other = Tracker::new(16000, 1).unwrap();
+    let mut healthy = None;
+    for i in 0..243 {
+        let o = callback(i);
+        healthy = other.observe(1, o, o.host_ns + 20_000_000).unwrap();
+    }
+    assert!(
+        fit.map_frame_from(&healthy.unwrap(), 240 * 160, good.host_ns + 20_000_000)
+            .is_none(),
+        "render lookup must also fence pre-fault positions"
+    );
+    use fotw_pipeline::reference_resample::{
+        AlignmentEpoch, Config, Error, FrameDomain, HostNs, NativeFrame, ProcessingFrame,
+        ReferenceBuffer, Request, TapGeneration,
+    };
+    let mut history = ReferenceBuffer::new(Config {
+        render_rate_hz: 16000,
+        capacity_frames: 16000,
+        mic: FrameDomain {
+            native_origin: NativeFrame(0),
+            native_offset_frames: 0.0,
+            processing_origin: ProcessingFrame(0),
+            native_rate_hz: 16000,
+        },
+        render_generation: TapGeneration(1),
+        mic_generation: TapGeneration(1),
+        epoch: AlignmentEpoch(2),
+    })
+    .unwrap();
+    history
+        .append(
+            AlignmentEpoch(2),
+            TapGeneration(1),
+            NativeFrame(240 * 160),
+            &vec![0.25; 800],
+        )
+        .unwrap();
+    let request = |start| Request {
+        epoch: AlignmentEpoch(2),
+        start: ProcessingFrame(start),
+        now: HostNs(good.host_ns + 20_000_000),
+        render: fit,
+        mic: healthy.unwrap(),
+    };
+    let mut out = [99.0];
+    assert_eq!(
+        history.fill(request(242 * 160), &mut out),
+        Err(Error::Clock),
+        "interpolation support must not reach into the fenced interval"
+    );
+    assert_eq!(out, [99.0]);
+    history.fill(request(242 * 160 + 40), &mut out).unwrap();
+    assert!((out[0] - 0.25).abs() < 1e-6);
+}
+#[test]
+fn recovery_does_not_bridge_drops_discontinuities_missing_callbacks_or_a_new_clock_offset() {
+    for case in 0..10 {
+        let mut t = recoverable();
+        let mut fault = callback(241);
+        fault.flags = 4;
+        fault.timing_faults = 1;
+        if case == 0 {
+            fault.flags = 2;
+        }
+        if case == 1 {
+            fault.dropped_samples = 160;
+        }
+        if case == 5 {
+            fault.flags = 6;
+        }
+        if case == 6 {
+            fault.timing_faults = 2;
+        }
+        assert!(t.observe(1, fault, fault.host_ns + 20_000_000).is_err());
+        let mut good = callback(242);
+        good.timing_faults = 1;
+        good.dropped_samples = fault.dropped_samples;
+        if case == 7 {
+            good.flags = 4;
+            good.timing_faults = 2;
+        }
+        if case == 8 {
+            good.host_ns += 110_000_000;
+        }
+        if case == 9 {
+            good.dropped_samples += 160;
+        }
+        if case == 2 {
+            good.sequence += 1;
+        }
+        if case == 3 {
+            good.host_ns += 200_000;
+        }
+        let result = t.observe(
+            if case == 4 { 2 } else { 1 },
+            good,
+            good.host_ns + 20_000_000,
+        );
+        assert!(
+            result.is_err() || result.unwrap().is_none(),
+            "unsafe recovery case {case}"
+        );
+    }
+}
+
+#[test]
+fn default_tracker_and_stale_calibration_cannot_use_timestamp_recovery() {
+    for opt_in in [false, true] {
+        let mut t = if opt_in {
+            recoverable()
+        } else {
+            let mut t = Tracker::new(16000, 1).unwrap();
+            for i in 0..241 {
+                let o = callback(i);
+                t.observe(1, o, o.host_ns + 20_000_000).unwrap();
+            }
+            t
+        };
+        let mut fault = callback(241);
+        fault.flags = 4;
+        fault.timing_faults = 1;
+        // The fault itself is fresh, but the previous calibration is expired.
+        if opt_in {
+            fault.host_ns += 1_100_000_000;
+        }
+        assert_eq!(
+            t.observe(1, fault, fault.host_ns + 20_000_000).unwrap_err(),
+            Rejection::Fault
+        );
+        let mut good = callback(242);
+        good.timing_faults = 1;
+        if opt_in {
+            good.host_ns += 1_100_000_000;
+        }
+        assert!(
+            t.observe(1, good, good.host_ns + 20_000_000)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
 fn observation(i: u64, ppm: f64, channels: u16) -> CaptureObservation {
     observation_at_rate(i, 16000, ppm, channels)
 }
