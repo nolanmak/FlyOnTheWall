@@ -214,22 +214,29 @@
       if(this.pending)await this.pending;
       if(this.status==='conflict' || !this.dirty)return;
       if(this.options.session) {
-        this.reading++;
-        try { this.document(await this.api(this.path())); }
-        catch (_) { this.status='error';this.changed();return; }
-        finally {this.reading--;trimDraft(this);}
+        const readVersion=++this.readVersion;this.reading++;
+        try {
+          const response=await this.api(this.path());
+          if(readVersion!==this.readVersion)return;
+          this.document(response);
+        } catch (_) {
+          if(readVersion===this.readVersion){this.status='error';this.changed();}
+          return;
+        } finally {this.reading--;trimDraft(this);}
       }
       await this.flush();
     }
     async overwrite() {
       if(this.pending || this.status!=='conflict')return;
       // The user explicitly chose their draft. Refresh only the revision, not text.
-      this.reading++;
+      const readVersion=++this.readVersion;this.reading++;
       try {
-        const current=this.document(await this.api(this.path()));
+        const response=await this.api(this.path());
+        if(readVersion!==this.readVersion)return;
+        const current=this.document(response);
         this.revision=current.revision;this.status='unsaved';
         await this.flush();
-      } catch (_) { this.status='conflict';this.changed(); }
+      } catch (_) { if(readVersion===this.readVersion){this.status='conflict';this.changed();} }
       finally {this.reading--;trimDraft(this);}
     }
     async discard() {

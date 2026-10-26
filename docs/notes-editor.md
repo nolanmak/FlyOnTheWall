@@ -300,3 +300,9 @@ clean navigations. The reports include hashes of the actual served scripts.
 [narrow](notes-lifecycle/dark-390.png). Input used owned DOM events; no capture
 devices, providers, clipboard or global keyboard events were used. This does
 not measure WebKit garbage collection, RSS or physical keyboard/IME behavior.
+
+Review followup: four regression-first cases also cover retry/overwrite refresh
+successes and errors arriving after Discard my draft and reload. These refreshes
+share the read generation fence: superseded operations cannot change capture
+bounds, delete restored anchors, replace Saved with an old error/conflict, or
+issue a POST after discard. All 151 UI tests pass.

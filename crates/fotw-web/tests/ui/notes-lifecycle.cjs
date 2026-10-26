@@ -119,3 +119,30 @@ test('clean inactive note drafts are collectible while the page remains loaded',
   const result=JSON.parse(run.stdout);assert.equal(result.pageLoaded,true);
   assert.equal(result.retained,0,'clean drafts must not accumulate in the page cache');
 });
+
+for(const action of ['retrySave','overwrite'])for(const outcome of ['success','error']) {
+  test(`${action} ignores a superseded ${outcome} after reloading saved notes`,async()=>{
+    const h=fixture();let reads=0,posts=0,finishOld,failOld;
+    const anchor={id:'saved-anchor',block_idx:0,block_text:'server notes',typed_at_ms:800};
+    const response=revision=>({meeting_id:'saved-meeting',elapsed_ms:1000,
+      note:{revision,body_md:'server notes',anchors:[anchor]}});
+    const api=async(_,options)=>{
+      if(options){posts++;throw Object.assign(new Error('fixture conflict'),{status:409});}
+      if(++reads===2)return new Promise((resolve,reject)=>{finishOld=resolve;failOld=reject;});
+      return response(reads);
+    };
+    const draft=h.notes.mount('session-race',h.host(),api,{session:true});await settle();
+    draft.edit('local draft');
+    if(action==='overwrite')await draft.flush();
+    const beforePosts=posts,operation=draft[action]();await settle();
+    await draft.discard();
+    assert.equal(draft.status,'saved');assert.equal(draft.revision,3);
+    if(outcome==='error')failOld(new Error('old refresh failed'));
+    else finishOld({...response(1),elapsed_ms:100});
+    await operation;
+    assert.equal(draft.body,'server notes');assert.equal(draft.revision,3);
+    assert.equal(draft.status,'saved');assert.equal(draft.captureElapsed,1000);
+    assert.equal(draft.anchors[0]?.id,'saved-anchor');assert.equal(draft.dirty,false);
+    assert.equal(posts,beforePosts,'a discarded operation must not write afterward');
+  });
+}
