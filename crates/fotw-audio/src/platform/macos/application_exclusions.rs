@@ -17,11 +17,16 @@ pub fn family(bundle_id: &str) -> Result<Vec<AppRef>, TapError> {
             "application exclusions require macOS 26 or newer",
         ));
     }
+    let app_name = match bundle_id {
+        "com.spotify.client" => "Spotify",
+        "com.brave.Browser" => "Brave",
+        _ => "the selected app",
+    };
     let url = NSWorkspace::sharedWorkspace()
         .URLForApplicationWithBundleIdentifier(&NSString::from_str(bundle_id))
         .ok_or_else(|| {
             TapError::unsupported(format!(
-                "Install {bundle_id} before enabling its audio exclusion"
+                "Install {app_name} before enabling its audio exclusion"
             ))
         })?;
     let path = url

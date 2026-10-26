@@ -30,10 +30,24 @@ passed, 0 failed, 16 opt-in ignored; 163 UI tests, strict workspace lint,
 dependency checks and the Windows audio seam passed.
 
 An owned nonpersistent WebKit window exercised actual checkbox/Save controls
-against a synthetic loopback settings server at 590px. Defaults, both saved,
+against the actual authenticated loopback settings API at 590px. Defaults, both saved,
 one independently disabled, reload, next-recording wording, Brave warning and
-button bounds passed. The screenshot was visually inspected. This is UI evidence,
+the collapsed summary passed. A fresh server process and fresh WebKit window
+reopened the known-key encrypted temporary SQLCipher store and retained the
+Brave-only preference; the database header was also confirmed encrypted.
+Screenshots were visually inspected. This is settings/UI evidence,
 not native audio evidence; see [manifest](audio-exclusion-owned-ui/manifest.json).
+
+The owned server can be built with:
+
+```sh
+cargo build --locked -p fotwd --example capture_settings_fixture
+target/debug/examples/capture_settings_fixture <owned-empty-directory>
+```
+
+It installs no recorder and writes a short-lived launch URL to a private file.
+Reusing the fixture directory reopens only its synthetic known-key database.
+The owned-WebKit input scripts and both phase results are in the evidence folder.
 
 ![Owned audio settings fixture](audio-exclusion-owned-ui/settings.png)
 

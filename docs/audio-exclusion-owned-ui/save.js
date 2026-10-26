@@ -1,0 +1,15 @@
+const check=(value,message)=>{if(!value)throw new Error(message)};
+const wait=async test=>{for(let i=0;i<400;i++){if(test())return;await new Promise(r=>setTimeout(r,10));}throw new Error('actual settings UI did not settle');};
+const pane=document.getElementById('capture-settings'),spotify=document.getElementById('capture-spotify'),brave=document.getElementById('capture-brave'),save=document.getElementById('capture-save'),reload=document.getElementById('capture-reload'),summary=document.getElementById('capture-summary');
+await wait(()=>!pane.hidden&&captureDraftKnown&&!captureSaving);
+check(!spotify.checked&&!brave.checked,'owned initial encrypted store should default to both off');pane.open=true;
+spotify.click();brave.click();save.click();await wait(()=>!captureSaving);
+spotify.checked=false;brave.checked=false;reload.click();await wait(()=>spotify.checked&&brave.checked);
+check(summary.textContent.includes('Spotify, Brave'),'actual saved summary missing both choices');
+spotify.click();save.click();await wait(()=>!captureSaving);
+const stored=await api('/api/settings/capture');
+check(stored.settings.ignore_spotify===false&&stored.settings.ignore_brave===true,'actual settings handler did not preserve independent preferences');
+check(document.getElementById('capture-disclosure').textContent.includes('meetings in Brave'),'Brave scope warning absent');
+pane.open=false;
+check(summary.textContent.includes('next recording: Brave'),'saved next-recording policy must remain visible when collapsed');
+return {authenticatedStartup:true,actualSettingsApi:true,initialDefaultsOff:true,bothSavedAndReloaded:true,independentSave:true,collapsedSavedPolicy:true,stored:stored.settings,scope:'Owned real WebServer and SQLCipher store with public fixture key; no Keychain, recorder, capture, provider or model installed'};

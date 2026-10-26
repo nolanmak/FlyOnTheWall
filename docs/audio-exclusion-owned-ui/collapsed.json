@@ -1,14 +1,13 @@
 {
-  "bothPersisted" : true,
-  "braveWarning" : true,
-  "collapsedSavedPolicyVisible" : true,
-  "defaultsOff" : true,
+  "actualSettingsApi" : true,
+  "authenticatedStartup" : true,
+  "bothSavedAndReloaded" : true,
+  "collapsedSavedPolicy" : true,
   "independentSave" : true,
-  "nextRecordingOnly" : true,
-  "saveBounds" : {
-    "left" : 16,
-    "right" : 146.984375,
-    "width" : 130.984375
-  },
-  "scope" : "Owned nonpersistent WebKit, synthetic loopback settings server; no product launch or audio"
+  "initialDefaultsOff" : true,
+  "scope" : "Owned real WebServer and SQLCipher store with public fixture key; no Keychain, recorder, capture, provider or model installed",
+  "stored" : {
+    "ignore_brave" : true,
+    "ignore_spotify" : false
+  }
 }
