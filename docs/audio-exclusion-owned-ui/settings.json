@@ -2,6 +2,7 @@
   "bothPersisted" : true,
   "braveWarning" : true,
   "defaultsOff" : true,
+  "expandedSettingsVisible" : true,
   "independentSave" : true,
   "nextRecordingOnly" : true,
   "saveBounds" : {

@@ -1,0 +1,14 @@
+{
+  "bothPersisted" : true,
+  "braveWarning" : true,
+  "collapsedSavedPolicyVisible" : true,
+  "defaultsOff" : true,
+  "independentSave" : true,
+  "nextRecordingOnly" : true,
+  "saveBounds" : {
+    "left" : 16,
+    "right" : 146.984375,
+    "width" : 130.984375
+  },
+  "scope" : "Owned nonpersistent WebKit, synthetic loopback settings server; no product launch or audio"
+}

@@ -523,6 +523,12 @@ impl DaemonRecorder {
             ));
         }
         control.system_scope = (self.capture_scope)().map_err(RecorderError::Failed)?;
+        if stop.is_stopped() {
+            return Err(RecorderError::Failed(
+                "recording start cancelled during application resolution; capture was not started"
+                    .into(),
+            ));
+        }
         let transcription = (self.transcription)();
         if stop.is_stopped() {
             return Err(RecorderError::Failed(

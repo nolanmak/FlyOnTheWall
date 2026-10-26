@@ -64,6 +64,7 @@ const el = {
   ghPublic: document.getElementById("gh-public"),
   ghWholeLibrary: document.getElementById("gh-whole-library"),
   captureSettings: document.getElementById("capture-settings"),
+  captureSummary: document.getElementById("capture-summary"),
   captureSpotify: document.getElementById("capture-spotify"),
   captureBrave: document.getElementById("capture-brave"),
   captureSave: document.getElementById("capture-save"),
@@ -1639,6 +1640,8 @@ function onCaptureChange() { captureDraftKnown = true; paintCapturePolicy(); }
 function renderCaptureSettings(body) {
   captureSupported = body.supported === true;
   captureDraftKnown = !!body.settings;
+  const excluded = body.settings ? [body.settings.ignore_spotify && "Spotify", body.settings.ignore_brave && "Brave"].filter(Boolean) : null;
+  el.captureSummary.textContent = excluded ? "Audio exclusions for next recording: " + (excluded.join(", ") || "none") + (excluded.length && !captureSupported ? " (unsupported)" : "") : "Audio exclusions: saved choice unavailable";
   if (body.settings) {
     el.captureSpotify.checked = body.settings.ignore_spotify === true;
     el.captureBrave.checked = body.settings.ignore_brave === true;
@@ -1655,7 +1658,10 @@ async function loadCapture() {
   try { renderCaptureSettings(await api("/api/settings/capture")); }
   catch (e) {
     el.captureSettings.hidden = e.status === 404;
-    if (e.status !== 404) el.captureStatus.textContent = "Could not load audio exclusions. Retry with Reload saved choice.";
+    if (e.status !== 404) {
+      el.captureSummary.textContent = "Audio exclusions: saved choice unavailable";
+      el.captureStatus.textContent = "Could not load audio exclusions. Retry with Reload saved choice.";
+    }
   }
 }
 async function onCaptureSave() {
@@ -1670,6 +1676,7 @@ async function onCaptureSave() {
     if (body.error) el.captureStatus.textContent = "Not saved. " + body.error;
     else renderCaptureSettings(body);
   } catch (_) {
+    el.captureSummary.textContent = "Audio exclusions: save unconfirmed — reload saved choice";
     el.captureStatus.textContent = "Save could not be confirmed. Reload saved choice to check; your draft is still here.";
   } finally {
     captureSaving = false;

@@ -49,3 +49,18 @@ test('unreadable saved policy never silently becomes an unchecked replacement',(
   const {ctx,node}=harness();ctx.renderCaptureSettings({...response(),settings:null,error:'Corrupt saved policy'});
   assert.equal(node('capture-save').disabled,true);assert.match(node('capture-status').textContent,/Corrupt/);
 });
+test('collapsed summary shows saved next-recording policy without following an unsaved draft',()=>{
+  const {ctx,node}=harness();ctx.renderCaptureSettings(response(true,true));
+  assert.match(node('capture-summary').textContent,/next recording: Spotify, Brave/);
+  node('capture-brave').checked=false;ctx.onCaptureChange();
+  assert.match(node('capture-summary').textContent,/Spotify, Brave/);
+  ctx.renderCaptureSettings({...response(true,false),supported:false});
+  assert.match(node('capture-summary').textContent,/Spotify.*unsupported/);
+  ctx.renderCaptureSettings({...response(),settings:null,error:'Cannot read saved policy'});
+  assert.match(node('capture-summary').textContent,/unavailable/);
+});
+test('an unconfirmed save cannot keep advertising the previous saved choice as verified',async()=>{
+  const {ctx,node}=harness();ctx.renderCaptureSettings(response());node('capture-brave').checked=true;
+  ctx.api=async()=>{throw new Error('response lost after request')};await ctx.onCaptureSave();
+  assert.match(node('capture-summary').textContent,/unconfirmed/);
+});

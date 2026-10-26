@@ -25,8 +25,9 @@ Six settings-UI regressions were RED before implementation and are GREEN.
 Encrypted in-memory persistence, malformed settings, unsupported policy, immutable
 policy planning, installed helper metadata and authenticated API checks pass.
 A device-free recorder test asserts invalid policy cannot open capture or configure
-STT. Full local `just ci` passed: strict workspace lint, Rust tests/doctests,
-157 UI tests, dependency checks and the Windows audio seam.
+STT. Full local `just ci` passed after integrating main: 2,201 Rust tests/doctests
+passed, 0 failed, 16 opt-in ignored; 163 UI tests, strict workspace lint,
+dependency checks and the Windows audio seam passed.
 
 An owned nonpersistent WebKit window exercised actual checkbox/Save controls
 against a synthetic loopback settings server at 590px. Defaults, both saved,
@@ -60,8 +61,19 @@ and profile-selection regressions were RED before implementation, then GREEN;
 policy tests and strict workspace Clippy pass. New tests use only injected key-free
 resolvers and owned synthetic directory metadata, never a real Keychain.
 
-Acceptance in #215 remains open. Outstanding work includes cloud/fallback input
-coverage and signed-app native playback,
+The matrix now covers all five cases in local, cloud and fallback modes (15
+cases). A loopback WebSocket provider inspects actual uploaded PCM; injected
+network loss must demote both sources to local with a transport-budget reason
+before Stop. Local and fallback also verify actual inference/replay input, and
+all modes verify raw and decoded saved audio. No paid calls or credentials are
+used. A separate cancellation regression proves resolution cancelled by Stop
+cannot proceed to speech/provider configuration or capture.
+
+The collapsed settings summary shows the saved next-recording policy, retains
+it while an unsaved draft changes, and displays uncertainty after an unconfirmed
+save. Updated owned expanded/collapsed WebKit evidence is included.
+
+Acceptance in #215 remains open. Outstanding work includes signed-app native playback,
 helper churn, restart/rebuild and saved-audio/transcript qualification. No actual
 Spotify/Brave audio was captured, and none of these tests prove system routing.
 Installed-app updates introducing new helper identities during a recording also

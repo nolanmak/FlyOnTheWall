@@ -4,9 +4,10 @@
   "width": 590,
   "height": 850,
   "source_sha256": {
-    "crates/fotw-web/ui/app.js": "193f2b6084652658763067a2bcc2271d8a333bb57950372a674ac184811cae0a",
-    "crates/fotw-web/ui/index.html": "b5f5502c8a979d065b403a7a9c852744f00680e26f48918c369f77f6a2e97285"
+    "crates/fotw-web/ui/app.js": "c335ccc1e70ce11e3c37d63333bdae99b6d886cf3e09472a5e78eaff4d0d0574",
+    "crates/fotw-web/ui/index.html": "3bbbf7eb73e6d18eebfec2caa7f204175de130e07d079c72c7e46bb47fd2b24d"
   },
-  "image_sha256": "cd4f512348e982849e6daac2ec48cd7cc4d33e0bd4e1d870235af9fbd86f8561",
-  "limitations": "Mock HTTP persistence; encrypted real settings API separately tested by Rust tests. This does not establish native waveform exclusion."
+  "image_sha256": "c3e597bf768e4efeead44f82e7746d5bb4826375080b7ad243e66faafd9c0038",
+  "limitations": "Mock HTTP persistence; encrypted real settings API separately tested by Rust tests. This does not establish native waveform exclusion.",
+  "collapsed_image_sha256": "c042a1b8505ec76482f1052fb236b33ef094c65c57b6f7fb3d32fbb965566c43"
 }
