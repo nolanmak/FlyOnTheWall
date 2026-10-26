@@ -287,3 +287,16 @@ A V8 collection test releases 20 clean saved/aliased drafts while keeping the
 page context alive; this is not a WebKit process-memory measurement. Physical
 timing/keyboard/device acceptance and the remaining #13/#122/#123 criteria
 remain open.
+
+An owned, nonpersistent native WebKit view also exercised the committed
+[lifecycle fixture](../crates/fotw-web/tests/fixtures/notes-lifecycle-webkit.js)
+against `ui_preview` and its temporary encrypted library. Both
+[1440px light](notes-lifecycle/light-1440.json) and
+[390px dark](notes-lifecycle/dark-390.json) runs verified fresh external updates,
+an older real HTTP read held across a remount, failed offscreen saves, exact
+Unicode draft recovery, explicit retry, original anchor identity/time and 20
+clean navigations. The reports include hashes of the actual served scripts.
+[Screenshots: desktop](notes-lifecycle/light-1440.png),
+[narrow](notes-lifecycle/dark-390.png). Input used owned DOM events; no capture
+devices, providers, clipboard or global keyboard events were used. This does
+not measure WebKit garbage collection, RSS or physical keyboard/IME behavior.

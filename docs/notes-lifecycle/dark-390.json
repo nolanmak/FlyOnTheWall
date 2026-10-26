@@ -1,0 +1,22 @@
+{
+  "anchorIdentityAndTimePreserved" : true,
+  "browserGcForced" : false,
+  "captureDevicesUsed" : false,
+  "cleanNavigationCount" : 20,
+  "cleanNotesRefreshed" : true,
+  "clipboardUsed" : false,
+  "cssWidth" : 390,
+  "failedDraftPreserved" : true,
+  "inputMechanism" : "owned DOM events",
+  "notesReads" : 15,
+  "olderReadIgnored" : true,
+  "processMemoryMeasured" : false,
+  "providerCalls" : 0,
+  "realEncryptedBackend" : true,
+  "refusedFixtureWrites" : 3,
+  "retrySaved" : true,
+  "scriptHashes" : {
+    "app.js" : "bee308051398a5a6b20298c4bacfac8201fad1e7d6dfaaa3ae2a91f55d9bb26c",
+    "notes.js" : "952a7d2ad861cfa7831f51c15ffa15cf91fbd7a1908d98c1f91cce5607c89977"
+  }
+}
