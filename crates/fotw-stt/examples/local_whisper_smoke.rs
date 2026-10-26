@@ -3,11 +3,17 @@
 #[cfg(all(target_os = "macos", feature = "local-whisper"))]
 fn main() -> Result<(), String> {
     use fotw_stt::{WhisperEngine, local::RecognizerFactory};
-    use std::{io::Read, time::Instant};
+    use std::{
+        io::{Read, Write},
+        time::Instant,
+    };
 
     let args: Vec<_> = std::env::args().collect();
-    if args.len() != 4 {
-        return Err("Usage: local_whisper_smoke MODEL mono16k.f32le LEGS(1|2)".into());
+    let wait_for_start = args.len() == 5 && args[4] == "--wait-for-start";
+    if args.len() != 4 && !wait_for_start {
+        return Err(
+            "Usage: local_whisper_smoke MODEL mono16k.f32le LEGS(1|2) [--wait-for-start]".into(),
+        );
     }
     let legs: usize = args[3].parse().map_err(|_| "LEGS must be 1 or 2")?;
     if !(1..=2).contains(&legs) {
@@ -39,6 +45,19 @@ fn main() -> Result<(), String> {
     let mut recognizers = Vec::new();
     for _ in 0..legs {
         recognizers.push(engine.create().map_err(|e| e.message)?);
+    }
+    // An owned QA controller can load both apps' engines before releasing
+    // inference. EOF or a wrong byte fails without transcribing the fixture.
+    if wait_for_start {
+        println!("{}", serde_json::json!({"ready":true,"legs":legs}));
+        std::io::stdout().flush().map_err(|e| e.to_string())?;
+        let mut gate = [0];
+        std::io::stdin()
+            .read_exact(&mut gate)
+            .map_err(|e| e.to_string())?;
+        if gate[0] != b'1' {
+            return Err("Expected start byte 1 from the owned QA controller".into());
+        }
     }
     let inference_started = Instant::now();
     let texts = std::thread::scope(|scope| {
