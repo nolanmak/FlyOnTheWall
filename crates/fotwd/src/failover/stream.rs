@@ -23,6 +23,9 @@ use super::policy::{Decision, HandoffLimits, HandoffPolicy};
 /// Per-source input and shutdown settings. Contains a cloud credential; never
 /// serialize or log this object.
 pub struct FailoverConfig {
+    /// Optional immutable audio-processing identity, declared before input.
+    /// Such sources accept only provenance-bearing `write_processed` calls.
+    pub processing: Option<super::processing::Descriptor>,
     /// Cloud transport, forced into provider-confirmed final mode on admission.
     pub cloud: DeepgramStreamConfig,
     /// Shared loaded model factory, with an independent state per source.
@@ -49,6 +52,7 @@ impl FailoverConfig {
     #[must_use]
     pub fn new(cloud: DeepgramStreamConfig, local: Arc<dyn RecognizerFactory>) -> Self {
         Self {
+            processing: None,
             cloud,
             local,
             local_revision: None,
@@ -117,6 +121,7 @@ struct WorkerConfig {
 }
 
 struct SourceInputs {
+    processing: Option<super::processing::Journal>,
     writer: ReplayWriter,
     journal: CoverageJournal,
     reader: ReplayReader,
@@ -206,8 +211,23 @@ struct Publication {
     status: Status,
 }
 struct Writer {
+    processing: Option<super::processing::Journal>,
     audio: ReplayWriter,
     last_sync: Instant,
+}
+impl Writer {
+    fn sync(&mut self) -> std::io::Result<()> {
+        if let Some(processing) = self.processing.as_mut() {
+            processing.sync()?;
+        }
+        self.audio.sync()?;
+        self.last_sync = Instant::now();
+        Ok(())
+    }
+    fn seal(&mut self) -> std::io::Result<u64> {
+        self.sync()?;
+        self.audio.seal()
+    }
 }
 struct Shared {
     writer: Mutex<Writer>,
@@ -302,6 +322,52 @@ impl PreparedSource {
 }
 
 impl FailoverStream {
+    /// Append one processor-owned interval on the canonical source clock.
+    /// Must run on the blocking pump after original capture has been archived.
+    /// Invalid calls accept no samples; disk errors fence provider publication.
+    pub fn write_processed(&self, output: &fotw_pipeline::aec::Output) -> Result<(), SttError> {
+        if output.samples.is_empty()
+            || output.samples.len() > 16000
+            || output.samples.iter().any(|s| !s.is_finite())
+        {
+            return Err(failure("invalid processed input"));
+        }
+        if self.shared.stop_requested.load(Ordering::Acquire) {
+            return Err(failure("source input is frozen"));
+        }
+        let mut writer = self.shared.writer.lock().unwrap_or_else(|p| p.into_inner());
+        if self.shared.stop_requested.load(Ordering::Acquire) {
+            return Err(failure("source input is frozen"));
+        }
+        let processing = writer
+            .processing
+            .as_mut()
+            .ok_or_else(|| failure("audio processing was not declared before capture"))?;
+        processing
+            .check(output.epoch, output.start_sample, output.samples.len())
+            .map_err(|e| failure(e.to_string()))?;
+        let pcm = fotw_pipeline::resample::Downmixer::to_i16(&output.samples);
+        let result = processing
+            .record(output.epoch, output.start_sample, output.kind, &pcm)
+            .and_then(|()| processing.sync())
+            .and_then(|()| writer.audio.append(&pcm))
+            .and_then(|()| {
+                if writer.last_sync.elapsed() >= Duration::from_secs(1) {
+                    writer.sync()?;
+                }
+                Ok(())
+            });
+        if let Err(error) = result {
+            let error = failure(error.to_string());
+            self.shared.terminal(Some(error.clone()));
+            return Err(error);
+        }
+        self.shared
+            .end
+            .store(writer.audio.end_sample(), Ordering::Release);
+        self.shared.wake.notify_one();
+        Ok(())
+    }
     /// Prepare durable source files and preflight the real local model before
     /// opening cloud transport. Session admission must call this before capture
     /// and wire pending-audio retirement/deletion before enabling the mode.
@@ -334,6 +400,9 @@ impl FailoverStream {
             .local_plan()
             .validate()
             .map_err(|e| failure(e.to_string()))?;
+        if let Some(processing) = config.processing.as_ref() {
+            processing.validate().map_err(|e| failure(e.to_string()))?;
+        }
         let local = Arc::clone(&config.local);
         let recognizer = tokio::task::spawn_blocking(move || local.create())
             .await
@@ -360,24 +429,49 @@ impl FailoverStream {
             capabilities: SttCapabilities::deepgram(),
         };
         let fallback = config.local_plan();
+        let processing_descriptor = config.processing.clone();
         let directory = dir.to_owned();
-        let (writer, journal, reader, recognizer) = tokio::task::spawn_blocking(move || {
-            let writer = ReplayWriter::create(&directory, &session_id, source(leg), anchor)
+        let (writer, journal, reader, recognizer, processing) =
+            tokio::task::spawn_blocking(move || {
+                let writer = match processing_descriptor.as_ref() {
+                    Some(descriptor) => ReplayWriter::create_with_processing(
+                        &directory,
+                        &session_id,
+                        source(leg),
+                        anchor,
+                        &descriptor
+                            .fingerprint()
+                            .map_err(|e| failure(e.to_string()))?,
+                    ),
+                    None => ReplayWriter::create(&directory, &session_id, source(leg), anchor),
+                }
                 .map_err(|e| failure(e.to_string()))?;
-            let journal = CoverageJournal::create_with_fallback(
-                &directory,
-                &session_id,
-                leg,
-                initial,
-                Some(fallback),
-            )
-            .map_err(|e| failure(e.to_string()))?;
-            let reader = ReplayReader::open(&directory, &session_id, source(leg))
+                let processing = processing_descriptor
+                    .map(|descriptor| {
+                        super::processing::Journal::create(
+                            &directory,
+                            &session_id,
+                            source(leg),
+                            anchor,
+                            descriptor,
+                        )
+                    })
+                    .transpose()
+                    .map_err(|e| failure(e.to_string()))?;
+                let journal = CoverageJournal::create_with_fallback(
+                    &directory,
+                    &session_id,
+                    leg,
+                    initial,
+                    Some(fallback),
+                )
                 .map_err(|e| failure(e.to_string()))?;
-            Ok::<_, SttError>((writer, journal, reader, recognizer))
-        })
-        .await
-        .map_err(|e| failure(e.to_string()))??;
+                let reader = ReplayReader::open(&directory, &session_id, source(leg))
+                    .map_err(|e| failure(e.to_string()))?;
+                Ok::<_, SttError>((writer, journal, reader, recognizer, processing))
+            })
+            .await
+            .map_err(|e| failure(e.to_string()))??;
         let (cloud, cloud_events) =
             DeepgramStream::open(config.cloud.clone().with_confirmed_finals());
         let worker_config = WorkerConfig {
@@ -394,6 +488,7 @@ impl FailoverStream {
         Self::launch(
             worker_config,
             SourceInputs {
+                processing,
                 writer,
                 journal,
                 reader,
@@ -422,10 +517,19 @@ impl FailoverStream {
         let (config, inputs) = tokio::task::spawn_blocking(move || {
             let prefix_writer = if prefix_end.is_some() {
                 Some(
-                    ReplayWriter::resume_prefix(
+                    ReplayWriter::resume_prefix_validated(
                         &directory,
                         &request.session_id,
                         source(request.source),
+                        |reader| {
+                            super::processing::validate(
+                                &directory,
+                                &request.session_id,
+                                source(request.source),
+                                reader,
+                            )
+                            .map(|_| ())
+                        },
                     )
                     .map_err(|e| failure(e.to_string()))?,
                 )
@@ -452,10 +556,21 @@ impl FailoverStream {
             }
             let mut writer = match prefix_writer {
                 Some(writer) => writer,
-                None => {
-                    ReplayWriter::resume(&directory, &request.session_id, source(request.source))
-                        .map_err(|e| failure(e.to_string()))?
-                }
+                None => ReplayWriter::resume_validated(
+                    &directory,
+                    &request.session_id,
+                    source(request.source),
+                    |reader| {
+                        super::processing::validate(
+                            &directory,
+                            &request.session_id,
+                            source(request.source),
+                            reader,
+                        )
+                        .map(|_| ())
+                    },
+                )
+                .map_err(|e| failure(e.to_string()))?,
             };
             let end = prefix_end.unwrap_or(writer.end_sample());
             if previous_through > end || end > writer.end_sample() {
@@ -498,6 +613,7 @@ impl FailoverStream {
             Ok::<_, SttError>((
                 config,
                 SourceInputs {
+                    processing: None,
                     writer,
                     journal,
                     reader,
@@ -527,6 +643,7 @@ impl FailoverStream {
         transport: Option<(DeepgramStream, mpsc::UnboundedReceiver<StreamEvent>)>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), SttError> {
         let SourceInputs {
+            processing,
             writer,
             journal,
             reader,
@@ -543,6 +660,7 @@ impl FailoverStream {
         let (events, receiver) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             writer: Mutex::new(Writer {
+                processing,
                 audio: writer,
                 last_sync: Instant::now(),
             }),
@@ -639,10 +757,12 @@ impl FailoverStream {
         if self.shared.stop_requested.load(Ordering::Acquire) {
             return Err(failure("source input is frozen"));
         }
+        if writer.processing.is_some() {
+            return Err(failure("declared audio processing requires tagged input"));
+        }
         let result = writer.audio.append(pcm).and_then(|()| {
             if writer.last_sync.elapsed() >= Duration::from_secs(1) {
-                writer.audio.sync()?;
-                writer.last_sync = Instant::now();
+                writer.sync()?;
             }
             Ok(())
         });
@@ -673,7 +793,6 @@ impl FailoverStream {
                         .writer
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .audio
                         .seal()
                 };
                 if let Err(error) = result {

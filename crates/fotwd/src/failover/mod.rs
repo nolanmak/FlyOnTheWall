@@ -5,4 +5,5 @@
 
 pub mod coverage;
 pub mod policy;
+pub mod processing;
 pub mod stream;

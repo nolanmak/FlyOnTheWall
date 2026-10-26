@@ -119,6 +119,8 @@ struct Header {
     source: ReplaySource,
     sample_rate: u32,
     first_sample: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    processing_id: Option<String>,
 }
 
 /// Exclusive offline restoration of one canonical source. The caller must
@@ -152,6 +154,7 @@ impl ReconstructionOwner {
             _ => return Err(invalid("restoration source is not an ordinary file")),
         };
         let expected = Header {
+            processing_id: None,
             session_id: session.into(),
             source,
             sample_rate: SAMPLE_RATE,
@@ -469,6 +472,12 @@ pub(crate) fn retirement_guard(
     Ok(Some(ReplayRetirementGuard { _owners: owners }))
 }
 
+fn valid_processing_id(id: &str) -> bool {
+    id.len() == 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -497,10 +506,40 @@ impl ReplayWriter {
         source: ReplaySource,
         first_sample: u64,
     ) -> io::Result<Self> {
+        Self::create_inner(dir, session_id, source, first_sample, None)
+    }
+    /// Declare an immutable processing configuration fingerprint in the audio
+    /// header, so losing a sidecar cannot reclassify processed audio as legacy.
+    pub fn create_with_processing(
+        dir: &Path,
+        session_id: &str,
+        source: ReplaySource,
+        first_sample: u64,
+        processing_id: &str,
+    ) -> io::Result<Self> {
+        if !valid_processing_id(processing_id) {
+            return Err(invalid("invalid processing fingerprint"));
+        }
+        Self::create_inner(
+            dir,
+            session_id,
+            source,
+            first_sample,
+            Some(processing_id.into()),
+        )
+    }
+    fn create_inner(
+        dir: &Path,
+        session_id: &str,
+        source: ReplaySource,
+        first_sample: u64,
+        processing_id: Option<String>,
+    ) -> io::Result<Self> {
         if session_id.is_empty() || session_id.len() > 512 {
             return Err(invalid("invalid replay session identity"));
         }
         let header = serde_json::to_vec(&Header {
+            processing_id,
             session_id: session_id.to_owned(),
             source,
             sample_rate: SAMPLE_RATE,
@@ -551,12 +590,24 @@ impl ReplayWriter {
     /// before any new PCM is appended. Identity/format validation precedes all
     /// mutation. A still-live writer causes an immediate error, never a wait.
     pub fn resume(dir: &Path, session_id: &str, source: ReplaySource) -> io::Result<Self> {
+        Self::resume_validated(dir, session_id, source, |_| Ok(()))
+    }
+
+    /// Validate caller-owned processing evidence under the source lease before
+    /// any torn-sample repair or append capability is granted.
+    pub fn resume_validated(
+        dir: &Path,
+        session_id: &str,
+        source: ReplaySource,
+        validate: impl FnOnce(&mut ReplayReader) -> io::Result<()>,
+    ) -> io::Result<Self> {
         let owner = source.lock(dir)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(source.path(dir))?;
         let mut reader = ReplayReader::from_file(dir, file, session_id, source)?;
+        validate(&mut reader)?;
         let sealed = reader.sealed_end()?.is_some();
         let length = reader.file.metadata()?.len();
         let audio_bytes = length
@@ -589,12 +640,24 @@ impl ReplayWriter {
     /// or granting append/seal capability. The complete prefix is synced;
     /// its observed end does not certify capture or transcription completion.
     pub fn resume_prefix(dir: &Path, session_id: &str, source: ReplaySource) -> io::Result<Self> {
+        Self::resume_prefix_validated(dir, session_id, source, |_| Ok(()))
+    }
+
+    /// Validate caller-owned evidence under the prefix lease without truncating
+    /// any bytes or granting append/seal capability.
+    pub fn resume_prefix_validated(
+        dir: &Path,
+        session_id: &str,
+        source: ReplaySource,
+        validate: impl FnOnce(&mut ReplayReader) -> io::Result<()>,
+    ) -> io::Result<Self> {
         let owner = source.lock(dir)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(source.path(dir))?;
-        let reader = ReplayReader::from_file(dir, file, session_id, source)?;
+        let mut reader = ReplayReader::from_file(dir, file, session_id, source)?;
+        validate(&mut reader)?;
         let sealed = reader.sealed_end()?.is_some();
         let end_sample = reader.available_end()?;
         reader.file.sync_data()?;
@@ -783,6 +846,11 @@ pub struct ReplayReader {
 }
 
 impl ReplayReader {
+    /// Immutable audio-processing fingerprint, absent on legacy/original input.
+    #[must_use]
+    pub fn processing_id(&self) -> Option<&str> {
+        self.header.processing_id.as_deref()
+    }
     /// Whether this already validated reader belongs to the expected source.
     #[must_use]
     pub fn has_identity(&self, session: &str, source: ReplaySource) -> bool {
@@ -825,6 +893,10 @@ impl ReplayReader {
         if header.session_id != session_id
             || header.source != source
             || header.sample_rate != SAMPLE_RATE
+            || header
+                .processing_id
+                .as_deref()
+                .is_some_and(|id| !valid_processing_id(id))
         {
             return Err(invalid("replay identity or sample rate mismatch"));
         }

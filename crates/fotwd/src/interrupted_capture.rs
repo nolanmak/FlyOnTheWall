@@ -60,6 +60,7 @@ fn retained_sources(dir: &Path, session: &str) -> io::Result<Vec<RetainedLease>>
             "stt-complete.json",
             "stt-projected.json",
             "stt-prefix-projected.json",
+            "stt-processing.jsonl",
         ] {
             optional_ordinary(&dir.join(format!("{name}.{suffix}")))?;
         }
@@ -76,7 +77,8 @@ fn retained_sources(dir: &Path, session: &str) -> io::Result<Vec<RetainedLease>>
             leases.push(RetainedLease(file));
         }
         if present(&dir.join(format!("{name}.stt16")))? {
-            let reader = ReplayReader::open(dir, session, replay)?;
+            let mut reader = ReplayReader::open(dir, session, replay)?;
+            crate::failover::processing::validate(dir, session, replay, &mut reader)?;
             // The complete prefix can validate committed receipts even when
             // the last write left half a sample. Indexing never repairs it or
             // claims a final replay boundary.

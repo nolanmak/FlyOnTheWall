@@ -552,6 +552,217 @@ async fn wait_open(events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn declared_audio_processing_requires_tagged_input_and_replays_exact_saved_pcm() {
+    use fotw_pipeline::{
+        aec::{Output, OutputKind},
+        replay::{ReplayReader, ReplaySource},
+        resample::Downmixer,
+    };
+    use fotwd::failover::processing::{Descriptor, validate};
+    let (cloud, _, server) = silent_provider().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = FailoverConfig::new(cloud, Arc::new(Factory));
+    config.processing = Some(Descriptor {
+        backend: "fixture-aec".into(),
+        version: "1.0".into(),
+        profile: "profile-v1".into(),
+    });
+    config.cloud_settle = Duration::ZERO;
+    let (stream, mut events) = FailoverStream::open(dir.path(), config).await.unwrap();
+    wait_open(&mut events).await;
+    assert!(
+        stream.write(&[100; 160]).is_err(),
+        "untagged input cannot enter a declared processed source"
+    );
+    let output = Output {
+        epoch: 1,
+        start_sample: 0,
+        samples: vec![0.125; 160],
+        kind: OutputKind::Cleaned,
+    };
+    stream.write_processed(&output).unwrap();
+    assert!(
+        stream.write_processed(&output).is_err(),
+        "duplicate source positions cannot append twice"
+    );
+    let mut reader = ReplayReader::open(dir.path(), "s", ReplaySource::System).unwrap();
+    let saved = validate(dir.path(), "s", ReplaySource::System, &mut reader)
+        .unwrap()
+        .unwrap();
+    assert_eq!((saved.end_sample, saved.cleaned_samples), (160, 160));
+    assert_eq!(
+        reader.read_from(0, 160).unwrap(),
+        Downmixer::to_i16(&output.samples)
+    );
+    assert!(stream.finish().await, "{:?}", stream.status());
+    drop(stream);
+    server.await.unwrap();
+    let request = || fotwd::failover::stream::LocalResumeConfig {
+        session_id: "s".into(),
+        source: Source::System,
+        local: Arc::new(Factory),
+        revision: None,
+        stop_timeout: Duration::from_secs(2),
+    };
+    let (restarted, _) = FailoverStream::resume_local(dir.path(), request())
+        .await
+        .unwrap();
+    assert!(restarted.finish().await);
+    drop(restarted);
+    let processing = dir.path().join("system.stt-processing.jsonl");
+    let text = std::fs::read_to_string(&processing).unwrap();
+    let mut lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    lines[1]["pcm_sha256"] = serde_json::Value::String("0".repeat(64));
+    let edited = lines
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    std::fs::write(&processing, &edited).unwrap();
+    let canonical = std::fs::read(dir.path().join("system.stt16")).unwrap();
+    let coverage = std::fs::read(dir.path().join("system.stt-coverage.jsonl")).unwrap();
+    assert!(
+        FailoverStream::resume_local(dir.path(), request())
+            .await
+            .is_err(),
+        "restart cannot trust audio whose processing digest differs"
+    );
+    assert_eq!(std::fs::read_to_string(&processing).unwrap(), edited);
+    assert_eq!(
+        std::fs::read(dir.path().join("system.stt16")).unwrap(),
+        canonical
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("system.stt-coverage.jsonl")).unwrap(),
+        coverage
+    );
+    std::fs::remove_file(processing).unwrap();
+    assert!(
+        FailoverStream::resume_local(dir.path(), request())
+            .await
+            .is_err(),
+        "missing processing evidence cannot silently turn a processed source into legacy input"
+    );
+}
+
+struct FixtureAec;
+impl fotw_pipeline::aec::Backend for FixtureAec {
+    type Error = ();
+    fn frame_samples(&self) -> usize {
+        160
+    }
+    fn delay_samples(&self) -> usize {
+        0
+    }
+    fn analyze_render(&mut self, _: &[f32]) -> Result<(), ()> {
+        Ok(())
+    }
+    fn process_capture(&mut self, input: &[f32], output: &mut [f32]) -> Result<(), ()> {
+        for (a, b) in output.iter_mut().zip(input) {
+            *a = *b * 0.5;
+        }
+        Ok(())
+    }
+    fn reset(&mut self) -> Result<(), ()> {
+        Ok(())
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_output_roundtrips_through_durable_stream_without_changing_original_wal() {
+    use fotw_pipeline::{
+        aec::Config as AdapterConfig,
+        aec_worker::{Config, Worker},
+        replay::{ReplayReader, ReplaySource},
+        resample::Downmixer,
+        wal::{SessionWal, TrackFormat},
+    };
+    use fotwd::failover::processing::{Descriptor, validate};
+    let root = tempfile::tempdir().unwrap();
+    let mut wal =
+        SessionWal::create_with_formats(root.path(), TrackFormat::new(16000, 1), None).unwrap();
+    let session = wal.manifest().id.clone();
+    let dir = wal.dir().to_path_buf();
+    let original = [vec![0.25; 320], vec![0.75; 160]].concat();
+    wal.write_system(&original).unwrap();
+    wal.flush().unwrap();
+    let raw_before = std::fs::read(dir.join("system.pcm")).unwrap();
+    let (mut cloud, _, server) = silent_provider().await;
+    cloud.normalizer.session_id = session.clone();
+    let mut config = FailoverConfig::new(cloud, Arc::new(Factory));
+    config.processing = Some(Descriptor {
+        backend: "fixture-aec".into(),
+        version: "1.0".into(),
+        profile: "half-gain-v1".into(),
+    });
+    config.cloud_settle = Duration::ZERO;
+    let (stream, mut events) = FailoverStream::open(&dir, config).await.unwrap();
+    wait_open(&mut events).await;
+    let mut worker = Worker::new(
+        FixtureAec,
+        Config {
+            adapter: AdapterConfig {
+                frame_samples: 160,
+                delay_samples: 0,
+                max_wait_samples: 320,
+                max_reference_samples: 640,
+            },
+            queued_blocks: 2,
+            block_samples: 320,
+            pending_samples: 640,
+            deadline_ms: 1000,
+        },
+        1,
+        0,
+    )
+    .unwrap();
+    let mut output = Vec::new();
+    worker
+        .submit(1, 0, &original[..320], Some(&[0.1; 320]), 0, &mut output)
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while worker.pending_samples() > 0 {
+        worker.poll(0, &mut output).unwrap();
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    worker
+        .submit(1, 320, &original[320..], None, 0, &mut output)
+        .unwrap();
+    worker.finish(0, &mut output).unwrap();
+    while worker.status().is_running() || worker.pending_samples() > 0 {
+        worker.poll(0, &mut output).unwrap();
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    for block in &output {
+        stream.write_processed(block).unwrap();
+    }
+    assert!(stream.finish().await, "{:?}", stream.status());
+    let mut reader = ReplayReader::open(&dir, &session, ReplaySource::System).unwrap();
+    let saved = validate(&dir, &session, ReplaySource::System, &mut reader)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (saved.end_sample, saved.cleaned_samples, saved.raw_samples),
+        (480, 320, 160)
+    );
+    let expected = Downmixer::to_i16(&[vec![0.125; 320], vec![0.75; 160]].concat());
+    assert_eq!(reader.read_from(0, 480).unwrap(), expected);
+    assert_eq!(std::fs::read(dir.join("system.pcm")).unwrap(), raw_before);
+    assert_eq!(
+        raw_before,
+        Downmixer::to_i16(&original)
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect::<Vec<_>>()
+    );
+    drop(stream);
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_connected_provider_without_finals_demotes_for_speech_and_replays_the_whole_pending_interval()
  {
     let (cloud, _, server) = silent_provider().await;

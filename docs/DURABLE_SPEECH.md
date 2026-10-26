@@ -1,5 +1,51 @@
 # Durable speech handoff runtime
 
+## Processed input and replay identity
+
+The durable stream can explicitly declare `FailoverConfig::processing` before
+source creation. Its backend/version/profile identifiers are validated and
+fingerprinted into the canonical audio header. Ordinary sources keep their
+existing header bytes and behavior. A declared processed source accepts only
+`write_processed` intervals with an absolute source offset, route epoch and
+cleaned/original-fallback classification. Untagged, duplicate, discontinuous,
+nonfinite, empty and oversized calls accept no new input.
+
+Before appending or exposing processed PCM to an ASR provider, the blocking pump
+writes and syncs the source's `stt-processing.jsonl` interval record. Each record
+binds the exact quantized PCM with SHA-256. The declaration and records describe
+audio processing, independently of the ASR provider epochs. The caller must
+archive original capture audio before submitting it to the AEC worker.
+
+Local restart validates the declaration, canonical fingerprint, contiguous
+intervals, route epochs and every saved PCM digest under the exclusive source
+lease before any torn-sample repair, inference or journal mutation. Reads are
+bounded to 4096 bytes per metadata record and 16000 PCM samples per interval;
+validation retains only aggregate counts. A missing sidecar remains detectable
+from the canonical header. Altered, incomplete, unknown or unsupported processing
+evidence is refused without rewriting those files.
+
+Raw reconstruction cannot acquire or reuse an ordinary raw recipe for processed
+input, including when processing metadata is malformed or missing. This version
+replays fully retained, verified processed PCM; it does not recreate lost cleaned
+PCM from original audio or recover a partially written processing interval.
+Such sources remain incomplete with retained audio/evidence. Existing legacy
+unprocessed recovery retains its current behavior. Older application versions
+may refuse the new processed header; existing original-source files are unchanged.
+
+The worker-to-durable-stream test uses generated audio, a fake AEC backend and a
+loopback provider. It verifies cleaned and missing-reference fallback samples,
+metadata roundtrip and byte-for-byte original WAL preservation. Other runtime
+RED/GREEN tests establish tagged-only admission, invalid digest/missing-sidecar
+restart refusal, raw-recipe exclusion and validation before PCM repair.
+
+This API does not enable AEC in recording. Capture-clock conversion, native
+reference alignment and capture-pump ownership still need integration; backend
+quality and physical acceptance remain separate. Per-interval metadata sync cost
+has not been qualified for live capture. Existing provider choices and defaults
+are unchanged.
+
+## Speech policy and lifecycle
+
 Select `fotwd stt fallback --model <name|absolute-path> [--language <code>]`
 to persist an explicit Deepgram preference with an on-device backup. Both CLI
 recording and dashboard Start read this choice. Deepgram remains the default;
