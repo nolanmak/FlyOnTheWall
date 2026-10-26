@@ -1,0 +1,17 @@
+{
+  "afterStop" : {
+    "utteranceHeight" : 168,
+    "visibleReadingHeight" : 318.75
+  },
+  "beforeStop" : {
+    "utteranceHeight" : 168,
+    "visibleReadingHeight" : 318.75
+  },
+  "copyReachable" : true,
+  "cssHeight" : 425,
+  "cssWidth" : 195,
+  "returnReachable" : true,
+  "savedSelectionPreserved" : true,
+  "startReachable" : true,
+  "stopReachable" : true
+}
