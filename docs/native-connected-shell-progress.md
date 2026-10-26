@@ -114,6 +114,11 @@ waiting for persistence after Idle. Additional tests cover finisher panic,
 shutdown-before-Start, service failure visibility, old state-file compatibility,
 and native Settings handoff routing. Existing recorder/shell regressions remain.
 
+An additional isolated `runloop_stop` example reproduced timer-only Quit hanging
+beyond four seconds. A shared stop helper now posts an application-defined event
+to its own AppKit queue; the same no-input example returned in 201 ms. All five
+bootstrap/quit exit paths use it. Shell tests and strict shell Clippy pass.
+
 ## Remaining acceptance
 
 - Full repository/hosted checks and signed review-bundle results must accompany

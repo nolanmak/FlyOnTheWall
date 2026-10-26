@@ -54,8 +54,11 @@ use block2::RcBlock;
 use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use muda::MenuEvent;
 use objc2::MainThreadMarker;
-use objc2_app_kit::{NSAlert, NSApplication, NSApplicationActivationPolicy};
-use objc2_foundation::{NSTimeInterval, NSTimer};
+use objc2_app_kit::{
+    NSAlert, NSApplication, NSApplicationActivationPolicy, NSEvent, NSEventModifierFlags,
+    NSEventType,
+};
+use objc2_foundation::{NSPoint, NSTimeInterval, NSTimer};
 use tray_icon::TrayIconEvent;
 
 use crate::clock::Monotonic;
@@ -183,7 +186,7 @@ pub fn run_bootstrapped<H: SurfaceHost + 'static>(
                 let now = native.now();
                 native.runtime.on_event(SurfaceEvent::Terminate, now);
             } else {
-                timer_app.stop(None);
+                stop_app(&timer_app);
                 return;
             }
         }
@@ -198,14 +201,14 @@ pub fn run_bootstrapped<H: SurfaceHost + 'static>(
                         let error = error.to_string();
                         show_startup_error(&error, mtm);
                         *timer_result.borrow_mut() = Err(error);
-                        timer_app.stop(None);
+                        stop_app(&timer_app);
                     }
                 },
-                Ok(BootstrapUpdate::Reentered) => timer_app.stop(None),
+                Ok(BootstrapUpdate::Reentered) => stop_app(&timer_app),
                 Err(error) => {
                     show_startup_error(&error, mtm);
                     *timer_result.borrow_mut() = Err(error);
-                    timer_app.stop(None);
+                    stop_app(&timer_app);
                 }
             }
         }
@@ -218,7 +221,7 @@ pub fn run_bootstrapped<H: SurfaceHost + 'static>(
             }
             native.pump();
             if native.runtime.should_exit() {
-                timer_app.stop(None);
+                stop_app(&timer_app);
             }
         }
     });
@@ -232,6 +235,45 @@ pub fn run_bootstrapped<H: SurfaceHost + 'static>(
     // Tear down native/global resources before returning to runtime shutdown.
     shell.borrow_mut().take();
     result.borrow().clone()
+}
+
+fn stop_app(app: &NSApplication) {
+    // A timer is not an NSEvent. Wake the application's own event queue so
+    // AppKit observes the stop flag even when the user supplies no input.
+    app.stop(None);
+    if let Some(event) = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+        NSEventType::ApplicationDefined,
+        NSPoint::new(0.0, 0.0),
+        NSEventModifierFlags::empty(),
+        0.0,
+        0,
+        None,
+        0,
+        0,
+        0,
+    ) {
+        app.postEvent_atStart(&event, true);
+    }
+}
+
+/// Run an owned empty AppKit loop and stop it from a timer without user input.
+/// Creates no surfaces, daemon, capture or global input controls.
+///
+/// # Errors
+/// If called off the AppKit main thread.
+pub fn probe_runloop_stop() -> Result<std::time::Duration, String> {
+    let mtm = MainThreadMarker::new().ok_or_else(|| ShellError::NotMainThread.to_string())?;
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    let callback_app = app.clone();
+    let block = RcBlock::new(move |_timer: NonNull<NSTimer>| stop_app(&callback_app));
+    // SAFETY: invoked only by this owned main-thread run loop.
+    let timer =
+        unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.2, false, &block) };
+    let began = Instant::now();
+    app.run();
+    timer.invalidate();
+    Ok(began.elapsed())
 }
 
 fn show_startup_error(error: &str, mtm: MainThreadMarker) {

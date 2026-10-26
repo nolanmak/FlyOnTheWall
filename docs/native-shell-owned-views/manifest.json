@@ -4,7 +4,7 @@
   "source_sha256": {
     "crates/fotw-shell/src/platform/macos/pill.rs": "e81f25a481713c58c27b3ef364879aec14fd2e6c25477759ee44c6e0347d9dea",
     "crates/fotw-shell/src/platform/macos/prompt.rs": "bb675985083671d1d671887e7d5420906b41c58be7e6e0912dc3d631eb00b4ce",
-    "crates/fotw-shell/src/platform/macos/mod.rs": "4a3f714aa1e5ecc261666023f43a75bd744b9d04f2a3a5c8cc30fe5e77b3c457",
+    "crates/fotw-shell/src/platform/macos/mod.rs": "bfc94c35ef09e38ba3263f290a0d5c6effe749059f16e9be6bdf09d4909198ec",
     "crates/fotw-shell/src/surface.rs": "123e39182ff57b3f3d3b825b063fa6971df3db53cc0933bf70ca7eb8368051d5",
     "crates/fotwd/src/native_host.rs": "fdf477a88a87f93489401c42ca60fc8d6bd64e5199398410c3fe91636df56882",
     "crates/fotwd/src/native_bridge.rs": "5b61c1b3f1edf31f5f4c2d558a3a890d7bff86d97339e481e26c2c02e48caab6",
@@ -26,5 +26,10 @@
     "Full-screen/space behavior, screen-share exclusion, scaling/accessibility acceptance",
     "Transcription quality or long-meeting reliability"
   ],
-  "application_events": "Owned Objective-C selectors queue a single reopen/dashboard request and a single coordinated Quit request, suppressing immediate AppKit termination; no real OS quit/reopen event or global shortcuts sent"
+  "application_events": "Owned Objective-C selectors queue a single reopen/dashboard request and a single coordinated Quit request, suppressing immediate AppKit termination; no real OS quit/reopen event or global shortcuts sent",
+  "runloop_stop": {
+    "regression": "Timer-only stop exceeded 4-second owned-child timeout",
+    "fixed": "Owned empty AppKit loop stopped without input in 201.163417ms",
+    "scope": "No windows, tray, daemon, capture, credentials or global input controls"
+  }
 }

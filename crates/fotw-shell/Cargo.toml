@@ -59,6 +59,8 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
   "NSFont",
   "NSFontDescriptor",
   "NSGraphics",
+  "NSGraphicsContext",
+  "NSEvent",
   "NSImage",
   "NSMenu",
   "NSPanel",
