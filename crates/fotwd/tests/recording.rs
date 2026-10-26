@@ -483,3 +483,283 @@ async fn live_status_names_the_capture_session_not_the_saved_meeting() {
     assert!(until(|| !rec.status().is_active()).await);
     assert!(rec.status().session_id.is_none());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_old_native_stop_target_cannot_stop_a_new_recording() {
+    let root = tmpdir("native-stale-stop");
+    let rec = recorder(&root.join("sessions"), Arc::new(AtomicU64::new(0)));
+    rec.start().unwrap();
+    let old = rec.observe().stop_target().cloned().unwrap();
+    rec.stop().unwrap();
+    assert!(until(|| rec.status().state == RecordingState::Idle).await);
+    rec.start().unwrap();
+    let result = rec.stop_observed(&old);
+    assert!(
+        result.is_err(),
+        "a stale native Stop changed the replacement recording"
+    );
+    assert_eq!(rec.status().state, RecordingState::Recording);
+    let current = rec.observe().stop_target().cloned().unwrap();
+    assert_eq!(
+        rec.stop_observed(&current).unwrap().state,
+        RecordingState::Finishing
+    );
+    assert!(until(|| rec.status().state == RecordingState::Idle).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_stop_targets_cannot_cross_recorder_instances() {
+    let aroot = tmpdir("native-stop-owner-a");
+    let broot = tmpdir("native-stop-owner-b");
+    let a = recorder(&aroot.join("sessions"), Arc::new(AtomicU64::new(0)));
+    let b = recorder(&broot.join("sessions"), Arc::new(AtomicU64::new(0)));
+    a.start().unwrap();
+    b.start().unwrap();
+    let a_target = a.observe().stop_target().cloned().unwrap();
+    assert!(
+        b.stop_observed(&a_target).is_err(),
+        "another recorder's target must not authorize Stop"
+    );
+    assert_eq!(b.status().state, RecordingState::Recording);
+    a.stop_observed(&a_target).unwrap();
+    b.stop().unwrap();
+    assert!(
+        until(
+            || a.status().state == RecordingState::Idle && b.status().state == RecordingState::Idle
+        )
+        .await
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_native_observation_has_no_stop_target() {
+    let root = tmpdir("native-idle-observation");
+    let rec = recorder(&root.join("sessions"), Arc::new(AtomicU64::new(0)));
+    let observation = rec.observe();
+    assert_eq!(observation.status().state, RecordingState::Idle);
+    assert!(observation.stop_target().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_native_stop_target_exists_during_setup_and_cannot_reach_the_next_attempt() {
+    struct Release(Arc<Gate>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+    let root = tmpdir("native-stop-during-setup");
+    let gate = Arc::new(Gate::default());
+    let _release = Release(Arc::clone(&gate));
+    let tap_gate = Arc::clone(&gate);
+    let rec = Arc::new(DaemonRecorder::with_parts(
+        root.join("sessions"),
+        tokio::runtime::Handle::current(),
+        fotwd::session::SegmentTap::default(),
+        fotwd::recording::ReadyTap::default(),
+        Box::new(move || {
+            tap_gate.hold();
+            Ok((
+                Box::new(FileAudioSource::from_wav(
+                    TapId::system_default(),
+                    tone(30.0),
+                    ReplaySpeed::Realtime,
+                )),
+                None,
+            ))
+        }),
+        Box::new(|| fotwd::session::Transcription::Disabled),
+        Box::new(|_, _| None),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    ));
+    let start_rec = Arc::clone(&rec);
+    let start = tokio::task::spawn_blocking(move || start_rec.start());
+    assert!(until(|| rec.status().state == RecordingState::Starting).await);
+    let observed = rec.observe();
+    assert!(observed.status().session_id.is_none());
+    let old = observed
+        .stop_target()
+        .cloned()
+        .expect("setup must already own its stop target");
+    let stopped = rec.stop_observed(&old).unwrap();
+    assert_eq!(stopped.state, RecordingState::Starting);
+    assert!(stopped.preparation_cancel_requested);
+    gate.open();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), start)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    assert!(until(|| rec.status().state == RecordingState::Idle).await);
+    rec.start().unwrap();
+    assert!(
+        rec.stop_observed(&old).is_err(),
+        "cancelled preparation cannot stop a later capture"
+    );
+    assert_eq!(rec.status().state, RecordingState::Recording);
+    rec.stop_observed(&rec.observe().stop_target().cloned().unwrap())
+        .unwrap();
+    assert!(until(|| rec.status().state == RecordingState::Idle).await);
+}
+
+fn counted_native_recorder(
+    root: &Path,
+    configured: Arc<AtomicU64>,
+    opened: Arc<AtomicU64>,
+) -> DaemonRecorder {
+    DaemonRecorder::with_parts(
+        root.to_path_buf(),
+        tokio::runtime::Handle::current(),
+        fotwd::session::SegmentTap::default(),
+        fotwd::recording::ReadyTap::default(),
+        Box::new(move || {
+            opened.fetch_add(1, Ordering::SeqCst);
+            Ok((
+                Box::new(FileAudioSource::from_wav(
+                    TapId::system_default(),
+                    tone(30.0),
+                    ReplaySpeed::Realtime,
+                )),
+                None,
+            ))
+        }),
+        Box::new(move || {
+            configured.fetch_add(1, Ordering::SeqCst);
+            fotwd::session::Transcription::Disabled
+        }),
+        Box::new(|_, _| None),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_start_without_acknowledgement_never_resolves_transcription_or_opens_capture() {
+    for origin in [
+        fotw_shell::StartOrigin::Menu,
+        fotw_shell::StartOrigin::Hotkey,
+    ] {
+        let root = tmpdir(&format!("native-no-ack-{}", origin.label()));
+        let configured = Arc::new(AtomicU64::new(0));
+        let opened = Arc::new(AtomicU64::new(0));
+        let rec =
+            counted_native_recorder(&root.join("sessions"), configured.clone(), opened.clone());
+        let result = rec.start_native(origin, false, fotwd::session::StopSignal::new());
+        if result.is_ok() {
+            rec.stop().unwrap();
+            assert!(until(|| rec.status().state == RecordingState::Idle).await);
+        }
+        assert!(
+            result.is_err(),
+            "unacknowledged native Start must be rejected"
+        );
+        assert_eq!(configured.load(Ordering::SeqCst), 0);
+        assert_eq!(opened.load(Ordering::SeqCst), 0);
+        assert!(!root.join("audit.jsonl").exists());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_start_cancelled_before_admission_never_configures_or_opens_capture() {
+    let root = tmpdir("native-precancelled-start");
+    let configured = Arc::new(AtomicU64::new(0));
+    let opened = Arc::new(AtomicU64::new(0));
+    let rec = counted_native_recorder(&root.join("sessions"), configured.clone(), opened.clone());
+    let cancel = fotwd::session::StopSignal::new();
+    cancel.stop();
+    let result = rec.start_native(fotw_shell::StartOrigin::Menu, true, cancel);
+    if result.is_ok() {
+        rec.stop().unwrap();
+        assert!(until(|| rec.status().state == RecordingState::Idle).await);
+    }
+    assert!(
+        result.is_err(),
+        "cancelled native Start must not open capture"
+    );
+    assert_eq!(configured.load(Ordering::SeqCst), 0);
+    assert_eq!(opened.load(Ordering::SeqCst), 0);
+    assert!(!root.join("audit.jsonl").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_start_records_the_actual_human_origin() {
+    let root = tmpdir("native-start-origin");
+    let rec = recorder(&root.join("sessions"), Arc::new(AtomicU64::new(0)));
+    rec.start_native(
+        fotw_shell::StartOrigin::Hotkey,
+        true,
+        fotwd::session::StopSignal::new(),
+    )
+    .unwrap();
+    rec.stop().unwrap();
+    assert!(until(|| rec.status().state == RecordingState::Idle).await);
+    let audit = std::fs::read_to_string(root.join("audit.jsonl")).unwrap();
+    let starts: Vec<serde_json::Value> = audit
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|e| e["event"] == "session_start")
+        .collect();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0]["origin"], "hotkey");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_start_cancelled_during_configuration_never_opens_capture() {
+    struct Release(Arc<Gate>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+    let root = tmpdir("native-cancel-during-config");
+    let gate = Arc::new(Gate::default());
+    let _release = Release(gate.clone());
+    let configuration_gate = gate.clone();
+    let opened = Arc::new(AtomicU64::new(0));
+    let tap_count = opened.clone();
+    let rec = Arc::new(DaemonRecorder::with_parts(
+        root.join("sessions"),
+        tokio::runtime::Handle::current(),
+        fotwd::session::SegmentTap::default(),
+        fotwd::recording::ReadyTap::default(),
+        Box::new(move || {
+            tap_count.fetch_add(1, Ordering::SeqCst);
+            Ok((
+                Box::new(FileAudioSource::from_wav(
+                    TapId::system_default(),
+                    tone(30.0),
+                    ReplaySpeed::Realtime,
+                )),
+                None,
+            ))
+        }),
+        Box::new(move || {
+            configuration_gate.hold();
+            fotwd::session::Transcription::Disabled
+        }),
+        Box::new(|_, _| None),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    ));
+    let cancel = fotwd::session::StopSignal::new();
+    let request_cancel = cancel.clone();
+    let start_rec = rec.clone();
+    let start = tokio::task::spawn_blocking(move || {
+        start_rec.start_native(fotw_shell::StartOrigin::Menu, true, request_cancel)
+    });
+    assert!(until(|| gate.reached()).await);
+    cancel.stop();
+    gate.open();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), start)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(opened.load(Ordering::SeqCst), 0);
+    assert_eq!(rec.status().state, RecordingState::Idle);
+}

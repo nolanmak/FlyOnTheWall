@@ -22,6 +22,7 @@ pub mod mcp;
 mod model_capture;
 pub mod model_setup;
 pub mod model_setup_control;
+pub mod native_shell;
 pub mod okf;
 pub mod onboard;
 pub mod persist;
