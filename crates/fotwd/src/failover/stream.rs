@@ -91,6 +91,34 @@ pub struct LocalSourceConfig {
     /// Bounded inference drain; native destruction remains separately visible.
     pub stop_timeout: Duration,
 }
+
+/// Explicit cloud-only durable source. Contains a provider credential, never
+/// serialize or log it. No local factory or backup model can be supplied.
+pub struct CloudSourceConfig {
+    /// Provider transport and canonical source identity/clock.
+    pub cloud: DeepgramStreamConfig,
+    /// Optional immutable audio processor declared before input acceptance.
+    pub processing: Option<super::processing::Descriptor>,
+    /// Maximum queued/in-flight canonical samples.
+    pub cloud_queue_samples: usize,
+    /// Time allowed for confirmed final coverage after Stop.
+    pub cloud_settle: Duration,
+    /// Bounded input-freeze and transcript-drain deadline.
+    pub stop_timeout: Duration,
+}
+impl CloudSourceConfig {
+    /// Configure durable cloud transcription without selecting local inference.
+    #[must_use]
+    pub fn new(cloud: DeepgramStreamConfig) -> Self {
+        Self {
+            cloud,
+            processing: None,
+            cloud_queue_samples: 32000,
+            cloud_settle: Duration::from_secs(1),
+            stop_timeout: Duration::from_secs(30),
+        }
+    }
+}
 impl LocalSourceConfig {
     /// Configure a source without opening a model, socket or credential store.
     #[must_use]
@@ -165,17 +193,21 @@ pub struct LocalResumeConfig {
 struct WorkerConfig {
     session_id: String,
     source: Source,
-    local: Arc<dyn RecognizerFactory>,
-    plan: LocalPlan,
+    local: Option<LocalRuntime>,
+    endpoint: EndpointConfig,
     limits: HandoffLimits,
     cloud_queue_samples: usize,
     cloud_settle: Duration,
     stop_timeout: Duration,
     prefix_end: Option<u64>,
 }
+struct LocalRuntime {
+    factory: Arc<dyn RecognizerFactory>,
+    plan: LocalPlan,
+}
 
 struct SourceInputs {
-    native: NativeLease,
+    native: Option<NativeLease>,
     processing: Option<super::processing::Journal>,
     writer: ReplayWriter,
     journal: CoverageJournal,
@@ -345,6 +377,23 @@ impl Drop for NativeExit {
 fn failure(message: impl Into<String>) -> SttError {
     SttError::new(SttErrorClass::Server, "handoff", message)
 }
+fn validate_cloud_input(cloud: &DeepgramStreamConfig, queued: usize) -> Result<(), SttError> {
+    if queued < MAX_READ_SAMPLES {
+        return Err(failure("cloud queue must hold one replay chunk"));
+    }
+    if cloud.params.sample_rate != 16000
+        || cloud.params.channels != 1
+        || cloud.params.encoding != "linear16"
+        || cloud.normalizer.model != cloud.params.model
+    {
+        return Err(SttError::new(
+            SttErrorClass::BadRequest,
+            "handoff",
+            "handoff requires canonical 16 kHz mono PCM16 and matching provider model metadata",
+        ));
+    }
+    Ok(())
+}
 fn source(source: Source) -> ReplaySource {
     match source {
         Source::System => ReplaySource::System,
@@ -410,6 +459,24 @@ pub struct PreparedSource {
 }
 
 impl PreparedSource {
+    /// Declare microphone processing after local preflight but before source
+    /// creation. An existing declaration cannot silently change its identity.
+    pub fn with_processing(
+        mut self,
+        descriptor: super::processing::Descriptor,
+    ) -> Result<Self, SttError> {
+        descriptor.validate().map_err(|e| failure(e.to_string()))?;
+        if self
+            .config
+            .processing
+            .as_ref()
+            .is_some_and(|old| old != &descriptor)
+        {
+            return Err(failure("prepared audio processor identity changed"));
+        }
+        self.config.processing = Some(descriptor);
+        Ok(self)
+    }
     /// Bind a prepared source to the capture's authoritative clock and identity.
     pub async fn open(
         mut self,
@@ -424,6 +491,92 @@ impl PreparedSource {
 }
 
 impl FailoverStream {
+    /// Open a cloud-only source with exact durable input and no local plan.
+    /// Provider failure retains input and reports incomplete transcription.
+    pub async fn open_cloud(
+        dir: &Path,
+        config: CloudSourceConfig,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), SttError> {
+        validate_cloud_input(&config.cloud, config.cloud_queue_samples)?;
+        if let Some(processing) = config.processing.as_ref() {
+            processing.validate().map_err(|e| failure(e.to_string()))?;
+        }
+        let session = config.cloud.normalizer.session_id.clone();
+        let leg = config.cloud.normalizer.source;
+        let anchor = config
+            .cloud
+            .session_offset_ms
+            .checked_mul(16)
+            .ok_or_else(|| failure("source clock overflow"))?;
+        let initial = EngineDescriptor {
+            provider: "deepgram".into(),
+            model: config.cloud.normalizer.model.clone(),
+            revision: None,
+            capabilities: SttCapabilities::deepgram(),
+        };
+        let processing_descriptor = config.processing;
+        let directory = dir.to_owned();
+        let inputs = tokio::task::spawn_blocking(move || {
+            let writer = match processing_descriptor.as_ref() {
+                Some(descriptor) => ReplayWriter::create_with_processing(
+                    &directory,
+                    &session,
+                    source(leg),
+                    anchor,
+                    &descriptor.fingerprint()?,
+                ),
+                None => ReplayWriter::create(&directory, &session, source(leg), anchor),
+            }?;
+            let processing = processing_descriptor
+                .map(|descriptor| {
+                    super::processing::Journal::create(
+                        &directory,
+                        &session,
+                        source(leg),
+                        anchor,
+                        descriptor,
+                    )
+                })
+                .transpose()?;
+            let journal =
+                CoverageJournal::create_with_fallback(&directory, &session, leg, initial, None)?;
+            let reader = ReplayReader::open(&directory, &session, source(leg))?;
+            Ok::<_, std::io::Error>(SourceInputs {
+                native: None,
+                processing,
+                writer,
+                journal,
+                reader,
+                recognizer: None,
+            })
+        })
+        .await
+        .map_err(|e| failure(e.to_string()))?
+        .map_err(|e| failure(e.to_string()))?;
+        let worker = WorkerConfig {
+            session_id: config.cloud.normalizer.session_id.clone(),
+            source: leg,
+            local: None,
+            endpoint: EndpointConfig::default(),
+            limits: HandoffLimits::default(),
+            cloud_queue_samples: config.cloud_queue_samples,
+            cloud_settle: config.cloud_settle,
+            stop_timeout: config.stop_timeout,
+            prefix_end: None,
+        };
+        let transport = DeepgramStream::open(config.cloud.with_confirmed_finals());
+        Self::launch(worker, inputs, Some(transport), false)
+    }
+    /// Whether this source accepts only provenance-bearing processed intervals.
+    #[must_use]
+    pub fn processing_declared(&self) -> bool {
+        self.shared
+            .writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .processing
+            .is_some()
+    }
     /// Open durable local input before loading the recognizer. Model failure
     /// leaves the recording and canonical input available, with an error event.
     /// This path cannot construct cloud transport.
@@ -478,7 +631,7 @@ impl FailoverStream {
             )?;
             let reader = ReplayReader::open(&directory, &session, source(leg))?;
             Ok::<_, std::io::Error>(SourceInputs {
-                native,
+                native: Some(native),
                 writer,
                 journal,
                 reader,
@@ -493,8 +646,11 @@ impl FailoverStream {
             WorkerConfig {
                 session_id: config.stream.session_id,
                 source: leg,
-                local: config.local,
-                plan,
+                endpoint: plan.endpoint,
+                local: Some(LocalRuntime {
+                    factory: config.local,
+                    plan,
+                }),
                 limits: HandoffLimits::default(),
                 cloud_queue_samples: 0,
                 cloud_settle: Duration::ZERO,
@@ -566,20 +722,7 @@ impl FailoverStream {
     /// Allocate and retain the actual local state before opening any capture or
     /// cloud transport. Failure refuses fallback admission.
     pub async fn prepare(config: FailoverConfig) -> Result<PreparedSource, SttError> {
-        if config.cloud_queue_samples < MAX_READ_SAMPLES {
-            return Err(failure("cloud queue must hold one replay chunk"));
-        }
-        if config.cloud.params.sample_rate != 16_000
-            || config.cloud.params.channels != 1
-            || config.cloud.params.encoding != "linear16"
-            || config.cloud.normalizer.model != config.cloud.params.model
-        {
-            return Err(SttError::new(
-                SttErrorClass::BadRequest,
-                "handoff",
-                "handoff requires canonical 16 kHz mono PCM16 and matching provider model metadata",
-            ));
-        }
+        validate_cloud_input(&config.cloud, config.cloud_queue_samples)?;
         config
             .local_plan()
             .validate()
@@ -663,8 +806,11 @@ impl FailoverStream {
         let worker_config = WorkerConfig {
             session_id: config.cloud.normalizer.session_id.clone(),
             source: config.cloud.normalizer.source,
-            local: Arc::clone(&config.local),
-            plan: config.local_plan(),
+            endpoint: config.endpoint,
+            local: Some(LocalRuntime {
+                factory: Arc::clone(&config.local),
+                plan: config.local_plan(),
+            }),
             limits: config.limits,
             cloud_queue_samples: config.cloud_queue_samples,
             cloud_settle: config.cloud_settle,
@@ -674,7 +820,7 @@ impl FailoverStream {
         Self::launch(
             worker_config,
             SourceInputs {
-                native,
+                native: Some(native),
                 processing,
                 writer,
                 journal,
@@ -792,8 +938,11 @@ impl FailoverStream {
             let config = WorkerConfig {
                 session_id: request.session_id,
                 source: request.source,
-                local: request.local,
-                plan,
+                endpoint: plan.endpoint,
+                local: Some(LocalRuntime {
+                    factory: request.local,
+                    plan,
+                }),
                 limits: HandoffLimits::default(),
                 cloud_queue_samples: 0,
                 cloud_settle: Duration::ZERO,
@@ -803,7 +952,7 @@ impl FailoverStream {
             Ok::<_, SttError>((
                 config,
                 SourceInputs {
-                    native,
+                    native: Some(native),
                     processing: None,
                     writer,
                     journal,
@@ -903,8 +1052,8 @@ impl FailoverStream {
                 let recognizer = recognizer;
                 let mut worker = Worker {
                     policy: HandoffPolicy::new(config.limits),
-                    vad: Endpointer::new(config.plan.endpoint),
-                    local_endpoint: local.then(|| Endpointer::new(config.plan.endpoint)),
+                    vad: Endpointer::new(config.endpoint),
+                    local_endpoint: local.then(|| Endpointer::new(config.endpoint)),
                     recognizer,
                     cloud,
                     cloud_events,
@@ -926,7 +1075,15 @@ impl FailoverStream {
                         worker.shared.emit(Event::Transcript(StreamEvent::State(
                             StreamState::Connecting,
                         )));
-                        worker.recognizer = Some(worker.config.local.create()?);
+                        worker.recognizer = Some(
+                            worker
+                                .config
+                                .local
+                                .as_ref()
+                                .ok_or_else(|| failure("local source has no local runtime"))?
+                                .factory
+                                .create()?,
+                        );
                         worker
                             .shared
                             .emit(Event::Transcript(StreamEvent::State(StreamState::Open)));
@@ -938,7 +1095,11 @@ impl FailoverStream {
                 // A local-only Stop can finish its audio while the native tail
                 // remains observable and prevents another recording.
                 let native_state = worker.recognizer.take();
-                let native_factory = Arc::clone(&worker.config.local);
+                let native_factory = worker
+                    .config
+                    .local
+                    .as_ref()
+                    .map(|local| Arc::clone(&local.factory));
                 drop(worker);
                 worker_shared.terminal(result.err());
                 // Release the thread's canonical owner before waking a caller
@@ -1269,6 +1430,7 @@ impl Worker {
             .map_err(|e| failure(e.to_string()))
     }
     fn demote_local(&mut self, reason: SwitchReason) -> Result<(), SttError> {
+        let local=self.config.local.as_ref().ok_or_else(||failure("cloud transcription incomplete; original input retained; no local fallback was selected"))?;
         if let Some(cloud) = self.cloud.take() {
             cloud.abort();
         }
@@ -1278,16 +1440,16 @@ impl Worker {
             .switch(
                 EngineDescriptor {
                     provider: fotw_stt::local::PROVIDER.into(),
-                    model: self.config.local.model().into(),
-                    revision: self.config.plan.engine.revision.clone(),
-                    capabilities: self.config.plan.engine.capabilities.clone(),
+                    model: local.factory.model().into(),
+                    revision: local.plan.engine.revision.clone(),
+                    capabilities: local.plan.engine.capabilities.clone(),
                 },
                 reason,
             )
             .map_err(|e| failure(e.to_string()))?;
         self.local_base = self.journal.committed_through();
         self.local_cursor = self.local_base;
-        self.local_endpoint = Some(Endpointer::new(self.config.plan.endpoint));
+        self.local_endpoint = Some(Endpointer::new(self.config.endpoint));
         let mut gate = self.shared.gate.lock().unwrap_or_else(|p| p.into_inner());
         if !gate.fenced {
             gate.status.phase = Phase::Local;
@@ -1315,10 +1477,15 @@ impl Worker {
         }
         let config = LocalStreamConfig::new(self.config.session_id.clone(), self.config.source)
             .with_session_offset_ms(self.local_base / 16);
+        let local = self
+            .config
+            .local
+            .as_ref()
+            .ok_or_else(|| failure("local inference was not selected"))?;
         let segments = segments_for(
             &config,
-            self.config.local.model(),
-            self.config.local.language(),
+            local.factory.model(),
+            local.factory.language(),
             &chunk,
             recognized,
         );

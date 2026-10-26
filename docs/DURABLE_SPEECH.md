@@ -1,5 +1,53 @@
 # Durable speech handoff runtime
 
+## Explicit recording-pump audio processing
+
+`SessionControl::processing` accepts a single-use `live_aec::Processing` request
+containing a preloaded backend and its declared version/profile. Cloned controls
+share one admission. The backend moves to an exclusive bounded worker before
+capture; capture callbacks still only publish into their rings. Cancellation
+claims and releases that worker even before capture admission, while recording
+ownership remains visible through native destruction. A retained clone cannot
+start another recording with the same processor.
+
+The ordinary recording pump and its supervised recovery callbacks forward
+generation-specific native sample ranges, actual formats and converter origins.
+Clock fitting and reference history use accepted native-rate frames; device
+counters detect faults and drops without being mistaken for reference indices.
+Microphone conversion composes the native-to-archive and archive-to-16k phases,
+the original source anchor and prior generation/gap offsets. Absolute positions
+remain integer; only the bounded fractional offset uses floating point.
+
+Original fixed-format mic/system archives are synced before processing admission.
+The processing owner retains at most 6400 microphone samples for up to 200ms
+while waiting for qualified reference geometry, then submits to the existing
+bounded AEC worker or preserves original input. Resets release earlier pending
+originals before accepting a new epoch. Gap padding and converter tails receive
+no invented native timestamps. Source failure, missing reference, owner failure
+or cancellation preserves microphone input; the suppressive gate is not run
+after this stage. Stop bounds data publication separately from native cleanup.
+
+Only the microphone transcription source declares processing. Local-only,
+explicit cloud-to-local fallback and cloud-only recording all persist the exact
+processed input and processing journal before exposing it to ASR. The new
+`CloudSourceConfig` contains no local factory or model plan: provider failure
+reports incomplete transcription and retains input without selecting local
+inference. Existing cloud-only behavior is unchanged without an explicit
+processing request. Processed sources cannot claim the ordinary raw replay
+recipe; verified retained processed PCM remains their recovery input.
+
+This is recording-runtime integration, not an acoustic-backend selection or a
+new enabled setting. No default provider, model, CLI or dashboard choice changes.
+The generated clocked-session tests exercise all three speech policies through
+the actual recording pump, verify originals are on disk at processor entry,
+compare both original files byte-for-byte, and validate processed input coverage
+and provenance. They use a fake subtractor and fake local recognizer, with only
+loopback rejection servers for provider failures. They do not establish native
+AEC quality, physical-device recovery or representative concurrent-app latency.
+Per-source archive sync and per-interval metadata sync costs remain unqualified
+for physical live capture. Backend comparison, fault/relearning quality and
+signed-app acoustic/resource acceptance remain unfinished before enablement.
+
 ## Local-only recording and restart
 
 Local-only recording now writes the same canonical 16 kHz source input and

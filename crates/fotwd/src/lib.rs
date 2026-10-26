@@ -17,6 +17,7 @@ pub mod failover;
 pub mod github;
 pub mod health;
 pub mod journal;
+pub mod live_aec;
 pub mod mcp;
 mod model_capture;
 pub mod model_setup;

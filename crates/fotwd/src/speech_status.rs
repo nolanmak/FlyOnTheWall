@@ -11,6 +11,7 @@ enum Reader {
 #[derive(Default)]
 struct Inner {
     readers: Vec<(CaptureSource, Reader)>,
+    processing: Option<fotw_pipeline::aec_worker::Status>,
 }
 /// One capture's status. Durable readers retain only metadata and atomics.
 #[derive(Clone, Default)]
@@ -76,15 +77,18 @@ impl SpeechMonitor {
     }
     /// Known native work still outstanding after capture's drain ended.
     pub fn has_retained_native_worker(&self) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .readers
-            .iter()
-            .any(|(_, reader)| match reader {
+        let inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        inner
+            .processing
+            .as_ref()
+            .is_some_and(|status| status.is_running())
+            || inner.readers.iter().any(|(_, reader)| match reader {
                 Reader::Durable(reader) => reader.read().worker_running,
                 Reader::Legacy(_) => false,
             })
+    }
+    pub(crate) fn bind_processing(&self, status: fotw_pipeline::aec_worker::Status) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).processing = Some(status);
     }
     fn register(&self, source: Source, reader: Reader) {
         let source = capture_source(source);
