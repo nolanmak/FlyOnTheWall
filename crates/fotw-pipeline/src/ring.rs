@@ -19,6 +19,80 @@ use rtrb::{Consumer, Producer, RingBuffer};
 #[derive(Debug)]
 pub struct AudioRing;
 
+/// Latest callback timing mapped to this generation's accepted PCM samples.
+///
+/// This is a monitoring snapshot, not a timestamp for an arbitrary pump chunk.
+/// Intermediate callbacks may be superseded. Host stamps describe the tap's
+/// clock contract (currently callback arrival on macOS), not hardware playback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptureObservation {
+    /// Nonempty callback number within this ring generation, starting at one.
+    pub sequence: u64,
+    /// Accepted interleaved samples preceding this callback, including untimed writes.
+    pub sample_start: u64,
+    /// Accepted samples in this callback; zero means the whole callback was dropped.
+    pub sample_count: usize,
+    /// Device frame index of the callback's first frame, before ring admission.
+    pub device_frames: u64,
+    /// Host nanoseconds reported by the capture backend, without reinterpretation.
+    pub host_ns: u64,
+    /// Original capture flag bits, including discontinuity and timestamp error.
+    pub flags: u32,
+    /// Cumulative samples rejected by this ring, including this callback.
+    pub dropped_samples: u64,
+}
+
+/// One writer owned by RingProducer. All fields are atomic so even an interrupted
+/// publication has no data race. Sequential consistency makes a matching even
+/// version enclose exactly one publication. Readers make one attempt, never spin.
+#[derive(Debug, Default)]
+struct ClockMailbox {
+    version: AtomicU64,
+    fields: [AtomicU64; 7],
+}
+
+impl ClockMailbox {
+    fn publish(&self, observation: CaptureObservation) {
+        let end = observation.sequence.wrapping_mul(2);
+        self.version.store(end.wrapping_sub(1), Ordering::SeqCst);
+        for (field, value) in self.fields.iter().zip([
+            observation.sample_start,
+            observation.sample_count as u64,
+            observation.device_frames,
+            observation.host_ns,
+            u64::from(observation.flags),
+            observation.dropped_samples,
+            observation.sequence,
+        ]) {
+            field.store(value, Ordering::SeqCst);
+        }
+        self.version.store(end, Ordering::SeqCst);
+    }
+
+    fn read(&self) -> Option<CaptureObservation> {
+        let before = self.version.load(Ordering::SeqCst);
+        if before == 0 || !before.is_multiple_of(2) {
+            return None;
+        }
+        let values = self
+            .fields
+            .each_ref()
+            .map(|field| field.load(Ordering::SeqCst));
+        if self.version.load(Ordering::SeqCst) != before {
+            return None;
+        }
+        Some(CaptureObservation {
+            sample_start: values[0],
+            sample_count: values[1] as usize,
+            device_frames: values[2],
+            host_ns: values[3],
+            flags: values[4] as u32,
+            dropped_samples: values[5],
+            sequence: values[6],
+        })
+    }
+}
+
 impl AudioRing {
     /// Allocate a ring holding `frames` samples and split it.
     ///
@@ -27,14 +101,19 @@ impl AudioRing {
     pub fn with_capacity_frames(frames: usize) -> (RingProducer, RingConsumer) {
         let (producer, consumer) = RingBuffer::<f32>::new(frames);
         let dropped = Arc::new(AtomicU64::new(0));
+        let clock = Arc::new(ClockMailbox::default());
         (
             RingProducer {
                 inner: producer,
                 dropped: Arc::clone(&dropped),
+                clock: Arc::clone(&clock),
+                accepted_samples: 0,
+                clock_sequence: 0,
             },
             RingConsumer {
                 inner: consumer,
                 dropped,
+                clock,
             },
         )
     }
@@ -45,6 +124,9 @@ impl AudioRing {
 pub struct RingProducer {
     inner: Producer<f32>,
     dropped: Arc<AtomicU64>,
+    clock: Arc<ClockMailbox>,
+    accepted_samples: u64,
+    clock_sequence: u64,
 }
 
 impl RingProducer {
@@ -60,6 +142,7 @@ impl RingProducer {
         // (what was taken, what did not fit).
         let (pushed, remainder) = self.inner.push_partial_slice(block);
         let took = pushed.len();
+        self.accepted_samples = self.accepted_samples.saturating_add(took as u64);
         if !remainder.is_empty() {
             self.dropped
                 .fetch_add(remainder.len() as u64, Ordering::Relaxed);
@@ -81,6 +164,34 @@ impl RingProducer {
             return 0;
         }
         self.push_block(block)
+    }
+
+    /// Admit a whole capture callback and publish its timing without allocating,
+    /// locking or retrying. An overrun publishes a zero-length observation so a
+    /// reader cannot mistake a rejected buffer for continuous accepted audio.
+    /// Empty callbacks do not replace the latest meaningful observation.
+    pub fn push_capture_block(
+        &mut self,
+        block: &[f32],
+        device_frames: u64,
+        host_ns: u64,
+        flags: u32,
+    ) -> usize {
+        let sample_start = self.accepted_samples;
+        let sample_count = self.push_complete_block(block);
+        if !block.is_empty() {
+            self.clock_sequence = self.clock_sequence.wrapping_add(1);
+            self.clock.publish(CaptureObservation {
+                sequence: self.clock_sequence,
+                sample_start,
+                sample_count,
+                device_frames,
+                host_ns,
+                flags,
+                dropped_samples: self.dropped_frames(),
+            });
+        }
+        sample_count
     }
 
     /// Samples dropped because the consumer could not keep up.
@@ -111,9 +222,18 @@ impl RingProducer {
 pub struct RingConsumer {
     inner: Consumer<f32>,
     dropped: Arc<AtomicU64>,
+    clock: Arc<ClockMailbox>,
 }
 
 impl RingConsumer {
+    /// Read one coherent latest capture observation. None means no observation
+    /// yet or a publication in progress; callers must defer rather than spin.
+    /// The snapshot can precede or follow the PCM drained by `pop_into`; use its
+    /// absolute sample positions, never attach it directly to that drain.
+    #[must_use]
+    pub fn capture_observation(&self) -> Option<CaptureObservation> {
+        self.clock.read()
+    }
     /// Drain up to `out.len()` samples, returning how many were written.
     pub fn pop_into(&mut self, out: &mut [f32]) -> usize {
         let (popped, _unfilled) = self.inner.pop_partial_slice(out);
@@ -211,6 +331,13 @@ impl GenerationRing {
 #[cfg(test)]
 mod generation_tests {
     use super::*;
+    #[test]
+    fn interrupted_clock_publication_defers_instead_of_returning_old_or_torn_fields() {
+        let mailbox = ClockMailbox::default();
+        mailbox.version.store(1, Ordering::SeqCst);
+        mailbox.fields[0].store(500, Ordering::SeqCst);
+        assert!(mailbox.read().is_none());
+    }
     #[test]
     fn retained_old_producer_and_failed_attempt_cannot_mix_with_replacement() {
         let (producer, mut old_consumer) = AudioRing::with_capacity_frames(8);

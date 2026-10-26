@@ -12,6 +12,96 @@ use fotw_pipeline::rt::{RtAlloc, RtGuard, allocation_violations};
 static ALLOC: RtAlloc = RtAlloc;
 
 #[test]
+fn capture_clock_tracks_accepted_positions_and_drops_without_allocation() {
+    let (mut producer, mut consumer) = AudioRing::with_capacity_frames(4);
+    assert!(consumer.capture_observation().is_none());
+    let before = allocation_violations();
+    {
+        let _rt = RtGuard::enter();
+        producer.push_capture_block(&[0.25; 4], 0, 0, 0);
+        producer.push_capture_block(&[0.75; 2], 2, 100, 4);
+    }
+    assert_eq!(allocation_violations(), before);
+    let rejected = consumer.capture_observation().unwrap();
+    assert_eq!((rejected.sequence, rejected.sample_start), (2, 4));
+    assert_eq!((rejected.sample_count, rejected.dropped_samples), (0, 2));
+    assert_eq!(
+        (rejected.device_frames, rejected.host_ns, rejected.flags),
+        (2, 100, 4)
+    );
+    let mut pcm = [0.0; 4];
+    assert_eq!(consumer.pop_into(&mut pcm), 4);
+    assert_eq!(pcm, [0.25; 4]);
+    producer.push_capture_block(&[0.5; 2], 3, 200, 2);
+    let resumed = consumer.capture_observation().unwrap();
+    assert_eq!((resumed.sample_start, resumed.sample_count), (4, 2));
+    assert_eq!((resumed.sequence, resumed.dropped_samples), (3, 2));
+    producer.push_capture_block(&[], 99, 999, 0);
+    assert_eq!(consumer.capture_observation(), Some(resumed));
+}
+
+#[test]
+fn capture_clock_isolated_from_late_callbacks_of_old_generation() {
+    let (producer, old_consumer) = AudioRing::with_capacity_frames(8);
+    let generations = GenerationRing::new(producer);
+    let mut old = generations.producer();
+    old.push_capture_block(&[1.0; 2], 0, 100, 0);
+    let mut replacement = generations.producer();
+    let current = generations.take_replacement().unwrap();
+    assert!(current.capture_observation().is_none());
+    replacement.push_capture_block(&[2.0; 2], 0, 200, 2);
+    old.push_capture_block(&[1.0; 2], 1, 300, 0);
+    assert_eq!(current.capture_observation().unwrap().host_ns, 200);
+    assert_eq!(current.capture_observation().unwrap().sample_start, 0);
+    assert_eq!(old_consumer.capture_observation().unwrap().host_ns, 300);
+}
+
+#[test]
+fn untimed_writes_remain_visible_in_capture_sample_positions() {
+    let (mut producer, mut consumer) = AudioRing::with_capacity_frames(4);
+    producer.push_block(&[1.0; 6]); // Four accepted, two dropped.
+    consumer.pop_into(&mut [0.0; 4]);
+    producer.push_capture_block(&[2.0; 2], 99, 100, 0);
+    let clock = consumer.capture_observation().unwrap();
+    assert_eq!(
+        (
+            clock.sample_start,
+            clock.sample_count,
+            clock.dropped_samples
+        ),
+        (4, 2, 2)
+    );
+}
+
+#[test]
+fn concurrent_clock_reader_never_combines_different_callbacks() {
+    let (mut producer, mut consumer) = AudioRing::with_capacity_frames(8);
+    let writer = std::thread::spawn(move || {
+        for frame in 0..20_000 {
+            producer.push_capture_block(&[0.5; 2], frame, frame * 1000, frame as u32);
+        }
+    });
+    let mut pcm = [0.0; 8];
+    loop {
+        if let Some(observed) = consumer.capture_observation() {
+            assert_eq!(observed.host_ns, observed.device_frames * 1000);
+            assert_eq!(u64::from(observed.flags), observed.device_frames);
+            assert_eq!(observed.sequence, observed.device_frames + 1);
+            assert_eq!(
+                observed.sample_start + observed.dropped_samples,
+                observed.device_frames * 2 + 2 - observed.sample_count as u64
+            );
+        }
+        consumer.pop_into(&mut pcm);
+        if consumer.is_abandoned() {
+            break;
+        }
+    }
+    writer.join().unwrap();
+    assert_eq!(consumer.capture_observation().unwrap().sequence, 20_000);
+}
+
+#[test]
 fn queued_initial_audio_does_not_shrink_replacement_capacity() {
     let (mut producer, mut old_consumer) = AudioRing::with_capacity_frames(8);
     assert_eq!(producer.push_complete_block(&[1.0; 8]), 8);

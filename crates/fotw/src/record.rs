@@ -110,7 +110,7 @@ struct RingSink {
 }
 
 impl FrameSink for RingSink {
-    fn on_frames(&mut self, pcm: &[f32], _ts: CaptureTimestamp, flags: FrameFlags) {
+    fn on_frames(&mut self, pcm: &[f32], ts: CaptureTimestamp, flags: FrameFlags) {
         // Three relaxed atomic adds. This is the whole of the watchdog's
         // real-time footprint.
         self.counters.record(
@@ -120,7 +120,7 @@ impl FrameSink for RingSink {
         // Drop/count a whole callback on overrun; partial samples could split
         // an interleaved frame. Never retry on the audio thread.
         if let Some(producer) = self.producer.as_mut() {
-            let _ = producer.push_complete_block(pcm);
+            let _ = producer.push_capture_block(pcm, ts.device_frames, ts.host_ns, flags.bits());
         }
     }
 
@@ -653,6 +653,41 @@ fn apply_gap(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn capture_sink_preserves_timing_and_raw_pcm_through_overflow() {
+        let (producer, mut consumer) = AudioRing::with_capacity_frames(2);
+        let mut sink = RingSink {
+            producer: Some(producer),
+            counters: Arc::new(ActivityCounters::new()),
+            channels: 2,
+        };
+        sink.on_frames(
+            &[0.5, -0.5],
+            CaptureTimestamp::new(0, 0),
+            FrameFlags::empty(),
+        );
+        sink.on_frames(
+            &[0.75, -0.75],
+            CaptureTimestamp::new(1, 100),
+            FrameFlags::DISCONTINUITY,
+        );
+        let observed = consumer.capture_observation().unwrap();
+        assert_eq!(
+            (
+                observed.sample_start,
+                observed.sample_count,
+                observed.dropped_samples
+            ),
+            (2, 0, 2)
+        );
+        assert_eq!(
+            (observed.device_frames, observed.host_ns, observed.flags),
+            (1, 100, FrameFlags::DISCONTINUITY.bits())
+        );
+        let mut pcm = [0.0; 2];
+        assert_eq!(consumer.pop_into(&mut pcm), 2);
+        assert_eq!(pcm, [0.5, -0.5]);
+    }
     use super::*;
     use fotw_audio::AudioTap;
     use fotw_audio::supervisor::GapReason;
