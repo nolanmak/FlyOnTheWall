@@ -9,8 +9,12 @@ An open-source, local-first meeting recorder for macOS. It captures system audio
 - **Audio is not encrypted at rest** ([#56](https://github.com/nolanmak/FlyOnTheWall/issues/56)). Only the database is.
 - **Two speech-to-text engines: Deepgram, or whisper.cpp on your Mac.** Choose local Whisper, Deepgram, or Deepgram with offline backup in the dashboard’s Transcription panel. Model setup is explicit and checksum-verified ([#33](https://github.com/nolanmak/FlyOnTheWall/issues/33)); Apple’s SpeechAnalyzer is not used. Recovery work remains tracked in [#12](https://github.com/nolanmak/FlyOnTheWall/issues/12). `fotwd key set` already accepts `elevenlabs` and `openai` keys, but nothing uses them yet.
 - **No menu-bar item or floating recording indicator.** Both are written, in `fotw-shell`, but nothing in the app starts them ([#58](https://github.com/nolanmak/FlyOnTheWall/issues/58)). Recording is started, stopped and shown in the dashboard.
-- **Notes cannot be typed yet.** The library, search, summaries and exports all handle a meeting's notes, but no shipped screen or command writes them.
+- **Notes are editable during and after recording.** Autosave, explicit retry, revision conflicts and recording-time block anchors are implemented. Acknowledged recording drafts are recoverable from the encrypted library; unacknowledged keystrokes can still be lost in a crash. Physical keyboard/IME and the remaining editor acceptance are tracked in [#122](https://github.com/nolanmak/FlyOnTheWall/issues/122) and [#13](https://github.com/nolanmak/FlyOnTheWall/issues/13); see [notes behavior and limits](docs/notes-editor.md).
+- **Echo cancellation is still being qualified.** The recording runtime has explicit processing hooks, but an acoustic backend has not passed the remaining quality/physical acceptance gates. See [#72](https://github.com/nolanmak/FlyOnTheWall/issues/72) and [processing status](docs/DURABLE_SPEECH.md#explicit-recording-pump-audio-processing).
 - **Windows and Linux** capture backends are empty placeholders (milestone M4).
+
+For an existing installation, see the [upgrade checkpoint](docs/UPGRADE_CHECKPOINT.md)
+for what is available to try, what remains unverified, and how to keep a rollback.
 
 ## The three commitments
 
