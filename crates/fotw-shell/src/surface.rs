@@ -10,6 +10,8 @@ pub enum SurfaceEvent {
     Menu(MenuAction),
     /// Stop on the visible recording indicator.
     Stop,
+    /// OS termination requests cleanup; it never acknowledges a failed save.
+    Terminate,
     /// The explicit acknowledgement checkbox changed.
     Acknowledge(bool),
     /// A response to the visible consent prompt.
@@ -39,6 +41,7 @@ impl<H: ShellHost> SurfaceHost for ShellRuntime<H> {
             }
             SurfaceEvent::Menu(action) => self.on_menu(action, now),
             SurfaceEvent::Stop => self.request_stop(),
+            SurfaceEvent::Terminate => self.on_menu(MenuAction::Quit, now),
             SurfaceEvent::Acknowledge(acknowledged) => self.acknowledge_prompt(acknowledged),
             SurfaceEvent::Prompt(choice) => self.respond_to_prompt(choice, now),
         }

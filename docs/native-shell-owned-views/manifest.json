@@ -4,10 +4,12 @@
   "source_sha256": {
     "crates/fotw-shell/src/platform/macos/pill.rs": "e81f25a481713c58c27b3ef364879aec14fd2e6c25477759ee44c6e0347d9dea",
     "crates/fotw-shell/src/platform/macos/prompt.rs": "bb675985083671d1d671887e7d5420906b41c58be7e6e0912dc3d631eb00b4ce",
-    "crates/fotw-shell/src/platform/macos/mod.rs": "def84beb95e0c37509132b9107ffa7150641a5dc8d6bc55aacb6ec7fe0d6e09f",
-    "crates/fotw-shell/src/surface.rs": "ebd1ef8f2dd9a8804c51607fdb4ad11422273c5b2eead147b069c765a82c63b2",
-    "crates/fotwd/src/native_host.rs": "3348dc3231b0b676c9489878bec5ad8647a129ae83bbcbfeefe6158c31ce87dc",
-    "crates/fotwd/src/native_bridge.rs": "5b61c1b3f1edf31f5f4c2d558a3a890d7bff86d97339e481e26c2c02e48caab6"
+    "crates/fotw-shell/src/platform/macos/mod.rs": "4a3f714aa1e5ecc261666023f43a75bd744b9d04f2a3a5c8cc30fe5e77b3c457",
+    "crates/fotw-shell/src/surface.rs": "123e39182ff57b3f3d3b825b063fa6971df3db53cc0933bf70ca7eb8368051d5",
+    "crates/fotwd/src/native_host.rs": "fdf477a88a87f93489401c42ca60fc8d6bd64e5199398410c3fe91636df56882",
+    "crates/fotwd/src/native_bridge.rs": "5b61c1b3f1edf31f5f4c2d558a3a890d7bff86d97339e481e26c2c02e48caab6",
+    "crates/fotw-shell/src/platform/macos/app_delegate.rs": "722563a1ba580e0a2fb5f98795d5cd2ceb772f70cb15f4fe1e37663b848f023e",
+    "crates/fotw-shell/src/bootstrap.rs": "e65e15d3acce97f170d8aa13b0fe31ee65b78b84424bc96ea6a8886da13693ff"
   },
   "images": {
     "recovery.png": "382e5dbaf72559e80825d98ac5585e3d95f60865bc6ed60db40894eef8c6aa0c",
@@ -23,5 +25,6 @@
     "Global shortcut registration/focus preservation",
     "Full-screen/space behavior, screen-share exclusion, scaling/accessibility acceptance",
     "Transcription quality or long-meeting reliability"
-  ]
+  ],
+  "application_events": "Owned Objective-C selectors queue a single reopen/dashboard request and a single coordinated Quit request, suppressing immediate AppKit termination; no real OS quit/reopen event or global shortcuts sent"
 }

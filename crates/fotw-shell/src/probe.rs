@@ -188,3 +188,14 @@ pub struct ConsentControlProbe {
     /// The host removed the prompt after admitting the acknowledged action.
     pub prompt_cleared: bool,
 }
+
+/// Owned delegate callback dispatch; no real OS quit/reopen event is sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApplicationEventProbe {
+    /// Reopen queues one dashboard action and suppresses default panel activation.
+    pub reopen_queued_once: bool,
+    /// Termination queues one coordinated cleanup action.
+    pub quit_queued_once: bool,
+    /// The callback prevents immediate AppKit process termination.
+    pub immediate_termination_cancelled: bool,
+}

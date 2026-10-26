@@ -119,14 +119,16 @@ impl NativeHost {
             }
         }
     }
-    fn quit(&mut self, now: Monotonic) {
+    fn quit(&mut self, now: Monotonic, acknowledge_recovery: bool) {
         if self.quitting.is_some()
             && self
                 .snapshot
                 .as_ref()
                 .is_some_and(|s| s.shutdown.drained() && s.shutdown.save_failed)
         {
-            self.quit_save_failure_acknowledged = true;
+            if acknowledge_recovery {
+                self.quit_save_failure_acknowledged = true;
+            }
             return;
         }
         if let Some(ticket) = &self.ticket {
@@ -239,7 +241,8 @@ impl SurfaceHost for NativeHost {
                 None => {}
             },
             SurfaceEvent::Menu(MenuAction::ToggleRecording) => self.toggle(StartOrigin::Menu),
-            SurfaceEvent::Menu(MenuAction::Quit) => self.quit(now),
+            SurfaceEvent::Menu(MenuAction::Quit) => self.quit(now, true),
+            SurfaceEvent::Terminate => self.quit(now, false),
             SurfaceEvent::Menu(action) => {
                 let request = match action {
                     MenuAction::OpenNotes => NativeAction::OpenDashboard,

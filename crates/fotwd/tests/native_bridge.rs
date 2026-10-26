@@ -448,6 +448,11 @@ async fn dashboard_start_is_visible_without_a_native_start_or_speculative_clock(
     })
     .await;
     assert!(!host.view().menu.status.contains("Saved"));
+    host.on_event(SurfaceEvent::Terminate, Monotonic::from_secs(1));
+    assert!(
+        !host.should_exit(),
+        "OS termination must not acknowledge failed-save recovery"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

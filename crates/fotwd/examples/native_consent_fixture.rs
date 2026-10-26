@@ -15,6 +15,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("usage: native_consent_fixture <owned-output-directory>")?,
     );
     std::fs::create_dir_all(&output)?;
+    let lifecycle = fotw_shell::platform::macos::probe_application_events()?;
+    assert!(
+        lifecycle.reopen_queued_once
+            && lifecycle.quit_queued_once
+            && lifecycle.immediate_termination_cancelled
+    );
+    std::fs::write(output.join("lifecycle.txt"), format!("{lifecycle:#?}\n"))?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

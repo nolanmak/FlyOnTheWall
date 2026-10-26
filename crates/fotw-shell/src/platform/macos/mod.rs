@@ -38,6 +38,7 @@
 //! behind a full-screen space; it can see a selector that goes nowhere and a
 //! consent gate the renderer forgot to apply.
 
+mod app_delegate;
 mod hotkeys;
 mod pill;
 mod prompt;
@@ -157,9 +158,14 @@ pub fn run_bootstrapped<H: SurfaceHost + 'static>(
     hotkeys: &HotkeyMap,
 ) -> Result<(), String> {
     use crate::bootstrap::{BootstrapUpdate, SurfaceBootstrap};
+    use objc2::runtime::ProtocolObject;
+    let delegate = app_delegate::AppDelegate::new(
+        MainThreadMarker::new().ok_or_else(|| ShellError::NotMainThread.to_string())?,
+    );
     let mtm = MainThreadMarker::new().ok_or_else(|| ShellError::NotMainThread.to_string())?;
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     let shell: Rc<RefCell<Option<MacShell<H>>>> = Rc::new(RefCell::new(None));
     let result = Rc::new(RefCell::new(Ok(())));
     let bootstrap = Rc::new(RefCell::new(SurfaceBootstrap::new(receiver)));
@@ -167,10 +173,20 @@ pub fn run_bootstrapped<H: SurfaceHost + 'static>(
     let timer_result = result.clone();
     let timer_app = app.clone();
     let keys = hotkeys.clone();
+    let timer_delegate = delegate.clone();
     let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
         let Ok(mut shell) = timer_shell.try_borrow_mut() else {
             return;
         };
+        if timer_delegate.take_quit() {
+            if let Some(native) = shell.as_mut() {
+                let now = native.now();
+                native.runtime.on_event(SurfaceEvent::Terminate, now);
+            } else {
+                timer_app.stop(None);
+                return;
+            }
+        }
         if shell.is_none() {
             match bootstrap.borrow_mut().poll() {
                 Ok(BootstrapUpdate::Pending) => {}
@@ -194,6 +210,12 @@ pub fn run_bootstrapped<H: SurfaceHost + 'static>(
             }
         }
         if let Some(native) = shell.as_mut() {
+            if timer_delegate.take_open() {
+                let now = native.now();
+                native
+                    .runtime
+                    .on_event(SurfaceEvent::Menu(MenuAction::OpenNotes), now);
+            }
             native.pump();
             if native.runtime.should_exit() {
                 timer_app.stop(None);
@@ -206,6 +228,7 @@ pub fn run_bootstrapped<H: SurfaceHost + 'static>(
     };
     app.run();
     timer.invalidate();
+    app.setDelegate(None);
     // Tear down native/global resources before returning to runtime shutdown.
     shell.borrow_mut().take();
     result.borrow().clone()
@@ -288,6 +311,36 @@ pub fn probe_consent_controls<H: SurfaceHost>(
         acknowledged_start_enabled,
         start_response_acknowledged,
         prompt_cleared,
+    })
+}
+
+/// Invoke the owned delegate's real Objective-C selectors without installing
+/// global controls or launching the product.
+///
+/// # Errors
+/// If called off the AppKit main thread.
+pub fn probe_application_events() -> Result<crate::probe::ApplicationEventProbe, String> {
+    use objc2::msg_send;
+    let mtm = MainThreadMarker::new().ok_or_else(|| ShellError::NotMainThread.to_string())?;
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    let delegate = app_delegate::AppDelegate::new(mtm);
+    // SAFETY: this owned main-thread delegate implements both exact signatures.
+    let default_reopen: bool = unsafe {
+        msg_send![&*delegate, applicationShouldHandleReopen: &*app, hasVisibleWindows: false]
+    };
+    let opened = delegate.take_open();
+    let open_once = !delegate.take_open();
+    // SAFETY: the callback queues a flag only; no termination is performed here.
+    let reply: objc2_app_kit::NSApplicationTerminateReply =
+        unsafe { msg_send![&*delegate, applicationShouldTerminate: &*app] };
+    let quit = delegate.take_quit();
+    let quit_once = !delegate.take_quit();
+    Ok(crate::probe::ApplicationEventProbe {
+        reopen_queued_once: !default_reopen && opened && open_once,
+        quit_queued_once: quit && quit_once,
+        immediate_termination_cancelled: reply
+            == objc2_app_kit::NSApplicationTerminateReply::TerminateCancel,
     })
 }
 

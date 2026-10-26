@@ -48,6 +48,10 @@ browser-only daemon is running, its UI remains available and the new app explain
 that it must finish/save and exit first. Finish and save its recording, quit the
 old `fotwd` process in Activity Monitor, then reopen. A second native launch opens
 a fresh authorized dashboard tab without creating another tray/hotkey owner.
+LaunchServices reopen events delivered to the running process also queue the same
+dashboard action. OS termination is routed through coordinated cleanup instead
+of immediate AppKit termination; repeated OS requests cannot acknowledge a failed
+save. Only the explicit recovery-labelled menu Quit can acknowledge that case.
 
 Quit closes new Start admission and requests Stop without blocking AppKit. A
 separate work lease covers configuration, capture and background persistence,
@@ -91,6 +95,10 @@ secondary text; default vibrant text and a separate colored status dot fixed it.
 ![Owned recording indicator fixture](native-shell-owned-views/recording.png)
 
 ![Owned recovery-needed fixture](native-shell-owned-views/recovery.png)
+
+The same owned fixture invokes the real Objective-C reopen/termination selectors,
+checking once-only request delivery and cancellation of immediate termination.
+It does not send real OS lifecycle events.
 
 The consent fixture feeds the actual `NativeHost` and bridge with a tap opener
 that refuses capture. Menu and hotkey prompts both blocked unchecked Start,

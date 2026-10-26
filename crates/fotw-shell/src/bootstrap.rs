@@ -82,3 +82,42 @@ mod tests {
         assert!(SurfaceBootstrap::new(receiver).poll().is_err());
     }
 }
+
+/// Main-thread lifecycle requests coalesce while startup or a pump is busy.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+pub(crate) struct AppRequests {
+    open: std::cell::Cell<bool>,
+    quit: std::cell::Cell<bool>,
+}
+#[cfg(any(target_os = "macos", test))]
+impl AppRequests {
+    pub(crate) fn request_open(&self) {
+        self.open.set(true);
+    }
+    pub(crate) fn request_quit(&self) {
+        self.quit.set(true);
+    }
+    pub(crate) fn take_open(&self) -> bool {
+        self.open.replace(false)
+    }
+    pub(crate) fn take_quit(&self) -> bool {
+        self.quit.replace(false)
+    }
+}
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::AppRequests;
+    #[test]
+    fn reopen_and_quit_coalesce_without_capture_and_are_consumed_once() {
+        let requests = AppRequests::default();
+        assert!(!requests.take_open() && !requests.take_quit());
+        requests.request_open();
+        requests.request_open();
+        requests.request_quit();
+        assert!(requests.take_open());
+        assert!(!requests.take_open());
+        assert!(requests.take_quit());
+        assert!(!requests.take_quit());
+    }
+}
