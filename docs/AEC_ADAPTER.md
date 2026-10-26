@@ -147,3 +147,48 @@ samples are retained exactly. Linear interpolation is an evaluation control,
 not a qualified bandlimited resampler. Production pump/worker wiring, mapping
 through capture conversion, reference-quality acceptance, replay provenance,
 speech/physical/real-room qualification and backend selection remain unfinished.
+
+## Native-rate bandlimited reference staging
+
+`reference_resample::ReferenceBuffer` now supplies bounded native-mono reference
+history and bandlimited lookup into the microphone's 16kHz processing clock. The
+owner downmixes complete native frames before append. Typed native/processing
+positions, host timestamps, tap generations and alignment epochs keep the units
+explicit. Both clocks must share the same capture-host epoch.
+
+The preloaded normalized Blackman-windowed sinc uses 257 phase rows, interpolated
+between adjacent phases, and 64 taps per ceiling(native-rate/16kHz). Its cutoff is
+90% of the smaller input/output Nyquist. Support grows with native rate through
+768kHz. History is capped at two seconds, appends at one second, and requests at
+3200 processing frames; the owner configures a smaller working history as needed.
+The filter and fixed scratch buffers allocate only at construction. Full support,
+clock validity and all positions are checked before any caller output is changed.
+Missing edges are refused, not zero-padded into purported reference audio.
+
+`ArchiveConverter::output_origin` exposes the pinned FFT kernel's rational native
+offset after integer output-delay trim, without changing PCM, duration or the
+persisted v1 reconstruction recipe. At 44.1kHz→16kHz the residual is +1/2 native
+frame; at 44.16kHz→16kHz it is −22/25. The reference mapping uses this signed offset.
+For native→archive→processing conversion, compose the actual stage origins:
+`phase_native = phase_capture + phase_processing * native_rate / archive_rate`.
+For example the direct and two-stage 44.16kHz conversions have different origins.
+Tests compare against actual converter output, including two-stage paths, rather
+than assuming that trimming an integer delay establishes a zero-phase origin.
+
+Timing failure advances the alignment epoch and clears the retained reference and
+AEC state. Late writes/requests from the old epoch are rejected even when native
+taps did not restart. Render format changes require a newly preloaded filter;
+microphone origin/rate and tap bindings can change on an explicit reset. This is
+worker work despite allocation freedom, not work for the capture callback.
+
+The native evaluation now drives this buffer with incremental captured slices,
+retaining at most 4000 native frames at 16kHz instead of using the whole fixture
+as reference history. Original fallback, compensated tails and contiguous source
+intervals are still checked by the existing AEC adapter. Measured continuous
+nominal/+80ppm/−120ppm cases pass existing signal gates; the fault/recovery case
+still fails aggregate echo/overlap quality and no app backend is selected.
+
+Actual recording-pump/worker lifetime, cancellation/backpressure, raw-first
+archival and processed-replay provenance remain integration requirements. The
+shared converter metadata is additive; existing consumers and PCM output are
+unchanged. Device/room and speech-word qualification remain separate gates.

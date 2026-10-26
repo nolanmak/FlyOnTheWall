@@ -3,6 +3,10 @@
 use super::*;
 use fotw_pipeline::{
     reference_clock::{Estimate, Tracker},
+    reference_resample::{
+        AlignmentEpoch, Config as ReferenceConfig, FrameDomain, HostNs, NativeFrame,
+        ProcessingFrame, ReferenceBuffer, Request, TapGeneration,
+    },
     ring::CaptureObservation,
 };
 
@@ -82,6 +86,32 @@ fn run_clocked(
     render_trace: &[CaptureObservation],
     mic_trace: &[CaptureObservation],
 ) -> (Vec<f32>, serde_json::Value) {
+    run_with_reference(far, mic, render_trace, mic_trace, false)
+}
+
+fn run_with_reference(
+    far: &[f32],
+    mic: &[f32],
+    render_trace: &[CaptureObservation],
+    mic_trace: &[CaptureObservation],
+    bandlimited: bool,
+) -> (Vec<f32>, serde_json::Value) {
+    let reference_config = ReferenceConfig {
+        render_rate_hz: RATE as u32,
+        capacity_frames: RATE / 4,
+        mic: FrameDomain {
+            native_origin: NativeFrame(0),
+            native_offset_frames: 0.0,
+            processing_origin: ProcessingFrame(0),
+            native_rate_hz: RATE as u32,
+        },
+        render_generation: TapGeneration(1),
+        mic_generation: TapGeneration(1),
+        epoch: AlignmentEpoch(1),
+    };
+    let mut history = bandlimited.then(|| ReferenceBuffer::new(reference_config).unwrap());
+    let (mut loaded, mut max_retained) = (0, 0);
+    let mut epoch = 1;
     let mut render_clock = Tracker::new(RATE as u32, 1).unwrap();
     let mut mic_clock = Tracker::new(RATE as u32, 1).unwrap();
     assert_eq!(far.len(), mic.len());
@@ -111,21 +141,79 @@ fn run_clocked(
         let index = (i + 8).min(render_trace.len() - 1);
         let (r, m) = (render_trace[index], mic_trace[index]);
         let now = r.host_ns.max(m.host_ns) + 20_000_000 + ((index % 7) as u64 + 1) * 1_000_000;
-        let render = render_clock.observe(1, r, now).ok().flatten();
-        let microphone = mic_clock.observe(1, m, now).ok().flatten();
+        let render = render_clock.observe(1, r, now);
+        let microphone = mic_clock.observe(1, m, now);
+        if let Some(history) = history.as_mut() {
+            if render.is_err() || microphone.is_err() {
+                let old_epoch = epoch;
+                epoch += 1;
+                history
+                    .reset(
+                        AlignmentEpoch(epoch),
+                        TapGeneration(1),
+                        TapGeneration(1),
+                        reference_config.mic,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    history.append(
+                        AlignmentEpoch(old_epoch),
+                        TapGeneration(1),
+                        NativeFrame(loaded as u64),
+                        &[]
+                    ),
+                    Err(fotw_pipeline::reference_resample::Error::Epoch)
+                );
+                adapter
+                    .reset(epoch, (i * FRAME) as u64, &mut blocks)
+                    .unwrap();
+            }
+            let end = (index + 1) * FRAME;
+            if end > loaded {
+                history
+                    .append(
+                        AlignmentEpoch(epoch),
+                        TapGeneration(1),
+                        NativeFrame(loaded as u64),
+                        &far[loaded..end],
+                    )
+                    .unwrap();
+                loaded = end;
+            }
+            max_retained = max_retained.max(history.retained_frames());
+        }
+        let render = render.ok().flatten();
+        let microphone = microphone.ok().flatten();
         let aligned = render.zip(microphone).and_then(|(r, m)| {
             rates = Some((r.rate_hz, m.rate_hz));
-            reference(far, &r, &m, i * FRAME, now)
+            if let Some(history) = history.as_mut() {
+                let mut aligned = [0.0; FRAME];
+                history
+                    .fill(
+                        Request {
+                            epoch: AlignmentEpoch(epoch),
+                            start: ProcessingFrame((i * FRAME) as u64),
+                            now: HostNs(now),
+                            render: r,
+                            mic: m,
+                        },
+                        &mut aligned,
+                    )
+                    .ok()?;
+                Some(aligned)
+            } else {
+                reference(far, &r, &m, i * FRAME, now)
+            }
         });
         if let Some(aligned) = aligned {
             adapter
-                .push_render(1, (i * FRAME) as u64, &aligned, &mut blocks)
+                .push_render(epoch, (i * FRAME) as u64, &aligned, &mut blocks)
                 .unwrap();
         } else {
             bypass += 1;
         }
         adapter
-            .push_capture(1, (i * FRAME) as u64, capture, &mut blocks)
+            .push_capture(epoch, (i * FRAME) as u64, capture, &mut blocks)
             .unwrap();
         if aligned.is_none() {
             adapter.flush_reference_wait(&mut blocks);
@@ -135,9 +223,11 @@ fn run_clocked(
     adapter.finish(&mut blocks);
     let stats = adapter.stats();
     let mut output = Vec::with_capacity(mic.len());
+    let mut last_epoch = 1;
     for block in blocks {
         assert_eq!(block.start_sample, output.len() as u64);
-        assert_eq!(block.epoch, 1);
+        assert!(block.epoch >= last_epoch && block.epoch <= epoch);
+        last_epoch = block.epoch;
         if matches!(block.kind, OutputKind::Raw(_)) {
             assert_eq!(
                 block.samples,
@@ -153,11 +243,18 @@ fn run_clocked(
         serde_json::json!({"render_rate_hz":rates.map(|r|r.0),"mic_rate_hz":rates.map(|r|r.1),
         "missing_reference_frames":bypass,"raw_passthrough_samples":stats.raw_samples,"processed_samples":stats.cleaned_samples,
         "backend_failures":stats.backend_failures,"backend_tail_drained":true,"callback_adapter":true,
-        "observation_lead_ms":80,"minimum_acquisition_delivery_ms":20,"linear_interpolation_evaluation_only":true}),
+        "observation_lead_ms":80,"minimum_acquisition_delivery_ms":20,"linear_interpolation_evaluation_only":!bandlimited,
+        "bandlimited_reference":bandlimited,"maximum_retained_native_reference_frames":max_retained,"reference_history_resets":epoch-1}),
     )
 }
 
 pub(super) fn probe() -> serde_json::Value {
+    probe_with_reference(false)
+}
+pub(super) fn bandlimited_probe() -> serde_json::Value {
+    probe_with_reference(true)
+}
+fn probe_with_reference(bandlimited: bool) -> serde_json::Value {
     let mut fixtures = Vec::new();
     for (label, ppm, fault) in [
         ("nominal", 0.0, false),
@@ -172,11 +269,15 @@ pub(super) fn probe() -> serde_json::Value {
         let r = trace(ppm, fault);
         let m = trace(0.0, false);
         let mut results = Vec::new();
-        for backend in [
+        let mut backends = vec![
             "passthrough",
             "native-webrtc-2.1.0-conservative",
             "native-webrtc-2.1.0-clocked-eval",
-        ] {
+        ];
+        if bandlimited {
+            backends.push("native-webrtc-2.1.0-bandlimited-eval");
+        }
+        for backend in backends {
             let mut lag = 0;
             for (case, clean, render) in [
                 ("near-only", &near, &zero),
@@ -191,6 +292,8 @@ pub(super) fn probe() -> serde_json::Value {
                 let start = Instant::now();
                 let (out, clocks) = if backend == "passthrough" {
                     (mic.clone(), serde_json::Value::Null)
+                } else if backend.ends_with("bandlimited-eval") {
+                    run_with_reference(render, &mic, &r, &m, true)
                 } else if backend.ends_with("clocked-eval") {
                     run_clocked(render, &mic, &r, &m)
                 } else {
@@ -212,12 +315,87 @@ pub(super) fn probe() -> serde_json::Value {
     serde_json::json!({"synthetic_only":true,"hardware":hardware(),"aggregate":aggregate_quality(&fixtures),"fixtures":fixtures,
         "sample_rate_hz":RATE,"audio_seconds_per_case":SAMPLES/RATE,"warmup_seconds":WARMUP/RATE,"metric_tail_excluded_samples":FRAME*2,
         "candidate_selected_for_app":false,"bandlimited_resampling_qualified":false,"physical_clock_alignment_qualified":false,
+        "bandlimited_reference_evaluated":bandlimited,
+        "native_reference_diagnostics":if bandlimited {Some(crate::reference_probe::run())}else{None},
         "native_conservative_parameters":native_profile_description()})
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bounded_bandlimited_reference_keeps_continuous_gates_and_exposes_fault_failure() {
+        let report = bandlimited_probe();
+        let diagnostics = &report["native_reference_diagnostics"];
+        for row in diagnostics["aliases"].as_array().unwrap() {
+            if row["input_tone_hz"].as_f64().unwrap() >= 8500.0 {
+                assert_eq!(row["alias_gate_pass"], true);
+            }
+        }
+        for row in diagnostics["native_conversion_alignment"]
+            .as_array()
+            .unwrap()
+        {
+            assert_eq!(row["phase_gate_pass"], true);
+        }
+        for f in report["fixtures"].as_array().unwrap() {
+            let q = f["signal_qualification"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|q| q["backend"] == "native-webrtc-2.1.0-bandlimited-eval")
+                .unwrap();
+            assert_eq!(
+                q["signal_gates_pass"],
+                f["injected_timing_fault"] == false,
+                "{}",
+                f["fixture"]
+            );
+            assert_eq!(q["near_only"], true);
+            for row in f["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r["backend"] == "native-webrtc-2.1.0-bandlimited-eval")
+            {
+                assert_eq!(row["clocks"]["bandlimited_reference"], true);
+                assert_eq!(
+                    row["clocks"]["maximum_retained_native_reference_frames"],
+                    4000
+                );
+                assert_eq!(
+                    row["clocks"]["reference_history_resets"],
+                    if f["injected_timing_fault"] == true {
+                        1
+                    } else {
+                        0
+                    }
+                );
+            }
+        }
+    }
+    #[test]
+    fn bandlimited_history_fences_faults_and_retains_the_original_near_clock() {
+        let near = signal(501);
+        let zero = vec![0.0; SAMPLES];
+        let (out, stats) =
+            run_with_reference(&zero, &near, &trace(80.0, true), &trace(0.0, false), true);
+        assert_eq!(stats["reference_history_resets"], 1);
+        assert!(
+            stats["maximum_retained_native_reference_frames"]
+                .as_u64()
+                .unwrap()
+                <= 4000
+        );
+        assert_eq!(out.len(), near.len());
+        assert_eq!(delay(&near, &out), 0);
+        let error = out
+            .iter()
+            .zip(&near)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(error < 1e-5);
+    }
     #[test]
     fn continuous_clock_quality_passes_but_fault_quality_is_not_hidden() {
         let report = probe();

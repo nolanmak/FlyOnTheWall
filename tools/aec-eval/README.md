@@ -389,3 +389,35 @@ The [retained report](results/m4-clock-alignment.json) includes the failed fault
 case and false aggregate acceptance. A runtime regression first failed when the
 reference path deliberately used equal sample indexes; it now requires the three
 continuous cases to pass and the fault failure to remain visible.
+
+## Bounded bandlimited native reference
+
+`cargo run --release --locked --features native-webrtc -- --bandlimited-signals`
+adds the bounded sinc reference path beside the prior linear control. It uses
+incremental native input, a 4000-frame history at 16kHz, complete filter support,
+and explicit history/AEC epoch reset on invalid timing. Old-epoch work is refused.
+No microphone audio is filtered by the reference sampler; missing reference uses
+the existing adapter's original-mic fallback and compensated tail policy.
+
+Additional diagnostics test 8.5/9/15kHz alias rejection from native 44.1/48/96/192/
+768kHz capture, plus native48kHz reference mapped to actual 44.1/44.16/48kHz
+microphone converters with independent +80/−120ppm clocks. Stereo clock counts
+are tested with already-downmixed reference PCM. Correct rational converter
+origin reduces measured phase RMS error from about .025/.044 to about 1.5e-7 in
+the fractional cases. The tested aliases are all below −80.8dB (gate:−65dB).
+These are generated diagnostics, not physical clock or acoustic acceptance.
+
+The [retained report](results/m4-bandlimited-reference.json) includes all four
+fixture outcomes, raw fallback counts and the failed fault/relearning case.
+No existing AEC parameter or quality threshold changed. Aggregate acceptance is
+false. Complete generated fixture inputs still exist outside the bounded staging
+component; this is not an implemented recording worker or a memory claim for it.
+The whole 48-case/diagnostic M4 probe used maxRSS25,935,872bytes, user9.40s,
+system.01s and elapsed9.60s with uncontrolled cache, not isolated backend/app cost.
+
+The shared ArchiveConverter accessor reports existing phase; it does not shift
+stored audio or change the existing reconstruction recipe. An eventual AEC
+integration needs its own persisted processing/clock provenance and cannot reuse
+the plain raw-to-canonical recipe for cleaned output. Production scheduling,
+late-output fencing, source archival, speech retention and physical/room evidence
+remain unfinished; no app backend is selected.
