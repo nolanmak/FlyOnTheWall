@@ -8,7 +8,8 @@
 use fotw_shell::TrayState;
 use fotw_shell::icon::{ICON_PIXELS, ICON_POINTS, is_template, tray_icon_rgba};
 
-const ALL_STATES: [TrayState; 4] = [
+const ALL_STATES: [TrayState; 5] = [
+    TrayState::Preparing,
     TrayState::Idle,
     TrayState::Recording,
     TrayState::Finishing,
@@ -147,4 +148,13 @@ fn every_state_draws_something() {
              menu-bar item is indistinguishable from a failed launch"
         );
     }
+}
+
+#[test]
+fn preparation_is_distinct_from_idle_capture_and_failure() {
+    let preparing = tray_icon_rgba(TrayState::Preparing);
+    for state in [TrayState::Idle, TrayState::Recording, TrayState::Fault] {
+        assert_ne!(preparing, tray_icon_rgba(state));
+    }
+    assert!(!is_template(TrayState::Preparing));
 }

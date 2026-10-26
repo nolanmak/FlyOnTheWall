@@ -343,6 +343,12 @@ impl Prompt {
         self.acknowledge.state() == NSControlStateValueOn
     }
 
+    pub(crate) fn nonactivating(&self) -> bool {
+        self.panel
+            .styleMask()
+            .contains(NSWindowStyleMask::NonactivatingPanel)
+    }
+
     /// Whether the Start button, as drawn, would accept a click.
     ///
     /// Read off the live `NSButton` rather than from the view that produced
@@ -508,6 +514,7 @@ impl Prompt {
         self.not_now
             .setTitle(&NSString::from_str(view.not_now_label));
         self.never.setTitle(&NSString::from_str(view.never_label));
+        self.never.setHidden(view.never_label.is_empty());
         // The core's rule, applied and never recomputed. A greyed Start beside
         // an un-ticked box is the whole of "blocking" as the user sees it;
         // `ShellCore` refuses the same start again underneath.

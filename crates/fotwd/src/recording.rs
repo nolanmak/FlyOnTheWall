@@ -265,6 +265,30 @@ impl RecorderObservation {
 #[derive(Clone)]
 pub struct StopTarget(crate::session::ReadySignal);
 
+impl StopTarget {
+    /// Whether two observations name exactly the same in-process attempt.
+    #[must_use]
+    pub fn same_attempt(&self, other: &Self) -> bool {
+        self.0.same_session(&other.0)
+    }
+}
+
+type VisibilityFn = dyn Fn(RecorderObservation, StopSignal) -> Result<(), String> + Send + Sync;
+
+/// A native renderer's admission check, run off the recorder lock before setup.
+#[derive(Clone)]
+pub struct StartVisibility(Arc<VisibilityFn>);
+
+impl StartVisibility {
+    /// Construct a bounded admission check. It must honor cancellation and refuse
+    /// capture when the native recording indicator cannot be rendered.
+    pub fn new(
+        check: impl Fn(RecorderObservation, StopSignal) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(check))
+    }
+}
+
 impl std::fmt::Debug for StopTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("StopTarget(<redacted>)")
@@ -289,6 +313,8 @@ pub struct DaemonRecorder {
     /// without being reloaded (#78).
     on_ready: ReadyTap,
     live: Arc<Mutex<Option<Live>>>,
+    start_visibility: Option<StartVisibility>,
+    lifecycle: Arc<crate::recorder_lifecycle::Lifecycle>,
 }
 
 impl std::fmt::Debug for DaemonRecorder {
@@ -318,6 +344,31 @@ pub const UI_CEILING: Duration = Duration::from_secs(2 * 60 * 60);
 pub const READY_DEADLINE: Duration = Duration::from_secs(15);
 
 impl DaemonRecorder {
+    /// Atomic-only admission capability for the native thread. Device Stop
+    /// still runs on the bridge worker; no recorder mutex is taken here.
+    pub(crate) fn admission_closer(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.lifecycle.closing)
+    }
+
+    /// Permanently close Start admission and request Stop on the current attempt.
+    /// Call on a background worker; this never waits for capture/persistence.
+    pub fn begin_shutdown(&self) {
+        self.lifecycle
+            .closing
+            .store(true, std::sync::atomic::Ordering::Release);
+        let mut slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(live) = slot.as_mut() {
+            stop_live(live);
+        }
+    }
+
+    /// Observe accepted work, including persistence after the device slot frees.
+    #[must_use]
+    pub fn shutdown_status(&self) -> crate::recorder_lifecycle::ShutdownStatus {
+        let slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        self.lifecycle.status(slot.is_some())
+    }
+
     /// Observe state for the native indicator without opening any capture.
     #[must_use]
     pub fn observe(&self) -> RecorderObservation {
@@ -375,6 +426,15 @@ impl DaemonRecorder {
         cancel: StopSignal,
     ) -> Result<RecordingStatus, RecorderError> {
         let mut slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        if self
+            .lifecycle
+            .closing
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(RecorderError::Failed(
+                "the app is shutting down; recording was not started".into(),
+            ));
+        }
         if cancel.is_stopped() {
             return Err(RecorderError::Failed(
                 "recording start cancelled before capture".into(),
@@ -384,6 +444,7 @@ impl DaemonRecorder {
             return Err(RecorderError::AlreadyRecording);
         }
 
+        let work = self.lifecycle.begin();
         let mut control = SessionControl {
             stop: cancel,
             ..SessionControl::new()
@@ -414,6 +475,7 @@ impl DaemonRecorder {
             ready: ready.clone(),
             stop: stop.clone(),
             armed: true,
+            work: Some(work),
         };
 
         // CON-05: the gate runs before anything is captured. The HTTP layer
@@ -439,6 +501,10 @@ impl DaemonRecorder {
                 // A recording we cannot account for is not one we should make.
                 RecorderError::Failed(format!("could not write the audit log: {e}"))
             })?;
+
+        if let Some(visibility) = &self.start_visibility {
+            (visibility.0)(self.observe(), stop.clone()).map_err(RecorderError::Failed)?;
+        }
 
         // Defer all tap opening until the session owns its slot and finishes
         // transcription admission. Opening a tap may itself access a device.
@@ -480,6 +546,7 @@ impl DaemonRecorder {
             Arc::clone(&live),
             finish,
             self.on_ready.clone(),
+            pending.work.take().expect("accepted work owner"),
         ));
         pending.armed = false;
 
@@ -604,6 +671,8 @@ impl DaemonRecorder {
             on_segment,
             on_ready,
             live: Arc::new(Mutex::new(None)),
+            start_visibility: None,
+            lifecycle: Arc::default(),
         }
     }
 
@@ -617,6 +686,14 @@ impl DaemonRecorder {
     #[must_use]
     pub const fn with_finish_deadlines(mut self, deadlines: FinishDeadlines) -> Self {
         self.finish_deadlines = deadlines;
+        self
+    }
+
+    /// Require native visibility before any transcription configuration or tap
+    /// opening. Install before sharing the recorder with HTTP or shell controls.
+    #[must_use]
+    pub fn with_start_visibility(mut self, visibility: StartVisibility) -> Self {
+        self.start_visibility = Some(visibility);
         self
     }
 
@@ -874,6 +951,7 @@ struct PendingStart {
     ready: crate::session::ReadySignal,
     stop: StopSignal,
     armed: bool,
+    work: Option<crate::recorder_lifecycle::WorkLease>,
 }
 
 impl Drop for PendingStart {
@@ -907,6 +985,7 @@ async fn spawn_session(
     live: Arc<Mutex<Option<Live>>>,
     finish: Arc<Finisher>,
     on_ready: ReadyTap,
+    mut work: crate::recorder_lifecycle::WorkLease,
 ) {
     // Prebuilt taps run the session that hands them over pre-started; the
     // supervised backend runs the one that builds a per-leg supervisor and
@@ -975,6 +1054,7 @@ async fn spawn_session(
     // recording that failed and a session that persisted nothing.
     let persisted = match outcome {
         Ok(outcome) => {
+            work.require_save();
             // Each entry names its own leg or stage ("mic: …", "capture: …"),
             // and since #79 they are not all transcription failures — a ring
             // drop rides this channel too, because it is the only one anybody
@@ -1003,12 +1083,25 @@ async fn spawn_session(
             }
             // Blocking work — Opus encoding and SQLite — off the runtime.
             let root2 = root.clone();
-            tokio::task::spawn_blocking(move || (finish)(&root2, &outcome))
-                .await
-                .ok()
-                .flatten()
+            tokio::task::spawn_blocking(move || {
+                let persisted = (finish)(&root2, &outcome);
+                if persisted.is_some() {
+                    work.saved();
+                }
+                // The blocking owner retains this lease even if its awaiting
+                // async task is cancelled or unwinds before the save returns.
+                drop(work);
+                persisted
+            })
+            .await
+            .ok()
+            .flatten()
         }
         Err(e) => {
+            if ready.session_id().is_some() || ready.capture_started_at_ms().is_some() {
+                work.require_save();
+            }
+            drop(work);
             diag!("  ! the recording failed: {e}");
             None
         }

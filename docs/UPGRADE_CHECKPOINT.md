@@ -1,6 +1,6 @@
 # Upgrade checkpoint
 
-Current checkpoint: FlyOnTheWall main at `5da188713583b3365827160392552d7c0c5c3e57`,
+Validated dashboard checkpoint: FlyOnTheWall main at `5da188713583b3365827160392552d7c0c5c3e57`,
 including [#212](https://github.com/nolanmak/FlyOnTheWall/pull/212). This records a
 specific tested source checkpoint, not a published release or laptop acceptance.
 
@@ -43,10 +43,13 @@ working old version remains the fallback until the actual laptop workflow passes
 
 ## Remaining release work
 
-- The native menu bar and floating recording indicator are still not connected
-  to the product launch path. The dashboard is the recording control surface.
-  [#58](https://github.com/nolanmak/FlyOnTheWall/issues/58) requires authoritative
-  recorder state, shared consent/start/stop gates and single-instance ownership.
+- This pinned dashboard checkpoint predates the connected native controls. The
+  newer source wires app-bundle launch and `fotwd shell` to one native shell and
+  daemon, shared consent/start/stop and persistence-aware Quit. See
+  [native evidence and remaining acceptance](native-connected-shell-progress.md).
+  The owned-view checks do not validate installed signed-app TCC, global shortcuts,
+  focus or actual meeting capture. Acceptance in
+  [#58](https://github.com/nolanmak/FlyOnTheWall/issues/58) remains open.
 - Genuine AEC still needs backend qualification, especially overlapping speech.
   Runtime wiring and signal tests do not establish acoustic acceptance.
 - Signed-app device disconnect/reconnect, Bluetooth, sleep/wake, long recording,

@@ -937,3 +937,77 @@ async fn configuration_unwind_releases_only_its_reserved_attempt() {
     rec.stop().unwrap();
     assert!(until(|| rec.status().state == RecordingState::Idle).await);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_waits_for_background_persistence_after_the_live_slot_is_idle() {
+    struct Release(Arc<Gate>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+    let root = tmpdir("native-shutdown-persist");
+    let gate = Arc::new(Gate::default());
+    let _release = Release(gate.clone());
+    let rec = gated_recorder(&root.join("sessions"), gate.clone());
+    rec.start().unwrap();
+    rec.begin_shutdown();
+    assert!(until(|| gate.reached()).await);
+    assert_eq!(rec.status().state, RecordingState::Idle);
+    let waiting = rec.shutdown_status();
+    assert!(waiting.closing);
+    assert_eq!(waiting.outstanding, 1);
+    assert!(!waiting.drained(), "Idle is not save completion");
+    assert!(
+        rec.start().is_err(),
+        "shutdown must refuse new dashboard admission"
+    );
+    assert!(
+        rec.start_native(
+            fotw_shell::StartOrigin::Hotkey,
+            true,
+            fotwd::session::StopSignal::new()
+        )
+        .is_err()
+    );
+    gate.open();
+    assert!(until(|| rec.shutdown_status().drained()).await);
+    assert!(
+        rec.shutdown_status().save_failed,
+        "the injected finisher deliberately confirms no save"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_panicking_persistence_worker_releases_ownership_and_reports_unconfirmed_save() {
+    let root = tmpdir("native-shutdown-save-panic");
+    let rec = recorder_with(
+        &root.join("sessions"),
+        Box::new(|_, _| panic!("injected save failure")),
+    );
+    rec.start().unwrap();
+    rec.begin_shutdown();
+    assert!(until(|| rec.shutdown_status().drained()).await);
+    assert!(rec.shutdown_status().save_failed);
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_before_start_refuses_configuration_audit_and_capture() {
+    let root = tmpdir("native-shutdown-before-start");
+    let configured = Arc::new(AtomicU64::new(0));
+    let opened = Arc::new(AtomicU64::new(0));
+    let rec = counted_native_recorder(&root.join("sessions"), configured.clone(), opened.clone());
+    rec.begin_shutdown();
+    assert!(rec.shutdown_status().drained());
+    assert!(rec.start().is_err());
+    assert!(
+        rec.start_native(
+            fotw_shell::StartOrigin::Menu,
+            true,
+            fotwd::session::StopSignal::new()
+        )
+        .is_err()
+    );
+    assert_eq!(configured.load(Ordering::SeqCst), 0);
+    assert_eq!(opened.load(Ordering::SeqCst), 0);
+    assert!(!root.join("audit.jsonl").exists());
+}

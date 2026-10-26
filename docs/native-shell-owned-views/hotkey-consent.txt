@@ -1,0 +1,14 @@
+ConsentControlProbe {
+    nonactivating: true,
+    on_screen: true,
+    unchecked_start_disabled: true,
+    unchecked_click_blocked: true,
+    acknowledgement_delivered: true,
+    acknowledged_start_enabled: true,
+    start_response_acknowledged: true,
+    prompt_cleared: true,
+}
+configuration_calls=0
+capture_calls=0
+shutdown_drained=true
+audit_origin=hotkey

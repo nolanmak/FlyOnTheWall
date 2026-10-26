@@ -38,6 +38,7 @@
 //! behind a full-screen space; it can see a selector that goes nowhere and a
 //! consent gate the renderer forgot to apply.
 
+mod app_delegate;
 mod hotkeys;
 mod pill;
 mod prompt;
@@ -53,8 +54,11 @@ use block2::RcBlock;
 use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use muda::MenuEvent;
 use objc2::MainThreadMarker;
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
-use objc2_foundation::{NSTimeInterval, NSTimer};
+use objc2_app_kit::{
+    NSAlert, NSApplication, NSApplicationActivationPolicy, NSEvent, NSEventModifierFlags,
+    NSEventType,
+};
+use objc2_foundation::{NSPoint, NSTimeInterval, NSTimer};
 use tray_icon::TrayIconEvent;
 
 use crate::clock::Monotonic;
@@ -68,6 +72,7 @@ use crate::probe::ShellProbe;
 use crate::prompt::{DetectedMeeting, PromptChoice};
 use crate::runtime::{ShellHost, ShellRuntime};
 use crate::state::{ShellCore, ShellInput};
+use crate::surface::{FrameAdmission, SurfaceEvent, SurfaceHost, render_surface};
 use crate::view::MenuAction;
 
 /// How often the run loop drains the event channels and advances the clock.
@@ -93,6 +98,19 @@ const PUMP_INTERVAL: NSTimeInterval = 0.05;
 /// with no recording indicator, so a partial start is a failure, not a
 /// degraded mode (CON-02).
 pub fn run<H: ShellHost + 'static>(host: H, hotkeys: HotkeyMap) -> Result<Infallible, ShellError> {
+    let runtime = ShellRuntime::with_hotkeys(host, hotkeys);
+    let keys = runtime.hotkeys().clone();
+    run_surface(runtime, &keys)
+}
+
+/// Run a recorder-driven surface host on the AppKit main thread.
+///
+/// # Errors
+/// If called off the main thread or native controls cannot be created.
+pub fn run_surface<H: SurfaceHost + 'static>(
+    host: H,
+    hotkeys: &HotkeyMap,
+) -> Result<Infallible, ShellError> {
     let mtm = MainThreadMarker::new().ok_or(ShellError::NotMainThread)?;
 
     let app = NSApplication::sharedApplication(mtm);
@@ -130,6 +148,242 @@ pub fn run<H: ShellHost + 'static>(host: H, hotkeys: HotkeyMap) -> Result<Infall
     // `run` returns only after `[NSApp stop:]`, at which point there is
     // nothing left to do and no value of `Infallible` to produce.
     std::process::exit(0);
+}
+
+/// Initialize AppKit immediately, then create controls only after background
+/// daemon ownership is confirmed. Returns normally after coordinated Quit so
+/// the caller can cancel background work and bound runtime shutdown.
+///
+/// # Errors
+/// Startup failure, an off-main-thread call, or failure to create native controls.
+pub fn run_bootstrapped<H: SurfaceHost + 'static>(
+    receiver: std::sync::mpsc::Receiver<Result<Option<H>, String>>,
+    hotkeys: &HotkeyMap,
+) -> Result<(), String> {
+    use crate::bootstrap::{BootstrapUpdate, SurfaceBootstrap};
+    use objc2::runtime::ProtocolObject;
+    let delegate = app_delegate::AppDelegate::new(
+        MainThreadMarker::new().ok_or_else(|| ShellError::NotMainThread.to_string())?,
+    );
+    let mtm = MainThreadMarker::new().ok_or_else(|| ShellError::NotMainThread.to_string())?;
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+    let shell: Rc<RefCell<Option<MacShell<H>>>> = Rc::new(RefCell::new(None));
+    let result = Rc::new(RefCell::new(Ok(())));
+    let bootstrap = Rc::new(RefCell::new(SurfaceBootstrap::new(receiver)));
+    let timer_shell = shell.clone();
+    let timer_result = result.clone();
+    let timer_app = app.clone();
+    let keys = hotkeys.clone();
+    let timer_delegate = delegate.clone();
+    let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
+        let Ok(mut shell) = timer_shell.try_borrow_mut() else {
+            return;
+        };
+        if timer_delegate.take_quit() {
+            if let Some(native) = shell.as_mut() {
+                let now = native.now();
+                native.runtime.on_event(SurfaceEvent::Terminate, now);
+            } else {
+                stop_app(&timer_app);
+                return;
+            }
+        }
+        if shell.is_none() {
+            match bootstrap.borrow_mut().poll() {
+                Ok(BootstrapUpdate::Pending) => {}
+                Ok(BootstrapUpdate::Start(host)) => match MacShell::new(mtm, host, &keys) {
+                    Ok(native) => {
+                        *shell = Some(native);
+                    }
+                    Err(error) => {
+                        let error = error.to_string();
+                        show_startup_error(&error, mtm);
+                        *timer_result.borrow_mut() = Err(error);
+                        stop_app(&timer_app);
+                    }
+                },
+                Ok(BootstrapUpdate::Reentered) => stop_app(&timer_app),
+                Err(error) => {
+                    show_startup_error(&error, mtm);
+                    *timer_result.borrow_mut() = Err(error);
+                    stop_app(&timer_app);
+                }
+            }
+        }
+        if let Some(native) = shell.as_mut() {
+            if timer_delegate.take_open() {
+                let now = native.now();
+                native
+                    .runtime
+                    .on_event(SurfaceEvent::Menu(MenuAction::OpenNotes), now);
+            }
+            native.pump();
+            if native.runtime.should_exit() {
+                stop_app(&timer_app);
+            }
+        }
+    });
+    // SAFETY: NSTimer invokes this block only from the main AppKit run loop.
+    let timer = unsafe {
+        NSTimer::scheduledTimerWithTimeInterval_repeats_block(PUMP_INTERVAL, true, &block)
+    };
+    app.run();
+    timer.invalidate();
+    app.setDelegate(None);
+    // Tear down native/global resources before returning to runtime shutdown.
+    shell.borrow_mut().take();
+    result.borrow().clone()
+}
+
+fn stop_app(app: &NSApplication) {
+    // A timer is not an NSEvent. Wake the application's own event queue so
+    // AppKit observes the stop flag even when the user supplies no input.
+    app.stop(None);
+    if let Some(event) = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+        NSEventType::ApplicationDefined,
+        NSPoint::new(0.0, 0.0),
+        NSEventModifierFlags::empty(),
+        0.0,
+        0,
+        None,
+        0,
+        0,
+        0,
+    ) {
+        app.postEvent_atStart(&event, true);
+    }
+}
+
+/// Run an owned empty AppKit loop and stop it from a timer without user input.
+/// Creates no surfaces, daemon, capture or global input controls.
+///
+/// # Errors
+/// If called off the AppKit main thread.
+pub fn probe_runloop_stop() -> Result<std::time::Duration, String> {
+    let mtm = MainThreadMarker::new().ok_or_else(|| ShellError::NotMainThread.to_string())?;
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    let callback_app = app.clone();
+    let block = RcBlock::new(move |_timer: NonNull<NSTimer>| stop_app(&callback_app));
+    // SAFETY: invoked only by this owned main-thread run loop.
+    let timer =
+        unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.2, false, &block) };
+    let began = Instant::now();
+    app.run();
+    timer.invalidate();
+    Ok(began.elapsed())
+}
+
+fn show_startup_error(error: &str, mtm: MainThreadMarker) {
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&objc2_foundation::NSString::from_str(
+        "FlyOnTheWall could not start",
+    ));
+    alert.setInformativeText(&objc2_foundation::NSString::from_str(error));
+    let _ = alert.addButtonWithTitle(&objc2_foundation::NSString::from_str("Close"));
+    let _ = alert.runModal();
+}
+
+/// Render and inspect one owned nonactivating indicator, then hide it. This
+/// fixture creates no tray/global hotkeys and does not launch the product.
+///
+/// # Errors
+/// An off-main-thread call, view rendering or PNG output failure.
+pub fn probe_indicator_frame(
+    view: &crate::PillView,
+    path: &std::path::Path,
+) -> Result<crate::probe::IndicatorFrameProbe, String> {
+    let mtm = MainThreadMarker::new().ok_or_else(|| ShellError::NotMainThread.to_string())?;
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    let mut pill = Pill::new(mtm);
+    pill.render(Some(view), mtm);
+    let result = pill.capture_frame(path, mtm);
+    pill.render(None, mtm);
+    result
+}
+
+/// Exercise only the owned consent panel and injected host. No tray, global
+/// hotkeys or product launch is created. The caller must inject device-free
+/// dependencies: the final acknowledged response is delivered to that host.
+///
+/// # Errors
+/// An off-main-thread call or missing consent prompt.
+pub fn probe_consent_controls<H: SurfaceHost>(
+    host: &mut H,
+    now: Monotonic,
+) -> Result<crate::probe::ConsentControlProbe, String> {
+    let mtm = MainThreadMarker::new().ok_or_else(|| ShellError::NotMainThread.to_string())?;
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    if host.view().prompt.is_none() {
+        return Err("owned host did not offer a consent prompt".into());
+    }
+    let mut prompt = Prompt::new(mtm);
+    prompt.render(host.view().prompt.as_ref(), mtm);
+    let nonactivating = prompt.nonactivating();
+    let on_screen = prompt.is_on_a_screen(mtm);
+    let unchecked_start_disabled = !prompt.start_is_enabled();
+    prompt.press(ProbePress::Start);
+    let unchecked_click_blocked = prompt.take_response().is_none();
+    prompt.press(ProbePress::Acknowledge);
+    let acknowledged = prompt.take_acknowledgement();
+    if let Some(value) = acknowledged {
+        host.on_event(SurfaceEvent::Acknowledge(value), now);
+    }
+    prompt.render(host.view().prompt.as_ref(), mtm);
+    let acknowledged_start_enabled = prompt.start_is_enabled();
+    prompt.press(ProbePress::Start);
+    let choice = prompt.take_response();
+    let start_response_acknowledged =
+        matches!(choice, Some(PromptChoice::Start { acknowledged: true }));
+    if let Some(choice) = choice {
+        host.on_event(SurfaceEvent::Prompt(choice), now);
+    }
+    let prompt_cleared = host.view().prompt.is_none();
+    prompt.render(None, mtm);
+    Ok(crate::probe::ConsentControlProbe {
+        nonactivating,
+        on_screen,
+        unchecked_start_disabled,
+        unchecked_click_blocked,
+        acknowledgement_delivered: acknowledged == Some(true),
+        acknowledged_start_enabled,
+        start_response_acknowledged,
+        prompt_cleared,
+    })
+}
+
+/// Invoke the owned delegate's real Objective-C selectors without installing
+/// global controls or launching the product.
+///
+/// # Errors
+/// If called off the AppKit main thread.
+pub fn probe_application_events() -> Result<crate::probe::ApplicationEventProbe, String> {
+    use objc2::msg_send;
+    let mtm = MainThreadMarker::new().ok_or_else(|| ShellError::NotMainThread.to_string())?;
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    let delegate = app_delegate::AppDelegate::new(mtm);
+    // SAFETY: this owned main-thread delegate implements both exact signatures.
+    let default_reopen: bool = unsafe {
+        msg_send![&*delegate, applicationShouldHandleReopen: &*app, hasVisibleWindows: false]
+    };
+    let opened = delegate.take_open();
+    let open_once = !delegate.take_open();
+    // SAFETY: the callback queues a flag only; no termination is performed here.
+    let reply: objc2_app_kit::NSApplicationTerminateReply =
+        unsafe { msg_send![&*delegate, applicationShouldTerminate: &*app] };
+    let quit = delegate.take_quit();
+    let quit_once = !delegate.take_quit();
+    Ok(crate::probe::ApplicationEventProbe {
+        reopen_queued_once: !default_reopen && opened && open_once,
+        quit_queued_once: quit && quit_once,
+        immediate_termination_cancelled: reply
+            == objc2_app_kit::NSApplicationTerminateReply::TerminateCancel,
+    })
 }
 
 /// Build the three surfaces, ask AppKit what it made of them, tear them down.
@@ -269,20 +523,21 @@ fn probe_meeting() -> DetectedMeeting {
         )
 }
 
-struct MacShell<H: ShellHost> {
-    runtime: ShellRuntime<H>,
+struct MacShell<H: SurfaceHost> {
+    runtime: H,
     tray: Tray,
     pill: Pill,
     prompt: Prompt,
     hotkeys: HotkeyRegistrar,
     origin: Instant,
     mtm: MainThreadMarker,
+    frames: FrameAdmission,
 }
 
-impl<H: ShellHost> MacShell<H> {
-    fn new(mtm: MainThreadMarker, host: H, hotkeys: HotkeyMap) -> Result<Self, ShellError> {
-        let registrar = HotkeyRegistrar::register(&hotkeys)?;
-        let runtime = ShellRuntime::with_hotkeys(host, hotkeys);
+impl<H: SurfaceHost> MacShell<H> {
+    fn new(mtm: MainThreadMarker, host: H, hotkeys: &HotkeyMap) -> Result<Self, ShellError> {
+        let registrar = HotkeyRegistrar::register(hotkeys)?;
+        let runtime = host;
         let tray = Tray::new(&runtime.view().menu)?;
         let pill = Pill::new(mtm);
         let prompt = Prompt::new(mtm);
@@ -294,6 +549,7 @@ impl<H: ShellHost> MacShell<H> {
             hotkeys: registrar,
             origin: Instant::now(),
             mtm,
+            frames: FrameAdmission::default(),
         })
     }
 
@@ -311,14 +567,14 @@ impl<H: ShellHost> MacShell<H> {
                 continue;
             }
             if let Some(chord) = self.hotkeys.chord_for(event.id) {
-                self.runtime.on_chord(chord, now);
+                self.runtime.on_event(SurfaceEvent::Chord(chord), now);
             }
         }
 
         // Menu clicks.
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if let Some(action) = MenuAction::from_id(&event.id.0) {
-                self.runtime.on_menu(action, now);
+                self.runtime.on_event(SurfaceEvent::Menu(action), now);
             }
         }
 
@@ -329,7 +585,7 @@ impl<H: ShellHost> MacShell<H> {
 
         // The pill's Stop button.
         if self.pill.take_stop_request() {
-            self.runtime.request_stop();
+            self.runtime.on_event(SurfaceEvent::Stop, now);
         }
 
         // The prompt. The acknowledgement is applied first: if a user manages
@@ -337,10 +593,11 @@ impl<H: ShellHost> MacShell<H> {
         // still first in wall-clock order and has to be honoured that way
         // (CON-05).
         if let Some(acknowledged) = self.prompt.take_acknowledgement() {
-            self.runtime.acknowledge_prompt(acknowledged);
+            self.runtime
+                .on_event(SurfaceEvent::Acknowledge(acknowledged), now);
         }
         if let Some(choice) = self.prompt.take_response() {
-            self.runtime.respond_to_prompt(choice, now);
+            self.runtime.on_event(SurfaceEvent::Prompt(choice), now);
         }
 
         self.runtime.tick(now);
@@ -348,11 +605,24 @@ impl<H: ShellHost> MacShell<H> {
     }
 
     fn render(&mut self) {
-        let view = self.runtime.view();
-        self.tray.render(&view.tray, &view.menu);
-        self.pill.render(view.pill.as_ref(), self.mtm);
-        // Issue #52: this line is the feature. Without it the state machine
-        // arms, the audit log is correct, and no human is ever asked.
-        self.prompt.render(view.prompt.as_ref(), self.mtm);
+        let Self {
+            runtime,
+            tray,
+            pill,
+            prompt,
+            mtm,
+            frames,
+            ..
+        } = self;
+        let _ = render_surface(runtime, |view| {
+            tray.render(&view.tray, &view.menu);
+            pill.render(view.pill.as_ref(), *mtm);
+            prompt.render(view.prompt.as_ref(), *mtm);
+            if frames.observe(view.pill.as_ref(), pill.visible_on_screen(*mtm)) {
+                Ok(())
+            } else {
+                Err(())
+            }
+        });
     }
 }

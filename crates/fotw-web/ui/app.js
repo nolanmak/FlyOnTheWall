@@ -24,6 +24,18 @@
 //           which is why they are not spelled out in this comment either.
 
 const TOKEN_KEY = "fotw.token";
+// Native Settings opens one named section. Only these content-free anchors may
+// survive handoff redemption; credentials and arbitrary fragments are removed.
+const REQUESTED_SETTINGS = ["#speech-settings", "#sum-settings"].includes(window.location.hash)
+  ? window.location.hash : "";
+function openRequestedSettings() {
+  const target = REQUESTED_SETTINGS === "#speech-settings" ? el.speechSettings
+    : REQUESTED_SETTINGS === "#sum-settings" ? el.sumSettings : null;
+  if (!target || target.hidden) return false;
+  target.open = true;
+  target.scrollIntoView?.({block: "start", behavior: "auto"});
+  return true;
+}
 
 const el = {
   search: document.getElementById("search"),
@@ -81,7 +93,7 @@ async function redeemHandoff() {
   const params = new URLSearchParams(window.location.search);
   const handoff = params.get("t");
   if (!handoff) return;
-  history.replaceState(null, "", window.location.pathname);
+  history.replaceState(null, "", window.location.pathname + REQUESTED_SETTINGS);
 
   const res = await fetch("/api/handoff", {
     method: "POST",
@@ -2087,6 +2099,7 @@ async function main() {
   await loadNoteDraftControl();
   await loadGithub();
   await loadSummarize();
+  openRequestedSettings();
   await pollRecording();
   setInterval(pollRecording, RECORDING_POLL_MS);
   connectStream();

@@ -1,0 +1,11 @@
+IndicatorFrameProbe {
+    nonactivating: true,
+    on_screen: true,
+    status: "Recording",
+    elapsed: "1:02:03",
+    detail: "System: whisper.cpp (small.en) · Mic: whisper.cpp (small.en)",
+    meter: "",
+    stop_enabled: true,
+    stop_dispatched: true,
+    controls_inside_panel: true,
+}
