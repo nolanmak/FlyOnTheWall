@@ -10,15 +10,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-async fn until(mut condition: impl FnMut() -> bool) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !condition() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("condition did not become true");
+#[track_caller]
+fn until(mut condition: impl FnMut() -> bool) -> impl std::future::Future<Output = ()> {
+    let caller = std::panic::Location::caller();
+    async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("condition did not become true at {caller}"));
+    }
 }
+
 fn recorder(
     root: &std::path::Path,
     gate: &RenderGate,
@@ -704,4 +709,36 @@ async fn a_stopped_daemon_disables_start_and_shows_failure_until_explicit_quit()
     host.on_event(SurfaceEvent::Menu(MenuAction::Quit), Monotonic::ZERO);
     assert!(host.should_exit());
     assert_eq!(opened.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_delivered_after_its_capture_already_ended_is_neutral() {
+    let root = tempfile::tempdir().unwrap();
+    let gate = RenderGate::new(Duration::from_secs(3));
+    let rec = recorder(root.path(), &gate, Arc::new(AtomicU64::new(0)));
+    let mut bridge = fotwd::native_bridge::RecorderBridge::spawn(rec.clone(), gate).unwrap();
+    let ticket = bridge.start(fotw_shell::StartOrigin::Menu, true).unwrap();
+    let preparing = snapshot_until(&mut bridge, |s| s.observation.stop_target().is_some()).await;
+    until(|| bridge.did_render(preparing.observation.stop_target().unwrap())).await;
+    let live = snapshot_until(&mut bridge, |s| {
+        s.observation.status().state == RecordingState::Recording
+    })
+    .await;
+    let target = live.observation.stop_target().unwrap().clone();
+    // The cancellation capability stops capture before its queued Stop arrives.
+    // This ordering is intentional, independent of worker scheduling.
+    ticket.cancel();
+    until(|| rec.status().state == RecordingState::Idle).await;
+    let idle = snapshot_until(&mut bridge, |s| {
+        s.observation.status().state == RecordingState::Idle
+    })
+    .await;
+    bridge.stop(&target).unwrap();
+    let after = snapshot_until(&mut bridge, |s| s.sequence >= idle.sequence + 3).await;
+    assert_eq!(after.observation.status().state, RecordingState::Idle);
+    assert!(
+        after.command_error.is_none(),
+        "an already completed Stop is not a recording failure: {:?}",
+        after.command_error
+    );
 }

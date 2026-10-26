@@ -126,6 +126,12 @@ the background worker handles device Stop once. Closing admission takes no
 recorder mutex and cannot fail because its command queue is full. All 14 native
 bridge regressions pass, including an immediate admission-closure assertion.
 
+A deterministic late-Stop regression reproduces cancellation completing capture
+before a queued Stop arrives. The bridge previously published `not recording` as
+a new failure. Already-ended Stop is now neutral; wrong-attempt rejection stays
+explicit. All 15 bridge tests pass. Test deadlines retain their original duration
+and now report the waiting call site to aid diagnosis on hosted runners.
+
 ## Remaining acceptance
 
 - Full repository/hosted checks and signed review-bundle results must accompany

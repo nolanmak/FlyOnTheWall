@@ -338,7 +338,13 @@ fn bridge_worker(
                     }
                 }
                 Command::Stop(target) => {
-                    command_error = recorder.stop_observed(&target).err().map(|e| e.to_string());
+                    // Ticket cancellation or natural completion can release
+                    // the slot before this queued Stop arrives. That is already
+                    // the requested outcome, not a new recording failure.
+                    command_error = match recorder.stop_observed(&target) {
+                        Ok(_) | Err(fotw_web::RecorderError::NotRecording) => None,
+                        Err(error) => Some(error.to_string()),
+                    };
                 }
             }
         }
