@@ -134,13 +134,13 @@ def main():
             ready = json.loads(command(helper + ['start', '--binary', args.server, '--port', port, '--timeout', 60]).stdout)
             assert ready['ready'] and ready['murmur_capabilities']['model_sha256'] == MODEL_SHA
             assert ready['url'] == f'http://127.0.0.1:{port}'
-            pids = [int(line[1:]) for line in subprocess.check_output(['/usr/sbin/lsof', '-nP', f'-iTCP:{port}', '-sTCP:LISTEN', '-Fp'], text=True).splitlines() if line.startswith('p')]
+            pids = [int(line[1:]) for line in subprocess.check_output(['/usr/sbin/lsof', '-nP', f'-iTCP:{port}', '-sTCP:LISTEN', '-Fp'], text=True, timeout=10).splitlines() if line.startswith('p')]
             assert len(pids) == 1
             gateway = pids[0]
-            children = list(map(int, subprocess.check_output(['/usr/bin/pgrep', '-P', str(gateway)], text=True).split()))
+            children = list(map(int, subprocess.check_output(['/usr/bin/pgrep', '-P', str(gateway)], text=True, timeout=10).split()))
             assert len(children) == 1
             engine = children[0]
-            assert Path(subprocess.check_output(['/bin/ps', '-p', str(engine), '-o', 'comm='], text=True).strip()).resolve() == args.server
+            assert Path(subprocess.check_output(['/bin/ps', '-p', str(engine), '-o', 'comm='], text=True, timeout=10).strip()).resolve() == args.server
 
             # Rotate order; the managed Murmur runtime remains loaded throughout.
             modes = ['murmur-only', 'fotw-idle', 'fotw-only', 'concurrent']
@@ -212,13 +212,13 @@ def main():
     assert identities == {name: sha(getattr(args, name)) for name in identities}, 'Executed binary changed during trials'
     root = Path(__file__).resolve().parents[1]
     report = {
-        'source_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(),
-        'tracked_source_dirty': bool(subprocess.check_output(['git', 'diff', 'HEAD', '--name-only'], cwd=root, text=True).strip()),
+        'source_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True, timeout=10).strip(),
+        'tracked_source_dirty': bool(subprocess.check_output(['git', 'diff', 'HEAD', '--name-only'], cwd=root, text=True, timeout=10).strip()),
         'binary_sha256': identities, 'model_sha256': MODEL_SHA, 'wave_sha256': WAV_SHA,
         'murmur_helper_sha256': {name: sha(scripts / name) for name in ['local-whisper.py', 'whisper_gateway.py', 'local-whisper-offline.sb']},
-        'hardware_model': subprocess.check_output(['/usr/sbin/sysctl', '-n', 'hw.model'], text=True).strip(),
+        'hardware_model': subprocess.check_output(['/usr/sbin/sysctl', '-n', 'hw.model'], text=True, timeout=10).strip(),
         'ram_bytes': int(subprocess.check_output(['/usr/sbin/sysctl', '-n', 'hw.memsize'], text=True)),
-        'macos': subprocess.check_output(['/usr/bin/sw_vers', '-productVersion'], text=True).strip(),
+        'macos': subprocess.check_output(['/usr/bin/sw_vers', '-productVersion'], text=True, timeout=10).strip(),
         'audio_seconds_per_recognizer': 11, 'fotw_recognizers': 2, 'repetitions': 3,
         'rss_sampling_interval_seconds': .05, 'rss_is_not_unique_physical_memory': True,
         'engine_defaults': 'FOTW release whisper-rs Metal; supplied Murmur server defaults, automatic GPU selection',
