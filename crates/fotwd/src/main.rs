@@ -679,6 +679,15 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
     }
     println!();
 
+    // Resolve the frozen policy before audit or any speech/provider setup.
+    let scope = match fotwd::capture_settings::configured(&root) {
+        Ok(scope) => scope,
+        Err(error) => {
+            eprintln!("fotwd: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // CON-01's acceptance criterion is about the audit log, not the UI: no
     // audio buffer reaches disk without a user-initiated Start recorded here
     // first. Written *before* the tap opens, so a crash during capture leaves
@@ -785,13 +794,6 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
         }
     };
     let plat = platform::host();
-    let scope = match fotwd::capture_settings::configured(&root) {
-        Ok(scope) => scope,
-        Err(error) => {
-            eprintln!("fotwd: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
     let system = match plat.open_system(scope, FormatRequest::any()) {
         Ok(t) => t,
         Err(e) => {

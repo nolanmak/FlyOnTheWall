@@ -92,3 +92,17 @@ helper churn, restart/rebuild and saved-audio/transcript qualification. No actua
 Spotify/Brave audio was captured, and none of these tests prove system routing.
 Installed-app updates introducing new helper identities during a recording also
 need explicit enforcement/failure qualification. Do not claim whole-issue completion.
+
+
+Review follow-up moves `fotwd record` policy resolution directly after consent,
+before the audit write or speech/provider setup. Helper refusal messages identify
+the helper name and unexpected identity without including absolute install paths.
+Native bundle fixtures use a per-process sequence as well as time to avoid name
+collisions. Full local core CI remains green.
+
+The isolated AEC tool lockfile also includes the new platform binding dependencies;
+no existing package versions changed. Core `just ci` now checks that standalone
+lock with a cheap resolver pass. Separate tool checks passed locally: default
+Clippy/10 tests/run, native Clippy/18 tests, and heldout/clocked/bandlimited generated
+signal runs, plus advisory/license/source checks. These are build/regression
+checks; they do not qualify a new AEC backend or change the separate AEC work.

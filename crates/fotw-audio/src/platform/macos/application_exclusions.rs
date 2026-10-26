@@ -85,14 +85,18 @@ fn family_at(root: &Path, expected: &str) -> Result<Vec<AppRef>, TapError> {
                 path.extension().and_then(|s| s.to_str()),
                 Some("app" | "xpc" | "appex")
             ) {
+                let helper = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy())
+                    .unwrap_or_default();
                 let id = identity(&path).ok_or_else(|| {
-                    TapError::unsupported("an application helper has no readable bundle identity")
+                    TapError::unsupported(format!("Audio exclusion cannot be confirmed for helper {helper}: its app identity is unreadable. Update or reinstall the selected app, then retry."))
                 })?;
                 // Never broaden Brave/Spotify policy to Chrome or shared Apple helpers.
                 if id != expected && !id.starts_with(&format!("{expected}.")) {
-                    return Err(TapError::unsupported(
-                        "application contains a helper outside its bundle identity family; exclusion cannot be confirmed",
-                    ));
+                    return Err(TapError::unsupported(format!(
+                        "Audio exclusion cannot be confirmed for helper {helper} ({id}): its identity is outside the selected app. Update or reinstall the selected app, then retry.",
+                    )));
                 }
                 ids.insert(id);
             }
@@ -105,6 +109,7 @@ fn family_at(root: &Path, expected: &str) -> Result<Vec<AppRef>, TapError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    static NEXT_BUNDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     struct OwnedBundle(PathBuf);
     impl OwnedBundle {
         fn new() -> Self {
@@ -112,8 +117,9 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
+            let sequence = NEXT_BUNDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "fotw-exclusion-bundle-{}-{unique}.app",
+                "fotw-exclusion-bundle-{}-{unique}-{sequence}.app",
                 std::process::id()
             ));
             std::fs::create_dir(&path).unwrap();
@@ -154,7 +160,23 @@ mod tests {
         let bundle = OwnedBundle::new();
         bundle.put("", "com.brave.Browser");
         bundle.put("Contents/Helpers/Other.app", "com.google.Chrome.helper");
-        assert!(family_at(&bundle.0, "com.brave.Browser").is_err());
+        let error = family_at(&bundle.0, "com.brave.Browser")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Other.app") && error.contains("com.google.Chrome.helper"),
+            "refusal must identify the helper: {error}"
+        );
+        let missing = OwnedBundle::new();
+        missing.put("", "com.brave.Browser");
+        std::fs::create_dir_all(missing.0.join("Contents/Helpers/Missing.app/Contents")).unwrap();
+        let error = family_at(&missing.0, "com.brave.Browser")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Missing.app"),
+            "unreadable helper must be identified: {error}"
+        );
         assert!(family_at(&bundle.0, "com.spotify.client").is_err());
     }
 }
