@@ -32,6 +32,7 @@
 //! is undocumented and its own users report it unreliable.
 
 mod activity;
+pub(crate) mod application_exclusions;
 mod capture_assets;
 pub(crate) mod capture_clock;
 mod capture_lifecycle;

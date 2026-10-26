@@ -1710,6 +1710,8 @@ impl SegmentTap {
 /// The latches a caller outside the session holds, and the clock on its end.
 #[derive(Clone, Debug, Default)]
 pub struct SessionControl {
+    /// Frozen application exclusions reused by every system-tap rebuild.
+    pub system_scope: SystemScope,
     /// Explicit single-use preloaded audio processing; no backend is selected
     /// by default. Its native cleanup remains part of recording ownership.
     pub processing: Option<crate::live_aec::Processing>,
@@ -1800,6 +1802,7 @@ pub async fn run_with_stop(
         transcription,
         duration,
         SessionControl {
+            system_scope: SystemScope::default(),
             processing: None,
             speech: crate::speech_status::SpeechMonitor::default(),
             capture_health: crate::capture_health::CaptureMonitor::default(),
@@ -2232,13 +2235,14 @@ pub async fn run_supervised(
         let slot = sys_slot.clone();
         let activity = Arc::clone(&sys_activity);
         let counters = sys_counters.clone();
+        let system_scope = control.system_scope.clone();
         CaptureSupervisor::new(
             SupervisorConfig {
                 id: TapId::system_default(),
                 ..SupervisorConfig::default()
             },
             Arc::clone(&clock),
-            move || plat.open_system(SystemScope::DefaultOutputMix, FormatRequest::any()),
+            move || plat.open_system(system_scope.clone(), FormatRequest::any()),
             move || slot.sink(Arc::clone(&activity), counters.clone(), 2),
         )
     };

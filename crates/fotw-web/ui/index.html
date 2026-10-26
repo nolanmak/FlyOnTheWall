@@ -33,6 +33,16 @@
     <p id="recording-limit" class="recording-limit" hidden></p>
     <section id="capture-health" class="capture-health" aria-label="Audio capture health" hidden></section>
     <section id="speech-health" class="speech-health" aria-label="Current recording transcription" hidden></section>
+    <details id="capture-settings" class="gh-settings" hidden>
+      <summary>Audio exclusions</summary>
+      <p id="capture-disclosure" class="gh-note">Exclude Spotify or all Brave audio from the system-audio track, including meetings in Brave. Chrome and other meeting apps remain included. Your microphone remains recorded; music audible through speakers can still reach it. Use headphones to avoid that.</p>
+      <label><input id="capture-spotify" type="checkbox"> Ignore Spotify</label>
+      <label><input id="capture-brave" type="checkbox"> Ignore Brave</label>
+      <p class="gh-note">Changes apply to the next recording. An active meeting keeps the audio policy it started with. Requires macOS 26 or newer and the selected apps installed.</p>
+      <button id="capture-save" type="button" disabled>Save audio exclusions</button>
+      <button id="capture-reload" type="button">Reload saved choice</button>
+      <p id="capture-status" class="gh-note" role="status"></p>
+    </details>
     <details id="speech-settings" class="gh-settings speech-settings" hidden>
       <summary>Transcription</summary>
       <p class="gh-note">Choose how the next recording becomes text. Changes apply to new recordings.</p>

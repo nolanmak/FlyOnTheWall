@@ -39,6 +39,7 @@ struct Inner {
     health: OnceLock<Arc<dyn DaemonHealth>>,
     model_setup: OnceLock<Arc<dyn crate::model_setup::ModelSetupControl>>,
     speech: OnceLock<Arc<dyn crate::speech::SpeechControl>>,
+    capture: OnceLock<Arc<dyn crate::capture::CaptureControl>>,
     speech_recovery: OnceLock<Arc<dyn crate::speech_recovery::SpeechRecoveryControl>>,
     documents: OnceLock<Arc<dyn crate::documents::DocumentControl>>,
 }
@@ -103,6 +104,15 @@ impl AppState {
     ) -> Option<Arc<dyn crate::speech_recovery::SpeechRecoveryControl>> {
         self.inner.speech_recovery.get().cloned()
     }
+    /// Install saved application-exclusion preferences before serving requests.
+    pub fn set_capture(&self, control: Arc<dyn crate::capture::CaptureControl>) {
+        let _ = self.inner.capture.set(control);
+    }
+    /// Snapshot the exclusion-settings control.
+    pub fn capture(&self) -> Option<Arc<dyn crate::capture::CaptureControl>> {
+        self.inner.capture.get().cloned()
+    }
+
     /// Attach transcription settings before serving requests.
     pub fn set_speech(&self, control: Arc<dyn crate::speech::SpeechControl>) {
         let _ = self.inner.speech.set(control);
@@ -185,6 +195,7 @@ impl AppState {
                 documents: OnceLock::new(),
                 model_setup: OnceLock::new(),
                 speech: OnceLock::new(),
+                capture: OnceLock::new(),
                 speech_recovery: OnceLock::new(),
                 tickets: TokenTable::new(WS_TICKET_TTL),
                 handoff: TokenTable::new(HANDOFF_TTL),

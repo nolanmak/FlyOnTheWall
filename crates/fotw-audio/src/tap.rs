@@ -23,9 +23,10 @@ use crate::watchdog::{OutputActivity, OutputProbe};
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// What slice of system audio to capture.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum SystemScope {
     /// Everything going to the default output.
+    #[default]
     DefaultOutputMix,
     /// Only these applications.
     Apps(Vec<AppRef>),

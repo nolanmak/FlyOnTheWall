@@ -23,3 +23,6 @@ cidre = { version = "=0.20.0", default-features = false, features = [
   "core_audio", "at", "av", "cm", "cat", "cf", "ns", "objc", "blocks", "dispatch",
   "macos_14_4",
 ] }
+
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWorkspace"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSBundle", "NSString", "NSURL"] }

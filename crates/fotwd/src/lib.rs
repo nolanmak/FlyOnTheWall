@@ -194,3 +194,5 @@ mod raw_replay;
 pub mod speech_recovery;
 /// Content-free live transcription provenance.
 pub mod speech_status;
+
+pub mod capture_settings;

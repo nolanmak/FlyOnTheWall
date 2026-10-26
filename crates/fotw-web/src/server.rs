@@ -232,6 +232,10 @@ fn routes(state: AppState) -> Router {
         .route("/api/models/install", post(crate::model_setup::start))
         .route("/api/models/cancel", post(crate::model_setup::cancel))
         .route(
+            "/api/settings/capture",
+            get(crate::capture::get).post(crate::capture::post),
+        )
+        .route(
             "/api/settings/speech",
             get(crate::speech::get).post(crate::speech::post),
         )

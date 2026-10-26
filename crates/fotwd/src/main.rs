@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use fotw_audio::{AudioPlatform, DeviceId, FormatRequest, SystemScope, platform};
+use fotw_audio::{AudioPlatform, DeviceId, FormatRequest, platform};
 use fotw_secrets::{KeyStore, Provider, SecretKey};
 use fotw_shell::StartOrigin;
 use fotw_store::{ArchiveOptions, Db};
@@ -736,7 +736,14 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
         }
     };
     let plat = platform::host();
-    let system = match plat.open_system(SystemScope::DefaultOutputMix, FormatRequest::any()) {
+    let scope = match fotwd::capture_settings::configured(&root) {
+        Ok(scope) => scope,
+        Err(error) => {
+            eprintln!("fotwd: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let system = match plat.open_system(scope, FormatRequest::any()) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("fotwd: could not open the system tap: {e}");

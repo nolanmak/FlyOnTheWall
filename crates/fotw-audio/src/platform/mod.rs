@@ -41,3 +41,36 @@ pub fn host() -> MacOsPlatform {
 pub fn host() -> StubPlatform {
     StubPlatform::new()
 }
+
+/// Whether persistent application exclusions are available, without opening audio.
+#[must_use]
+pub fn application_exclusions_supported() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::application_exclusions::supported()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// Resolve installed application and helper identities without launching it.
+///
+/// # Errors
+/// Unsupported runtime, missing installation or unconfirmed helper identity.
+pub fn application_exclusion_family(
+    bundle_id: &str,
+) -> Result<Vec<crate::AppRef>, crate::TapError> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::application_exclusions::family(bundle_id)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = bundle_id;
+        Err(crate::TapError::unsupported(
+            "application exclusions are unavailable on this platform",
+        ))
+    }
+}

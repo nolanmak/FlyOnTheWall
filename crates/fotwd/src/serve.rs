@@ -517,6 +517,12 @@ async fn serve_until_stopped(root: PathBuf, launch: Launch, port: u16) -> Result
             .set_documents(Arc::new(crate::documents::Documents::new(db, store)));
     }
 
+    if let Ok(db) = crate::open_library(&root) {
+        server
+            .state()
+            .set_capture(Arc::new(crate::capture_settings::SettingsControl::new(db)));
+    }
+
     let addr = server.addr();
     let state = server.state().clone();
 
