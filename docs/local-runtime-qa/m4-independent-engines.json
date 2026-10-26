@@ -1,0 +1,284 @@
+{
+  "source_commit": "6af9d23693e6aba2878237a25eca33d7e8b3481a",
+  "tracked_source_dirty": false,
+  "binary_sha256": {
+    "fotw": "f7491fcfc10f7af8d79eb95dd246ef0893564475252807c10e3210544a1681a4",
+    "murmur": "b58f76b7317edae9f885158148b44fbd9b437c7b7b15cb0137c4be968ff11984",
+    "server": "437a74a72cea6d8a3c3c035f5ca9d65bd4b553ce0d8eff635b18c727740e6c37"
+  },
+  "model_sha256": "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
+  "wave_sha256": "59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e",
+  "murmur_helper_sha256": {
+    "local-whisper.py": "a8c4d5e667e871c658da770fe440d08ad1606f1225565378f549bf47a6b5e3f7",
+    "whisper_gateway.py": "acdbcc3b95feacc9cfde53f29e81b93240accf5149497cf0430ec1bfcabffbc9",
+    "local-whisper-offline.sb": "c64e8c4f08e9895001326cdf12bcb237dcb8f717441a529d2d88fbc67d683fa4"
+  },
+  "hardware_model": "Mac16,10",
+  "ram_bytes": 17179869184,
+  "macos": "26.4",
+  "audio_seconds_per_recognizer": 11,
+  "fotw_recognizers": 2,
+  "repetitions": 3,
+  "rss_sampling_interval_seconds": 0.05,
+  "rss_is_not_unique_physical_memory": true,
+  "engine_defaults": "FOTW release whisper-rs Metal; supplied Murmur server defaults, automatic GPU selection",
+  "input_pacing": "accelerated whole public clip per recognizer, not realtime recording",
+  "cache_controlled": false,
+  "murmur_startup_memory_measured": false,
+  "fotw_loading_memory_sampled": true,
+  "gpu_memory_separately_measured": false,
+  "external_network_denied": true,
+  "owned_runtime_stopped": true,
+  "temporary_state_removed": true,
+  "transcripts_retained": false,
+  "full_app_or_device_acceptance": false,
+  "shared_worker_evaluated": false,
+  "trials": [
+    {
+      "repeat": 1,
+      "mode": "murmur-only",
+      "murmur": {
+        "wall_seconds": 0.40475454200000005,
+        "reference_matches": true
+      },
+      "memory": {
+        "sample_count": 8,
+        "per_role_peak_rss_bytes": {
+          "murmur-engine": 729808896,
+          "gateway": 26214400,
+          "murmur-client": 21970944
+        },
+        "peak_sampled_sum_rss_bytes": 777945088
+      }
+    },
+    {
+      "repeat": 1,
+      "mode": "fotw-idle",
+      "murmur": {
+        "wall_seconds": 0.37991029200000037,
+        "reference_matches": true
+      },
+      "memory": {
+        "sample_count": 14,
+        "per_role_peak_rss_bytes": {
+          "murmur-engine": 730103808,
+          "gateway": 26181632,
+          "murmur-client": 21970944,
+          "fotw-engine": 795115520
+        },
+        "peak_sampled_sum_rss_bytes": 1572962304
+      }
+    },
+    {
+      "repeat": 1,
+      "mode": "fotw-only",
+      "fotw": {
+        "inference_seconds": 0.558732792,
+        "reference_matches": [
+          true,
+          true
+        ]
+      },
+      "memory": {
+        "sample_count": 14,
+        "per_role_peak_rss_bytes": {
+          "murmur-engine": 636633088,
+          "gateway": 25477120,
+          "fotw-engine": 816087040
+        },
+        "peak_sampled_sum_rss_bytes": 1478197248
+      }
+    },
+    {
+      "repeat": 1,
+      "mode": "concurrent",
+      "fotw": {
+        "inference_seconds": 0.798531916,
+        "reference_matches": [
+          true,
+          true
+        ]
+      },
+      "murmur": {
+        "wall_seconds": 0.7776662499999993,
+        "reference_matches": true
+      },
+      "request_intervals_overlap": true,
+      "dispatch_skew_seconds": -3.583399999929071e-05,
+      "memory": {
+        "sample_count": 21,
+        "per_role_peak_rss_bytes": {
+          "murmur-engine": 636633088,
+          "gateway": 25853952,
+          "murmur-client": 21905408,
+          "fotw-engine": 816349184
+        },
+        "peak_sampled_sum_rss_bytes": 1493188608
+      }
+    },
+    {
+      "repeat": 2,
+      "mode": "fotw-idle",
+      "murmur": {
+        "wall_seconds": 0.3705705420000003,
+        "reference_matches": true
+      },
+      "memory": {
+        "sample_count": 14,
+        "per_role_peak_rss_bytes": {
+          "murmur-engine": 627752960,
+          "gateway": 25821184,
+          "murmur-client": 21889024,
+          "fotw-engine": 796344320
+        },
+        "peak_sampled_sum_rss_bytes": 1471692800
+      }
+    },
+    {
+      "repeat": 2,
+      "mode": "fotw-only",
+      "fotw": {
+        "inference_seconds": 0.552408542,
+        "reference_matches": [
+          true,
+          true
+        ]
+      },
+      "memory": {
+        "sample_count": 14,
+        "per_role_peak_rss_bytes": {
+          "murmur-engine": 627703808,
+          "gateway": 25690112,
+          "fotw-engine": 816185344
+        },
+        "peak_sampled_sum_rss_bytes": 1469579264
+      }
+    },
+    {
+      "repeat": 2,
+      "mode": "concurrent",
+      "fotw": {
+        "inference_seconds": 0.796233875,
+        "reference_matches": [
+          true,
+          true
+        ]
+      },
+      "murmur": {
+        "wall_seconds": 0.7648857089999996,
+        "reference_matches": true
+      },
+      "request_intervals_overlap": true,
+      "dispatch_skew_seconds": -3.574999999855777e-05,
+      "memory": {
+        "sample_count": 20,
+        "per_role_peak_rss_bytes": {
+          "murmur-engine": 627785728,
+          "gateway": 26034176,
+          "murmur-client": 21921792,
+          "fotw-engine": 816381952
+        },
+        "peak_sampled_sum_rss_bytes": 1492074496
+      }
+    },
+    {
+      "repeat": 2,
+      "mode": "murmur-only",
+      "murmur": {
+        "wall_seconds": 0.3689972500000014,
+        "reference_matches": true
+      },
+      "memory": {
+        "sample_count": 7,
+        "per_role_peak_rss_bytes": {
+          "murmur-engine": 627802112,
+          "gateway": 26083328,
+          "murmur-client": 21970944
+        },
+        "peak_sampled_sum_rss_bytes": 675856384
+      }
+    },
+    {
+      "repeat": 3,
+      "mode": "fotw-only",
+      "fotw": {
+        "inference_seconds": 0.53691475,
+        "reference_matches": [
+          true,
+          true
+        ]
+      },
+      "memory": {
+        "sample_count": 14,
+        "per_role_peak_rss_bytes": {
+          "murmur-engine": 627802112,
+          "gateway": 26050560,
+          "fotw-engine": 816037888
+        },
+        "peak_sampled_sum_rss_bytes": 1469890560
+      }
+    },
+    {
+      "repeat": 3,
+      "mode": "concurrent",
+      "fotw": {
+        "inference_seconds": 0.803122833,
+        "reference_matches": [
+          true,
+          true
+        ]
+      },
+      "murmur": {
+        "wall_seconds": 0.770879292,
+        "reference_matches": true
+      },
+      "request_intervals_overlap": true,
+      "dispatch_skew_seconds": -2.8083000000123093e-05,
+      "memory": {
+        "sample_count": 20,
+        "per_role_peak_rss_bytes": {
+          "murmur-engine": 627818496,
+          "gateway": 26378240,
+          "murmur-client": 21872640,
+          "fotw-engine": 816349184
+        },
+        "peak_sampled_sum_rss_bytes": 1491910656
+      }
+    },
+    {
+      "repeat": 3,
+      "mode": "murmur-only",
+      "murmur": {
+        "wall_seconds": 0.3634442500000006,
+        "reference_matches": true
+      },
+      "memory": {
+        "sample_count": 7,
+        "per_role_peak_rss_bytes": {
+          "murmur-engine": 627851264,
+          "gateway": 26099712,
+          "murmur-client": 21921792
+        },
+        "peak_sampled_sum_rss_bytes": 675872768
+      }
+    },
+    {
+      "repeat": 3,
+      "mode": "fotw-idle",
+      "murmur": {
+        "wall_seconds": 0.36224491599999986,
+        "reference_matches": true
+      },
+      "memory": {
+        "sample_count": 14,
+        "per_role_peak_rss_bytes": {
+          "murmur-engine": 627916800,
+          "gateway": 26378240,
+          "murmur-client": 21921792,
+          "fotw-engine": 796344320
+        },
+        "peak_sampled_sum_rss_bytes": 1472561152
+      }
+    }
+  ]
+}

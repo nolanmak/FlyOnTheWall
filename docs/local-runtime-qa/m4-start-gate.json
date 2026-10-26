@@ -1,0 +1,22 @@
+{
+  "binary_sha256": "f7491fcfc10f7af8d79eb95dd246ef0893564475252807c10e3210544a1681a4",
+  "external_network_denied": true,
+  "cases": [
+    {
+      "gate": "EOF",
+      "ready": true,
+      "inference_output": false,
+      "exit_code": 1
+    },
+    {
+      "gate": "1",
+      "ready": true,
+      "reference_matches": [
+        true,
+        true
+      ],
+      "inference_seconds": 0.581338459,
+      "exit_code": 0
+    }
+  ]
+}
