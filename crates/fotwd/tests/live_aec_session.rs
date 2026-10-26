@@ -352,9 +352,21 @@ async fn recording(mode: Mode) {
     let evidence = processing::validate(&outcome.dir, &id, ReplaySource::Mic, &mut replay)
         .unwrap()
         .expect("actual recording must declare its selected processor");
+    let processing_diagnostic = (evidence.cleaned_samples <= 8000).then(|| {
+        let journal =
+            std::fs::read_to_string(outcome.dir.join("mic.stt-processing.jsonl")).unwrap();
+        let mut kinds = std::collections::BTreeMap::<String, usize>::new();
+        let mut epochs = std::collections::BTreeSet::new();
+        for line in journal.lines().skip(1) {
+            let interval: serde_json::Value = serde_json::from_str(line).unwrap();
+            *kinds.entry(interval["kind"].to_string()).or_default() += 1;
+            epochs.insert(interval["epoch"].as_u64().unwrap());
+        }
+        (kinds, epochs.len())
+    });
     assert!(
         evidence.cleaned_samples > 8000,
-        "clock-qualified audio must reach AEC: evidence={evidence:?}, calls={}, errors={:?}",
+        "clock-qualified audio must reach AEC: evidence={evidence:?}, calls={}, errors={:?}, processing kinds/epoch-count={processing_diagnostic:?}",
         calls.load(Ordering::Acquire),
         outcome.stt_errors
     );

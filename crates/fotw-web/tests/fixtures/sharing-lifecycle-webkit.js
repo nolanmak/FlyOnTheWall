@@ -1,6 +1,7 @@
-// Run as an async function body in the owned, nonpersistent WebKit runner,
+// Invoke runSharingLifecycleFixture() in the owned, nonpersistent WebKit runner,
 // against ui_preview's throwaway library. Sharing responses are synthetic;
 // downloads are captured as strings. No providers, capture or clipboard.
+async function runSharingLifecycleFixture() {
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function until(check) {
   for (let i = 0; i < 200; i++) { if (check()) return; await pause(10); }
@@ -71,3 +72,4 @@ return {cssWidth: innerWidth, draftPreserved: true, originalRevisionSaved: true,
   liveNavigationClearedSharing: true, cleanNavigationCount: 20,
   downloadIntents: downloads.length, actualDownloads: 0, scriptHashes,
   processMemoryMeasured: false, browserGcForced: false};
+}

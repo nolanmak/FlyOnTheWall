@@ -225,7 +225,10 @@ are synthetic; download intents are captured as strings. At 1440px/light and
 390px/dark it edits Unicode text, switches meeting/live views, saves using the
 original revision, navigates 20 times, and reopens the saved text. Both cases
 pass with exactly one download intent and zero actual downloads. Served script
-hashes match the source files. The screenshots were visually inspected:
+hashes match the source files. On macOS 26.4, the example runs from its owned
+build output and the runner uses a nonactivating, nonpersistent WKWebView.
+Append `return await runSharingLifecycleFixture();` to the fixture source passed
+to `WKWebView.callAsyncJavaScript`. The screenshots were visually inspected:
 
 - [1440px light](dashboard-refresh/sharing-lifecycle-light-1440.png),
   [measurements](dashboard-refresh/sharing-lifecycle-light-1440.json).
