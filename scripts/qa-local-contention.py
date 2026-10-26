@@ -217,7 +217,7 @@ def main():
         'binary_sha256': identities, 'model_sha256': MODEL_SHA, 'wave_sha256': WAV_SHA,
         'murmur_helper_sha256': {name: sha(scripts / name) for name in ['local-whisper.py', 'whisper_gateway.py', 'local-whisper-offline.sb']},
         'hardware_model': subprocess.check_output(['/usr/sbin/sysctl', '-n', 'hw.model'], text=True, timeout=10).strip(),
-        'ram_bytes': int(subprocess.check_output(['/usr/sbin/sysctl', '-n', 'hw.memsize'], text=True)),
+        'ram_bytes': int(subprocess.check_output(['/usr/sbin/sysctl', '-n', 'hw.memsize'], text=True, timeout=10)),
         'macos': subprocess.check_output(['/usr/bin/sw_vers', '-productVersion'], text=True, timeout=10).strip(),
         'audio_seconds_per_recognizer': 11, 'fotw_recognizers': 2, 'repetitions': 3,
         'rss_sampling_interval_seconds': .05, 'rss_is_not_unique_physical_memory': True,
