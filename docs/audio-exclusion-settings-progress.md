@@ -36,8 +36,18 @@ not native audio evidence; see [manifest](audio-exclusion-owned-ui/manifest.json
 
 ![Owned audio settings fixture](audio-exclusion-owned-ui/settings.png)
 
-Acceptance in #215 remains open. Outstanding work includes actual supervised
-rebuild and downstream PCM/archive/STT/replay regression coverage, review of the
+A synthetic platform integration test now runs all-off, Spotify-only,
+Brave-only, both, and failed enforcement on reopen through the actual supervised
+session, WAL and fake local recognizer. It inspects distinct source frequencies
+in stored PCM and actual inference chunks, verifies meeting/microphone signals
+remain and asserts every reopened tap receives the frozen scope. Injected output
+and sleep/wake signals exercise recovery without touching system devices.
+Temporarily restoring the old default-mix opener makes this test RED (scope
+widened); restoring the frozen opener is GREEN. All-target daemon Clippy passes.
+This tests software plumbing against an injected platform, not OS routing.
+
+Acceptance in #215 remains open. Outstanding work includes decoded compressed
+audio, cloud/fallback/durable replay coverage, review of the
 separate low-level `fotw` diagnostics capture path, and signed-app native playback,
 helper churn, restart/rebuild and saved-audio/transcript qualification. No actual
 Spotify/Brave audio was captured, and none of these tests prove system routing.
