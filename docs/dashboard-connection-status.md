@@ -22,7 +22,10 @@ and Stop survived. The 390px dark connected and 195px light disconnected views
 were inspected. Both preserve Stop without horizontal overflow. The smaller
 viewport exercises narrow layout; it does not prove native zoom/focus behavior.
 See [evidence manifest](dashboard-connection-owned-ui/manifest.json) and the
-repeatable script alongside the screenshots.
+repeatable script alongside the screenshots. The existing narrow reading fixture
+also passed at 195×425: a complete saved utterance, Stop, Return to recording
+and Copy transcript stayed reachable; synthetic Stop left the saved selection
+intact and Start reachable. Copy was focused, never invoked.
 
 ![Connected updates](dashboard-connection-owned-ui/390-dark.png)
 ![Disconnected updates at narrow width](dashboard-connection-owned-ui/195-light.png)

@@ -1,7 +1,7 @@
 {
   "source_sha256": {
-    "crates/fotw-web/ui/app.js": "208d1a311d65ad791d9cfe9cab1888a18db5e91d2afecafc32f2bb825be7dbf4",
-    "crates/fotw-web/ui/index.html": "9d0b57c87690624d5ff27904b14b4216a6aede253b8dd5da17cbadf4e8d83966",
+    "crates/fotw-web/ui/app.js": "0e6f8662014a4b7899bb0eae41c233f2fdfc307c8597ba4ef50e30b6f2d0807b",
+    "crates/fotw-web/ui/index.html": "f03162d34c56c4e4b644c6c4a6ea1dc8a43dfb4eeaa62d79f760fcac87b3884a",
     "crates/fotw-web/ui/app.css": "ee154205587dc2f5b14d2cd26c35c6db48307a21c0881764c43774d9d740cd31"
   },
   "fixture": "Existing owned ui_preview --live-notes, debug FOTW_UI_DIR points to these exact UI assets; real WebServer/auth/status API and synthetic recorder; known-key temporary SQLCipher library only",
@@ -22,5 +22,14 @@
       "behavior": "Actual owned socket closed; disconnected status, recording, elapsed and Stop remain visible without horizontal overflow; narrower viewport approximates 200% layout width, not a native zoom or focus qualification"
     }
   ],
-  "limits": "No installed product launch, devices, user data, provider credentials, global keys or clipboard. No full #123 acceptance claim."
+  "limits": "No installed product launch, devices, user data, provider credentials, global keys or clipboard. No full #123 acceptance claim.",
+  "source_revision": "05e116d15e13f22bac409cddc970656a6cfa2feb (same UI asset hashes in evidence-only follow-up commit)",
+  "additional_regression": {
+    "script": "crates/fotw-web/tests/fixtures/zoom-reading-webkit.js",
+    "script_sha256": "951002c1abaaee1f2e21229169822e4f054f07d0ef4d6b2f7ea12222c2ea7b2e",
+    "result": "narrow-reading.json",
+    "width": 195,
+    "height": 425,
+    "coverage": "Actual own WebKit saved reading, Stop, Return, Copy button focus without copying, then synthetic Stop and Start; saved selection preserved; no horizontal overflow. Geometry/DOM focus evidence only, not native zoom/active-window focus-ring qualification."
+  }
 }
