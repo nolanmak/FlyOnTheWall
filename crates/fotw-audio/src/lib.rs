@@ -91,3 +91,6 @@ pub use crate::watchdog::{
 
 #[cfg(any(test, feature = "conformance"))]
 pub mod conformance;
+
+#[cfg(any(target_os = "macos", test))]
+mod system_exclusions;
