@@ -101,7 +101,7 @@
       this.id=id; this.api=api; this.notify=notify;this.options=options;this.savedMeetingId=null;
       this.body=''; this.anchors=[]; this.revision=0; this.dirty=false;
       this.status='loading'; this.version=0; this.pending=null; this.loaded=false;
-      this.composing=false;this.view=null;this.captureElapsed=null;
+      this.composing=false;this.view=null;this.captureElapsed=null;this.reading=0;this.readVersion=0;
     }
     path() { return '/api/'+(this.options.session?'sessions':'meetings')+'/'+encodeURIComponent(this.id)+'/notes'; }
     document(response) {
@@ -117,20 +117,26 @@
       if(this.savedMeetingId)linkSession(this.id,this.savedMeetingId);
       return response.note;
     }
-    changed() { this.notify(this); }
+    changed() { this.notify(this);trimDraft(this); }
     async load() {
       if (this.dirty || this.composing) return;
-      const version=this.version, previousStatus=this.status;
+      const version=this.version, previousStatus=this.status, readVersion=++this.readVersion;
+      this.reading++;
       this.status='loading';this.changed();
       try {
-        const d=this.document(await this.api(this.path()));
+        const response=await this.api(this.path());
+        // A remount may have started a newer read. Its body, revision and final
+        // capture clock must not be replaced by an older request's snapshot.
+        if(readVersion!==this.readVersion)return;
+        const d=this.document(response);
         if(this.version!==version || this.dirty || this.composing) {
           if(this.status==='loading')this.status=this.dirty?'unsaved':previousStatus;
           this.changed();return;
         }
         this.body=d.body_md;this.revision=d.revision;this.anchors=d.anchors;
         this.loaded=true;this.status='saved';
-      } catch (_) { this.status='error'; }
+      } catch (_) { if(readVersion===this.readVersion)this.status='error'; }
+      finally {this.reading--;trimDraft(this);}
       this.changed();
     }
     edit(body, selection, checkpoint) {
@@ -208,19 +214,23 @@
       if(this.pending)await this.pending;
       if(this.status==='conflict' || !this.dirty)return;
       if(this.options.session) {
+        this.reading++;
         try { this.document(await this.api(this.path())); }
         catch (_) { this.status='error';this.changed();return; }
+        finally {this.reading--;trimDraft(this);}
       }
       await this.flush();
     }
     async overwrite() {
       if(this.pending || this.status!=='conflict')return;
       // The user explicitly chose their draft. Refresh only the revision, not text.
+      this.reading++;
       try {
         const current=this.document(await this.api(this.path()));
         this.revision=current.revision;this.status='unsaved';
         await this.flush();
       } catch (_) { this.status='conflict';this.changed(); }
+      finally {this.reading--;trimDraft(this);}
     }
     async discard() {
       if(this.pending)return;
@@ -229,6 +239,12 @@
   }
 
   const drafts=new Map();
+  function trimDraft(draft) {
+    if(draft.view || draft.dirty || draft.pending || draft.composing || draft.reading)return;
+    // A live draft can have both session and canonical-meeting keys. Release
+    // only aliases to this clean object; independently edited drafts survive.
+    for(const [key,value] of drafts)if(value===draft)drafts.delete(key);
+  }
   function linkSession(sessionId, meetingId) {
     const draft=drafts.get('session:'+sessionId);
     if(draft) {
@@ -266,9 +282,9 @@
     for(const b of [retry,overwrite,reload,up,down])actions.appendChild(b);
     section.appendChild(actions);parent.appendChild(section);
     const key=(options.session?'session:':'meeting:')+id;
+    drafts.get(key)?.view?.release();
     let draft=drafts.get(key);
     if(!draft){draft=new Draft(id,api,()=>{},options);drafts.set(key,draft);}
-    if(draft.view)draft.view.release();
     let composing=false, checkpoint=null;const view={parent,section};draft.view=view;
     const active=()=>draft.view===view && section.isConnected!==false;
     let delay=null, maximum=null;
@@ -324,7 +340,7 @@
     view.release=()=>{
       if(draft.view!==view)return;
       view.prepare();composing=false;checkpoint=null;draft.view=null;draft.notify=()=>{};
-      return draft.flush();
+      const saving=draft.flush();trimDraft(draft);return saving;
     };
     input.addEventListener('compositionstart',()=>{
       if(!active())return;
