@@ -77,6 +77,7 @@ struct InputClock {
     offset: Option<i128>,
     expected_sample: Option<f64>,
     last_host: Option<u64>,
+    last_native_host: Option<u64>,
 }
 impl InputClock {
     fn stamp(
@@ -134,14 +135,19 @@ impl InputClock {
             let ns = u128::from(delta) * u128::from(base.numer) / u128::from(base.denom.get());
             u64::try_from(ns).ok()
         })();
+        let reversed = mapped
+            .zip(self.last_native_host)
+            .is_some_and(|(now, last)| now <= last);
+        if reversed {
+            flags |= FrameFlags::DISCONTINUITY | FrameFlags::TIMESTAMP_ERROR;
+        } else if mapped.is_some() {
+            self.last_native_host = mapped;
+        }
         let fallback = elapsed_ns(base.origin, reading.continuous, base.numer, base.denom);
         let host = match mapped {
-            Some(host) if self.last_host.is_none_or(|last| host > last) => host,
+            Some(host) if !reversed && self.last_host.is_none_or(|last| host > last) => host,
             _ => {
                 flags |= FrameFlags::TIMESTAMP_ERROR;
-                if mapped.is_some() {
-                    flags |= FrameFlags::DISCONTINUITY;
-                }
                 self.last_host.map_or(fallback, |last| fallback.max(last))
             }
         };
@@ -276,7 +282,11 @@ mod tests {
             &fixture_base(),
         );
         assert_eq!(ts.host_ns, 11000);
-        assert!(flags.contains(FrameFlags::TIMESTAMP_ERROR | FrameFlags::DISCONTINUITY));
+        assert!(flags.contains(FrameFlags::TIMESTAMP_ERROR));
+        assert!(
+            !flags.contains(FrameFlags::DISCONTINUITY),
+            "recovery behind an arrival fallback is not proof of a source gap"
+        );
     }
     #[test]
     fn sleep_epoch_change_and_uncertain_bridge_are_not_trusted() {
@@ -333,6 +343,34 @@ mod tests {
             flags.contains(FrameFlags::TIMESTAMP_ERROR),
             "stale native time is not current audio timing"
         );
+    }
+    #[test]
+    fn actual_native_host_reversal_is_a_discontinuity_even_after_fallback() {
+        let base = fixture_base();
+        let mut clock = InputClock::default();
+        clock.stamp(
+            &cat::AudioTimeStamp::with_sample_and_host_time(0.0, 9000),
+            0,
+            480,
+            reading(10000, 1000),
+            &base,
+        );
+        clock.stamp(
+            &cat::AudioTimeStamp::invalid(),
+            480,
+            480,
+            reading(11000, 1000),
+            &base,
+        );
+        let (ts, flags) = clock.stamp(
+            &cat::AudioTimeStamp::with_sample_and_host_time(960.0, 8000),
+            960,
+            480,
+            reading(12000, 1000),
+            &base,
+        );
+        assert_eq!(ts.host_ns, 12000);
+        assert!(flags.contains(FrameFlags::DISCONTINUITY | FrameFlags::TIMESTAMP_ERROR));
     }
     #[test]
     fn public_capture_clock_uses_the_native_continuous_epoch() {

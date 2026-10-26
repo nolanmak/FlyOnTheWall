@@ -74,9 +74,12 @@ host time are valid. A bracketed absolute/continuous clock reading projects
 than 100 microseconds, an offset change exceeding that bound, future/stale input
 (older than one second), pre-epoch/overflow values or non-increasing mapped time
 cannot qualify timing. Audio passes unchanged with a monotonic callback-arrival
-fallback and TIMESTAMP_ERROR. Epoch shifts and backward mapped time also flag
+fallback and TIMESTAMP_ERROR. Epoch shifts and reversals of qualified native host time also flag
 DISCONTINUITY. Native sample gaps/resets flag discontinuity; malformed or inexact
 sample times cannot qualify timing. Delivered device-frame counts remain unchanged.
+An otherwise ordered native time that lags a previous arrival-time fallback is
+not evidence of interrupted audio: it remains a timing error without inventing
+a discontinuity. This matters for Murmur, which cancels on source interruption.
 All conversion state is owned by the existing per-tap sink try-lock and replaced
 at start; the conversion uses fixed arithmetic/native clock reads on the callback.
 
