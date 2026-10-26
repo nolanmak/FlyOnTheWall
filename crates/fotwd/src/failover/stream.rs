@@ -492,7 +492,8 @@ impl PreparedSource {
 
 impl FailoverStream {
     /// Open a cloud-only source with exact durable input and no local plan.
-    /// Provider failure retains input and reports incomplete transcription.
+    /// Terminal provider failure retains input and reports incomplete
+    /// transcription; handoff budgets never terminate cloud-only retries.
     pub async fn open_cloud(
         dir: &Path,
         config: CloudSourceConfig,
@@ -1295,7 +1296,21 @@ impl Worker {
                             }
                         }
                         StreamEvent::Error(error) => {
-                            let decision = self.policy.error(self.now(), &error);
+                            // Handoff budgets belong only to a selected backup.
+                            // Cloud-only keeps transport retries but still surfaces
+                            // terminal provider/request errors immediately.
+                            let decision = if self.config.local.is_some() {
+                                self.policy.error(self.now(), &error)
+                            } else {
+                                match error.class {
+                                    SttErrorClass::Auth
+                                    | SttErrorClass::Quota
+                                    | SttErrorClass::BadRequest
+                                    | SttErrorClass::Unsupported
+                                    | SttErrorClass::AudioFormat => Decision::Surface,
+                                    _ => Decision::KeepCloud,
+                                }
+                            };
                             if decision == Decision::Surface {
                                 return Err(error);
                             }
@@ -1327,8 +1342,9 @@ impl Worker {
                     drop(self.vad.push(&pcm));
                     moved = true;
                 }
-                if let Decision::Switch(reason) =
-                    self.policy.tick(self.now(), self.vad.voiced_samples())
+                if self.config.local.is_some()
+                    && let Decision::Switch(reason) =
+                        self.policy.tick(self.now(), self.vad.voiced_samples())
                 {
                     self.demote_local(reason)?;
                 }
@@ -1345,12 +1361,13 @@ impl Worker {
                         self.cloud_cursor += pcm.len() as u64;
                         self.blocked_since = None;
                         moved = true;
-                    } else if self
-                        .blocked_since
-                        .get_or_insert_with(Instant::now)
-                        .elapsed()
-                        .as_millis()
-                        >= u128::from(self.config.limits.retry_budget_ms)
+                    } else if self.config.local.is_some()
+                        && self
+                            .blocked_since
+                            .get_or_insert_with(Instant::now)
+                            .elapsed()
+                            .as_millis()
+                            >= u128::from(self.config.limits.retry_budget_ms)
                     {
                         self.demote_local(SwitchReason::TransportBudget)?;
                     }

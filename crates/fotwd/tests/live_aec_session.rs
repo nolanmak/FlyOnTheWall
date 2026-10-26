@@ -46,12 +46,14 @@ struct PulseTap {
     mic: bool,
     epoch: Arc<OnceLock<(Instant, u64)>>,
     ready: ReadySignal,
+    completed: Arc<AtomicUsize>,
     stopped: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 impl PulseTap {
-    fn pair(ready: ReadySignal) -> (Box<dyn AudioTap>, Box<dyn AudioTap>) {
+    fn pair(ready: ReadySignal) -> (Box<dyn AudioTap>, Box<dyn AudioTap>, Arc<AtomicUsize>) {
         let epoch = Arc::new(OnceLock::new());
+        let completed = Arc::new(AtomicUsize::new(0));
         let tap = |mic| {
             Box::new(Self {
                 id: if mic {
@@ -62,11 +64,12 @@ impl PulseTap {
                 mic,
                 epoch: epoch.clone(),
                 ready: ready.clone(),
+                completed: completed.clone(),
                 stopped: Arc::new(AtomicBool::new(false)),
                 thread: None,
             }) as Box<dyn AudioTap>
         };
-        (tap(false), tap(true))
+        (tap(false), tap(true), completed.clone())
     }
 }
 impl AudioTap for PulseTap {
@@ -84,6 +87,7 @@ impl AudioTap for PulseTap {
         let ready = self.ready.clone();
         let stopped = self.stopped.clone();
         let mic = self.mic;
+        let completed = self.completed.clone();
         self.thread = Some(std::thread::spawn(move || {
             // This fixture measures steady recording, not filesystem startup.
             // Reserve its full clock-qualification window after actual readiness.
@@ -101,7 +105,7 @@ impl AudioTap for PulseTap {
                     std::thread::sleep(wait);
                 }
                 if stopped.load(Ordering::Acquire) {
-                    break;
+                    return;
                 }
                 // Fixture-native sample time, independent of callback scheduling.
                 sink.on_frames(
@@ -110,6 +114,7 @@ impl AudioTap for PulseTap {
                     FrameFlags::empty(),
                 );
             }
+            completed.fetch_add(1, Ordering::Release);
         }));
         Ok(self.format())
     }
@@ -285,17 +290,25 @@ async fn recording(mode: Mode) {
             ))
         }
     };
-    let (system, mic) = PulseTap::pair(control.ready.clone());
+    let (system, mic, completed) = PulseTap::pair(control.ready.clone());
     let stop = control.stop.clone();
     let ready = control.ready.clone();
     let stopper = tokio::spawn(async move {
-        while !ready.is_ready() && !stop.is_stopped() {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        if ready.is_ready() {
-            tokio::time::sleep(Duration::from_millis(4250)).await;
-            stop.stop();
-        }
+        let result = tokio::time::timeout(Duration::from_secs(15), async {
+            while !ready.is_ready() && !stop.is_stopped() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            while completed.load(Ordering::Acquire) < 2 && !stop.is_stopped() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            completed.load(Ordering::Acquire) == 2
+        })
+        .await;
+        stop.stop();
+        assert!(
+            matches!(result, Ok(true)),
+            "both generated taps must deliver all 400 blocks before Stop"
+        );
     });
     let outcome = session::run_with_control(
         &root,
@@ -305,9 +318,9 @@ async fn recording(mode: Mode) {
         Duration::from_secs(20),
         control,
     )
-    .await
-    .unwrap();
+    .await;
     stopper.await.unwrap();
+    let outcome = outcome.unwrap();
     let id = outcome.dir.file_name().unwrap().to_string_lossy();
     let mut replay = ReplayReader::open(&outcome.dir, &id, ReplaySource::Mic).unwrap();
     let evidence = processing::validate(&outcome.dir, &id, ReplaySource::Mic, &mut replay)
@@ -431,7 +444,7 @@ async fn cancelled_processing_admission_retains_native_cleanup_and_cannot_be_reu
     control.processing = Some(processing.clone());
     control.stop.stop();
     let retained = control.clone();
-    let (system, mic) = PulseTap::pair(control.ready.clone());
+    let (system, mic, _) = PulseTap::pair(control.ready.clone());
     let error = tokio::time::timeout(
         Duration::from_secs(1),
         session::run_with_control(
@@ -458,7 +471,7 @@ async fn cancelled_processing_admission_retains_native_cleanup_and_cannot_be_reu
         retained.speech.has_retained_native_worker(),
         "native cleanup remains part of recorder ownership"
     );
-    let (system, mic) = PulseTap::pair(retained.ready.clone());
+    let (system, mic, _) = PulseTap::pair(retained.ready.clone());
     let error = session::run_with_control(
         &sessions,
         system,

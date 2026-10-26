@@ -30,9 +30,10 @@ after this stage. Stop bounds data publication separately from native cleanup.
 Only the microphone transcription source declares processing. Local-only,
 explicit cloud-to-local fallback and cloud-only recording all persist the exact
 processed input and processing journal before exposing it to ASR. The new
-`CloudSourceConfig` contains no local factory or model plan: provider failure
-reports incomplete transcription and retains input without selecting local
-inference. Existing cloud-only behavior is unchanged without an explicit
+`CloudSourceConfig` contains no local factory or model plan. Handoff budgets do
+not end a live cloud-only stream; terminal provider/request failure or an
+unconfirmed Stop retains input and reports incomplete transcription without
+selecting local inference. Existing cloud-only behavior is unchanged without an explicit
 processing request. Processed sources cannot claim the ordinary raw replay
 recipe; verified retained processed PCM remains their recovery input.
 
@@ -76,8 +77,8 @@ Stop can time out while the original audio and canonical input remain retained.
 
 The local durable path preserves microphone overlap instead of applying the
 old suppressive echo gate to its canonical input. Transcript deduplication is
-unchanged. This does not enable acoustic echo cancellation; live processing
-integration and physical overlap-quality acceptance remain unfinished.
+unchanged. Explicit processing can use the recording integration above; native
+backend selection and physical overlap-quality acceptance remain unfinished.
 
 Device-free tests cover exact retained input and restart after inference
 failure, initialization deadlines, cancellation before capture, data/native
@@ -128,11 +129,11 @@ metadata roundtrip and byte-for-byte original WAL preservation. Other runtime
 RED/GREEN tests establish tagged-only admission, invalid digest/missing-sidecar
 restart refusal, raw-recipe exclusion and validation before PCM repair.
 
-This API does not enable AEC in recording. Capture-clock conversion, native
-reference alignment and capture-pump ownership still need integration; backend
-quality and physical acceptance remain separate. Per-interval metadata sync cost
-has not been qualified for live capture. Existing provider choices and defaults
-are unchanged.
+This API integrates explicitly selected processing into recording, including
+capture-clock conversion, native reference alignment and worker ownership. It
+does not select or enable a native acoustic backend. Backend quality and physical
+acceptance remain separate. Per-interval metadata sync cost has not been qualified
+for live capture. Existing provider choices and defaults are unchanged.
 
 ## Speech policy and lifecycle
 
