@@ -53,7 +53,7 @@ use block2::RcBlock;
 use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use muda::MenuEvent;
 use objc2::MainThreadMarker;
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+use objc2_app_kit::{NSAlert, NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::{NSTimeInterval, NSTimer};
 use tray_icon::TrayIconEvent;
 
@@ -68,7 +68,7 @@ use crate::probe::ShellProbe;
 use crate::prompt::{DetectedMeeting, PromptChoice};
 use crate::runtime::{ShellHost, ShellRuntime};
 use crate::state::{ShellCore, ShellInput};
-use crate::surface::{SurfaceEvent, SurfaceHost, render_surface};
+use crate::surface::{FrameAdmission, SurfaceEvent, SurfaceHost, render_surface};
 use crate::view::MenuAction;
 
 /// How often the run loop drains the event channels and advances the clock.
@@ -144,6 +144,151 @@ pub fn run_surface<H: SurfaceHost + 'static>(
     // `run` returns only after `[NSApp stop:]`, at which point there is
     // nothing left to do and no value of `Infallible` to produce.
     std::process::exit(0);
+}
+
+/// Initialize AppKit immediately, then create controls only after background
+/// daemon ownership is confirmed. Returns normally after coordinated Quit so
+/// the caller can cancel background work and bound runtime shutdown.
+///
+/// # Errors
+/// Startup failure, an off-main-thread call, or failure to create native controls.
+pub fn run_bootstrapped<H: SurfaceHost + 'static>(
+    receiver: std::sync::mpsc::Receiver<Result<Option<H>, String>>,
+    hotkeys: &HotkeyMap,
+) -> Result<(), String> {
+    use crate::bootstrap::{BootstrapUpdate, SurfaceBootstrap};
+    let mtm = MainThreadMarker::new().ok_or_else(|| ShellError::NotMainThread.to_string())?;
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    let shell: Rc<RefCell<Option<MacShell<H>>>> = Rc::new(RefCell::new(None));
+    let result = Rc::new(RefCell::new(Ok(())));
+    let bootstrap = Rc::new(RefCell::new(SurfaceBootstrap::new(receiver)));
+    let timer_shell = shell.clone();
+    let timer_result = result.clone();
+    let timer_app = app.clone();
+    let keys = hotkeys.clone();
+    let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
+        let Ok(mut shell) = timer_shell.try_borrow_mut() else {
+            return;
+        };
+        if shell.is_none() {
+            match bootstrap.borrow_mut().poll() {
+                Ok(BootstrapUpdate::Pending) => {}
+                Ok(BootstrapUpdate::Start(host)) => match MacShell::new(mtm, host, &keys) {
+                    Ok(native) => {
+                        *shell = Some(native);
+                    }
+                    Err(error) => {
+                        let error = error.to_string();
+                        show_startup_error(&error, mtm);
+                        *timer_result.borrow_mut() = Err(error);
+                        timer_app.stop(None);
+                    }
+                },
+                Ok(BootstrapUpdate::Reentered) => timer_app.stop(None),
+                Err(error) => {
+                    show_startup_error(&error, mtm);
+                    *timer_result.borrow_mut() = Err(error);
+                    timer_app.stop(None);
+                }
+            }
+        }
+        if let Some(native) = shell.as_mut() {
+            native.pump();
+            if native.runtime.should_exit() {
+                timer_app.stop(None);
+            }
+        }
+    });
+    // SAFETY: NSTimer invokes this block only from the main AppKit run loop.
+    let timer = unsafe {
+        NSTimer::scheduledTimerWithTimeInterval_repeats_block(PUMP_INTERVAL, true, &block)
+    };
+    app.run();
+    timer.invalidate();
+    // Tear down native/global resources before returning to runtime shutdown.
+    shell.borrow_mut().take();
+    result.borrow().clone()
+}
+
+fn show_startup_error(error: &str, mtm: MainThreadMarker) {
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&objc2_foundation::NSString::from_str(
+        "FlyOnTheWall could not start",
+    ));
+    alert.setInformativeText(&objc2_foundation::NSString::from_str(error));
+    let _ = alert.addButtonWithTitle(&objc2_foundation::NSString::from_str("Close"));
+    let _ = alert.runModal();
+}
+
+/// Render and inspect one owned nonactivating indicator, then hide it. This
+/// fixture creates no tray/global hotkeys and does not launch the product.
+///
+/// # Errors
+/// An off-main-thread call, view rendering or PNG output failure.
+pub fn probe_indicator_frame(
+    view: &crate::PillView,
+    path: &std::path::Path,
+) -> Result<crate::probe::IndicatorFrameProbe, String> {
+    let mtm = MainThreadMarker::new().ok_or_else(|| ShellError::NotMainThread.to_string())?;
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    let mut pill = Pill::new(mtm);
+    pill.render(Some(view), mtm);
+    let result = pill.capture_frame(path, mtm);
+    pill.render(None, mtm);
+    result
+}
+
+/// Exercise only the owned consent panel and injected host. No tray, global
+/// hotkeys or product launch is created. The caller must inject device-free
+/// dependencies: the final acknowledged response is delivered to that host.
+///
+/// # Errors
+/// An off-main-thread call or missing consent prompt.
+pub fn probe_consent_controls<H: SurfaceHost>(
+    host: &mut H,
+    now: Monotonic,
+) -> Result<crate::probe::ConsentControlProbe, String> {
+    let mtm = MainThreadMarker::new().ok_or_else(|| ShellError::NotMainThread.to_string())?;
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    if host.view().prompt.is_none() {
+        return Err("owned host did not offer a consent prompt".into());
+    }
+    let mut prompt = Prompt::new(mtm);
+    prompt.render(host.view().prompt.as_ref(), mtm);
+    let nonactivating = prompt.nonactivating();
+    let on_screen = prompt.is_on_a_screen(mtm);
+    let unchecked_start_disabled = !prompt.start_is_enabled();
+    prompt.press(ProbePress::Start);
+    let unchecked_click_blocked = prompt.take_response().is_none();
+    prompt.press(ProbePress::Acknowledge);
+    let acknowledged = prompt.take_acknowledgement();
+    if let Some(value) = acknowledged {
+        host.on_event(SurfaceEvent::Acknowledge(value), now);
+    }
+    prompt.render(host.view().prompt.as_ref(), mtm);
+    let acknowledged_start_enabled = prompt.start_is_enabled();
+    prompt.press(ProbePress::Start);
+    let choice = prompt.take_response();
+    let start_response_acknowledged =
+        matches!(choice, Some(PromptChoice::Start { acknowledged: true }));
+    if let Some(choice) = choice {
+        host.on_event(SurfaceEvent::Prompt(choice), now);
+    }
+    let prompt_cleared = host.view().prompt.is_none();
+    prompt.render(None, mtm);
+    Ok(crate::probe::ConsentControlProbe {
+        nonactivating,
+        on_screen,
+        unchecked_start_disabled,
+        unchecked_click_blocked,
+        acknowledgement_delivered: acknowledged == Some(true),
+        acknowledged_start_enabled,
+        start_response_acknowledged,
+        prompt_cleared,
+    })
 }
 
 /// Build the three surfaces, ask AppKit what it made of them, tear them down.
@@ -291,6 +436,7 @@ struct MacShell<H: SurfaceHost> {
     hotkeys: HotkeyRegistrar,
     origin: Instant,
     mtm: MainThreadMarker,
+    frames: FrameAdmission,
 }
 
 impl<H: SurfaceHost> MacShell<H> {
@@ -308,6 +454,7 @@ impl<H: SurfaceHost> MacShell<H> {
             hotkeys: registrar,
             origin: Instant::now(),
             mtm,
+            frames: FrameAdmission::default(),
         })
     }
 
@@ -369,13 +516,18 @@ impl<H: SurfaceHost> MacShell<H> {
             pill,
             prompt,
             mtm,
+            frames,
             ..
         } = self;
         let _ = render_surface(runtime, |view| {
             tray.render(&view.tray, &view.menu);
             pill.render(view.pill.as_ref(), *mtm);
             prompt.render(view.prompt.as_ref(), *mtm);
-            Ok::<_, Infallible>(())
+            if frames.observe(view.pill.as_ref(), pill.visible_on_screen(*mtm)) {
+                Ok(())
+            } else {
+                Err(())
+            }
         });
     }
 }

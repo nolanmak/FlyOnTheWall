@@ -91,6 +91,7 @@
 // harder to read.
 #![allow(clippy::doc_markdown)]
 
+pub mod bootstrap;
 pub mod clock;
 mod error;
 pub mod hotkey;

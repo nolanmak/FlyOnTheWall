@@ -343,6 +343,12 @@ impl Prompt {
         self.acknowledge.state() == NSControlStateValueOn
     }
 
+    pub(crate) fn nonactivating(&self) -> bool {
+        self.panel
+            .styleMask()
+            .contains(NSWindowStyleMask::NonactivatingPanel)
+    }
+
     /// Whether the Start button, as drawn, would accept a click.
     ///
     /// Read off the live `NSButton` rather than from the view that produced

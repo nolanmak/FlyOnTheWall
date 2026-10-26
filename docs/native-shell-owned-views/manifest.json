@@ -1,0 +1,27 @@
+{
+  "macos": "26.4",
+  "scope": "Owned view-only indicator and actual consent controls with injected device-free host; no installed product, capture device, provider credentials, tray or global hotkeys used",
+  "source_sha256": {
+    "crates/fotw-shell/src/platform/macos/pill.rs": "e81f25a481713c58c27b3ef364879aec14fd2e6c25477759ee44c6e0347d9dea",
+    "crates/fotw-shell/src/platform/macos/prompt.rs": "bb675985083671d1d671887e7d5420906b41c58be7e6e0912dc3d631eb00b4ce",
+    "crates/fotw-shell/src/platform/macos/mod.rs": "def84beb95e0c37509132b9107ffa7150641a5dc8d6bc55aacb6ec7fe0d6e09f",
+    "crates/fotw-shell/src/surface.rs": "ebd1ef8f2dd9a8804c51607fdb4ad11422273c5b2eead147b069c765a82c63b2",
+    "crates/fotwd/src/native_host.rs": "3348dc3231b0b676c9489878bec5ad8647a129ae83bbcbfeefe6158c31ce87dc",
+    "crates/fotwd/src/native_bridge.rs": "5b61c1b3f1edf31f5f4c2d558a3a890d7bff86d97339e481e26c2c02e48caab6"
+  },
+  "images": {
+    "recovery.png": "382e5dbaf72559e80825d98ac5585e3d95f60865bc6ed60db40894eef8c6aa0c",
+    "recording.png": "53b9ec08d4eec71006763239ff141a5ca45fab514462fc55953816e4e570f605",
+    "finishing.png": "c0b341f2f8c4c8d6d8da92fde0fdd96511df54b649e875e6ee1c0a9e139e5f68",
+    "preparing.png": "f25de24ab586898a39fd59ea6b3b09c18ef337c4f9fbff17852413a927a0123f"
+  },
+  "indicator_checks": "All four panels nonactivating, on screen, controls inside panel, exact native text; enabled Stop dispatches, unknown measured level renders no meter",
+  "consent_checks": "Menu and hotkey actual AppKit unchecked Start blocked, checkbox delivered, acknowledged Start enabled, correct audit origin; 0 configuration/capture calls before indicator acknowledgement; coordinated cancellation drained",
+  "not_established": [
+    "Installed signed-app LaunchServices/TCC behavior",
+    "Real microphone or system audio",
+    "Global shortcut registration/focus preservation",
+    "Full-screen/space behavior, screen-share exclusion, scaling/accessibility acceptance",
+    "Transcription quality or long-meeting reliability"
+  ]
+}

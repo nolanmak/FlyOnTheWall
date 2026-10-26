@@ -32,6 +32,15 @@ fn recorder_with_factory(
     opened: Arc<AtomicU64>,
     factory: fotwd::recording::TranscriptionFactory,
 ) -> Arc<DaemonRecorder> {
+    recorder_with_finisher(root, gate, opened, factory, Box::new(|_, _| None))
+}
+fn recorder_with_finisher(
+    root: &std::path::Path,
+    gate: &RenderGate,
+    opened: Arc<AtomicU64>,
+    factory: fotwd::recording::TranscriptionFactory,
+    finish: fotwd::recording::Finisher,
+) -> Arc<DaemonRecorder> {
     Arc::new(
         DaemonRecorder::with_parts(
             root.join("sessions"),
@@ -53,7 +62,7 @@ fn recorder_with_factory(
                 ))
             }),
             factory,
-            Box::new(|_, _| None),
+            finish,
             Duration::from_secs(5),
             Duration::from_secs(5),
         )
@@ -523,5 +532,167 @@ async fn user_cancelled_native_preparation_returns_to_idle_without_a_failure_bad
         host.view().pill.is_none(),
         "deliberate preparation cancellation is not a failure"
     );
+    assert_eq!(opened.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_quit_waits_for_persistence_and_requires_acknowledgement_of_save_failure() {
+    use fotw_shell::{MenuAction, Monotonic, PromptChoice, SurfaceEvent, SurfaceHost};
+    use std::sync::{Condvar, Mutex};
+    struct Release(Arc<(Mutex<bool>, Condvar)>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            *self.0.0.lock().unwrap() = true;
+            self.0.1.notify_all();
+        }
+    }
+    let release = Release(Arc::new((Mutex::new(false), Condvar::new())));
+    let finish_release = release.0.clone();
+    let entered = Arc::new(AtomicU64::new(0));
+    let finish_entered = entered.clone();
+    let root = tempfile::tempdir().unwrap();
+    let gate = RenderGate::new(Duration::from_secs(3));
+    let opened = Arc::new(AtomicU64::new(0));
+    let rec = recorder_with_finisher(
+        root.path(),
+        &gate,
+        opened,
+        Box::new(|| Transcription::Disabled),
+        Box::new(move |_, _| {
+            finish_entered.fetch_add(1, Ordering::SeqCst);
+            let (lock, changed) = &*finish_release;
+            let mut open = lock.lock().unwrap();
+            while !*open {
+                open = changed.wait(open).unwrap();
+            }
+            None
+        }),
+    );
+    let mut host = native_host(rec.clone(), gate);
+    until(|| {
+        host.tick(Monotonic::ZERO);
+        host.view().menu.record.enabled
+    })
+    .await;
+    host.on_event(
+        SurfaceEvent::Menu(MenuAction::ToggleRecording),
+        Monotonic::ZERO,
+    );
+    host.on_event(SurfaceEvent::Acknowledge(true), Monotonic::ZERO);
+    host.on_event(
+        SurfaceEvent::Prompt(PromptChoice::Start { acknowledged: true }),
+        Monotonic::ZERO,
+    );
+    until(|| {
+        host.tick(Monotonic::ZERO);
+        host.did_render();
+        rec.status().state == RecordingState::Recording
+    })
+    .await;
+    host.on_event(SurfaceEvent::Menu(MenuAction::Quit), Monotonic::ZERO);
+    until(|| entered.load(Ordering::SeqCst) == 1).await;
+    assert!(
+        rec.shutdown_status().closing,
+        "native Quit must close dashboard Start admission"
+    );
+    assert_eq!(rec.status().state, RecordingState::Idle);
+    host.tick(Monotonic::ZERO);
+    assert!(
+        !host.should_exit(),
+        "the persistence worker still owns audio"
+    );
+    assert!(rec.start().is_err());
+    host.tick(Monotonic::from_secs(31));
+    assert!(
+        host.view()
+            .pill
+            .unwrap()
+            .detail
+            .contains("app remains open")
+    );
+    assert!(!host.should_exit());
+    drop(release);
+    until(|| {
+        host.tick(Monotonic::from_secs(1));
+        host.view().menu.quit.label.contains("recover")
+    })
+    .await;
+    assert!(
+        !host.should_exit(),
+        "a missing save must be acknowledged before exit"
+    );
+    assert!(!host.view().menu.status.contains("Saved"));
+    host.on_event(
+        SurfaceEvent::Menu(MenuAction::Quit),
+        Monotonic::from_secs(1),
+    );
+    assert!(host.should_exit());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_quit_before_the_first_render_cancels_without_save_failure_or_capture() {
+    use fotw_shell::{MenuAction, Monotonic, PromptChoice, SurfaceEvent, SurfaceHost};
+    let root = tempfile::tempdir().unwrap();
+    let gate = RenderGate::new(Duration::from_secs(3));
+    let opened = Arc::new(AtomicU64::new(0));
+    let rec = recorder(root.path(), &gate, opened.clone());
+    let mut host = native_host(rec.clone(), gate);
+    until(|| {
+        host.tick(Monotonic::ZERO);
+        host.view().menu.record.enabled
+    })
+    .await;
+    host.on_event(
+        SurfaceEvent::Menu(MenuAction::ToggleRecording),
+        Monotonic::ZERO,
+    );
+    host.on_event(SurfaceEvent::Acknowledge(true), Monotonic::ZERO);
+    host.on_event(
+        SurfaceEvent::Prompt(PromptChoice::Start { acknowledged: true }),
+        Monotonic::ZERO,
+    );
+    host.on_event(SurfaceEvent::Menu(MenuAction::Quit), Monotonic::ZERO);
+    until(|| {
+        host.tick(Monotonic::ZERO);
+        host.should_exit()
+    })
+    .await;
+    assert!(rec.shutdown_status().drained());
+    assert!(!rec.shutdown_status().save_failed);
+    assert_eq!(opened.load(Ordering::SeqCst), 0);
+    assert!(!host.view().menu.record.enabled);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_daemon_disables_start_and_shows_failure_until_explicit_quit() {
+    use fotw_shell::{MenuAction, Monotonic, SurfaceEvent, SurfaceHost};
+    let root = tempfile::tempdir().unwrap();
+    let gate = RenderGate::new(Duration::from_secs(3));
+    let opened = Arc::new(AtomicU64::new(0));
+    let rec = recorder(root.path(), &gate, opened.clone());
+    let mut host = native_host(rec.clone(), gate);
+    until(|| {
+        host.tick(Monotonic::ZERO);
+        host.view().menu.record.enabled
+    })
+    .await;
+    rec.begin_shutdown();
+    until(|| {
+        host.tick(Monotonic::ZERO);
+        !host.view().menu.record.enabled
+    })
+    .await;
+    assert!(host.view().pill.unwrap().detail.contains("daemon stopped"));
+    assert!(
+        !host.should_exit(),
+        "a service failure must remain visible until acknowledged"
+    );
+    host.on_event(
+        SurfaceEvent::Menu(MenuAction::ToggleRecording),
+        Monotonic::ZERO,
+    );
+    assert!(host.view().prompt.is_none());
+    host.on_event(SurfaceEvent::Menu(MenuAction::Quit), Monotonic::ZERO);
+    assert!(host.should_exit());
     assert_eq!(opened.load(Ordering::SeqCst), 0);
 }

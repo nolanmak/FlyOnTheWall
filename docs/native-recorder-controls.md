@@ -1,10 +1,9 @@
 # Native recorder control foundation
 
-The daemon exposes in-process controls for connecting the native shell to the
-same recorder used by the dashboard. These APIs are implemented; product launch,
-AppKit rendering, the native consent prompt and the asynchronous command bridge
-remain unfinished. The dashboard remains the shipped recording control surface.
-Acceptance in issues #58 and #57 remains open.
+The connected native shell and dashboard use the same daemon recorder. Atomic
+observations, attempt-specific Stop and acknowledged Start are described here;
+[launch, rendering, shutdown and owned native evidence](native-connected-shell-progress.md)
+describe the integration. Physical acceptance in issues #58 and #57 remains open.
 
 ## Control contract
 
@@ -45,10 +44,10 @@ provider credentials or real meeting content. Native view tests exercise the
 projection only. These checks do not establish AppKit, TCC, hotkey, focus,
 physical-device or signed-app acceptance.
 
-## Remaining product integration
+## Integration and acceptance
 
-Connect a bounded asynchronous command/status bridge and the AppKit surfaces,
-require the native consent prompt before Start, acknowledge visible preparation
-before opening capture, and enforce one shell/daemon owner. Handle stale
-completions, bounded Stop/Quit, and persistence announcements without inventing
-success. Then run the isolated/native and physical acceptance described in #58.
+The connected host uses a bounded asynchronous bridge, render admission, native
+consent and canonical-library ownership. Quit additionally tracks accepted
+configuration/capture/persistence work, since an idle live slot alone does not
+prove a save. Signed-app hotkey/TCC/focus, devices and meeting acceptance remain
+open; use the integration document and #58 for the unverified scope.

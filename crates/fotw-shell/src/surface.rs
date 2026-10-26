@@ -26,6 +26,10 @@ pub trait SurfaceHost {
     fn view(&self) -> ShellView;
     /// Acknowledgement after the entire frame has been applied to native views.
     fn did_render(&mut self) {}
+    /// Whether coordinated shutdown has completed and the event loop may stop.
+    fn should_exit(&self) -> bool {
+        false
+    }
 }
 impl<H: ShellHost> SurfaceHost for ShellRuntime<H> {
     fn on_event(&mut self, event: SurfaceEvent, now: Monotonic) {
@@ -44,6 +48,24 @@ impl<H: ShellHost> SurfaceHost for ShellRuntime<H> {
     }
     fn view(&self) -> ShellView {
         Self::view(self)
+    }
+}
+
+/// Require a complete visible indicator frame across an AppKit pump cycle.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+pub(crate) struct FrameAdmission {
+    previous: Option<crate::PillView>,
+    previous_visible: bool,
+}
+#[cfg(any(target_os = "macos", test))]
+impl FrameAdmission {
+    pub(crate) fn observe(&mut self, frame: Option<&crate::PillView>, visible: bool) -> bool {
+        let ready = frame.is_none()
+            || (self.previous_visible && visible && self.previous.as_ref() == frame);
+        self.previous = frame.cloned();
+        self.previous_visible = frame.is_some() && visible;
+        ready
     }
 }
 
@@ -103,6 +125,31 @@ mod tests {
             Err("unavailable")
         );
         assert_eq!(*calls.borrow(), ["frame", "failed render"]);
+    }
+    #[test]
+    fn capture_admission_requires_an_unchanged_visible_frame_across_a_pump_cycle() {
+        let mut core = crate::ShellCore::new();
+        core.handle(crate::ShellInput::Start {
+            at: Monotonic::ZERO,
+            origin: crate::StartOrigin::Menu,
+        });
+        let frame = core.view().pill.unwrap();
+        let mut admission = FrameAdmission::default();
+        assert!(!admission.observe(Some(&frame), false));
+        assert!(
+            !admission.observe(Some(&frame), true),
+            "first visible frame has not passed a pump cycle"
+        );
+        assert!(admission.observe(Some(&frame), true));
+        let mut changed = frame.clone();
+        changed.detail = "a different attempt/source state".into();
+        assert!(!admission.observe(Some(&changed), true));
+        assert!(admission.observe(Some(&changed), true));
+        assert!(admission.observe(None, false));
+        assert!(
+            !admission.observe(Some(&changed), true),
+            "hidden views must not retain admission"
+        );
     }
     #[test]
     fn legacy_runtime_keeps_its_existing_event_routing() {

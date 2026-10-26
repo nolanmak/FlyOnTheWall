@@ -1,67 +1,119 @@
-# Connected native shell implementation
+# Connected native recording controls
 
-This branch contains the recorder bridge, native interaction model and AppKit
-renderer seam. Product launch/daemon bootstrap and coordinated Quit/finalization are still
-unfinished. The daemon lifetime lock is implemented; the native shell must still
-share and retain that ownership. The normal app launch still uses the
-dashboard. Acceptance in #58, #57 and #124 remains open.
+App-bundle serving launches and `fotwd shell` connect one AppKit shell to the
+existing daemon and recorder. The dashboard remains the notes/library surface.
+Native controls cannot be disabled by an app argument. Loose CLI serving keeps
+its terminal behavior. This is source implementation with owned native evidence,
+not installed-app or physical meeting acceptance. Acceptance in #58, #57 and
+#124 remains open.
 
-## Implemented contracts
+## Start, visibility and Stop
 
-- A four-command bounded queue, one Start worker and one retained status snapshot
-  keep the native thread independent of recorder/configuration waits. The status
-  worker publishes a monotonically ordered snapshot and the exact Stop target.
-- Each queued Start has its own cancellation ticket. Old tickets, rendered
-  frames and Stop targets cannot authorize a replacement attempt.
-- The renderer gate is installed before exposing Start. Audit precedes capture;
-  the gate then requires the actual attempt's Preparing indicator to render
-  before transcription configuration or tap setup. Timeout, cancellation or a
-  closed renderer refuses capture and releases its reservation.
-- `SurfaceHost` connects AppKit events and views without the legacy synchronous
-  assumption that a successful command dispatch means capture is already live.
-  Native rendering acknowledges only after all surfaces have been applied.
-- `NativeHost` requires a fresh explicit consent prompt for Menu/Hotkey Start,
-  routes the actual origin through the recorder and follows dashboard-started
-  recordings. It uses recorder capture time and preserves Stop until backend
-  state acknowledges it. Idle does not mean Saved. A deliberately cancelled
-  preparation returns to neutral idle; old action failures do not label a new
-  observed capture as failed.
-- The indicator has a source/status detail row and accessible full detail text.
-  Unavailable measured audio level renders no meter. Preparing has a distinct
-  visual register. Native appearance, clipping and focus behavior still require
-  owned-view and signed-app acceptance; compilation is not visual proof.
+Menu and hotkey Start raise a fresh consent prompt. AppKit's actual checkbox
+state must reach the host, and Start still requires acknowledgement at the
+recorder boundary. The audit records the actual origin. Detection never starts
+capture; the existing detector's automatic arming is not connected to this host
+yet and remains follow-up work.
 
-## Tests and limitations
+A four-command bounded queue, one Start worker and one retained status snapshot
+keep recorder/configuration work off the AppKit thread. Each Start has its own
+cancellation ticket; Stop and renderer acknowledgements use opaque exact-attempt
+capabilities. Stale callbacks cannot authorize or stop a replacement attempt.
 
-Behavioral RED/green logs reproduce capture before a rendered frame, missing
-renderer admission, missing manual consent, stale UI errors and cancellation
-shown as failure. Eleven device-free bridge/host tests cover timeout, foreign and
-stale capabilities, blocked configuration, source closure, Menu/Hotkey consent,
-dashboard recording visibility and clock absence. Existing recording and view
-regressions remain green. Shell tests check render-before-ack ordering, failed
-render without acknowledgement, legacy routing and distinct preparation icons.
+All dashboard/native starts reserve their attempt before configuration. The
+native render gate requires an unchanged indicator, visible within a screen,
+across an AppKit pump cycle before configuration or tap setup. Changed, hidden or
+missing frames do not admit capture. Timeout, cancellation or a closed renderer
+refuses it. AppKit is initialized on main while database, keys and daemon setup
+run on workers. Native surfaces/global shortcuts are created only after the
+process has daemon ownership; existing-daemon reentry creates neither.
 
-Tests use synthetic PCM, injected configuration/finishers and throwaway nested
-roots. No user recordings, provider credentials, capture devices, installed app,
-global hotkeys or real keyboard input are used. `run_surface` is compiled, not
-launched. A production launch must additionally bind one daemon/shell owner,
-connect background menu actions and close HTTP admission before coordinated
-Stop/drain/persistence shutdown. The current bridge Drop requests Stop; it does
-not prove finalization or authorize immediate process exit.
+The indicator follows actual preparing/starting/recording/finishing state,
+capture time, source health and active speech engine/model/lag/errors. Unknown
+clock or measured audio level stays unknown; it does not invent a timer or meter.
+Opening old meetings or closing the browser does not change its recorder state.
+Native Stop remains pending until recorder state acknowledges it.
 
-## Lifetime ownership progress
+## Ownership, reentry and Quit
 
-`InstanceOwner` holds an OS file lock in the canonical library directory for the
-whole serving lifetime. A second daemon cannot bypass it with another port or a
-different sessions subdirectory. The file remains after exit; its unlocked inode
-is reused rather than unlinked. New files are private on Unix and opening a
-symlink lock is refused. Existing UI reentry runs first; a process losing the
-startup race retries reentry for a bounded interval and refuses a second daemon.
-The guard is acquired before keys, library and background work are initialized.
+An OS file lock in the canonical library directory excludes another daemon
+regardless of port, session-subdirectory name or directory alias. Keep its inode:
+normal shutdown releases the file handle rather than unlinking the lock. New Unix
+lock files are private and symlink locks are refused. The guard is acquired before
+keys/library/background work and shared with the native host.
 
-Regression RED reproduced duplicate handles and canonical aliases. Green checks
-also cover separate libraries, relative path resolution and an owned subprocess:
-its live lock excludes a second owner, and both normal exit and forced termination
-release the OS lock. These tests do not launch the installed app or access a real
-library. Native shell bootstrap must retain the same owner before creating global
-controls; ordinary reentry must not flash a second tray item.
+The private atomic daemon state file additionally advertises native capability;
+legacy CLI readers still read its unchanged port/token fields. If an older
+browser-only daemon is running, its UI remains available and the new app explains
+that it must finish/save and exit first. Finish and save its recording, quit the
+old `fotwd` process in Activity Monitor, then reopen. A second native launch opens
+a fresh authorized dashboard tab without creating another tray/hotkey owner.
+
+Quit closes new Start admission and requests Stop without blocking AppKit. A
+separate work lease covers configuration, capture and background persistence,
+including a blocking finisher whose async waiter is cancelled. Idle alone never
+means Saved. Quit waits for both live/native cleanup and these work owners.
+
+A slow cleanup/save remains visible after the 30-second wait notice; the app
+stays open and new recordings remain disabled. An unconfirmed or panicking save
+requires a second explicit Quit acknowledging recovery is needed. No Saved claim
+is fabricated. A stopped daemon disables Start and keeps a failure visible until
+explicit Quit. Once capture/persistence drain, native/global resources are torn
+down, server shutdown revokes background automatic output, and runtime teardown
+has a two-second bound. Background enrichment is independent of the confirmed
+audio save and may need to be retried after restart.
+
+Menu actions run on a bounded background handler: Notes opens a fresh dashboard
+handoff, Settings opens its available Transcription section, and Disclosure/About
+open public static information. Handoff redemption keeps only allowlisted,
+content-free settings anchors and removes the credential from the address bar.
+
+## Owned native evidence
+
+On macOS 26.4, two isolated examples exercised actual AppKit widgets without
+launching the installed product, reading provider credentials, opening capture
+devices, creating a tray or registering global hotkeys:
+
+```sh
+cargo build --locked -p fotw-shell --example indicator_frames
+target/debug/examples/indicator_frames <owned-output-directory>
+cargo build --locked -p fotwd --example native_consent_fixture
+FOTW_JURISDICTION=US-CA target/debug/examples/native_consent_fixture <owned-output-directory>
+```
+
+The indicator fixture captures only its own view through AppKit's view bitmap
+cache. These are simulated display states, not live ASR or captured meeting time.
+All four panels retained nonactivating style, were on a screen, had controls
+inside bounds and exact native text. Enabled Stop dispatched through AppKit;
+unavailable measured level rendered no meter. Visual inspection found faint
+secondary text; default vibrant text and a separate colored status dot fixed it.
+
+![Owned recording indicator fixture](native-shell-owned-views/recording.png)
+
+![Owned recovery-needed fixture](native-shell-owned-views/recovery.png)
+
+The consent fixture feeds the actual `NativeHost` and bridge with a tap opener
+that refuses capture. Menu and hotkey prompts both blocked unchecked Start,
+delivered checkbox acknowledgement, enabled acknowledged Start, cleared the
+prompt, audited the correct origin and drained on Quit. Configuration/capture
+calls stayed at zero because no indicator was acknowledged. Results, all four
+images and measured source hashes are in
+[the owned-view manifest](native-shell-owned-views/manifest.json).
+
+Behavioral RED/green tests cover renderer admission, consent, stale UI errors,
+normal cancellation, visibility across pump cycles, ownership exclusion, and Quit
+waiting for persistence after Idle. Additional tests cover finisher panic,
+shutdown-before-Start, service failure visibility, old state-file compatibility,
+and native Settings handoff routing. Existing recorder/shell regressions remain.
+
+## Remaining acceptance
+
+- Full repository/hosted checks and signed review-bundle results must accompany
+  the final PR head; owned examples alone are insufficient release proof.
+- Installed signed-app LaunchServices/TCC, actual global shortcuts, focus,
+  fullscreen/spaces, scaling and screen-share behavior remain unvalidated.
+- Actual microphone/system audio, USB/Bluetooth/sleep recovery, long meetings,
+  provider/local fallback and concurrent-app laptop acceptance remain open.
+- Automatic detector-to-native-prompt arming/snooze/suppression remains follow-up.
+- Genuine AEC and broader model/provider quality/resource qualification remain
+  separate roadmap work. No new models or user recordings were used here.

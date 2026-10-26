@@ -36,6 +36,46 @@ pub struct DaemonState {
     pub token: String,
 }
 
+/// Connection and native-shell capability tied to the same private state file.
+#[derive(Clone, Serialize)]
+pub struct DaemonDescriptor {
+    /// Existing CLI connection fields, unchanged on disk.
+    #[serde(flatten)]
+    pub connection: DaemonState,
+    /// This serving process also owns the native shell.
+    pub native_shell: bool,
+}
+impl std::fmt::Debug for DaemonDescriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DaemonDescriptor(<redacted>)")
+    }
+}
+/// Write a capability descriptor with the same private atomic writer.
+///
+/// # Errors
+/// Any filesystem or serialization failure.
+pub fn write_daemon_descriptor(path: &Path, state: &DaemonDescriptor) -> io::Result<()> {
+    write_serialized(path, state)
+}
+/// Read connection fields plus the optional native capability. Legacy/unknown
+/// capability values mean dashboard-only, without rejecting valid connection data.
+///
+/// # Errors
+/// Missing/unreadable state or invalid connection data.
+pub fn read_daemon_descriptor(path: &Path) -> io::Result<DaemonDescriptor> {
+    let bytes = fs::read(path)?;
+    let connection = serde_json::from_slice(&bytes)
+        .map_err(|e| io::Error::other(format!("parsing the daemon state: {e}")))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    Ok(DaemonDescriptor {
+        connection,
+        native_shell: value
+            .get("native_shell")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
 /// Write `state` to `path` atomically, with `0600` in a `0700` directory.
 ///
 /// # Errors
@@ -43,6 +83,10 @@ pub struct DaemonState {
 /// Any filesystem failure. A caller that cannot write this file should not
 /// come up: a daemon the CLI cannot find is a daemon the user cannot stop.
 pub fn write_state_file(path: &Path, state: &DaemonState) -> io::Result<()> {
+    write_serialized(path, state)
+}
+
+fn write_serialized<T: Serialize>(path: &Path, state: &T) -> io::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::other("the state file needs a parent directory"))?;
@@ -156,6 +200,43 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
+    #[test]
+    fn native_capability_round_trips_without_breaking_legacy_cli_readers() {
+        let path = scratch("native-capability");
+        let connection = DaemonState {
+            port: 12345,
+            token: "owned-fixture".into(),
+        };
+        write_daemon_descriptor(
+            &path,
+            &DaemonDescriptor {
+                connection: connection.clone(),
+                native_shell: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(read_state_file(&path).unwrap(), connection);
+        assert!(read_daemon_descriptor(&path).unwrap().native_shell);
+        write_state_file(&path, &connection).unwrap();
+        assert!(!read_daemon_descriptor(&path).unwrap().native_shell);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+    #[test]
+    fn an_unknown_capability_value_does_not_discard_valid_legacy_connection_fields() {
+        let path = scratch("unknown-native-capability");
+        let connection = DaemonState {
+            port: 12345,
+            token: "owned-fixture".into(),
+        };
+        write_state_file(&path, &connection).unwrap();
+        let mut value = serde_json::to_value(&connection).unwrap();
+        value["native_shell"] = serde_json::json!("unknown-future-value");
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let descriptor = read_daemon_descriptor(&path).unwrap();
+        assert_eq!(descriptor.connection, connection);
+        assert!(!descriptor.native_shell);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
     #[cfg(unix)]
     #[test]
     fn the_file_is_0600_in_a_0700_directory() {

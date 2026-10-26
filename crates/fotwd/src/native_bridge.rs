@@ -137,6 +137,8 @@ pub struct BridgeSnapshot {
     pub start_outcome: Option<StartOutcome>,
     /// Last command failure; it does not replace capture status.
     pub command_error: Option<String>,
+    /// Admission and persistence ownership, independent of the capture slot.
+    pub shutdown: crate::recorder_lifecycle::ShutdownStatus,
 }
 enum Command {
     Start {
@@ -144,6 +146,7 @@ enum Command {
         ticket: StartTicket,
     },
     Stop(StopTarget),
+    Shutdown,
 }
 /// The native thread only uses try-send, try-lock and cancellation atomics.
 /// Recorder methods and Start waiting execute on background workers.
@@ -242,6 +245,15 @@ impl RecorderBridge {
             .try_send(Command::Stop(target.clone()))
             .map_err(|_| "native Stop could not be queued; try again".into())
     }
+    /// Close Start admission and request Stop without waiting for finalization.
+    ///
+    /// # Errors
+    /// If the bounded control queue is busy or unavailable.
+    pub fn begin_shutdown(&self) -> Result<(), String> {
+        self.commands
+            .try_send(Command::Shutdown)
+            .map_err(|_| "Quit could not be queued; try again".into())
+    }
     /// Take the latest snapshot without waiting on any worker or recorder lock.
     pub fn poll(&mut self) -> Option<BridgeSnapshot> {
         let snapshot = self.latest.try_lock().ok()?.take()?;
@@ -320,6 +332,7 @@ fn bridge_worker(
                         busy.store(false, Ordering::Release);
                     }
                 }
+                Command::Shutdown => recorder.begin_shutdown(),
                 Command::Stop(target) => {
                     command_error = recorder.stop_observed(&target).err().map(|e| e.to_string());
                 }
@@ -340,13 +353,12 @@ fn bridge_worker(
             observation,
             start_outcome: outcome.clone(),
             command_error: command_error.clone(),
+            shutdown: recorder.shutdown_status(),
         };
         *latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(snapshot);
         std::thread::sleep(Duration::from_millis(25));
     }
-    // Losing the only native surface must not leave invisible capture running.
-    // This only requests Stop; native/session cleanup retains its normal owner.
-    if let Some(target) = recorder.observe().stop_target() {
-        let _ = recorder.stop_observed(target);
-    }
+    // Losing the native surface closes new admission as well as requesting Stop.
+    // The product's coordinated Quit waits for work ownership before teardown.
+    recorder.begin_shutdown();
 }

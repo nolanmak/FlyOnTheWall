@@ -1,0 +1,11 @@
+IndicatorFrameProbe {
+    nonactivating: true,
+    on_screen: true,
+    status: "Preparing",
+    elapsed: "—",
+    detail: "Preparing local transcription; capture has not started",
+    meter: "",
+    stop_enabled: true,
+    stop_dispatched: true,
+    controls_inside_panel: true,
+}

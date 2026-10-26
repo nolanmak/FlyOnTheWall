@@ -21,8 +21,6 @@ pub enum NativeAction {
     OpenDisclosure,
     /// Open application information.
     OpenAbout,
-    /// Stop/drain and finish app shutdown.
-    Quit,
 }
 /// Native controls driven by the same recorder as the dashboard.
 pub struct NativeHost {
@@ -37,6 +35,11 @@ pub struct NativeHost {
     action_error: Option<String>,
     stop_queued: Option<StopTarget>,
     cancel_requested: bool,
+    quitting: Option<Monotonic>,
+    quit_save_failure_acknowledged: bool,
+    now: Monotonic,
+    _owner: Option<std::sync::Arc<crate::instance::InstanceOwner>>,
+    action_feedback: Option<std::sync::mpsc::Receiver<String>>,
 }
 impl NativeHost {
     /// Construct after daemon initialization, without starting any capture.
@@ -59,9 +62,28 @@ impl NativeHost {
             action_error: None,
             stop_queued: None,
             cancel_requested: false,
+            quitting: None,
+            quit_save_failure_acknowledged: false,
+            now: Monotonic::ZERO,
+            _owner: None,
+            action_feedback: None,
         }
     }
+    pub(crate) fn with_owner(
+        mut self,
+        owner: std::sync::Arc<crate::instance::InstanceOwner>,
+    ) -> Self {
+        self._owner = Some(owner);
+        self
+    }
+    pub(crate) fn with_feedback(mut self, feedback: std::sync::mpsc::Receiver<String>) -> Self {
+        self.action_feedback = Some(feedback);
+        self
+    }
     fn toggle(&mut self, origin: StartOrigin) {
+        if self.quitting.is_some() || self.snapshot.as_ref().is_some_and(|s| s.shutdown.closing) {
+            return;
+        }
         if self
             .snapshot
             .as_ref()
@@ -97,6 +119,95 @@ impl NativeHost {
             }
         }
     }
+    fn quit(&mut self, now: Monotonic) {
+        if self.quitting.is_some()
+            && self
+                .snapshot
+                .as_ref()
+                .is_some_and(|s| s.shutdown.drained() && s.shutdown.save_failed)
+        {
+            self.quit_save_failure_acknowledged = true;
+            return;
+        }
+        if let Some(ticket) = &self.ticket {
+            ticket.cancel();
+            self.cancel_requested = true;
+        }
+        match self.bridge.begin_shutdown() {
+            Ok(()) => {
+                self.quitting.get_or_insert(now);
+                self.prompt_origin = None;
+                self.acknowledged = false;
+                self.action_error = None;
+            }
+            Err(error) => self.action_error = Some(error),
+        }
+    }
+    fn quit_view(&self, view: &mut ShellView) {
+        let Some(began) = self.quitting else {
+            return;
+        };
+        view.menu.record.enabled = false;
+        let shutdown = self.snapshot.as_ref().map(|s| s.shutdown);
+        let failed = shutdown.is_some_and(|s| s.drained() && s.save_failed);
+        let drained = shutdown.is_some_and(crate::recorder_lifecycle::ShutdownStatus::drained);
+        let waiting = self.now.since(began) >= Duration::from_secs(30);
+        let message = if failed {
+            view.menu.quit.label = "Quit; recover audio next launch".into();
+            "Save not confirmed. Quit again to acknowledge recovery on next launch."
+        } else if drained {
+            "Capture and audio saving have finished. Closing the app."
+        } else if waiting {
+            "Quit is still waiting for capture cleanup or saving. The app remains open and new recordings are disabled."
+        } else {
+            "Quit requested. Waiting for capture cleanup and audio saving; new recordings are disabled."
+        };
+        if let Some(pill) = &mut view.pill {
+            pill.stop_enabled = false;
+            if !pill.detail.is_empty() {
+                pill.detail.push_str(" · ");
+            }
+            pill.detail.push_str(message);
+        } else {
+            view.pill = Some(PillView {
+                elapsed: Duration::ZERO,
+                elapsed_label: "—".into(),
+                status_label: if failed {
+                    "Save needs recovery"
+                } else if drained {
+                    "Closing"
+                } else if waiting {
+                    "Still saving"
+                } else {
+                    "Saving audio"
+                },
+                level: Level::SILENT,
+                level_available: false,
+                detail: message.into(),
+                tone: if failed { Tone::Fault } else { Tone::Finishing },
+                stop_enabled: false,
+            });
+        }
+        if failed {
+            view.tray.state = TrayState::Fault;
+        }
+        view.tray.tooltip.push_str(". ");
+        view.tray.tooltip.push_str(message);
+        if !self
+            .snapshot
+            .as_ref()
+            .is_some_and(|s| s.observation.status().is_active())
+        {
+            view.menu.status = if failed {
+                "Save needs recovery"
+            } else if drained {
+                "Closing"
+            } else {
+                "Waiting for audio save"
+            }
+            .into();
+        }
+    }
     fn request(&mut self, action: NativeAction) {
         if self.actions.try_send(action).is_err() {
             self.action_error = Some("application action could not be queued; try again".into());
@@ -119,7 +230,8 @@ impl NativeHost {
     }
 }
 impl SurfaceHost for NativeHost {
-    fn on_event(&mut self, event: SurfaceEvent, _now: Monotonic) {
+    fn on_event(&mut self, event: SurfaceEvent, now: Monotonic) {
+        self.now = now;
         match event {
             SurfaceEvent::Chord(chord) => match self.hotkeys.action_for(chord) {
                 Some(HotkeyAction::ToggleRecording) => self.toggle(StartOrigin::Hotkey),
@@ -127,18 +239,15 @@ impl SurfaceHost for NativeHost {
                 None => {}
             },
             SurfaceEvent::Menu(MenuAction::ToggleRecording) => self.toggle(StartOrigin::Menu),
+            SurfaceEvent::Menu(MenuAction::Quit) => self.quit(now),
             SurfaceEvent::Menu(action) => {
                 let request = match action {
                     MenuAction::OpenNotes => NativeAction::OpenDashboard,
                     MenuAction::Settings => NativeAction::OpenSettings,
                     MenuAction::DisclosureKit => NativeAction::OpenDisclosure,
                     MenuAction::About => NativeAction::OpenAbout,
-                    MenuAction::Quit => NativeAction::Quit,
-                    MenuAction::ToggleRecording => unreachable!(),
+                    MenuAction::Quit | MenuAction::ToggleRecording => unreachable!(),
                 };
-                if request == NativeAction::Quit {
-                    self.stop();
-                }
                 self.request(request);
             }
             SurfaceEvent::Stop => self.stop(),
@@ -169,8 +278,19 @@ impl SurfaceHost for NativeHost {
             }
         }
     }
-    fn tick(&mut self, _now: Monotonic) {
+    fn tick(&mut self, now: Monotonic) {
+        self.now = now;
+        if let Some(feedback) = &self.action_feedback
+            && let Ok(error) = feedback.try_recv()
+        {
+            self.action_error = Some(error);
+        }
         if let Some(snapshot) = self.bridge.poll() {
+            if snapshot.shutdown.closing && self.quitting.is_none() {
+                self.action_error = Some("The daemon stopped. Recording is disabled; quit and reopen the app after audio saving finishes.".into());
+                self.prompt_origin = None;
+                self.acknowledged = false;
+            }
             if self
                 .snapshot
                 .as_ref()
@@ -283,13 +403,13 @@ impl SurfaceHost for NativeHost {
             "Start Recording…"
         }
         .into();
-        menu.record.enabled = self.snapshot.is_some()
+        menu.record.enabled = self.snapshot.as_ref().is_some_and(|s| !s.shutdown.closing)
             && if pending || status.is_active() {
                 stop_enabled
             } else {
                 true
             };
-        ShellView {
+        let mut view = ShellView {
             pill: (status.is_active() || pending || error.is_some()).then(|| PillView {
                 elapsed: Duration::from_millis(status.elapsed_ms.unwrap_or(0)),
                 elapsed_label: elapsed.clone().unwrap_or_else(|| "—".into()),
@@ -315,9 +435,21 @@ impl SurfaceHost for NativeHost {
             },
             menu,
             prompt: self.prompt(),
-        }
+        };
+        self.quit_view(&mut view);
+        view
+    }
+    fn should_exit(&self) -> bool {
+        self.quitting.is_some()
+            && self.snapshot.as_ref().is_some_and(|s| {
+                s.shutdown.drained()
+                    && (!s.shutdown.save_failed || self.quit_save_failure_acknowledged)
+            })
     }
     fn did_render(&mut self) {
+        if self.quitting.is_some() {
+            return;
+        }
         if self.view().pill.is_some()
             && let Some(target) = self
                 .snapshot

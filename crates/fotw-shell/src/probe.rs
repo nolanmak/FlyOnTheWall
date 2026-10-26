@@ -136,3 +136,55 @@ impl ShellProbe {
             && self.status_item_retained
     }
 }
+
+/// An owned indicator-view check, without a tray, hotkeys or capture devices.
+#[derive(Clone, Debug, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent native diagnostic observations, not runtime control flags"
+)]
+pub struct IndicatorFrameProbe {
+    /// The real panel kept its nonactivating initializer style.
+    pub nonactivating: bool,
+    /// The panel is actually visible inside a real screen's usable bounds.
+    pub on_screen: bool,
+    /// Actual native status text.
+    pub status: String,
+    /// Actual native elapsed label (unknown time stays unknown).
+    pub elapsed: String,
+    /// Actual native source/detail text.
+    pub detail: String,
+    /// Actual native audio-level text; empty if no measurement is supplied.
+    pub meter: String,
+    /// Actual native Stop enabled state.
+    pub stop_enabled: bool,
+    /// An enabled owned Stop button dispatched its action through AppKit.
+    pub stop_dispatched: bool,
+    /// Every control frame is inside the panel's content bounds.
+    pub controls_inside_panel: bool,
+}
+
+/// Actual AppKit consent controls, exercised against an injected surface host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent native diagnostic observations, not runtime control flags"
+)]
+pub struct ConsentControlProbe {
+    /// The panel retained its nonactivating initialization style.
+    pub nonactivating: bool,
+    /// The prompt is visible inside a real screen's usable bounds.
+    pub on_screen: bool,
+    /// Start is disabled before acknowledgement.
+    pub unchecked_start_disabled: bool,
+    /// AppKit swallowed the unchecked Start click.
+    pub unchecked_click_blocked: bool,
+    /// The checkbox delivered its actual checked state to the host.
+    pub acknowledgement_delivered: bool,
+    /// Repainting host state enabled Start only after acknowledgement.
+    pub acknowledged_start_enabled: bool,
+    /// The native Start action returned explicit acknowledgement.
+    pub start_response_acknowledged: bool,
+    /// The host removed the prompt after admitting the acknowledged action.
+    pub prompt_cleared: bool,
+}

@@ -167,6 +167,7 @@ impl RecordingPanel {
 pub(crate) struct Pill {
     panel: Retained<RecordingPanel>,
     status: Retained<NSTextField>,
+    accent: Retained<NSTextField>,
     elapsed: Retained<NSTextField>,
     meter: Retained<NSTextField>,
     detail: Retained<NSTextField>,
@@ -221,7 +222,7 @@ impl Pill {
         let status = label(mtm, "Recording", 12.0);
         status.setFrame(NSRect::new(
             NSPoint::new(16.0, 33.0),
-            NSSize::new(120.0, 18.0),
+            NSSize::new(132.0, 18.0),
         ));
 
         let elapsed = label(mtm, "00:00", 15.0);
@@ -229,14 +230,13 @@ impl Pill {
             15.0, 0.3,
         )));
         elapsed.setFrame(NSRect::new(
-            NSPoint::new(140.0, 32.0),
+            NSPoint::new(152.0, 32.0),
             NSSize::new(80.0, 20.0),
         ));
 
         let meter = label(mtm, "", 11.0);
-        meter.setTextColor(Some(&NSColor::secondaryLabelColor()));
         meter.setFrame(NSRect::new(
-            NSPoint::new(224.0, 34.0),
+            NSPoint::new(236.0, 34.0),
             NSSize::new(76.0, 16.0),
         ));
 
@@ -257,11 +257,16 @@ impl Pill {
         ));
 
         let detail = label(mtm, "", 11.0);
-        detail.setTextColor(Some(&NSColor::secondaryLabelColor()));
         detail.setFrame(NSRect::new(
             NSPoint::new(16.0, 9.0),
             NSSize::new(408.0, 16.0),
         ));
+        let accent = label(mtm, "●", 8.0);
+        accent.setFrame(NSRect::new(
+            NSPoint::new(5.0, 35.0),
+            NSSize::new(10.0, 14.0),
+        ));
+        content.addSubview(&accent);
         content.addSubview(&detail);
         content.addSubview(&status);
         content.addSubview(&elapsed);
@@ -272,6 +277,7 @@ impl Pill {
         Self {
             panel,
             status,
+            accent,
             elapsed,
             meter,
             detail,
@@ -329,12 +335,94 @@ impl Pill {
             self.panel.orderFrontRegardless();
             self.on_screen = true;
         }
+        self.panel.displayIfNeeded();
+    }
+
+    pub(crate) fn visible_on_screen(&self, mtm: MainThreadMarker) -> bool {
+        if !self.panel.isVisible() {
+            return false;
+        }
+        let frame = self.panel.frame();
+        NSScreen::screens(mtm).iter().any(|screen| {
+            let visible = screen.visibleFrame();
+            frame.origin.x >= visible.origin.x - 1.0
+                && frame.origin.y >= visible.origin.y - 1.0
+                && frame.origin.x + frame.size.width <= visible.origin.x + visible.size.width + 1.0
+                && frame.origin.y + frame.size.height
+                    <= visible.origin.y + visible.size.height + 1.0
+        })
+    }
+
+    /// Capture only this owned view; never use a screen/window capture API.
+    pub(crate) fn capture_frame(
+        &self,
+        path: &std::path::Path,
+        mtm: MainThreadMarker,
+    ) -> Result<crate::probe::IndicatorFrameProbe, String> {
+        use objc2_app_kit::NSBitmapImageFileType;
+        let content = self
+            .panel
+            .contentView()
+            .ok_or_else(|| "indicator content is missing".to_owned())?;
+        content.displayIfNeeded();
+        let bounds = content.bounds();
+        let bitmap = content
+            .bitmapImageRepForCachingDisplayInRect(bounds)
+            .ok_or_else(|| "could not allocate owned indicator bitmap".to_owned())?;
+        content.cacheDisplayInRect_toBitmapImageRep(bounds, &bitmap);
+        // SAFETY: an empty property dictionary has no wrongly typed key/value.
+        let png = unsafe {
+            bitmap.representationUsingType_properties(
+                NSBitmapImageFileType::PNG,
+                &objc2_foundation::NSDictionary::new(),
+            )
+        }
+        .ok_or_else(|| "could not encode owned indicator frame".to_owned())?;
+        std::fs::write(path, png.to_vec()).map_err(|e| e.to_string())?;
+        let inside = |frame: NSRect| {
+            frame.origin.x >= 0.0
+                && frame.origin.y >= 0.0
+                && frame.origin.x + frame.size.width <= bounds.size.width
+                && frame.origin.y + frame.size.height <= bounds.size.height
+        };
+        let stop_enabled = self.stop.isEnabled();
+        self.take_stop_request();
+        if stop_enabled {
+            // SAFETY: this owned enabled button targets the live RecordingPanel
+            // and its defined Stop selector; no recorder or external target exists.
+            unsafe {
+                self.stop.performClick(None);
+            }
+        }
+        Ok(crate::probe::IndicatorFrameProbe {
+            nonactivating: self
+                .panel
+                .styleMask()
+                .contains(NSWindowStyleMask::NonactivatingPanel),
+            on_screen: self.visible_on_screen(mtm),
+            status: self.status.stringValue().to_string(),
+            elapsed: self.elapsed.stringValue().to_string(),
+            detail: self.detail.stringValue().to_string(),
+            meter: self.meter.stringValue().to_string(),
+            stop_enabled,
+            stop_dispatched: self.take_stop_request(),
+            controls_inside_panel: [
+                self.status.frame(),
+                self.accent.frame(),
+                self.elapsed.frame(),
+                self.detail.frame(),
+                self.meter.frame(),
+                self.stop.frame(),
+            ]
+            .into_iter()
+            .all(inside),
+        })
     }
 
     fn apply(&self, view: &PillView) {
         self.status
             .setStringValue(&NSString::from_str(view.status_label));
-        self.status.setTextColor(Some(&tone_color(view.tone)));
+        self.accent.setTextColor(Some(&tone_color(view.tone)));
         self.elapsed
             .setStringValue(&NSString::from_str(&view.elapsed_label));
         let meter = if view.level_available {

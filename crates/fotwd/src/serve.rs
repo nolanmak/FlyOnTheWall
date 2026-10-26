@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fotw_web::{
-    DaemonState, GithubExport, StoreSource, SummarizeControl, WebServer, write_state_file,
+    DaemonState, GithubExport, StoreSource, SummarizeControl, WebServer, write_daemon_descriptor,
 };
 
 use crate::engine_control::EngineControl;
@@ -203,14 +203,21 @@ pub async fn fetch_fresh_launch_url(port: u16, token: &str) -> Result<String, St
 
 /// If a daemon is already serving this library, hand back a fresh login URL
 /// from it. `None` means nobody real answered and a fresh start is in order.
-async fn reopen_running_ui(root: &Path) -> Option<String> {
-    let state = fotw_web::read_state_file(&state_file_path(root)).ok()?;
-    fetch_fresh_launch_url(state.port, &state.token).await.ok()
+async fn reopen_running_ui(root: &Path) -> Option<(String, bool)> {
+    let state = fotw_web::read_daemon_descriptor(&state_file_path(root)).ok()?;
+    let url = fetch_fresh_launch_url(state.connection.port, &state.connection.token)
+        .await
+        .ok()?;
+    Some((url, state.native_shell))
 }
 
-async fn reopen_for_launch(root: &Path, launch: Launch) -> bool {
-    let Some(url) = reopen_running_ui(root).await else {
-        return false;
+async fn reopen_for_launch(
+    root: &Path,
+    launch: Launch,
+    native_requested: bool,
+) -> Result<bool, String> {
+    let Some((url, existing_native)) = reopen_running_ui(root).await else {
+        return Ok(false);
     };
     match launch {
         Launch::OpenBrowser => {
@@ -235,7 +242,16 @@ async fn reopen_for_launch(root: &Path, launch: Launch) -> bool {
         }
         Launch::Nothing => println!("  already running"),
     }
-    true
+    check_reentry_mode(native_requested, existing_native)?;
+    Ok(true)
+}
+
+fn check_reentry_mode(native_requested: bool, existing_native: bool) -> Result<(), String> {
+    if native_requested && !existing_native {
+        Err("A dashboard-only FlyOnTheWall daemon is already running. Its dashboard remains available. Finish and save its recording, quit the old fotwd process in Activity Monitor, then reopen the app for native controls.".into())
+    } else {
+        Ok(())
+    }
 }
 
 /// Run the loopback server until the process is stopped.
@@ -244,7 +260,7 @@ async fn reopen_for_launch(root: &Path, launch: Launch) -> bool {
 /// click that found a daemon already running — passes through
 /// [`record_exit`], which is the whole of #102.
 pub async fn serve(root: PathBuf, launch: Launch, port: u16) -> Result<(), String> {
-    record_exit(serve_until_stopped(root, launch, port).await)
+    record_exit(serve_until_stopped(root, launch, port, None).await)
 }
 
 /// Journal why `serve` is returning, and hand the outcome back untouched.
@@ -280,33 +296,72 @@ pub fn record_exit(outcome: Result<(), String>) -> Result<(), String> {
 
 /// [`serve`]'s body: everything that can fail, in one place, so that one
 /// wrapper sees every way it can end.
-async fn serve_until_stopped(root: PathBuf, launch: Launch, port: u16) -> Result<(), String> {
+pub(crate) struct NativeStartup {
+    pub(crate) sender:
+        Option<std::sync::mpsc::SyncSender<Result<Option<crate::native_host::NativeHost>, String>>>,
+    pub(crate) gate: crate::native_bridge::RenderGate,
+    pub(crate) stop: crate::session::StopSignal,
+    pub(crate) recorder: Option<Arc<crate::recording::DaemonRecorder>>,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) async fn serve_native(
+    root: PathBuf,
+    launch: Launch,
+    port: u16,
+    mut startup: NativeStartup,
+) {
+    let outcome = record_exit(match std::fs::create_dir_all(&root) {
+        Ok(()) => serve_until_stopped(root, launch, port, Some(&mut startup)).await,
+        Err(error) => Err(format!("could not prepare the library directory: {error}")),
+    });
+    if let Some(recorder) = &startup.recorder {
+        recorder.begin_shutdown();
+        while !recorder.shutdown_status().drained() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    // Early reentry or startup failure has not delivered a native host.
+    if let Some(sender) = startup.sender.take() {
+        let _ = sender.send(outcome.map(|()| None));
+    }
+}
+
+async fn serve_until_stopped(
+    root: PathBuf,
+    launch: Launch,
+    port: u16,
+    mut native: Option<&mut NativeStartup>,
+) -> Result<(), String> {
     // Second click, not second daemon: if one is already serving, every tab
     // problem is solved by a fresh one-time link from it — no keychain read,
     // no bind, no new process. This is also what makes the app icon behave
     // like an app: launching it again brings the UI back.
-    if reopen_for_launch(&root, launch).await {
+    if reopen_for_launch(&root, launch, native.is_some()).await? {
         return Ok(());
     }
     // A launch URL check cannot exclude another process that has not bound yet.
     // Hold canonical-library ownership before opening keys, DB or background work
     // and retain it for this whole serving lifetime, independent of port choice.
-    let _owner = match crate::instance::InstanceOwner::acquire(&root) {
+    let owner = Arc::new(match crate::instance::InstanceOwner::acquire(&root) {
         Ok(owner) => owner,
         Err(crate::instance::InstanceError::Busy) => {
             let reopened = tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
-                    if reopen_for_launch(&root, launch).await {
-                        return;
+                    if reopen_for_launch(&root, launch, native.is_some()).await? {
+                        return Ok(());
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             })
             .await;
-            return reopened.map_err(|_| crate::instance::InstanceError::Busy.to_string());
+            return match reopened {
+                Ok(result) => result,
+                Err(_) => Err(crate::instance::InstanceError::Busy.to_string()),
+            };
         }
         Err(error) => return Err(error.to_string()),
-    };
+    });
 
     // The durable half of every diagnostic below (#101). Opened before the
     // library, because "the daemon will not start" is the failure most in need
@@ -447,12 +502,20 @@ async fn serve_until_stopped(root: PathBuf, launch: Launch, port: u16) -> Result
     // that can start a meeting. It needs the runtime handle because `start()`
     // is called from a blocking pool thread and has to spawn the session task
     // back onto the runtime.
-    let recorder = Arc::new(crate::recording::DaemonRecorder::new(
+    let recorder = crate::recording::DaemonRecorder::new(
         root.clone(),
         tokio::runtime::Handle::current(),
         on_segment,
         on_ready,
-    ));
+    );
+    let recorder = Arc::new(if let Some(startup) = native.as_deref() {
+        recorder.with_start_visibility(startup.gate.admission())
+    } else {
+        recorder
+    });
+    if let Some(startup) = native.as_deref_mut() {
+        startup.recorder = Some(recorder.clone());
+    }
 
     // The GitHub export target (issue #63). Its own library connection, as
     // the sweeper has one, so a push never holds the UI's mutex through a
@@ -597,7 +660,14 @@ async fn serve_until_stopped(root: PathBuf, launch: Launch, port: u16) -> Result
         token: state.policy().secret().expose_hex(),
     };
     let path = state_file_path(&root);
-    write_state_file(&path, &daemon).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    write_daemon_descriptor(
+        &path,
+        &fotw_web::DaemonDescriptor {
+            connection: daemon,
+            native_shell: native.is_some(),
+        },
+    )
+    .map_err(|e| format!("writing {}: {e}", path.display()))?;
 
     // macOS attributes a system-audio grant to the responsible process, which
     // for a daemon started from a shell is the terminal. Saying so here is the
@@ -624,8 +694,16 @@ async fn serve_until_stopped(root: PathBuf, launch: Launch, port: u16) -> Result
             let url = state.launch_url();
             // Deliberately not printed: it carries the handoff token, and a
             // terminal scrollback is a place secrets survive.
-            match std::process::Command::new("open").arg(&url).status() {
-                Ok(s) if s.success() => println!("  opened your browser"),
+            let opened = tokio::time::timeout(
+                Duration::from_secs(3),
+                tokio::process::Command::new("open")
+                    .arg(&url)
+                    .kill_on_drop(true)
+                    .status(),
+            )
+            .await;
+            match opened {
+                Ok(Ok(status)) if status.success() => println!("  opened your browser"),
                 _ => println!("  could not open a browser — run `fotwd serve --print-url`"),
             }
         }
@@ -641,7 +719,43 @@ async fn serve_until_stopped(root: PathBuf, launch: Launch, port: u16) -> Result
     // A daemon that stopped serving stopped for a reason, and the reason is
     // the last thing the log should hold — `record_exit` writes it, here as at
     // every other way out of this function.
-    server.serve().await.map_err(|e| format!("server: {e}"))
+    if let Some(startup) = native {
+        let (actions, requests) = std::sync::mpsc::sync_channel(4);
+        let (feedback, feedback_receiver) = std::sync::mpsc::sync_channel(4);
+        let bridge = crate::native_bridge::RecorderBridge::spawn(recorder, startup.gate.clone())?;
+        let home = std::env::var("FOTW_JURISDICTION").unwrap_or_else(|_| "US-CA".into());
+        let notice = crate::consent::Rules::builtin()
+            .escalate(&crate::consent::JurisdictionSignals::home(&home))
+            .user_text();
+        let host = crate::native_host::NativeHost::new(
+            bridge,
+            fotw_shell::HotkeyMap::defaults(),
+            notice,
+            actions,
+        )
+        .with_owner(owner.clone())
+        .with_feedback(feedback_receiver);
+        startup
+            .sender
+            .take()
+            .ok_or_else(|| "native startup reply was already delivered".to_owned())?
+            .send(Ok(Some(host)))
+            .map_err(|_| "native event loop closed during initialization".to_owned())?;
+        let stop = startup.stop.clone();
+        tokio::spawn(crate::native_actions::run(
+            requests,
+            feedback,
+            state.clone(),
+            root,
+            stop.clone(),
+        ));
+        tokio::select! {
+            outcome = server.serve() => outcome.map_err(|e| format!("server: {e}")),
+            () = stop.wait() => Ok(()),
+        }
+    } else {
+        server.serve().await.map_err(|e| format!("server: {e}"))
+    }
 }
 
 /// Start the auto-push worker on its own thread.
@@ -973,4 +1087,19 @@ pub fn delta_partial(seg: &fotw_stt::TranscriptSegment) -> fotw_web::Delta {
 /// into terminal scrollback; the user asks for that explicitly.
 pub fn print_launch_url(state: &fotw_web::AppState) {
     println!("{}", state.launch_url());
+}
+
+#[cfg(test)]
+mod native_reentry_tests {
+    use super::check_reentry_mode;
+    #[test]
+    fn a_native_upgrade_requires_restart_of_an_existing_dashboard_only_daemon() {
+        assert!(check_reentry_mode(false, false).is_ok());
+        assert!(check_reentry_mode(false, true).is_ok());
+        assert!(check_reentry_mode(true, true).is_ok());
+        let error = check_reentry_mode(true, false).unwrap_err();
+        assert!(error.contains("dashboard remains available"));
+        assert!(error.contains("Activity Monitor"));
+        assert!(error.contains("fotwd"));
+    }
 }

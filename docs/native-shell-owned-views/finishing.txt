@@ -1,0 +1,11 @@
+IndicatorFrameProbe {
+    nonactivating: true,
+    on_screen: true,
+    status: "Finishing",
+    elapsed: "1:02:03",
+    detail: "Capture stopped; waiting for transcription and audio finalization",
+    meter: "",
+    stop_enabled: false,
+    stop_dispatched: false,
+    controls_inside_panel: true,
+}
