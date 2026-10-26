@@ -921,3 +921,56 @@ async fn detection_withdrawal_snooze_and_shutdown_cannot_acknowledge_or_replace_
     assert!(host.view().prompt.is_none());
     assert_eq!(opened.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn detected_start_revalidates_a_closed_sampler_without_waiting_for_the_next_ui_tick() {
+    use fotw_audio::activity::{ActivitySnapshot, AudioClient, InputDevice, Transport};
+    use fotw_shell::{Monotonic, PromptChoice, SurfaceEvent, SurfaceHost};
+    use fotwd::native_detection::{ActivitySample, NativeDetection};
+    let root = tempfile::tempdir().unwrap();
+    let gate = RenderGate::new(Duration::from_secs(3));
+    let opened = Arc::new(AtomicU64::new(0));
+    let rec = recorder(root.path(), &gate, opened.clone());
+    let (input, sender) = NativeDetection::channel(fotwd::detect::DetectorConfig {
+        dwell: Duration::ZERO,
+        ..Default::default()
+    });
+    let mut host = native_host(rec.clone(), gate).with_detection(input);
+    until(|| {
+        host.tick(Monotonic::ZERO);
+        host.view().menu.record.enabled
+    })
+    .await;
+    sender
+        .try_send(ActivitySample {
+            captured_at_ns: fotw_audio::clock::host_ns(),
+            snapshot: Ok(ActivitySnapshot {
+                clients: vec![
+                    AudioClient::new(123, Some("us.zoom.xos"))
+                        .with_input(true)
+                        .with_output(true),
+                ],
+                default_input: Some(InputDevice::new(
+                    "Synthetic input",
+                    Transport::BuiltIn,
+                    true,
+                )),
+            }),
+        })
+        .unwrap();
+    host.tick(Monotonic::ZERO);
+    assert!(host.view().prompt.is_some());
+    host.on_event(SurfaceEvent::Acknowledge(true), Monotonic::ZERO);
+    drop(sender);
+    // The sampler died after the last tick. Start must refresh the offer itself.
+    host.on_event(
+        SurfaceEvent::Prompt(PromptChoice::Start { acknowledged: true }),
+        Monotonic::ZERO,
+    );
+    assert!(
+        host.view().pill.is_none(),
+        "closed sampler admitted a pending recording Start"
+    );
+    assert!(host.view().prompt.is_none());
+    assert_eq!(opened.load(Ordering::SeqCst), 0);
+}

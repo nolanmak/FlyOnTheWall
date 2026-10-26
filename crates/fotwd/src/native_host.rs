@@ -291,6 +291,17 @@ impl NativeHost {
 impl SurfaceHost for NativeHost {
     fn on_event(&mut self, event: SurfaceEvent, now: Monotonic) {
         self.now = now;
+        // Refresh an existing detected offer at the action boundary as well as
+        // on timer ticks. Never create a new prompt from an old checkbox event.
+        if self.prompt_origin == Some(StartOrigin::DetectionPrompt)
+            && matches!(
+                &event,
+                SurfaceEvent::Acknowledge(_) | SurfaceEvent::Prompt(PromptChoice::Start { .. })
+            )
+        {
+            self.poll_detection(now);
+        }
+
         match event {
             SurfaceEvent::Chord(chord) => match self.hotkeys.action_for(chord) {
                 Some(HotkeyAction::ToggleRecording) => self.toggle(StartOrigin::Hotkey),

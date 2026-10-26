@@ -24,11 +24,14 @@ The audit records detection-prompt, the detected app and the shown jurisdiction
 notice before capture. Not now uses the detector's existing ten-minute snooze.
 Probe failure cannot withdraw manual consent; active recording, pending Start and
 Quit cannot be replaced by an automatic prompt. An old acknowledgement cannot
-survive withdrawal and rearming.
+survive withdrawal and rearming. Checkbox and Start actions revalidate an existing
+detected offer immediately; they cannot act on a dead sampler between UI ticks.
 
 Two detector-inbox regressions and the native offer regression were RED before
 wiring, then GREEN. A separate audit regression was RED until the detected
-metadata crossed the shared admission path. All 17 native bridge regressions,
+metadata crossed the shared admission path. A click-boundary regression was RED
+when a sampler closed after the last tick could still admit a pending Start;
+revalidating the existing offer before consent actions makes it GREEN. All 18 native bridge regressions,
 three inbox/sampler checks and strict all-target daemon Clippy passed. The blocked
 probe test releases and joins its own synthetic query without touching devices.
 
@@ -37,7 +40,8 @@ prompts through actual AppKit controls. Unchecked Start stays disabled; the actu
 checkbox enables and acknowledges Start. No recording indicator is admitted in
 this fixture, so configuration and capture calls stay zero. Quit drains, and the
 audit contains the actual origin and detected app. No tray/global shortcut is
-registered, and the installed product is not launched.
+registered, and the installed product is not launched. Final-source results and
+source hashes are in [the owned-control manifest](native-detection-owned-controls/manifest.json).
 
 Acceptance in #58, #57 and #124 remains open. Signed installed-app LaunchServices,
 TCC, real-call detection accuracy, focus/fullscreen/display behavior and physical

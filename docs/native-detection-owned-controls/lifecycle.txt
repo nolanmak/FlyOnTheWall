@@ -1,0 +1,5 @@
+ApplicationEventProbe {
+    reopen_queued_once: true,
+    quit_queued_once: true,
+    immediate_termination_cancelled: true,
+}
