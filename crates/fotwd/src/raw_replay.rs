@@ -86,6 +86,9 @@ mod compatibility {
 /// samples, so recovering never substitutes a differently filtered prefix.
 pub(crate) struct CanonicalInput(ArchiveConverter);
 impl CanonicalInput {
+    pub(crate) fn output_origin(&self) -> fotw_pipeline::resample::ConversionOrigin {
+        self.0.output_origin()
+    }
     pub fn new(format: TrackFormat) -> Result<Self, String> {
         ArchiveConverter::new(format.sample_rate_hz, format.channels, 16000, 1)
             .map(Self)

@@ -213,6 +213,14 @@ pub struct CaptureArchive {
     failure: Option<String>,
 }
 impl CaptureArchive {
+    /// Active native input shape for this converter/tap generation.
+    pub fn input_format(&self) -> (u32, u16) {
+        (self.converter.input_rate, self.converter.input_channels)
+    }
+    /// Exact native-frame origin after archive output delay trimming.
+    pub fn output_origin(&self) -> ConversionOrigin {
+        self.converter.output_origin()
+    }
     pub fn new(
         input_rate: u32,
         input_channels: u16,

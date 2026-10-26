@@ -44,6 +44,8 @@ use fotw_stt::{
     DeepgramStream, DeepgramStreamConfig, LocalStreamConfig, RecognizerFactory, Source,
     StreamEvent, TranscriptSegment,
 };
+mod processing;
+use processing::{NativeContext, PumpAec};
 
 /// Ring capacity per leg, in samples. Ten seconds at 48 kHz stereo.
 const RING_SAMPLES: usize = 48_000 * 2 * 10;
@@ -503,6 +505,8 @@ fn archive_converter(format: StreamFormat, archive: TrackFormat) -> Result<Captu
 /// [`supervise_channel_observed`] run inside `pump_loop` against the same `sys`/`mic`
 /// consumers the ordinary drain reads, rather than a second private copy.
 struct ChannelMeta {
+    generation: u64,
+    native_samples: u64,
     slot: ProducerSlot,
     converter: CaptureArchive,
     retired_drops: u64,
@@ -523,6 +527,19 @@ struct ChannelMeta {
     /// wrong amount of silence (#82).
     wal_format: TrackFormat,
 }
+impl ChannelMeta {
+    fn native_context<'a>(&self, consumer: &RingConsumer, samples: &'a [f32]) -> NativeContext<'a> {
+        let (rate, channels) = self.converter.input_format();
+        NativeContext {
+            generation: self.generation,
+            format: StreamFormat::new(rate, channels, fotw_audio::SampleFormat::F32),
+            phase: self.converter.output_origin(),
+            accepted_start: self.native_samples,
+            observation: consumer.capture_observation(),
+            samples,
+        }
+    }
+}
 
 /// Poll one supervised leg and apply whatever it decided to the WAL.
 ///
@@ -541,8 +558,13 @@ fn supervise_channel(
     epoch_ns: u64,
     scratch: &mut [f32],
 ) -> Result<(), String> {
-    supervise_channel_observed(wal, meta, cons, plat, epoch_ns, scratch, &mut |_| Ok(()))
+    supervise_channel_observed(wal, meta, cons, plat, epoch_ns, scratch, &mut |_, _, _| {
+        Ok(())
+    })
 }
+
+type ArchiveObserver<'a> = dyn for<'b> FnMut(&mut SessionWal, &[f32], Option<NativeContext<'b>>) -> Result<(), String>
+    + 'a;
 
 #[allow(clippy::too_many_arguments)] // capture state plus a post-WAL feed observer
 fn supervise_channel_observed(
@@ -552,7 +574,7 @@ fn supervise_channel_observed(
     plat: &(impl AudioPlatform + ?Sized),
     epoch_ns: u64,
     scratch: &mut [f32],
-    on_pcm: &mut dyn FnMut(&[f32]) -> Result<(), String>,
+    on_pcm: &mut ArchiveObserver<'_>,
 ) -> Result<(), String> {
     let source = match meta.channel {
         LegChannel::System => fotw_web::recorder::CaptureSource::System,
@@ -593,15 +615,24 @@ fn supervise_channel_observed(
             remaining -= n;
             let pcm = meta.converter.process(&mut scratch[..n]);
             meta.channel.write(wal, &pcm).map_err(|e| e.to_string())?;
-            on_pcm(&pcm)?;
+            on_pcm(wal, &pcm, Some(meta.native_context(cons, &scratch[..n])))?;
+            meta.native_samples = meta
+                .native_samples
+                .checked_add(n as u64)
+                .ok_or("native capture position overflow")?;
         }
         let tail = meta.converter.finish();
         meta.channel.write(wal, &tail).map_err(|e| e.to_string())?;
-        on_pcm(&tail)?;
+        on_pcm(wal, &tail, None)?;
         meta.archive_warnings.extend(meta.converter.warnings());
         meta.retired_drops += cons.dropped_frames();
         *cons = meta.slot.replacement()?;
         meta.converter = archive_converter(format, meta.wal_format)?;
+        meta.generation = meta
+            .generation
+            .checked_add(1)
+            .ok_or("capture generation overflow")?;
+        meta.native_samples = 0;
 
         for mut gap in gaps {
             if gap.reason == fotw_audio::supervisor::GapReason::InitiallyUnavailable {
@@ -657,7 +688,7 @@ fn apply_leg_gap(
     format: TrackFormat,
     epoch_ns: u64,
     scratch: &mut [f32],
-    on_pcm: &mut dyn FnMut(&[f32]) -> Result<(), String>,
+    on_pcm: &mut ArchiveObserver<'_>,
 ) -> Result<(), String> {
     let gap = CaptureGap {
         start_ns: gap.start_ns.max(epoch_ns),
@@ -692,7 +723,7 @@ fn apply_leg_gap(
         channel
             .write(wal, &scratch[..n])
             .map_err(|e| format!("could not pad the gap: {e}"))?;
-        on_pcm(&scratch[..n])?;
+        on_pcm(wal, &scratch[..n], None)?;
         remaining -= n;
     }
     Ok(())
@@ -1679,6 +1710,9 @@ impl SegmentTap {
 /// The latches a caller outside the session holds, and the clock on its end.
 #[derive(Clone, Debug, Default)]
 pub struct SessionControl {
+    /// Explicit single-use preloaded audio processing; no backend is selected
+    /// by default. Its native cleanup remains part of recording ownership.
+    pub processing: Option<crate::live_aec::Processing>,
     /// Actual source/model telemetry, independent of capture health.
     pub speech: crate::speech_status::SpeechMonitor,
     /// Independent source health and session-scoped recovery requests.
@@ -1702,6 +1736,15 @@ impl SessionControl {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+    fn take_processing(&self) -> Result<Option<crate::live_aec::Prepared>, String> {
+        self.processing
+            .as_ref()
+            .map(|processing| {
+                self.speech.bind_processing(processing.status());
+                processing.take()
+            })
+            .transpose()
     }
 }
 
@@ -1757,6 +1800,7 @@ pub async fn run_with_stop(
         transcription,
         duration,
         SessionControl {
+            processing: None,
             speech: crate::speech_status::SpeechMonitor::default(),
             capture_health: crate::capture_health::CaptureMonitor::default(),
             stop,
@@ -1782,6 +1826,7 @@ pub async fn run_with_control(
     duration: Duration,
     control: SessionControl,
 ) -> Result<SessionOutcome, String> {
+    let processing = control.take_processing()?;
     if control.stop.is_stopped() {
         return Err("recording cancelled before capture setup".into());
     }
@@ -1854,12 +1899,18 @@ pub async fn run_with_control(
         mic_format.is_some(),
         control.errors.clone(),
         control.speech.clone(),
+        processing.as_ref().map(|p| p.descriptor.clone()),
     )
     .await;
 
     let stop = Arc::new(AtomicBool::new(false));
     let pump_stop = Arc::clone(&stop);
     let feeds = SttFeeds {
+        timing: PumpTiming {
+            mic_anchor: anchors.mic_ms.checked_mul(16),
+            clock: Arc::new(fotw_audio::clock::HostClock),
+        },
+        processing,
         system: sys_stt.clone().map(|s| s as Arc<dyn PcmFeed>),
         mic: mic_stt.clone().map(|s| s as Arc<dyn PcmFeed>),
         // Durable replay must retain original near-end speech, including
@@ -2144,6 +2195,7 @@ pub async fn run_supervised(
     duration: Duration,
     control: SessionControl,
 ) -> Result<SessionOutcome, String> {
+    let processing = control.take_processing()?;
     if control.stop.is_stopped() {
         return Err("recording cancelled before capture setup".into());
     }
@@ -2273,12 +2325,18 @@ pub async fn run_supervised(
         true,
         control.errors.clone(),
         control.speech.clone(),
+        processing.as_ref().map(|p| p.descriptor.clone()),
     )
     .await;
 
     let stop = Arc::new(AtomicBool::new(false));
     let pump_stop = Arc::clone(&stop);
     let feeds = SttFeeds {
+        timing: PumpTiming {
+            mic_anchor: anchors.mic_ms.checked_mul(16),
+            clock: clock.clone(),
+        },
+        processing,
         system: sys_stt.clone().map(|s| s as Arc<dyn PcmFeed>),
         mic: mic_stt.clone().map(|s| s as Arc<dyn PcmFeed>),
         // Durable replay must retain original near-end speech, including
@@ -2311,6 +2369,8 @@ pub async fn run_supervised(
         plat: Arc::clone(&plat),
         epoch_ns,
         system: ChannelMeta {
+            generation: 1,
+            native_samples: 0,
             slot: sys_slot,
             converter: archive_converter(
                 sys_format,
@@ -2327,6 +2387,8 @@ pub async fn run_supervised(
             wal_format: TrackFormat::new(sys_format.sample_rate_hz, sys_format.channels),
         },
         mic: Some(ChannelMeta {
+            generation: 1,
+            native_samples: 0,
             slot: mic_slot,
             converter: mic_converter,
             retired_drops: 0,
@@ -2587,6 +2649,12 @@ fn spawn_leg_collector(
 trait PcmFeed: Send + Sync {
     /// Hand the provider 16-bit little-endian mono PCM.
     fn write_pcm(&self, pcm: &[i16]);
+    fn write_processed(&self, output: &fotw_pipeline::aec::Output) {
+        self.write_pcm(&Downmixer::to_i16(&output.samples));
+    }
+    fn processing_declared(&self) -> bool {
+        false
+    }
     fn durable_replay(&self) -> bool {
         false
     }
@@ -2645,6 +2713,37 @@ impl LegStream {
 }
 
 impl PcmFeed for LegStream {
+    fn processing_declared(&self) -> bool {
+        match self {
+            Self::Deepgram(_) => false,
+            Self::Failover { stream, .. } | Self::DurableLocal { stream, .. } => {
+                stream.processing_declared()
+            }
+        }
+    }
+    fn write_processed(&self, output: &fotw_pipeline::aec::Output) {
+        match self {
+            Self::Deepgram(_) => {} // processing admission never binds a legacy feed
+            Self::Failover {
+                stream,
+                errors,
+                write_failed,
+            }
+            | Self::DurableLocal {
+                stream,
+                errors,
+                write_failed,
+            } => {
+                if let Err(error) = stream.write_processed(output)
+                    && !write_failed.swap(true, Ordering::AcqRel)
+                {
+                    errors.record(format!(
+                        "processed transcription input failed; original audio retained: {error}"
+                    ));
+                }
+            }
+        }
+    }
     fn durable_replay(&self) -> bool {
         self.requires_original_pcm()
     }
@@ -2693,6 +2792,7 @@ type OpenLegs = (
 /// The mic leg is additionally gated on the mic tap having actually started: a
 /// stream for a device that is not there would be fed nothing — and, for
 /// Deepgram, still billed for the socket.
+#[allow(clippy::too_many_arguments)] // source identity, lifecycle monitor and optional processor declaration
 async fn open_legs(
     transcription: Transcription,
     dir: &Path,
@@ -2701,6 +2801,7 @@ async fn open_legs(
     mic_started: bool,
     errors: SttErrors,
     speech: crate::speech_status::SpeechMonitor,
+    processing: Option<crate::failover::processing::Descriptor>,
 ) -> OpenLegs {
     match transcription {
         Transcription::PreparingFailover(_) | Transcription::PreparingLocal(_) => {
@@ -2729,8 +2830,20 @@ async fn open_legs(
                     );
                     cfg.normalizer.session_id = session_id.to_owned();
                     cfg.session_offset_ms = anchors.mic_ms;
-                    let (m, rx) = DeepgramStream::open(*cfg);
-                    (Some(Arc::new(LegStream::Deepgram(m))), Some(rx))
+                    if let Some(descriptor) = processing.clone() {
+                        let mut config = crate::failover::stream::CloudSourceConfig::new(*cfg);
+                        config.processing = Some(descriptor);
+                        bind_durable_source(
+                            crate::failover::stream::FailoverStream::open_cloud(dir, config).await,
+                            errors.clone(),
+                            Source::Mic,
+                            speech.clone(),
+                            false,
+                        )
+                    } else {
+                        let (m, rx) = DeepgramStream::open(*cfg);
+                        (Some(Arc::new(LegStream::Deepgram(m))), Some(rx))
+                    }
                 }
                 _ => (None, None),
             };
@@ -2758,6 +2871,7 @@ async fn open_legs(
                     let mut config =
                         crate::failover::stream::LocalSourceConfig::new(*cfg, legs.engine);
                     config.revision = legs.revision;
+                    config.processing = processing;
                     bind_durable_source(
                         crate::failover::stream::FailoverStream::open_local(dir, config).await,
                         errors,
@@ -2783,7 +2897,16 @@ async fn open_legs(
             )
             .await;
             let mic = match mic {
-                Some(config) if mic_started => {
+                Some(mut config) if mic_started => {
+                    if let Some(descriptor) = processing {
+                        match config.with_processing(descriptor) {
+                            Ok(declared) => config = declared,
+                            Err(error) => {
+                                errors.record(format!("audio processing declaration failed; original capture retained: {error}"));
+                                return (system.0, system.1, None, None);
+                            }
+                        }
+                    }
                     open_failover_source(
                         config,
                         dir,
@@ -2879,13 +3002,28 @@ fn bind_durable_source(
 ///
 /// A struct rather than two more parameters: the pump's argument list was at
 /// clippy's limit, and these two travel together or not at all.
+#[derive(Default)]
 struct SttFeeds {
+    processing: Option<crate::live_aec::Prepared>,
+    timing: PumpTiming,
     system: Option<Arc<dyn PcmFeed>>,
     mic: Option<Arc<dyn PcmFeed>>,
     /// CAP-11 v1 (#71): withholds echo-dominated mic chunks from the mic
     /// feed when the mic is judged to be hearing the speakers. Present only
     /// when both feeds are live — with one leg there is nothing to couple.
     echo_gate: Option<fotw_pipeline::echo::EchoGate>,
+}
+struct PumpTiming {
+    mic_anchor: Option<u64>,
+    clock: Arc<dyn Clock>,
+}
+impl Default for PumpTiming {
+    fn default() -> Self {
+        Self {
+            mic_anchor: Some(0),
+            clock: Arc::new(fotw_audio::clock::HostClock),
+        }
+    }
 }
 
 /// How the pump is told to end, and how long it may take.
@@ -2967,12 +3105,42 @@ fn pump_loop(
 }
 
 struct PumpTranscription {
+    aec: Option<PumpAec>,
+    archive_samples: [u64; 2],
+    mic_position: u64,
     stt: SttFeeds,
     resampler: crate::raw_replay::CanonicalInput,
     mic_resampler: Option<crate::raw_replay::CanonicalInput>,
     hush: Vec<i16>,
 }
 impl PumpTranscription {
+    fn feed_archived(
+        &mut self,
+        wal: &mut SessionWal,
+        channel: LegChannel,
+        pcm: &[f32],
+        native: Option<NativeContext<'_>>,
+    ) -> Result<(), String> {
+        let index = if channel == LegChannel::System { 0 } else { 1 };
+        if self.aec.is_some()
+            || self
+                .stt
+                .mic
+                .as_ref()
+                .is_some_and(|feed| feed.processing_declared())
+        {
+            wal.flush()
+                .map_err(|e| format!("original audio sync failed before processing: {e}"))?;
+        }
+        if let Some(aec) = self.aec.as_mut() {
+            aec.capture(channel, native, self.archive_samples[index]);
+        }
+        self.feed(channel, pcm)?;
+        self.archive_samples[index] = self.archive_samples[index]
+            .checked_add(pcm.len() as u64)
+            .ok_or("archive position overflow")?;
+        Ok(())
+    }
     fn feed(&mut self, channel: LegChannel, pcm: &[f32]) -> Result<(), String> {
         let mono = match channel {
             LegChannel::System if self.stt.system.is_some() => self.resampler.process(pcm)?,
@@ -2982,21 +3150,21 @@ impl PumpTranscription {
             },
             _ => return Ok(()),
         };
-        self.deliver(channel, &mono);
+        self.deliver(channel, &mono)?;
         Ok(())
     }
     fn finish(&mut self) -> Result<(), String> {
         let mono = self.resampler.finish()?;
-        self.deliver(LegChannel::System, &mono);
+        self.deliver(LegChannel::System, &mono)?;
         if let Some(r) = self.mic_resampler.as_mut() {
             let mono = r.finish()?;
-            self.deliver(LegChannel::Mic, &mono);
+            self.deliver(LegChannel::Mic, &mono)?;
         }
         Ok(())
     }
-    fn deliver(&mut self, channel: LegChannel, mono: &[f32]) {
+    fn deliver(&mut self, channel: LegChannel, mono: &[f32]) -> Result<(), String> {
         if mono.is_empty() {
-            return;
+            return Ok(());
         }
         match channel {
             LegChannel::System => {
@@ -3010,7 +3178,30 @@ impl PumpTranscription {
                 }
             }
             LegChannel::Mic => {
+                let end = self
+                    .mic_position
+                    .checked_add(mono.len() as u64)
+                    .ok_or("microphone source clock overflow")?;
+                if let Some(aec) = self.aec.as_mut() {
+                    aec.write_mic(mono);
+                    self.mic_position = end;
+                    return Ok(());
+                }
                 if let Some(h) = self.stt.mic.as_ref() {
+                    if h.processing_declared() {
+                        for (i, chunk) in mono.chunks(3200).enumerate() {
+                            h.write_processed(&fotw_pipeline::aec::Output {
+                                epoch: 1,
+                                start_sample: self.mic_position + i as u64 * 3200,
+                                samples: chunk.to_vec(),
+                                kind: fotw_pipeline::aec::OutputKind::Raw(
+                                    fotw_pipeline::aec::BypassReason::BackendFailed,
+                                ),
+                            });
+                        }
+                        self.mic_position = end;
+                        return Ok(());
+                    }
                     // CAP-11 v1: on speakers the mic is mostly a copy of the
                     // system leg — transcribing it again costs money and
                     // attributes the far end's words to the user. Withheld
@@ -3039,8 +3230,10 @@ impl PumpTranscription {
                         h.write_pcm(&Downmixer::to_i16(mono));
                     }
                 }
+                self.mic_position = end;
             }
         }
+        Ok(())
     }
 }
 
@@ -3058,7 +3251,7 @@ fn pump_drain(
     mut mic: RingConsumer,
     sys_format: StreamFormat,
     mic_format: Option<StreamFormat>,
-    stt: SttFeeds,
+    mut stt: SttFeeds,
     stop: PumpStop<'_>,
     mut supervision: Option<Supervision>,
 ) -> Result<PumpCounts, String> {
@@ -3067,6 +3260,7 @@ fn pump_drain(
     let mut last_capture_checkpoint = Instant::now();
     let mut scratch = vec![0.0f32; 48_000];
     let (mut sys_written, mut mic_written) = (0u64, 0u64);
+    let (mut sys_native_samples, mut mic_native_samples) = (0u64, 0u64);
     // What a suppressed mic chunk is fed as. Kept across iterations because
     // chunk sizes settle: after the first few rounds this stops growing.
     let hush: Vec<i16> = Vec::new();
@@ -3089,7 +3283,41 @@ fn pump_drain(
         _ => None,
     };
 
+    let mic_position = stt.timing.mic_anchor.unwrap_or(0);
+    let aec = stt.processing.take().and_then(|prepared| {
+        let bound = match (
+            stt.mic.clone(),
+            mic_format,
+            mic_resampler.as_ref(),
+            stt.timing.mic_anchor,
+        ) {
+            (Some(sink), Some(format), Some(canonical), Some(anchor)) => PumpAec::bind(
+                prepared,
+                sink,
+                sys_format,
+                format,
+                canonical.output_origin(),
+                anchor,
+                stt.timing.clock.clone(),
+            ),
+            _ => Err(
+                "selected audio processing has no started microphone transcription source".into(),
+            ),
+        };
+        match bound {
+            Ok(aec) => Some(aec),
+            Err(error) => {
+                capture_warnings.push(format!(
+                    "audio processing unavailable; original capture retained: {error}"
+                ));
+                None
+            }
+        }
+    });
     let mut transcription = PumpTranscription {
+        aec,
+        archive_samples: [0, 0],
+        mic_position,
         stt,
         resampler,
         mic_resampler,
@@ -3111,7 +3339,7 @@ fn pump_drain(
                 mic_format,
             ),
         ] {
-            if feed.is_some_and(|h| h.durable_replay())
+            if feed.is_some_and(|h| h.durable_replay() && !h.processing_declared())
                 && let Some(format) = format
                 && let Err(error) = crate::raw_replay::save_plan(
                     wal.dir(),
@@ -3162,9 +3390,9 @@ fn pump_drain(
                         meta.wal_format,
                         sup.epoch_ns,
                         &mut scratch,
-                        &mut |pcm| {
+                        &mut |wal, pcm, native| {
                             mic_written += pcm.len() as u64;
-                            transcription.feed(LegChannel::Mic, pcm)
+                            transcription.feed_archived(wal, LegChannel::Mic, pcm, native)
                         },
                     )?;
                 }
@@ -3186,9 +3414,9 @@ fn pump_drain(
                 &*sup.plat,
                 sup.epoch_ns,
                 &mut scratch,
-                &mut |pcm| {
+                &mut |wal, pcm, native| {
                     sys_written += pcm.len() as u64;
-                    transcription.feed(LegChannel::System, pcm)
+                    transcription.feed_archived(wal, LegChannel::System, pcm, native)
                 },
             )?;
             if let Some(mic_meta) = sup.mic.as_mut() {
@@ -3199,9 +3427,9 @@ fn pump_drain(
                     &*sup.plat,
                     sup.epoch_ns,
                     &mut scratch,
-                    &mut |pcm| {
+                    &mut |wal, pcm, native| {
                         mic_written += pcm.len() as u64;
-                        transcription.feed(LegChannel::Mic, pcm)
+                        transcription.feed_archived(wal, LegChannel::Mic, pcm, native)
                     },
                 )?;
             }
@@ -3209,6 +3437,10 @@ fn pump_drain(
         }
 
         let mut moved = false;
+        if let Some(aec) = transcription.aec.as_mut() {
+            aec.observe(LegChannel::System, sys.capture_observation());
+            aec.observe(LegChannel::Mic, mic.capture_observation());
+        }
 
         let n = sys.pop_into(&mut scratch);
         if n > 0 {
@@ -3222,7 +3454,32 @@ fn pump_drain(
             sys_written += pcm.len() as u64;
             moved = true;
 
-            transcription.feed(LegChannel::System, pcm)?;
+            let native = if let Some(sup) = supervision.as_mut() {
+                let context = sup.system.native_context(&sys, &scratch[..n]);
+                sup.system.native_samples = sup
+                    .system
+                    .native_samples
+                    .checked_add(n as u64)
+                    .ok_or("native system position overflow")?;
+                context
+            } else {
+                let context = NativeContext {
+                    generation: 1,
+                    format: sys_format,
+                    phase: fotw_pipeline::resample::ConversionOrigin {
+                        input_frame_numerator: 0,
+                        denominator: 1,
+                    },
+                    accepted_start: sys_native_samples,
+                    observation: sys.capture_observation(),
+                    samples: &scratch[..n],
+                };
+                sys_native_samples = sys_native_samples
+                    .checked_add(n as u64)
+                    .ok_or("native system position overflow")?;
+                context
+            };
+            transcription.feed_archived(&mut wal, LegChannel::System, pcm, Some(native))?;
         }
 
         let m = mic.pop_into(&mut scratch);
@@ -3238,12 +3495,39 @@ fn pump_drain(
             mic_written += pcm.len() as u64;
             moved = true;
 
-            transcription.feed(LegChannel::Mic, pcm)?;
+            let native = if let Some(meta) = supervision.as_mut().and_then(|s| s.mic.as_mut()) {
+                let context = meta.native_context(&mic, &scratch[..m]);
+                meta.native_samples = meta
+                    .native_samples
+                    .checked_add(m as u64)
+                    .ok_or("native microphone position overflow")?;
+                context
+            } else {
+                let context = NativeContext {
+                    generation: 1,
+                    format: mic_format.unwrap_or(sys_format),
+                    phase: fotw_pipeline::resample::ConversionOrigin {
+                        input_frame_numerator: 0,
+                        denominator: 1,
+                    },
+                    accepted_start: mic_native_samples,
+                    observation: mic.capture_observation(),
+                    samples: &scratch[..m],
+                };
+                mic_native_samples = mic_native_samples
+                    .checked_add(m as u64)
+                    .ok_or("native microphone position overflow")?;
+                context
+            };
+            transcription.feed_archived(&mut wal, LegChannel::Mic, pcm, Some(native))?;
         }
 
         if last_capture_checkpoint.elapsed() >= Duration::from_secs(2) {
             stop.checkpoint(&mut wal, &mut capture_warnings);
             last_capture_checkpoint = Instant::now();
+        }
+        if let Some(aec) = transcription.aec.as_mut() {
+            aec.poll();
         }
 
         match drain_by {
@@ -3281,15 +3565,19 @@ fn pump_drain(
         let tail = sup.system.converter.finish();
         wal.write_system(&tail).map_err(|e| e.to_string())?;
         sys_written += tail.len() as u64;
-        transcription.feed(LegChannel::System, &tail)?;
+        transcription.feed_archived(&mut wal, LegChannel::System, &tail, None)?;
         if let Some(mic) = sup.mic.as_mut() {
             let tail = mic.converter.finish();
             wal.write_mic(&tail).map_err(|e| e.to_string())?;
             mic_written += tail.len() as u64;
-            transcription.feed(LegChannel::Mic, &tail)?;
+            transcription.feed_archived(&mut wal, LegChannel::Mic, &tail, None)?;
         }
     }
     transcription.finish()?;
+    if let Some(aec) = transcription.aec.as_mut() {
+        aec.finish();
+        capture_warnings.extend(aec.take_warnings());
+    }
     stop.checkpoint(&mut wal, &mut capture_warnings);
     wal.flush().map_err(|e| format!("flush failed: {e}"))?;
     // Finalize stamps `ended_at_ms`. Without it every cleanly-ended meeting
@@ -3426,6 +3714,7 @@ mod raw_reconstruction_pump_tests {
                     system: (!is_mic).then(|| feed.clone() as Arc<dyn PcmFeed>),
                     mic: is_mic.then(|| feed.clone() as Arc<dyn PcmFeed>),
                     echo_gate: None,
+                    ..SttFeeds::default()
                 },
                 PumpStop {
                     capture: None,
@@ -3685,6 +3974,7 @@ mod pump_clock_tests {
             system: Some(Arc::clone(&sys_feed) as Arc<dyn PcmFeed>),
             mic: Some(Arc::clone(&mic_feed) as Arc<dyn PcmFeed>),
             echo_gate: gated.then(|| fotw_pipeline::echo::EchoGate::new(FEED_RATE as u32)),
+            ..SttFeeds::default()
         };
 
         let stop = AtomicBool::new(true);
@@ -3980,6 +4270,7 @@ mod pump_clock_tests {
                 system: None,
                 mic: None,
                 echo_gate: None,
+                ..SttFeeds::default()
             },
             PumpStop {
                 capture: Some(&ready),
@@ -4027,6 +4318,7 @@ mod pump_clock_tests {
                 system: None,
                 mic: None,
                 echo_gate: None,
+                ..SttFeeds::default()
             },
             PumpStop {
                 capture: Some(&ready),
@@ -4073,6 +4365,7 @@ mod pump_clock_tests {
                 system: None,
                 mic: None,
                 echo_gate: None,
+                ..SttFeeds::default()
             },
             PumpStop {
                 capture: None,
@@ -4122,6 +4415,7 @@ mod pump_drain_tests {
             system: None,
             mic: None,
             echo_gate: None,
+            ..SttFeeds::default()
         }
     }
 
@@ -4300,6 +4594,8 @@ mod supervised_recovery_tests {
         supervisor.start().unwrap();
         (
             ChannelMeta {
+                generation: 1,
+                native_samples: 0,
                 slot,
                 converter: archive_converter(format, wal_format).unwrap(),
                 retired_drops: 0,
@@ -4534,6 +4830,7 @@ mod supervised_recovery_tests {
         supervise_channel(&mut wal, &mut meta, &mut consumer, &plat, 0, &mut scratch).unwrap();
         clock.advance(Duration::from_secs(6));
         let mut forwarded = Vec::new();
+        let mut native_ranges = Vec::new();
         supervise_channel_observed(
             &mut wal,
             &mut meta,
@@ -4541,12 +4838,32 @@ mod supervised_recovery_tests {
             &plat,
             0,
             &mut scratch,
-            &mut |pcm| {
+            &mut |_, pcm, native| {
+                if let Some(native) = native {
+                    native_ranges.push((
+                        native.generation,
+                        native.accepted_start,
+                        native.format.sample_rate_hz,
+                        native.format.channels,
+                        native.samples.len(),
+                    ));
+                }
                 forwarded.extend_from_slice(pcm);
                 Ok(())
             },
         )
         .unwrap();
+        assert_eq!(
+            native_ranges,
+            [(1, 0, 48000, 2, 960)],
+            "gap padding and converter tails have no invented native timing"
+        );
+        assert_eq!(
+            (meta.generation, meta.native_samples),
+            (2, 0),
+            "replacement rings start a new accepted-sample lifetime"
+        );
+        assert_eq!(meta.converter.input_format(), (16000, 1));
         assert_eq!(
             forwarded.len(),
             960 + 6 * 48_000 * 2,
@@ -4585,6 +4902,7 @@ mod supervised_recovery_tests {
                 system: Some(feed.clone()),
                 mic: None,
                 echo_gate: None,
+                ..SttFeeds::default()
             },
             PumpStop {
                 capture: None,
@@ -4936,6 +5254,7 @@ mod supervised_recovery_tests {
                         system: None,
                         mic: None,
                         echo_gate: None,
+                        ..SttFeeds::default()
                     },
                     PumpStop {
                         capture: None,
