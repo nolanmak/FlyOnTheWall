@@ -5,18 +5,24 @@
 version: 2
 updates:
   - package-ecosystem: cargo
+    cooldown:
+      default-days: 7
     directory: /tools/aec-eval
     schedule:
       interval: weekly
     open-pull-requests-limit: 1
 
   - package-ecosystem: cargo
+    cooldown:
+      default-days: 7
     directory: /
     schedule:
       interval: weekly
     open-pull-requests-limit: 3
 
   - package-ecosystem: github-actions
+    cooldown:
+      default-days: 7
     directory: /
     schedule:
       interval: weekly
