@@ -452,10 +452,9 @@ fn sha256_file(path: &Path) -> Result<String, String> {
 
 /// Transcription on this machine, for one session.
 ///
-/// The model is not opened here: it loads on the first leg's worker once
-/// capture is up, so `Start` is not held for it, and a missing or unreadable
-/// file arrives as that leg's error on the dashboard rather than a refusal to
-/// record.
+/// File identity is resolved on an owned preparation task. Native loading stays
+/// on the source worker after capture begins. An invalid/unavailable model still
+/// records audio and reports its error, with no implicit cloud fallback.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn local_transcription(
@@ -465,13 +464,137 @@ pub fn local_transcription(
     mic_present: bool,
     mic_enabled: bool,
 ) -> Transcription {
-    let engine = fotw_stt::WhisperEngine::new(settings.model_path(data_root), settings.language());
-    Transcription::Local(crate::session::LocalLegs::for_session(
-        std::sync::Arc::new(engine),
-        session_id,
-        mic_present,
-        mic_enabled,
-    ))
+    let settings = settings.clone();
+    let data_root = data_root.to_path_buf();
+    let session_id = session_id.to_owned();
+    Transcription::PreparingLocal(Box::pin(async move {
+        tokio::task::spawn_blocking(move || {
+            use fotw_stt::RecognizerFactory;
+            let path = settings.model_path(&data_root);
+            let engine = fotw_stt::WhisperEngine::new(&path, settings.language());
+            let expected_revision =
+                known_model(engine.model()).map(|model| format!("sha256:{}", model.sha256));
+            let checked = verify_model(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|known| match known {
+                    Some(model) => Ok(model.sha256.to_owned()),
+                    None => sha256_file(&path),
+                });
+            let (factory, revision): (std::sync::Arc<dyn RecognizerFactory>, Option<String>) =
+                match checked {
+                    Ok(digest) => (
+                        std::sync::Arc::new(SavedFactory {
+                            engine,
+                            path,
+                            digest: digest.clone(),
+                        }),
+                        Some(format!("sha256:{digest}")),
+                    ),
+                    Err(message) => (
+                        std::sync::Arc::new(UnavailableLocal {
+                            model: engine.model().to_owned(),
+                            language: engine.language().map(str::to_owned),
+                            message,
+                        }),
+                        expected_revision,
+                    ),
+                };
+            let mut legs = crate::session::LocalLegs::for_session(
+                factory,
+                &session_id,
+                mic_present,
+                mic_enabled,
+            );
+            legs.revision = revision;
+            legs
+        })
+        .await
+        .map_err(|_| "local model identity preparation failed".to_owned())
+    }))
+}
+
+#[cfg(target_os = "macos")]
+struct UnavailableLocal {
+    model: String,
+    language: Option<String>,
+    message: String,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[tokio::test]
+async fn unavailable_catalog_model_keeps_its_expected_identity_for_later_recovery() {
+    let root = tempfile::tempdir().unwrap();
+    let settings = SttSettings {
+        engine: SttEngine::Local,
+        model: root
+            .path()
+            .join("ggml-small.en.bin")
+            .to_string_lossy()
+            .into_owned(),
+        language: "en".into(),
+    };
+    let prepared = local_transcription(&settings, root.path(), "fixture", false, false)
+        .prepare(&crate::session::SessionControl::new())
+        .await
+        .unwrap();
+    let Transcription::Local(legs) = prepared else {
+        panic!("expected recording-capable local configuration");
+    };
+    let expected = format!("sha256:{}", known_model("small.en").unwrap().sha256);
+    assert_eq!(legs.revision.as_deref(), Some(expected.as_str()));
+    assert!(
+        legs.engine.create().is_err(),
+        "an expected identity must not pretend the model is available"
+    );
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[tokio::test]
+async fn local_identity_is_pinned_without_loading_native_weights_and_refuses_a_changed_file() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("custom-model.ggml");
+    std::fs::write(
+        &path,
+        b"metadata-only identity fixture; never native weights",
+    )
+    .unwrap();
+    let settings = SttSettings {
+        engine: SttEngine::Local,
+        model: path.to_string_lossy().into_owned(),
+        language: "en".into(),
+    };
+    let expected = format!("sha256:{}", sha256_file(&path).unwrap());
+    let prepared = local_transcription(&settings, root.path(), "fixture", false, false)
+        .prepare(&crate::session::SessionControl::new())
+        .await
+        .unwrap();
+    let Transcription::Local(legs) = prepared else {
+        panic!("expected local configuration");
+    };
+    assert_eq!(legs.revision.as_deref(), Some(expected.as_str()));
+    std::fs::write(&path, b"changed before native allocation").unwrap();
+    let error = legs
+        .engine
+        .create()
+        .err()
+        .expect("changed identity must be refused before native initialization");
+    assert!(error.message.contains("revision changed"));
+}
+#[cfg(target_os = "macos")]
+impl fotw_stt::RecognizerFactory for UnavailableLocal {
+    fn model(&self) -> &str {
+        &self.model
+    }
+    fn language(&self) -> Option<&str> {
+        self.language.as_deref()
+    }
+    fn create(&self) -> Result<Box<dyn fotw_stt::Recognizer>, fotw_stt::SttError> {
+        Err(fotw_stt::SttError::new(
+            fotw_stt::SttErrorClass::Unsupported,
+            fotw_stt::local::PROVIDER,
+            self.message.clone(),
+        ))
+    }
 }
 
 /// Transcription on this machine: not built for this platform yet, so a

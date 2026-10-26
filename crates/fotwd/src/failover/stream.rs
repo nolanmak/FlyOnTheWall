@@ -78,6 +78,60 @@ impl FailoverConfig {
     }
 }
 
+/// Live on-device source configuration. It has no cloud key or transport.
+pub struct LocalSourceConfig {
+    /// Session/source clock and utterance policy.
+    pub stream: LocalStreamConfig,
+    /// Shared model factory; loading stays on the exclusive speech worker.
+    pub local: Arc<dyn RecognizerFactory>,
+    /// Pinned/expected model revision; this does not assert native readiness.
+    pub revision: Option<String>,
+    /// Optional declared audio-processing identity.
+    pub processing: Option<super::processing::Descriptor>,
+    /// Bounded inference drain; native destruction remains separately visible.
+    pub stop_timeout: Duration,
+}
+impl LocalSourceConfig {
+    /// Configure a source without opening a model, socket or credential store.
+    #[must_use]
+    pub fn new(stream: LocalStreamConfig, local: Arc<dyn RecognizerFactory>) -> Self {
+        Self {
+            stream,
+            local,
+            revision: None,
+            processing: None,
+            stop_timeout: Duration::from_secs(30),
+        }
+    }
+    fn plan(&self) -> LocalPlan {
+        LocalPlan {
+            engine: EngineDescriptor {
+                provider: fotw_stt::local::PROVIDER.into(),
+                model: self.local.model().into(),
+                revision: self.revision.clone(),
+                capabilities: local_capabilities(),
+            },
+            language: self.local.language().map(str::to_owned),
+            endpoint: self.stream.endpoint,
+        }
+    }
+}
+fn local_capabilities() -> SttCapabilities {
+    SttCapabilities {
+        streaming: true,
+        batch: false,
+        word_timestamps: fotw_stt::FeatureAvailability::None,
+        diarization: fotw_stt::FeatureAvailability::None,
+        language_detection: false,
+        custom_vocabulary: fotw_stt::CustomVocabulary::None,
+        max_file_bytes: 0,
+        max_file_seconds: 0,
+        native_rates: vec![16000],
+        retention_control: fotw_stt::RetentionControl::None,
+        supports_replay_faster_than_realtime: true,
+    }
+}
+
 impl FailoverConfig {
     fn local_plan(&self) -> LocalPlan {
         LocalPlan {
@@ -121,6 +175,7 @@ struct WorkerConfig {
 }
 
 struct SourceInputs {
+    native: NativeLease,
     processing: Option<super::processing::Journal>,
     writer: ReplayWriter,
     journal: CoverageJournal,
@@ -241,6 +296,51 @@ struct Shared {
     events: mpsc::UnboundedSender<Event>,
     prefix_only: bool,
 }
+struct NativeExit {
+    done: Arc<AtomicBool>,
+    notice: watch::Sender<bool>,
+}
+struct NativeLease(std::fs::File);
+impl NativeLease {
+    fn acquire(dir: &Path, source: Source) -> std::io::Result<Self> {
+        let name = match source {
+            Source::System => "system",
+            Source::Mic => "mic",
+        };
+        let path = dir.join(format!("{name}.stt-native.lock"));
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if !meta.file_type().is_file() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "native ownership marker is not an ordinary file",
+                ));
+            }
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(path)?;
+        file.try_lock().map_err(std::io::Error::from)?;
+        Ok(Self(file))
+    }
+}
+impl Drop for NativeLease {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+impl Drop for NativeExit {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+        let _ = self.notice.send(true);
+    }
+}
 
 fn failure(message: impl Into<String>) -> SttError {
     SttError::new(SttErrorClass::Server, "handoff", message)
@@ -297,6 +397,8 @@ impl Shared {
 pub struct FailoverStream {
     shared: Arc<Shared>,
     done: watch::Receiver<bool>,
+    published: watch::Receiver<bool>,
+    finish_on_publication: bool,
     stop_timeout: Duration,
 }
 
@@ -322,6 +424,88 @@ impl PreparedSource {
 }
 
 impl FailoverStream {
+    /// Open durable local input before loading the recognizer. Model failure
+    /// leaves the recording and canonical input available, with an error event.
+    /// This path cannot construct cloud transport.
+    pub async fn open_local(
+        dir: &Path,
+        config: LocalSourceConfig,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), SttError> {
+        let plan = config.plan();
+        plan.validate().map_err(|e| failure(e.to_string()))?;
+        if let Some(processing) = config.processing.as_ref() {
+            processing.validate().map_err(|e| failure(e.to_string()))?;
+        }
+        let anchor = config
+            .stream
+            .session_offset_ms
+            .checked_mul(16)
+            .ok_or_else(|| failure("source clock overflow"))?;
+        let directory = dir.to_owned();
+        let session = config.stream.session_id.clone();
+        let leg = config.stream.source;
+        let processing_descriptor = config.processing;
+        let saved_plan = plan.clone();
+        let inputs = tokio::task::spawn_blocking(move || {
+            let native = NativeLease::acquire(&directory, leg)?;
+            let writer = match processing_descriptor.as_ref() {
+                Some(descriptor) => ReplayWriter::create_with_processing(
+                    &directory,
+                    &session,
+                    source(leg),
+                    anchor,
+                    &descriptor.fingerprint()?,
+                ),
+                None => ReplayWriter::create(&directory, &session, source(leg), anchor),
+            }?;
+            let processing = processing_descriptor
+                .map(|descriptor| {
+                    super::processing::Journal::create(
+                        &directory,
+                        &session,
+                        source(leg),
+                        anchor,
+                        descriptor,
+                    )
+                })
+                .transpose()?;
+            let journal = CoverageJournal::create_with_fallback(
+                &directory,
+                &session,
+                leg,
+                saved_plan.engine.clone(),
+                Some(saved_plan),
+            )?;
+            let reader = ReplayReader::open(&directory, &session, source(leg))?;
+            Ok::<_, std::io::Error>(SourceInputs {
+                native,
+                writer,
+                journal,
+                reader,
+                recognizer: None,
+                processing,
+            })
+        })
+        .await
+        .map_err(|e| failure(e.to_string()))?
+        .map_err(|e| failure(e.to_string()))?;
+        Self::launch(
+            WorkerConfig {
+                session_id: config.stream.session_id,
+                source: leg,
+                local: config.local,
+                plan,
+                limits: HandoffLimits::default(),
+                cloud_queue_samples: 0,
+                cloud_settle: Duration::ZERO,
+                stop_timeout: config.stop_timeout,
+                prefix_end: None,
+            },
+            inputs,
+            None,
+            true,
+        )
+    }
     /// Append one processor-owned interval on the canonical source clock.
     /// Must run on the blocking pump after original capture has been archived.
     /// Invalid calls accept no samples; disk errors fence provider publication.
@@ -431,8 +615,10 @@ impl FailoverStream {
         let fallback = config.local_plan();
         let processing_descriptor = config.processing.clone();
         let directory = dir.to_owned();
-        let (writer, journal, reader, recognizer, processing) =
+        let (writer, journal, reader, recognizer, processing, native) =
             tokio::task::spawn_blocking(move || {
+                let native =
+                    NativeLease::acquire(&directory, leg).map_err(|e| failure(e.to_string()))?;
                 let writer = match processing_descriptor.as_ref() {
                     Some(descriptor) => ReplayWriter::create_with_processing(
                         &directory,
@@ -468,7 +654,7 @@ impl FailoverStream {
                 .map_err(|e| failure(e.to_string()))?;
                 let reader = ReplayReader::open(&directory, &session_id, source(leg))
                     .map_err(|e| failure(e.to_string()))?;
-                Ok::<_, SttError>((writer, journal, reader, recognizer, processing))
+                Ok::<_, SttError>((writer, journal, reader, recognizer, processing, native))
             })
             .await
             .map_err(|e| failure(e.to_string()))??;
@@ -488,6 +674,7 @@ impl FailoverStream {
         Self::launch(
             worker_config,
             SourceInputs {
+                native,
                 processing,
                 writer,
                 journal,
@@ -495,6 +682,7 @@ impl FailoverStream {
                 recognizer: Some(recognizer),
             },
             Some((cloud, cloud_events)),
+            false,
         )
     }
 
@@ -515,6 +703,8 @@ impl FailoverStream {
     ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), SttError> {
         let directory = dir.to_owned();
         let (config, inputs) = tokio::task::spawn_blocking(move || {
+            let native = NativeLease::acquire(&directory, request.source)
+                .map_err(|e| failure(e.to_string()))?;
             let prefix_writer = if prefix_end.is_some() {
                 Some(
                     ReplayWriter::resume_prefix_validated(
@@ -613,6 +803,7 @@ impl FailoverStream {
             Ok::<_, SttError>((
                 config,
                 SourceInputs {
+                    native,
                     processing: None,
                     writer,
                     journal,
@@ -623,7 +814,7 @@ impl FailoverStream {
         })
         .await
         .map_err(|e| failure(e.to_string()))??;
-        Self::launch(config, inputs, None)
+        Self::launch(config, inputs, None, false)
     }
 
     /// Recover an explicitly bounded canonical prefix without closing the
@@ -641,8 +832,10 @@ impl FailoverStream {
         config: WorkerConfig,
         inputs: SourceInputs,
         transport: Option<(DeepgramStream, mpsc::UnboundedReceiver<StreamEvent>)>,
+        live_local: bool,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), SttError> {
         let SourceInputs {
+            native,
             processing,
             writer,
             journal,
@@ -651,7 +844,8 @@ impl FailoverStream {
         } = inputs;
         let anchor = journal.committed_through();
         let end = config.prefix_end.unwrap_or(writer.end_sample());
-        let resuming = transport.is_none();
+        let local = transport.is_none();
+        let resuming = local && !live_local;
         let (cloud, cloud_events) = match transport {
             Some((cloud, events)) => (Some(Arc::new(cloud)), Some(events)),
             None => (None, None),
@@ -671,7 +865,7 @@ impl FailoverStream {
             gate: Arc::new(Mutex::new(Publication {
                 fenced: false,
                 status: Status {
-                    phase: if resuming { Phase::Local } else { Phase::Cloud },
+                    phase: if local { Phase::Local } else { Phase::Cloud },
                     epoch: journal.current_epoch().clone(),
                     committed_sample: anchor,
                     written_sample: end,
@@ -692,15 +886,25 @@ impl FailoverStream {
         }
         let stop_timeout = config.stop_timeout;
         let (done_sender, done) = watch::channel(false);
+        let (published_sender, published) = watch::channel(false);
         let worker_shared = Arc::clone(&shared);
         let runtime = tokio::runtime::Handle::current();
         std::thread::Builder::new()
             .name("fotw-durable-handoff".into())
             .spawn(move || {
+                // Declared before moving native captures into locals: status
+                // releases only after their destruction, including unwinding.
+                let _native_exit = NativeExit {
+                    done: Arc::clone(&worker_shared.done),
+                    notice: done_sender,
+                };
+                let native = native;
+                let config = config;
+                let recognizer = recognizer;
                 let mut worker = Worker {
                     policy: HandoffPolicy::new(config.limits),
                     vad: Endpointer::new(config.plan.endpoint),
-                    local_endpoint: resuming.then(|| Endpointer::new(config.plan.endpoint)),
+                    local_endpoint: local.then(|| Endpointer::new(config.plan.endpoint)),
                     recognizer,
                     cloud,
                     cloud_events,
@@ -717,19 +921,33 @@ impl FailoverStream {
                     reader,
                     runtime,
                 };
-                let result =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.run()))
-                        .unwrap_or_else(|_| {
-                            Err(failure("transcription worker panicked; audio retained"))
-                        });
-                drop(worker); // native state and journal ownership released before done.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if live_local {
+                        worker.shared.emit(Event::Transcript(StreamEvent::State(
+                            StreamState::Connecting,
+                        )));
+                        worker.recognizer = Some(worker.config.local.create()?);
+                        worker
+                            .shared
+                            .emit(Event::Transcript(StreamEvent::State(StreamState::Open)));
+                    }
+                    worker.run()
+                }))
+                .unwrap_or_else(|_| Err(failure("transcription worker panicked; audio retained")));
+                // Release disk/publication owners before native destruction.
+                // A local-only Stop can finish its audio while the native tail
+                // remains observable and prevents another recording.
+                let native_state = worker.recognizer.take();
+                let native_factory = Arc::clone(&worker.config.local);
+                drop(worker);
                 worker_shared.terminal(result.err());
-                let actual_done = Arc::clone(&worker_shared.done);
                 // Release the thread's canonical owner before waking a caller
                 // that drops its stream and acquires projection/source leases.
                 drop(worker_shared);
-                actual_done.store(true, Ordering::Release);
-                let _ = done_sender.send(true);
+                let _ = published_sender.send(true);
+                drop(native_state);
+                drop(native_factory);
+                drop(native);
             })
             .map_err(|e| {
                 if let Some(cloud) = abort_on_failure {
@@ -741,6 +959,8 @@ impl FailoverStream {
             Self {
                 shared,
                 done,
+                published,
+                finish_on_publication: live_local,
                 stop_timeout,
             },
             receiver,
@@ -783,7 +1003,11 @@ impl FailoverStream {
     pub async fn finish(&self) -> bool {
         self.shared.stop_requested.store(true, Ordering::Release);
         let shared = Arc::clone(&self.shared);
-        let mut done = self.done.clone();
+        let mut done = if self.finish_on_publication {
+            self.published.clone()
+        } else {
+            self.done.clone()
+        };
         let drain = async move {
             tokio::task::spawn_blocking(move || {
                 let result = if shared.prefix_only {

@@ -1858,8 +1858,8 @@ async fn local_only_recorder_retains_native_destructor_without_delaying_audio_fi
     let source = recorder.status().speech_status.pop().unwrap();
     assert_eq!(source.provider, fotw_stt::local::PROVIDER);
     assert_eq!(source.worker_running, Some(true));
-    assert_eq!(source.epoch, None);
-    assert_eq!(source.pending_audio_ms, None);
+    assert_eq!(source.epoch, Some(0));
+    assert_eq!(source.pending_audio_ms, Some(0));
     assert!(matches!(
         recorder.start(),
         Err(RecorderError::AlreadyRecording)
