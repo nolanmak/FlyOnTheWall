@@ -52,7 +52,7 @@ Daemon and CLI capture sinks now publish a bounded latest observation alongside
 each generation's PCM ring. `RingConsumer::capture_observation` makes one attempt
 to read a coherent callback number, absolute accepted interleaved sample position,
 accepted sample count, device frame index, host timestamp, original flags and
-cumulative dropped samples. Overruns publish zero accepted samples. Empty callbacks
+cumulative dropped samples and a timing-fault count. Overruns publish zero accepted samples. Empty callbacks
 do not supersede an observation. Untimed ring writes also advance sample positions.
 Old tap callbacks cannot publish into a replacement generation's clock mailbox.
 Construction allocates the mailbox; callback publication has fixed atomic work
@@ -61,15 +61,33 @@ with no allocation, lock, retry, logging or dependency on pump progress.
 This is latest-value monitoring evidence, not per-chunk timing: observations may
 be superseded, may be stale, and may precede or follow an independently drained
 PCM chunk. A reader must use sequence/position evidence, reject timestamp-error
-or discontinuity flags, detect drops and reset on generation changes. `None`
+or discontinuity flags, detect drops and reset on generation changes. Compare
+`timing_faults` as well: it counts callbacks carrying either timing fault and
+survives replacement by a later unflagged observation. Silence is not a timing
+fault. `None`
 means no observation yet or publication in progress, never an instruction to
 spin. It is not a complete callback journal or a durable reconstruction recipe.
 
-Current macOS backends stamp host time at callback delivery and count delivered
-device frames. Scheduling jitter therefore affects these observations. They do
-not establish hardware presentation time, estimate a trusted device rate, resample
-the reference, or enable AEC in the pump. Those remain integration requirements;
-the conservative native profile's drift validation is still failing.
+macOS capture now uses Core Audio input timestamps when both native sample and
+host time are valid. A bracketed absolute/continuous clock reading projects
+`mach_absolute_time` into the existing sleep-aware process epoch. A bridge wider
+than 100 microseconds, an offset change exceeding that bound, future/stale input
+(older than one second), pre-epoch/overflow values or non-increasing mapped time
+cannot qualify timing. Audio passes unchanged with a monotonic callback-arrival
+fallback and TIMESTAMP_ERROR. Epoch shifts and reversals of qualified native host time also flag
+DISCONTINUITY. Native sample gaps/resets flag discontinuity; malformed or inexact
+sample times cannot qualify timing. Delivered device-frame counts remain unchanged.
+An otherwise ordered native time that lags a previous arrival-time fallback is
+not evidence of interrupted audio: it remains a timing error without inventing
+a discontinuity. This matters for Murmur, which cancels on source interruption.
+All conversion state is owned by the existing per-tap sink try-lock and replaced
+at start; the conversion uses fixed arithmetic/native clock reads on the callback.
+
+This validates timestamp handling, not acoustic alignment, device latency or
+physical sleep/wake. It does not estimate device rates, resample the reference,
+or enable AEC in the pump. Those remain integration requirements; the conservative
+native profile's drift validation is still failing. Physical-device qualification
+of timestamp availability and latency is also outstanding.
 
 ## Evidence
 

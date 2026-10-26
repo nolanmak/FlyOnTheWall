@@ -23,7 +23,8 @@ pub struct AudioRing;
 ///
 /// This is a monitoring snapshot, not a timestamp for an arbitrary pump chunk.
 /// Intermediate callbacks may be superseded. Host stamps describe the tap's
-/// clock contract (currently callback arrival on macOS), not hardware playback.
+/// clock contract (native input time or a flagged fallback on macOS), not proof
+/// of hardware playback or acoustic alignment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CaptureObservation {
     /// Nonempty callback number within this ring generation, starting at one.
@@ -40,6 +41,9 @@ pub struct CaptureObservation {
     pub flags: u32,
     /// Cumulative samples rejected by this ring, including this callback.
     pub dropped_samples: u64,
+    /// Number of callbacks carrying discontinuity/timestamp-error flags in this
+    /// generation. Unlike latest flags, this evidence survives supersession.
+    pub timing_faults: u64,
 }
 
 /// One writer owned by RingProducer. All fields are atomic so even an interrupted
@@ -48,7 +52,7 @@ pub struct CaptureObservation {
 #[derive(Debug, Default)]
 struct ClockMailbox {
     version: AtomicU64,
-    fields: [AtomicU64; 7],
+    fields: [AtomicU64; 8],
 }
 
 impl ClockMailbox {
@@ -63,6 +67,7 @@ impl ClockMailbox {
             u64::from(observation.flags),
             observation.dropped_samples,
             observation.sequence,
+            observation.timing_faults,
         ]) {
             field.store(value, Ordering::SeqCst);
         }
@@ -89,6 +94,7 @@ impl ClockMailbox {
             flags: values[4] as u32,
             dropped_samples: values[5],
             sequence: values[6],
+            timing_faults: values[7],
         })
     }
 }
@@ -109,6 +115,7 @@ impl AudioRing {
                 clock: Arc::clone(&clock),
                 accepted_samples: 0,
                 clock_sequence: 0,
+                timing_faults: 0,
             },
             RingConsumer {
                 inner: consumer,
@@ -127,6 +134,7 @@ pub struct RingProducer {
     clock: Arc<ClockMailbox>,
     accepted_samples: u64,
     clock_sequence: u64,
+    timing_faults: u64,
 }
 
 impl RingProducer {
@@ -181,6 +189,12 @@ impl RingProducer {
         let sample_count = self.push_complete_block(block);
         if !block.is_empty() {
             self.clock_sequence = self.clock_sequence.wrapping_add(1);
+            // FrameFlags' stable WASAPI-compatible bits: discontinuity=2,
+            // timestamp error=4. SILENT=1 is not a timing fault. Keep the seam's
+            // raw representation without importing platform capture into DSP.
+            if flags & 0b110 != 0 {
+                self.timing_faults = self.timing_faults.saturating_add(1);
+            }
             self.clock.publish(CaptureObservation {
                 sequence: self.clock_sequence,
                 sample_start,
@@ -189,6 +203,7 @@ impl RingProducer {
                 host_ns,
                 flags,
                 dropped_samples: self.dropped_frames(),
+                timing_faults: self.timing_faults,
             });
         }
         sample_count

@@ -12,6 +12,21 @@ use fotw_pipeline::rt::{RtAlloc, RtGuard, allocation_violations};
 static ALLOC: RtAlloc = RtAlloc;
 
 #[test]
+fn timing_faults_survive_superseded_callbacks_without_counting_silence() {
+    let (mut producer, mut consumer) = AudioRing::with_capacity_frames(4);
+    let mut pcm = [0.0; 4];
+    for (flag, expected) in [(2, 1), (0, 1), (4, 2), (1, 2)] {
+        producer.push_capture_block(&[0.5; 2], 0, 0, flag);
+        consumer.pop_into(&mut pcm);
+        producer.push_capture_block(&[0.5; 2], 0, 1, 0);
+        let observed = consumer.capture_observation().unwrap();
+        assert_eq!(observed.flags, 0);
+        assert_eq!(observed.timing_faults, expected);
+        consumer.pop_into(&mut pcm);
+    }
+}
+
+#[test]
 fn capture_clock_tracks_accepted_positions_and_drops_without_allocation() {
     let (mut producer, mut consumer) = AudioRing::with_capacity_frames(4);
     assert!(consumer.capture_observation().is_none());
