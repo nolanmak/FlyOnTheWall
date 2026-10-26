@@ -8,6 +8,16 @@ use crate::resample::ResampleError;
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Resampler};
 
+/// Native-frame coordinate of output frame zero after integer delay trimming.
+/// This reports the pinned FFT filter geometry; it does not alter PCM or recipe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConversionOrigin {
+    /// Signed numerator in native input frames; negative means padded pre-origin support.
+    pub input_frame_numerator: i128,
+    /// Positive denominator of the native-frame offset.
+    pub denominator: u64,
+}
+
 pub struct ArchiveConverter {
     input_rate: u32,
     input_channels: u16,
@@ -21,6 +31,33 @@ pub struct ArchiveConverter {
     finished: bool,
 }
 impl ArchiveConverter {
+    /// Residual input-frame origin after the converter's integer output trim.
+    /// Rubato5 centers its kernel at floor(fft_size_in/2), while output_delay
+    /// trims floor(fft_size_out/2). These differ fractionally for some rate pairs.
+    /// The value is stable before, during and after processing/finish.
+    pub fn output_origin(&self) -> ConversionOrigin {
+        match &self.filter {
+            None => ConversionOrigin {
+                input_frame_numerator: 0,
+                denominator: 1,
+            },
+            Some(filter) => {
+                let input = filter.fft_size_in() as i128;
+                let output = filter.fft_size_out() as i128;
+                let numerator = filter.output_delay() as i128 * input - (input / 2) * output;
+                let (mut a, mut b) = (numerator.unsigned_abs(), output as u128);
+                while b != 0 {
+                    let remainder = a % b;
+                    a = b;
+                    b = remainder;
+                }
+                ConversionOrigin {
+                    input_frame_numerator: numerator / a as i128,
+                    denominator: (output / a as i128) as u64,
+                }
+            }
+        }
+    }
     pub fn new(
         input_rate: u32,
         input_channels: u16,

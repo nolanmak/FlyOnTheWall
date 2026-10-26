@@ -2,6 +2,8 @@
 #[cfg(feature = "native-webrtc")]
 mod clocked;
 mod quality;
+#[cfg(feature = "native-webrtc")]
+mod reference_probe;
 #[cfg(all(target_os = "macos", feature = "speech-retention"))]
 mod speech;
 #[cfg(any(all(target_os = "macos", feature = "speech-retention"), test))]
@@ -401,6 +403,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", clocked::probe());
             return Ok(());
         }
+        #[cfg(feature = "native-webrtc")]
+        if args.len() == 1 && args[0] == "--bandlimited-signals" {
+            println!("{}", clocked::bandlimited_probe());
+            return Ok(());
+        }
         if args.len() == 1 && args[0] == "--heldout-signals" {
             let fixtures = vec![
                 signal_probe(
@@ -444,7 +451,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if args[0] == "--speech-retention" {
             return speech::run(&args[1..]);
         }
-        return Err("use no arguments or --heldout-signals for generated signals; --clocked-signals requires native-webrtc; --speech-retention WAV MODEL requires speech-retention on macOS".into());
+        return Err("use no arguments or --heldout-signals for generated signals; --clocked-signals/--bandlimited-signals require native-webrtc; --speech-retention WAV MODEL requires speech-retention on macOS".into());
     }
     println!(
         "{}",
