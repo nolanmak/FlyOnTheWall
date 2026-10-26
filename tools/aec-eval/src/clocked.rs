@@ -324,6 +324,83 @@ fn probe_with_reference(bandlimited: bool) -> serde_json::Value {
 mod tests {
     use super::*;
     #[test]
+    fn native_worker_compensates_delay_and_drains_a_partial_stop_on_the_original_clock() {
+        use fotw_pipeline::aec_worker::{Config, Worker};
+        use std::time::{Duration, Instant};
+        let mut worker = Worker::new(
+            NativeBackend {
+                processor: native_processor(true),
+            },
+            Config {
+                adapter: AdapterConfig {
+                    frame_samples: FRAME,
+                    delay_samples: 128,
+                    max_wait_samples: 320,
+                    max_reference_samples: 640,
+                },
+                queued_blocks: 2,
+                block_samples: 320,
+                pending_samples: 1024,
+                deadline_ms: 1000,
+            },
+            7,
+            73,
+        )
+        .unwrap();
+        let near = signal(501)[..16159].to_vec();
+        let mut blocks = Vec::new();
+        let mut start = 73;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        for chunk in near.chunks(320) {
+            worker
+                .submit(
+                    7,
+                    start,
+                    chunk,
+                    Some(&vec![0.0; chunk.len()]),
+                    0,
+                    &mut blocks,
+                )
+                .unwrap();
+            start += chunk.len() as u64;
+            while worker.pending_samples() >= 288 {
+                worker.poll(0, &mut blocks).unwrap();
+                assert!(Instant::now() < deadline, "native worker stalled");
+                std::thread::yield_now();
+            }
+        }
+        worker.finish(0, &mut blocks).unwrap();
+        while worker.status().is_running() || worker.pending_samples() > 0 {
+            worker.poll(0, &mut blocks).unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "native worker did not release its tail/resource"
+            );
+            std::thread::yield_now();
+        }
+        let mut output = Vec::new();
+        for block in blocks {
+            assert_eq!(
+                (block.epoch, block.start_sample),
+                (7, 73 + output.len() as u64)
+            );
+            assert_eq!(block.kind, OutputKind::Cleaned);
+            output.extend(block.samples);
+        }
+        assert_eq!(output.len(), near.len());
+        // The whole-probe lag estimator starts after eight seconds and cannot
+        // measure this short tail fixture. Compare every unshifted sample.
+        let worst = output
+            .iter()
+            .zip(near)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            worst < 1e-5,
+            "native worker changed/delayed original samples: {worst}"
+        );
+    }
+    #[test]
     fn bounded_bandlimited_reference_keeps_continuous_gates_and_exposes_fault_failure() {
         let report = bandlimited_probe();
         let diagnostics = &report["native_reference_diagnostics"];

@@ -400,7 +400,7 @@ No microphone audio is filtered by the reference sampler; missing reference uses
 the existing adapter's original-mic fallback and compensated tail policy.
 
 Additional diagnostics test 8.5/9/15kHz alias rejection from native 44.1/48/96/192/
-768kHz capture, plus native48kHz reference mapped to actual 44.1/44.16/48kHz
+768kHz capture, plus native 48kHz reference mapped to actual 44.1/44.16/48kHz
 microphone converters with independent +80/−120ppm clocks. Stereo clock counts
 are tested with already-downmixed reference PCM. Correct rational converter
 origin reduces measured phase RMS error from about .025/.044 to about 1.5e-7 in
@@ -412,8 +412,9 @@ fixture outcomes, raw fallback counts and the failed fault/relearning case.
 No existing AEC parameter or quality threshold changed. Aggregate acceptance is
 false. Complete generated fixture inputs still exist outside the bounded staging
 component; this is not an implemented recording worker or a memory claim for it.
-The whole 48-case/diagnostic M4 probe used maxRSS25,935,872bytes, user9.40s,
-system.01s and elapsed9.60s with uncontrolled cache, not isolated backend/app cost.
+The whole 48-case/diagnostic M4 probe used max RSS 25,935,872 bytes, 9.40 s user CPU,
+0.01 s system CPU and 9.60 s elapsed, with uncontrolled cache. These are whole-tool
+measurements, not isolated backend/app costs.
 
 The shared ArchiveConverter accessor reports existing phase; it does not shift
 stored audio or change the existing reconstruction recipe. An eventual AEC

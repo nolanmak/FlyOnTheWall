@@ -1,5 +1,50 @@
 # Worker-side echo frame adaptation
 
+## Thread ownership and bounded publication
+
+`aec_worker::Worker` moves a preloaded `Backend + Send` and the existing adapter
+onto one exclusive OS thread. Pump/control calls use bounded `try_send` admission
+and non-waiting result polling; they never await a native call. This is not a
+realtime callback API: owner-side copies, allocations and channel operations are
+allowed. Backend construction/loading precedes worker creation.
+
+The owner retains original microphone samples until matching output is accepted.
+Commands contain at most 3200 samples and queues at most 16 blocks. Owner originals
+are bounded to 16000 samples; adapter retention has its existing separate limits.
+There is one in-flight command and a result queue of `queued_blocks + 1` messages.
+Each result contains only the adapter's previously bounded pending output plus
+one bounded command's output. Caller-drained output, native backend state and
+allocator/channel overhead are separate from these sample budgets.
+
+Source offsets remain contiguous within an external route epoch. Saturation,
+expired publication deadlines, cancel and route reset publish remaining originals
+and advance a private worker fence. Old queued/in-flight results cannot publish
+after that fence. Deadlines use caller-supplied monotonic milliseconds and are
+checked before accepting mailbox results. The owner must keep polling; a deadline
+does not create an independent timer or guarantee scheduling latency.
+
+Stop requests adapter tail draining without blocking the pump. If its command
+cannot be admitted, pending originals are released instead. Cancel releases
+originals immediately. Neither operation kills a blocked native call. A
+metadata-only status stays running through actual backend destruction, including
+unwinding; route reset reuses that exclusive worker rather than starting a
+replacement beside a retained resource. A disconnected/failed worker degrades to
+original audio. Backend panic-abort behavior cannot be recovered by a Rust thread.
+
+Deterministic tests block capture and destruction separately and cover Stop,
+timeout, saturation, reset, cancellation, late publication, panic, invalid input,
+partial tails and sample conservation. The native evaluation test also moves the
+actual pinned WebRTC backend through this worker and checks its 128-sample delay
+compensation and partial Stop tail with generated near-only audio.
+
+This worker accepts already aligned mono 16 kHz reference/mic inputs. It does not
+yet connect the recording pump, map native/canonical conversion phases, archive
+audio, or persist processed replay provenance. Production integration must write
+originals before submission, bind timing/route ownership, preserve every emitted
+interval's processing provenance and retain the resource status until teardown.
+The raw reconstruction recipe must not be reused for cleaned audio. No acoustic
+quality threshold or backend-selection decision changes here.
+
 `fotw-pipeline::aec::Adapter` provides one backend-neutral framing/reference
 boundary for #72. It does not choose a canceller or enable one in the capture
 pump. The existing gate and app behavior are unchanged. Backend selection still
