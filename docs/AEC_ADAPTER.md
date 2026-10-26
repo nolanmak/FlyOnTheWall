@@ -110,3 +110,40 @@ values, while the M4 probe measures zero compensated delay. The backend still
 fails overlap-quality gates. No model asset, device, provider, credential or user
 recording is used by these tests. See `tools/aec-eval/README.md` for methodology,
 retained licenses and source references.
+
+## Clock-rate fitting and evaluation
+
+`reference_clock::Tracker` fits native mono-frame positions against qualified
+host timestamps on a worker. It retains at most 64 observations, samples at most
+once per 100ms, prunes beyond eight seconds, and needs at least eight points over
+two seconds. A prototype estimate requires a rate within 500ppm of nominal and
+maximum residual 100us. These are admission limits, not physical qualification.
+
+Future/stale snapshots (older than 1s), timing flags (silence is allowed), changed
+fault/drop counters, inconsistent positions or callback sequences and callbacks
+longer than 1s cannot qualify a fit. Consecutive callback positions must match the
+prior complete callback; skipped observations must account for accepted device
+frames without splitting channels. Repeated snapshots cannot create duration or
+refresh evidence. New generations reset fitting; old generations cannot enter it.
+
+`Estimate::map_frame_from` checks freshness of both streams and maps only captured
+frame extents. Integer epochs/counters remain separate from relative floating
+point calculations, including counters above 2^53. The owner must invalidate cached
+estimates after a fault/drop/generation change and reconstruct the tracker for a
+format change. Estimates are monitoring models, not a timestamp journal or an
+acoustic delay measurement. Their positions are native mono frames: applying them
+after nominal resampling requires explicit position/filter-delay conversion.
+
+The isolated native tool now exercises this geometry with synthetic clock traces,
+linear reference interpolation and the existing bounded AEC adapter. Rate fitting
+never receives the fixture's ppm. The adapter preserves source duration, compensates
+native delay, drains tails and releases original samples on timing failure. A real
+native near-only regression first failed with 128 samples of uncompensated delay;
+it now verifies every sample across warmup, a timing fault, recovery and Stop.
+
+Continuous nominal/+80ppm/-120ppm signal cases pass the unchanged gates. The
+timing-fault case still fails aggregate echo/overlap quality; original fallback
+samples are retained exactly. Linear interpolation is an evaluation control,
+not a qualified bandlimited resampler. Production pump/worker wiring, mapping
+through capture conversion, reference-quality acceptance, replay provenance,
+speech/physical/real-room qualification and backend selection remain unfinished.
