@@ -763,3 +763,177 @@ async fn native_start_cancelled_during_configuration_never_opens_capture() {
     assert_eq!(opened.load(Ordering::SeqCst), 0);
     assert_eq!(rec.status().state, RecordingState::Idle);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_configuration_keeps_observation_and_stop_responsive() {
+    struct Release(Arc<Gate>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+    let root = tmpdir("native-observe-during-config");
+    let gate = Arc::new(Gate::default());
+    let _release = Release(gate.clone());
+    let configuration_gate = gate.clone();
+    let opened = Arc::new(AtomicU64::new(0));
+    let tap_count = opened.clone();
+    let rec = Arc::new(DaemonRecorder::with_parts(
+        root.join("sessions"),
+        tokio::runtime::Handle::current(),
+        fotwd::session::SegmentTap::default(),
+        fotwd::recording::ReadyTap::default(),
+        Box::new(move || {
+            tap_count.fetch_add(1, Ordering::SeqCst);
+            Ok((
+                Box::new(FileAudioSource::from_wav(
+                    TapId::system_default(),
+                    tone(30.0),
+                    ReplaySpeed::Realtime,
+                )),
+                None,
+            ))
+        }),
+        Box::new(move || {
+            configuration_gate.hold();
+            fotwd::session::Transcription::Disabled
+        }),
+        Box::new(|_, _| None),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    ));
+    let cancel = fotwd::session::StopSignal::new();
+    let request_cancel = cancel.clone();
+    let start_rec = rec.clone();
+    let start = tokio::task::spawn_blocking(move || {
+        start_rec.start_native(fotw_shell::StartOrigin::Menu, true, request_cancel)
+    });
+    assert!(until(|| gate.reached()).await);
+    let observe_rec = rec.clone();
+    let observed = tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::task::spawn_blocking(move || observe_rec.observe()),
+    )
+    .await
+    .expect("status must not wait for configuration")
+    .unwrap();
+    assert_eq!(observed.status().state, RecordingState::Preparing);
+    assert!(observed.status().session_id.is_none());
+    let target = observed
+        .stop_target()
+        .cloned()
+        .expect("preparation stop target");
+    let stop_rec = rec.clone();
+    let stopped = tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::task::spawn_blocking(move || stop_rec.stop_observed(&target)),
+    )
+    .await
+    .expect("Stop must not wait for configuration")
+    .unwrap()
+    .unwrap();
+    assert!(stopped.preparation_cancel_requested);
+    assert!(cancel.is_stopped());
+    assert!(matches!(
+        rec.start(),
+        Err(fotw_web::RecorderError::AlreadyRecording)
+    ));
+    gate.open();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), start)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(opened.load(Ordering::SeqCst), 0);
+    assert_eq!(rec.status().state, RecordingState::Idle);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_audit_releases_preparation_without_configuring_or_opening_capture() {
+    let root = tmpdir("native-audit-reservation");
+    std::fs::create_dir(root.join("audit.jsonl")).unwrap();
+    let rec = Arc::new(DaemonRecorder::with_parts(
+        root.join("sessions"),
+        tokio::runtime::Handle::current(),
+        fotwd::session::SegmentTap::default(),
+        fotwd::recording::ReadyTap::default(),
+        Box::new(|| panic!("failed audit must not open capture")),
+        Box::new(|| panic!("failed audit must not configure transcription")),
+        Box::new(|_, _| None),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    ));
+    let cancel = fotwd::session::StopSignal::new();
+    let request_cancel = cancel.clone();
+    let start_rec = rec.clone();
+    let error = tokio::task::spawn_blocking(move || {
+        start_rec.start_native(fotw_shell::StartOrigin::Menu, true, request_cancel)
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(error.to_string().contains("audit log"));
+    assert!(cancel.is_stopped());
+    assert_eq!(rec.observe().status().state, RecordingState::Idle);
+    assert!(rec.observe().stop_target().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn configuration_unwind_releases_only_its_reserved_attempt() {
+    let root = tmpdir("native-config-unwind");
+    let attempts = Arc::new(AtomicU64::new(0));
+    let factory_attempts = attempts.clone();
+    let opened = Arc::new(AtomicU64::new(0));
+    let tap_count = opened.clone();
+    let rec = Arc::new(DaemonRecorder::with_parts(
+        root.join("sessions"),
+        tokio::runtime::Handle::current(),
+        fotwd::session::SegmentTap::default(),
+        fotwd::recording::ReadyTap::default(),
+        Box::new(move || {
+            tap_count.fetch_add(1, Ordering::SeqCst);
+            Ok((
+                Box::new(FileAudioSource::from_wav(
+                    TapId::system_default(),
+                    tone(30.0),
+                    ReplaySpeed::Realtime,
+                )),
+                None,
+            ))
+        }),
+        Box::new(move || {
+            if factory_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("injected configuration failure");
+            }
+            fotwd::session::Transcription::Disabled
+        }),
+        Box::new(|_, _| None),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    ));
+    let cancel = fotwd::session::StopSignal::new();
+    let request_cancel = cancel.clone();
+    let start_rec = rec.clone();
+    let failed = tokio::task::spawn_blocking(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            start_rec.start_native(fotw_shell::StartOrigin::Menu, true, request_cancel)
+        }))
+    })
+    .await
+    .unwrap();
+    assert!(failed.is_err());
+    assert!(cancel.is_stopped());
+    assert_eq!(opened.load(Ordering::SeqCst), 0);
+    assert_eq!(rec.observe().status().state, RecordingState::Idle);
+    let start_rec = rec.clone();
+    let started = tokio::task::spawn_blocking(move || start_rec.start())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(started.state, RecordingState::Recording);
+    assert_eq!(opened.load(Ordering::SeqCst), 1);
+    rec.stop().unwrap();
+    assert!(until(|| rec.status().state == RecordingState::Idle).await);
+}

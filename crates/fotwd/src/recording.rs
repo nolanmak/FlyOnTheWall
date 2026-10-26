@@ -384,6 +384,38 @@ impl DaemonRecorder {
             return Err(RecorderError::AlreadyRecording);
         }
 
+        let mut control = SessionControl {
+            stop: cancel,
+            ..SessionControl::new()
+        };
+        control.on_segment = self.on_segment.clone();
+        control.deadlines = self.finish_deadlines;
+        let stop = control.stop.clone();
+        let ready = control.ready.clone();
+        ready.set_preparing(true);
+        let started_at_ms = now_ms();
+        let capture_health = control.capture_health.clone();
+        *slot = Some(Live {
+            speech: control.speech.clone(),
+            capture_health: capture_health.clone(),
+            ready: ready.clone(),
+            stop: stop.clone(),
+            started_at_ms,
+            stopped_at_ms: None,
+            errors: control.errors.clone(),
+        });
+        drop(slot);
+
+        // Configuration and audit I/O must not own the live-slot mutex. The
+        // reserved attempt stays observable/cancellable and rejects a second
+        // Start until this owner either dispatches capture or releases it.
+        let mut pending = PendingStart {
+            live: Arc::clone(&self.live),
+            ready: ready.clone(),
+            stop: stop.clone(),
+            armed: true,
+        };
+
         // CON-05: the gate runs before anything is captured. The HTTP layer
         // or native admission has already refused a start with no acknowledgement,
         // so reaching here means a human ticked the box; what is recorded here is *what
@@ -418,34 +450,18 @@ impl DaemonRecorder {
             },
         };
 
+        if stop.is_stopped() {
+            return Err(RecorderError::Failed(
+                "recording start cancelled before configuration".into(),
+            ));
+        }
         let transcription = (self.transcription)();
-        if cancel.is_stopped() {
+        if stop.is_stopped() {
             return Err(RecorderError::Failed(
                 "recording start cancelled before capture".into(),
             ));
         }
-
-        let mut control = SessionControl {
-            stop: cancel,
-            ..SessionControl::new()
-        };
-        control.on_segment = self.on_segment.clone();
-        control.deadlines = self.finish_deadlines;
-        let stop = control.stop.clone();
-        let ready = control.ready.clone();
         ready.set_preparing(transcription.needs_preparation());
-        let started_at_ms = now_ms();
-        let capture_health = control.capture_health.clone();
-        *slot = Some(Live {
-            speech: control.speech.clone(),
-            capture_health: capture_health.clone(),
-            ready: ready.clone(),
-            stop: stop.clone(),
-            started_at_ms,
-            stopped_at_ms: None,
-            errors: control.errors.clone(),
-        });
-        drop(slot);
 
         let root = self.root.clone();
         let live = Arc::clone(&self.live);
@@ -465,6 +481,7 @@ impl DaemonRecorder {
             finish,
             self.on_ready.clone(),
         ));
+        pending.armed = false;
 
         // Do not answer until capture is real. Answering on spawn is what let
         // a wedged device show a RECORDING badge over an empty disk.
@@ -847,6 +864,26 @@ impl RecorderControl for DaemonRecorder {
 
     fn status(&self) -> RecordingStatus {
         self.observe().status
+    }
+}
+
+/// Releases only this reservation if pre-dispatch I/O fails or unwinds.
+/// Once dispatched, the session task owns cleanup, including native retention.
+struct PendingStart {
+    live: Arc<Mutex<Option<Live>>>,
+    ready: crate::session::ReadySignal,
+    stop: StopSignal,
+    armed: bool,
+}
+
+impl Drop for PendingStart {
+    fn drop(&mut self) {
+        if self.armed {
+            self.ready.request_stop(&self.stop);
+            self.ready
+                .fail("recording preparation ended before capture".into());
+            clear_session_slot(&self.live, &self.ready);
+        }
     }
 }
 
