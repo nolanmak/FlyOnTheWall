@@ -194,3 +194,8 @@ mod raw_replay;
 pub mod speech_recovery;
 /// Content-free live transcription provenance.
 pub mod speech_status;
+
+/// Nonblocking native command/status bridge and render admission.
+pub mod native_bridge;
+/// Recorder-driven interaction model for the connected native shell.
+pub mod native_host;

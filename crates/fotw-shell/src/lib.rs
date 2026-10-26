@@ -100,18 +100,20 @@ pub mod probe;
 pub mod prompt;
 mod runtime;
 mod state;
+mod surface;
 pub mod testing;
 mod view;
 
 pub use crate::clock::{Monotonic, format_elapsed};
 pub use crate::error::ShellError;
 pub use crate::hotkey::{Chord, HotkeyAction, HotkeyError, HotkeyMap, Key, MediaKey, Modifiers};
-pub use crate::platform::run;
+pub use crate::platform::{run, run_surface};
 pub use crate::prompt::{DetectedMeeting, DetectionUpdate, PromptChoice, StartOrigin};
 pub use crate::runtime::{ShellHost, ShellRuntime};
 pub use crate::state::{
     FINISHED_LINGER, METER_SEGMENTS, Phase, ShellCore, ShellEffect, ShellInput,
 };
+pub use crate::surface::{SurfaceEvent, SurfaceHost};
 pub use crate::view::{
     Level, MenuAction, MenuButton, MenuModel, PillView, PromptView, ShellView, Tone, TrayState,
     TrayView,

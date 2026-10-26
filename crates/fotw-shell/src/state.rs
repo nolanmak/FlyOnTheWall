@@ -612,6 +612,8 @@ impl ShellCore {
             elapsed_label: format_elapsed(elapsed),
             status_label,
             level: self.level,
+            level_available: true,
+            detail: String::new(),
             tone,
             stop_enabled,
         })

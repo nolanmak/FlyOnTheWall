@@ -58,8 +58,8 @@ use crate::view::{PillView, Tone};
 
 /// Pill size, in points.
 const PILL_SIZE: NSSize = NSSize {
-    width: 268.0,
-    height: 36.0,
+    width: 440.0,
+    height: 60.0,
 };
 
 /// Gap between the pill and the bottom of the screen's visible frame.
@@ -169,6 +169,7 @@ pub(crate) struct Pill {
     status: Retained<NSTextField>,
     elapsed: Retained<NSTextField>,
     meter: Retained<NSTextField>,
+    detail: Retained<NSTextField>,
     stop: Retained<NSButton>,
     on_screen: bool,
     last: Option<PillView>,
@@ -213,14 +214,14 @@ impl Pill {
         content.setState(NSVisualEffectState::Active);
         content.setWantsLayer(true);
         if let Some(layer) = content.layer() {
-            layer.setCornerRadius(PILL_SIZE.height / 2.0);
+            layer.setCornerRadius(16.0);
             layer.setMasksToBounds(true);
         }
 
         let status = label(mtm, "Recording", 12.0);
         status.setFrame(NSRect::new(
-            NSPoint::new(16.0, 9.0),
-            NSSize::new(82.0, 18.0),
+            NSPoint::new(16.0, 33.0),
+            NSSize::new(120.0, 18.0),
         ));
 
         let elapsed = label(mtm, "00:00", 15.0);
@@ -228,15 +229,15 @@ impl Pill {
             15.0, 0.3,
         )));
         elapsed.setFrame(NSRect::new(
-            NSPoint::new(100.0, 8.0),
-            NSSize::new(56.0, 20.0),
+            NSPoint::new(140.0, 32.0),
+            NSSize::new(80.0, 20.0),
         ));
 
         let meter = label(mtm, "", 11.0);
         meter.setTextColor(Some(&NSColor::secondaryLabelColor()));
         meter.setFrame(NSRect::new(
-            NSPoint::new(158.0, 10.0),
-            NSSize::new(52.0, 16.0),
+            NSPoint::new(224.0, 34.0),
+            NSSize::new(76.0, 16.0),
         ));
 
         let stop_title = NSString::from_str("Stop");
@@ -251,10 +252,17 @@ impl Pill {
             )
         };
         stop.setFrame(NSRect::new(
-            NSPoint::new(212.0, 5.0),
-            NSSize::new(48.0, 26.0),
+            NSPoint::new(360.0, 29.0),
+            NSSize::new(64.0, 26.0),
         ));
 
+        let detail = label(mtm, "", 11.0);
+        detail.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        detail.setFrame(NSRect::new(
+            NSPoint::new(16.0, 9.0),
+            NSSize::new(408.0, 16.0),
+        ));
+        content.addSubview(&detail);
         content.addSubview(&status);
         content.addSubview(&elapsed);
         content.addSubview(&meter);
@@ -266,6 +274,7 @@ impl Pill {
             status,
             elapsed,
             meter,
+            detail,
             stop,
             on_screen: false,
             last: None,
@@ -328,8 +337,16 @@ impl Pill {
         self.status.setTextColor(Some(&tone_color(view.tone)));
         self.elapsed
             .setStringValue(&NSString::from_str(&view.elapsed_label));
-        self.meter
-            .setStringValue(&NSString::from_str(&view.level.meter(METER_SEGMENTS)));
+        let meter = if view.level_available {
+            view.level.meter(METER_SEGMENTS)
+        } else {
+            String::new()
+        };
+        self.meter.setStringValue(&NSString::from_str(&meter));
+        self.detail
+            .setStringValue(&NSString::from_str(&view.detail));
+        self.detail
+            .setToolTip(Some(&NSString::from_str(&view.detail)));
         self.stop.setEnabled(view.stop_enabled);
         self.panel
             .setAccessibilityLabel(Some(&NSString::from_str(&view.accessibility_label())));
@@ -355,6 +372,7 @@ fn label(mtm: MainThreadMarker, text: &str, size: f64) -> Retained<NSTextField> 
 
 fn tone_color(tone: Tone) -> Retained<NSColor> {
     match tone {
+        Tone::Preparing => NSColor::systemBlueColor(),
         Tone::Live => NSColor::systemRedColor(),
         Tone::Finishing => NSColor::systemYellowColor(),
         Tone::Saved => NSColor::secondaryLabelColor(),

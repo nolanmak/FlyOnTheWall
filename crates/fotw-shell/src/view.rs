@@ -89,6 +89,8 @@ impl Level {
 /// The visual register of the pill and the menu-bar item.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
+    /// Preparation is active; capture is not yet confirmed.
+    Preparing,
     /// Capture is live.
     Live,
     /// Capture has stopped but the session is still being written to disk.
@@ -115,6 +117,10 @@ pub struct PillView {
     pub status_label: &'static str,
     /// Current input level.
     pub level: Level,
+    /// False when the backend has not supplied a measured audio level.
+    pub level_available: bool,
+    /// Source health, active speech engine and actionable errors.
+    pub detail: String,
     /// Visual register.
     pub tone: Tone,
     /// Whether the Stop button accepts a click.
@@ -131,13 +137,20 @@ impl PillView {
     /// single assertion over the rendered state.
     #[must_use]
     pub fn accessibility_label(&self) -> String {
-        format!("{} — {}", self.status_label, self.elapsed_label)
+        let mut label = format!("{} — {}", self.status_label, self.elapsed_label);
+        if !self.detail.is_empty() {
+            label.push_str(". ");
+            label.push_str(&self.detail);
+        }
+        label
     }
 }
 
 /// The menu-bar item's state. Idle and recording must be visually distinct.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayState {
+    /// Preparation is active; capture is not yet confirmed.
+    Preparing,
     /// Not recording.
     Idle,
     /// Capture is live.

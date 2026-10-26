@@ -508,6 +508,7 @@ impl Prompt {
         self.not_now
             .setTitle(&NSString::from_str(view.not_now_label));
         self.never.setTitle(&NSString::from_str(view.never_label));
+        self.never.setHidden(view.never_label.is_empty());
         // The core's rule, applied and never recomputed. A greyed Start beside
         // an un-ticked box is the whole of "blocking" as the user sees it;
         // `ShellCore` refuses the same start again underneath.

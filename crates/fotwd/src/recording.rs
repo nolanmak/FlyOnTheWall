@@ -265,6 +265,30 @@ impl RecorderObservation {
 #[derive(Clone)]
 pub struct StopTarget(crate::session::ReadySignal);
 
+impl StopTarget {
+    /// Whether two observations name exactly the same in-process attempt.
+    #[must_use]
+    pub fn same_attempt(&self, other: &Self) -> bool {
+        self.0.same_session(&other.0)
+    }
+}
+
+type VisibilityFn = dyn Fn(RecorderObservation, StopSignal) -> Result<(), String> + Send + Sync;
+
+/// A native renderer's admission check, run off the recorder lock before setup.
+#[derive(Clone)]
+pub struct StartVisibility(Arc<VisibilityFn>);
+
+impl StartVisibility {
+    /// Construct a bounded admission check. It must honor cancellation and refuse
+    /// capture when the native recording indicator cannot be rendered.
+    pub fn new(
+        check: impl Fn(RecorderObservation, StopSignal) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(check))
+    }
+}
+
 impl std::fmt::Debug for StopTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("StopTarget(<redacted>)")
@@ -289,6 +313,7 @@ pub struct DaemonRecorder {
     /// without being reloaded (#78).
     on_ready: ReadyTap,
     live: Arc<Mutex<Option<Live>>>,
+    start_visibility: Option<StartVisibility>,
 }
 
 impl std::fmt::Debug for DaemonRecorder {
@@ -439,6 +464,10 @@ impl DaemonRecorder {
                 // A recording we cannot account for is not one we should make.
                 RecorderError::Failed(format!("could not write the audit log: {e}"))
             })?;
+
+        if let Some(visibility) = &self.start_visibility {
+            (visibility.0)(self.observe(), stop.clone()).map_err(RecorderError::Failed)?;
+        }
 
         // Defer all tap opening until the session owns its slot and finishes
         // transcription admission. Opening a tap may itself access a device.
@@ -604,6 +633,7 @@ impl DaemonRecorder {
             on_segment,
             on_ready,
             live: Arc::new(Mutex::new(None)),
+            start_visibility: None,
         }
     }
 
@@ -617,6 +647,14 @@ impl DaemonRecorder {
     #[must_use]
     pub const fn with_finish_deadlines(mut self, deadlines: FinishDeadlines) -> Self {
         self.finish_deadlines = deadlines;
+        self
+    }
+
+    /// Require native visibility before any transcription configuration or tap
+    /// opening. Install before sharing the recorder with HTTP or shell controls.
+    #[must_use]
+    pub fn with_start_visibility(mut self, visibility: StartVisibility) -> Self {
+        self.start_visibility = Some(visibility);
         self
     }
 

@@ -29,3 +29,14 @@ pub fn run<H: ShellHost>(_host: H, _hotkeys: HotkeyMap) -> Result<Infallible, Sh
 pub fn probe() -> Result<ShellProbe, ShellError> {
     Err(ShellError::unsupported())
 }
+
+/// Always fails with [`ShellError::Unsupported`].
+///
+/// # Errors
+/// Always.
+pub fn run_surface<H: crate::SurfaceHost>(
+    _host: H,
+    _hotkeys: &HotkeyMap,
+) -> Result<Infallible, ShellError> {
+    Err(ShellError::unsupported())
+}

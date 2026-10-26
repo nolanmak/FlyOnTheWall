@@ -68,6 +68,7 @@ use crate::probe::ShellProbe;
 use crate::prompt::{DetectedMeeting, PromptChoice};
 use crate::runtime::{ShellHost, ShellRuntime};
 use crate::state::{ShellCore, ShellInput};
+use crate::surface::{SurfaceEvent, SurfaceHost, render_surface};
 use crate::view::MenuAction;
 
 /// How often the run loop drains the event channels and advances the clock.
@@ -93,6 +94,19 @@ const PUMP_INTERVAL: NSTimeInterval = 0.05;
 /// with no recording indicator, so a partial start is a failure, not a
 /// degraded mode (CON-02).
 pub fn run<H: ShellHost + 'static>(host: H, hotkeys: HotkeyMap) -> Result<Infallible, ShellError> {
+    let runtime = ShellRuntime::with_hotkeys(host, hotkeys);
+    let keys = runtime.hotkeys().clone();
+    run_surface(runtime, &keys)
+}
+
+/// Run a recorder-driven surface host on the AppKit main thread.
+///
+/// # Errors
+/// If called off the main thread or native controls cannot be created.
+pub fn run_surface<H: SurfaceHost + 'static>(
+    host: H,
+    hotkeys: &HotkeyMap,
+) -> Result<Infallible, ShellError> {
     let mtm = MainThreadMarker::new().ok_or(ShellError::NotMainThread)?;
 
     let app = NSApplication::sharedApplication(mtm);
@@ -269,8 +283,8 @@ fn probe_meeting() -> DetectedMeeting {
         )
 }
 
-struct MacShell<H: ShellHost> {
-    runtime: ShellRuntime<H>,
+struct MacShell<H: SurfaceHost> {
+    runtime: H,
     tray: Tray,
     pill: Pill,
     prompt: Prompt,
@@ -279,10 +293,10 @@ struct MacShell<H: ShellHost> {
     mtm: MainThreadMarker,
 }
 
-impl<H: ShellHost> MacShell<H> {
-    fn new(mtm: MainThreadMarker, host: H, hotkeys: HotkeyMap) -> Result<Self, ShellError> {
-        let registrar = HotkeyRegistrar::register(&hotkeys)?;
-        let runtime = ShellRuntime::with_hotkeys(host, hotkeys);
+impl<H: SurfaceHost> MacShell<H> {
+    fn new(mtm: MainThreadMarker, host: H, hotkeys: &HotkeyMap) -> Result<Self, ShellError> {
+        let registrar = HotkeyRegistrar::register(hotkeys)?;
+        let runtime = host;
         let tray = Tray::new(&runtime.view().menu)?;
         let pill = Pill::new(mtm);
         let prompt = Prompt::new(mtm);
@@ -311,14 +325,14 @@ impl<H: ShellHost> MacShell<H> {
                 continue;
             }
             if let Some(chord) = self.hotkeys.chord_for(event.id) {
-                self.runtime.on_chord(chord, now);
+                self.runtime.on_event(SurfaceEvent::Chord(chord), now);
             }
         }
 
         // Menu clicks.
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if let Some(action) = MenuAction::from_id(&event.id.0) {
-                self.runtime.on_menu(action, now);
+                self.runtime.on_event(SurfaceEvent::Menu(action), now);
             }
         }
 
@@ -329,7 +343,7 @@ impl<H: ShellHost> MacShell<H> {
 
         // The pill's Stop button.
         if self.pill.take_stop_request() {
-            self.runtime.request_stop();
+            self.runtime.on_event(SurfaceEvent::Stop, now);
         }
 
         // The prompt. The acknowledgement is applied first: if a user manages
@@ -337,10 +351,11 @@ impl<H: ShellHost> MacShell<H> {
         // still first in wall-clock order and has to be honoured that way
         // (CON-05).
         if let Some(acknowledged) = self.prompt.take_acknowledgement() {
-            self.runtime.acknowledge_prompt(acknowledged);
+            self.runtime
+                .on_event(SurfaceEvent::Acknowledge(acknowledged), now);
         }
         if let Some(choice) = self.prompt.take_response() {
-            self.runtime.respond_to_prompt(choice, now);
+            self.runtime.on_event(SurfaceEvent::Prompt(choice), now);
         }
 
         self.runtime.tick(now);
@@ -348,11 +363,19 @@ impl<H: ShellHost> MacShell<H> {
     }
 
     fn render(&mut self) {
-        let view = self.runtime.view();
-        self.tray.render(&view.tray, &view.menu);
-        self.pill.render(view.pill.as_ref(), self.mtm);
-        // Issue #52: this line is the feature. Without it the state machine
-        // arms, the audit log is correct, and no human is ever asked.
-        self.prompt.render(view.prompt.as_ref(), self.mtm);
+        let Self {
+            runtime,
+            tray,
+            pill,
+            prompt,
+            mtm,
+            ..
+        } = self;
+        let _ = render_surface(runtime, |view| {
+            tray.render(&view.tray, &view.menu);
+            pill.render(view.pill.as_ref(), *mtm);
+            prompt.render(view.prompt.as_ref(), *mtm);
+            Ok::<_, Infallible>(())
+        });
     }
 }
