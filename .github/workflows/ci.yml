@@ -112,6 +112,7 @@ jobs:
           cargo run --release --manifest-path tools/aec-eval/Cargo.toml --locked --features native-webrtc -- --heldout-signals
           cargo run --release --manifest-path tools/aec-eval/Cargo.toml --locked --features native-webrtc -- --clocked-signals
           cargo run --release --manifest-path tools/aec-eval/Cargo.toml --locked --features native-webrtc -- --bandlimited-signals
+          cargo run --release --manifest-path tools/aec-eval/Cargo.toml --locked --features native-webrtc -- --relearning-signals
 
   keyring-interop:
     timeout-minutes: 10
