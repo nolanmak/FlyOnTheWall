@@ -715,6 +715,7 @@ version = "0.1.0"
 dependencies = [
  "fotw-audio",
  "fotw-pipeline",
+ "fotwd",
 ]
 
 [[package]]
@@ -722,6 +723,8 @@ name = "fotw-audio"
 version = "0.1.0"
 dependencies = [
  "cidre",
+ "objc2-app-kit",
+ "objc2-foundation",
  "thiserror",
 ]
 

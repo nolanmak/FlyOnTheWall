@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use fotw_audio::{AudioPlatform, DeviceId, FormatRequest, SystemScope, platform};
+use fotw_audio::{AudioPlatform, DeviceId, FormatRequest, platform};
 use fotw_secrets::{KeyStore, Provider, SecretKey};
 use fotw_shell::StartOrigin;
 use fotw_store::{ArchiveOptions, Db};
@@ -652,11 +652,7 @@ fn session_id() -> String {
 }
 
 fn default_root() -> PathBuf {
-    std::env::var("HOME")
-        .map(|h| {
-            PathBuf::from(h).join("Library/Application Support/com.flyonthewall.fotw/sessions")
-        })
-        .unwrap_or_else(|_| std::env::temp_dir().join("fotw-sessions"))
+    fotwd::default_session_root()
 }
 
 async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
@@ -682,6 +678,15 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
     println!();
+
+    // Resolve the frozen policy before audit or any speech/provider setup.
+    let scope = match fotwd::capture_settings::configured(&root) {
+        Ok(scope) => scope,
+        Err(error) => {
+            eprintln!("fotwd: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // CON-01's acceptance criterion is about the audit log, not the UI: no
     // audio buffer reaches disk without a user-initiated Start recorded here
@@ -789,7 +794,7 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
         }
     };
     let plat = platform::host();
-    let system = match plat.open_system(SystemScope::DefaultOutputMix, FormatRequest::any()) {
+    let system = match plat.open_system(scope, FormatRequest::any()) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("fotwd: could not open the system tap: {e}");

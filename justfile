@@ -50,15 +50,23 @@ deny:
         echo "⚠ skipped cargo deny: not installed (cargo install --locked cargo-deny); CI still runs it"
     fi
 
-# Everything CI runs, locally, in CI's order. Where a local run still differs:
+# Core workspace CI plus standalone dependency-lock consistency. The separate
+# AEC signal/native evaluations and cross-repository consumer jobs remain
+# additional hosted checks. Where a local run still differs:
 #   - CI runs the tests on both ubuntu-latest and macos-15; this runs them here.
 #   - CI sets RUSTFLAGS=-D warnings on every job. Locally `lint` runs clippy
 #     with -D warnings over every target instead, which fails on the same
 #     compiler warnings without giving the other recipes a separate build cache.
 #   - `deny` and the Windows half of `seam` print a "skipped" line instead of
 #     running when cargo-deny or the x86_64-pc-windows-msvc target is missing.
-ci: lint test deny seam
+ci: lint test deny seam lockfiles
     @echo "✓ ci green"
+
+# Resolve the isolated tool's dependency graph without building native DSP code.
+# This catches path-dependency changes that the root workspace lock cannot see.
+lockfiles:
+    cargo tree --manifest-path tools/aec-eval/Cargo.toml --locked --depth 0 > /dev/null
+
 
 # The platform seam must not rot into macOS-shaped code. Mirrors CI's `seam`
 # job: fotw-audio has to compile for Windows, and no macOS type may appear

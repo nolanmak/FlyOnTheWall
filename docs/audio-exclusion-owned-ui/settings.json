@@ -1,0 +1,10 @@
+{
+  "actualEncryptedStoreRestart" : true,
+  "authenticatedStartup" : true,
+  "scope" : "Second owned server process and a fresh nonpersistent WebKit window; no user library or credentials",
+  "stored" : {
+    "ignore_brave" : true,
+    "ignore_spotify" : false
+  },
+  "uiMatchesPersistedChoice" : true
+}

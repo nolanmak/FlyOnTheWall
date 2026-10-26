@@ -1,0 +1,13 @@
+{
+  "actualSettingsApi" : true,
+  "authenticatedStartup" : true,
+  "bothSavedAndReloaded" : true,
+  "collapsedSavedPolicy" : true,
+  "independentSave" : true,
+  "initialDefaultsOff" : true,
+  "scope" : "Owned real WebServer and SQLCipher store with public fixture key; no Keychain, recorder, capture, provider or model installed",
+  "stored" : {
+    "ignore_brave" : true,
+    "ignore_spotify" : false
+  }
+}

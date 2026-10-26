@@ -195,6 +195,18 @@ pub mod speech_recovery;
 /// Content-free live transcription provenance.
 pub mod speech_status;
 
+pub mod capture_settings;
+
+/// Default sessions location shared by the daemon and capture diagnostics.
+#[must_use]
+pub fn default_session_root() -> std::path::PathBuf {
+    std::env::var("HOME")
+        .map(|home| {
+            std::path::PathBuf::from(home)
+                .join("Library/Application Support/com.flyonthewall.fotw/sessions")
+        })
+        .unwrap_or_else(|_| std::env::temp_dir().join("fotw-sessions"))
+}
 /// Lifetime ownership for a single daemon/native shell per library.
 pub mod instance;
 mod native_actions;

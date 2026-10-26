@@ -117,6 +117,7 @@ pub use crate::tokens::{HANDOFF_TTL, TokenTable, WS_TICKET_TTL};
 #[cfg(feature = "store")]
 pub use crate::store_source::StoreSource;
 
+pub mod capture;
 /// Transcription policy settings and daemon control seam.
 pub mod model_setup;
 pub mod speech;

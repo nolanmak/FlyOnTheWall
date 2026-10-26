@@ -63,6 +63,14 @@ const el = {
   ghRepoList: document.getElementById("gh-repo-list"),
   ghPublic: document.getElementById("gh-public"),
   ghWholeLibrary: document.getElementById("gh-whole-library"),
+  captureSettings: document.getElementById("capture-settings"),
+  captureSummary: document.getElementById("capture-summary"),
+  captureSpotify: document.getElementById("capture-spotify"),
+  captureBrave: document.getElementById("capture-brave"),
+  captureSave: document.getElementById("capture-save"),
+  captureReload: document.getElementById("capture-reload"),
+  captureStatus: document.getElementById("capture-status"),
+  captureDisclosure: document.getElementById("capture-disclosure"),
   speechSettings: document.getElementById("speech-settings"),
   speechMode: document.getElementById("speech-mode"),
   speechModel: document.getElementById("speech-model"),
@@ -1621,6 +1629,62 @@ function paintSpeechPolicy() {
     ? "Audio streams to Deepgram (api.deepgram.com) using your configured key. There is no automatic offline backup in this mode. Summaries are configured separately."
     : "Choose a mode explicitly to repair the saved transcription choice.";
 }
+let captureSaving = false;
+let captureSupported = false;
+let captureDraftKnown = false;
+function paintCapturePolicy() {
+  const selected = el.captureSpotify.checked || el.captureBrave.checked;
+  el.captureSave.disabled = captureSaving || !captureDraftKnown || (selected && !captureSupported);
+}
+function onCaptureChange() { captureDraftKnown = true; paintCapturePolicy(); }
+function renderCaptureSettings(body) {
+  captureSupported = body.supported === true;
+  captureDraftKnown = !!body.settings;
+  const excluded = body.settings ? [body.settings.ignore_spotify && "Spotify", body.settings.ignore_brave && "Brave"].filter(Boolean) : null;
+  el.captureSummary.textContent = excluded ? "Audio exclusions for next recording: " + (excluded.join(", ") || "none") + (excluded.length && !captureSupported ? " (unsupported)" : "") : "Audio exclusions: saved choice unavailable";
+  if (body.settings) {
+    el.captureSpotify.checked = body.settings.ignore_spotify === true;
+    el.captureBrave.checked = body.settings.ignore_brave === true;
+  }
+  el.captureDisclosure.textContent = "Exclude Spotify or all Brave audio from the system-audio track, including meetings in Brave. Chrome and other meeting apps remain included. Your microphone remains recorded; speaker music can still reach it. Use headphones to avoid that.";
+  el.captureStatus.textContent = body.error || (!captureSupported
+    ? "Audio exclusions require macOS 26 or newer. If a saved exclusion is enabled, filtered Start is refused. Turn both off explicitly to record the full mix."
+    : "Saved for the next recording. The active meeting keeps its existing audio policy.");
+  el.captureSettings.hidden = false;
+  paintCapturePolicy();
+}
+async function loadCapture() {
+  if (!el.captureSettings || captureSaving) return;
+  try { renderCaptureSettings(await api("/api/settings/capture")); }
+  catch (e) {
+    el.captureSettings.hidden = e.status === 404;
+    if (e.status !== 404) {
+      el.captureSummary.textContent = "Audio exclusions: saved choice unavailable";
+      el.captureStatus.textContent = "Could not load audio exclusions. Retry with Reload saved choice.";
+    }
+  }
+}
+async function onCaptureSave() {
+  paintCapturePolicy();
+  if (el.captureSave.disabled) return;
+  captureSaving = true;
+  const controls = [el.captureSpotify, el.captureBrave, el.captureReload];
+  controls.forEach(control => { control.disabled = true; });
+  paintCapturePolicy();
+  try {
+    const body = await api("/api/settings/capture", {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({ignore_spotify:el.captureSpotify.checked,ignore_brave:el.captureBrave.checked})});
+    if (body.error) el.captureStatus.textContent = "Not saved. " + body.error;
+    else renderCaptureSettings(body);
+  } catch (_) {
+    el.captureSummary.textContent = "Audio exclusions: save unconfirmed — reload saved choice";
+    el.captureStatus.textContent = "Save could not be confirmed. Reload saved choice to check; your draft is still here.";
+  } finally {
+    captureSaving = false;
+    controls.forEach(control => { control.disabled = false; });
+    paintCapturePolicy();
+  }
+}
+
 function renderSpeechSettings(body) {
   const settings = body.settings;
   el.speechMode.value = settings?.engine || "";
@@ -2083,6 +2147,10 @@ async function main() {
     }
   });
   el.speechSave?.addEventListener("click", onSpeechSave);
+  el.captureSpotify?.addEventListener("change", onCaptureChange);
+  el.captureBrave?.addEventListener("change", onCaptureChange);
+  el.captureSave?.addEventListener("click", onCaptureSave);
+  el.captureReload?.addEventListener("click", loadCapture);
   el.speechReload?.addEventListener("click", loadSpeech);
   el.speechMode?.addEventListener("change", paintSpeechPolicy);
   el.sumSave.addEventListener("click", onSummarizeSave);
@@ -2092,6 +2160,7 @@ async function main() {
   el.ghSettings.addEventListener("toggle", function () {
     if (el.ghSettings.open) loadGithubRepos();
   });
+  await loadCapture();
   await loadSpeech();
   const modelSetup = document.getElementById("model-setup-mount");
   if (modelSetup && typeof FOTWModels !== "undefined") FOTWModels.mount(modelSetup, api);

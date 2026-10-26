@@ -301,6 +301,7 @@ pub struct DaemonRecorder {
     handle: tokio::runtime::Handle,
     capture: CaptureMode,
     transcription: TranscriptionFactory,
+    capture_scope: Box<dyn Fn() -> Result<fotw_audio::SystemScope, String> + Send + Sync>,
     finish: Arc<Finisher>,
     ceiling: Duration,
     ready_deadline: Duration,
@@ -521,6 +522,13 @@ impl DaemonRecorder {
                 "recording start cancelled before configuration".into(),
             ));
         }
+        control.system_scope = (self.capture_scope)().map_err(RecorderError::Failed)?;
+        if stop.is_stopped() {
+            return Err(RecorderError::Failed(
+                "recording start cancelled during application resolution; capture was not started"
+                    .into(),
+            ));
+        }
         let transcription = (self.transcription)();
         if stop.is_stopped() {
             return Err(RecorderError::Failed(
@@ -591,6 +599,7 @@ impl DaemonRecorder {
         // there is no hub behind them.
         let finish_ready = on_ready.clone();
         let transcription_root = root.clone();
+        let capture_root = root.clone();
         // The real daemon supervises the taps it opens itself, so a stalled
         // Core Audio process tap is rebuilt mid-meeting instead of recording
         // silence to the end (docs/REQUIREMENTS.md 6.4, #101). The session
@@ -611,6 +620,7 @@ impl DaemonRecorder {
             UI_CEILING,
             READY_DEADLINE,
         )
+        .with_capture_scope(move || crate::capture_settings::configured(&capture_root))
     }
 
     /// [`DaemonRecorder::new`] with every dependency named, for tests.
@@ -664,6 +674,7 @@ impl DaemonRecorder {
             handle,
             capture,
             transcription,
+            capture_scope: Box::new(|| Ok(fotw_audio::SystemScope::DefaultOutputMix)),
             finish: Arc::new(finish),
             ceiling,
             ready_deadline,
@@ -674,6 +685,16 @@ impl DaemonRecorder {
             start_visibility: None,
             lifecycle: Arc::default(),
         }
+    }
+
+    /// Set a per-Start scope factory; tests inject device-free policy resolvers.
+    #[must_use]
+    pub fn with_capture_scope(
+        mut self,
+        scope: impl Fn() -> Result<fotw_audio::SystemScope, String> + Send + Sync + 'static,
+    ) -> Self {
+        self.capture_scope = Box::new(scope);
+        self
     }
 
     /// The same recorder, finishing on a different clock (#85).

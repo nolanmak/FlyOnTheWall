@@ -1,0 +1,17 @@
+{
+  "scope": "Owned nonpersistent WebKit, actual authenticated WebServer and SettingsControl, and known-key encrypted temporary SQLCipher store; two server processes and fresh windows verify persistence. No user library, Keychain, recorder, capture devices, providers or models.",
+  "macos": "26.4",
+  "width": 590,
+  "height": 850,
+  "source_sha256": {
+    "crates/fotw-web/ui/app.js": "c335ccc1e70ce11e3c37d63333bdae99b6d886cf3e09472a5e78eaff4d0d0574",
+    "crates/fotw-web/ui/index.html": "3bbbf7eb73e6d18eebfec2caa7f204175de130e07d079c72c7e46bb47fd2b24d",
+    "crates/fotwd/src/capture_settings.rs": "0ca5deb4b0494d3b47b11663857430ae1a96222d1cc5101c2d892311a6a5a79f",
+    "crates/fotw-web/src/capture.rs": "e6e630f1f4f8d111ff370329c3ef39845c4650a0a654bb2e67e9054a55abe793",
+    "crates/fotwd/examples/capture_settings_fixture.rs": "ac9d9b09b44769fee5c13913046bea0756a73e403c385e29e5254f262e2c31d9"
+  },
+  "image_sha256": "8041974f246ee9ecffbbf52212777e95b3bb19874bc2da455cff25403ec3ce4a",
+  "limitations": "Does not establish native waveform exclusion, helper churn or physical lifecycle behavior.",
+  "collapsed_image_sha256": "22ffb4f4867da908bfbfd02e3236fdb54f1a7fe84e9b86833f16b7001488bb55",
+  "actual_api_and_encrypted_restart": true
+}

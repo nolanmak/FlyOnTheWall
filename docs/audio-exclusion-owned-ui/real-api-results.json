@@ -1,0 +1,30 @@
+{
+  "realApiAndEncryptedStore": true,
+  "crossProcessRestart": true,
+  "databaseHeaderEncrypted": true,
+  "phases": [
+    {
+      "actualSettingsApi": true,
+      "authenticatedStartup": true,
+      "bothSavedAndReloaded": true,
+      "collapsedSavedPolicy": true,
+      "independentSave": true,
+      "initialDefaultsOff": true,
+      "scope": "Owned real WebServer and SQLCipher store with public fixture key; no Keychain, recorder, capture, provider or model installed",
+      "stored": {
+        "ignore_brave": true,
+        "ignore_spotify": false
+      }
+    },
+    {
+      "actualEncryptedStoreRestart": true,
+      "authenticatedStartup": true,
+      "scope": "Second owned server process and a fresh nonpersistent WebKit window; no user library or credentials",
+      "stored": {
+        "ignore_brave": true,
+        "ignore_spotify": false
+      },
+      "uiMatchesPersistedChoice": true
+    }
+  ]
+}
