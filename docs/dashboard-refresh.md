@@ -200,3 +200,43 @@ confirms both boundaries in every final width/appearance/zoom run, and the
 runtime copy assertion checks all 4,001 copied lines in order. The browser
 fixture is a standard async function; pass its source followed by
 `return await runSavedTranscriptFixture();` to `WKWebView.callAsyncJavaScript`.
+
+## Sharing editor lifetime during navigation
+
+Opening saved meetings kept each sharing editor's render callback in a global
+cache. That callback rooted a detached panel even after the document load had
+finished. A real Node/V8 garbage-collection regression visited 20 read-only
+meetings, left their panels, then forced GC: all 20 panels remained reachable
+before the fix and none did afterward. A second runtime RED reproduced the
+same retention when returning from a saved meeting to the live pane.
+
+Every detail replacement now releases sharing view callbacks. Clean, inactive
+editors drop their document/excerpts and are evicted unless small local form
+preferences need to survive. Dirty drafts retain their source/revision; busy
+operations settle normally. Their completion updates the current mount only,
+and inactive clean results are released. A separate forced-GC test collects an
+old dirty editor panel, then reopens and saves its original unsaved text. Other
+behavior checks cover generation preferences, one requested download completing
+after navigation, and an offscreen failed save preserving text for retry.
+
+The [owned WebKit fixture](../crates/fotw-web/tests/fixtures/sharing-lifecycle-webkit.js)
+uses the real `ui_preview` library/server and embedded assets. Sharing responses
+are synthetic; download intents are captured as strings. At 1440px/light and
+390px/dark it edits Unicode text, switches meeting/live views, saves using the
+original revision, navigates 20 times, and reopens the saved text. Both cases
+pass with exactly one download intent and zero actual downloads. Served script
+hashes match the source files. The screenshots were visually inspected:
+
+- [1440px light](dashboard-refresh/sharing-lifecycle-light-1440.png),
+  [measurements](dashboard-refresh/sharing-lifecycle-light-1440.json).
+- [390px dark](dashboard-refresh/sharing-lifecycle-dark-390.png),
+  [measurements](dashboard-refresh/sharing-lifecycle-dark-390.json).
+
+All 139 UI tests and the full local repository checks pass. Node's forced-GC
+evidence proves the detached-panel regression in that engine; the native WebKit
+run verifies functional preservation, not browser heap reclamation or whole
+process memory. Dirty drafts and pending operations intentionally remain live.
+This advances #123 without closing its full memory/accessibility/physical
+acceptance. No capture, provider, credential, clipboard, installed app or user
+library was used. Owned preview servers, temporary libraries and one-use URL
+files were removed; the fixture stores no real conversation data.

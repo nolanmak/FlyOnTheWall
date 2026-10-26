@@ -53,7 +53,7 @@ test('download name follows the live meeting title over the stored document titl
 });
 
 // Small DOM harness for the asynchronous create/save/download workflow.
-function workflow() {
+function workflow(sourcePath = path.join(__dirname, '../../ui/documents.js')) {
   class Element {
     constructor(tag) { this.tagName = tag; this.children = []; this.listeners = {}; this.value = ''; }
     get isConnected() { return this === body || Boolean(this.parent?.isConnected); }
@@ -84,24 +84,109 @@ function workflow() {
     text: (tag, value, cls) => {const e = new Element(tag); e.textContent = value; e.className = cls; return e;},
     clear: el => { while (el.firstChild) el.removeChild(el.firstChild); },
     renderMarkdown: (md, el) => {const e = new Element('p');e.textContent = md;el.appendChild(e);},
-    api: async (_, opts) => {const req = JSON.parse(opts.body); requests.push(req); return respond(req);},
+    api: async (url, opts) => {const req = JSON.parse(opts.body); requests.push(req); return respond(req,url);},
     URL: {createObjectURL: blob => {const u = 'blob:' + blobs.size; blobs.set(u,blob);return u;}, revokeObjectURL: () => {}},
     setTimeout: () => {},
   });
-  vm.runInContext(fs.readFileSync(path.join(__dirname, '../../ui/documents.js'), 'utf8'), ctx);
+  vm.runInContext(fs.readFileSync(sourcePath, 'utf8'), ctx);
   const all = (node = body) => [node, ...node.children.flatMap(c => all(c))];
   return {ctx, requests, downloads,
     respond: fn => {respond = fn;}, blockDownload: v => {failDownload = v;},
     mount: id => {const host = body.appendChild(new Element('div'));ctx.mountSharingDocument({meeting:{id,state:'ready'}},host);return host;},
+    navigate: id => {while(body.firstChild)body.removeChild(body.firstChild);const host=body.appendChild(new Element('div'));ctx.mountSharingDocument({meeting:{id,state:'ready'}},host);return host;},
     button: label => all().find(n => n.tagName === 'button' && n.textContent === label),
     find: tag => all().find(n => n.tagName === tag),
+    input: label => all().find(n=>n.tagName==='label'&&n.textContent===label)?.children.find(n=>n.tagName==='input'),
   };
 }
 const flush = () => new Promise(resolve => setImmediate(resolve));
+test('read-only navigation releases detached document panels to the garbage collector', () => {
+  const {spawnSync}=require('node:child_process');
+  const source=`
+    const fs=require('node:fs'),vm=require('node:vm'),path=require('node:path');
+    const workflow=(${workflow.toString()});
+    (async()=>{
+      const w=workflow(${JSON.stringify(path.join(__dirname,'../../ui/documents.js'))});
+      const references=[];
+      for(let i=0;i<20;i++){
+        let host=w.navigate('meeting-'+i);
+        await new Promise(setImmediate);
+        references.push(new WeakRef(host));host=null;
+      }
+      w.navigate('last');await new Promise(setImmediate);
+      for(let i=0;i<8;i++){await new Promise(setImmediate);global.gc();}
+      const retained=references.filter(r=>r.deref()).length;
+      if(retained!==0)throw Error(retained+' detached clean document panels remain reachable');
+      process.stdout.write(JSON.stringify({visited:20,retained}));
+    })().catch(error=>{console.error(error);process.exitCode=1});
+  `;
+  const result=spawnSync(process.execPath,['--expose-gc','-e',source],{encoding:'utf8',timeout:15000});
+  assert.equal(result.status,0,result.stderr||String(result.error));
+  assert.deepEqual(JSON.parse(result.stdout),{visited:20,retained:0});
+});
 function savedState() {
   const e = editor();
   return {document:{...e.document, markdown:e.markdown, review_notes:[], audience:'Client'}, revision:1, automatic:true};
 }
+test('retaining an unsaved draft does not retain its detached editor panel',()=>{
+ const {spawnSync}=require('node:child_process');
+ const source=`
+   const fs=require('node:fs'),vm=require('node:vm'),path=require('node:path');
+   const workflow=(${workflow.toString()}),editor=(${editor.toString()}),savedState=(${savedState.toString()});
+   (async()=>{
+     const w=workflow(${JSON.stringify(path.join(__dirname,'../../ui/documents.js'))});
+     w.respond(()=>savedState());let host=w.navigate('A');await new Promise(setImmediate);
+     let area=w.find('textarea');area.value='Preserve my draft';area.listeners.input();area=null;
+     const old=new WeakRef(host);host=null;w.navigate('B');await new Promise(setImmediate);
+     for(let i=0;i<8;i++){await new Promise(setImmediate);global.gc();}
+     if(old.deref())throw Error('the retained draft still roots its detached panel');
+     w.navigate('A');await new Promise(setImmediate);
+     if(w.find('textarea').value!=='Preserve my draft')throw Error('collecting the panel lost the draft');
+   })().catch(error=>{console.error(error);process.exitCode=1});
+ `;
+ const result=spawnSync(process.execPath,['--expose-gc','-e',source],{encoding:'utf8',timeout:15000});
+ assert.equal(result.status,0,result.stderr||String(result.error));
+});
+test('unsaved sharing edits survive navigation and save with their original revision',async()=>{
+ const w=workflow();w.respond(()=>savedState());w.navigate('A');await flush();
+ let area=w.find('textarea');area.value='Unsaved reviewer edits';area.listeners.input();
+ w.navigate('B');await flush();w.navigate('A');await flush();
+ assert.equal(w.find('textarea').value,'Unsaved reviewer edits');
+ assert.equal(w.requests.filter(r=>r.action==='load').length,2,'returning to a dirty draft must not replace it from the server');
+ w.respond(req=>({...savedState(),revision:2,document:{...savedState().document,markdown:req.markdown}}));
+ await w.button('Save & download .md').click();
+ const save=w.requests.find(r=>r.action==='save');
+ assert.equal(save.revision,1);assert.equal(save.markdown,'Unsaved reviewer edits');
+ assert.match(await w.downloads[0].blob.text(),/Unsaved reviewer edits/);
+});
+test('local generation preferences survive navigation while clean saved content is refreshed',async()=>{
+ const w=workflow();w.respond(()=>savedState());w.navigate('A');await flush();
+ const purpose=w.input('Meeting purpose');purpose.value='Follow-up tasks';purpose.listeners.input();
+ w.navigate('B');await flush();
+ w.respond(()=>({...savedState(),document:{...savedState().document,markdown:'Fresh saved content'}}));
+ w.navigate('A');await flush();
+ assert.equal(w.input('Meeting purpose').value,'Follow-up tasks');
+ assert.equal(w.find('textarea').value,'Fresh saved content');
+});
+test('requested generation finishes once after navigation without repainting the other meeting',async()=>{
+ const w=workflow();w.navigate('A');await flush();let finish;
+ w.respond(req=>req.action==='generate'?new Promise(resolve=>{finish=resolve;}):savedState());
+ const creating=w.button('Create & download .md').click();
+ w.navigate('B');await flush();const shown=w.find('textarea');
+ finish(savedState());await creating;
+ assert.equal(w.find('textarea'),shown);assert.equal(w.downloads.length,1);
+ w.navigate('A');await flush();assert.equal(w.downloads.length,1);
+});
+test('a failed offscreen save keeps the unsaved text available for retry',async()=>{
+ const w=workflow();w.respond(()=>savedState());w.navigate('A');await flush();
+ const area=w.find('textarea');area.value='Keep this unsaved text';area.listeners.input();let finish;
+ w.respond(req=>req.action==='save'?new Promise(resolve=>{finish=resolve;}):savedState());
+ const saving=w.button('Save & download .md').click();
+ w.navigate('B');await flush();finish({error:'Save conflict'});await saving;
+ w.navigate('A');await flush();
+ assert.equal(w.find('textarea').value,'Keep this unsaved text');
+ assert.ok(w.button('Save & download .md'));assert.equal(w.downloads.length,0);
+});
 test('create downloads exactly once after generation succeeds, never merely on load', async () => {
   const w = workflow(); w.mount('meeting'); await flush();
   assert.equal(w.downloads.length, 0);
