@@ -595,6 +595,10 @@ async fn native_quit_waits_for_persistence_and_requires_acknowledgement_of_save_
     })
     .await;
     host.on_event(SurfaceEvent::Menu(MenuAction::Quit), Monotonic::ZERO);
+    assert!(
+        rec.shutdown_status().closing,
+        "Quit closes Start admission synchronously before releasing capture"
+    );
     until(|| entered.load(Ordering::SeqCst) == 1).await;
     assert!(
         rec.shutdown_status().closing,

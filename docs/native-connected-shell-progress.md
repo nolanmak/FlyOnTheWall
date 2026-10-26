@@ -119,6 +119,13 @@ beyond four seconds. A shared stop helper now posts an application-defined event
 to its own AppKit queue; the same no-input example returned in 201 ms. All five
 bootstrap/quit exit paths use it. Shell tests and strict shell Clippy pass.
 
+Hosted macOS testing exposed a second Quit ordering race: cancellation could
+release capture into persistence before a queued shutdown closed dashboard Start
+admission. Quit now closes admission with a shared atomic before cancellation;
+the background worker handles device Stop once. Closing admission takes no
+recorder mutex and cannot fail because its command queue is full. All 14 native
+bridge regressions pass, including an immediate admission-closure assertion.
+
 ## Remaining acceptance
 
 - Full repository/hosted checks and signed review-bundle results must accompany

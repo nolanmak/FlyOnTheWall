@@ -131,20 +131,19 @@ impl NativeHost {
             }
             return;
         }
+        // Close HTTP/native admission before cancelling a ticket: cancellation
+        // can release the live slot and enter persistence before the next pump.
+        self.bridge.begin_shutdown();
         if let Some(ticket) = &self.ticket {
             ticket.cancel();
             self.cancel_requested = true;
         }
-        match self.bridge.begin_shutdown() {
-            Ok(()) => {
-                self.quitting.get_or_insert(now);
-                self.prompt_origin = None;
-                self.acknowledged = false;
-                self.action_error = None;
-            }
-            Err(error) => self.action_error = Some(error),
-        }
+        self.quitting.get_or_insert(now);
+        self.prompt_origin = None;
+        self.acknowledged = false;
+        self.action_error = None;
     }
+
     fn quit_view(&self, view: &mut ShellView) {
         let Some(began) = self.quitting else {
             return;

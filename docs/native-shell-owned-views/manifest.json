@@ -6,8 +6,8 @@
     "crates/fotw-shell/src/platform/macos/prompt.rs": "bb675985083671d1d671887e7d5420906b41c58be7e6e0912dc3d631eb00b4ce",
     "crates/fotw-shell/src/platform/macos/mod.rs": "bfc94c35ef09e38ba3263f290a0d5c6effe749059f16e9be6bdf09d4909198ec",
     "crates/fotw-shell/src/surface.rs": "123e39182ff57b3f3d3b825b063fa6971df3db53cc0933bf70ca7eb8368051d5",
-    "crates/fotwd/src/native_host.rs": "fdf477a88a87f93489401c42ca60fc8d6bd64e5199398410c3fe91636df56882",
-    "crates/fotwd/src/native_bridge.rs": "5b61c1b3f1edf31f5f4c2d558a3a890d7bff86d97339e481e26c2c02e48caab6",
+    "crates/fotwd/src/native_host.rs": "10d0812955e48de724bf680f02dbefc8e12cbd153ae38a7f1ce51c7e7138fd79",
+    "crates/fotwd/src/native_bridge.rs": "142e0e74d13bb82003532b8e2fbb661554f6668c9f43af6a3a311751fe8256d6",
     "crates/fotw-shell/src/platform/macos/app_delegate.rs": "722563a1ba580e0a2fb5f98795d5cd2ceb772f70cb15f4fe1e37663b848f023e",
     "crates/fotw-shell/src/bootstrap.rs": "e65e15d3acce97f170d8aa13b0fe31ee65b78b84424bc96ea6a8886da13693ff"
   },
@@ -31,5 +31,10 @@
     "regression": "Timer-only stop exceeded 4-second owned-child timeout",
     "fixed": "Owned empty AppKit loop stopped without input in 201.163417ms",
     "scope": "No windows, tray, daemon, capture, credentials or global input controls"
+  },
+  "quit_admission_ordering": {
+    "regression": "Hosted macOS native_quit_waits_for_persistence failed because persistence could begin before queued Shutdown closed dashboard Start admission",
+    "fix": "Atomic admission closure precedes cancellation; background worker performs device Stop once; no bounded queue required to close Start",
+    "scope": "Device-free bridge/recorder tests"
   }
 }

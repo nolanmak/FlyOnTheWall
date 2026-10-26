@@ -146,7 +146,6 @@ enum Command {
         ticket: StartTicket,
     },
     Stop(StopTarget),
-    Shutdown,
 }
 /// The native thread only uses try-send, try-lock and cancellation atomics.
 /// Recorder methods and Start waiting execute on background workers.
@@ -156,6 +155,7 @@ pub struct RecorderBridge {
     busy: Arc<AtomicBool>,
     shutdown: StopSignal,
     gate: RenderGate,
+    closing: Arc<AtomicBool>,
     pending: Option<StartTicket>,
     next_id: u64,
 }
@@ -169,6 +169,7 @@ impl RecorderBridge {
         let latest = Arc::new(Mutex::new(None));
         let busy = Arc::new(AtomicBool::new(false));
         let shutdown = StopSignal::new();
+        let closing = recorder.admission_closer();
         let worker_latest = latest.clone();
         let worker_busy = busy.clone();
         let worker_shutdown = shutdown.clone();
@@ -190,6 +191,7 @@ impl RecorderBridge {
             busy,
             shutdown,
             gate,
+            closing,
             pending: None,
             next_id: 0,
         })
@@ -245,14 +247,10 @@ impl RecorderBridge {
             .try_send(Command::Stop(target.clone()))
             .map_err(|_| "native Stop could not be queued; try again".into())
     }
-    /// Close Start admission and request Stop without waiting for finalization.
-    ///
-    /// # Errors
-    /// If the bounded control queue is busy or unavailable.
-    pub fn begin_shutdown(&self) -> Result<(), String> {
-        self.commands
-            .try_send(Command::Shutdown)
-            .map_err(|_| "Quit could not be queued; try again".into())
+    /// Close Start admission immediately without waiting for a queue or mutex.
+    /// The background worker observes this irreversible flag and requests Stop.
+    pub fn begin_shutdown(&self) {
+        self.closing.store(true, Ordering::Release);
     }
     /// Take the latest snapshot without waiting on any worker or recorder lock.
     pub fn poll(&mut self) -> Option<BridgeSnapshot> {
@@ -273,6 +271,7 @@ impl RecorderBridge {
 }
 impl Drop for RecorderBridge {
     fn drop(&mut self) {
+        self.closing.store(true, Ordering::Release);
         self.gate.close();
         if let Some(pending) = &self.pending {
             pending.cancel();
@@ -292,7 +291,13 @@ fn bridge_worker(
     let mut command_error = None;
     let mut sequence = 0_u64;
     let mut last_target: Option<StopTarget> = None;
+    let closing = recorder.admission_closer();
+    let mut quit_stop_requested = false;
     while !shutdown.is_stopped() {
+        if !quit_stop_requested && closing.load(Ordering::Acquire) {
+            recorder.begin_shutdown();
+            quit_stop_requested = true;
+        }
         if let Ok(completion) = completions.try_recv() {
             outcome = Some(completion);
             busy.store(false, Ordering::Release);
@@ -332,7 +337,6 @@ fn bridge_worker(
                         busy.store(false, Ordering::Release);
                     }
                 }
-                Command::Shutdown => recorder.begin_shutdown(),
                 Command::Stop(target) => {
                     command_error = recorder.stop_observed(&target).err().map(|e| e.to_string());
                 }

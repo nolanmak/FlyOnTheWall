@@ -23,7 +23,7 @@ impl ShutdownStatus {
 }
 #[derive(Default)]
 pub(crate) struct Lifecycle {
-    pub(crate) closing: AtomicBool,
+    pub(crate) closing: Arc<AtomicBool>,
     state: Mutex<WorkState>,
 }
 #[derive(Default)]

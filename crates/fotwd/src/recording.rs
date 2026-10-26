@@ -344,6 +344,12 @@ pub const UI_CEILING: Duration = Duration::from_secs(2 * 60 * 60);
 pub const READY_DEADLINE: Duration = Duration::from_secs(15);
 
 impl DaemonRecorder {
+    /// Atomic-only admission capability for the native thread. Device Stop
+    /// still runs on the bridge worker; no recorder mutex is taken here.
+    pub(crate) fn admission_closer(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.lifecycle.closing)
+    }
+
     /// Permanently close Start admission and request Stop on the current attempt.
     /// Call on a background worker; this never waits for capture/persistence.
     pub fn begin_shutdown(&self) {
