@@ -212,6 +212,8 @@ pub mod instance;
 mod native_actions;
 /// Nonblocking native command/status bridge and render admission.
 pub mod native_bridge;
+/// Bounded read-only activity sampling for native meeting offers.
+pub mod native_detection;
 /// Recorder-driven interaction model for the connected native shell.
 pub mod native_host;
 /// Native app launch selection and the AppKit/daemon doorway.

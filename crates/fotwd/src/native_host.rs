@@ -38,6 +38,9 @@ pub struct NativeHost {
     quitting: Option<Monotonic>,
     quit_save_failure_acknowledged: bool,
     now: Monotonic,
+    detection: Option<crate::native_detection::NativeDetection>,
+    detected: Option<fotw_shell::DetectedMeeting>,
+    pending_detection_start: bool,
     _owner: Option<std::sync::Arc<crate::instance::InstanceOwner>>,
     action_feedback: Option<std::sync::mpsc::Receiver<String>>,
 }
@@ -65,9 +68,18 @@ impl NativeHost {
             quitting: None,
             quit_save_failure_acknowledged: false,
             now: Monotonic::ZERO,
+            detection: None,
+            detected: None,
+            pending_detection_start: false,
             _owner: None,
             action_feedback: None,
         }
+    }
+    /// Attach read-only background activity observations. Detection only offers consent.
+    #[must_use]
+    pub fn with_detection(mut self, detection: crate::native_detection::NativeDetection) -> Self {
+        self.detection = Some(detection);
+        self
     }
     pub(crate) fn with_owner(
         mut self,
@@ -92,6 +104,7 @@ impl NativeHost {
         {
             self.stop();
         } else if self.snapshot.is_some() {
+            self.detected = None;
             self.prompt_origin = Some(origin);
             self.acknowledged = false;
             self.action_error = None;
@@ -140,6 +153,7 @@ impl NativeHost {
         }
         self.quitting.get_or_insert(now);
         self.prompt_origin = None;
+        self.detected = None;
         self.acknowledged = false;
         self.action_error = None;
     }
@@ -214,17 +228,61 @@ impl NativeHost {
             self.action_error = Some("application action could not be queued; try again".into());
         }
     }
+    fn poll_detection(&mut self, now: Monotonic) {
+        let Some(detection) = self.detection.as_mut() else {
+            return;
+        };
+        match detection.poll(now) {
+            crate::detect::Detection::Arm(meeting)
+                if self.prompt_origin.is_none()
+                    && self.ticket.is_none()
+                    && self.quitting.is_none()
+                    && self.snapshot.as_ref().is_some_and(|s| {
+                        !s.observation.status().is_active() && !s.shutdown.closing
+                    }) =>
+            {
+                self.detected = Some(meeting);
+                self.prompt_origin = Some(StartOrigin::DetectionPrompt);
+                self.acknowledged = false;
+            }
+            crate::detect::Detection::Clear
+                if self.prompt_origin == Some(StartOrigin::DetectionPrompt) =>
+            {
+                self.detected = None;
+                self.prompt_origin = None;
+                self.acknowledged = false;
+            }
+            _ => {}
+        }
+    }
     fn prompt(&self) -> Option<PromptView> {
         self.prompt_origin.map(|_| PromptView {
-            app_key: "manual-recording".into(),
-            headline: "Start recording this meeting?".into(),
-            evidence: "Recording captures computer audio and the microphone when available.".into(),
-            consent_notice: self.consent_notice.clone(),
+            app_key: self
+                .detected
+                .as_ref()
+                .map_or_else(|| "manual-recording".into(), |m| m.app_key.clone()),
+            headline: self.detected.as_ref().map_or_else(
+                || "Start recording this meeting?".into(),
+                fotw_shell::DetectedMeeting::headline,
+            ),
+            evidence: self.detected.as_ref().map_or_else(
+                || "Recording captures computer audio and the microphone when available.".into(),
+                |m| m.evidence.clone(),
+            ),
+            consent_notice: self
+                .detected
+                .as_ref()
+                .filter(|m| !m.consent_notice.is_empty())
+                .map_or_else(|| self.consent_notice.clone(), |m| m.consent_notice.clone()),
             requires_acknowledgement: true,
             acknowledged: self.acknowledged,
             start_enabled: self.acknowledged,
             start_label: "Start recording",
-            not_now_label: "Cancel",
+            not_now_label: if self.detected.is_some() {
+                "Not now"
+            } else {
+                "Cancel"
+            },
             never_label: "",
             acknowledge_label: "Everyone in this meeting has agreed to be recorded",
         })
@@ -264,9 +322,20 @@ impl SurfaceHost for NativeHost {
                     && let Some(origin) = self.prompt_origin.take()
                 {
                     self.acknowledged = false;
-                    match self.bridge.start(origin, true) {
+                    let detected = self.detected.take();
+                    let started = match (origin, detected) {
+                        (StartOrigin::DetectionPrompt, Some(meeting)) => {
+                            self.bridge.start_detected(meeting, true)
+                        }
+                        (StartOrigin::DetectionPrompt, None) => {
+                            Err("meeting prompt expired; choose Start again".into())
+                        }
+                        _ => self.bridge.start(origin, true),
+                    };
+                    match started {
                         Ok(ticket) => {
                             self.ticket = Some(ticket);
+                            self.pending_detection_start = origin == StartOrigin::DetectionPrompt;
                             self.cancel_requested = false;
                             self.action_error = None;
                         }
@@ -275,6 +344,13 @@ impl SurfaceHost for NativeHost {
                 }
             }
             SurfaceEvent::Prompt(PromptChoice::NotNow | PromptChoice::NeverForThisApp) => {
+                // No persistent "never" control is exposed by this host yet.
+                if self.prompt_origin == Some(StartOrigin::DetectionPrompt)
+                    && let Some(detection) = self.detection.as_mut()
+                {
+                    detection.snooze(now);
+                }
+                self.detected = None;
                 self.prompt_origin = None;
                 self.acknowledged = false;
             }
@@ -291,6 +367,7 @@ impl SurfaceHost for NativeHost {
             if snapshot.shutdown.closing && self.quitting.is_none() {
                 self.action_error = Some("The daemon stopped. Recording is disabled; quit and reopen the app after audio saving finishes.".into());
                 self.prompt_origin = None;
+                self.detected = None;
                 self.acknowledged = false;
             }
             if self
@@ -298,6 +375,7 @@ impl SurfaceHost for NativeHost {
                 .as_ref()
                 .is_some_and(|previous| previous.sequence >= snapshot.sequence)
             {
+                self.poll_detection(now);
                 return;
             }
             if let Some(target) = snapshot.observation.stop_target()
@@ -317,6 +395,12 @@ impl SurfaceHost for NativeHost {
                     .is_some_and(|ticket| ticket.id() == outcome.id)
             {
                 self.ticket = None;
+                if std::mem::take(&mut self.pending_detection_start)
+                    && outcome.error.is_none()
+                    && let Some(detection) = self.detection.as_mut()
+                {
+                    detection.started();
+                }
                 let cancelled = self.cancel_requested;
                 self.cancel_requested = false;
                 // A late Start result never changes the observed recorder
@@ -342,10 +426,12 @@ impl SurfaceHost for NativeHost {
             }
             if snapshot.observation.status().is_active() {
                 self.prompt_origin = None;
+                self.detected = None;
                 self.acknowledged = false;
             }
             self.snapshot = Some(snapshot);
         }
+        self.poll_detection(now);
     }
     fn view(&self) -> ShellView {
         let status = self

@@ -12,8 +12,9 @@ not installed-app or physical meeting acceptance. Acceptance in #58, #57 and
 Menu and hotkey Start raise a fresh consent prompt. AppKit's actual checkbox
 state must reach the host, and Start still requires acknowledgement at the
 recorder boundary. The audit records the actual origin. Detection never starts
-capture; the existing detector's automatic arming is not connected to this host
-yet and remains follow-up work.
+capture. The background read-only detector now offers consent through this host;
+see [native meeting offers](native-detection-progress.md) for sampling, snooze,
+audit and remaining qualification limits.
 
 A four-command bounded queue, one Start worker and one retained status snapshot
 keep recorder/configuration work off the AppKit thread. Each Start has its own

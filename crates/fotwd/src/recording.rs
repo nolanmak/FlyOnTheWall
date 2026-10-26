@@ -413,18 +413,28 @@ impl DaemonRecorder {
         acknowledged: bool,
         cancel: StopSignal,
     ) -> Result<RecordingStatus, RecorderError> {
+        self.start_native_context(origin, acknowledged, cancel, None)
+    }
+    pub(crate) fn start_native_context(
+        &self,
+        origin: StartOrigin,
+        acknowledged: bool,
+        cancel: StopSignal,
+        detected: Option<fotw_shell::DetectedMeeting>,
+    ) -> Result<RecordingStatus, RecorderError> {
         if !acknowledged {
             return Err(RecorderError::Failed(
                 "confirm that everyone consented before recording".into(),
             ));
         }
-        self.start_admitted(origin, cancel)
+        self.start_admitted(origin, cancel, detected)
     }
 
     fn start_admitted(
         &self,
         origin: StartOrigin,
         cancel: StopSignal,
+        detected: Option<fotw_shell::DetectedMeeting>,
     ) -> Result<RecordingStatus, RecorderError> {
         let mut slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
         if self
@@ -494,9 +504,14 @@ impl DaemonRecorder {
         audit
             .record(AuditKind::SessionStart {
                 origin: origin.label().to_owned(),
-                detected_app: None,
-                jurisdiction_warning: escalation.user_text(),
-                acknowledged_all_party: escalation.blocks(),
+                detected_app: detected.as_ref().map(|m| m.app_key.clone()),
+                jurisdiction_warning: detected
+                    .as_ref()
+                    .filter(|m| !m.consent_notice.is_empty())
+                    .map_or_else(|| escalation.user_text(), |m| m.consent_notice.clone()),
+                acknowledged_all_party: detected
+                    .as_ref()
+                    .map_or_else(|| escalation.blocks(), |m| m.requires_acknowledgement),
             })
             .map_err(|e| {
                 // A recording we cannot account for is not one we should make.
@@ -925,7 +940,7 @@ fn persist_and_promote(root: &Path, outcome: &SessionOutcome, ready: &ReadyTap) 
 
 impl RecorderControl for DaemonRecorder {
     fn start(&self) -> Result<RecordingStatus, RecorderError> {
-        self.start_admitted(StartOrigin::WebUi, StopSignal::new())
+        self.start_admitted(StartOrigin::WebUi, StopSignal::new(), None)
     }
 
     fn stop(&self) -> Result<RecordingStatus, RecorderError> {
