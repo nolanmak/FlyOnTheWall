@@ -40,6 +40,12 @@ pub enum BypassReason {
     BackendFailed,
     /// Route reset releases pending original audio before clearing history.
     Reset,
+    /// Worker admission/retention budget was exhausted.
+    WorkerBusy,
+    /// Owner publication deadline expired; late native results are fenced.
+    WorkerDeadline,
+    /// Owner cancelled processing; original audio is retained for publication.
+    WorkerCancelled,
 }
 /// Provenance of one output interval.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

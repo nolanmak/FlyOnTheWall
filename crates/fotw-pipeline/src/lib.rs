@@ -9,6 +9,7 @@
 #![warn(missing_docs)]
 
 pub mod aec;
+pub mod aec_worker;
 pub mod capture_clock;
 pub mod echo;
 pub mod opus;
