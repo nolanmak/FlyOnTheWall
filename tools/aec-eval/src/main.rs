@@ -1,4 +1,6 @@
 //! AEC comparison with generated signals or opt-in approved public speech.
+#[cfg(feature = "native-webrtc")]
+mod clocked;
 mod quality;
 #[cfg(all(target_os = "macos", feature = "speech-retention"))]
 mod speech;
@@ -156,13 +158,8 @@ fn run_native(far: &[f32], mic: &[f32]) -> Vec<f32> {
 }
 
 #[cfg(feature = "native-webrtc")]
-fn run_native_profile(far: &[f32], mic: &[f32], conservative: bool) -> Vec<f32> {
+fn native_processor(conservative: bool) -> webrtc_audio_processing::Processor {
     use webrtc_audio_processing::{Config, Processor, config::EchoCanceller};
-    assert_eq!(far.len(), mic.len());
-    assert!(
-        mic.len().is_multiple_of(FRAME),
-        "fixed-frame control cannot drop a tail"
-    );
     let processor = if conservative {
         let mut config = webrtc_audio_processing::experimental::EchoCanceller3Config::default();
         // 32 * 64 samples covers 128 ms of the echo path at 16 kHz.
@@ -195,6 +192,17 @@ fn run_native_profile(far: &[f32], mic: &[f32], conservative: bool) -> Vec<f32> 
         }),
         ..Default::default()
     });
+    processor
+}
+
+#[cfg(feature = "native-webrtc")]
+fn run_native_profile(far: &[f32], mic: &[f32], conservative: bool) -> Vec<f32> {
+    assert_eq!(far.len(), mic.len());
+    assert!(
+        mic.len().is_multiple_of(FRAME),
+        "fixed-frame control cannot drop a tail"
+    );
+    let processor = native_processor(conservative);
     let mut output = Vec::with_capacity(mic.len());
     for (render, capture) in far.chunks_exact(FRAME).zip(mic.chunks_exact(FRAME)) {
         // Analyze the immutable reference before its matching capture frame.
@@ -388,6 +396,11 @@ fn native_profile_description() -> Option<serde_json::Value> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if !args.is_empty() {
+        #[cfg(feature = "native-webrtc")]
+        if args.len() == 1 && args[0] == "--clocked-signals" {
+            println!("{}", clocked::probe());
+            return Ok(());
+        }
         if args.len() == 1 && args[0] == "--heldout-signals" {
             let fixtures = vec![
                 signal_probe(
@@ -431,7 +444,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if args[0] == "--speech-retention" {
             return speech::run(&args[1..]);
         }
-        return Err("use no arguments or --heldout-signals for generated signals, or --speech-retention WAV MODEL with the speech-retention feature on macOS".into());
+        return Err("use no arguments or --heldout-signals for generated signals; --clocked-signals requires native-webrtc; --speech-retention WAV MODEL requires speech-retention on macOS".into());
     }
     println!(
         "{}",

@@ -350,3 +350,42 @@ observations, not app memory or end-to-end latency.
 alignment, capture-worker integration, route resets, LocalVQE comparison and
 physical/real-room acceptance remain separate requirements. A passing static
 signal or one public sentence cannot grant them.
+
+## Observation-based clock alignment (evaluation only)
+
+Run `cargo run --release --locked --features native-webrtc -- --clocked-signals`
+from this tool directory, with the native build prerequisites above. No speech
+or model asset is needed. The processor receives synthetic native clock traces,
+not the generator's known drift value. The pipeline's bounded clock tracker fits
+each leg and maps microphone frames to fractional reference positions. The native
+profile parameters and existing quality gates are unchanged.
+
+This probe assumes native 16kHz mono inputs and uses linear interpolation. It does
+not qualify bandlimited correction of resampled 48kHz/stereo capture. Eight callback
+periods of observation lead plus an acquisition/delivery budget simulate worker
+backlog; they are not a measured application latency. Callback delivery jitter
+does not replace native timestamps. Clocks need two seconds of evidence; missing
+or invalid alignment passes original microphone samples through.
+
+The existing AEC adapter supplies framing, delay compensation, reset fallback and
+tail drain. Every output interval is checked for contiguous source positions,
+unchanged total duration and bit-exact originals for raw fallback. A native
+regression checks the complete near-only waveform across a timing fault and Stop,
+not only an overall vector length. The measured compensated delay is zero.
+
+The nominal/+80ppm/-120ppm cases pass the original gates, but the timing-fault
+fixture fails echo and overlap quality during fallback/relearning. Aggregate
+acceptance remains false and no app backend is selected. All four fixtures were
+exercised during development; this is not an untouched held-out corpus. The first
+draft's uncompensated reset-loop failure was fixed by using the existing adapter,
+not by changing thresholds or native parameters. Public speech word retention,
+physical clocks/rooms and production capture-worker/replay integration remain open.
+
+The fixture vectors hold the complete generated inputs; this is not a production
+reference-history queue. The whole 36-case M4 probe used maximum RSS 20,234,240
+bytes, 6.33s user CPU, 0.01s system CPU and 6.53s elapsed. Cache state was
+uncontrolled; these are whole-probe figures, not isolated backend or app latency.
+The [retained report](results/m4-clock-alignment.json) includes the failed fault
+case and false aggregate acceptance. A runtime regression first failed when the
+reference path deliberately used equal sample indexes; it now requires the three
+continuous cases to pass and the fault failure to remain visible.

@@ -110,6 +110,7 @@ jobs:
           cargo test --manifest-path tools/aec-eval/Cargo.toml --locked --all-features
           cargo run --release --manifest-path tools/aec-eval/Cargo.toml --locked --features native-webrtc
           cargo run --release --manifest-path tools/aec-eval/Cargo.toml --locked --features native-webrtc -- --heldout-signals
+          cargo run --release --manifest-path tools/aec-eval/Cargo.toml --locked --features native-webrtc -- --clocked-signals
 
   keyring-interop:
     timeout-minutes: 10

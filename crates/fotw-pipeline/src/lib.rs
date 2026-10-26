@@ -13,6 +13,7 @@ pub mod capture_clock;
 pub mod echo;
 pub mod opus;
 pub mod promote;
+pub mod reference_clock;
 pub mod replay;
 pub mod resample;
 pub mod retention;
