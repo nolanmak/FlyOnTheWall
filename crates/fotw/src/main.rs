@@ -5,12 +5,16 @@
 //! user configures or recovers — provider keys, the summary engine, the
 //! Recovery Key, exports — is a `fotwd` subcommand.
 //!
+//! `record` reads the app library audio-exclusion policy before opening taps;
+//! `--library` selects an existing library containing `db.sqlite3`.
+//!
 //! `doctor` matters more than it looks. There is **no public API** to query
 //! the macOS system-audio permission, and a denial delivers silence that is
 //! indistinguishable from a quiet room. A round-trip capture is the only
 //! truthful answer available, so that is what this does.
 
 mod record;
+mod record_options;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -27,17 +31,18 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("doctor") => doctor(),
         Some("record") => {
-            let secs = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
-            let root = args.get(2).map_or_else(
-                || std::env::temp_dir().join("fotw-sessions"),
-                std::path::PathBuf::from,
-            );
-            if let Err(e) = std::fs::create_dir_all(&root) {
-                eprintln!("fotw: cannot create {}: {e}", root.display());
-                return ExitCode::FAILURE;
-            }
-            println!("FlyOnTheWall record — {secs}s");
-            match record::record(root, secs) {
+            let options = match record_options::RecordOptions::parse(&args[1..]) {
+                Ok(options) => options,
+                Err(error) => {
+                    eprintln!("fotw: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            println!("FlyOnTheWall record — {}s", options.seconds);
+            match options.run(
+                fotwd::capture_settings::configured_diagnostic,
+                record::record,
+            ) {
                 Ok(dir) => {
                     println!("\n  ✓ session written to {}", dir.display());
                     ExitCode::SUCCESS
@@ -50,11 +55,11 @@ fn main() -> ExitCode {
         }
         Some(other) => {
             eprintln!("fotw: unknown command `{other}`");
-            eprintln!("usage: fotw <doctor|record [seconds] [dir]>");
+            eprintln!("usage: fotw <doctor|record [seconds] [dir] [--library directory]>");
             ExitCode::FAILURE
         }
         None => {
-            eprintln!("usage: fotw <doctor|record [seconds] [dir]>");
+            eprintln!("usage: fotw <doctor|record [seconds] [dir] [--library directory]>");
             ExitCode::FAILURE
         }
     }

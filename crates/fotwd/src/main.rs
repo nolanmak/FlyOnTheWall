@@ -599,11 +599,7 @@ fn session_id() -> String {
 }
 
 fn default_root() -> PathBuf {
-    std::env::var("HOME")
-        .map(|h| {
-            PathBuf::from(h).join("Library/Application Support/com.flyonthewall.fotw/sessions")
-        })
-        .unwrap_or_else(|_| std::env::temp_dir().join("fotw-sessions"))
+    fotwd::default_session_root()
 }
 
 async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {

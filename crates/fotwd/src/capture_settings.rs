@@ -228,3 +228,90 @@ mod control_tests {
         );
     }
 }
+
+/// Read saved policy for diagnostics without creating a first-run library.
+/// Only the absent default library uses the legacy all-system default. An
+/// explicit library must already exist. An existing library
+/// that cannot be read never silently becomes an unfiltered diagnostic recording.
+///
+/// # Errors
+/// Inaccessible library path, key/library failure, or unenforceable saved policy.
+pub fn configured_diagnostic(
+    root: &std::path::Path,
+    require_initialized: bool,
+) -> Result<fotw_audio::SystemScope, String> {
+    existing_policy(root, require_initialized, configured)
+}
+
+fn existing_policy(
+    root: &std::path::Path,
+    require_initialized: bool,
+    load: impl FnOnce(&std::path::Path) -> Result<fotw_audio::SystemScope, String>,
+) -> Result<fotw_audio::SystemScope, String> {
+    let db_path = root.parent().unwrap_or(root).join("db.sqlite3");
+    match std::fs::symlink_metadata(db_path) {
+        Ok(_) => load(root),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !require_initialized => {
+            Ok(fotw_audio::SystemScope::DefaultOutputMix)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err("The selected library does not exist. Choose the directory containing db.sqlite3; no recording was started.".into())
+        }
+        Err(error) => Err(format!("Cannot inspect saved audio exclusions: {error}")),
+    }
+}
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    #[test]
+    fn standalone_diagnostics_do_not_create_a_library_or_read_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            existing_policy(&dir.path().join("sessions"), false, |_| panic!(
+                "no first-run key access"
+            ))
+            .unwrap(),
+            fotw_audio::SystemScope::DefaultOutputMix
+        );
+        assert!(!dir.path().join("db.sqlite3").exists());
+    }
+    #[test]
+    fn existing_unreadable_settings_cannot_become_an_unfiltered_mix() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("db.sqlite3"),
+            b"synthetic metadata marker; not a real database",
+        )
+        .unwrap();
+        assert!(
+            existing_policy(&dir.path().join("sessions"), false, |_| Err(
+                "cannot unlock existing policy".into()
+            ))
+            .is_err()
+        );
+        let path = dir.path().join("not-a-directory");
+        std::fs::write(&path, b"fixture").unwrap();
+        assert!(
+            existing_policy(&path.join("sessions"), false, |_| panic!(
+                "bad path must refuse before loading"
+            ))
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod explicit_library_tests {
+    use super::*;
+    #[test]
+    fn a_misspelled_explicit_library_never_silently_records_the_default_mix() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            existing_policy(&dir.path().join("sessions"), true, |_| panic!(
+                "missing selected profile must not initialize a key"
+            ))
+            .is_err()
+        );
+        assert!(!dir.path().join("db.sqlite3").exists());
+    }
+}

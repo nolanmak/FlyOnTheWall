@@ -316,6 +316,75 @@ async fn frozen_exclusions_survive_rebuilds_and_keep_music_out_of_wal_and_local_
                 assert!(level > 0.08, "unselected music app should remain included");
             }
         }
+        // Archive the actual WAL, then inspect decoded content rather than
+        // accepting a nonempty compressed file as proof of source exclusion.
+        let encoded = fotw_pipeline::wal::encode_session(&outcome.dir).unwrap();
+        for (track, is_mic) in [(&encoded.system, false), (&encoded.mic, true)] {
+            let decoded =
+                fotw_pipeline::opus::decode_ogg_opus_file(outcome.dir.join(&track.file), 16000)
+                    .unwrap();
+            assert!(!decoded.truncated);
+            let mono: Vec<_> = decoded
+                .samples
+                .iter()
+                .step_by(usize::from(decoded.channels))
+                .copied()
+                .collect();
+            assert!(
+                magnitude(&mono, if is_mic { 1600.0 } else { 400.0 }) > 0.05,
+                "eligible source disappeared from compressed audio"
+            );
+            if !is_mic {
+                for (hz, excluded) in [(800.0, spotify), (1200.0, brave)] {
+                    let level = magnitude(&mono, hz);
+                    if excluded {
+                        assert!(
+                            level < 0.0125,
+                            "excluded source reappeared in decoded audio: {hz}Hz={level}"
+                        );
+                    } else {
+                        assert!(
+                            level > 0.05,
+                            "eligible source disappeared from decoded audio: {hz}Hz={level}"
+                        );
+                    }
+                }
+            }
+        }
+        let session_id = outcome.dir.file_name().unwrap().to_str().unwrap();
+        for (source, is_mic) in [
+            (fotw_pipeline::replay::ReplaySource::System, false),
+            (fotw_pipeline::replay::ReplaySource::Mic, true),
+        ] {
+            let mut reader =
+                fotw_pipeline::replay::ReplayReader::open(&outcome.dir, session_id, source)
+                    .unwrap();
+            assert!(reader.is_complete().unwrap());
+            let mut cursor = reader.first_sample();
+            let mut samples = Vec::new();
+            loop {
+                let chunk = reader.read_from(cursor, 16000).unwrap();
+                if chunk.is_empty() {
+                    break;
+                }
+                cursor += chunk.len() as u64;
+                samples.extend(chunk.into_iter().map(|s| f32::from(s) / 32768.0));
+            }
+            assert!(
+                magnitude(&samples, if is_mic { 1600.0 } else { 400.0 }) > 0.08,
+                "eligible source disappeared from durable replay"
+            );
+            if !is_mic {
+                for (hz, excluded) in [(800.0, spotify), (1200.0, brave)] {
+                    let level = magnitude(&samples, hz);
+                    if excluded {
+                        assert!(level < 0.002, "excluded source reached durable replay");
+                    } else {
+                        assert!(level > 0.08, "eligible source missing from durable replay");
+                    }
+                }
+            }
+        }
         let chunks = inspected.0.lock().unwrap();
         assert!(
             !chunks.is_empty(),

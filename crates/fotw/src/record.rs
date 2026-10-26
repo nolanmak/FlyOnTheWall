@@ -172,7 +172,9 @@ impl Channel {
 }
 
 /// Record system audio for `seconds` into a session under `root`.
-pub fn record(root: PathBuf, seconds: u64) -> Result<PathBuf, String> {
+pub fn record(root: PathBuf, seconds: u64, system_scope: SystemScope) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(&root)
+        .map_err(|e| format!("could not create recording directory: {e}"))?;
     let plat = Arc::new(platform::host());
     let clock: Arc<dyn Clock> = Arc::new(HostClock);
     let capacity = 48_000 * 2 * RING_SECONDS;
@@ -197,7 +199,7 @@ pub fn record(root: PathBuf, seconds: u64) -> Result<PathBuf, String> {
                 ..SupervisorConfig::default()
             },
             Arc::clone(&clock),
-            move || plat.open_system(SystemScope::DefaultOutputMix, FormatRequest::any()),
+            move || plat.open_system(system_scope.clone(), FormatRequest::any()),
             move || slot.sink(Arc::clone(&counters), 2),
         )
     };
