@@ -2,6 +2,24 @@
 // here sends a message. The configured GitHub worker can sync saved briefs.
 const sharingEditors = new Map();
 
+// Unsaved content stays available across navigation, but a cached editor must
+// not keep its old DOM (or a clean document's full excerpts) alive.
+function trimSharingEditor(id, editor) {
+  if (editor.render || editor.dirty || editor.busy) return;
+  editor.document = null; editor.markdown = ""; editor.loaded = false;
+  editor.excluded.clear(); editor.message = "Loading document…";
+  if (!(editor.purpose || editor.audience || editor.incorrectName || editor.correctName
+      || editor.optionsOpen || editor.reviewOpen || editor.includeTranscript === false)) {
+    if (sharingEditors.get(id) === editor) sharingEditors.delete(id);
+  }
+}
+function releaseSharingDocument() {
+  for (const [id, editor] of sharingEditors) {
+    editor.render = null;
+    trimSharingEditor(id, editor);
+  }
+}
+
 function sharingTime(ms) {
   return new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York", year: "numeric", month: "short", day: "numeric",
@@ -120,6 +138,7 @@ async function sharingRequest(id, body) {
   return result;
 }
 function mountSharingDocument(detail, host) {
+  releaseSharingDocument();
   if (detail.meeting.state !== "ready") return;
   const id = detail.meeting.id;
   let editor = sharingEditors.get(id);
@@ -145,7 +164,7 @@ function mountSharingDocument(detail, host) {
   }
   async function run(body, label, download = false) {
     if (editor.busy) return;
-    editor.busy = true; editor.downloading = download; editor.message = label; editor.render();
+    editor.busy = true; editor.downloading = download; editor.message = label; editor.render?.();
     try {
       const state = await sharingRequest(id, body);
       if (body.action === "configure") editor.automatic = state.automatic;
@@ -157,7 +176,8 @@ function mountSharingDocument(detail, host) {
         await openMeeting(id);
       }
     } catch (e) { editor.message = e.message === "request failed" ? "Could not load or save the document. Check the connection and retry." : e.message; }
-    editor.busy = false; editor.downloading = false; editor.render();
+    editor.busy = false; editor.downloading = false; editor.render?.();
+    trimSharingEditor(id, editor);
   }
   function button(label, handler, disabled = false) {
     const b = text("button", label); b.type = "button"; b.disabled = disabled;
@@ -197,7 +217,7 @@ function mountSharingDocument(detail, host) {
       if (!editor.document) return create();
       if (editor.dirty) return run({action: "save", revision: editor.revision, markdown: editor.markdown,
         excluded_indices: Array.from(editor.excluded)}, "Saving your changes…", true);
-      startDownload(); editor.render();
+      startDownload(); editor.render?.();
     });
     // The spinner is CSS on the button itself, so the label stays the button's whole text.
     primary.className = editor.busy && editor.downloading ? "document-primary is-busy" : "document-primary";

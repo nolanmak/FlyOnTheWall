@@ -1,0 +1,15 @@
+{
+  "actualDownloads" : 0,
+  "browserGcForced" : false,
+  "cleanNavigationCount" : 20,
+  "cssWidth" : 1440,
+  "downloadIntents" : 1,
+  "draftPreserved" : true,
+  "liveNavigationClearedSharing" : true,
+  "originalRevisionSaved" : true,
+  "processMemoryMeasured" : false,
+  "scriptHashes" : {
+    "app.js" : "bee308051398a5a6b20298c4bacfac8201fad1e7d6dfaaa3ae2a91f55d9bb26c",
+    "documents.js" : "59785ca9f868caa2dc70ceb9bd574b00460a073f9c3c30450f67a5f31181f936"
+  }
+}

@@ -400,8 +400,13 @@ function beginRename(detail, row, heading) {
   input.select();
 }
 
-function renderDetail(detail) {
+function clearDetail() {
+  if (typeof releaseSharingDocument === "function") releaseSharingDocument();
   clear(el.detail);
+}
+
+function renderDetail(detail) {
+  clearDetail();
   el.detail.appendChild(renderTitleHeader(detail));
   el.detail.appendChild(text("p", when(detail.meeting.started_at_ms), "meta"));
 
@@ -1328,7 +1333,7 @@ function showLive() {
   currentDetail = null;
   selectedMeetingId = null;
   updateMeetingSelection();
-  clear(el.detail);
+  clearDetail();
   el.detail.appendChild(text("h2", "Recording"));
   el.detail.appendChild(
     text("p", "Words appear here as the provider finalizes them.", "meta"),
@@ -1380,17 +1385,17 @@ function showLive() {
 async function showNoteDrafts() {
   if (typeof FOTWNotes === "undefined") return;
   const request=++detailRequest;currentDetail=null;selectedMeetingId=null;
-  updateMeetingSelection();clear(el.detail);paintLiveNavigation();
+  updateMeetingSelection();clearDetail();paintLiveNavigation();
   el.detail.appendChild(text("p","Saving pending notes…","meta"));
   await FOTWNotes.flushAll();
   if(request!==detailRequest)return;
-  clear(el.detail);FOTWNotes.mountRecovery(el.detail,api,showRecoveredNote);
+  clearDetail();FOTWNotes.mountRecovery(el.detail,api,showRecoveredNote);
 }
 function showRecoveredNote(id) {
   if (id===liveSessionId && recState==="recording") {showLive();return;}
   if (typeof FOTWNotes === "undefined") return;
   FOTWNotes.flushAll();const request=++detailRequest;currentDetail=null;selectedMeetingId=null;
-  updateMeetingSelection();clear(el.detail);paintLiveNavigation();
+  updateMeetingSelection();clearDetail();paintLiveNavigation();
   FOTWNotes.mountRecovered(id,el.detail,api,{onSaved:meetingId=>{
     if(request===detailRequest)openMeeting(meetingId);
   }});
