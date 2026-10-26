@@ -1,0 +1,26 @@
+{
+  "source_sha256": {
+    "crates/fotw-web/ui/app.js": "208d1a311d65ad791d9cfe9cab1888a18db5e91d2afecafc32f2bb825be7dbf4",
+    "crates/fotw-web/ui/index.html": "9d0b57c87690624d5ff27904b14b4216a6aede253b8dd5da17cbadf4e8d83966",
+    "crates/fotw-web/ui/app.css": "ee154205587dc2f5b14d2cd26c35c6db48307a21c0881764c43774d9d740cd31"
+  },
+  "fixture": "Existing owned ui_preview --live-notes, debug FOTW_UI_DIR points to these exact UI assets; real WebServer/auth/status API and synthetic recorder; known-key temporary SQLCipher library only",
+  "renderer": "Nonpersistent WKWebView, nonactivating prohibited AppKit window",
+  "cases": [
+    {
+      "file": "390-dark",
+      "width": 390,
+      "height": 850,
+      "appearance": "dark",
+      "behavior": "Actual owned update socket closed; two ticket requests fail synthetically; real ticket/socket reconnect; authoritative recording, clock and Stop preserved"
+    },
+    {
+      "file": "195-light",
+      "width": 195,
+      "height": 425,
+      "appearance": "light",
+      "behavior": "Actual owned socket closed; disconnected status, recording, elapsed and Stop remain visible without horizontal overflow; narrower viewport approximates 200% layout width, not a native zoom or focus qualification"
+    }
+  ],
+  "limits": "No installed product launch, devices, user data, provider credentials, global keys or clipboard. No full #123 acceptance claim."
+}

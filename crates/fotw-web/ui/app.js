@@ -747,28 +747,55 @@ function onSearch() {
 // mints a ticket that is good for one connection within ten seconds, and the
 // ticket travels in the query string because that is the only channel there
 // is.
+let streamSocket = null;
+let streamConnecting = false;
+let streamRetryTimer = null;
+function paintStreamConnection(connected) {
+  el.live.hidden = false;
+  el.live.textContent = connected ? "Updates connected" : "Updates reconnecting…";
+  el.live.classList.toggle("disconnected", !connected);
+}
+function retryStream() {
+  paintStreamConnection(false);
+  if (streamRetryTimer !== null) return;
+  // One ticket, one connection: reconnecting always mints another ticket.
+  streamRetryTimer = setTimeout(() => {
+    streamRetryTimer = null;
+    return connectStream();
+  }, 2000);
+}
 async function connectStream() {
-  let ticket;
+  if (streamConnecting || streamSocket) return;
+  streamConnecting = true;
+  if (streamRetryTimer !== null) {
+    clearTimeout(streamRetryTimer);
+    streamRetryTimer = null;
+  }
   try {
     const body = await api("/api/ws-ticket", { method: "POST" });
-    ticket = body.ticket;
+    const url = "ws://" + window.location.host + "/api/stream?ticket=" + encodeURIComponent(body.ticket);
+    const socket = new WebSocket(url);
+    streamSocket = socket;
+    socket.addEventListener("open", () => {
+      if (streamSocket !== socket) return;
+      paintStreamConnection(true);
+      pollRecording().then(recoverLiveHistory);
+    });
+    socket.addEventListener("message", (event) => {
+      if (streamSocket === socket) handleStreamFrame(JSON.parse(event.data));
+    });
+    socket.addEventListener("close", () => {
+      if (streamSocket !== socket) return;
+      streamSocket = null;
+      retryStream();
+    });
   } catch (e) {
-    return;
+    // A daemon restart can fail the ticket POST as well as the socket. Keep
+    // trying either way; never infer recording state from this connection.
+    retryStream();
+  } finally {
+    streamConnecting = false;
   }
-
-  const url = "ws://" + window.location.host + "/api/stream?ticket=" + encodeURIComponent(ticket);
-  const socket = new WebSocket(url);
-
-  socket.addEventListener("open", () => {
-    el.live.hidden = false;
-    pollRecording().then(recoverLiveHistory);
-  });
-  socket.addEventListener("message", (event) => handleStreamFrame(JSON.parse(event.data)));
-  socket.addEventListener("close", () => {
-    el.live.hidden = true;
-    // One ticket, one connection: reconnecting means minting another.
-    setTimeout(connectStream, 2000);
-  });
 }
 
 function handleStreamFrame(frame) {

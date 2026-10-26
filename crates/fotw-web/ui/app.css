@@ -88,6 +88,8 @@ h1 {
   letter-spacing: 0.08em;
 }
 
+.live.disconnected { color: var(--muted); }
+
 /* Deliberately not `.live`: that one means "the socket is connected", and a
    page with a socket open is not a page that is recording. Two facts, two
    indicators. */

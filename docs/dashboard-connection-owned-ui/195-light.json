@@ -1,0 +1,16 @@
+{
+  "disconnected" : {
+    "elapsed" : "0:09",
+    "label" : "Updates reconnecting…",
+    "recording" : "recording",
+    "stopAvailable" : true
+  },
+  "failedTickets" : 0,
+  "finalLabel" : "Updates reconnecting…",
+  "height" : 425,
+  "horizontalOverflow" : false,
+  "reconnected" : false,
+  "recordingPreserved" : true,
+  "stopAvailable" : true,
+  "width" : 195
+}
