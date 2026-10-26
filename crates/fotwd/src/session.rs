@@ -1433,7 +1433,7 @@ impl StopSignal {
     /// only those already waiting and leaves no permit behind, so a `stop()`
     /// landing between a read and an await would be lost forever. Registering
     /// first turns that race into a redundant wake-up.
-    async fn wait(&self) {
+    pub(crate) async fn wait(&self) {
         loop {
             let notified = self.0.notify.notified();
             if self.is_stopped() {

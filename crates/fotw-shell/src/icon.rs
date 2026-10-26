@@ -53,6 +53,7 @@ pub fn tray_icon_rgba(state: TrayState) -> Vec<u8> {
     // failed session cannot be mistaken for a live one at a glance.
     let filled = matches!(state, TrayState::Recording | TrayState::Finishing);
     let rgb = match state {
+        TrayState::Preparing => [0x38, 0x80, 0xD8],
         TrayState::Recording | TrayState::Finishing | TrayState::Fault => RECORD_RGB,
         // Template image: macOS ignores the colour channels entirely.
         TrayState::Idle => [0, 0, 0],

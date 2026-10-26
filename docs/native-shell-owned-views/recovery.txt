@@ -1,0 +1,11 @@
+IndicatorFrameProbe {
+    nonactivating: true,
+    on_screen: true,
+    status: "Save needs recovery",
+    elapsed: "—",
+    detail: "A library save was not confirmed. Check recovery audio on next launch.",
+    meter: "",
+    stop_enabled: false,
+    stop_dispatched: false,
+    controls_inside_panel: true,
+}

@@ -11,7 +11,9 @@
 //! serves it to a local agent, and `record` captures one meeting without the
 //! dashboard. The usage text in `main`'s fallback arm lists them all.
 //!
-//! Nothing here starts the AppKit shell (`fotw-shell`) yet (#58).
+//! App-bundle serving launches and `fotwd shell` connect the native shell to the same daemon.
+//! Loose CLI serving preserves its terminal doorway. App-bundle serving always
+//! connects native controls; AppKit runs only on the native main thread.
 //!
 //! # Provider keys never touch disk or argv
 //!
@@ -38,10 +40,61 @@ use fotwd::persist;
 use fotwd::secrets;
 use fotwd::session::{self, Transcription};
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let terminal = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    if fotwd::native_launch::should_launch(
+        fotwd::recording::DaemonRecorder::launched_as_app(),
+        terminal,
+        &args,
+    ) {
+        let root = if args.first().is_some_and(|a| a == "serve" || a == "shell") {
+            positionals(&args[1..], &["--port"])
+                .first()
+                .map_or_else(default_root, PathBuf::from)
+        } else {
+            default_root()
+        };
+        let launch = if args.iter().any(|a| a == "--print-url") {
+            fotwd::serve::Launch::PrintUrl
+        } else if args.iter().any(|a| a == "--no-open") {
+            fotwd::serve::Launch::Nothing
+        } else {
+            fotwd::serve::Launch::OpenBrowser
+        };
+        let port = match fotwd::serve::parse_port(&args) {
+            Ok(port) => port,
+            Err(error) => {
+                eprintln!("fotwd: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        return match fotwd::native_launch::run(root, launch, port) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("fotwd: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(run_cli(args)),
+        Err(error) => {
+            eprintln!("fotwd: could not start the runtime: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_cli(args: Vec<String>) -> ExitCode {
     match args.first().map(String::as_str) {
+        Some("shell") => {
+            eprintln!("fotwd: the native shell requires macOS");
+            ExitCode::FAILURE
+        }
         Some("record") => {
             let acknowledged = args.iter().any(|a| a == "--i-have-consent");
             let positional: Vec<&String> =
@@ -176,7 +229,7 @@ async fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: fotwd <serve [dir] [--port <n>] | record [seconds] [dir] [--i-have-consent] | \
+                "usage: fotwd <serve [dir] [--port <n>] | shell [dir] [--port <n>] | record [seconds] [dir] [--i-have-consent] | \
                  list [dir] | summarize <id> [dir] [--template <slug>] | disclose | \
                  onboard | detect [seconds] | \
                  retention [dir] [--apply] [--days <n>] [--budget-gib <n>] | \

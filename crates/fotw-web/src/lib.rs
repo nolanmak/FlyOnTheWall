@@ -104,7 +104,10 @@ pub use crate::source::{
     SourceError,
 };
 pub use crate::state::AppState;
-pub use crate::state_file::{DaemonState, read_state_file, write_state_file};
+pub use crate::state_file::{
+    DaemonDescriptor, DaemonState, read_daemon_descriptor, read_state_file,
+    write_daemon_descriptor, write_state_file,
+};
 pub use crate::stream::{Delta, DeltaHub, FLUSH_INTERVAL, Frame, MeetingReady, MeetingReadyReason};
 pub use crate::summarize::{
     CliEngine, SummarizeControl, SummarizeError, SummarizeSettingsDoc, SummarizeStatus,

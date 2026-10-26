@@ -11,7 +11,7 @@ pub mod stub;
 pub mod macos;
 
 #[cfg(target_os = "macos")]
-pub use crate::platform::macos::{probe, run};
+pub use crate::platform::macos::{probe, run, run_surface};
 
 #[cfg(not(target_os = "macos"))]
-pub use crate::platform::stub::{probe, run};
+pub use crate::platform::stub::{probe, run, run_surface};
