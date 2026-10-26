@@ -364,7 +364,8 @@ async fn frozen_exclusions_survive_rebuilds_and_all_speech_paths() {
             let driver = async {
                 tokio::time::timeout(Duration::from_secs(4), async {
                     loop {
-                        if platform.system.lock().unwrap().is_some()
+                        if control.ready.is_ready()
+                            && platform.system.lock().unwrap().is_some()
                             && platform.mic.lock().unwrap().is_some()
                         {
                             break;
@@ -374,15 +375,29 @@ async fn frozen_exclusions_survive_rebuilds_and_all_speech_paths() {
                 })
                 .await
                 .expect("synthetic taps must start");
-                for frame in 0..240 {
+                // Supervision polls on wall time but debounces on ManualClock.
+                // Keep delivering/advancing until a reopen is observed; freezing
+                // the clock after 240 guessed scheduler turns can leave a late
+                // event permanently inside the debounce window on a busy runner.
+                let delivery_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+                for frame in 0.. {
+                    if frame >= 240 && platform.scopes.lock().unwrap().len() >= 2 {
+                        break;
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < delivery_deadline,
+                        "supervised reopen must occur while delivering frames: {mode:?}, Spotify={spotify}, Brave={brave}, fail_reopen={fail_reopen}"
+                    );
                     clock.advance(Duration::from_millis(20));
-                    if frame == 70 {
+                    // The refusal case deliberately delivers changes at the old
+                    // final frame, so the late-event regression stays covered.
+                    if frame == if fail_reopen { 239 } else { 70 } {
                         platform.event(DeviceChangeKind::DefaultOutput);
                     }
-                    if frame == 130 {
+                    if frame == if fail_reopen { 239 } else { 130 } {
                         platform.event(DeviceChangeKind::WillSleep);
                     }
-                    if frame == 150 {
+                    if frame == if fail_reopen { 239 } else { 150 } {
                         platform.event(DeviceChangeKind::DidWake);
                     }
                     let mask = platform.included.load(Ordering::SeqCst);

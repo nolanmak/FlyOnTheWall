@@ -106,3 +106,11 @@ lock with a cheap resolver pass. Separate tool checks passed locally: default
 Clippy/10 tests/run, native Clippy/18 tests, and heldout/clocked/bandlimited generated
 signal runs, plus advisory/license/source checks. These are build/regression
 checks; they do not qualify a new AEC backend or change the separate AEC work.
+
+The macOS hosted run exposed a synthetic-clock scheduling bug in the matrix:
+a late device event could arrive just before the driver froze ManualClock,
+preventing the debounce from ever expiring. Delivering all events at the old
+final frame reproduced the failure locally. The driver now waits for readiness
+and continues bounded audio/clock delivery until it observes a real reopen.
+Each speech mode retains a deliberately late-event refusal case. No production
+recovery timing or exclusion assertions were weakened.
