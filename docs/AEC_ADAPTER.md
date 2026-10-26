@@ -46,6 +46,31 @@ and await actual backend teardown before reusing or releasing that resource.
 Capture-pump wiring, native worker teardown-race tests and real acoustic timing
 are separate integration requirements, not completed by these contracts.
 
+## Capture timing observations
+
+Daemon and CLI capture sinks now publish a bounded latest observation alongside
+each generation's PCM ring. `RingConsumer::capture_observation` makes one attempt
+to read a coherent callback number, absolute accepted interleaved sample position,
+accepted sample count, device frame index, host timestamp, original flags and
+cumulative dropped samples. Overruns publish zero accepted samples. Empty callbacks
+do not supersede an observation. Untimed ring writes also advance sample positions.
+Old tap callbacks cannot publish into a replacement generation's clock mailbox.
+Construction allocates the mailbox; callback publication has fixed atomic work
+with no allocation, lock, retry, logging or dependency on pump progress.
+
+This is latest-value monitoring evidence, not per-chunk timing: observations may
+be superseded, may be stale, and may precede or follow an independently drained
+PCM chunk. A reader must use sequence/position evidence, reject timestamp-error
+or discontinuity flags, detect drops and reset on generation changes. `None`
+means no observation yet or publication in progress, never an instruction to
+spin. It is not a complete callback journal or a durable reconstruction recipe.
+
+Current macOS backends stamp host time at callback delivery and count delivered
+device frames. Scheduling jitter therefore affects these observations. They do
+not establish hardware presentation time, estimate a trusted device rate, resample
+the reference, or enable AEC in the pump. Those remain integration requirements;
+the conservative native profile's drift validation is still failing.
+
 ## Evidence
 
 Initial runtime tests failed for delayed/partial-tail output, late reference

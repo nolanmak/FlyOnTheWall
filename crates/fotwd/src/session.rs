@@ -285,17 +285,10 @@ struct LegCounters {
     /// This leg's t0: the host-clock nanosecond of its **first** buffer, and
     /// [`NO_BUFFER`](Self::NO_BUFFER) until one arrives (#86).
     ///
-    /// # Why only the first
-    ///
-    /// The ring is `RingBuffer<f32>` — samples, no side channel — so a stamp
-    /// per buffer would need a second queue for the pump to correlate against,
-    /// and nothing downstream would read it. Per-leg t0 is the whole of what
-    /// lining the two legs up requires: within a leg the device's own frame
-    /// counter is the exact measure of how much audio exists, and
-    /// `CaptureTimestamp::is_monotonic_after` already asserts the two clocks
-    /// agree buffer to buffer. Mid-session *drift* between the two devices is
-    /// real and is deliberately not detected here; when something wants to act
-    /// on it, this field grows a companion — the ring does not.
+    /// This session-wide anchor remains fixed across recovery. The ring's
+    /// separate latest capture observation carries continuous callback timing
+    /// and accepted sample positions within each isolated tap generation.
+    /// Neither establishes hardware presentation time or corrects clock drift.
     first_host_ns: Arc<AtomicU64>,
 }
 
@@ -378,7 +371,9 @@ impl FrameSink for RingSink {
         }
         // If capacity is insufficient, drop/count the whole callback rather
         // than splitting an interleaved frame. Never retry on the audio thread.
-        let _ = self.producer.push_complete_block(pcm);
+        let _ = self
+            .producer
+            .push_capture_block(pcm, ts.device_frames, ts.host_ns, flags.bits());
     }
 
     fn on_error(&mut self, _e: TapError) {}
@@ -469,7 +464,7 @@ impl FrameSink for SupervisedSink {
                 .store(ts.host_ns, Ordering::Relaxed);
         }
         if let Some(producer) = self.producer.as_mut() {
-            let _ = producer.push_complete_block(pcm);
+            let _ = producer.push_capture_block(pcm, ts.device_frames, ts.host_ns, flags.bits());
         }
     }
 
@@ -3780,9 +3775,8 @@ mod pump_clock_tests {
 
     /// Piece one: the `host_ns` `RingSink` used to throw away.
     ///
-    /// Only the *first* buffer's, because per-leg t0 is the whole of what
-    /// anchoring needs — see the note on [`LegCounters::first_host_ns`] for why
-    /// per-buffer stamps were not built.
+    /// The session anchor remains the first buffer even while the separate
+    /// generation-local ring observation advances with later callbacks.
     #[test]
     fn a_leg_records_the_host_time_of_its_first_buffer_and_of_no_later_one() {
         let counters = LegCounters::default();
@@ -3792,7 +3786,7 @@ mod pump_clock_tests {
             "a tap that has not delivered a buffer has no t0 to report"
         );
 
-        let (producer, _consumer) = AudioRing::with_capacity_frames(RING_SAMPLES);
+        let (producer, consumer) = AudioRing::with_capacity_frames(RING_SAMPLES);
         let mut sink = counters.sink(producer);
         sink.on_frames(
             &[0.5, 0.5],
@@ -3806,6 +3800,7 @@ mod pump_clock_tests {
         );
 
         assert_eq!(counters.t0_ns(), Some(4_000_000));
+        assert_eq!(consumer.capture_observation().unwrap().host_ns, 9_000_000);
     }
 
     /// Piece two: session t0 is the earlier leg's, and each leg's anchor is its
@@ -4952,6 +4947,18 @@ mod supervised_recovery_tests {
             );
             assert_eq!(&scratch[..4], &[1.0, -1.0, 2.0, -2.0]);
             assert_eq!(consumer.dropped_frames(), 4);
+            let clock = consumer
+                .capture_observation()
+                .expect("capture timing survives overflow");
+            assert_eq!(
+                (
+                    clock.sample_start,
+                    clock.sample_count,
+                    clock.dropped_samples
+                ),
+                (4, 0, 4)
+            );
+            assert_eq!((clock.device_frames, clock.host_ns), (2, 1));
             sink.on_frames(
                 &[5.0, -5.0],
                 CaptureTimestamp::new(4, 2),
@@ -4959,6 +4966,16 @@ mod supervised_recovery_tests {
             );
             assert_eq!(consumer.pop_into(&mut scratch), 2);
             assert_eq!(&scratch[..2], &[5.0, -5.0]);
+            let clock = consumer.capture_observation().unwrap();
+            assert_eq!(
+                (
+                    clock.sample_start,
+                    clock.sample_count,
+                    clock.dropped_samples
+                ),
+                (4, 2, 4)
+            );
+            assert_eq!((clock.device_frames, clock.host_ns), (4, 2));
         }
     }
 
