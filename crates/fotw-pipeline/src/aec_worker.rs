@@ -291,6 +291,9 @@ impl Worker {
         if let Some(next) = old.checked_add(1) {
             self.fence.store(next, Ordering::Release);
         } else {
+            // Zero is never an admitted generation. A terminal marker also
+            // releases publication waiting at the exhausted fence.
+            self.fence.store(0, Ordering::Release);
             self.commands.take();
             self.closed = true;
         }
@@ -381,16 +384,223 @@ fn run<B: Backend>(
                 }
             }
         }
-        if active == fence.load(Ordering::Acquire)
-            && !blocks.is_empty()
-            && output
-                .try_send(ResultBlock {
+        if !blocks.is_empty()
+            && !publish(
+                &output,
+                fence,
+                ResultBlock {
                     fence: active,
                     blocks,
-                })
-                .is_err()
+                },
+            )
         {
             return;
         }
+    }
+}
+
+fn publish(output: &SyncSender<ResultBlock>, fence: &AtomicU64, mut result: ResultBlock) -> bool {
+    loop {
+        // The owner can release originals while native work is finishing.
+        // Cancellation/reset/drop must also release a full result mailbox.
+        if result.fence != fence.load(Ordering::Acquire) {
+            return true;
+        }
+        match output.try_send(result) {
+            Ok(()) => return true,
+            Err(TrySendError::Disconnected(_)) => return false,
+            Err(TrySendError::Full(pending)) => {
+                // Backpressure stays on this exclusive worker. No new native
+                // call, allocation or owner/callback wait is introduced.
+                result = pending;
+                std::thread::park_timeout(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod result_backpressure_tests {
+    use super::*;
+    use std::{thread::JoinHandle, time::Duration};
+
+    struct Identity {
+        calls: mpsc::Sender<usize>,
+        count: usize,
+    }
+    impl Backend for Identity {
+        type Error = ();
+        fn frame_samples(&self) -> usize {
+            160
+        }
+        fn delay_samples(&self) -> usize {
+            0
+        }
+        fn analyze_render(&mut self, _: &[f32]) -> Result<(), ()> {
+            Ok(())
+        }
+        fn process_capture(&mut self, input: &[f32], output: &mut [f32]) -> Result<(), ()> {
+            output.copy_from_slice(input);
+            self.count += 1;
+            self.calls.send(self.count).unwrap();
+            Ok(())
+        }
+        fn reset(&mut self) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    struct PausedOwner {
+        input: SyncSender<Command>,
+        output: Receiver<ResultBlock>,
+        calls: Receiver<usize>,
+        fence: Arc<AtomicU64>,
+        done: Receiver<()>,
+        thread: JoinHandle<()>,
+    }
+    fn job(index: u64) -> Command {
+        Command::Input(Input {
+            fence: 1,
+            start: index * 160,
+            mic: vec![0.5; 160],
+            reference: Some(vec![0.1; 160]),
+        })
+    }
+    fn paused_owner() -> PausedOwner {
+        // Match a production queue of four commands and five results. Fill the
+        // result mailbox while an already-admitted sixth job completes.
+        let (input, jobs) = mpsc::sync_channel(4);
+        let (results, output) = mpsc::sync_channel(5);
+        let (progress, calls) = mpsc::channel();
+        let (completed, done) = mpsc::channel();
+        let fence = Arc::new(AtomicU64::new(1));
+        let worker_fence = fence.clone();
+        let thread = std::thread::spawn(move || {
+            let mut adapter = Adapter::new(
+                Identity {
+                    calls: progress,
+                    count: 0,
+                },
+                AdapterConfig {
+                    frame_samples: 160,
+                    delay_samples: 0,
+                    max_wait_samples: 320,
+                    max_reference_samples: 640,
+                },
+                1,
+                0,
+            )
+            .unwrap();
+            run(&mut adapter, jobs, results, &worker_fence);
+            drop(adapter);
+            completed.send(()).unwrap();
+        });
+        for index in 0..6 {
+            input.send(job(index)).unwrap();
+            assert_eq!(
+                calls.recv_timeout(Duration::from_secs(2)).unwrap(),
+                index as usize + 1
+            );
+        }
+        PausedOwner {
+            input,
+            output,
+            calls,
+            fence,
+            done,
+            thread,
+        }
+    }
+
+    #[test]
+    fn full_result_mailbox_recovers_when_the_owner_resumes_polling() {
+        let owner = paused_owner();
+        assert_eq!(
+            owner.calls.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "a full result mailbox must retain the live backend, not disconnect it"
+        );
+        owner.input.send(job(6)).unwrap();
+        let first = owner.output.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(first.blocks[0].start_sample, 0);
+        assert_eq!(first.blocks[0].samples, vec![0.5; 160]);
+        assert_eq!(owner.calls.recv_timeout(Duration::from_secs(2)).unwrap(), 7);
+        for index in 1..7 {
+            let result = owner.output.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(result.fence, 1);
+            assert_eq!(result.blocks.len(), 1);
+            assert_eq!(result.blocks[0].start_sample, index * 160);
+            assert_eq!(result.blocks[0].samples, vec![0.5; 160]);
+        }
+        drop(owner.output);
+        drop(owner.input);
+        owner.done.recv_timeout(Duration::from_secs(2)).unwrap();
+        owner.thread.join().unwrap();
+    }
+
+    #[test]
+    fn fencing_a_full_result_mailbox_releases_the_worker_without_owner_polling() {
+        let owner = paused_owner();
+        owner.fence.store(2, Ordering::Release);
+        drop(owner.input);
+        // Keep the result receiver alive and full: cancellation must be enough.
+        owner.done.recv_timeout(Duration::from_secs(2)).unwrap();
+        owner.thread.join().unwrap();
+        drop(owner.output);
+    }
+
+    #[test]
+    fn cancel_at_exhausted_fence_releases_a_full_mailbox_without_owner_polling() {
+        let (progress, calls) = mpsc::channel();
+        let mut worker = Worker::new(
+            Identity {
+                calls: progress,
+                count: 0,
+            },
+            Config {
+                adapter: AdapterConfig {
+                    frame_samples: 160,
+                    delay_samples: 0,
+                    max_wait_samples: 320,
+                    max_reference_samples: 640,
+                },
+                queued_blocks: 4,
+                block_samples: 160,
+                pending_samples: 16000,
+                deadline_ms: 500,
+            },
+            1,
+            0,
+        )
+        .unwrap();
+        worker.fence.store(u64::MAX, Ordering::Release);
+        // Exercise the native mailbox directly so owner polling cannot free it.
+        for index in 0..6 {
+            let Command::Input(mut input) = job(index) else {
+                unreachable!()
+            };
+            input.fence = u64::MAX;
+            worker
+                .commands
+                .as_ref()
+                .unwrap()
+                .send(Command::Input(input))
+                .unwrap();
+            assert_eq!(
+                calls.recv_timeout(Duration::from_secs(2)).unwrap(),
+                index as usize + 1
+            );
+        }
+        worker.cancel(&mut Vec::new());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while worker.status().is_running() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancel must release publication even when the fence cannot increment"
+            );
+            std::thread::yield_now();
+        }
+        assert!(worker.closed);
+        assert_eq!(worker.fence.load(Ordering::Acquire), 0);
     }
 }
