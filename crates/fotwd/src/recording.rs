@@ -238,6 +238,39 @@ struct Live {
     errors: SttErrors,
 }
 
+/// The recorder state and its exact stop target, observed for native controls.
+#[derive(Clone, Debug)]
+pub struct RecorderObservation {
+    /// Authoritative capture/preparation state.
+    status: RecordingStatus,
+    /// An opaque target for this attempt, including pre-capture preparation.
+    stop_target: Option<StopTarget>,
+}
+
+impl RecorderObservation {
+    /// The status captured with this observation's stop capability.
+    #[must_use]
+    pub const fn status(&self) -> &RecordingStatus {
+        &self.status
+    }
+
+    /// The matching capability; absent when no attempt occupied the slot.
+    #[must_use]
+    pub const fn stop_target(&self) -> Option<&StopTarget> {
+        self.stop_target.as_ref()
+    }
+}
+
+/// An in-process capability to stop one observed attempt, never its successor.
+#[derive(Clone)]
+pub struct StopTarget(crate::session::ReadySignal);
+
+impl std::fmt::Debug for StopTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StopTarget(<redacted>)")
+    }
+}
+
 /// Starts and stops real recordings on the UI's behalf.
 pub struct DaemonRecorder {
     root: PathBuf,
@@ -285,6 +318,198 @@ pub const UI_CEILING: Duration = Duration::from_secs(2 * 60 * 60);
 pub const READY_DEADLINE: Duration = Duration::from_secs(15);
 
 impl DaemonRecorder {
+    /// Observe state for the native indicator without opening any capture.
+    #[must_use]
+    pub fn observe(&self) -> RecorderObservation {
+        let slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        slot.as_ref().map_or_else(
+            || RecorderObservation {
+                status: RecordingStatus::idle(),
+                stop_target: None,
+            },
+            |live| RecorderObservation {
+                status: live_status(live, self.ceiling),
+                stop_target: Some(StopTarget(live.ready.clone())),
+            },
+        )
+    }
+
+    /// Stop the exact attempt represented by an earlier native observation.
+    /// Validation and Stop hold the same slot lock, so replacement cannot race
+    /// between checking the target and issuing the command.
+    ///
+    /// # Errors
+    /// If the attempt ended or was replaced, without changing a successor.
+    pub fn stop_observed(&self, target: &StopTarget) -> Result<RecordingStatus, RecorderError> {
+        let mut slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        let live = slot.as_mut().ok_or(RecorderError::NotRecording)?;
+        if !live.ready.same_session(&target.0) {
+            return Err(RecorderError::Failed(
+                "recording changed; refresh its status".into(),
+            ));
+        }
+        Ok(stop_live(live))
+    }
+
+    /// Start requested by the native shell after its explicit consent action.
+    ///
+    /// # Errors
+    /// When acknowledgement is absent, the request is cancelled, or capture fails.
+    pub fn start_native(
+        &self,
+        origin: StartOrigin,
+        acknowledged: bool,
+        cancel: StopSignal,
+    ) -> Result<RecordingStatus, RecorderError> {
+        if !acknowledged {
+            return Err(RecorderError::Failed(
+                "confirm that everyone consented before recording".into(),
+            ));
+        }
+        self.start_admitted(origin, cancel)
+    }
+
+    fn start_admitted(
+        &self,
+        origin: StartOrigin,
+        cancel: StopSignal,
+    ) -> Result<RecordingStatus, RecorderError> {
+        let mut slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        if cancel.is_stopped() {
+            return Err(RecorderError::Failed(
+                "recording start cancelled before capture".into(),
+            ));
+        }
+        if slot.is_some() {
+            return Err(RecorderError::AlreadyRecording);
+        }
+
+        let mut control = SessionControl {
+            stop: cancel,
+            ..SessionControl::new()
+        };
+        control.on_segment = self.on_segment.clone();
+        control.deadlines = self.finish_deadlines;
+        let stop = control.stop.clone();
+        let ready = control.ready.clone();
+        ready.set_preparing(true);
+        let started_at_ms = now_ms();
+        let capture_health = control.capture_health.clone();
+        *slot = Some(Live {
+            speech: control.speech.clone(),
+            capture_health: capture_health.clone(),
+            ready: ready.clone(),
+            stop: stop.clone(),
+            started_at_ms,
+            stopped_at_ms: None,
+            errors: control.errors.clone(),
+        });
+        drop(slot);
+
+        // Configuration and audit I/O must not own the live-slot mutex. The
+        // reserved attempt stays observable/cancellable and rejects a second
+        // Start until this owner either dispatches capture or releases it.
+        let mut pending = PendingStart {
+            live: Arc::clone(&self.live),
+            ready: ready.clone(),
+            stop: stop.clone(),
+            armed: true,
+        };
+
+        // CON-05: the gate runs before anything is captured. The HTTP layer
+        // or native admission has already refused a start with no acknowledgement,
+        // so reaching here means a human ticked the box; what is recorded here is *what
+        // they were warned about*.
+        let home = std::env::var("FOTW_JURISDICTION").unwrap_or_else(|_| "US-CA".to_owned());
+        let escalation = Rules::builtin().escalate(&JurisdictionSignals::home(&home));
+
+        // CON-01's acceptance criterion is about the audit log, not the UI: no
+        // audio buffer reaches disk without a user-initiated Start recorded
+        // first. Written *before* the tap opens, so a crash during capture
+        // still leaves the record of who asked.
+        let audit = AuditLog::at(&self.root);
+        audit
+            .record(AuditKind::SessionStart {
+                origin: origin.label().to_owned(),
+                detected_app: None,
+                jurisdiction_warning: escalation.user_text(),
+                acknowledged_all_party: escalation.blocks(),
+            })
+            .map_err(|e| {
+                // A recording we cannot account for is not one we should make.
+                RecorderError::Failed(format!("could not write the audit log: {e}"))
+            })?;
+
+        // Defer all tap opening until the session owns its slot and finishes
+        // transcription admission. Opening a tap may itself access a device.
+        let capture = match &self.capture {
+            CaptureMode::Prebuilt(open_taps) => SessionCapture::Prebuilt(Arc::clone(open_taps)),
+            CaptureMode::Supervised { plat, clock } => SessionCapture::Supervised {
+                plat: Arc::clone(plat),
+                clock: Arc::clone(clock),
+            },
+        };
+
+        if stop.is_stopped() {
+            return Err(RecorderError::Failed(
+                "recording start cancelled before configuration".into(),
+            ));
+        }
+        let transcription = (self.transcription)();
+        if stop.is_stopped() {
+            return Err(RecorderError::Failed(
+                "recording start cancelled before capture".into(),
+            ));
+        }
+        ready.set_preparing(transcription.needs_preparation());
+
+        let root = self.root.clone();
+        let live = Arc::clone(&self.live);
+        let ceiling = self.ceiling;
+        // Behind an `Arc` so the task owns a handle without the recorder
+        // having to be `Clone`.
+        let finish = Arc::clone(&self.finish);
+
+        self.handle.spawn(spawn_session(
+            root,
+            capture,
+            transcription,
+            ceiling,
+            control,
+            started_at_ms,
+            Arc::clone(&live),
+            finish,
+            self.on_ready.clone(),
+        ));
+        pending.armed = false;
+
+        // Do not answer until capture is real. Answering on spawn is what let
+        // a wedged device show a RECORDING badge over an empty disk.
+        if !ready.wait_timeout(self.ready_deadline) {
+            if let Some(error) = ready.failure() {
+                return Err(RecorderError::Failed(error));
+            }
+            let preparing = ready.is_preparing();
+            capture_health.close();
+            ready.request_stop(&stop);
+            let error = if preparing {
+                "local backup model preparation timed out; capture was not started. Waiting for native preparation to release its resources."
+            } else {
+                "recording setup timed out; waiting for native setup to release its resources before another Start. A blocked Core Audio HAL may require restarting coreaudiod and the app."
+            }.to_owned();
+            // Deadlines bound the caller, not an OS operation. Every mode keeps
+            // its native owner until spawn_session actually completes cleanup.
+            let slot = live.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(owner) = slot.as_ref().filter(|s| s.ready.same_session(&ready)) {
+                owner.errors.record(error.clone());
+            }
+            ready.fail(error.clone());
+            return Err(RecorderError::Failed(error));
+        }
+
+        Ok(self.status())
+    }
+
     /// A recorder that opens the host's real devices.
     #[must_use]
     pub fn new(
@@ -602,156 +827,13 @@ fn persist_and_promote(root: &Path, outcome: &SessionOutcome, ready: &ReadyTap) 
 
 impl RecorderControl for DaemonRecorder {
     fn start(&self) -> Result<RecordingStatus, RecorderError> {
-        let mut slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
-        if slot.is_some() {
-            return Err(RecorderError::AlreadyRecording);
-        }
-
-        // CON-05: the gate runs before anything is captured. The HTTP layer
-        // has already refused a start with no acknowledgement, so reaching
-        // here means a human ticked the box; what is recorded here is *what
-        // they were warned about*.
-        let home = std::env::var("FOTW_JURISDICTION").unwrap_or_else(|_| "US-CA".to_owned());
-        let escalation = Rules::builtin().escalate(&JurisdictionSignals::home(&home));
-
-        // CON-01's acceptance criterion is about the audit log, not the UI: no
-        // audio buffer reaches disk without a user-initiated Start recorded
-        // first. Written *before* the tap opens, so a crash during capture
-        // still leaves the record of who asked.
-        let audit = AuditLog::at(&self.root);
-        audit
-            .record(AuditKind::SessionStart {
-                origin: StartOrigin::WebUi.label().to_owned(),
-                detected_app: None,
-                jurisdiction_warning: escalation.user_text(),
-                acknowledged_all_party: escalation.blocks(),
-            })
-            .map_err(|e| {
-                // A recording we cannot account for is not one we should make.
-                RecorderError::Failed(format!("could not write the audit log: {e}"))
-            })?;
-
-        // Defer all tap opening until the session owns its slot and finishes
-        // transcription admission. Opening a tap may itself access a device.
-        let capture = match &self.capture {
-            CaptureMode::Prebuilt(open_taps) => SessionCapture::Prebuilt(Arc::clone(open_taps)),
-            CaptureMode::Supervised { plat, clock } => SessionCapture::Supervised {
-                plat: Arc::clone(plat),
-                clock: Arc::clone(clock),
-            },
-        };
-
-        let transcription = (self.transcription)();
-
-        let mut control = SessionControl::new();
-        control.on_segment = self.on_segment.clone();
-        control.deadlines = self.finish_deadlines;
-        let stop = control.stop.clone();
-        let ready = control.ready.clone();
-        ready.set_preparing(transcription.needs_preparation());
-        let started_at_ms = now_ms();
-        let capture_health = control.capture_health.clone();
-        *slot = Some(Live {
-            speech: control.speech.clone(),
-            capture_health: capture_health.clone(),
-            ready: ready.clone(),
-            stop: stop.clone(),
-            started_at_ms,
-            stopped_at_ms: None,
-            errors: control.errors.clone(),
-        });
-        drop(slot);
-
-        let root = self.root.clone();
-        let live = Arc::clone(&self.live);
-        let ceiling = self.ceiling;
-        // Behind an `Arc` so the task owns a handle without the recorder
-        // having to be `Clone`.
-        let finish = Arc::clone(&self.finish);
-
-        self.handle.spawn(spawn_session(
-            root,
-            capture,
-            transcription,
-            ceiling,
-            control,
-            started_at_ms,
-            Arc::clone(&live),
-            finish,
-            self.on_ready.clone(),
-        ));
-
-        // Do not answer until capture is real. Answering on spawn is what let
-        // a wedged device show a RECORDING badge over an empty disk.
-        if !ready.wait_timeout(self.ready_deadline) {
-            if let Some(error) = ready.failure() {
-                return Err(RecorderError::Failed(error));
-            }
-            let preparing = ready.is_preparing();
-            capture_health.close();
-            ready.request_stop(&stop);
-            let error = if preparing {
-                "local backup model preparation timed out; capture was not started. Waiting for native preparation to release its resources."
-            } else {
-                "recording setup timed out; waiting for native setup to release its resources before another Start. A blocked Core Audio HAL may require restarting coreaudiod and the app."
-            }.to_owned();
-            // Deadlines bound the caller, not an OS operation. Every mode keeps
-            // its native owner until spawn_session actually completes cleanup.
-            let slot = live.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(owner) = slot.as_ref().filter(|s| s.ready.same_session(&ready)) {
-                owner.errors.record(error.clone());
-            }
-            ready.fail(error.clone());
-            return Err(RecorderError::Failed(error));
-        }
-
-        Ok(self.status())
+        self.start_admitted(StartOrigin::WebUi, StopSignal::new())
     }
 
     fn stop(&self) -> Result<RecordingStatus, RecorderError> {
         let mut slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(live) = slot.as_mut() else {
-            return Err(RecorderError::NotRecording);
-        };
-        // Set once. A reloaded tab presses Stop again, and a second stop that
-        // moved this forward would make the meeting appear to grow after it
-        // ended — the clock is frozen at the first Stop or it is not frozen.
-        if !live.ready.is_ready() {
-            let capture_setup = live.ready.request_stop(&live.stop);
-            let message = if capture_setup {
-                live.stopped_at_ms.get_or_insert(now_ms());
-                "stopping capture setup; any buffered audio will be saved"
-            } else {
-                "preparation cancelled; waiting for native setup to release its resources"
-            }
-            .to_owned();
-            live.errors.record(message.clone());
-            live.ready.fail(message);
-            let status = if capture_setup {
-                RecordingStatus::starting(true)
-            } else {
-                RecordingStatus::preparing(true)
-            };
-            return Ok(status
-                .with_transcription_error(live.errors.latest())
-                .with_speech_status(live.speech.snapshot()));
-        }
-        let ended_at_ms = *live.stopped_at_ms.get_or_insert(now_ms());
-        // Trip and return. The task clears the slot once the meeting is on
-        // disk; until then status reads `finishing`.
-        live.ready.signal_capture_stopped(ended_at_ms);
-        live.capture_health.close();
-        live.stop.stop();
-        let started_at_ms = live
-            .ready
-            .capture_started_at_ms()
-            .unwrap_or(live.started_at_ms);
-        let ended_at_ms = live.ready.capture_ended_at_ms().unwrap_or(ended_at_ms);
-        Ok(RecordingStatus::finishing(started_at_ms, ended_at_ms)
-            .with_speech_status(live.speech.snapshot())
-            .with_capture_health(live.capture_health.snapshot())
-            .with_transcription_error(live.errors.latest())
-            .with_session_id(live.ready.session_id()))
+        let live = slot.as_mut().ok_or(RecorderError::NotRecording)?;
+        Ok(stop_live(live))
     }
 
     fn retry_capture(
@@ -781,48 +863,27 @@ impl RecorderControl for DaemonRecorder {
     }
 
     fn status(&self) -> RecordingStatus {
-        let slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
-        slot.as_ref().map_or_else(RecordingStatus::idle, |live| {
-            let started_at_ms = live
-                .ready
-                .capture_started_at_ms()
-                .unwrap_or(live.started_at_ms);
-            let status = if !live.ready.is_ready() {
-                if live.ready.capture_setup_started() {
-                    RecordingStatus::starting(live.stop.is_stopped())
-                } else {
-                    RecordingStatus::preparing(live.stop.is_stopped())
-                }
-            } else {
-                match live.ready.capture_ended_at_ms().or(live.stopped_at_ms) {
-                    // Frozen: the tap is shut, so the number cannot grow.
-                    Some(ended_at_ms) => {
-                        RecordingStatus::finishing(started_at_ms, ended_at_ms.max(started_at_ms))
-                    }
-                    None => RecordingStatus::recording(
-                        started_at_ms,
-                        now_ms().saturating_sub(started_at_ms),
-                    ),
-                }
-            }
-            // Kept for finishing too: a tab loaded mid-finalize must still see
-            // that transcription failed, or an empty transcript is
-            // indistinguishable from a quiet meeting exactly when someone goes
-            // looking for the words.
-            .with_speech_status(live.speech.snapshot())
-            .with_capture_health(live.capture_health.snapshot())
-            .with_transcription_error(live.errors.latest())
-            .with_session_id(live.ready.session_id());
-            if live.ready.is_ready() {
-                status.with_auto_stop_at_ms(
-                    started_at_ms.saturating_add(
-                        u64::try_from(self.ceiling.as_millis()).unwrap_or(u64::MAX),
-                    ),
-                )
-            } else {
-                status
-            }
-        })
+        self.observe().status
+    }
+}
+
+/// Releases only this reservation if pre-dispatch I/O fails or unwinds.
+/// Once dispatched, the session task owns cleanup, including native retention.
+struct PendingStart {
+    live: Arc<Mutex<Option<Live>>>,
+    ready: crate::session::ReadySignal,
+    stop: StopSignal,
+    armed: bool,
+}
+
+impl Drop for PendingStart {
+    fn drop(&mut self) {
+        if self.armed {
+            self.ready.request_stop(&self.stop);
+            self.ready
+                .fail("recording preparation ended before capture".into());
+            clear_session_slot(&self.live, &self.ready);
+        }
     }
 }
 
@@ -1096,5 +1157,86 @@ mod capture_retry_tests {
             recorder.status().capture_health.unwrap().mic.state,
             CaptureDelivery::Stopped
         );
+    }
+}
+
+fn stop_live(live: &mut Live) -> RecordingStatus {
+    // Set once. A reloaded tab presses Stop again, and a second stop that
+    // moved this forward would make the meeting appear to grow after it
+    // ended — the clock is frozen at the first Stop or it is not frozen.
+    if !live.ready.is_ready() {
+        let capture_setup = live.ready.request_stop(&live.stop);
+        let message = if capture_setup {
+            live.stopped_at_ms.get_or_insert(now_ms());
+            "stopping capture setup; any buffered audio will be saved"
+        } else {
+            "preparation cancelled; waiting for native setup to release its resources"
+        }
+        .to_owned();
+        live.errors.record(message.clone());
+        live.ready.fail(message);
+        let status = if capture_setup {
+            RecordingStatus::starting(true)
+        } else {
+            RecordingStatus::preparing(true)
+        };
+        return status
+            .with_transcription_error(live.errors.latest())
+            .with_speech_status(live.speech.snapshot());
+    }
+    let ended_at_ms = *live.stopped_at_ms.get_or_insert(now_ms());
+    // Trip and return. The task clears the slot once the meeting is on
+    // disk; until then status reads `finishing`.
+    live.ready.signal_capture_stopped(ended_at_ms);
+    live.capture_health.close();
+    live.stop.stop();
+    let started_at_ms = live
+        .ready
+        .capture_started_at_ms()
+        .unwrap_or(live.started_at_ms);
+    let ended_at_ms = live.ready.capture_ended_at_ms().unwrap_or(ended_at_ms);
+    RecordingStatus::finishing(started_at_ms, ended_at_ms)
+        .with_speech_status(live.speech.snapshot())
+        .with_capture_health(live.capture_health.snapshot())
+        .with_transcription_error(live.errors.latest())
+        .with_session_id(live.ready.session_id())
+}
+
+fn live_status(live: &Live, ceiling: Duration) -> RecordingStatus {
+    let started_at_ms = live
+        .ready
+        .capture_started_at_ms()
+        .unwrap_or(live.started_at_ms);
+    let status = if !live.ready.is_ready() {
+        if live.ready.capture_setup_started() {
+            RecordingStatus::starting(live.stop.is_stopped())
+        } else {
+            RecordingStatus::preparing(live.stop.is_stopped())
+        }
+    } else {
+        match live.ready.capture_ended_at_ms().or(live.stopped_at_ms) {
+            // Frozen: the tap is shut, so the number cannot grow.
+            Some(ended_at_ms) => {
+                RecordingStatus::finishing(started_at_ms, ended_at_ms.max(started_at_ms))
+            }
+            None => {
+                RecordingStatus::recording(started_at_ms, now_ms().saturating_sub(started_at_ms))
+            }
+        }
+    }
+    // Kept for finishing too: a tab loaded mid-finalize must still see
+    // that transcription failed, or an empty transcript is
+    // indistinguishable from a quiet meeting exactly when someone goes
+    // looking for the words.
+    .with_speech_status(live.speech.snapshot())
+    .with_capture_health(live.capture_health.snapshot())
+    .with_transcription_error(live.errors.latest())
+    .with_session_id(live.ready.session_id());
+    if live.ready.is_ready() {
+        status.with_auto_stop_at_ms(
+            started_at_ms.saturating_add(u64::try_from(ceiling.as_millis()).unwrap_or(u64::MAX)),
+        )
+    } else {
+        status
     }
 }
