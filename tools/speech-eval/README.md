@@ -207,6 +207,71 @@ Protocol references: [prerecorded audio](https://developers.deepgram.com/referen
 [version](https://developers.deepgram.com/docs/version),
 [keyterm prompting](https://developers.deepgram.com/docs/keyterm).
 
+### Parakeet Unified adapter (macOS)
+
+`parakeet/` supplies the local English Unified 0.6B **int8** candidate used by
+[Muesli](https://github.com/Muesli-HQ/muesli) at source revision
+`55c207859bcf6e7c33d99568c4f731662d4c08cd`. This is not the TDT v3 candidate.
+It uses FluidAudio **0.17.3**, revision
+`a6b826ce9a09028fc685a4b32a8927ec920c3188`, through `UnifiedAsrManager`'s explicit
+local-directory loader. The runtime performs its offline windowing; the adapter
+does no capture, model discovery, download, resampling, cleanup or speaker labeling.
+It rejects vocabulary hints rather than claiming an unsupported vocabulary trial.
+
+The dependency-free checks require macOS 14+ and Swift 6.0+ (Command Line Tools
+are sufficient; XCTest is not required):
+
+```sh
+env -u FOTW_FLUIDAUDIO_SOURCE swift run \
+  --package-path tools/speech-eval/parakeet -j 3 parakeet-protocol-check
+```
+
+Building the actual adapter requires **Swift 6.2+** and a separately provisioned
+local FluidAudio source directory at the revision above. Verify that directory
+before building:
+
+```sh
+python3 tools/speech-eval/parakeet/verify_runtime.py /absolute/FluidAudio
+FOTW_FLUIDAUDIO_SOURCE=/absolute/FluidAudio swift build \
+  --package-path tools/speech-eval/parakeet -c release -j 3 --product parakeet-eval
+```
+
+Verification hashes all 387 selected files across Sources, both manifests and
+LICENSE; it downloads nothing. A source-only directory works: upstream Tests,
+audio fixtures and model weights are not needed to compile this product. Packaged
+static TTS lexicon/config files under Sources are included in the source pin.
+The opt-in manifest disables the NeMo text-normalizer trait. SwiftPM may still
+resolve/cache the upstream checksum-pinned binary artifact at build time, even
+though it is not linked. Compilation is not an offline-inference measurement.
+
+Separately provision the model files from
+[`FluidInference/parakeet-unified-en-0.6b-coreml`](https://huggingface.co/FluidInference/parakeet-unified-en-0.6b-coreml/tree/d32e972dd4315f1dc3f6be28fb2aab0ab3e80358),
+revision `d32e972dd4315f1dc3f6be28fb2aab0ab3e80358`, preserving these bundles:
+`parakeet_unified_encoder_int8.mlmodelc`, `parakeet_unified_decoder.mlmodelc`,
+`parakeet_unified_joint_decision_single_step.mlmodelc`, plus `vocab.json` and
+`metadata.json`. Each compiled bundle needs its coremldata.bin, model.mil and
+weights/weight.bin files. The preflight checks layout and file types, not model
+authenticity; the runner's fingerprint pins the complete operator-provisioned
+directory. No weights or audio are included in this repository.
+
+Configure a generic local candidate with `model_id:
+"parakeet-unified-en-0.6b-int8"`, `use_terms: false`, the resolved release executable,
+its SHA-256, the model directory and its `hash-asset` fingerprint. Set `argv` to:
+
+```json
+["--audio-wav", "{audio_wav}", "--model-directory", "{model}",
+ "--model-id", "{model_id}", "--terms-json", "{terms_json}"]
+```
+
+Record the source revision and Swift version in `runtime_revision`; pin any
+additional distributed runtime assets. Run through the paired runner to enforce
+network denial, input/model/binary pins, process ownership and deadlines. The
+adapter emits raw text only in its result JSON; its own failures use a fixed
+diagnostic. Upstream/CoreML diagnostics may still appear on stderr, which the
+runner bounds and discards. CI validates model-free behavior only. A successful
+compile does not establish inference success, accuracy, latency, memory usage,
+ANE placement or a production fallback for either app.
+
 ## Measurement scope
 
 Candidate order rotates across fixtures/trials. Every candidate uses the same
