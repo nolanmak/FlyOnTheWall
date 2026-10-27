@@ -141,6 +141,7 @@ and now report the waiting call site to aid diagnosis on hosted runners.
   fullscreen/spaces, scaling and screen-share behavior remain unvalidated.
 - Actual microphone/system audio, USB/Bluetooth/sleep recovery, long meetings,
   provider/local fallback and concurrent-app laptop acceptance remain open.
-- Automatic detector-to-native-prompt arming/snooze/suppression remains follow-up.
+- Persistent per-app Never suppression, decline auditing and EventKit/Bluetooth
+  calendar fallback for native detection remain follow-up.
 - Genuine AEC and broader model/provider quality/resource qualification remain
   separate roadmap work. No new models or user recordings were used here.
