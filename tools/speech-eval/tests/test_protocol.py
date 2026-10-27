@@ -120,3 +120,9 @@ class JsonTests(unittest.TestCase):
                     b'{"x":NaN}', ('{"x":' + '9' * 100000 + '}').encode()]:
             with self.subTest(size=len(raw)), self.assertRaises(ValueError):
                 benchmark.strict_json(raw)
+
+
+class DepthTests(unittest.TestCase):
+    def test_deeply_nested_adapter_output_is_a_value_error_not_a_run_ending_crash(self):
+        with self.assertRaises(ValueError):
+            benchmark.parse_response(b"[" * 100000, "asr-eval-v1", 1000)

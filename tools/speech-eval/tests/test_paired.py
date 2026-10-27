@@ -218,3 +218,24 @@ class PairedTests(unittest.TestCase):
         report = self.run_pair(candidates)
         self.assertFalse(report["paired_execution_complete"])
         self.assertEqual([r["status"] for r in report["rows"]], ["asset_mismatch"] * 2)
+
+    def test_model_mutation_during_a_trial_invalidates_and_stops_the_pair(self):
+        def mutate(argv, timeout_seconds, **kwargs):
+            result = self.execute(argv, timeout_seconds, **kwargs)
+            self.model.write_bytes(b"changed during inference")
+            return result
+        report = self.run_pair([self.candidate(), self.candidate("poor")], executor=mutate)
+        self.assertFalse(report["paired_execution_complete"], "changed model falsely retained its old pin")
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual([r["status"] for r in report["rows"]], ["asset_changed"] * 2)
+
+    def test_deeply_nested_response_does_not_discard_other_trial_results(self):
+        def nested(argv, timeout_seconds, **kwargs):
+            result = self.execute(argv, timeout_seconds, **kwargs)
+            if argv[-1] == "good":
+                result["stdout"] = b"[" * 100000
+            return result
+        report = self.run_pair([self.candidate(), self.candidate("poor")], executor=nested)
+        self.assertFalse(report["paired_execution_complete"])
+        self.assertEqual([r["status"] for r in report["rows"]], ["invalid_response", "ok"])
+        self.assertEqual(report["candidates"][1]["successful_trials"], 1)

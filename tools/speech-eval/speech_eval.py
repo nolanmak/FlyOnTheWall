@@ -3,9 +3,9 @@ import math
 import re
 import unicodedata
 
-NORMALIZATION = "nfc-casefold-technical-numeric-v1"
+NORMALIZATION = "nfc-casefold-technical-numeric-v2"
 NUMBER = r"(?:[$€£]?[+-]?|[+-]?[$€£]?)\d+(?:[.,]\d+)*(?:%)?"
-TOKEN = re.compile(NUMBER + r"(?!\w)|\w+(?:[._:/’'-]+\w+)*(?:\+\+(?:\d+)?|#)?", re.UNICODE)
+TOKEN = re.compile(NUMBER + r"(?!\w|[._:/’'-]+\w)|\w+(?:[._:/’'-]+\w+)*(?:\+\+(?:\d+)?|#)?", re.UNICODE)
 MAX_ALIGNMENT_CELLS = 12_000_000
 
 
@@ -17,7 +17,7 @@ def tokenize(text):
     if not marks:
         return TOKEN.findall(normalized)
     word = r"[\w" + re.escape(marks) + "]"
-    pattern = NUMBER + r"(?!" + word + r")|\w" + word + r"*(?:[._:/’'-]+" + word + r"+)*(?:\+\+(?:\d+)?|#)?"
+    pattern = NUMBER + r"(?!" + word + r"|[._:/’'-]+" + word + r")|\w" + word + r"*(?:[._:/’'-]+" + word + r"+)*(?:\+\+(?:\d+)?|#)?"
     return re.findall(pattern, normalized)
 
 

@@ -57,3 +57,15 @@ class ScoringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NumericIdentifierTests(unittest.TestCase):
+    def test_numeric_leading_identifiers_keep_their_separators(self):
+        import speech_eval
+        self.assertEqual(speech_eval.tokenize("2-factor 3.11-beta 8-bit"), ["2-factor", "3.11-beta", "8-bit"])
+        self.assertNotEqual(speech_eval.tokenize("2-factor"), speech_eval.tokenize("2 factor"))
+        result = speech_eval.score("Use 2-factor", "Use 2 factor", ["2-factor"])
+        self.assertGreater(result["wer"], 0)
+        self.assertEqual(result["term_recall"], 0)
+        self.assertEqual(speech_eval.tokenize("2-क्ष"), ["2-क्ष"])
+        self.assertEqual(speech_eval.tokenize("-$12.50 €4.75"), ["-$12.50", "€4.75"])

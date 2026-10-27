@@ -26,6 +26,22 @@ def write_report(path, report):
         os.unlink(temporary)
 
 
+def preflight_output(path):
+    """Check private temporary writes and atomic publication before inference."""
+    try:
+        parent = Path(path).parent
+        parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".speech-eval-check-", dir=parent) as owned:
+            source = Path(owned) / "source"
+            with source.open("xb") as output:
+                output.write(b"report preflight")
+                output.flush()
+                os.fsync(output.fileno())
+            os.link(source, Path(owned) / "linked")
+    except OSError as error:
+        raise ValueError("report directory cannot write and atomically publish a report") from error
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -47,6 +63,7 @@ def main(argv=None):
             return 0
         if args.output.exists() or args.output.is_symlink():
             raise ValueError("report path already exists; choose a new output path")
+        preflight_output(args.output)
         report = runner.run(args.corpus, args.candidates, repetitions=args.repetitions,
                             allow_cloud=args.command == "run-cloud", max_total_seconds=args.max_seconds)
         write_report(args.output, report)

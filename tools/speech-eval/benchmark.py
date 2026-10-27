@@ -33,8 +33,11 @@ def strict_json(raw):
                 raise ValueError("duplicate JSON field")
             result[key] = value
         return result
-    return json.loads(raw, parse_constant=invalid_constant, parse_float=floating,
-                      parse_int=integer, object_pairs_hook=object_pairs)
+    try:
+        return json.loads(raw, parse_constant=invalid_constant, parse_float=floating,
+                          parse_int=integer, object_pairs_hook=object_pairs)
+    except RecursionError as error:
+        raise ValueError("JSON nesting exceeds supported depth") from error
 
 
 def sha256_file(path):

@@ -132,10 +132,12 @@ wrong source/model receipt or malformed output is a failure, never silence.
 
 Directory models are supported. Their fingerprint is SHA-256 of compact ASCII
 JSON `["speech-eval-tree-v1", [[relative_POSIX_path, file_SHA256], ...]]`, sorted by
-path. Empty bundles, symlinks/non-files, over 10,000 files or over 16 GiB are
+path. Empty bundles, symlinks/non-files, over 10,000 files, 20,000 total entries, 32 directory levels or 16 GiB are
 refused. Single-file pins use the ordinary file SHA-256. Optional `runtime_assets`
 is a list of `{ "id": "adapter-script", "path": "/absolute/adapter.py",
 "sha256": "<fingerprint>" }` for external adapter scripts/frameworks/lockfiles.
+File identity/size/change metadata is checked before and after each trial; changed
+artifacts invalidate the pair without rehashing large weights for every request.
 Pin all relevant runtime artifacts; a source revision alone does not freeze an
 untracked Python environment. Model/binary/runtime pins are checked before running.
 

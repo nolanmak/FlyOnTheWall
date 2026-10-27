@@ -50,3 +50,15 @@ class CliTests(unittest.TestCase):
         self.assertTrue(report["annotation_claims_only"])
         self.assertEqual(report["short_utterances_by_kind"], {"human": 0, "synthetic": 1, "silence": 0})
         self.assertEqual(report["ten_minute_paired_meeting_ids"], ["meeting"])
+
+    def test_unsupported_report_filesystem_refuses_before_any_adapter_runs(self):
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / "report.json"
+            report = {"paired_execution_complete": True, "rows": []}
+            with patch.object(runner, "run", return_value=report) as call, \
+                    patch.object(run_benchmark.os, "link", side_effect=OSError("unsupported")), \
+                    contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                code = run_benchmark.main(["run", "--corpus", "c", "--candidates", "m", "--output", str(output)])
+            self.assertEqual(code, 2)
+            call.assert_not_called()
+            self.assertEqual(list(Path(folder).iterdir()), [])

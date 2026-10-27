@@ -6,6 +6,7 @@ import platform
 from pathlib import Path
 import re
 import shutil
+import stat
 import struct
 import sys
 import tempfile
@@ -21,6 +22,35 @@ UNMEASURED = ["warm_release_to_result", "process_tree_peak_memory", "memory_pres
               "thermal_desktop_load", "license_review"]
 
 
+def bundle_entries(root):
+    entries = []
+    for entry in root.rglob("*"):
+        if len(entries) >= 20000 or len(entry.relative_to(root).parts) > 32:
+            raise ValueError("model bundle traversal exceeds limits")
+        entries.append(entry)
+    return sorted(entries)
+
+
+def file_stamp(path):
+    info = path.lstat()
+    if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+        raise ValueError("asset contains a symlink or non-file")
+    return (info.st_mode, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def asset_stamps(path):
+    path = Path(path)
+    root = (path, file_stamp(path))
+    return [root] + [(p, file_stamp(p)) for p in bundle_entries(path)] if path.is_dir() else [root]
+
+
+def assets_intact(stamps):
+    try:
+        return all(file_stamp(path) == expected for path, expected in stamps)
+    except (OSError, ValueError):
+        return False
+
+
 def asset_digest(path):
     """File SHA-256 or versioned, sorted directory-tree fingerprint, without symlinks."""
     path = Path(path)
@@ -34,7 +64,7 @@ def asset_digest(path):
         raise FileNotFoundError("asset unavailable")
     entries = []
     size = 0
-    for entry in sorted(path.rglob("*")):
+    for entry in bundle_entries(path):
         if entry.is_symlink():
             raise ValueError("model bundle cannot contain symlinks")
         if entry.is_dir():
@@ -224,7 +254,7 @@ def run(corpus_path, candidate_path, repetitions=1, allow_cloud=False, max_total
         raise ValueError("experiment exceeds 10000 request limit")
     if sum(f["audio_path"].stat().st_size for f in corpus["fixtures"]) > 2 * 1024**3:
         raise ValueError("corpus exceeds 2 GiB snapshot limit")
-    states, credentials = {}, {}
+    states, credentials, seals = {}, {}, {}
     for candidate in candidates:
         identity = candidate["id"]
         if candidate["mode"] == "cloud" and not allow_cloud:
@@ -243,16 +273,23 @@ def run(corpus_path, candidate_path, repetitions=1, allow_cloud=False, max_total
             states[identity] = "unsupported_offline_guard"
             continue
         try:
+            paths = [candidate["executable"], *([candidate["model_path"]] if candidate["mode"] == "local" else []),
+                     *(a["path"] for a in candidate.get("runtime_assets", []))]
+            seal = [entry for path in paths for entry in asset_stamps(path)]
             if asset_digest(candidate["executable"]) != candidate["executable_sha256"] or (
                 candidate["mode"] == "local" and asset_digest(candidate["model_path"]) != candidate["model_sha256"]
             ):
                 states[identity] = "asset_mismatch"
             if any(asset_digest(a["path"]) != a["sha256"] for a in candidate.get("runtime_assets", [])):
                 states[identity] = "asset_mismatch"
+            if not assets_intact(seal):
+                states[identity] = "asset_changed"
+            if identity not in states:
+                seals[identity] = seal
         except (OSError, ValueError):
             states[identity] = "asset_unavailable"
     started = time.monotonic()
-    rows, compromised = [], False
+    rows, compromised = [], None
     with tempfile.TemporaryDirectory(prefix="paired-speech-inputs-") as owned:
         fixtures = snapshot(corpus, Path(owned))
         for fixture_index, fixture in enumerate(fixtures):
@@ -264,13 +301,20 @@ def run(corpus_path, candidate_path, repetitions=1, allow_cloud=False, max_total
                            "kind": fixture["kind"], "tags": fixture["tags"],
                            "duration_ms": fixture["duration_ms"]}
                     rows.append(row)
-                    if compromised or not input_intact(fixture):
-                        compromised = True
-                        row["status"] = "input_changed"
+                    if compromised:
+                        row["status"] = compromised
+                        continue
+                    if not input_intact(fixture):
+                        compromised = "input_changed"
+                        row["status"] = compromised
                         continue
                     state = states.get(candidate["id"])
                     if state:
                         row["status"] = state
+                        continue
+                    if not assets_intact(seals[candidate["id"]]):
+                        compromised = "asset_changed"
+                        row["status"] = compromised
                         continue
                     remaining = max_total_seconds - (time.monotonic() - started)
                     if remaining <= 0:
@@ -290,8 +334,12 @@ def run(corpus_path, candidate_path, repetitions=1, allow_cloud=False, max_total
                                       extra_env=credentials.get(candidate["id"]))
                     row.update(status=result["status"], elapsed_ms=result["elapsed_ms"])
                     if not input_intact(fixture):
-                        compromised = True
-                        row["status"] = "input_changed"
+                        compromised = "input_changed"
+                        row["status"] = compromised
+                        continue
+                    if not assets_intact(seals[candidate["id"]]):
+                        compromised = "asset_changed"
+                        row["status"] = compromised
                         continue
                     if result["status"] != "ok":
                         continue
