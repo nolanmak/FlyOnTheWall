@@ -68,6 +68,12 @@ struct Pending {
     used: usize,
     accepted_ms: u64,
 }
+struct Offered<'a> {
+    epoch: u64,
+    start: u64,
+    mic: &'a [f32],
+    reference: Option<&'a [f32]>,
+}
 /// Single-owner nonblocking command and publication boundary.
 /// Call on the recording pump/control thread, never a realtime callback. The
 /// caller must archive mic/system PCM before admission and persist processed
@@ -154,6 +160,58 @@ impl Worker {
         now_ms: u64,
         out: &mut Vec<Output>,
     ) -> Result<(), Error> {
+        self.submit_inner(
+            Offered {
+                epoch,
+                start,
+                mic,
+                reference,
+            },
+            now_ms,
+            out,
+            false,
+        )
+        .map(|_| ())
+    }
+    /// Try admission without discarding already accepted work on saturation.
+    /// False leaves this input unaccepted and its start position unchanged;
+    /// the caller must retain it within its own bounded queue and enforce its
+    /// own admission deadline. Prior outputs
+    /// and expired originals may still be published by the initial poll.
+    pub fn try_submit(
+        &mut self,
+        epoch: u64,
+        start: u64,
+        mic: &[f32],
+        reference: Option<&[f32]>,
+        now_ms: u64,
+        out: &mut Vec<Output>,
+    ) -> Result<bool, Error> {
+        self.submit_inner(
+            Offered {
+                epoch,
+                start,
+                mic,
+                reference,
+            },
+            now_ms,
+            out,
+            true,
+        )
+    }
+    fn submit_inner(
+        &mut self,
+        offered: Offered<'_>,
+        now_ms: u64,
+        out: &mut Vec<Output>,
+        defer_when_full: bool,
+    ) -> Result<bool, Error> {
+        let Offered {
+            epoch,
+            start,
+            mic,
+            reference,
+        } = offered;
         if self.closed
             || epoch != self.epoch
             || start != self.next
@@ -166,20 +224,23 @@ impl Worker {
         }
         self.poll(now_ms, out)?;
         if mic.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
         if self.retained + mic.len() > self.config.pending_samples {
+            if defer_when_full {
+                return Ok(false);
+            }
             self.fallback(BypassReason::WorkerBusy, out);
         }
-        self.next += mic.len() as u64;
         if self.commands.is_none() || !self.status.is_running() {
+            self.next += mic.len() as u64;
             out.push(Output {
                 epoch: self.epoch,
                 start_sample: start,
                 samples: mic.to_vec(),
                 kind: OutputKind::Raw(BypassReason::BackendFailed),
             });
-            return Ok(());
+            return Ok(true);
         }
         let input = Input {
             fence: self.fence.load(Ordering::Acquire),
@@ -187,6 +248,20 @@ impl Worker {
             mic: mic.to_vec(),
             reference: reference.map(<[f32]>::to_vec),
         };
+        let reason = match self
+            .commands
+            .as_ref()
+            .unwrap()
+            .try_send(Command::Input(input))
+        {
+            Ok(()) => None,
+            Err(TrySendError::Full(_)) if defer_when_full => return Ok(false),
+            Err(TrySendError::Full(_)) => Some(BypassReason::WorkerBusy),
+            Err(TrySendError::Disconnected(_)) => Some(BypassReason::BackendFailed),
+        };
+        // The worker may compute immediately, but only this owner polls results.
+        // Record ownership before returning to the next poll.
+        self.next += mic.len() as u64;
         self.pending.push_back(Pending {
             start,
             samples: mic.to_vec(),
@@ -194,20 +269,13 @@ impl Worker {
             accepted_ms: now_ms,
         });
         self.retained += mic.len();
-        match self
-            .commands
-            .as_ref()
-            .unwrap()
-            .try_send(Command::Input(input))
-        {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => self.fallback(BypassReason::WorkerBusy, out),
-            Err(TrySendError::Disconnected(_)) => {
-                self.fallback(BypassReason::BackendFailed, out);
+        if let Some(reason) = reason {
+            self.fallback(reason, out);
+            if reason == BypassReason::BackendFailed {
                 self.commands.take();
             }
         }
-        Ok(())
+        Ok(true)
     }
     /// Drain currently available results and enforce the owner deadline.
     pub fn poll(&mut self, now_ms: u64, out: &mut Vec<Output>) -> Result<(), Error> {
