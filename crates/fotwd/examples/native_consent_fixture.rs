@@ -39,6 +39,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )),
         ),
         ("detection-prompt", None),
+        ("detection-not-now", None),
+        ("detection-never", None),
     ] {
         let root = tempfile::Builder::new()
             .prefix("owned-consent-")
@@ -87,7 +89,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     dwell: Duration::ZERO,
                     ..Default::default()
                 });
-            host = host.with_detection(input);
+            let preferences = fotwd::detection_preferences::DetectionPreferences::spawn(
+                fotw_store::Db::open_in_memory(&fotw_store::DbKey::from_bytes([0x55; 32]))?,
+                fotwd::audit::AuditLog::at(&root.path().join("sessions")),
+            )?;
+            host = host
+                .with_detection(input)
+                .with_detection_preferences(preferences);
             sender.try_send(fotwd::native_detection::ActivitySample {
                 captured_at_ns: fotw_audio::clock::host_ns(),
                 snapshot: Ok(ActivitySnapshot {
@@ -107,6 +115,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             assert_eq!(host.view().prompt.as_ref().unwrap().app_key, "us.zoom.xos");
             Some(sender)
         };
+        if matches!(name, "detection-not-now" | "detection-never") {
+            let (choice, answer) = if name == "detection-never" {
+                (
+                    fotw_shell::PromptChoice::NeverForThisApp,
+                    "never_for_this_app",
+                )
+            } else {
+                (fotw_shell::PromptChoice::NotNow, "not_now")
+            };
+            fotw_shell::platform::macos::probe_decline_control(&mut host, choice, Monotonic::ZERO)?;
+            host.on_event(SurfaceEvent::Menu(MenuAction::Quit), Monotonic::ZERO);
+            let began = Instant::now();
+            while !host.should_exit() {
+                assert!(began.elapsed() < Duration::from_secs(5));
+                host.tick(Monotonic::ZERO);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(configured.load(Ordering::SeqCst), 0);
+            let log = fotwd::audit::AuditLog::at(&root.path().join("sessions")).read()?;
+            assert_eq!(log.len(), 1);
+            assert!(matches!(&log[0].kind,
+                fotwd::audit::AuditKind::DetectionDeclined {app, answer: actual}
+                if app=="us.zoom.xos" && actual==answer));
+            std::fs::write(
+                output.join(format!("{name}.txt")),
+                format!(
+                    "actual_owned_dismissal_control=true\nnonactivating=true\naudit_answer={answer}\naudit_app=us.zoom.xos\nconfiguration_calls=0\ncapture_calls=0\nshutdown_drained=true\n"
+                ),
+            )?;
+            continue;
+        }
         let probe =
             fotw_shell::platform::macos::probe_consent_controls(&mut host, Monotonic::ZERO)?;
         assert!(

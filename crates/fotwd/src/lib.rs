@@ -9,6 +9,7 @@
 pub mod audit;
 pub mod consent;
 pub mod detect;
+pub mod detection_preferences;
 pub mod documents;
 pub mod engine;
 pub mod engine_control;

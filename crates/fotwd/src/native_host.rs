@@ -40,6 +40,9 @@ pub struct NativeHost {
     now: Monotonic,
     detection: Option<crate::native_detection::NativeDetection>,
     detected: Option<fotw_shell::DetectedMeeting>,
+    detection_preferences: Option<crate::detection_preferences::DetectionPreferences>,
+    detection_save_failed: bool,
+    detection_failure_acknowledged: bool,
     pending_detection_start: bool,
     _owner: Option<std::sync::Arc<crate::instance::InstanceOwner>>,
     action_feedback: Option<std::sync::mpsc::Receiver<String>>,
@@ -70,6 +73,9 @@ impl NativeHost {
             now: Monotonic::ZERO,
             detection: None,
             detected: None,
+            detection_preferences: None,
+            detection_save_failed: false,
+            detection_failure_acknowledged: false,
             pending_detection_start: false,
             _owner: None,
             action_feedback: None,
@@ -77,9 +83,36 @@ impl NativeHost {
     }
     /// Attach read-only background activity observations. Detection only offers consent.
     #[must_use]
-    pub fn with_detection(mut self, detection: crate::native_detection::NativeDetection) -> Self {
+    pub fn with_detection(
+        mut self,
+        mut detection: crate::native_detection::NativeDetection,
+    ) -> Self {
+        if let Some(preferences) = &self.detection_preferences {
+            detection.restore_suppressions(preferences.initial_apps());
+        }
         self.detection = Some(detection);
         self
+    }
+    /// Attach encrypted preferences/audit before automatic detection is offered.
+    #[must_use]
+    pub fn with_detection_preferences(
+        mut self,
+        preferences: crate::detection_preferences::DetectionPreferences,
+    ) -> Self {
+        if let Some(detection) = self.detection.as_mut() {
+            detection.restore_suppressions(preferences.initial_apps());
+        }
+        self.detection_preferences = Some(preferences);
+        self
+    }
+    pub(crate) fn with_detection_error(mut self, error: String) -> Self {
+        self.action_error = Some(error);
+        self
+    }
+    fn detection_save_pending(&self) -> bool {
+        self.detection_preferences
+            .as_ref()
+            .is_some_and(|p| p.pending())
     }
     pub(crate) fn with_owner(
         mut self,
@@ -133,16 +166,20 @@ impl NativeHost {
         }
     }
     fn quit(&mut self, now: Monotonic, acknowledge_recovery: bool) {
-        if self.quitting.is_some()
-            && self
+        if self.quitting.is_some() {
+            let capture_failed = self
                 .snapshot
                 .as_ref()
-                .is_some_and(|s| s.shutdown.drained() && s.shutdown.save_failed)
-        {
-            if acknowledge_recovery {
-                self.quit_save_failure_acknowledged = true;
+                .is_some_and(|s| s.shutdown.drained() && s.shutdown.save_failed);
+            if capture_failed || self.detection_save_failed {
+                if acknowledge_recovery {
+                    // These acknowledgements cannot cover a later, unseen
+                    // failure in the other persistence path.
+                    self.quit_save_failure_acknowledged |= capture_failed;
+                    self.detection_failure_acknowledged |= self.detection_save_failed;
+                }
+                return;
             }
-            return;
         }
         // Close HTTP/native admission before cancelling a ticket: cancellation
         // can release the live slot and enter persistence before the next pump.
@@ -164,12 +201,27 @@ impl NativeHost {
         };
         view.menu.record.enabled = false;
         let shutdown = self.snapshot.as_ref().map(|s| s.shutdown);
-        let failed = shutdown.is_some_and(|s| s.drained() && s.save_failed);
-        let drained = shutdown.is_some_and(crate::recorder_lifecycle::ShutdownStatus::drained);
+        let capture_failed = shutdown.is_some_and(|s| s.drained() && s.save_failed);
+        let failed = capture_failed || self.detection_save_failed;
+        let drained = shutdown.is_some_and(crate::recorder_lifecycle::ShutdownStatus::drained)
+            && !self.detection_save_pending();
         let waiting = self.now.since(began) >= Duration::from_secs(30);
         let message = if failed {
-            view.menu.quit.label = "Quit; recover audio next launch".into();
-            "Save not confirmed. Quit again to acknowledge recovery on next launch."
+            view.menu.quit.label = if !capture_failed && self.detection_save_failed {
+                "Quit; acknowledge unsaved preferences"
+            } else {
+                "Quit; recover audio next launch"
+            }
+            .into();
+            if capture_failed && self.detection_save_failed {
+                "Audio saving and detection preferences were not confirmed. Quit again to acknowledge audio recovery on next launch."
+            } else if self.detection_save_failed {
+                "A detection preference or decline audit was not saved. Quit again to acknowledge."
+            } else {
+                "Save not confirmed. Quit again to acknowledge recovery on next launch."
+            }
+        } else if self.detection_save_pending() {
+            "Saving detection preferences before closing the app."
         } else if drained {
             "Capture and audio saving have finished. Closing the app."
         } else if waiting {
@@ -188,7 +240,11 @@ impl NativeHost {
                 elapsed: Duration::ZERO,
                 elapsed_label: "—".into(),
                 status_label: if failed {
-                    "Save needs recovery"
+                    if !capture_failed && self.detection_save_failed {
+                        "Preferences not saved"
+                    } else {
+                        "Save needs recovery"
+                    }
                 } else if drained {
                     "Closing"
                 } else if waiting {
@@ -214,7 +270,11 @@ impl NativeHost {
             .is_some_and(|s| s.observation.status().is_active())
         {
             view.menu.status = if failed {
-                "Save needs recovery"
+                if !capture_failed && self.detection_save_failed {
+                    "Preferences not saved"
+                } else {
+                    "Save needs recovery"
+                }
             } else if drained {
                 "Closing"
             } else {
@@ -283,7 +343,11 @@ impl NativeHost {
             } else {
                 "Cancel"
             },
-            never_label: "",
+            never_label: if self.detected.is_some() && self.detection_preferences.is_some() {
+                "Never for this app"
+            } else {
+                ""
+            },
             acknowledge_label: "Everyone in this meeting has agreed to be recorded",
         })
     }
@@ -296,7 +360,7 @@ impl SurfaceHost for NativeHost {
         if self.prompt_origin == Some(StartOrigin::DetectionPrompt)
             && matches!(
                 &event,
-                SurfaceEvent::Acknowledge(_) | SurfaceEvent::Prompt(PromptChoice::Start { .. })
+                SurfaceEvent::Acknowledge(_) | SurfaceEvent::Prompt(_)
             )
         {
             self.poll_detection(now);
@@ -354,12 +418,37 @@ impl SurfaceHost for NativeHost {
                     }
                 }
             }
-            SurfaceEvent::Prompt(PromptChoice::NotNow | PromptChoice::NeverForThisApp) => {
-                // No persistent "never" control is exposed by this host yet.
+            SurfaceEvent::Prompt(
+                choice @ (PromptChoice::NotNow | PromptChoice::NeverForThisApp),
+            ) => {
+                if self.quitting.is_some() {
+                    return;
+                }
                 if self.prompt_origin == Some(StartOrigin::DetectionPrompt)
-                    && let Some(detection) = self.detection.as_mut()
+                    && let Some(meeting) = self.detected.as_ref()
                 {
-                    detection.snooze(now);
+                    let never = choice == PromptChoice::NeverForThisApp;
+                    if let Some(preferences) = &self.detection_preferences {
+                        let answer = if never {
+                            crate::detection_preferences::DeclineAnswer::NeverForThisApp
+                        } else {
+                            crate::detection_preferences::DeclineAnswer::NotNow
+                        };
+                        if let Err(error) = preferences.submit(meeting.app_key.clone(), answer) {
+                            self.action_error = Some(error);
+                            return;
+                        }
+                    } else if never {
+                        // Never claim persistence when storage was not attached.
+                        return;
+                    }
+                    if let Some(detection) = self.detection.as_mut() {
+                        if never {
+                            detection.suppress(&meeting.app_key);
+                        } else {
+                            detection.snooze(now);
+                        }
+                    }
                 }
                 self.detected = None;
                 self.prompt_origin = None;
@@ -369,6 +458,15 @@ impl SurfaceHost for NativeHost {
     }
     fn tick(&mut self, now: Monotonic) {
         self.now = now;
+        if let Some(preferences) = &self.detection_preferences
+            && let Some(Err(error)) = preferences.poll()
+        {
+            // An unrelated later success cannot repair an earlier failed
+            // suppression or audit entry.
+            self.detection_save_failed = true;
+            self.detection_failure_acknowledged = false;
+            self.action_error = Some(error);
+        }
         if let Some(feedback) = &self.action_feedback
             && let Ok(error) = feedback.try_recv()
         {
@@ -542,7 +640,9 @@ impl SurfaceHost for NativeHost {
         self.quitting.is_some()
             && self.snapshot.as_ref().is_some_and(|s| {
                 s.shutdown.drained()
+                    && !self.detection_save_pending()
                     && (!s.shutdown.save_failed || self.quit_save_failure_acknowledged)
+                    && (!self.detection_save_failed || self.detection_failure_acknowledged)
             })
     }
     fn did_render(&mut self) {
