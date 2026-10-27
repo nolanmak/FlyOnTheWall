@@ -81,6 +81,14 @@ Where CI still differs from a local `just ci`:
 The recipes build with 3 parallel cargo jobs so the machine stays usable; set
 `CARGO_BUILD_JOBS` to change that.
 
+### Experimental echo cancellation
+
+Normal builds omit the live AEC coordinator and recording-pump adapter.
+`cargo test -p fotwd --features experimental-aec` explicitly enables their
+synthetic integration tests. `just ci` runs both default and explicitly enabled checks. This flag selects no
+native backend, downloads no weights and does not qualify a canceller for release. Durable processing journals
+and replay remain readable without it. Acceptance in #72 remains open.
+
 ### Dependency changes and third-party notices
 
 `THIRD_PARTY_NOTICES.md` carries the license texts for everything compiled into

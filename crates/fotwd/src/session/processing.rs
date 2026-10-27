@@ -1,18 +1,25 @@
-//! Actual recording-pump adapter; originals are synced before every admission.
+//! Capture metadata and the opt-in recording-pump AEC adapter.
+#[cfg(feature = "experimental-aec")]
 use super::{LegChannel, PcmFeed};
+#[cfg(feature = "experimental-aec")]
 use crate::live_aec::{ConversionChain, Coordinator, Prepared};
-use fotw_audio::{StreamFormat, clock::Clock};
+use fotw_audio::StreamFormat;
+#[cfg(feature = "experimental-aec")]
+use fotw_audio::clock::Clock;
+#[cfg(feature = "experimental-aec")]
 use fotw_pipeline::{
     aec::{BypassReason, Output, OutputKind},
     reference_resample::{AlignmentEpoch, Config, NativeFrame, ProcessingFrame, TapGeneration},
-    resample::ConversionOrigin,
-    ring::CaptureObservation,
 };
+use fotw_pipeline::{resample::ConversionOrigin, ring::CaptureObservation};
+#[cfg(feature = "experimental-aec")]
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
 
+// Capture/recovery still carries native timestamp metadata without a processor.
+#[cfg_attr(not(feature = "experimental-aec"), allow(dead_code))]
 pub(super) struct NativeContext<'a> {
     pub(super) generation: u64,
     pub(super) format: StreamFormat,
@@ -22,12 +29,14 @@ pub(super) struct NativeContext<'a> {
     pub(super) samples: &'a [f32],
 }
 #[derive(Clone, Copy)]
+#[cfg(feature = "experimental-aec")]
 struct Shape {
     generation: u64,
     format: StreamFormat,
     phase: ConversionOrigin,
     archive_start: u64,
 }
+#[cfg(feature = "experimental-aec")]
 impl Shape {
     fn initial(format: StreamFormat) -> Self {
         Self {
@@ -41,6 +50,7 @@ impl Shape {
         }
     }
 }
+#[cfg(feature = "experimental-aec")]
 pub(super) struct PumpAec {
     owner: Coordinator,
     sink: Arc<dyn PcmFeed>,
@@ -57,6 +67,7 @@ pub(super) struct PumpAec {
     deadline_ms: u64,
     warnings: Vec<String>,
 }
+#[cfg(feature = "experimental-aec")]
 impl PumpAec {
     #[allow(clippy::too_many_arguments)] // capture/archive geometry and source admission
     pub(super) fn bind(

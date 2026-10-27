@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [features]
+# Unqualified live AEC coordination; explicitly opt in for experiments only.
+# Normal app builds omit live coordination, admission and the pump adapter.
+experimental-aec = []
 # Compiles the #83 test-egress refusal into `engine::resolve_binary`, and with
 # it `fotwd::testing`. Never enabled for a shipped build -- see the self
 # dev-dependency below for how it is switched on, and why it has to be.

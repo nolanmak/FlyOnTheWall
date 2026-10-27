@@ -86,6 +86,7 @@ mod compatibility {
 /// samples, so recovering never substitutes a differently filtered prefix.
 pub(crate) struct CanonicalInput(ArchiveConverter);
 impl CanonicalInput {
+    #[cfg(feature = "experimental-aec")]
     pub(crate) fn output_origin(&self) -> fotw_pipeline::resample::ConversionOrigin {
         self.0.output_origin()
     }
