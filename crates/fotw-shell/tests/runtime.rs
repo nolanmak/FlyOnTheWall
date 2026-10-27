@@ -22,6 +22,42 @@ fn toggle_chord() -> Chord {
 }
 
 #[test]
+fn pending_warning_blocks_menu_hotkey_and_direct_requests_until_acknowledged() {
+    for origin in StartOrigin::ALL {
+        let (mut rt, host) = runtime();
+        let meeting = DetectedMeeting::new("owned.test", "Owned", "Synthetic activity")
+            .with_consent_notice("Synthetic blocking warning", true);
+        rt.meeting_detected(Monotonic::ZERO, meeting.clone());
+        match origin {
+            StartOrigin::Menu => rt.on_menu(MenuAction::ToggleRecording, Monotonic::ZERO),
+            StartOrigin::Hotkey => {
+                assert!(rt.on_chord(toggle_chord(), Monotonic::ZERO));
+            }
+            _ => rt.request_start(origin, Monotonic::ZERO),
+        }
+        assert_eq!(host.count(&HostCall::StartCapture), 0, "{origin:?}");
+        assert_eq!(host.count(&HostCall::AuditStart(origin)), 0);
+        assert!(rt.view().prompt.is_some());
+
+        rt.acknowledge_prompt(true);
+        rt.request_start(origin, Monotonic::ZERO);
+        assert_eq!(host.count(&HostCall::StartCapture), 1);
+        assert_eq!(host.count(&HostCall::AuditStart(origin)), 1);
+        rt.request_stop();
+        rt.capture_finished(Monotonic::ZERO);
+        rt.dismiss();
+        rt.meeting_detected(Monotonic::ZERO, meeting);
+        rt.request_start(origin, Monotonic::ZERO);
+        assert_eq!(
+            host.count(&HostCall::StartCapture),
+            1,
+            "stale acknowledgement"
+        );
+        assert!(!rt.view().prompt.unwrap().acknowledged);
+    }
+}
+
+#[test]
 fn the_toggle_hotkey_starts_then_stops_capture() {
     let (mut rt, host) = runtime();
 
