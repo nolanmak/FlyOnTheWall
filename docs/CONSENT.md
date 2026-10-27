@@ -182,13 +182,40 @@ Built and verified:
   pre-filled consent email.
 - **Local-only by construction**, with an exact-host egress allowlist.
 
-**A second gap, and the more urgent one.** The all-party jurisdiction warning
-blocks Start **only on the detection-prompt path**. `ShellCore::toggle()` —
-which both the menu item and the global hotkey call — never consults
-jurisdiction at all, so ⇧⌘R starts recording in California with no warning
-shown. A gate covering one of three start paths is not a gate, and the hotkey
-is the path a regular user actually reaches for because it is the fast one.
-Tracked as #57.
+### Current production Start admission
+
+The connected native app uses `fotwd::native_host::NativeHost`, not
+`ShellRuntime`/`ShellCore::toggle()`, for its menu and global-hotkey actions.
+Both idle actions open a fresh prompt. Start stays disabled until the user
+checks “Everyone in this meeting has agreed to be recorded”; accepting Start
+also requires that explicit acknowledgement. A new prompt clears the previous
+answer. This applies to every native recording, regardless of the jurisdiction
+classification. Detected offers use the same acknowledgement and recorder
+admission, with their current meeting notice. Detection alone cannot start it.
+
+`RecorderBridge::start_context` and `DaemonRecorder::start_native_context`
+independently reject missing acknowledgement before capture admission. The
+dashboard has its own explicit consent checkbox; it does not inherit a native
+prompt's answer. In the connected native app, both native and dashboard starts
+also need a rendered Preparing frame before opening capture devices.
+
+The old #57 report describes the standalone `fotw-shell` state machine: its
+direct `toggle()` still does not apply the detection prompt's jurisdiction gate.
+It is not the production recorder-admission layer, and custom users of that
+standalone API must not treat it as a consent guarantee. This distinction does
+not resolve that API limitation or establish physical hotkey/TCC acceptance.
+
+Source and device-free checks:
+
+- [`native_host.rs`](../crates/fotwd/src/native_host.rs): manual and detected prompts.
+- [`native_bridge.rs`](../crates/fotwd/src/native_bridge.rs) and
+  [`recording.rs`](../crates/fotwd/src/recording.rs): recorder admission.
+- [`tests/native_bridge.rs`](../crates/fotwd/tests/native_bridge.rs):
+  `native_menu_and_hotkey_require_a_fresh_explicit_consent_prompt`, detected-offer,
+  stale-answer and renderer-admission regressions. These use disposable synthetic
+  sources, not real microphones or global keyboard events.
+
+### Disclosure evidence remains incomplete
 
 **The first gap, stated plainly.** The `meetings.disclosed` column exists, is
 exported, and has a builder — and **nothing in the codebase ever sets it to
@@ -203,9 +230,10 @@ What that needs, concretely:
 1. **A disclosure ledger per meeting** — what was disclosed, by which channel
    (calendar / chat / verbal / email), when, and by whom. Append-only, exported
    with the meeting, because evidence you can edit afterwards is not evidence.
-2. **A pre-flight gate in all-party jurisdictions.** The escalation is already
-   computed; Start should require acknowledging it, and that acknowledgement
-   should be what sets `disclosed`.
+2. **Connect admission acknowledgements to disclosure evidence.** The production
+   gate above records a user's consent assertion; it does not establish what
+   notice was actually delivered, to whom, or by which channel. A disclosure
+   ledger must preserve that distinction rather than infer notice from Start.
 3. **First-class objection handling.** One action that stops recording *and*
    deletes, because the correct response to an objection is not a menu.
 4. **Retention that is a promise, not a default.** "How long do you keep it"
