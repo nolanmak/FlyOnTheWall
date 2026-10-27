@@ -146,6 +146,67 @@ Cloud adapters use `mode: "cloud"`, generic format and
 not provisioned yet is explicitly `{ "id": "parakeet", "mode": "local",
 "unconfigured": true }`. It cannot claim invented model/runtime pins.
 
+### Nova-3 adapter
+
+`deepgram_adapter.py` supplies the prerecorded English Nova-3 candidate. It uploads
+only the explicit WAV, once, to `https://api.deepgram.com/v1/listen`. Its CLI also
+requires `--allow-cloud`; the runner's `run` command still skips it before launch.
+There is no endpoint override, proxy discovery, redirect following, retry or model
+discovery. Credentials come only from the explicitly supplied environment.
+
+Use an **actual available dated version** from your provider configuration, with
+model ID `nova-3@YYYY-MM-DD.REVISION`. `latest` and bare `nova-3` are rejected. The
+request sets that exact `version`, and the response must identify one model with
+matching version and `nova-3` architecture before it becomes an ASR result. This
+pins the provider's reported version, not a remotely verifiable weight hash. No
+version availability or live provider success is implied by synthetic tests.
+
+Configure a generic cloud candidate as above, with these fields:
+
+```json
+{
+  "id": "nova3-raw-baseline",
+  "mode": "cloud",
+  "format": "asr-eval-v1",
+  "executable": "/absolute/pinned/python3",
+  "executable_sha256": "<Python binary SHA-256>",
+  "runtime_revision": "<adapter Git revision and Python version>",
+  "model_id": "nova-3@<actual dated version>",
+  "credential_env": "DEEPGRAM_API_KEY",
+  "use_terms": false,
+  "timeout_seconds": 180,
+  "argv": ["/absolute/deepgram_adapter.py", "--allow-cloud",
+           "--audio", "{audio_wav}", "--model-id", "{model_id}",
+           "--terms-json", "{terms_json}"],
+  "runtime_assets": [
+    {"id": "adapter", "path": "/absolute/deepgram_adapter.py", "sha256": "<SHA-256>"},
+    {"id": "protocol", "path": "/absolute/benchmark.py", "sha256": "<SHA-256>"},
+    {"id": "scoring", "path": "/absolute/speech_eval.py", "sha256": "<SHA-256>"}
+  ]
+}
+```
+
+Resolve the executable symlink before fingerprinting, and pin the Python runtime
+environment. The adjacent protocol/scoring modules are runtime dependencies.
+Create a second candidate with a distinct ID and `use_terms: true` for a vocabulary
+trial. The adapter sends repeated, URL-encoded `keyterm` parameters (up to 100 plain
+terms), preserving phrases and symbols. It does not use the legacy weighted
+`keywords` option. English, punctuation, smart formatting, diarization and utterance
+settings are fixed: English is enabled and the four transformations are disabled.
+Thus results evaluate raw prerecorded ASR, not production streaming, endpointing,
+speaker attribution, cleanup or formatted-number behavior.
+
+`mip_opt_out=true` is always sent; Deepgram documents pricing impacts for this
+option. Uploading/paid runs require separate authorization and supplied credentials.
+No live request or credential lookup runs in CI. The response is byte-bounded;
+errors emit a fixed diagnostic without server bodies, keys or transcripts. The
+socket timeout is 120 seconds; the runner's owned process deadline supplies the
+total wall-time bound, including a server that sends data slowly.
+
+Protocol references: [prerecorded audio](https://developers.deepgram.com/reference/speech-to-text/listen-pre-recorded),
+[version](https://developers.deepgram.com/docs/version),
+[keyterm prompting](https://developers.deepgram.com/docs/keyterm).
+
 ## Measurement scope
 
 Candidate order rotates across fixtures/trials. Every candidate uses the same
