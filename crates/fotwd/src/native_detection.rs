@@ -76,6 +76,12 @@ impl NativeDetection {
             update
         }
     }
+    pub(crate) fn restore_suppressions(&mut self, apps: &[String]) {
+        self.detector.restore_suppressions(apps.iter().cloned());
+    }
+    pub(crate) fn suppress(&mut self, app: &str) {
+        self.detector.suppress_app(app);
+    }
     pub(crate) fn snooze(&mut self, now: Monotonic) {
         self.detector.snooze(now);
     }

@@ -974,3 +974,234 @@ async fn detected_start_revalidates_a_closed_sampler_without_waiting_for_the_nex
     assert!(host.view().prompt.is_none());
     assert_eq!(opened.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_declining_a_detected_offer_records_the_app_and_never_starts_capture() {
+    use fotw_shell::{Monotonic, PromptChoice, SurfaceEvent, SurfaceHost};
+    use fotwd::native_detection::{ActivitySample, NativeDetection};
+    let root = tempfile::tempdir().unwrap();
+    let gate = RenderGate::new(Duration::from_secs(3));
+    let opened = Arc::new(AtomicU64::new(0));
+    let rec = recorder(root.path(), &gate, opened.clone());
+    let (input, sender) = NativeDetection::channel(fotwd::detect::DetectorConfig {
+        dwell: Duration::ZERO,
+        ..Default::default()
+    });
+    let prefs = fotwd::detection_preferences::DetectionPreferences::spawn(
+        fotw_store::Db::open_in_memory(&fotw_store::DbKey::from_bytes([0x43; 32])).unwrap(),
+        fotwd::audit::AuditLog::at(&root.path().join("sessions")),
+    )
+    .unwrap();
+    let mut host = native_host(rec, gate)
+        .with_detection(input)
+        .with_detection_preferences(prefs);
+    until(|| {
+        host.tick(Monotonic::ZERO);
+        host.view().menu.record.enabled
+    })
+    .await;
+    sender
+        .try_send(ActivitySample {
+            captured_at_ns: fotw_audio::clock::host_ns(),
+            snapshot: Ok(fotw_audio::activity::ActivitySnapshot {
+                clients: vec![
+                    fotw_audio::activity::AudioClient::new(123, Some("us.zoom.xos"))
+                        .with_input(true)
+                        .with_output(true),
+                ],
+                default_input: None,
+            }),
+        })
+        .unwrap();
+    host.tick(Monotonic::ZERO);
+    assert!(host.view().prompt.is_some());
+    host.on_event(SurfaceEvent::Prompt(PromptChoice::NotNow), Monotonic::ZERO);
+    until(|| {
+        host.tick(Monotonic::ZERO);
+        fotwd::audit::AuditLog::at(&root.path().join("sessions"))
+            .read()
+            .unwrap()
+            .iter()
+            .any(|e| {
+                matches!(&e.kind,
+                fotwd::audit::AuditKind::DetectionDeclined { app, answer }
+                if app == "us.zoom.xos" && answer == "not_now")
+            })
+    })
+    .await;
+    assert_eq!(opened.load(Ordering::SeqCst), 0);
+}
+
+fn detection_sample(app: &str) -> fotwd::native_detection::ActivitySample {
+    fotwd::native_detection::ActivitySample {
+        captured_at_ns: fotw_audio::clock::host_ns(),
+        snapshot: Ok(fotw_audio::activity::ActivitySnapshot {
+            clients: vec![
+                fotw_audio::activity::AudioClient::new(123, Some(app))
+                    .with_input(true)
+                    .with_output(true),
+            ],
+            default_input: None,
+        }),
+    }
+}
+async fn preference_host(
+    root: &std::path::Path,
+    db: fotw_store::Db,
+) -> (
+    fotwd::native_host::NativeHost,
+    std::sync::mpsc::SyncSender<fotwd::native_detection::ActivitySample>,
+    Arc<AtomicU64>,
+) {
+    use fotw_shell::{Monotonic, SurfaceHost};
+    let gate = RenderGate::new(Duration::from_secs(3));
+    let opened = Arc::new(AtomicU64::new(0));
+    let rec = recorder(root, &gate, opened.clone());
+    let prefs = fotwd::detection_preferences::DetectionPreferences::spawn(
+        db,
+        fotwd::audit::AuditLog::at(&root.join("sessions")),
+    )
+    .unwrap();
+    let (input, sender) =
+        fotwd::native_detection::NativeDetection::channel(fotwd::detect::DetectorConfig {
+            dwell: Duration::ZERO,
+            ..Default::default()
+        });
+    let mut host = native_host(rec, gate)
+        .with_detection_preferences(prefs)
+        .with_detection(input);
+    until(|| {
+        host.tick(Monotonic::ZERO);
+        host.view().menu.record.enabled
+    })
+    .await;
+    (host, sender, opened)
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn native_never_is_app_scoped_after_restart_and_does_not_disable_manual_consent() {
+    use fotw_shell::{MenuAction, Monotonic, PromptChoice, SurfaceEvent, SurfaceHost};
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("library.db");
+    let key = fotw_store::DbKey::from_bytes([0x52; 32]);
+    let (mut host, sender, opened) =
+        preference_host(root.path(), fotw_store::Db::open(&path, &key).unwrap()).await;
+    sender.try_send(detection_sample("us.zoom.xos")).unwrap();
+    host.tick(Monotonic::ZERO);
+    assert_eq!(
+        host.view().prompt.unwrap().never_label,
+        "Never for this app"
+    );
+    host.on_event(
+        SurfaceEvent::Prompt(PromptChoice::NeverForThisApp),
+        Monotonic::ZERO,
+    );
+    assert!(host.view().prompt.is_none());
+    // Stop the app immediately: Quit must wait for the accepted write.
+    host.on_event(SurfaceEvent::Menu(MenuAction::Quit), Monotonic::ZERO);
+    until(|| {
+        host.tick(Monotonic::ZERO);
+        host.should_exit()
+    })
+    .await;
+    assert_eq!(opened.load(Ordering::SeqCst), 0);
+    drop(host);
+    drop(sender);
+    let (mut restarted, sender, opened) =
+        preference_host(root.path(), fotw_store::Db::open(&path, &key).unwrap()).await;
+    sender.try_send(detection_sample("us.zoom.xos")).unwrap();
+    restarted.tick(Monotonic::ZERO);
+    assert!(
+        restarted.view().prompt.is_none(),
+        "restart forgot the suppression"
+    );
+    sender
+        .try_send(detection_sample("com.microsoft.teams2"))
+        .unwrap();
+    restarted.tick(Monotonic::ZERO);
+    assert_eq!(
+        restarted.view().prompt.unwrap().app_key,
+        "com.microsoft.teams2"
+    );
+    restarted.on_event(
+        SurfaceEvent::Menu(MenuAction::ToggleRecording),
+        Monotonic::ZERO,
+    );
+    let manual = restarted.view().prompt.unwrap();
+    assert_eq!(manual.app_key, "manual-recording");
+    assert!(manual.never_label.is_empty());
+    assert!(!manual.start_enabled);
+    restarted.on_event(SurfaceEvent::Prompt(PromptChoice::NotNow), Monotonic::ZERO);
+    assert!(restarted.view().prompt.is_none());
+    assert_eq!(opened.load(Ordering::SeqCst), 0);
+    let log = fotwd::audit::AuditLog::at(&root.path().join("sessions"))
+        .read()
+        .unwrap();
+    assert_eq!(
+        log.len(),
+        1,
+        "manual cancel must not create a detection decline"
+    );
+    assert!(
+        matches!(&log[0].kind, fotwd::audit::AuditKind::DetectionDeclined {app,answer}
+        if app=="us.zoom.xos" && answer=="never_for_this_app")
+    );
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_native_never_from_a_closed_sampler_cannot_save_or_audit_a_choice() {
+    use fotw_shell::{Monotonic, PromptChoice, SurfaceEvent, SurfaceHost};
+    let root = tempfile::tempdir().unwrap();
+    let db = fotw_store::Db::open_in_memory(&fotw_store::DbKey::from_bytes([0x53; 32])).unwrap();
+    let (mut host, sender, opened) = preference_host(root.path(), db).await;
+    sender.try_send(detection_sample("us.zoom.xos")).unwrap();
+    host.tick(Monotonic::ZERO);
+    assert!(host.view().prompt.is_some());
+    drop(sender);
+    host.on_event(
+        SurfaceEvent::Prompt(PromptChoice::NeverForThisApp),
+        Monotonic::ZERO,
+    );
+    host.tick(Monotonic::ZERO);
+    assert!(host.view().prompt.is_none());
+    assert!(
+        fotwd::audit::AuditLog::at(&root.path().join("sessions"))
+            .read()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(opened.load(Ordering::SeqCst), 0);
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn native_preference_audit_failure_is_visible_and_quit_requires_acknowledgement() {
+    use fotw_shell::{MenuAction, Monotonic, PromptChoice, SurfaceEvent, SurfaceHost};
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("audit.jsonl")).unwrap();
+    let db = fotw_store::Db::open_in_memory(&fotw_store::DbKey::from_bytes([0x54; 32])).unwrap();
+    let (mut host, sender, opened) = preference_host(root.path(), db).await;
+    sender.try_send(detection_sample("us.zoom.xos")).unwrap();
+    host.tick(Monotonic::ZERO);
+    host.on_event(
+        SurfaceEvent::Prompt(PromptChoice::NeverForThisApp),
+        Monotonic::ZERO,
+    );
+    host.on_event(SurfaceEvent::Menu(MenuAction::Quit), Monotonic::ZERO);
+    until(|| {
+        host.tick(Monotonic::ZERO);
+        host.view()
+            .tray
+            .tooltip
+            .contains("decline audit was not saved")
+    })
+    .await;
+    assert!(
+        !host.should_exit(),
+        "Quit discarded the failed preference acknowledgement"
+    );
+    assert!(host.view().menu.quit.label.contains("unsaved preferences"));
+    host.on_event(SurfaceEvent::Menu(MenuAction::Quit), Monotonic::ZERO);
+    until(|| {
+        host.tick(Monotonic::ZERO);
+        host.should_exit()
+    })
+    .await;
+    assert_eq!(opened.load(Ordering::SeqCst), 0);
+}

@@ -356,6 +356,51 @@ pub fn probe_consent_controls<H: SurfaceHost>(
     })
 }
 
+/// Exercise an actual owned dismissal button without global controls or capture.
+/// The injected host must already offer a detected meeting.
+///
+/// # Errors
+/// Missing/hidden controls, off-main-thread use or an incorrect native response.
+pub fn probe_decline_control<H: SurfaceHost>(
+    host: &mut H,
+    choice: PromptChoice,
+    now: Monotonic,
+) -> Result<(), String> {
+    let mtm = MainThreadMarker::new().ok_or_else(|| ShellError::NotMainThread.to_string())?;
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    let view = host.view();
+    let offered = view
+        .prompt
+        .as_ref()
+        .ok_or("owned host did not offer a prompt")?;
+    let control = match choice {
+        PromptChoice::NotNow if !offered.not_now_label.is_empty() => ProbePress::NotNow,
+        PromptChoice::NeverForThisApp if !offered.never_label.is_empty() => ProbePress::Never,
+        _ => return Err("owned host did not offer that dismissal control".into()),
+    };
+    let mut prompt = Prompt::new(mtm);
+    prompt.render(Some(offered), mtm);
+    if !prompt.nonactivating() || !prompt.is_on_a_screen(mtm) {
+        return Err("owned dismissal panel was not visible and nonactivating".into());
+    }
+    if !prompt.control_visible_and_enabled(control) {
+        prompt.render(None, mtm);
+        return Err("owned dismissal control was hidden or disabled".into());
+    }
+    prompt.press(control);
+    let response = prompt.take_response();
+    prompt.render(None, mtm);
+    if response != Some(choice) {
+        return Err("owned dismissal control returned the wrong response".into());
+    }
+    host.on_event(SurfaceEvent::Prompt(choice), now);
+    if host.view().prompt.is_some() {
+        return Err("owned dismissal did not withdraw the prompt".into());
+    }
+    Ok(())
+}
+
 /// Invoke the owned delegate's real Objective-C selectors without installing
 /// global controls or launching the product.
 ///

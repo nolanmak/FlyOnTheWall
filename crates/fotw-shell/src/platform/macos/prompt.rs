@@ -379,6 +379,17 @@ impl Prompt {
         })
     }
 
+    /// Read the actual control state after rendering.
+    pub(crate) fn control_visible_and_enabled(&self, control: ProbePress) -> bool {
+        let button = match control {
+            ProbePress::Start => &self.start,
+            ProbePress::NotNow => &self.not_now,
+            ProbePress::Never => &self.never,
+            ProbePress::Acknowledge => &self.acknowledge,
+        };
+        !button.isHidden() && button.isEnabled()
+    }
+
     /// Press a control the way a finger would, for [`super::probe`].
     ///
     /// `performClick:` goes through AppKit's real target/action dispatch, so a
