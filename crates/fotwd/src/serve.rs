@@ -744,7 +744,10 @@ async fn serve_until_stopped(
         // Load before starting the read-only sampler. Corrupt saved suppression
         // must not silently re-enable automatic offers; manual Start still works.
         let host = match crate::open_library(&root).and_then(|db| {
-            crate::detection_preferences::DetectionPreferences::spawn(db, crate::audit::AuditLog::at(&root))
+            crate::detection_preferences::DetectionPreferences::spawn(
+                db,
+                crate::audit::AuditLog::at(&root),
+            )
         }) {
             Ok(preferences) => host
                 .with_detection(crate::native_detection::spawn(
@@ -756,9 +759,12 @@ async fn serve_until_stopped(
                     },
                 ))
                 .with_detection_preferences(preferences),
-            Err(_) => host.with_detection_error(
-                "Automatic meeting prompts are disabled because saved detection preferences could not be loaded. Manual Start remains available.".into()
-            ),
+            Err(error) => {
+                diag!("  ! automatic meeting prompts are disabled: {error}");
+                host.with_detection_error(
+                    "Automatic meeting prompts are disabled because saved detection preferences could not be loaded. Manual Start remains available.".into()
+                )
+            }
         };
         startup
             .sender
