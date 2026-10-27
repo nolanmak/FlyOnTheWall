@@ -145,6 +145,20 @@ class DeepgramTests(unittest.TestCase):
                     adapter.transcribe(self.audio, self.model, [], 'owned-test-value')
                 connection.assert_not_called()
 
+    def test_truncated_riff_after_valid_pcm_is_rejected_before_connection(self):
+        original = self.audio.read_bytes()
+        complete = original + b'JUNK' + (8).to_bytes(4, 'little') + b'owned123'
+        complete = complete[:4] + (len(complete) - 8).to_bytes(4, 'little') + complete[8:]
+        self.audio.write_bytes(complete[:-6])
+        with self.assertRaises(ValueError):
+            benchmark.wav_duration(self.audio)
+        with patch.object(adapter.http.client, 'HTTPSConnection') as connection:
+            with self.assertRaises(ValueError):
+                adapter.transcribe(self.audio, self.model, [], 'owned-test-value')
+            self.assertFalse(connection.called, 'truncated container reached HTTPS')
+        self.audio.write_bytes(complete)
+        self.assertEqual(self.transcribe()['text'], 'C++ uses 20 threads')
+
     def test_cli_requires_opt_in_before_credential_lookup_and_scrubs_errors(self):
         args = ['--audio', str(self.audio), '--model-id', self.model, '--terms-json', '[]']
         def no_credential(name, default=None):

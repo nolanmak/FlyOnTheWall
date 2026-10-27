@@ -62,7 +62,11 @@ def finite(value):
 
 
 def wav_duration(path):
-    return _wav_duration(str(path))
+    try:
+        with Path(path).open("rb") as source:
+            return _wav_duration(source)
+    except OSError as error:
+        raise ValueError("invalid or unreadable WAV") from error
 
 
 def wav_duration_bytes(data):
@@ -74,6 +78,14 @@ def wav_duration_bytes(data):
 
 def _wav_duration(source):
     try:
+        size = source.seek(0, io.SEEK_END)
+        source.seek(0)
+        header = source.read(12)
+        if (not 12 <= size <= MAX_AUDIO_BYTES or header[:4] != b"RIFF"
+                or header[8:12] != b"WAVE"
+                or int.from_bytes(header[4:8], "little") + 8 != size):
+            raise ValueError("incomplete or oversized RIFF container")
+        source.seek(0)
         with wave.open(source, "rb") as audio:
             if (audio.getnchannels(), audio.getsampwidth(), audio.getframerate(), audio.getcomptype()) != (1, 2, 16000, "NONE"):
                 raise ValueError("expected mono PCM16 16kHz WAV")
