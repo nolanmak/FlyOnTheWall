@@ -166,6 +166,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       # The pipeline must be provable with no audio device and no GUI.
       - run: cargo test --workspace
+      # Default builds prove the admission API is absent via a compile-fail
+      # doctest; retain synthetic AEC coverage only with explicit opt-in.
+      - name: Test experimental AEC hooks without a native backend
+        run: |
+          cargo clippy -p fotwd --all-targets --features experimental-aec -- -D warnings
+          cargo test -p fotwd --lib --features experimental-aec live_aec
+          cargo test -p fotwd --test live_aec_session --features experimental-aec
       - name: Check opt-in resource QA entry point without assets
         run: python3 scripts/qa-local-contention.py --help
 

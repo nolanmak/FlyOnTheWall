@@ -1,5 +1,7 @@
 //! Actual session/pump with generated, precisely clocked taps and a fake AEC.
 //! No physical capture, model weights, credential store or external provider.
+#![cfg(feature = "experimental-aec")]
+
 use fotw_audio::{AudioTap, SampleFormat, StreamFormat, TapError, TapId};
 use fotw_audio::{CaptureTimestamp, FrameFlags, FrameSink};
 use fotw_pipeline::{

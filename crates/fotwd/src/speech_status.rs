@@ -87,6 +87,7 @@ impl SpeechMonitor {
                 Reader::Legacy(_) => false,
             })
     }
+    #[cfg(feature = "experimental-aec")]
     pub(crate) fn bind_processing(&self, status: fotw_pipeline::aec_worker::Status) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).processing = Some(status);
     }

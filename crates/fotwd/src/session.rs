@@ -45,7 +45,9 @@ use fotw_stt::{
     StreamEvent, TranscriptSegment,
 };
 mod processing;
-use processing::{NativeContext, PumpAec};
+use processing::NativeContext;
+#[cfg(feature = "experimental-aec")]
+use processing::PumpAec;
 
 /// Ring capacity per leg, in samples. Ten seconds at 48 kHz stereo.
 const RING_SAMPLES: usize = 48_000 * 2 * 10;
@@ -1708,12 +1710,24 @@ impl SegmentTap {
 }
 
 /// The latches a caller outside the session holds, and the clock on its end.
+#[cfg_attr(
+    not(feature = "experimental-aec"),
+    doc = r#"
+Experimental processing cannot be selected in a normal build:
+
+```compile_fail
+let mut control = fotwd::session::SessionControl::new();
+control.processing = None;
+```
+"#
+)]
 #[derive(Clone, Debug, Default)]
 pub struct SessionControl {
     /// Frozen application exclusions reused by every system-tap rebuild.
     pub system_scope: SystemScope,
     /// Explicit single-use preloaded audio processing; no backend is selected
     /// by default. Its native cleanup remains part of recording ownership.
+    #[cfg(feature = "experimental-aec")]
     pub processing: Option<crate::live_aec::Processing>,
     /// Actual source/model telemetry, independent of capture health.
     pub speech: crate::speech_status::SpeechMonitor,
@@ -1739,6 +1753,7 @@ impl SessionControl {
     pub fn new() -> Self {
         Self::default()
     }
+    #[cfg(feature = "experimental-aec")]
     fn take_processing(&self) -> Result<Option<crate::live_aec::Prepared>, String> {
         self.processing
             .as_ref()
@@ -1803,6 +1818,7 @@ pub async fn run_with_stop(
         duration,
         SessionControl {
             system_scope: SystemScope::default(),
+            #[cfg(feature = "experimental-aec")]
             processing: None,
             speech: crate::speech_status::SpeechMonitor::default(),
             capture_health: crate::capture_health::CaptureMonitor::default(),
@@ -1829,7 +1845,12 @@ pub async fn run_with_control(
     duration: Duration,
     control: SessionControl,
 ) -> Result<SessionOutcome, String> {
+    #[cfg(feature = "experimental-aec")]
     let processing = control.take_processing()?;
+    #[cfg(feature = "experimental-aec")]
+    let processing_descriptor = processing.as_ref().map(|p| p.descriptor.clone());
+    #[cfg(not(feature = "experimental-aec"))]
+    let processing_descriptor = None;
     if control.stop.is_stopped() {
         return Err("recording cancelled before capture setup".into());
     }
@@ -1902,7 +1923,7 @@ pub async fn run_with_control(
         mic_format.is_some(),
         control.errors.clone(),
         control.speech.clone(),
-        processing.as_ref().map(|p| p.descriptor.clone()),
+        processing_descriptor,
     )
     .await;
 
@@ -1911,8 +1932,10 @@ pub async fn run_with_control(
     let feeds = SttFeeds {
         timing: PumpTiming {
             mic_anchor: anchors.mic_ms.checked_mul(16),
+            #[cfg(feature = "experimental-aec")]
             clock: Arc::new(fotw_audio::clock::HostClock),
         },
+        #[cfg(feature = "experimental-aec")]
         processing,
         system: sys_stt.clone().map(|s| s as Arc<dyn PcmFeed>),
         mic: mic_stt.clone().map(|s| s as Arc<dyn PcmFeed>),
@@ -2198,7 +2221,12 @@ pub async fn run_supervised(
     duration: Duration,
     control: SessionControl,
 ) -> Result<SessionOutcome, String> {
+    #[cfg(feature = "experimental-aec")]
     let processing = control.take_processing()?;
+    #[cfg(feature = "experimental-aec")]
+    let processing_descriptor = processing.as_ref().map(|p| p.descriptor.clone());
+    #[cfg(not(feature = "experimental-aec"))]
+    let processing_descriptor = None;
     if control.stop.is_stopped() {
         return Err("recording cancelled before capture setup".into());
     }
@@ -2329,7 +2357,7 @@ pub async fn run_supervised(
         true,
         control.errors.clone(),
         control.speech.clone(),
-        processing.as_ref().map(|p| p.descriptor.clone()),
+        processing_descriptor,
     )
     .await;
 
@@ -2338,8 +2366,10 @@ pub async fn run_supervised(
     let feeds = SttFeeds {
         timing: PumpTiming {
             mic_anchor: anchors.mic_ms.checked_mul(16),
+            #[cfg(feature = "experimental-aec")]
             clock: clock.clone(),
         },
+        #[cfg(feature = "experimental-aec")]
         processing,
         system: sys_stt.clone().map(|s| s as Arc<dyn PcmFeed>),
         mic: mic_stt.clone().map(|s| s as Arc<dyn PcmFeed>),
@@ -3008,6 +3038,7 @@ fn bind_durable_source(
 /// clippy's limit, and these two travel together or not at all.
 #[derive(Default)]
 struct SttFeeds {
+    #[cfg(feature = "experimental-aec")]
     processing: Option<crate::live_aec::Prepared>,
     timing: PumpTiming,
     system: Option<Arc<dyn PcmFeed>>,
@@ -3019,12 +3050,14 @@ struct SttFeeds {
 }
 struct PumpTiming {
     mic_anchor: Option<u64>,
+    #[cfg(feature = "experimental-aec")]
     clock: Arc<dyn Clock>,
 }
 impl Default for PumpTiming {
     fn default() -> Self {
         Self {
             mic_anchor: Some(0),
+            #[cfg(feature = "experimental-aec")]
             clock: Arc::new(fotw_audio::clock::HostClock),
         }
     }
@@ -3109,6 +3142,7 @@ fn pump_loop(
 }
 
 struct PumpTranscription {
+    #[cfg(feature = "experimental-aec")]
     aec: Option<PumpAec>,
     archive_samples: [u64; 2],
     mic_position: u64,
@@ -3126,7 +3160,13 @@ impl PumpTranscription {
         native: Option<NativeContext<'_>>,
     ) -> Result<(), String> {
         let index = if channel == LegChannel::System { 0 } else { 1 };
-        if self.aec.is_some()
+        #[cfg(not(feature = "experimental-aec"))]
+        let _ = native;
+        #[cfg(feature = "experimental-aec")]
+        let has_aec = self.aec.is_some();
+        #[cfg(not(feature = "experimental-aec"))]
+        let has_aec = false;
+        if has_aec
             || self
                 .stt
                 .mic
@@ -3136,6 +3176,7 @@ impl PumpTranscription {
             wal.flush()
                 .map_err(|e| format!("original audio sync failed before processing: {e}"))?;
         }
+        #[cfg(feature = "experimental-aec")]
         if let Some(aec) = self.aec.as_mut() {
             aec.capture(channel, native, self.archive_samples[index]);
         }
@@ -3186,6 +3227,7 @@ impl PumpTranscription {
                     .mic_position
                     .checked_add(mono.len() as u64)
                     .ok_or("microphone source clock overflow")?;
+                #[cfg(feature = "experimental-aec")]
                 if let Some(aec) = self.aec.as_mut() {
                     aec.write_mic(mono);
                     self.mic_position = end;
@@ -3255,7 +3297,7 @@ fn pump_drain(
     mut mic: RingConsumer,
     sys_format: StreamFormat,
     mic_format: Option<StreamFormat>,
-    mut stt: SttFeeds,
+    #[cfg_attr(not(feature = "experimental-aec"), allow(unused_mut))] mut stt: SttFeeds,
     stop: PumpStop<'_>,
     mut supervision: Option<Supervision>,
 ) -> Result<PumpCounts, String> {
@@ -3288,6 +3330,7 @@ fn pump_drain(
     };
 
     let mic_position = stt.timing.mic_anchor.unwrap_or(0);
+    #[cfg(feature = "experimental-aec")]
     let aec = stt.processing.take().and_then(|prepared| {
         let bound = match (
             stt.mic.clone(),
@@ -3319,6 +3362,7 @@ fn pump_drain(
         }
     });
     let mut transcription = PumpTranscription {
+        #[cfg(feature = "experimental-aec")]
         aec,
         archive_samples: [0, 0],
         mic_position,
@@ -3441,6 +3485,7 @@ fn pump_drain(
         }
 
         let mut moved = false;
+        #[cfg(feature = "experimental-aec")]
         if let Some(aec) = transcription.aec.as_mut() {
             aec.observe(LegChannel::System, sys.capture_observation());
             aec.observe(LegChannel::Mic, mic.capture_observation());
@@ -3530,6 +3575,7 @@ fn pump_drain(
             stop.checkpoint(&mut wal, &mut capture_warnings);
             last_capture_checkpoint = Instant::now();
         }
+        #[cfg(feature = "experimental-aec")]
         if let Some(aec) = transcription.aec.as_mut() {
             aec.poll();
         }
@@ -3578,6 +3624,7 @@ fn pump_drain(
         }
     }
     transcription.finish()?;
+    #[cfg(feature = "experimental-aec")]
     if let Some(aec) = transcription.aec.as_mut() {
         aec.finish();
         capture_warnings.extend(aec.take_warnings());

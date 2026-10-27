@@ -32,11 +32,14 @@ build:
 
 test:
     CARGO_BUILD_JOBS={{jobs}} cargo test --workspace
+    CARGO_BUILD_JOBS={{jobs}} cargo test -p fotwd --lib --features experimental-aec live_aec
+    CARGO_BUILD_JOBS={{jobs}} cargo test -p fotwd --test live_aec_session --features experimental-aec
     node --test crates/fotw-web/tests/ui/*.cjs
 
 lint:
     cargo fmt --all --check
     CARGO_BUILD_JOBS={{jobs}} cargo clippy --workspace --all-targets -- -D warnings
+    CARGO_BUILD_JOBS={{jobs}} cargo clippy -p fotwd --all-targets --features experimental-aec -- -D warnings
 
 # Dependency licenses, bans and sources, exactly as CI's `deny` job checks them
 # (.github/workflows/ci.yml; keep the two commands in step). cargo-deny is
