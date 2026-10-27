@@ -740,7 +740,15 @@ async fn serve_until_stopped(
             actions,
         )
         .with_owner(owner.clone())
-        .with_feedback(feedback_receiver);
+        .with_feedback(feedback_receiver)
+        .with_detection(crate::native_detection::spawn(
+            Arc::new(fotw_audio::platform::host()),
+            startup.stop.clone(),
+            crate::detect::DetectorConfig {
+                home_jurisdiction: home,
+                ..Default::default()
+            },
+        ));
         startup
             .sender
             .take()

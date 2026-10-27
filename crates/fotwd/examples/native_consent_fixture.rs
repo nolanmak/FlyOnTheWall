@@ -26,15 +26,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     for (name, event) in [
-        ("menu", SurfaceEvent::Menu(MenuAction::ToggleRecording)),
+        (
+            "menu",
+            Some(SurfaceEvent::Menu(MenuAction::ToggleRecording)),
+        ),
         (
             "hotkey",
-            SurfaceEvent::Chord(
+            Some(SurfaceEvent::Chord(
                 HotkeyMap::defaults()
                     .chord_for(HotkeyAction::ToggleRecording)
                     .unwrap(),
-            ),
+            )),
         ),
+        ("detection-prompt", None),
     ] {
         let root = tempfile::Builder::new()
             .prefix("owned-consent-")
@@ -73,7 +77,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             host.tick(Monotonic::ZERO);
             std::thread::sleep(Duration::from_millis(10));
         }
-        host.on_event(event, Monotonic::ZERO);
+        let _detection_sender = if let Some(event) = event {
+            host.on_event(event, Monotonic::ZERO);
+            None
+        } else {
+            use fotw_audio::activity::{ActivitySnapshot, AudioClient, InputDevice, Transport};
+            let (input, sender) =
+                fotwd::native_detection::NativeDetection::channel(fotwd::detect::DetectorConfig {
+                    dwell: Duration::ZERO,
+                    ..Default::default()
+                });
+            host = host.with_detection(input);
+            sender.try_send(fotwd::native_detection::ActivitySample {
+                captured_at_ns: fotw_audio::clock::host_ns(),
+                snapshot: Ok(ActivitySnapshot {
+                    clients: vec![
+                        AudioClient::new(123, Some("us.zoom.xos"))
+                            .with_input(true)
+                            .with_output(true),
+                    ],
+                    default_input: Some(InputDevice::new(
+                        "Synthetic input",
+                        Transport::BuiltIn,
+                        true,
+                    )),
+                }),
+            })?;
+            host.tick(Monotonic::ZERO);
+            assert_eq!(host.view().prompt.as_ref().unwrap().app_key, "us.zoom.xos");
+            Some(sender)
+        };
         let probe =
             fotw_shell::platform::macos::probe_consent_controls(&mut host, Monotonic::ZERO)?;
         assert!(
@@ -106,6 +139,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert!(!rec.shutdown_status().save_failed);
         let audit = std::fs::read_to_string(root.path().join("audit.jsonl"))?;
         assert!(audit.contains(&format!("\"origin\":\"{name}\"")));
+        if name == "detection-prompt" {
+            assert!(audit.contains("\"detected_app\":\"us.zoom.xos\""));
+        }
         std::fs::write(
             output.join(format!("{name}.txt")),
             format!(

@@ -143,6 +143,7 @@ pub struct BridgeSnapshot {
 enum Command {
     Start {
         origin: StartOrigin,
+        detected: Option<fotw_shell::DetectedMeeting>,
         ticket: StartTicket,
     },
     Stop(StopTarget),
@@ -205,6 +206,21 @@ impl RecorderBridge {
         origin: StartOrigin,
         acknowledged: bool,
     ) -> Result<StartTicket, String> {
+        self.start_context(origin, acknowledged, None)
+    }
+    pub(crate) fn start_detected(
+        &mut self,
+        meeting: fotw_shell::DetectedMeeting,
+        acknowledged: bool,
+    ) -> Result<StartTicket, String> {
+        self.start_context(StartOrigin::DetectionPrompt, acknowledged, Some(meeting))
+    }
+    fn start_context(
+        &mut self,
+        origin: StartOrigin,
+        acknowledged: bool,
+        detected: Option<fotw_shell::DetectedMeeting>,
+    ) -> Result<StartTicket, String> {
         if !acknowledged {
             return Err("confirm that everyone consented before recording".into());
         }
@@ -227,6 +243,7 @@ impl RecorderBridge {
             .commands
             .try_send(Command::Start {
                 origin,
+                detected,
                 ticket: ticket.clone(),
             })
             .is_err()
@@ -308,7 +325,11 @@ fn bridge_worker(
                 break;
             };
             match command {
-                Command::Start { origin, ticket } => {
+                Command::Start {
+                    origin,
+                    detected,
+                    ticket,
+                } => {
                     outcome = None;
                     command_error = None;
                     let recorder = recorder.clone();
@@ -319,7 +340,12 @@ fn bridge_worker(
                         .spawn(move || {
                             let result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    recorder.start_native(origin, true, ticket.stop)
+                                    recorder.start_native_context(
+                                        origin,
+                                        true,
+                                        ticket.stop,
+                                        detected,
+                                    )
                                 }));
                             let error = match result {
                                 Ok(Ok(_)) => None,

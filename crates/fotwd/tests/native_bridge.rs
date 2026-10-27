@@ -742,3 +742,235 @@ async fn a_stop_delivered_after_its_capture_already_ended_is_neutral() {
         after.command_error
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn detected_meeting_only_offers_consent_and_uses_the_shared_visible_start_gate() {
+    use fotw_audio::activity::{ActivitySnapshot, AudioClient, InputDevice, Transport};
+    use fotw_shell::{Monotonic, PromptChoice, SurfaceEvent, SurfaceHost};
+    use fotwd::native_detection::{ActivitySample, NativeDetection};
+    let root = tempfile::tempdir().unwrap();
+    let gate = RenderGate::new(Duration::from_secs(3));
+    let opened = Arc::new(AtomicU64::new(0));
+    let rec = recorder(root.path(), &gate, opened.clone());
+    let (detection, sender) = NativeDetection::channel(fotwd::detect::DetectorConfig {
+        dwell: Duration::ZERO,
+        ..Default::default()
+    });
+    let mut host = native_host(rec.clone(), gate).with_detection(detection);
+    until(|| {
+        host.tick(Monotonic::ZERO);
+        host.view().menu.record.enabled
+    })
+    .await;
+    sender
+        .try_send(ActivitySample {
+            captured_at_ns: fotw_audio::clock::host_ns(),
+            snapshot: Ok(ActivitySnapshot {
+                clients: vec![
+                    AudioClient::new(123, Some("us.zoom.xos"))
+                        .with_input(true)
+                        .with_output(true),
+                ],
+                default_input: Some(InputDevice::new(
+                    "Synthetic input",
+                    Transport::BuiltIn,
+                    true,
+                )),
+            }),
+        })
+        .unwrap();
+    host.tick(Monotonic::ZERO);
+    let prompt = host.view().prompt.expect("detection must offer consent");
+    assert_eq!(prompt.app_key, "us.zoom.xos");
+    assert!(prompt.requires_acknowledgement);
+    assert!(!prompt.start_enabled);
+    assert_eq!(opened.load(Ordering::SeqCst), 0);
+    host.on_event(
+        SurfaceEvent::Prompt(PromptChoice::Start { acknowledged: true }),
+        Monotonic::ZERO,
+    );
+    assert_eq!(
+        rec.status().state,
+        RecordingState::Idle,
+        "a fabricated Start without the checkbox cannot record"
+    );
+    host.on_event(SurfaceEvent::Acknowledge(true), Monotonic::ZERO);
+    host.on_event(
+        SurfaceEvent::Prompt(PromptChoice::Start { acknowledged: true }),
+        Monotonic::ZERO,
+    );
+    until(|| {
+        host.tick(Monotonic::ZERO);
+        rec.status().state == RecordingState::Preparing
+    })
+    .await;
+    assert_eq!(
+        opened.load(Ordering::SeqCst),
+        0,
+        "detected Start bypassed visibility"
+    );
+    until(|| {
+        host.tick(Monotonic::ZERO);
+        host.did_render();
+        rec.status().state == RecordingState::Recording
+    })
+    .await;
+    host.on_event(SurfaceEvent::Stop, Monotonic::ZERO);
+    until(|| {
+        host.tick(Monotonic::ZERO);
+        rec.status().state == RecordingState::Idle
+    })
+    .await;
+    assert!(
+        host.view().prompt.is_none(),
+        "same handled meeting re-prompted after Stop"
+    );
+    let events = fotwd::audit::AuditLog::at(&root.path().join("sessions"))
+        .read()
+        .unwrap();
+    assert!(
+        events.iter().any(|event| matches!(&event.kind,
+            fotwd::audit::AuditKind::SessionStart {origin,detected_app,..}
+            if origin=="detection-prompt" && detected_app.as_deref()==Some("us.zoom.xos")
+        )),
+        "detected app and actual Start origin must reach the audit before capture"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn detection_withdrawal_snooze_and_shutdown_cannot_acknowledge_or_replace_manual_consent() {
+    use fotw_audio::activity::{ActivitySnapshot, AudioClient, InputDevice, Transport};
+    use fotw_shell::{MenuAction, Monotonic, PromptChoice, SurfaceEvent, SurfaceHost};
+    use fotwd::native_detection::{ActivitySample, NativeDetection};
+    let root = tempfile::tempdir().unwrap();
+    let gate = RenderGate::new(Duration::from_secs(3));
+    let opened = Arc::new(AtomicU64::new(0));
+    let rec = recorder(root.path(), &gate, opened.clone());
+    let (input, sender) = NativeDetection::channel(fotwd::detect::DetectorConfig {
+        dwell: Duration::ZERO,
+        ..Default::default()
+    });
+    let mut host = native_host(rec.clone(), gate).with_detection(input);
+    until(|| {
+        host.tick(Monotonic::ZERO);
+        host.view().menu.record.enabled
+    })
+    .await;
+    let sample = || ActivitySample {
+        captured_at_ns: fotw_audio::clock::host_ns(),
+        snapshot: Ok(ActivitySnapshot {
+            clients: vec![
+                AudioClient::new(123, Some("us.zoom.xos"))
+                    .with_input(true)
+                    .with_output(true),
+            ],
+            default_input: Some(InputDevice::new(
+                "Synthetic input",
+                Transport::BuiltIn,
+                true,
+            )),
+        }),
+    };
+    sender.try_send(sample()).unwrap();
+    host.tick(Monotonic::ZERO);
+    assert!(host.view().prompt.is_some());
+    host.on_event(SurfaceEvent::Acknowledge(true), Monotonic::ZERO);
+    sender
+        .try_send(ActivitySample {
+            captured_at_ns: fotw_audio::clock::host_ns(),
+            snapshot: Err("synthetic failed probe".into()),
+        })
+        .unwrap();
+    host.tick(Monotonic::ZERO);
+    assert!(host.view().prompt.is_none());
+    sender.try_send(sample()).unwrap();
+    host.tick(Monotonic::ZERO);
+    assert!(
+        !host.view().prompt.unwrap().acknowledged,
+        "withdrawn acknowledgement carried into a new prompt"
+    );
+    host.on_event(SurfaceEvent::Prompt(PromptChoice::NotNow), Monotonic::ZERO);
+    sender.try_send(sample()).unwrap();
+    host.tick(Monotonic::from_secs(1));
+    assert!(
+        host.view().prompt.is_none(),
+        "snoozed meeting prompted again"
+    );
+    host.on_event(
+        SurfaceEvent::Menu(MenuAction::ToggleRecording),
+        Monotonic::from_secs(1),
+    );
+    sender
+        .try_send(ActivitySample {
+            captured_at_ns: fotw_audio::clock::host_ns(),
+            snapshot: Err("synthetic failed probe".into()),
+        })
+        .unwrap();
+    host.tick(Monotonic::from_secs(1));
+    assert_eq!(
+        host.view().prompt.unwrap().app_key,
+        "manual-recording",
+        "probe failure withdrew a manual consent prompt"
+    );
+    host.on_event(
+        SurfaceEvent::Menu(MenuAction::Quit),
+        Monotonic::from_secs(1000),
+    );
+    sender.try_send(sample()).unwrap();
+    host.tick(Monotonic::from_secs(1000));
+    assert!(host.view().prompt.is_none());
+    assert_eq!(opened.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn detected_start_revalidates_a_closed_sampler_without_waiting_for_the_next_ui_tick() {
+    use fotw_audio::activity::{ActivitySnapshot, AudioClient, InputDevice, Transport};
+    use fotw_shell::{Monotonic, PromptChoice, SurfaceEvent, SurfaceHost};
+    use fotwd::native_detection::{ActivitySample, NativeDetection};
+    let root = tempfile::tempdir().unwrap();
+    let gate = RenderGate::new(Duration::from_secs(3));
+    let opened = Arc::new(AtomicU64::new(0));
+    let rec = recorder(root.path(), &gate, opened.clone());
+    let (input, sender) = NativeDetection::channel(fotwd::detect::DetectorConfig {
+        dwell: Duration::ZERO,
+        ..Default::default()
+    });
+    let mut host = native_host(rec.clone(), gate).with_detection(input);
+    until(|| {
+        host.tick(Monotonic::ZERO);
+        host.view().menu.record.enabled
+    })
+    .await;
+    sender
+        .try_send(ActivitySample {
+            captured_at_ns: fotw_audio::clock::host_ns(),
+            snapshot: Ok(ActivitySnapshot {
+                clients: vec![
+                    AudioClient::new(123, Some("us.zoom.xos"))
+                        .with_input(true)
+                        .with_output(true),
+                ],
+                default_input: Some(InputDevice::new(
+                    "Synthetic input",
+                    Transport::BuiltIn,
+                    true,
+                )),
+            }),
+        })
+        .unwrap();
+    host.tick(Monotonic::ZERO);
+    assert!(host.view().prompt.is_some());
+    host.on_event(SurfaceEvent::Acknowledge(true), Monotonic::ZERO);
+    drop(sender);
+    // The sampler died after the last tick. Start must refresh the offer itself.
+    host.on_event(
+        SurfaceEvent::Prompt(PromptChoice::Start { acknowledged: true }),
+        Monotonic::ZERO,
+    );
+    assert!(
+        host.view().pill.is_none(),
+        "closed sampler admitted a pending recording Start"
+    );
+    assert!(host.view().prompt.is_none());
+    assert_eq!(opened.load(Ordering::SeqCst), 0);
+}

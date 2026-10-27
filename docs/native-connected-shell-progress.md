@@ -12,8 +12,9 @@ not installed-app or physical meeting acceptance. Acceptance in #58, #57 and
 Menu and hotkey Start raise a fresh consent prompt. AppKit's actual checkbox
 state must reach the host, and Start still requires acknowledgement at the
 recorder boundary. The audit records the actual origin. Detection never starts
-capture; the existing detector's automatic arming is not connected to this host
-yet and remains follow-up work.
+capture. The background read-only detector now offers consent through this host;
+see [native meeting offers](native-detection-progress.md) for sampling, snooze,
+audit and remaining qualification limits.
 
 A four-command bounded queue, one Start worker and one retained status snapshot
 keep recorder/configuration work off the AppKit thread. Each Start has its own
@@ -140,6 +141,7 @@ and now report the waiting call site to aid diagnosis on hosted runners.
   fullscreen/spaces, scaling and screen-share behavior remain unvalidated.
 - Actual microphone/system audio, USB/Bluetooth/sleep recovery, long meetings,
   provider/local fallback and concurrent-app laptop acceptance remain open.
-- Automatic detector-to-native-prompt arming/snooze/suppression remains follow-up.
+- Persistent per-app Never suppression, decline auditing and EventKit/Bluetooth
+  calendar fallback for native detection remain follow-up.
 - Genuine AEC and broader model/provider quality/resource qualification remain
   separate roadmap work. No new models or user recordings were used here.

@@ -1,0 +1,20 @@
+{
+  "source_sha256": {
+    "crates/fotwd/src/native_detection.rs": "15c8a7958486a20fa72c1d7effcf0dd7f3878171927722e3d6bfb1fc2ede266e",
+    "crates/fotwd/src/native_host.rs": "4a28066137c7c4301c9af203910fe971fdd1b303d332fa35b89604a6c8eb8f6a",
+    "crates/fotwd/src/native_bridge.rs": "65de5304bdc7e88bccf04f75c16cc2e2ee209f114971333470c7dda178a7a08a",
+    "crates/fotwd/src/recording.rs": "60e7940ff880e90de8b21734d3ed3a552e00fc211c0790db98c40671a5ca65b4",
+    "crates/fotwd/src/serve.rs": "7bee8f3d0f774d581028fd3b2c7025742fbd9e577868dbfe0bead1a32f8bcfd4",
+    "crates/fotwd/examples/native_consent_fixture.rs": "aee6dcb00a54c483de5319b5ef4fa33afbcd07b068d81d4b62640549f7bab463"
+  },
+  "fixture_binary_sha256": "e2330ea040772c5e6e46cf0aa33448bc478e83deb8020b8e2e02f2baacb61c24",
+  "macOS": "26.4",
+  "command": "FOTW_JURISDICTION=US-CA target/debug/examples/native_consent_fixture <owned-output-directory>",
+  "cases": [
+    "menu",
+    "hotkey",
+    "detection-prompt"
+  ],
+  "checks": "Actual own AppKit controls: on-screen nonactivating prompt, unchecked Start disabled and blocked, actual acknowledgement enabled/delivered Start, prompt cleared; no rendered indicator so configuration/capture=0; coordinated Quit drained; actual audit origin checked and detected app checked for detection case. Own lifecycle selectors only.",
+  "limits": "Injected process activity, synthetic temporary library, no device/provider/model/keychain, installed product, tray/global registration, TCC, actual OS sleep or real meeting. No visual screenshot/focus/fullscreen/signing qualification. Never persistence, decline audit and EventKit remain separate."
+}
