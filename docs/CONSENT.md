@@ -199,11 +199,13 @@ dashboard has its own explicit consent checkbox; it does not inherit a native
 prompt's answer. In the connected native app, both native and dashboard starts
 also need a rendered Preparing frame before opening capture devices.
 
-The old #57 report describes the standalone `fotw-shell` state machine: its
-direct `toggle()` still does not apply the detection prompt's jurisdiction gate.
-It is not the production recorder-admission layer, and custom users of that
-standalone API must not treat it as a consent guarantee. This distinction does
-not resolve that API limitation or establish physical hotkey/TCC acceptance.
+The standalone `fotw-shell` state machine also refuses a direct Start or toggle
+while a known blocking prompt remains unacknowledged, regardless of Start origin.
+It preserves the prompt so the user can answer it, and consumes that answer on
+Start. It does not load jurisdiction rules or create manual prompts when no
+detection context is supplied. Embedders must supply their admission policy;
+the connected production app uses `NativeHost` above. State-machine tests do not
+establish physical hotkey/TCC acceptance.
 
 Source and device-free checks:
 
@@ -214,6 +216,9 @@ Source and device-free checks:
   `native_menu_and_hotkey_require_a_fresh_explicit_consent_prompt`, detected-offer,
   stale-answer and renderer-admission regressions. These use disposable synthetic
   sources, not real microphones or global keyboard events.
+- [`shell admission tests`](../crates/fotw-shell/tests/con01_detection_arms_only.rs)
+  and [`runtime tests`](../crates/fotw-shell/tests/runtime.rs): direct Starts,
+  toggles, menu/hotkey dispatch and acknowledgement consumption across all origins.
 
 ### Disclosure evidence remains incomplete
 

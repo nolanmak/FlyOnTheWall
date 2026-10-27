@@ -259,6 +259,48 @@ fn every_start_origin_is_a_human_action() {
 }
 
 #[test]
+fn every_direct_start_and_toggle_respects_a_pending_blocking_warning() {
+    for origin in StartOrigin::ALL {
+        for toggle in [false, true] {
+            let mut core = ShellCore::new();
+            core.handle(ShellInput::MeetingDetected {
+                at: Monotonic::ZERO,
+                meeting: zoom().with_consent_notice("Synthetic blocking warning", true),
+            });
+            let effects = if toggle {
+                core.toggle(Monotonic::ZERO, origin)
+            } else {
+                core.handle(ShellInput::Start {
+                    at: Monotonic::ZERO,
+                    origin,
+                })
+            };
+            assert!(
+                effects.is_empty(),
+                "{origin:?}, toggle={toggle} bypassed the warning: {effects:?}"
+            );
+            assert!(!core.capture_is_live());
+            assert!(!core.view().prompt.unwrap().start_enabled);
+            core.handle(ShellInput::PromptAcknowledged { acknowledged: true });
+            let effects = core.toggle(Monotonic::ZERO, origin);
+            assert!(effects.contains(&ShellEffect::StartCapture));
+            assert_eq!(effects.first(), Some(&ShellEffect::AuditStart(origin)));
+            assert!(core.view().prompt.is_none());
+        }
+        let mut nonblocking = ShellCore::new();
+        nonblocking.handle(ShellInput::MeetingDetected {
+            at: Monotonic::ZERO,
+            meeting: zoom().with_consent_notice("Synthetic nonblocking notice", false),
+        });
+        assert!(
+            nonblocking
+                .toggle(Monotonic::ZERO, origin)
+                .contains(&ShellEffect::StartCapture)
+        );
+    }
+}
+
+#[test]
 fn a_blocking_jurisdiction_warning_cannot_be_clicked_past() {
     // CON-05: an all-party or contested jurisdiction escalates the pre-record
     // sheet to a blocking modal requiring an explicit acknowledgement. The
@@ -493,6 +535,21 @@ fn capture_never_begins_without_a_human_over_two_hundred_thousand_random_inputs(
                 // acknowledgement may come from the click itself or from the
                 // checkbox that was already ticked on the prompt as drawn --
                 // and nowhere else.
+                if let Some(prompt) = &armed_before
+                    && prompt.requires_acknowledgement
+                    && !prompt.acknowledged
+                {
+                    assert!(
+                        matches!(
+                            input,
+                            ShellInput::PromptResponse {
+                                choice: PromptChoice::Start { acknowledged: true },
+                                ..
+                            }
+                        ),
+                        "{where_}: {input:?} bypassed an unacknowledged blocking warning"
+                    );
+                }
                 if let ShellInput::PromptResponse {
                     choice: PromptChoice::Start { acknowledged },
                     ..

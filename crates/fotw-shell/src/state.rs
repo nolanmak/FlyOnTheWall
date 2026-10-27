@@ -360,6 +360,18 @@ impl ShellCore {
             _ => {}
         }
 
+        // A pending blocking warning belongs to admission, not just its Start
+        // button. Menu/hotkey toggles and direct runtime requests all reach here.
+        if matches!(&input, ShellInput::Start { .. })
+            && self
+                .prompt
+                .as_ref()
+                .is_some_and(|meeting| meeting.requires_acknowledgement)
+            && !self.acknowledged
+        {
+            return Vec::new();
+        }
+
         let origin = match &input {
             ShellInput::Start { origin, .. } => Some(*origin),
             _ => None,
