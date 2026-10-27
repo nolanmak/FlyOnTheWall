@@ -103,8 +103,12 @@ For the existing production Whisper helper:
 
 Build it explicitly with `cargo build --locked --release -p fotw-stt --example
 local_whisper_smoke --features local-whisper`. Its fixed invocation uses a derived
-float32 PCM copy and one leg. The existing helper limits input to 120 seconds;
-it does not establish long-meeting streaming/backlog acceptance. Its reported
+float32 PCM copy and one leg. The helper accepts bounded batches up to 30 minutes
+(115.2 MB of float PCM),
+so ten-minute meeting tracks can use the same candidate. It reads one whole
+batch before inference; transient decoding buffers add memory beyond the PCM
+size. This does not establish production streaming, bounded meeting backlog,
+warm latency or resource acceptance. Its reported
 model path and duration use the existing production protocol; the executable and
 model are pinned before invocation.
 

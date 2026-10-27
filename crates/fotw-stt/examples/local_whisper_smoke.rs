@@ -1,4 +1,4 @@
-//! Explicit local-model smoke check; reads mono 16 kHz little-endian f32 PCM.
+//! Explicit local-model smoke check; reads up to 30 minutes of mono 16 kHz f32 PCM.
 //! No capture, credentials or provider network. Supply a public fixture.
 #[cfg(all(target_os = "macos", feature = "local-whisper"))]
 fn main() -> Result<(), String> {
@@ -19,25 +19,7 @@ fn main() -> Result<(), String> {
     if !(1..=2).contains(&legs) {
         return Err("LEGS must be 1 or 2".into());
     }
-    let mut bytes = Vec::new();
-    std::fs::File::open(&args[2])
-        .map_err(|e| e.to_string())?
-        .take(16_000 * 120 * 4 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    if bytes.is_empty() || bytes.len() > 16_000 * 120 * 4 || bytes.len() % 4 != 0 {
-        return Err("Expected 0–120 seconds of complete f32 samples".into());
-    }
-    let pcm: Vec<_> = bytes
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
-    if pcm
-        .iter()
-        .any(|sample| !sample.is_finite() || sample.abs() > 1.0)
-    {
-        return Err("PCM samples must be finite and within [-1, 1]".into());
-    }
+    let pcm = read_pcm(std::fs::File::open(&args[2]).map_err(|e| e.to_string())?)?;
     let started = Instant::now();
     let engine = WhisperEngine::new(&args[1], Some("en".into()));
     engine.load().map_err(|e| e.message)?;
@@ -97,4 +79,97 @@ fn main() -> Result<(), String> {
 #[cfg(not(all(target_os = "macos", feature = "local-whisper")))]
 fn main() -> Result<(), String> {
     Err("This smoke check requires macOS and --features local-whisper".into())
+}
+
+#[cfg(any(test, all(target_os = "macos", feature = "local-whisper")))]
+fn read_pcm(input: impl std::io::Read) -> Result<Vec<f32>, String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    input
+        .take(16_000 * 1800 * 4 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.is_empty() || bytes.len() > 16_000 * 1800 * 4 || bytes.len() % 4 != 0 {
+        return Err("Expected 0–1800 seconds of complete f32 samples".into());
+    }
+    let pcm: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    if pcm
+        .iter()
+        .any(|sample| !sample.is_finite() || sample.abs() > 1.0)
+    {
+        return Err("PCM samples must be finite and within [-1, 1]".into());
+    }
+    Ok(pcm)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_pcm;
+    use std::{
+        cell::Cell,
+        io::{self, Read},
+    };
+
+    #[test]
+    fn ten_minute_fixture_keeps_its_tail_and_exact_sample_count() {
+        let samples = 16_000 * 600;
+        let input = io::repeat(0)
+            .take((samples * 4 - 4) as u64)
+            .chain(io::Cursor::new(0.25_f32.to_le_bytes()));
+        let pcm = read_pcm(input).expect("a ten-minute meeting fixture must be accepted");
+        assert_eq!(pcm.len(), samples);
+        assert_eq!(pcm[0], 0.0);
+        assert_eq!(pcm.last(), Some(&0.25));
+    }
+
+    #[test]
+    fn over_thirty_minutes_is_refused_with_a_bounded_read() {
+        struct Counted<'a> {
+            bytes: &'a Cell<usize>,
+            remaining: usize,
+        }
+        impl Read for Counted<'_> {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                let count = output.len().min(self.remaining);
+                output[..count].fill(0);
+                self.remaining -= count;
+                self.bytes.set(self.bytes.get() + count);
+                Ok(count)
+            }
+        }
+        let count = Cell::new(0);
+        let input = Counted {
+            bytes: &count,
+            remaining: 16_000 * 1801 * 4,
+        };
+        assert!(read_pcm(input).is_err());
+        assert_eq!(
+            count.get(),
+            16_000 * 1800 * 4 + 1,
+            "stop reading at the documented 30-minute bound plus one byte"
+        );
+    }
+
+    #[test]
+    fn malformed_and_invalid_float_samples_are_refused() {
+        for bytes in [
+            vec![],
+            vec![0, 0, 0],
+            f32::NAN.to_le_bytes().to_vec(),
+            f32::INFINITY.to_le_bytes().to_vec(),
+            (-1.01_f32).to_le_bytes().to_vec(),
+            1.01_f32.to_le_bytes().to_vec(),
+        ] {
+            assert!(read_pcm(io::Cursor::new(bytes)).is_err());
+        }
+        let expected = [-1.0_f32, 0.0, 0.25, 1.0];
+        let bytes: Vec<_> = expected
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        assert_eq!(read_pcm(io::Cursor::new(bytes)).unwrap(), expected);
+    }
 }

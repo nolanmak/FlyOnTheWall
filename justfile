@@ -36,6 +36,7 @@ test:
     CARGO_BUILD_JOBS={{jobs}} cargo test -p fotwd --test live_aec_session --features experimental-aec
     node --test crates/fotw-web/tests/ui/*.cjs
     python3 -m unittest discover -s tools/speech-eval/tests
+    CARGO_BUILD_JOBS={{jobs}} cargo test --locked -p fotw-stt --example local_whisper_smoke
     if [[ "$(uname -s)" == Darwin ]]; then env -u FOTW_FLUIDAUDIO_SOURCE swift run --package-path tools/speech-eval/parakeet -j {{jobs}} parakeet-protocol-check; fi
 
 lint:
