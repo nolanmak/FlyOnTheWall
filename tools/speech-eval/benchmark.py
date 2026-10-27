@@ -1,5 +1,6 @@
 """Validated benchmark corpus and adapter protocol. Never downloads assets."""
 import hashlib
+import io
 import json
 import math
 from pathlib import Path
@@ -62,7 +63,30 @@ def finite(value):
 
 def wav_duration(path):
     try:
-        with wave.open(str(path), "rb") as audio:
+        with Path(path).open("rb") as source:
+            return _wav_duration(source)
+    except OSError as error:
+        raise ValueError("invalid or unreadable WAV") from error
+
+
+def wav_duration_bytes(data):
+    """Validate the exact bounded upload buffer, independently of a mutable path."""
+    if not isinstance(data, bytes) or len(data) > MAX_AUDIO_BYTES:
+        raise ValueError("invalid WAV byte buffer")
+    return _wav_duration(io.BytesIO(data))
+
+
+def _wav_duration(source):
+    try:
+        size = source.seek(0, io.SEEK_END)
+        source.seek(0)
+        header = source.read(12)
+        if (not 12 <= size <= MAX_AUDIO_BYTES or header[:4] != b"RIFF"
+                or header[8:12] != b"WAVE"
+                or int.from_bytes(header[4:8], "little") + 8 != size):
+            raise ValueError("incomplete or oversized RIFF container")
+        source.seek(0)
+        with wave.open(source, "rb") as audio:
             if (audio.getnchannels(), audio.getsampwidth(), audio.getframerate(), audio.getcomptype()) != (1, 2, 16000, "NONE"):
                 raise ValueError("expected mono PCM16 16kHz WAV")
             frames = audio.getnframes()

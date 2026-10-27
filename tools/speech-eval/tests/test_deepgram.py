@@ -132,6 +132,33 @@ class DeepgramTests(unittest.TestCase):
                     adapter.transcribe(self.audio, self.model, [], credential)
             connection.assert_not_called()
 
+    def test_file_changed_at_read_cannot_upload_bytes_that_were_never_validated(self):
+        original_open = Path.open
+        def changed_at_read(path, *args, **kwargs):
+            if path == self.audio and args == ('rb',):
+                with original_open(path, 'wb') as destination:
+                    destination.write(b'not a WAV: changed after path validation')
+            return original_open(path, *args, **kwargs)
+        with patch.object(Path, 'open', changed_at_read):
+            with patch.object(adapter.http.client, 'HTTPSConnection') as connection:
+                with self.assertRaises(ValueError):
+                    adapter.transcribe(self.audio, self.model, [], 'owned-test-value')
+                connection.assert_not_called()
+
+    def test_truncated_riff_after_valid_pcm_is_rejected_before_connection(self):
+        original = self.audio.read_bytes()
+        complete = original + b'JUNK' + (8).to_bytes(4, 'little') + b'owned123'
+        complete = complete[:4] + (len(complete) - 8).to_bytes(4, 'little') + complete[8:]
+        self.audio.write_bytes(complete[:-6])
+        with self.assertRaises(ValueError):
+            benchmark.wav_duration(self.audio)
+        with patch.object(adapter.http.client, 'HTTPSConnection') as connection:
+            with self.assertRaises(ValueError):
+                adapter.transcribe(self.audio, self.model, [], 'owned-test-value')
+            self.assertFalse(connection.called, 'truncated container reached HTTPS')
+        self.audio.write_bytes(complete)
+        self.assertEqual(self.transcribe()['text'], 'C++ uses 20 threads')
+
     def test_cli_requires_opt_in_before_credential_lookup_and_scrubs_errors(self):
         args = ['--audio', str(self.audio), '--model-id', self.model, '--terms-json', '[]']
         def no_credential(name, default=None):

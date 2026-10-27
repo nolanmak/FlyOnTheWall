@@ -43,11 +43,11 @@ def transcribe(audio_path, model_id, terms, credential, timeout_seconds=120):
     path = Path(audio_path)
     if not path.is_file() or path.stat().st_size > benchmark.MAX_AUDIO_BYTES:
         raise ValueError('invalid WAV size')
-    benchmark.wav_duration(path)
     with path.open('rb') as audio:
         data = audio.read(benchmark.MAX_AUDIO_BYTES + 1)
     if len(data) > benchmark.MAX_AUDIO_BYTES:
         raise ValueError('WAV changed beyond size limit')
+    benchmark.wav_duration_bytes(data)
     query = [('model', 'nova-3'), ('version', version), ('language', 'en'),
              ('smart_format', 'false'), ('punctuate', 'false'), ('diarize', 'false'),
              ('utterances', 'false'), ('mip_opt_out', 'true')]
