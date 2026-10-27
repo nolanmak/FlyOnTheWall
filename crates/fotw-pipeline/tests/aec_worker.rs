@@ -62,7 +62,9 @@ fn config() -> Config {
         deadline_ms: 100,
     }
 }
-fn blocked() -> (
+fn blocked_with_config(
+    cfg: Config,
+) -> (
     Worker,
     mpsc::Receiver<()>,
     mpsc::Sender<()>,
@@ -77,13 +79,78 @@ fn blocked() -> (
             release: Some(release_rx),
             dropped: dropped.clone(),
         },
-        config(),
+        cfg,
         1,
         0,
     )
     .unwrap();
     (w, entered_rx, release_tx, dropped)
 }
+fn blocked() -> (
+    Worker,
+    mpsc::Receiver<()>,
+    mpsc::Sender<()>,
+    Arc<AtomicBool>,
+) {
+    blocked_with_config(config())
+}
+
+#[test]
+fn deferred_admission_retains_capacity_and_interval_until_retry() {
+    // Cover both the retained-original budget and the command-channel budget.
+    for budget in [320, 640] {
+        let mut cfg = config();
+        cfg.pending_samples = budget;
+        let (mut worker, entered, release, _) = blocked_with_config(cfg);
+        let mut output = Vec::new();
+        worker
+            .submit(1, 0, &[0.8; 160], Some(&[0.2; 160]), 0, &mut output)
+            .unwrap();
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker
+            .submit(1, 160, &[0.6; 160], Some(&[0.2; 160]), 1, &mut output)
+            .unwrap();
+        let admitted = worker
+            .try_submit(1, 320, &[0.4; 160], Some(&[0.2; 160]), 2, &mut output)
+            .unwrap();
+        let retained = worker.pending_samples();
+        let released_early = !output.is_empty();
+        release.send(()).unwrap();
+        assert!(!admitted, "over-budget input must stay with its caller");
+        assert!(
+            !released_early,
+            "temporary pressure cannot fence earlier work"
+        );
+        assert_eq!(retained, 320);
+        until(|| {
+            worker.poll(2, &mut output).unwrap();
+            worker.pending_samples() == 0
+        });
+        assert!(
+            worker
+                .try_submit(1, 320, &[0.4; 160], Some(&[0.2; 160]), 2, &mut output)
+                .unwrap(),
+            "the same interval must remain admissible after capacity returns"
+        );
+        until(|| {
+            worker.poll(2, &mut output).unwrap();
+            worker.pending_samples() == 0
+        });
+        assert_eq!(output.len(), 3);
+        for (index, block) in output.iter().enumerate() {
+            assert_eq!((block.epoch, block.start_sample), (1, index as u64 * 160));
+            assert_eq!(block.kind, OutputKind::Cleaned);
+        }
+        assert_eq!(
+            pcm(&output),
+            [vec![0.4; 160], vec![0.3; 160], vec![0.2; 160]].concat()
+        );
+        let status = worker.status();
+        worker.finish(2, &mut output).unwrap();
+        until(|| !status.is_running());
+    }
+}
+
 fn until(mut test: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !test() {

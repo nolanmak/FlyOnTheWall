@@ -11,6 +11,10 @@ use fotw_pipeline::{
 };
 use std::collections::VecDeque;
 
+// Existing owner-side reference wait also bounds capacity deferral, even if
+// capture stops supplying new samples before the waiting-sample cap is reached.
+const MAX_OWNER_WAIT_MS: u64 = 200;
+
 struct Pending {
     start: u64,
     samples: Vec<f32>,
@@ -361,6 +365,7 @@ impl Coordinator {
     }
     fn drain(&mut self, force: bool, out: &mut Vec<Output>) -> Result<(), String> {
         while let Some(front) = self.waiting.front() {
+            let expired = self.now / 1_000_000 - front.accepted_ms >= MAX_OWNER_WAIT_MS;
             let mut reference = vec![0.0; front.samples.len()];
             let aligned = self
                 .render
@@ -380,13 +385,23 @@ impl Coordinator {
                         )
                         .is_ok()
                 });
-            if !aligned && !force && self.now / 1_000_000 - front.accepted_ms < 200 {
+            if !aligned && !force && !expired {
                 break;
             }
             let pending = self.waiting.pop_front().unwrap();
-            if self
-                .worker
-                .submit(
+            let admitted = if force || expired {
+                self.worker
+                    .submit(
+                        self.epoch,
+                        pending.start,
+                        &pending.samples,
+                        aligned.then_some(reference.as_slice()),
+                        self.now / 1_000_000,
+                        out,
+                    )
+                    .map(|_| true)
+            } else {
+                self.worker.try_submit(
                     self.epoch,
                     pending.start,
                     &pending.samples,
@@ -394,10 +409,20 @@ impl Coordinator {
                     self.now / 1_000_000,
                     out,
                 )
-                .is_err()
-            {
-                self.waiting.push_front(pending);
-                return Err("AEC worker input rejected".into());
+            };
+            match admitted {
+                Ok(true) => {}
+                Ok(false) => {
+                    // Keep the original in this existing bounded queue. A later
+                    // poll retries after native progress; forced drain/Stop and
+                    // the waiting-sample cap retain passthrough behavior.
+                    self.waiting.push_front(pending);
+                    break;
+                }
+                Err(_) => {
+                    self.waiting.push_front(pending);
+                    return Err("AEC worker input rejected".into());
+                }
             }
             self.waiting_samples -= pending.samples.len();
         }
@@ -517,6 +542,172 @@ mod tests {
             },
         )
     }
+    #[test]
+    fn qualified_burst_waits_for_worker_capacity_without_fencing_earlier_audio() {
+        check_qualified_burst(false);
+    }
+
+    #[test]
+    fn blocked_admission_expires_without_more_capture_input() {
+        check_qualified_burst(true);
+    }
+
+    fn check_qualified_burst(expire: bool) {
+        use std::sync::mpsc;
+        struct Gate {
+            inner: Subtract,
+            first: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+        }
+        impl Backend for Gate {
+            type Error = ();
+            fn frame_samples(&self) -> usize {
+                self.inner.frame_samples()
+            }
+            fn delay_samples(&self) -> usize {
+                0
+            }
+            fn analyze_render(&mut self, frame: &[f32]) -> Result<(), ()> {
+                self.inner.analyze_render(frame)
+            }
+            fn process_capture(&mut self, frame: &[f32], out: &mut [f32]) -> Result<(), ()> {
+                if let Some((entered, release)) = self.first.take() {
+                    entered.send(()).map_err(|_| ())?;
+                    release
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .map_err(|_| ())?;
+                }
+                self.inner.process_capture(frame, out)
+            }
+            fn reset(&mut self) -> Result<(), ()> {
+                self.inner.reset()
+            }
+        }
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut worker, reference) = config();
+        worker.queued_blocks = 1;
+        let start = 2192 + 48000;
+        let mut owner = Coordinator::new(
+            Gate {
+                inner: Subtract {
+                    render: Vec::new(),
+                    calls: calls.clone(),
+                },
+                first: Some((entered_tx, release_rx)),
+            },
+            worker,
+            reference,
+            (1, 1),
+            start,
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        // Qualify both original sample clocks before offering a short burst.
+        for i in 0..=310 {
+            let observation = observation(i);
+            owner
+                .observe_render(observation, observation.host_ns + 10_000_000, &mut output)
+                .unwrap();
+            owner
+                .observe_mic(observation, observation.host_ns + 10_000_000, &mut output)
+                .unwrap();
+        }
+        let now = observation(310).host_ns + 10_000_000;
+        // Retain interpolation guard samples on both sides of the offered range.
+        owner
+            .append_render(47872, &[0.2; 1888], now, &mut output)
+            .unwrap();
+        owner
+            .push_mic(start, &[0.8; 160], now, &mut output)
+            .unwrap();
+        entered
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("qualified first frame must reach the held backend");
+        owner
+            .push_mic(start + 160, &[0.8; 1440], now, &mut output)
+            .unwrap();
+        let released_early = !output.is_empty();
+        let waiting = owner.waiting_samples;
+        if expire {
+            owner.poll(now + 199_000_000, &mut output).unwrap();
+            let before_deadline = output.is_empty();
+            owner.poll(now + 200_000_000, &mut output).unwrap();
+            let published = owner.is_drained();
+            let originals: Vec<_> = output
+                .iter()
+                .flat_map(|block| block.samples.iter().copied())
+                .collect();
+            let status = owner.status();
+            let still_owned = status.is_running();
+            owner.cancel(&mut output);
+            release.send(()).unwrap();
+            assert!(
+                before_deadline,
+                "capacity wait expired before its existing 200ms budget"
+            );
+            assert!(
+                published,
+                "blocked admission must expire even with no new capture input"
+            );
+            assert_eq!(originals, vec![0.8; 1600]);
+            assert!(
+                still_owned,
+                "publication deadline does not cancel native work"
+            );
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while status.is_running() {
+                assert!(std::time::Instant::now() < until);
+                std::thread::yield_now();
+            }
+            owner.poll(now + 201_000_000, &mut output).unwrap();
+            assert_eq!(
+                output
+                    .iter()
+                    .map(|block| block.samples.len())
+                    .sum::<usize>(),
+                1600,
+                "late native output cannot duplicate deadline passthrough"
+            );
+            return;
+        }
+        // Always release the owned fake call before assertions/unwinding.
+        release.send(()).unwrap();
+        assert!(
+            !released_early,
+            "queue pressure prematurely released/fenced earlier audio: blocks={}, waiting={waiting}",
+            output.len()
+        );
+        assert!(
+            waiting > 0,
+            "burst must remain in the existing bounded owner queue"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !owner.is_drained() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "qualified burst did not resume"
+            );
+            owner.poll(now, &mut output).unwrap();
+            std::thread::yield_now();
+        }
+        assert_eq!(calls.load(Ordering::Acquire), 10);
+        let mut next = start;
+        for block in &output {
+            assert_eq!(block.start_sample, next);
+            assert_eq!(block.kind, OutputKind::Cleaned);
+            assert_eq!(block.samples.len(), 160);
+            assert!(
+                block
+                    .samples
+                    .iter()
+                    .all(|sample| (*sample - 0.6).abs() < 1e-6)
+            );
+            next += 160;
+        }
+        assert_eq!(next, start + 1600);
+    }
+
     #[test]
     fn live_clocked_owner_processes_overlap_and_keeps_every_source_sample() {
         let calls = Arc::new(AtomicUsize::new(0));
