@@ -35,6 +35,7 @@ test:
     CARGO_BUILD_JOBS={{jobs}} cargo test -p fotwd --lib --features experimental-aec live_aec
     CARGO_BUILD_JOBS={{jobs}} cargo test -p fotwd --test live_aec_session --features experimental-aec
     node --test crates/fotw-web/tests/ui/*.cjs
+    python3 -m unittest discover -s tools/speech-eval/tests
 
 lint:
     cargo fmt --all --check
