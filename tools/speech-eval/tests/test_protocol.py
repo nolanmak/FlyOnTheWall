@@ -112,3 +112,11 @@ class ResponseTests(unittest.TestCase):
         for bad in [dict(doc, legs=2), dict(doc, transcripts=[]), dict(doc, audio_seconds_per_leg=2.0)]:
             with self.assertRaises(ValueError):
                 self.parse(bad, "fotw-whisper-smoke-v1")
+
+
+class JsonTests(unittest.TestCase):
+    def test_duplicate_fields_and_overflowing_numbers_refuse_without_ambiguous_policy(self):
+        for raw in [b'{"mode":"local","mode":"cloud"}', b'{"x":1e999}',
+                    b'{"x":NaN}', ('{"x":' + '9' * 100000 + '}').encode()]:
+            with self.subTest(size=len(raw)), self.assertRaises(ValueError):
+                benchmark.strict_json(raw)

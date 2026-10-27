@@ -17,7 +17,24 @@ ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\Z")
 def strict_json(raw):
     def invalid_constant(_value):
         raise ValueError("nonfinite JSON number")
-    return json.loads(raw, parse_constant=invalid_constant)
+    def floating(value):
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValueError("nonfinite JSON number")
+        return result
+    def integer(value):
+        if len(value.lstrip("-")) > 20:
+            raise ValueError("JSON integer exceeds measurement range")
+        return int(value)
+    def object_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON field")
+            result[key] = value
+        return result
+    return json.loads(raw, parse_constant=invalid_constant, parse_float=floating,
+                      parse_int=integer, object_pairs_hook=object_pairs)
 
 
 def sha256_file(path):
@@ -115,7 +132,7 @@ def load_corpus(path):
     return {"schema_version": 1, "manifest_sha256": hashlib.sha256(raw).hexdigest(), "fixtures": fixtures}
 
 
-def parse_response(raw, output_format, duration_ms):
+def parse_response(raw, output_format, duration_ms, expected_audio_sha256=None, expected_model=None):
     if not isinstance(raw, bytes) or len(raw) > MAX_RESPONSE_BYTES:
         raise ValueError("adapter output exceeds byte limit")
     doc = strict_json(raw.decode("utf-8"))
@@ -134,6 +151,10 @@ def parse_response(raw, output_format, duration_ms):
                 "reported_total_ms": finite(doc.get("total_seconds")) * 1000}
     if output_format != "asr-eval-v1" or type(doc.get("schema_version")) is not int or doc["schema_version"] != 1 or not isinstance(doc.get("text"), str):
         raise ValueError("missing transcript or unsupported adapter schema")
+    if expected_audio_sha256 is not None and doc.get("audio_sha256") != expected_audio_sha256:
+        raise ValueError("adapter transcribed a different source")
+    if expected_model is not None and doc.get("model_id") != expected_model:
+        raise ValueError("adapter reported a different model")
     segments = doc.get("segments")
     if segments is not None:
         if not isinstance(segments, list) or len(segments) > 10000 or doc.get("timestamp_unit") != "ms":

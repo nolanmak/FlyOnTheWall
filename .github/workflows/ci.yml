@@ -173,6 +173,8 @@ jobs:
           cargo clippy -p fotwd --all-targets --features experimental-aec -- -D warnings
           cargo test -p fotwd --lib --features experimental-aec live_aec
           cargo test -p fotwd --test live_aec_session --features experimental-aec
+      - name: Test paired speech evaluation without models or providers
+        run: python3 -m unittest discover -s tools/speech-eval/tests
       - name: Check opt-in resource QA entry point without assets
         run: python3 scripts/qa-local-contention.py --help
 
