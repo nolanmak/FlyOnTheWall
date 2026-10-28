@@ -93,19 +93,19 @@ impl ModelSetupControl for DashboardModels {
             .as_ref()
             .map(|job| lock(&job.status).clone())
             .unwrap_or_default();
+        // The speech detector is listed so its license and pin are visible;
+        // installing any Whisper model installs it too.
         let models = crate::stt::KNOWN_MODELS
             .iter()
+            .chain(std::iter::once(&crate::stt::VAD_MODEL))
             .map(|model| Model {
                 name: model.name.into(),
                 description: model.note.into(),
                 bytes: model.bytes,
                 sha256: model.sha256.into(),
-                revision: crate::stt::MODEL_REVISION.into(),
-                license: "MIT".into(),
-                license_url: format!(
-                    "https://huggingface.co/ggerganov/whisper.cpp/blob/{}/README.md",
-                    crate::stt::MODEL_REVISION
-                ),
+                revision: model.revision.into(),
+                license: model.license.into(),
+                license_url: model.license_url(),
                 present: std::fs::symlink_metadata(
                     crate::stt::models_dir(&self.root)
                         .join(crate::stt::model_file_name(model.name)),
@@ -117,7 +117,7 @@ impl ModelSetupControl for DashboardModels {
     }
     fn start(&self, request: Request) -> Result<Status, String> {
         let model =
-            crate::stt::known_model(request.model()).ok_or("Choose a model from the catalog.")?;
+            crate::stt::catalog_model(request.model()).ok_or("Choose a model from the catalog.")?;
         let source = match request {
             Request::Download { .. } => Source::Download,
             Request::Import { path, .. } => {
@@ -283,11 +283,20 @@ mod tests {
         let mut c = DashboardModels::new(root.path().to_owned());
         c.run = Arc::new(|_, _, _, _, _| panic!("source accessed"));
         let s = c.read();
-        assert_eq!(s.models.len(), 4);
+        // Four Whisper models and the speech detector, each with its license.
+        assert_eq!(s.models.len(), 5);
         assert!(s.models.iter().all(|m| m.license == "MIT"
             && m.revision.len() == 40
             && m.sha256.len() == 64
+            && m.license_url.ends_with("/README.md")
             && !m.present));
+        let detector = s.models.last().unwrap();
+        assert_eq!(detector.name, crate::stt::VAD_MODEL.name);
+        assert!(
+            detector
+                .license_url
+                .starts_with("https://huggingface.co/ggml-org/whisper-vad/blob/")
+        );
         assert!(
             c.start(Request::Download {
                 model: "../bad".into()

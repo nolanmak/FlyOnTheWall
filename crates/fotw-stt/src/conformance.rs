@@ -233,6 +233,31 @@ pub fn vocabulary() {
         snippets_only.hints_for(CustomVocabulary::None),
         HintSelection::NotRequested
     );
+    vocabulary_corrections();
+}
+
+/// Local corrections: exact, case, accents, near misses, phrases and guards.
+///
+/// # Panics
+/// If local vocabulary correction semantics change.
+pub fn vocabulary_corrections() {
+    use crate::{vocabulary::Profile, vocabulary_matcher::VocabularyMatcher};
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../tests/fixtures/vocabulary-corrections-v1.json"
+    ))
+    .unwrap();
+    for group in fixture["groups"].as_array().unwrap() {
+        let profile = Profile::parse(&serde_json::to_vec(&group["profile"]).unwrap()).unwrap();
+        let matcher = VocabularyMatcher::new(&profile);
+        for case in group["cases"].as_array().unwrap() {
+            assert_eq!(
+                matcher.apply(case["input"].as_str().unwrap()),
+                case["output"].as_str().unwrap(),
+                "{}",
+                case["why"]
+            );
+        }
+    }
 }
 
 #[cfg(test)]

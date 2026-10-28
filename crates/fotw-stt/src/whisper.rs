@@ -7,15 +7,23 @@
 //! One model is loaded per session and shared by both legs. Each leg gets its
 //! own `WhisperState` — the decoder's scratch memory — so the legs transcribe
 //! independently without a second copy of the weights.
+//!
+//! With [`WhisperEngine::with_speech_gate`], each leg also gets its own Silero
+//! VAD context (whisper.cpp's ggml port, under a megabyte), and every chunk is
+//! shown to it before Whisper (#242, see [`crate::vad`]). The daemon always
+//! sets the gate; an ungated engine is for tools that compare against it.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
+    WhisperVadContext, WhisperVadContextParams,
 };
 
+use crate::cleanup::should_drop;
 use crate::local::{PROVIDER, Recognized, Recognizer, RecognizerFactory, SAMPLE_RATE};
+use crate::vad::{GateConfig, GatedRecognizer, SpeechDetector, WINDOW_SAMPLES, overlaps_speech};
 use crate::{SttError, SttErrorClass};
 
 /// whisper.cpp declines input under 100 ms and is unreliable on much under a
@@ -33,6 +41,9 @@ pub struct WhisperEngine {
     language: Option<String>,
     threads: i32,
     context: OnceLock<Result<Arc<WhisperContext>, SttError>>,
+    /// The Silero VAD model every chunk is gated by, if any.
+    vad: Option<PathBuf>,
+    gate: GateConfig,
 }
 
 impl std::fmt::Debug for WhisperEngine {
@@ -40,6 +51,7 @@ impl std::fmt::Debug for WhisperEngine {
         f.debug_struct("WhisperEngine")
             .field("path", &self.path)
             .field("language", &self.language)
+            .field("vad", &self.vad)
             .finish_non_exhaustive()
     }
 }
@@ -62,16 +74,38 @@ impl WhisperEngine {
             language,
             threads,
             context: OnceLock::new(),
+            vad: None,
+            gate: GateConfig::default(),
         }
     }
 
-    /// Load the model now rather than on the first leg.
+    /// Gate every chunk behind the Silero VAD model at `vad_model`: audio it
+    /// does not hear as speech never reaches Whisper (#242).
+    #[must_use]
+    pub fn with_speech_gate(mut self, vad_model: impl Into<PathBuf>) -> Self {
+        self.vad = Some(vad_model.into());
+        self
+    }
+
+    /// Where the gate draws the line; [`GateConfig::default`] unless changed.
+    #[must_use]
+    pub fn with_gate_config(mut self, gate: GateConfig) -> Self {
+        self.gate = gate;
+        self
+    }
+
+    /// Load the model now rather than on the first leg, and check that the
+    /// speech gate's model loads too.
     ///
     /// # Errors
     ///
-    /// When the file is missing or is not a model whisper.cpp can read.
+    /// When either file is missing or is not a model whisper.cpp can read.
     pub fn load(&self) -> Result<(), SttError> {
-        self.context().map(|_| ())
+        self.context()?;
+        if let Some(vad) = &self.vad {
+            SileroDetector::load(vad)?;
+        }
+        Ok(())
     }
 
     fn context(&self) -> Result<Arc<WhisperContext>, SttError> {
@@ -169,11 +203,86 @@ impl RecognizerFactory for WhisperEngine {
             )
             .with_detail(error.to_string())
         })?;
-        Ok(Box::new(WhisperRecognizer {
+        let recognizer = Box::new(WhisperRecognizer {
             state,
             language,
             threads: self.threads,
-        }))
+        });
+        Ok(match &self.vad {
+            None => recognizer,
+            Some(vad) => Box::new(GatedRecognizer::new(
+                Box::new(SileroDetector::load(vad)?),
+                recognizer,
+                self.gate,
+            )),
+        })
+    }
+}
+
+/// Silero VAD through whisper.cpp, one context per leg.
+pub struct SileroDetector {
+    context: WhisperVadContext,
+}
+
+impl SileroDetector {
+    /// Load the ggml Silero model at `path`.
+    ///
+    /// # Errors
+    ///
+    /// When the file is missing or is not a VAD model whisper.cpp can read.
+    pub fn load(path: &Path) -> Result<Self, SttError> {
+        whisper_rs::install_logging_hooks();
+        let unusable = |why: &str| {
+            SttError::new(
+                SttErrorClass::Unsupported,
+                PROVIDER,
+                format!(
+                    "the speech detector model {} ({}); run `fotwd stt models install silero-v5.1.2`",
+                    why,
+                    path.display()
+                ),
+            )
+            .not_retryable(why.to_owned())
+        };
+        if !path.is_file() {
+            return Err(unusable("is missing"));
+        }
+        let name = path
+            .to_str()
+            .ok_or_else(|| unusable("has a path that is not UTF-8"))?;
+        let mut params = WhisperVadContextParams::default();
+        // A 32 ms window at a time is too little work to spread or to ship
+        // to the GPU, which Whisper itself is using.
+        params.set_n_threads(1);
+        params.set_use_gpu(false);
+        WhisperVadContext::new(name, params)
+            .map(|context| Self { context })
+            .map_err(|_| unusable("could not be loaded"))
+    }
+}
+
+impl SpeechDetector for SileroDetector {
+    fn probabilities(&mut self, pcm: &[f32]) -> Result<Vec<f32>, SttError> {
+        let failed = || {
+            SttError::new(
+                SttErrorClass::Server,
+                PROVIDER,
+                "the speech detector failed on a stretch of audio",
+            )
+        };
+        if pcm.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.context.detect_speech(pcm).map_err(|_| failed())?;
+        let probabilities = self.context.probabilities();
+        if probabilities.len() != pcm.len().div_ceil(WINDOW_SAMPLES) {
+            return Err(failed().with_detail(format!(
+                "{} probabilities for {} samples; expected one per {WINDOW_SAMPLES}",
+                probabilities.len(),
+                pcm.len()
+            )));
+        }
+        Ok(probabilities.to_vec())
     }
 }
 
@@ -185,6 +294,25 @@ struct WhisperRecognizer {
 
 impl Recognizer for WhisperRecognizer {
     fn transcribe(&mut self, pcm: &[f32]) -> Result<Vec<Recognized>, SttError> {
+        self.decode(pcm, None)
+    }
+
+    fn transcribe_speech(
+        &mut self,
+        pcm: &[f32],
+        speech: &[std::ops::Range<usize>],
+    ) -> Result<Vec<Recognized>, SttError> {
+        self.decode(pcm, Some(speech))
+    }
+}
+
+impl WhisperRecognizer {
+    /// Decode one chunk. `speech` is the gate's speech regions, when gated.
+    fn decode(
+        &mut self,
+        pcm: &[f32],
+        speech: Option<&[std::ops::Range<usize>]>,
+    ) -> Result<Vec<Recognized>, SttError> {
         let mut padded = Vec::new();
         let audio = if pcm.len() < MIN_SAMPLES {
             padded.extend_from_slice(pcm);
@@ -229,9 +357,18 @@ impl Recognizer for WhisperRecognizer {
                 )
                 .with_detail(error.to_string())
             })?;
+            let start_ms = centiseconds_to_ms(segment.start_timestamp());
+            let end_ms = centiseconds_to_ms(segment.end_timestamp());
+            // Stock phrases and bare labels over audio the model doubted was
+            // speech — unless the gate heard speech there: silenced stretches
+            // raise the doubt of every segment in the window.
+            let heard = speech.is_some_and(|regions| overlaps_speech(start_ms, end_ms, regions));
+            if should_drop(&text, segment.no_speech_probability(), heard) {
+                continue;
+            }
             recognized.push(Recognized {
-                start_ms: centiseconds_to_ms(segment.start_timestamp()),
-                end_ms: centiseconds_to_ms(segment.end_timestamp()),
+                start_ms,
+                end_ms,
                 text: text.trim().to_owned(),
             });
         }
@@ -300,6 +437,27 @@ mod tests {
                 .as_deref(),
             Some("en")
         );
+    }
+
+    #[test]
+    fn a_missing_speech_detector_is_a_clear_error_not_a_crash() {
+        let error = SileroDetector::load(Path::new("/nonexistent/ggml-silero-v5.1.2.bin"))
+            .err()
+            .expect("no model, no detector");
+        assert_eq!(error.class, SttErrorClass::Unsupported);
+        assert!(error.message.contains("silero-v5.1.2"), "{}", error.message);
+        assert!(!error.retryable);
+    }
+
+    #[test]
+    #[ignore = "requires FOTW_SILERO_VAD_MODEL pointing at ggml-silero-v5.1.2.bin; no downloads"]
+    fn real_silero_scores_digital_silence_as_non_speech() {
+        let path = std::env::var_os("FOTW_SILERO_VAD_MODEL")
+            .expect("set FOTW_SILERO_VAD_MODEL to the ggml Silero model");
+        let mut detector = SileroDetector::load(Path::new(&path)).unwrap();
+        let probabilities = detector.probabilities(&vec![0.0; 16_000]).unwrap();
+        assert_eq!(probabilities.len(), 16_000usize.div_ceil(WINDOW_SAMPLES));
+        assert!(probabilities.iter().all(|&p| p < 0.5), "{probabilities:?}");
     }
 
     #[test]
