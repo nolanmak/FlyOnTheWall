@@ -768,3 +768,70 @@ async fn frames_written_before_the_helper_exits_are_read_before_it_is_declared_d
     }
     client.shutdown().await;
 }
+
+/// Fake helpers still running whose command line contains `tag`.
+fn fakes_running(tag: &str) -> usize {
+    let out = Command::new("pgrep")
+        .args(["-f", tag])
+        .output()
+        .expect("pgrep");
+    String::from_utf8_lossy(&out.stdout).lines().count()
+}
+
+#[tokio::test]
+async fn shutdown_during_a_slow_restart_returns_at_once_and_leaves_no_helper() {
+    // A crash starts a background restart, whose replayed load takes 30 s.
+    // Quitting the app then must not wait for it.
+    let marker = std::env::temp_dir().join(format!("speechd-slow-load-{}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let tag = marker.to_string_lossy().into_owned();
+    let Some(mut config) = fake_only(&["--slow-load-if", &tag]) else {
+        return;
+    };
+    config.restart.min_interval = Duration::from_millis(50);
+    let client = SpeechdClient::start(config).await.expect("start");
+    client.load("fake-crash").await.expect("a fast first load");
+    std::fs::write(&marker, b"").unwrap();
+
+    let mut doomed = client
+        .open_stream(stream("fake-crash"))
+        .await
+        .expect("open");
+    doomed.send_audio(&[1; 16]).await.expect("audio");
+    assert!(matches!(
+        next(&mut doomed).await,
+        Some(StreamEvent::Failed(_))
+    ));
+    // Wait until the replacement is spawned and its replayed load is pending.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while client.status().spawns.len() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a restart");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        fakes_running(&tag),
+        1,
+        "the replacement is up, replaying its load"
+    );
+
+    let quitting = Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), client.shutdown())
+        .await
+        .expect("shutdown must not wait for the restart");
+    assert!(
+        quitting.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        quitting.elapsed()
+    );
+    let gone = tokio::time::timeout(Duration::from_secs(1), async {
+        while fakes_running(&tag) > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    std::fs::remove_file(&marker).unwrap();
+    assert!(gone.is_ok(), "the replacement helper was left running");
+}
