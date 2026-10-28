@@ -47,12 +47,18 @@ pub enum SttEngine {
 ///
 /// Only a missing settings row uses the fresh-library default. An unreadable
 /// or invalid saved choice must never silently enable cloud transcription.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The fresh-library default for local transcription is Parakeet Unified
+/// (#244). A saved row keeps what it says: one written before Parakeet, with
+/// no model or an empty one, still means [`DEFAULT_MODEL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SttSettings {
     /// Which engine.
     pub engine: SttEngine,
-    /// The ggml model file the local engine loads, as an absolute path.
+    /// What the local engine runs: [`crate::speechd::ENGINE`] for Parakeet
+    /// Unified, else the ggml model file whisper.cpp loads, as an absolute
+    /// path. Empty means [`DEFAULT_MODEL`], as it always has.
     #[serde(default)]
     pub model: String,
     /// ISO 639-1 code for the local engine. Empty detects per utterance.
@@ -60,7 +66,23 @@ pub struct SttSettings {
     pub language: String,
 }
 
+impl Default for SttSettings {
+    fn default() -> Self {
+        Self {
+            engine: SttEngine::default(),
+            model: crate::speechd::ENGINE.to_owned(),
+            language: String::new(),
+        }
+    }
+}
+
 impl SttSettings {
+    /// Whether the local engine is Parakeet Unified rather than Whisper.
+    #[must_use]
+    pub fn uses_parakeet(&self) -> bool {
+        crate::speechd::is_engine(&self.model)
+    }
+
     /// The settings in force for this library.
     pub fn read(db: &Db) -> Result<Self, String> {
         match db.get_setting(SETTINGS_KEY).map_err(|e| e.to_string())? {
@@ -77,7 +99,12 @@ impl SttSettings {
     /// selecting an engine again. This never persists or starts transcription.
     #[must_use]
     pub fn for_selection(db: &Db, engine: SttEngine) -> Self {
-        let mut settings = Self::read(db).unwrap_or_default();
+        // A corrupt row is repaired to what an empty model always meant, the
+        // Whisper default, not to the fresh-library Parakeet default.
+        let mut settings = Self::read(db).unwrap_or_else(|_| Self {
+            model: String::new(),
+            ..Self::default()
+        });
         settings.engine = engine;
         settings
     }
@@ -118,11 +145,60 @@ pub fn fallback_transcription(
     data_root: PathBuf,
     cloud: Box<dyn FnOnce() -> Result<crate::session::DeepgramLegs, String> + Send>,
 ) -> Transcription {
+    #[cfg(target_os = "macos")]
+    return fallback_transcription_with(
+        settings,
+        data_root,
+        cloud,
+        &VAD_MODEL,
+        crate::speechd::Launch::bundled,
+    );
+    #[cfg(not(target_os = "macos"))]
+    fallback_transcription_with(settings, data_root, cloud)
+}
+
+/// [`fallback_transcription`] with the detector and helper passed in.
+#[cfg(target_os = "macos")]
+pub(crate) fn fallback_transcription_with(
+    settings: SttSettings,
+    data_root: PathBuf,
+    cloud: Box<dyn FnOnce() -> Result<crate::session::DeepgramLegs, String> + Send>,
+    detector: &'static KnownModel,
+    launch: impl FnOnce() -> Result<crate::speechd::Launch, String> + Send + 'static,
+) -> Transcription {
+    Transcription::PreparingFailover(Box::pin(async move {
+        let (engine, revision) = if settings.uses_parakeet() {
+            parakeet_factory(data_root, detector, launch).await?
+        } else {
+            tokio::task::spawn_blocking(move || pinned_local_model(&settings, &data_root))
+                .await
+                .map_err(|_| "local backup model preparation failed".to_owned())??
+        };
+        fallback_legs(engine, revision, cloud).await
+    }))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fallback_transcription_with(
+    settings: SttSettings,
+    data_root: PathBuf,
+    cloud: Box<dyn FnOnce() -> Result<crate::session::DeepgramLegs, String> + Send>,
+) -> Transcription {
     Transcription::PreparingFailover(Box::pin(async move {
         let (engine, revision) =
             tokio::task::spawn_blocking(move || pinned_local_model(&settings, &data_root))
                 .await
                 .map_err(|_| "local backup model preparation failed".to_owned())??;
+        fallback_legs(engine, revision, cloud).await
+    }))
+}
+
+async fn fallback_legs(
+    engine: std::sync::Arc<dyn fotw_stt::RecognizerFactory>,
+    revision: String,
+    cloud: Box<dyn FnOnce() -> Result<crate::session::DeepgramLegs, String> + Send>,
+) -> Result<crate::session::FailoverLegs, String> {
+    {
         let legs = tokio::task::spawn_blocking(cloud)
             .await
             .map_err(|_| "could not read the Deepgram credential".to_owned())??;
@@ -138,7 +214,7 @@ pub fn fallback_transcription(
         )
         .await
         .map_err(|e| e.message)
-    }))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -185,6 +261,9 @@ fn saved_local_model_with(
     detector: &'static KnownModel,
 ) -> Result<std::sync::Arc<dyn fotw_stt::RecognizerFactory>, String> {
     use fotw_stt::RecognizerFactory;
+    if plan.engine.provider == fotw_stt::speechd::PROVIDER {
+        return Err("Parakeet recovery isn't supported yet; the audio is kept.".into());
+    }
     plan.validate().map_err(|e| e.to_string())?;
     let digest = plan
         .engine
@@ -466,7 +545,10 @@ pub fn verify_vad_model(data_root: &Path) -> Result<PathBuf, String> {
 
 /// [`verify_vad_model`] against a given detector identity, so tests can pin a
 /// fixture instead of real weights.
-fn verify_detector(data_root: &Path, detector: &'static KnownModel) -> Result<PathBuf, String> {
+pub(crate) fn verify_detector(
+    data_root: &Path,
+    detector: &'static KnownModel,
+) -> Result<PathBuf, String> {
     let path = models_dir(data_root).join(model_file_name(detector.name));
     let fix = format!(
         "Install it with `fotwd stt models install {}` (installing a Whisper model from \
@@ -631,22 +713,38 @@ pub fn local_transcription(
         mic_present,
         mic_enabled,
         &VAD_MODEL,
+        crate::speechd::Launch::bundled,
     )
 }
 
 #[cfg(target_os = "macos")]
-fn local_transcription_with(
+pub(crate) fn local_transcription_with(
     settings: &SttSettings,
     data_root: &Path,
     session_id: &str,
     mic_present: bool,
     mic_enabled: bool,
     detector: &'static KnownModel,
+    launch: impl FnOnce() -> Result<crate::speechd::Launch, String> + Send + 'static,
 ) -> Transcription {
     let settings = settings.clone();
     let data_root = data_root.to_path_buf();
     let session_id = session_id.to_owned();
     Transcription::PreparingLocal(Box::pin(async move {
+        // Parakeet refuses Start outright when it cannot run: unlike a Whisper
+        // file, there is nothing to record an expected identity against, and
+        // the fix (install it) is one command.
+        if settings.uses_parakeet() {
+            let (engine, revision) = parakeet_factory(data_root, detector, launch).await?;
+            let mut legs = crate::session::LocalLegs::for_session(
+                engine,
+                &session_id,
+                mic_present,
+                mic_enabled,
+            );
+            legs.revision = Some(revision);
+            return Ok(legs);
+        }
         tokio::task::spawn_blocking(move || {
             use fotw_stt::RecognizerFactory;
             // Without the gate, music and noise become text (#242): refuse
@@ -698,6 +796,67 @@ fn local_transcription_with(
     }))
 }
 
+/// Parakeet Unified behind its speech gate, in the daemon's shared helper, for
+/// `fotwd stt local` and `fotwd stt test`.
+///
+/// # Errors
+///
+/// As at Start: no helper, no detector, or no model, each with its fix.
+#[cfg(target_os = "macos")]
+pub async fn prepare_parakeet(
+    data_root: &Path,
+) -> Result<(std::sync::Arc<dyn fotw_stt::RecognizerFactory>, String), String> {
+    parakeet_factory(
+        data_root.to_owned(),
+        &VAD_MODEL,
+        crate::speechd::Launch::bundled,
+    )
+    .await
+}
+
+/// Parakeet Unified is served only on macOS.
+///
+/// # Errors
+///
+/// Always.
+#[cfg(not(target_os = "macos"))]
+pub async fn prepare_parakeet(
+    _data_root: &Path,
+) -> Result<(std::sync::Arc<dyn fotw_stt::RecognizerFactory>, String), String> {
+    Err("Parakeet Unified runs only on macOS".into())
+}
+
+/// Parakeet Unified for a recording: the detector checked, the helper
+/// started with the model loaded and warmed, and every leg's recognizer
+/// behind its own speech gate. Returns the revision the helper loaded.
+#[cfg(target_os = "macos")]
+async fn parakeet_factory(
+    data_root: PathBuf,
+    detector: &'static KnownModel,
+    launch: impl FnOnce() -> Result<crate::speechd::Launch, String> + Send + 'static,
+) -> Result<(std::sync::Arc<dyn fotw_stt::RecognizerFactory>, String), String> {
+    let root = data_root.clone();
+    // Without the gate, music and noise become text (#242).
+    let vad = tokio::task::spawn_blocking(move || verify_detector(&root, detector))
+        .await
+        .map_err(|_| "speech detector check failed".to_owned())??;
+    let launch = launch()?;
+    let (engine, revision) = crate::speechd::prepare(&launch, &data_root).await?;
+    let gated = fotw_stt::GatedFactory::new(engine, move || {
+        // Checked again per leg, as a Whisper leg checks its files.
+        if !sha256_file(&vad).is_ok_and(|hash| hash == detector.sha256) {
+            return Err(fotw_stt::SttError::new(
+                fotw_stt::SttErrorClass::Unsupported,
+                fotw_stt::speechd::PROVIDER,
+                "the speech detector changed after Start checked it; audio retained",
+            ));
+        }
+        fotw_stt::whisper::SileroDetector::load(&vad)
+            .map(|detector| Box::new(detector) as Box<dyn fotw_stt::SpeechDetector>)
+    });
+    Ok((std::sync::Arc::new(gated), revision))
+}
+
 #[cfg(target_os = "macos")]
 struct UnavailableLocal {
     model: String,
@@ -719,11 +878,18 @@ async fn unavailable_catalog_model_keeps_its_expected_identity_for_later_recover
         language: "en".into(),
     };
     let detector = fixture_detector(root.path());
-    let prepared =
-        local_transcription_with(&settings, root.path(), "fixture", false, false, detector)
-            .prepare(&crate::session::SessionControl::new())
-            .await
-            .unwrap();
+    let prepared = local_transcription_with(
+        &settings,
+        root.path(),
+        "fixture",
+        false,
+        false,
+        detector,
+        crate::speechd::Launch::bundled,
+    )
+    .prepare(&crate::session::SessionControl::new())
+    .await
+    .unwrap();
     let Transcription::Local(legs) = prepared else {
         panic!("expected recording-capable local configuration");
     };
@@ -752,11 +918,18 @@ async fn local_identity_is_pinned_without_loading_native_weights_and_refuses_a_c
     };
     let expected = format!("sha256:{}", sha256_file(&path).unwrap());
     let detector = fixture_detector(root.path());
-    let prepared =
-        local_transcription_with(&settings, root.path(), "fixture", false, false, detector)
-            .prepare(&crate::session::SessionControl::new())
-            .await
-            .unwrap();
+    let prepared = local_transcription_with(
+        &settings,
+        root.path(),
+        "fixture",
+        false,
+        false,
+        detector,
+        crate::speechd::Launch::bundled,
+    )
+    .prepare(&crate::session::SessionControl::new())
+    .await
+    .unwrap();
     let Transcription::Local(legs) = prepared else {
         panic!("expected local configuration");
     };

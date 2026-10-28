@@ -25,6 +25,8 @@ fotw-pipeline = { path = "../fotw-pipeline" }
 # the real state machine and prove that no detection reaches `StartCapture`.
 fotw-shell = { path = "../fotw-shell" }
 fotw-stt = { path = "../fotw-stt", features = ["local-whisper"] }
+# Spawns and owns the FluidAudio speech helper that serves Parakeet (#244).
+fotw-speechd-client = { path = "../fotw-speechd-client" }
 fotw-summarize = { path = "../fotw-summarize" }
 fotw-web = { path = "../fotw-web" }
 fotw-secrets = { path = "../fotw-secrets" }

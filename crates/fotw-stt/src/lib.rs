@@ -50,6 +50,7 @@ mod latin_base;
 pub mod local;
 pub mod replay;
 pub mod speaker;
+pub mod speechd;
 pub mod store;
 pub mod stream;
 pub mod transcript;
@@ -71,11 +72,12 @@ pub use local::{
 };
 pub use replay::{PcmRing, Replay, to_linear16_le};
 pub use speaker::{SpeakerNormalizer, SpeakerRegistry};
+pub use speechd::SpeechdEngine;
 pub use store::{
     CountingIdFactory, SegmentIdFactory, SegmentStore, StoreOutcome, UlidFactory, UtteranceTracker,
 };
 pub use stream::{StreamEvent, StreamState};
 pub use transcript::{Source, TimestampSource, TranscriptSegment, Word};
-pub use vad::{GateConfig, GatedRecognizer, SpeechDetector};
+pub use vad::{GateConfig, GatedFactory, GatedRecognizer, SpeechDetector};
 #[cfg(all(target_os = "macos", feature = "local-whisper"))]
 pub use whisper::WhisperEngine;

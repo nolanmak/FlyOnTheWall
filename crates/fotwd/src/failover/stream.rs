@@ -134,7 +134,7 @@ impl LocalSourceConfig {
     fn plan(&self) -> LocalPlan {
         LocalPlan {
             engine: EngineDescriptor {
-                provider: fotw_stt::local::PROVIDER.into(),
+                provider: self.local.provider().into(),
                 model: self.local.model().into(),
                 revision: self.revision.clone(),
                 capabilities: local_capabilities(),
@@ -164,7 +164,7 @@ impl FailoverConfig {
     fn local_plan(&self) -> LocalPlan {
         LocalPlan {
             engine: EngineDescriptor {
-                provider: fotw_stt::local::PROVIDER.into(),
+                provider: self.local.provider().into(),
                 model: self.local.model().into(),
                 revision: self.local_revision.clone(),
                 capabilities: self.local_capabilities.clone(),
@@ -422,7 +422,11 @@ impl Shared {
         } else {
             Phase::Complete
         };
-        gate.status.error = error.as_ref().map(|e| e.message.clone());
+        // A gap noted earlier stays visible on a source that then completed.
+        gate.status.error = error
+            .as_ref()
+            .map(|e| e.message.clone())
+            .or_else(|| gate.status.error.take());
         if let Some(error) = error {
             let _ = self
                 .events
@@ -432,6 +436,14 @@ impl Shared {
             .events
             .send(Event::Transcript(StreamEvent::State(StreamState::Closed)));
         gate.fenced = true;
+    }
+    /// A non-fatal gap: shown while the source keeps running, and kept after
+    /// it completes.
+    fn note_gap(&self, note: &str) {
+        let mut gate = self.gate.lock().unwrap_or_else(|p| p.into_inner());
+        if !gate.fenced {
+            gate.status.error = Some(note.to_owned());
+        }
     }
     fn commit_status(&self, journal: &CoverageJournal) {
         let mut gate = self.gate.lock().unwrap_or_else(|p| p.into_inner());
@@ -1456,7 +1468,7 @@ impl Worker {
             .journal
             .switch(
                 EngineDescriptor {
-                    provider: fotw_stt::local::PROVIDER.into(),
+                    provider: local.factory.provider().into(),
                     model: local.factory.model().into(),
                     revision: local.plan.engine.revision.clone(),
                     capabilities: local.plan.engine.capabilities.clone(),
@@ -1488,7 +1500,18 @@ impl Worker {
             .iter()
             .map(|&sample| f32::from(sample) / 32768.0)
             .collect();
-        let recognized = self.recognizer.as_mut().unwrap().transcribe(&pcm)?;
+        let recognized = match self.recognizer.as_mut().unwrap().transcribe(&pcm) {
+            Ok(recognized) => recognized,
+            // The helper failed this utterance even after a restart, but it
+            // can still serve the next one: keep the audio, record the gap,
+            // and carry on. A spent restart budget is not retryable and ends
+            // the source as before.
+            Err(error) if error.provider == fotw_stt::speechd::PROVIDER && error.retryable => {
+                let through = self.local_base + chunk.start_sample + chunk.samples.len() as u64;
+                return self.skip(through, chunk.samples.len(), &error);
+            }
+            Err(error) => return Err(error),
+        };
         if self.shared.fenced() {
             return Err(failure("late native inference fenced"));
         }
@@ -1501,6 +1524,7 @@ impl Worker {
             .ok_or_else(|| failure("local inference was not selected"))?;
         let segments = segments_for(
             &config,
+            local.factory.provider(),
             local.factory.model(),
             local.factory.language(),
             &chunk,
@@ -1510,6 +1534,37 @@ impl Worker {
             self.local_base + chunk.start_sample + chunk.samples.len() as u64,
             segments,
         )
+    }
+    fn skip(&mut self, through: u64, samples: usize, error: &SttError) -> Result<(), SttError> {
+        if self.shared.fenced() {
+            return Err(failure("late coverage gap fenced"));
+        }
+        let reason = match &error.detail {
+            Some(detail) => format!("{} ({detail})", error.message),
+            None => error.message.clone(),
+        };
+        let reason: String = reason.chars().take(500).collect();
+        self.journal
+            .skip(
+                self.journal.current_epoch().number,
+                self.journal.committed_through(),
+                through,
+                reason.clone(),
+            )
+            .map_err(|e| failure(e.to_string()))?;
+        self.shared.commit_status(&self.journal);
+        let note = format!(
+            "{:.1} s of speech were not transcribed: {reason}; the audio is kept",
+            samples as f64 / 16_000.0
+        );
+        self.shared.note_gap(&note);
+        self.shared
+            .emit(Event::Transcript(StreamEvent::Error(SttError::new(
+                error.class,
+                error.provider.clone(),
+                note,
+            ))));
+        Ok(())
     }
     fn commit(&mut self, through: u64, segments: Vec<TranscriptSegment>) -> Result<(), SttError> {
         if self.shared.fenced() {

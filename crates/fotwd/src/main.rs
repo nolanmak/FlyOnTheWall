@@ -1651,6 +1651,7 @@ async fn stt_command(args: &[String]) -> ExitCode {
         // With `--model`, a model can be tried before there is a library to
         // store a choice in; without it, the stored choice is what is tested.
         let mut settings = match flag_value(args, "--model") {
+            Some(model) if fotwd::speechd::is_engine(&model) => SttSettings::default(),
             Some(model) => match resolve_model_arg(&model, &data_root) {
                 Ok(path) => SttSettings {
                     model: path.to_string_lossy().into_owned(),
@@ -1712,11 +1713,15 @@ async fn stt_command(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
             if let Some(model) = flag_value(args, "--model") {
-                settings.model = match resolve_model_arg(&model, &data_root) {
-                    Ok(path) => path.to_string_lossy().into_owned(),
-                    Err(e) => {
-                        eprintln!("fotwd: {e}");
-                        return ExitCode::FAILURE;
+                settings.model = if fotwd::speechd::is_engine(&model) {
+                    fotwd::speechd::ENGINE.to_owned()
+                } else {
+                    match resolve_model_arg(&model, &data_root) {
+                        Ok(path) => path.to_string_lossy().into_owned(),
+                        Err(e) => {
+                            eprintln!("fotwd: {e}");
+                            return ExitCode::FAILURE;
+                        }
                     }
                 };
             }
@@ -1729,26 +1734,46 @@ async fn stt_command(args: &[String]) -> ExitCode {
                 }
                 settings.language = if code == "auto" { String::new() } else { code };
             }
-            let path = settings.model_path(&data_root);
-            if !check_model(&path, &data_root) {
-                return ExitCode::FAILURE;
-            }
-            // Validate the actual model metadata before persisting this choice.
-            // Renaming an English-only model must not bypass language validation.
-            #[cfg(target_os = "macos")]
-            if let Err(error) = fotw_stt::WhisperEngine::new(&path, settings.language())
-                .with_speech_gate(fotwd::stt::vad_model_path(&data_root))
-                .load()
-            {
-                eprintln!("fotwd: {}", error.message);
-                return ExitCode::FAILURE;
+            if settings.uses_parakeet() {
+                // English only, and ready means the helper loaded and warmed
+                // the installed model behind its speech gate.
+                if settings.language().is_some_and(|code| code != "en") {
+                    eprintln!(
+                        "fotwd: Parakeet Unified transcribes English only; use --language en or auto"
+                    );
+                    return ExitCode::FAILURE;
+                }
+                println!(
+                    "  checking   : {} in the speech helper",
+                    fotwd::speechd::ENGINE
+                );
+                if let Err(error) = fotwd::stt::prepare_parakeet(&data_root).await {
+                    eprintln!("fotwd: {error}");
+                    return ExitCode::FAILURE;
+                }
+                println!("  verified   : loaded and warmed up");
+            } else {
+                let path = settings.model_path(&data_root);
+                if !check_model(&path, &data_root) {
+                    return ExitCode::FAILURE;
+                }
+                // Validate the actual model metadata before persisting this choice.
+                // Renaming an English-only model must not bypass language validation.
+                #[cfg(target_os = "macos")]
+                if let Err(error) = fotw_stt::WhisperEngine::new(&path, settings.language())
+                    .with_speech_gate(fotwd::stt::vad_model_path(&data_root))
+                    .load()
+                {
+                    eprintln!("fotwd: {}", error.message);
+                    return ExitCode::FAILURE;
+                }
+                settings.model = path.to_string_lossy().into_owned();
             }
             settings.engine = if fallback {
                 SttEngine::Fallback
             } else {
                 SttEngine::Local
             };
-            settings.model = path.to_string_lossy().into_owned();
             if let Err(e) = settings.write(&mut db) {
                 eprintln!("fotwd: {e}");
                 return ExitCode::FAILURE;
@@ -1790,6 +1815,25 @@ async fn stt_command(args: &[String]) -> ExitCode {
 async fn model_setup_command(default_data_root: &std::path::Path, args: &[String]) -> ExitCode {
     use fotwd::model_setup::{Control, Source};
     if args.is_empty() || matches!(args, [action] if action=="list") {
+        println!("Speech helper models (fotw-speechd):");
+        for model in fotwd::speechd::HELPER_MODELS {
+            println!(
+                "{}: {} bytes; {}\n  {}@{}; every file size- and SHA-256-pinned\n  License: {} — {}\n  {}",
+                model.id,
+                model.bytes,
+                model.note,
+                model.repository,
+                model.revision,
+                model.license,
+                model.license_url(),
+                if fotwd::speechd::present_model(default_data_root, model) {
+                    "installed"
+                } else {
+                    "not installed"
+                }
+            );
+        }
+        println!();
         println!("Pinned Whisper catalog: {}", fotwd::stt::MODEL_REVISION);
         println!(
             "License: MIT — https://huggingface.co/ggerganov/whisper.cpp/blob/{}/README.md",
@@ -1846,12 +1890,13 @@ async fn model_setup_command(default_data_root: &std::path::Path, args: &[String
         },
         _ => {
             eprintln!(
-                "usage: fotwd stt models list | install <name> [--data-root <dir>] | import <name> <file> [--data-root <dir>]"
+                "usage: fotwd stt models list | install <name> [--data-root <dir>] | import <name> <file|dir> [--data-root <dir>]"
             );
             return ExitCode::FAILURE;
         }
     };
     let root_for_report = root.clone();
+    let setup_root = root.clone();
     let result = tokio::task::spawn_blocking(move || {
         let mut last = None;
         fotwd::model_setup::install(&root, &name, source, &Control::default(), |progress| {
@@ -1868,6 +1913,18 @@ async fn model_setup_command(default_data_root: &std::path::Path, args: &[String
     })
     .await;
     match result {
+        Ok(Ok(path))
+            if path.starts_with(
+                fotwd::speechd::models_root(&setup_root).join(fotwd::speechd::ENGINE),
+            ) =>
+        {
+            println!("Verified model: {}", path.display());
+            println!(
+                "Parakeet Unified is installed and is the default on-device engine. Choose it in \
+                 Transcription settings or with `fotwd stt local --model parakeet-unified`."
+            );
+            ExitCode::SUCCESS
+        }
         Ok(Ok(path)) => {
             println!("Verified model: {}", path.display());
             let vad = fotwd::stt::vad_model_path(&root_for_report);
@@ -1984,8 +2041,50 @@ fn check_whisper_model(path: &std::path::Path, data_root: &std::path::Path) -> b
     }
 }
 
+fn print_parakeet_model() {
+    println!(
+        "  model      : {}@{} ({})",
+        fotwd::speechd::ENGINE,
+        fotwd::speechd::REVISION,
+        fotwd::speechd::LICENSE
+    );
+}
+
+/// What would stop Parakeet at Start, without starting the helper.
+fn print_parakeet_readiness(data_root: &std::path::Path) {
+    if !cfg!(target_os = "macos") {
+        println!("  ! local transcription is macOS-only for now; Start is refused");
+    } else if fotwd::speechd::Launch::bundled().is_err() {
+        println!("  ! this build has no speech helper (fotw-speechd); Start is refused");
+    } else if !fotwd::speechd::present(data_root) {
+        println!("  ! the model is not installed, so Start is refused; install it with");
+        println!("    `fotwd stt models install {}`", fotwd::speechd::ENGINE);
+    } else if !fotwd::stt::vad_model_path(data_root).is_file() {
+        println!("  ! the speech detector is missing, so Start is refused; install it with");
+        println!(
+            "    `fotwd stt models install {}`",
+            fotwd::stt::VAD_MODEL.name
+        );
+    }
+}
+
 fn print_stt_status(settings: &fotwd::stt::SttSettings, data_root: &std::path::Path) {
     match settings.engine {
+        fotwd::stt::SttEngine::Local if settings.uses_parakeet() => {
+            println!(
+                "  engine     : local — Parakeet Unified in the speech helper; meeting audio stays here"
+            );
+            print_parakeet_model();
+            println!("  language   : en");
+            print_parakeet_readiness(data_root);
+        }
+        fotwd::stt::SttEngine::Fallback if settings.uses_parakeet() => {
+            println!(
+                "  engine     : Deepgram with local backup (audio initially streams to api.deepgram.com)"
+            );
+            print_parakeet_model();
+            print_parakeet_readiness(data_root);
+        }
         fotwd::stt::SttEngine::Local => {
             let path = settings.model_path(data_root);
             println!("  engine     : local — whisper.cpp on this Mac; meeting audio stays here");
@@ -2081,19 +2180,31 @@ async fn stt_test(
         }
     };
 
-    let path = settings.model_path(data_root);
-    if !check_model(&path, data_root) {
-        return ExitCode::FAILURE;
-    }
-    let engine = Arc::new(
-        WhisperEngine::new(&path, settings.language())
-            .with_speech_gate(fotwd::stt::vad_model_path(data_root)),
-    );
     let loading = Instant::now();
-    if let Err(e) = engine.load() {
-        eprintln!("fotwd: {e}");
-        return ExitCode::FAILURE;
-    }
+    let engine: Arc<dyn fotw_stt::RecognizerFactory> = if settings.uses_parakeet() {
+        match fotwd::stt::prepare_parakeet(data_root).await {
+            Ok((engine, revision)) => {
+                println!("  model      : {}@{revision}", fotwd::speechd::ENGINE);
+                engine
+            }
+            Err(e) => {
+                eprintln!("fotwd: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        let path = settings.model_path(data_root);
+        if !check_model(&path, data_root) {
+            return ExitCode::FAILURE;
+        }
+        let engine = WhisperEngine::new(&path, settings.language())
+            .with_speech_gate(fotwd::stt::vad_model_path(data_root));
+        if let Err(e) = engine.load() {
+            eprintln!("fotwd: {e}");
+            return ExitCode::FAILURE;
+        }
+        Arc::new(engine)
+    };
     println!("  loaded     : in {:.1}s", loading.elapsed().as_secs_f64());
     println!();
 
