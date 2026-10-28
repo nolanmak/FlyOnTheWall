@@ -26,10 +26,10 @@ use fotwd::{
     },
 };
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -70,17 +70,75 @@ fn fixture_epoch_cannot_put_native_timestamps_in_the_future_after_a_scheduling_p
         );
     }
 }
+/// Blocks the archive may trail delivery before a tap waits for the pump, and
+/// blocks the backend may trail delivery once it is processing. Both stay
+/// under the coordinator's 200 ms owner wait (and the worker's 500 ms
+/// deadline), so on the generated timeline aligned audio cannot age into a
+/// fallback merely because a thread was descheduled.
+const PUMP_LAG_BLOCKS: u64 = 15;
+const AEC_LAG_BLOCKS: u64 = 15;
+
+/// The generated capture timeline, shared by both taps, the backend and the
+/// session's processing clock (#262).
+///
+/// Taps stamp each block with its ideal host time. With the host clock the
+/// session compared those stamps against wall time, so a pump or AEC worker
+/// descheduled on a loaded machine aged queued audio past its deadlines and
+/// the whole recording fell back to raw. Here time is the timeline: it moves
+/// only when a tap delivers, and a tap delivers only once the pump has
+/// archived, and the backend processed, all but a bounded tail. Scheduling
+/// changes how long the test takes, not what processing sees.
+#[derive(Default)]
+struct Timeline {
+    /// Host time of the latest delivered block; the processing clock.
+    now_ns: AtomicU64,
+    /// One past the latest microphone block the backend processed; 0 = none.
+    processed: AtomicU64,
+}
+impl fotw_audio::clock::Clock for Timeline {
+    fn now_ns(&self) -> u64 {
+        self.now_ns.load(Ordering::Acquire)
+    }
+}
+impl Timeline {
+    /// Wait, without consulting wall time, until block `i` may be delivered.
+    fn admit(&self, i: u64, root: &Path, ready: &ReadySignal, stopped: &AtomicBool) {
+        let archived = |name| {
+            ready
+                .session_id()
+                .and_then(|id| std::fs::metadata(root.join(id).join(name)).ok())
+                .map_or(0, |m| m.len() / 320)
+        };
+        while !stopped.load(Ordering::Acquire) {
+            let pump = i < PUMP_LAG_BLOCKS
+                || archived("mic.pcm").min(archived("system.pcm")) >= i - PUMP_LAG_BLOCKS;
+            let processed = self.processed.load(Ordering::Acquire);
+            let aec = processed == 0 || processed + AEC_LAG_BLOCKS > i;
+            if pump && aec {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
 struct PulseTap {
     id: TapId,
     mic: bool,
     epoch: Arc<OnceLock<(Instant, u64)>>,
+    timeline: Arc<Timeline>,
+    root: PathBuf,
     ready: ReadySignal,
     completed: Arc<AtomicUsize>,
     stopped: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 impl PulseTap {
-    fn pair(ready: ReadySignal) -> (Box<dyn AudioTap>, Box<dyn AudioTap>, Arc<AtomicUsize>) {
+    fn pair(
+        ready: ReadySignal,
+        timeline: Arc<Timeline>,
+        root: &Path,
+    ) -> (Box<dyn AudioTap>, Box<dyn AudioTap>, Arc<AtomicUsize>) {
         let epoch = Arc::new(OnceLock::new());
         let completed = Arc::new(AtomicUsize::new(0));
         let tap = |mic| {
@@ -92,6 +150,8 @@ impl PulseTap {
                 },
                 mic,
                 epoch: epoch.clone(),
+                timeline: timeline.clone(),
+                root: root.to_path_buf(),
                 ready: ready.clone(),
                 completed: completed.clone(),
                 stopped: Arc::new(AtomicBool::new(false)),
@@ -117,6 +177,8 @@ impl AudioTap for PulseTap {
         let stopped = self.stopped.clone();
         let mic = self.mic;
         let completed = self.completed.clone();
+        let timeline = self.timeline.clone();
+        let root = self.root.clone();
         self.thread = Some(std::thread::spawn(move || {
             // This fixture measures steady recording, not filesystem startup.
             // Reserve its full clock-qualification window after actual readiness.
@@ -132,13 +194,16 @@ impl AudioTap for PulseTap {
                 if let Some(wait) = deadline.checked_duration_since(Instant::now()) {
                     std::thread::sleep(wait);
                 }
+                timeline.admit(i, &root, &ready, &stopped);
                 if stopped.load(Ordering::Acquire) {
                     return;
                 }
                 // Fixture-native sample time, independent of callback scheduling.
+                let host_ns = epoch.1 + i * 10_000_000;
+                timeline.now_ns.fetch_max(host_ns, Ordering::AcqRel);
                 sink.on_frames(
                     &pcm(i, mic),
-                    CaptureTimestamp::new(i * 160, epoch.1 + i * 10_000_000),
+                    CaptureTimestamp::new(i * 160, host_ns),
                     FrameFlags::empty(),
                 );
             }
@@ -183,6 +248,7 @@ struct Subtract {
     ready: ReadySignal,
     root: PathBuf,
     calls: Arc<AtomicUsize>,
+    timeline: Arc<Timeline>,
 }
 impl Backend for Subtract {
     type Error = ();
@@ -222,6 +288,9 @@ impl Backend for Subtract {
         );
         self.render.clear();
         self.calls.fetch_add(1, Ordering::AcqRel);
+        self.timeline
+            .processed
+            .fetch_max(index + 1, Ordering::AcqRel);
         Ok(())
     }
     fn reset(&mut self) -> Result<(), ()> {
@@ -240,6 +309,7 @@ async fn recording(mode: Mode) {
     let root = directory.path().join("sessions");
     let mut control = SessionControl::new();
     let calls = Arc::new(AtomicUsize::new(0));
+    let timeline = Arc::new(Timeline::default());
     control.processing = Some(
         Processing::new(
             Subtract {
@@ -247,6 +317,7 @@ async fn recording(mode: Mode) {
                 ready: control.ready.clone(),
                 root: root.clone(),
                 calls: calls.clone(),
+                timeline: timeline.clone(),
             },
             WorkerConfig {
                 adapter: Config {
@@ -318,7 +389,7 @@ async fn recording(mode: Mode) {
             ))
         }
     };
-    let (system, mic, completed) = PulseTap::pair(control.ready.clone());
+    let (system, mic, completed) = PulseTap::pair(control.ready.clone(), timeline.clone(), &root);
     let stop = control.stop.clone();
     let ready = control.ready.clone();
     let stopper = tokio::spawn(async move {
@@ -338,13 +409,14 @@ async fn recording(mode: Mode) {
             "both generated taps must deliver all 400 blocks before Stop"
         );
     });
-    let outcome = session::run_with_control(
+    let outcome = session::run_with_control_on_clock(
         &root,
         system,
         Some(mic),
         transcription,
         Duration::from_secs(20),
         control,
+        timeline,
     )
     .await;
     stopper.await.unwrap();
@@ -484,7 +556,7 @@ async fn cancelled_processing_admission_retains_native_cleanup_and_cannot_be_reu
     control.processing = Some(processing.clone());
     control.stop.stop();
     let retained = control.clone();
-    let (system, mic, _) = PulseTap::pair(control.ready.clone());
+    let (system, mic, _) = PulseTap::pair(control.ready.clone(), Arc::default(), &sessions);
     let error = tokio::time::timeout(
         Duration::from_secs(1),
         session::run_with_control(
@@ -511,7 +583,7 @@ async fn cancelled_processing_admission_retains_native_cleanup_and_cannot_be_reu
         retained.speech.has_retained_native_worker(),
         "native cleanup remains part of recorder ownership"
     );
-    let (system, mic, _) = PulseTap::pair(retained.ready.clone());
+    let (system, mic, _) = PulseTap::pair(retained.ready.clone(), Arc::default(), &sessions);
     let error = session::run_with_control(
         &sessions,
         system,
