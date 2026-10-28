@@ -37,6 +37,7 @@ pub mod serve;
 pub mod session;
 pub mod stt;
 pub mod summarize;
+mod summary_guard;
 /// Names the integration tests share, so none of them hand-writes one that
 /// resolves to a real engine — #83. Absent from every shipped build; see the
 /// `test-guards` feature in `Cargo.toml`.
@@ -222,3 +223,7 @@ pub mod native_host;
 pub mod native_launch;
 /// Capture and persistence shutdown observations.
 pub mod recorder_lifecycle;
+
+/// App-owned, network-isolated local summary inference.
+#[cfg(unix)]
+pub mod local_summary;

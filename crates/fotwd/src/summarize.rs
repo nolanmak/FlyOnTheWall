@@ -6,7 +6,7 @@
 //! never touches the audio — which is exactly why the schema keeps summaries
 //! as append-only rows rather than a mutable column on the meeting.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use fotw_secrets::KeyStore;
 use fotw_store::{Db, NewSummary};
@@ -16,8 +16,9 @@ use fotw_summarize::document::TranscriptDocument;
 use fotw_summarize::pipeline::{Pipeline, PipelineConfig, SummaryOutcome, Warning};
 use fotw_summarize::template::Template;
 use fotw_summarize::title;
-use fotw_summarize::{AnthropicAdapter, Preset};
+use fotw_summarize::{AnthropicAdapter, LlmAdapter, Preset};
 
+use crate::summary_guard::{GuardedAdapter, PolicyStamp, changed};
 use crate::transport::AllowlistedTransport;
 
 /// How long one CLI call may take. Generous — a long meeting is a long
@@ -60,11 +61,9 @@ pub enum SummarizeRunError {
     NoTranscript(String),
     /// No engine is configured — neither an API key nor an enabled CLI.
     #[error(
-        "no summarize engine configured — run `fotwd key set anthropic` (API), \
-         or `fotwd engine claude-cli --i-acknowledge-egress` (Claude \
-         subscription) or `fotwd engine codex-cli --i-acknowledge-egress` \
-         (ChatGPT/Codex subscription). The transcript is unchanged and can be \
-         summarised later."
+        "no summary engine is ready — choose a destination in the Summaries \
+         settings or use `fotwd engine`. Local-only may still require model \
+         setup. The transcript is unchanged and can be summarised later."
     )]
     NoKey,
     /// The engine answered the title call with something that is not a title
@@ -168,6 +167,7 @@ where
     if segments.is_empty() {
         return Err(SummarizeRunError::NoTranscript(meeting_id.to_owned()));
     }
+    let stamp = PolicyStamp::capture(db, engine)?;
 
     // The user's typed notes, if any. They are a *saliency signal*, not just
     // another input: the prompt contract treats each line as a pointer to
@@ -211,7 +211,6 @@ where
         CLI_DEADLINE,
     );
     let (provider_name, recorded_model) = (built.provider, built.model.clone());
-    let (prose, extraction) = (&*built.prose, &*built.extraction);
 
     // The template arrives as a parsed file (SUM-08), and what crosses this
     // seam is still just its rendered body -- untrusted text that
@@ -251,15 +250,26 @@ where
             })
         })
         .collect::<Result<Vec<_>, fotw_store::StoreError>>()?;
-    let pipeline = Pipeline::new(prose, extraction).with_config(PipelineConfig {
-        speech_context: Some(fotw_summarize::speech_context::SpeechContext::new(epochs)),
-        template_body: template.prompt_body(),
-        ..PipelineConfig::default()
-    });
+    let outcome = {
+        let borrowed = Mutex::new(&mut *db);
+        let check = || {
+            let db = borrowed.lock().map_err(|_| changed())?;
+            stamp.check(&db)
+        };
+        let prose = GuardedAdapter::new(built.prose.as_ref(), &check);
+        let extraction = GuardedAdapter::new(built.extraction.as_ref(), &check);
+        let pipeline = Pipeline::new(&prose, &extraction).with_config(PipelineConfig {
+            speech_context: Some(fotw_summarize::speech_context::SpeechContext::new(epochs)),
+            template_body: template.prompt_body(),
+            ..PipelineConfig::default()
+        });
 
-    let outcome = pipeline
-        .run_with_anchors(&document, &notes.body_md, &anchors, duration_ms)
-        .await?;
+        let outcome = pipeline
+            .run_with_anchors(&document, &notes.body_md, &anchors, duration_ms)
+            .await?;
+        check()?;
+        outcome
+    };
     let warnings = user_warnings(&outcome);
 
     // The admonitions ride in *our* rendered markdown, never in
@@ -305,7 +315,7 @@ where
     // Versioned, never overwritten. A user regenerating with a different
     // template must be able to compare, and losing the previous version to do
     // that would make the feature actively worse than not having it.
-    let summary = db.meetings().insert_summary(
+    let summary = db.meetings().insert_summary_if_setting(
         meeting_id,
         NewSummary {
             transcript_id: Some(transcript_id),
@@ -324,6 +334,7 @@ where
             template_id: None,
             origin_device_id: "local".to_owned(),
         },
+        stamp.version(),
     )?;
 
     Ok(SummarizeOutcome {
@@ -371,7 +382,7 @@ where
     T: fotw_summarize::transport::HttpTransport + 'static,
 {
     match engine {
-        crate::engine::Engine::Anthropic { key } => EngineAdapters {
+        crate::engine::Engine::Anthropic { key, .. } => EngineAdapters {
             prose: Box::new(AnthropicAdapter::new(
                 Arc::clone(transport),
                 prose_model,
@@ -385,7 +396,7 @@ where
             provider: "anthropic",
             model: prose_model.to_owned(),
         },
-        crate::engine::Engine::ClaudeCli { binary } => {
+        crate::engine::Engine::ClaudeCli { binary, .. } => {
             // No read shield: the adapter runs claude with no built-in tools
             // and no MCP servers, so the transcript has nothing to steer, and
             // its login needs the real $HOME (see TokioCliRunner's docs).
@@ -402,7 +413,7 @@ where
                 model: "claude-cli".to_owned(),
             }
         }
-        crate::engine::Engine::Codex { binary } => {
+        crate::engine::Engine::Codex { binary, .. } => {
             // Same shape as the claude arm, plus the read shield: codex is
             // agentic — it runs shell over the untrusted transcript — so the
             // child gets an empty $HOME (see TokioCliRunner's docs).
@@ -435,12 +446,13 @@ where
 ///
 /// As [`title_meeting_with`].
 pub async fn title_meeting_on(
+    db: &mut Db,
     engine: &crate::engine::Engine,
     meeting_id: &str,
     segments: &[TranscriptSegment],
 ) -> Result<String, SummarizeRunError> {
     let transport = Arc::new(AllowlistedTransport::new());
-    title_meeting_with(engine, meeting_id, segments, transport).await
+    title_meeting_with(db, engine, meeting_id, segments, transport).await
 }
 
 /// [`title_meeting_on`] over an injected transport.
@@ -448,8 +460,8 @@ pub async fn title_meeting_on(
 /// Takes the segments the caller already loaded rather than re-reading them:
 /// the only caller is enrichment, which holds them for `fallback_title`
 /// anyway, and this call deliberately reads a *head* of them rather than the
-/// meeting. With the engine passed in too, this touches neither the library
-/// nor the keychain — which is why it takes neither.
+/// meeting. It reads the policy revision from the library, but never resolves
+/// the engine again or reads a credential.
 ///
 /// One [`LlmAdapter::complete`](fotw_summarize::adapter::LlmAdapter::complete)
 /// against the cheap arm — naming a meeting is the lowest-difficulty task this
@@ -463,6 +475,7 @@ pub async fn title_meeting_on(
 /// [`SummarizeRunError::NoTranscript`] with nothing to read, and whatever the
 /// provider or the sanitizer refused.
 pub async fn title_meeting_with<T>(
+    db: &mut Db,
     engine: &crate::engine::Engine,
     meeting_id: &str,
     segments: &[TranscriptSegment],
@@ -478,10 +491,17 @@ where
         .extraction_model()
         .unwrap_or("claude-haiku-4-5");
     let built = engine_adapters(engine, &transport, model, model, TITLE_DEADLINE);
+    let stamp = PolicyStamp::capture(db, engine)?;
+    let borrowed = Mutex::new(db);
+    let check = || {
+        let db = borrowed.lock().map_err(|_| changed())?;
+        stamp.check(&db)
+    };
+    let adapter = GuardedAdapter::new(built.prose.as_ref(), &check);
 
     let document = TranscriptDocument::from_segments(segments);
     let request = title::title_request(&document, title::head_indices(&document), model);
-    let response = built.prose.complete(&request).await?;
+    let response = adapter.complete(&request).await?;
     // SUM-10, and it means something specific here: the cap is 64 output
     // tokens over an instruction that says "the title alone". A model that ran
     // into that did not answer the question, and the local fallback is more
