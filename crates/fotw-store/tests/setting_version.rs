@@ -69,6 +69,11 @@ fn unchanged_settings_allow_generated_writes_and_unrelated_settings_do_not_cance
         .meetings()
         .create(NewMeeting::new("fixture", "UTC"))
         .unwrap();
+    // Exercise a genuinely absent generic setting, rather than the new
+    // library default inserted by bootstrap.
+    db.conn()
+        .execute("DELETE FROM settings WHERE key='summarize'", [])
+        .unwrap();
     let missing = db.setting_version("summarize").unwrap();
     assert_eq!(missing.value(), None);
     db.put_setting("unrelated", "changed").unwrap();

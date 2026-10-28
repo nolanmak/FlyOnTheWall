@@ -509,7 +509,13 @@ fn importing_the_same_archive_twice_changes_nothing() {
     assert_eq!(snapshot(&dest), after_first, "a second import changed data");
     assert!(second.conflicts.is_empty(), "{:?}", second.conflicts);
     assert_eq!(second.rows_inserted, 0);
-    assert_eq!(second.rows_already_present, first.rows_inserted);
+    // Fresh libraries already contain identical bootstrap defaults. They are
+    // present on both imports, while archive rows are inserted only once.
+    assert!(first.conflicts.is_empty(), "{:?}", first.conflicts);
+    assert_eq!(
+        second.rows_already_present,
+        first.rows_inserted + first.rows_already_present
+    );
 }
 
 #[test]

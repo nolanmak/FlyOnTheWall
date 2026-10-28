@@ -191,7 +191,10 @@ mod tests {
 
     fn enable(binary: &str, kind: CliEngine) -> SummarizeSettingsDoc {
         SummarizeSettingsDoc {
-            policy: None,
+            policy: Some(match kind {
+                CliEngine::Claude => fotw_web::SummaryPolicy::ClaudeCli,
+                CliEngine::Codex => fotw_web::SummaryPolicy::CodexCli,
+            }),
             cli_enabled: true,
             acknowledged_egress: true,
             cli_kind: kind,

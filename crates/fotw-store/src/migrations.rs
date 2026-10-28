@@ -14,7 +14,7 @@ use crate::key::DbKey;
 ///
 /// Bump this in the same commit that appends to [`migration_set`]; the two
 /// drifting apart is what [`crate::Db::open`]'s refusal is guarding against.
-pub const LATEST_SCHEMA_VERSION: usize = 8;
+pub const LATEST_SCHEMA_VERSION: usize = 9;
 
 /// Every migration, oldest first. Append only — a released migration is
 /// immutable, because editing one changes the schema of databases that already
@@ -24,7 +24,7 @@ pub const LATEST_SCHEMA_VERSION: usize = 8;
 /// 0001 has shipped, so a released library has to migrate *forward* into the
 /// FTS tables (and backfill them — see the `'rebuild'` statements at the end of
 /// 0002) rather than be rewritten underneath.
-fn migration_set() -> Migrations<'static> {
+fn migration_set(new_library: bool) -> Migrations<'static> {
     Migrations::new(vec![
         M::up(include_str!("schema/0001_initial.sql")).comment("initial schema"),
         M::up(include_str!("schema/0002_fts.sql")).comment("fts5 search indexes"),
@@ -38,6 +38,29 @@ fn migration_set() -> Migrations<'static> {
             .comment("durable speech receipts and provenance"),
         M::up(include_str!("schema/0008_capture_clock_state.sql"))
             .comment("explicit interrupted capture clocks"),
+        M::up_with_hook(
+            include_str!("schema/0009_summary_destination_bootstrap.sql"),
+            move |tx| {
+                if new_library {
+                    // Bootstrap defaults are identical across fresh libraries.
+                    // A user save gets its own timestamp/lamport revision; the
+                    // untouched seed must round-trip without false conflicts.
+                    tx.execute(
+                        "INSERT INTO settings
+                            (key,value,updated_at,lamport,origin_device_id)
+                         VALUES('summarize',?1,0,0,'local')",
+                        [r#"{"policy":"off"}"#],
+                    )?;
+                    tx.execute(
+                        "UPDATE app_meta SET value='explicit-off-v1'
+                         WHERE key='summary_destination_bootstrap'",
+                        [],
+                    )?;
+                }
+                Ok(())
+            },
+        )
+        .comment("explicit summary destination defaults for new libraries"),
     ])
 }
 
@@ -90,13 +113,15 @@ pub(crate) fn migrate(
     // `user_version = 0` — one written before migrations existed, or one
     // recovered by hand — and those are exactly the files where a migration is
     // most likely to go wrong and a backup most likely to be needed.
+    let contains_objects = has_objects(conn)?;
+    let new_library = found == 0 && !contains_objects;
     if let Some(path) = db_path
-        && has_objects(conn)?
+        && contains_objects
     {
         backup_before_migration(conn, path, found, key)?;
     }
 
-    migration_set().to_latest(conn)?;
+    migration_set(new_library).to_latest(conn)?;
     Ok(())
 }
 

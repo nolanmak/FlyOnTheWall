@@ -99,6 +99,16 @@ fn invalid_explicit_policy_or_corrupt_settings_cannot_restore_legacy_egress() {
 fn legacy_libraries_keep_their_previous_explicit_api_key_behavior() {
     let store = ObservedStore::configured();
     let db = fotw_store::Db::open_in_memory(&fotw_store::DbKey::from_bytes([7; 32])).unwrap();
+    // Explicitly model an upgraded legacy library, not a new library.
+    db.conn()
+        .execute("DELETE FROM settings WHERE key='summarize'", [])
+        .unwrap();
+    db.conn()
+        .execute(
+            "UPDATE app_meta SET value='legacy' WHERE key='summary_destination_bootstrap'",
+            [],
+        )
+        .unwrap();
     assert!(matches!(
         resolve_engine(&store, &db),
         Some(Engine::Anthropic { .. })
@@ -185,6 +195,28 @@ fn choosing_off_or_local_does_not_erase_an_inactive_custom_cli_path() {
         assert_eq!(saved.binary, "/owned/fixture-codex");
         assert_eq!(saved.policy, Some(policy));
         assert!(!saved.acknowledged_egress);
+        assert_eq!(store.reads.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn removing_fresh_defaults_or_damaging_the_bootstrap_marker_cannot_restore_implicit_hosted_calls() {
+    for provenance in [None, Some("explicit-off-v1"), Some("unknown-future-policy")] {
+        let db = fotw_store::Db::open_in_memory(&fotw_store::DbKey::from_bytes([7; 32])).unwrap();
+        db.conn()
+            .execute("DELETE FROM settings WHERE key='summarize'", [])
+            .unwrap();
+        db.conn()
+            .execute(
+                "DELETE FROM app_meta WHERE key='summary_destination_bootstrap'",
+                [],
+            )
+            .unwrap();
+        if let Some(value) = provenance {
+            db.conn().execute("INSERT INTO app_meta(key,value,updated_at) VALUES('summary_destination_bootstrap',?1,0)",[value]).unwrap();
+        }
+        let store = ObservedStore::configured();
+        assert!(resolve_engine(&store, &db).is_none());
         assert_eq!(store.reads.load(Ordering::SeqCst), 0);
     }
 }

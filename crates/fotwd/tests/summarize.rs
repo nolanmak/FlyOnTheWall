@@ -219,7 +219,19 @@ fn tmpdir(name: &str) -> std::path::PathBuf {
 }
 
 fn db_at(dir: &std::path::Path) -> Db {
-    Db::open(dir.join("db.sqlite3"), &DbKey::from_bytes([0x11; 32])).unwrap()
+    let path = dir.join("db.sqlite3");
+    let new = !path.exists();
+    let mut db = Db::open(path, &DbKey::from_bytes([0x11; 32])).unwrap();
+    if new {
+        // These pipeline fixtures deliberately choose their fake HTTP engine.
+        // Reopening a writer must not overwrite a later policy change.
+        db.put_setting(
+            "summarize",
+            r#"{"policy":"anthropic","acknowledged_egress":true}"#,
+        )
+        .unwrap();
+    }
+    db
 }
 
 /// The shipped `general` template (SUM-08). Deliberately a real one rather
@@ -620,6 +632,11 @@ async fn summary_calls_receive_saved_engine_limits_without_turning_metadata_into
         NewMeeting, NewSegment, SpeechCommit, SpeechEpoch, SpeechSegment, SpeechSource,
     };
     let mut db = Db::open_in_memory(&DbKey::from_bytes([0x11; 32])).unwrap();
+    db.put_setting(
+        "summarize",
+        r#"{"policy":"anthropic","acknowledged_egress":true}"#,
+    )
+    .unwrap();
     let id = db
         .finalize_speech_capture(
             "summary-engine-fixture",
@@ -680,5 +697,37 @@ async fn summary_calls_receive_saved_engine_limits_without_turning_metadata_into
         );
         assert!(!content[0].to_string().contains("fixture-small.en"));
         assert!(content[0].to_string().contains("We should ship this."));
+    }
+}
+
+#[tokio::test]
+async fn a_fresh_library_refuses_an_injected_hosted_engine_before_any_request() {
+    for remove_default in [false, true] {
+        let dir = tmpdir(&format!("fresh-no-consent-{remove_default}"));
+        let mut db = Db::open(dir.join("db.sqlite3"), &DbKey::from_bytes([0x11; 32])).unwrap();
+        let id = seeded_meeting(&mut db, &dir);
+        if remove_default {
+            db.conn()
+                .execute("DELETE FROM settings WHERE key='summarize'", [])
+                .unwrap();
+        }
+        let transport = Arc::new(MockTransport::new());
+        assert!(
+            summarize::summarize_meeting_with(
+                &mut db,
+                &anthropic(),
+                &id,
+                &general(),
+                Arc::clone(&transport)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            transport.call_count(),
+            0,
+            "fresh defaults must fence actual pipeline dispatch"
+        );
+        assert!(db.meetings().current_summary(&id).unwrap().is_none());
     }
 }

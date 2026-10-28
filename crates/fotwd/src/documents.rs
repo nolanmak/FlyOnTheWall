@@ -1029,6 +1029,11 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        db.put_setting(
+            "summarize",
+            r#"{"policy":"claude_cli","cli_enabled":true,"acknowledged_egress":true}"#,
+        )
+        .unwrap();
         let engine = crate::engine::Engine::ClaudeCli {
             binary,
             settings_version: None,

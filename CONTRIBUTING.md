@@ -129,6 +129,29 @@ volume. Missing observations remain unknown. This metadata does not qualify a
 model or prove that a particular model fits; admission must refresh it before
 loading rather than cache a decision from installed RAM alone.
 
+The bundled local-summary catalog pins public model revisions, every GGUF shard,
+and the optional runtime archive/file digests. Catalog entries describe downloadable
+artifacts; they do not assert that a model fits this Mac or passes meeting-summary
+quality requirements. Provisioning is an explicit development action:
+
+```sh
+cargo run -p fotwd --example local_summary_install -- qwen3-06b-q8-0 /path/to/owned-development-cache
+```
+
+This downloads public artifacts into `local-summary-models` under the supplied
+cache, verifies exact sizes/digests, retains the runtime license and atomically
+publishes the complete package. It does not enable the product's Local-only engine.
+Repeating the command revalidates installed bytes and needs no network when the
+package is intact. Interrupted downloads retain a checksummed prefix; a retry
+rehashes it before issuing a range request. Source errors never select a hosted
+summary provider. Use a development cache, separate from your meeting library.
+
+The provisioning API returns an owned `Job`: request cancellation with `cancel`,
+then retain and await `wait` to establish that its worker has finished. Cancellation
+and native model readiness are separate from download progress. Product setup,
+resource admission, ownership across capture and inference, and quality qualification
+remain separate acceptance work in #234.
+
 ### Dependency changes and third-party notices
 
 `THIRD_PARTY_NOTICES.md` carries the license texts for everything compiled into
