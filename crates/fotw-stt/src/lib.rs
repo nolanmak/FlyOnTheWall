@@ -45,6 +45,7 @@ pub mod deepgram;
 pub mod deepgram_stream;
 pub mod deepgram_wire;
 pub mod error;
+mod latin_base;
 pub mod local;
 pub mod replay;
 pub mod speaker;

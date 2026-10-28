@@ -16,9 +16,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 ulid = { workspace = true }
-# Accent-insensitive vocabulary matching (NFD). Already in the dependency graph
-# through url/idna, with the same features, so it adds no crate. Unicode-3.0.
-icu_normalizer = { version = "2.2", default-features = false, features = ["compiled_data"] }
 # The streaming transport (spec 7.4). Declared here rather than in
 # [workspace.dependencies] because no other crate opens a socket to a provider.
 #

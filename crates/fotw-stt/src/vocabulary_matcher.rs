@@ -10,8 +10,9 @@
 //! the phrase is kept; punctuation inside it blocks the match.
 //!
 //! Differences from Muesli, each pinned by `tests/fixtures/vocabulary-corrections-v1.json`:
-//! - Comparison folds accents as well as case (NFD, combining marks removed),
-//!   so `jose` matches `José`. Muesli compares canonically equivalent text.
+//! - Comparison folds Latin accents as well as case, so `jose` matches `José`
+//!   (precomposed or with combining marks). Muesli compares canonically
+//!   equivalent text.
 //! - Words are split on any whitespace, which is kept verbatim, not only on
 //!   spaces.
 //! - A near miss never replaces a frequent English word or its inflection
@@ -355,12 +356,12 @@ fn split_punctuation(word: &str) -> Option<(&str, &str, &str)> {
     Some((&word[..start], core, &word[end..]))
 }
 
-/// Case- and accent-insensitive comparison form.
+/// Case- and accent-insensitive comparison form: Latin letters lose their
+/// accents whether precomposed or followed by combining marks.
 fn fold(text: &str) -> Vec<char> {
-    let decomposed = icu_normalizer::DecomposingNormalizerBorrowed::new_nfd().normalize(text);
-    decomposed
-        .chars()
+    text.chars()
         .filter(|&c| !is_combining_mark(c))
+        .map(crate::latin_base::base_letter)
         .flat_map(char::to_lowercase)
         .collect()
 }
