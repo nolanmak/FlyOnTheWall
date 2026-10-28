@@ -45,6 +45,12 @@ Windows, but neither captures anything.
   model. `fotwd stt test <wav>` runs a file through the same path. If the
   engine is set to local and the model is missing, the meeting is recorded
   without a transcript and the reason is shown. Nothing falls back to Deepgram.
+- `fotw-speechd-client` (#243): the protocol and process owner for the
+  FluidAudio speech helper that later issues run Parakeet, Silero VAD and the
+  streaming engines through
+  ([docs/SPEECHD_PROTOCOL.md](docs/SPEECHD_PROTOCOL.md)). It restarts a crashed
+  helper at most 3 times in a row, 2 s apart, and fails open streams at once
+  instead of waiting on it. Nothing uses it yet.
 
 #### Library and keys
 
