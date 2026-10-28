@@ -663,20 +663,31 @@ async fn try_send_audio_reports_backpressure_instead_of_blocking() {
     client.shutdown().await;
 }
 
-/// The fake behind a relay that hands its output on 100 ms late, in a wrapper
-/// process that exits as soon as the fake does: the client sees the exit
-/// before it has read what the helper wrote just before dying.
+/// The fake behind a relay that hands each chunk of its output on 50 ms after
+/// it was written (a fixed latency, not one per chunk that could pile up), in
+/// a wrapper process that exits as soon as the fake does: the client sees the
+/// exit before it has read what the helper wrote just before dying.
 fn behind_a_slow_relay(extra: &[&str]) -> Option<SpeechdConfig> {
     let (fake, true) = helper() else { return None };
     let script = r#"f="$(mktemp -u)"; mkfifo "$f"
-python3 -u -c 'import os, sys, time
-src = os.open(sys.argv[1], os.O_RDONLY)
+python3 -u -c 'import os, queue, sys, threading, time
+src, chunks = os.open(sys.argv[1], os.O_RDONLY), queue.Queue()
+def read():
+    while True:
+        chunk = os.read(src, 65536)
+        chunks.put((time.monotonic() + 0.05, chunk))
+        if not chunk:
+            return
+threading.Thread(target=read, daemon=True).start()
 while True:
-    chunk = os.read(src, 65536)
+    due, chunk = chunks.get()
+    time.sleep(max(0.0, due - time.monotonic()))
     if not chunk:
         break
-    time.sleep(0.1)
-    os.write(1, chunk)' "$f" &
+    try:
+        os.write(1, chunk)
+    except BrokenPipeError:
+        break' "$f" &
 "$0" "$@" > "$f"; status=$?; rm -f "$f"; exit $status"#;
     let mut config = SpeechdConfig::new("/bin/sh", std::env::temp_dir());
     let mut args: Vec<std::ffi::OsString> = vec!["-c".into(), script.into(), fake.into()];
