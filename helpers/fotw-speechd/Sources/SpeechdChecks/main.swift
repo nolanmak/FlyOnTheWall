@@ -284,7 +284,7 @@ func aDictationStreamShowsEachStepOnceAndReturnsItsRecognizerReset() async throw
 
 func pinsAreComplete() throws {
     let ids = PinnedModels.all.map(\.id)
-    try expect(ids == ["parakeet-unified", "silero-vad", "parakeet-eou-320ms", "nemotron-3.5-2240ms"], "\(ids)")
+    try expect(ids == ["parakeet-unified", "silero-vad", "parakeet-eou-320ms", "nemotron-3.5"], "\(ids)")
     for model in PinnedModels.all {
         try expect(model.revision.count == 40 && model.revision.allSatisfy(\.isHexDigit), "\(model.id) revision")
         try expect(!model.files.isEmpty && !model.license.isEmpty, "\(model.id) files and license")

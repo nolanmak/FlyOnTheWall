@@ -169,7 +169,7 @@ Error codes: `version_mismatch`, `protocol`, `bad_request`, `unknown_engine`,
 | `parakeet-unified` | batch | `FluidInference/parakeet-unified-en-0.6b-coreml` | CC-BY-4.0 |
 | `silero-vad` | vad | `FluidInference/silero-vad-coreml` | MIT |
 | `parakeet-eou-320ms` | streaming (planned, #245) | `FluidInference/parakeet-realtime-eou-120m-coreml` | NVIDIA Open Model License |
-| `nemotron-3.5` | streaming (planned, Murmur #100) | `FluidInference/Nemotron-3.5-ASR-Streaming-Multilingual-0.6b-CoreML` | OpenMDW-1.1 |
+| `nemotron-3.5` | streaming, one dictation at a time (Murmur #100) | `FluidInference/Nemotron-3.5-ASR-Streaming-Multilingual-0.6b-CoreML` | OpenMDW-1.1 |
 
 Each engine states its per-stream bound as `max_audio_ms` in the
 capabilities, and a stream past it fails with `too_long`.
@@ -180,6 +180,17 @@ capabilities, and a stream past it fails with `too_long`.
 - A **vad** stream answers as audio arrives, in 256 ms steps. Unbounded.
 - A **streaming** stream sends `partial`s as audio arrives and a `final` per
   utterance, with `utterance` ids. Unbounded; state is the engine's cache.
+  `nemotron-3.5` (streaming dictation, Murmur #100) treats the whole stream
+  as utterance 1. It runs the model's 560 ms and 1120 ms variants in lockstep
+  on the same audio: a `partial` with the 560 ms variant's running text
+  whenever a step changes it, and on `finish` the 1120 ms variant's last
+  partial step padded with silence and decoded into the one `final`. Its
+  `options.language` is a language code the model has a prompt for (`en`,
+  `de`, `en-GB`…); absent or unknown, the model detects the language. It
+  holds one stream's state, so it serves one stream at a time: a second
+  waits up to 1 s for the first to end, then is refused with `busy`. Each
+  stream starts from a reset state, and `warmup` runs one step of silence
+  and resets.
 - A **diarization** stream (#246) takes a whole channel of a meeting, up to
   `max_audio_ms` (4 hours for the planned `diarizer`). It processes audio as
   it arrives in bounded windows, as Muesli's `diarizeRecordedAudio` does, and
@@ -201,6 +212,7 @@ ordinary test suites use:
 | `fake-hang` | the process stops reading and answering on its first audio frame |
 | `fake-stall` | never answers `finish`, but keeps serving everything else |
 | `fake-exit-after-final` | on `finish`, `final` and `closed`, then the process exits with status 70 |
+| `fake-dictation` | `nemotron-3.5` without a model, in 250 ms (4000-sample) steps: a `partial {text: "steps=<n> lang=<language or auto>", utterance: 1}` when a step completes; on `finish` the last partial step counts as one more, `final {utterance: 1}` with the same text. A frame holding a sample of −32768 fails the stream with `engine` |
 
 `load` and `warmup` of a fake engine send one `progress` each.
 

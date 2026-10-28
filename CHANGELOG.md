@@ -67,6 +67,11 @@ Windows, but neither captures anything.
   per-file SHA-256 and installed only by an explicit setup action, and model-free
   fake engines that the Rust protocol tests run against on macOS. Built only
   with `FOTW_FLUIDAUDIO_SOURCE`; `just speechd-real` is its real-model suite.
+- Streaming dictation in `fotw-speechd` (Murmur #100): the `nemotron-3.5`
+  engine (Nemotron 3.5 ASR Streaming 0.6B, multilingual, OpenMDW-1.1), its
+  560 ms variant for partials and its 1120 ms variant for the final, and the
+  model-free `fake-dictation` engine for tests. `speechd_dictation` replays
+  the corpus through it in real time.
 
 #### Library and keys
 
