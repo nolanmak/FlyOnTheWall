@@ -63,7 +63,8 @@ impl Plan {
 }
 
 /// Opens a saved track; `Ok(None)` when the meeting has none for a channel.
-pub type OpenTrack<'a> = dyn Fn(Channel) -> Result<Option<Box<dyn PcmSource>>, String> + Send + Sync + 'a;
+pub type OpenTrack<'a> =
+    dyn Fn(Channel) -> Result<Option<Box<dyn PcmSource>>, String> + Send + Sync + 'a;
 
 /// How a run ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,7 +152,12 @@ pub async fn run(
         }
     }
     let windows_of = |track: &dyn PcmSource| {
-        super::windows::plan(track.total(), samples(plan.window_ms), samples(plan.overlap_ms)).len() as u64
+        super::windows::plan(
+            track.total(),
+            samples(plan.window_ms),
+            samples(plan.overlap_ms),
+        )
+        .len() as u64
     };
     let system_windows = tracks
         .iter()
@@ -162,7 +168,11 @@ pub async fn run(
     let diarize_units = system_windows.div_ceil(5);
     let mut progress = Progress {
         done: 0,
-        total: tracks.iter().map(|(_, t)| windows_of(t.as_ref())).sum::<u64>() + diarize_units,
+        total: tracks
+            .iter()
+            .map(|(_, t)| windows_of(t.as_ref()))
+            .sum::<u64>()
+            + diarize_units,
     };
 
     let mut heard: Vec<(Channel, Vec<WindowWords>)> = Vec::new();
@@ -172,9 +182,15 @@ pub async fn run(
             .post_pass_windows(meeting_id, name)
             .map_err(|e| e.to_string())?
             .into_iter()
-            .map(|(i, json)| Ok((i as usize, serde_json::from_str(&json).map_err(|e: serde_json::Error| e.to_string())?)))
+            .map(|(i, json)| {
+                Ok((
+                    i as usize,
+                    serde_json::from_str(&json).map_err(|e: serde_json::Error| e.to_string())?,
+                ))
+            })
             .collect::<Result<_, String>>()?;
-        let mut reader = WindowReader::with_sizes(track, samples(plan.window_ms), samples(plan.overlap_ms));
+        let mut reader =
+            WindowReader::with_sizes(track, samples(plan.window_ms), samples(plan.overlap_ms));
         let bounds: Vec<(u64, u64)> = reader.plan().to_vec();
         progress.done += saved.len() as u64;
         while let Some(mut window) = reader.next_window(|i| saved.contains_key(&i))? {
@@ -200,7 +216,13 @@ pub async fn run(
             progress.done += 1;
             let json = serde_json::to_string(&words).map_err(|e| e.to_string())?;
             lock(db)
-                .post_pass_checkpoint(meeting_id, name, window.index as i64, &json, progress.permille())
+                .post_pass_checkpoint(
+                    meeting_id,
+                    name,
+                    window.index as i64,
+                    &json,
+                    progress.permille(),
+                )
                 .map_err(|e| e.to_string())?;
             saved.insert(window.index, words);
         }
@@ -218,7 +240,17 @@ pub async fn run(
 
     let mut notes = Vec::new();
     let speakers = if heard.iter().any(|(c, _)| *c == Channel::System) {
-        match diarize(db, meeting_id, engine, open, stop, &mut progress, diarize_units).await? {
+        match diarize(
+            db,
+            meeting_id,
+            engine,
+            open,
+            stop,
+            &mut progress,
+            diarize_units,
+        )
+        .await?
+        {
             Diarized::Spans(spans) => Some(spans),
             Diarized::Unavailable(why) => {
                 notes.push(why);
@@ -237,7 +269,11 @@ pub async fn run(
             .map(|(_, w)| merge_windows(w))
             .unwrap_or_default()
     };
-    let turns = build_turns(&merged(Channel::Mic), &merged(Channel::System), speakers.as_deref());
+    let turns = build_turns(
+        &merged(Channel::Mic),
+        &merged(Channel::System),
+        speakers.as_deref(),
+    );
     let model = if speakers.is_some() {
         "parakeet-unified+diarizer"
     } else {
@@ -296,7 +332,9 @@ async fn diarize(
 ) -> Result<Diarized, String> {
     let unavailable = |e: String| Diarized::Unavailable(format!("speaker labels unavailable: {e}"));
     let Some(mut session) = engine.diarize().await? else {
-        return Ok(Diarized::Unavailable("speaker labels unavailable: no diarizer installed".into()));
+        return Ok(Diarized::Unavailable(
+            "speaker labels unavailable: no diarizer installed".into(),
+        ));
     };
     let Some(mut track) = open(Channel::System)? else {
         return Ok(Diarized::Spans(Vec::new()));
@@ -370,7 +408,9 @@ mod tests {
     fn track(total_blocks: usize, words: &[(i16, usize, usize)]) -> Vec<i16> {
         let mut pcm = vec![0i16; total_blocks * BLOCK];
         for &(v, at, len) in words {
-            pcm[at * BLOCK..(at + len) * BLOCK].iter_mut().for_each(|x| *x = v);
+            pcm[at * BLOCK..(at + len) * BLOCK]
+                .iter_mut()
+                .for_each(|x| *x = v);
         }
         pcm
     }
@@ -380,10 +420,11 @@ mod tests {
     /// quiet and a loud speaker in 6 s turns.
     fn meeting() -> (Vec<i16>, Vec<i16>) {
         let blocks = 3_000;
-        let edges: Vec<usize> = super::super::windows::plan((blocks * BLOCK) as u64, 480_000, 32_000)
-            .windows(2)
-            .flat_map(|p| [p[1].0 as usize / BLOCK, p[0].1 as usize / BLOCK])
-            .collect();
+        let edges: Vec<usize> =
+            super::super::windows::plan((blocks * BLOCK) as u64, 480_000, 32_000)
+                .windows(2)
+                .flat_map(|p| [p[1].0 as usize / BLOCK, p[0].1 as usize / BLOCK])
+                .collect();
         let layout = |base: i16, loud: Option<i16>| {
             let mut out = Vec::new();
             let mut at = 1;
@@ -411,7 +452,10 @@ mod tests {
 
     fn library() -> (Mutex<Db>, String) {
         let mut db = Db::open_in_memory(&DbKey::from_bytes([0x24; 32])).unwrap();
-        let meeting = db.meetings().create(NewMeeting::new("dev-1", "UTC")).unwrap();
+        let meeting = db
+            .meetings()
+            .create(NewMeeting::new("dev-1", "UTC"))
+            .unwrap();
         let live = db
             .meetings()
             .create_transcript(&meeting, "fotw-speechd", "parakeet-unified", true)
@@ -427,7 +471,10 @@ mod tests {
         assert!(lock(db).post_pass_queue(meeting, &plan).unwrap());
     }
 
-    fn opener(mic: Vec<i16>, system: Vec<i16>) -> impl Fn(Channel) -> Result<Option<Box<dyn PcmSource>>, String> + Send + Sync {
+    fn opener(
+        mic: Vec<i16>,
+        system: Vec<i16>,
+    ) -> impl Fn(Channel) -> Result<Option<Box<dyn PcmSource>>, String> + Send + Sync {
         move |c| {
             let pcm = match c {
                 Channel::Mic => mic.clone(),
@@ -439,7 +486,12 @@ mod tests {
 
     fn stored(db: &Mutex<Db>, meeting: &str) -> Vec<(String, Option<String>, String)> {
         let db = lock(db);
-        let id = db.post_pass_job(meeting).unwrap().unwrap().cleaned_transcript_id.unwrap();
+        let id = db
+            .post_pass_job(meeting)
+            .unwrap()
+            .unwrap()
+            .cleaned_transcript_id
+            .unwrap();
         let mut db2 = db;
         db2.meetings()
             .transcript_segments(&id)
@@ -455,9 +507,15 @@ mod tests {
         let (db, meeting_id) = library();
         let engine = FakeEngine::default();
         queue(&db, &meeting_id, &engine);
-        let outcome = run(&db, &meeting_id, &engine, &opener(mic.clone(), system.clone()), &AtomicBool::new(false))
-            .await
-            .unwrap();
+        let outcome = run(
+            &db,
+            &meeting_id,
+            &engine,
+            &opener(mic.clone(), system.clone()),
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
         assert!(matches!(outcome, Outcome::Done(_)));
         let segments = stored(&db, &meeting_id);
         let spoken = |c: &str| -> Vec<String> {
@@ -470,10 +528,18 @@ mod tests {
         let expected = |pcm: &[i16]| words(pcm).into_iter().map(|w| w.text).collect::<Vec<_>>();
         assert_eq!(spoken("mic"), expected(&mic));
         assert_eq!(spoken("system"), expected(&system));
-        let speakers: std::collections::BTreeSet<_> =
-            segments.iter().filter(|s| s.0 == "system").map(|s| s.1.clone()).collect();
+        let speakers: std::collections::BTreeSet<_> = segments
+            .iter()
+            .filter(|s| s.0 == "system")
+            .map(|s| s.1.clone())
+            .collect();
         assert_eq!(speakers, [Some("S1".into()), Some("S2".into())].into());
-        assert!(segments.iter().filter(|s| s.0 == "mic").all(|s| s.1.as_deref() == Some("me")));
+        assert!(
+            segments
+                .iter()
+                .filter(|s| s.0 == "mic")
+                .all(|s| s.1.as_deref() == Some("me"))
+        );
         let job = lock(&db).post_pass_job(&meeting_id).unwrap().unwrap();
         assert_eq!(job.state, PostPassState::Done);
         assert_eq!(job.progress_permille, 1000);
@@ -481,14 +547,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_job_killed_halfway_resumes_without_redoing_a_window_and_matches_an_uninterrupted_run() {
+    async fn a_job_killed_halfway_resumes_without_redoing_a_window_and_matches_an_uninterrupted_run()
+     {
         let (mic, system) = meeting();
         let open = opener(mic, system);
 
         let (whole_db, whole_meeting) = library();
         let whole = FakeEngine::default();
         queue(&whole_db, &whole_meeting, &whole);
-        run(&whole_db, &whole_meeting, &whole, &open, &AtomicBool::new(false)).await.unwrap();
+        run(
+            &whole_db,
+            &whole_meeting,
+            &whole,
+            &open,
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
         let windows = whole.transcribed.load(Ordering::SeqCst);
 
         let (db, meeting_id) = library();
@@ -506,10 +581,16 @@ mod tests {
         assert!(killed.is_err(), "the run was cut off");
         let job = lock(&db).post_pass_job(&meeting_id).unwrap().unwrap();
         assert_eq!(job.state, PostPassState::Pending);
-        assert!((400..=600).contains(&job.progress_permille), "{}", job.progress_permille);
+        assert!(
+            (400..=600).contains(&job.progress_permille),
+            "{}",
+            job.progress_permille
+        );
 
         let second = FakeEngine::default();
-        run(&db, &meeting_id, &second, &open, &AtomicBool::new(false)).await.unwrap();
+        run(&db, &meeting_id, &second, &open, &AtomicBool::new(false))
+            .await
+            .unwrap();
         assert_eq!(
             first.transcribed.load(Ordering::SeqCst) + second.transcribed.load(Ordering::SeqCst),
             windows,
@@ -527,8 +608,21 @@ mod tests {
             ..FakeEngine::default()
         };
         queue(&db, &meeting_id, &engine);
-        run(&db, &meeting_id, &engine, &opener(mic, system), &AtomicBool::new(false)).await.unwrap();
-        assert!(stored(&db, &meeting_id).iter().filter(|s| s.0 == "system").all(|s| s.1.is_none()));
+        run(
+            &db,
+            &meeting_id,
+            &engine,
+            &opener(mic, system),
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+        assert!(
+            stored(&db, &meeting_id)
+                .iter()
+                .filter(|s| s.0 == "system")
+                .all(|s| s.1.is_none())
+        );
         let job = lock(&db).post_pass_job(&meeting_id).unwrap().unwrap();
         assert!(job.detail.unwrap().contains("no diarizer"));
     }
@@ -541,11 +635,23 @@ mod tests {
         queue(&db, &meeting_id, &engine);
         let stop = AtomicBool::new(true);
         assert_eq!(
-            run(&db, &meeting_id, &engine, &opener(mic, system), &stop).await.unwrap(),
+            run(&db, &meeting_id, &engine, &opener(mic, system), &stop)
+                .await
+                .unwrap(),
             Outcome::Stopped
         );
-        let live = lock(&db).post_pass_job(&meeting_id).unwrap().unwrap().live_transcript_id;
-        assert_eq!(lock(&db).meetings().primary_transcript_id(&meeting_id).unwrap(), live);
+        let live = lock(&db)
+            .post_pass_job(&meeting_id)
+            .unwrap()
+            .unwrap()
+            .live_transcript_id;
+        assert_eq!(
+            lock(&db)
+                .meetings()
+                .primary_transcript_id(&meeting_id)
+                .unwrap(),
+            live
+        );
         let _ = Arc::new(AtomicUsize::new(0));
     }
 

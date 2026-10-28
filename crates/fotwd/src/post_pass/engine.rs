@@ -95,7 +95,10 @@ pub(crate) mod fake {
             })
         }
 
-        fn transcribe<'a>(&'a self, pcm: &'a [i16]) -> BoxFuture<'a, Result<Vec<TimedWord>, String>> {
+        fn transcribe<'a>(
+            &'a self,
+            pcm: &'a [i16],
+        ) -> BoxFuture<'a, Result<Vec<TimedWord>, String>> {
             Box::pin(async move {
                 let call = self.started.fetch_add(1, Ordering::SeqCst) + 1;
                 if self.hang_on == Some(call) {
@@ -131,7 +134,11 @@ pub(crate) mod fake {
 
     impl FakeDiarization {
         fn take_blocks(&mut self, all: bool) {
-            let whole = if all { self.pending.len() } else { self.pending.len() / BLOCK * BLOCK };
+            let whole = if all {
+                self.pending.len()
+            } else {
+                self.pending.len() / BLOCK * BLOCK
+            };
             let taken: Vec<i16> = self.pending.drain(..whole).collect();
             for block in taken.chunks(BLOCK) {
                 let peak = block.iter().map(|x| x.unsigned_abs()).max().unwrap_or(0);
@@ -171,7 +178,10 @@ pub(crate) mod fake {
                     .map(|&(s, e, loud)| SpeakerSpan {
                         start_ms: s,
                         end_ms: e,
-                        speaker: format!("S{}", classes.iter().position(|&c| c == loud).unwrap_or(0) + 1),
+                        speaker: format!(
+                            "S{}",
+                            classes.iter().position(|&c| c == loud).unwrap_or(0) + 1
+                        ),
                     })
                     .collect())
             })

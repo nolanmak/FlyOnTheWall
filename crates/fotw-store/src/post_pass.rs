@@ -293,6 +293,38 @@ impl Db {
         Ok(())
     }
 
+    /// A meeting's archived tracks, as `(channel, path relative to the data
+    /// root)`, in channel order.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failures.
+    pub fn post_pass_tracks(&self, meeting_id: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT channel, rel_path FROM recordings
+              WHERE meeting_id = ?1 AND state = 'complete' AND deleted_at IS NULL
+              ORDER BY channel",
+        )?;
+        let rows = stmt.query_map(params![meeting_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
+    /// Whether any transcript or speech epoch of the meeting came from a
+    /// cloud provider (Deepgram), which a cleanup would pay for twice.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failures.
+    pub fn post_pass_used_cloud(&self, meeting_id: &str) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS (SELECT 1 FROM transcripts WHERE meeting_id = ?1 AND provider LIKE '%deepgram%')
+                 OR EXISTS (SELECT 1 FROM speech_epochs WHERE meeting_id = ?1 AND provider LIKE '%deepgram%')",
+            params![meeting_id],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Whether summaries and the GitHub push should still wait for this
     /// meeting's cleanup: a pending job younger than [`POST_PASS_WAIT_MS`].
     ///

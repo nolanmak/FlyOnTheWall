@@ -200,7 +200,10 @@ impl<S: PcmSource> WindowReader<S> {
     /// # Errors
     ///
     /// A decode failure, or a track shorter than its recorded length.
-    pub fn next_window(&mut self, skip: impl Fn(usize) -> bool) -> Result<Option<PcmWindow>, String> {
+    pub fn next_window(
+        &mut self,
+        skip: impl Fn(usize) -> bool,
+    ) -> Result<Option<PcmWindow>, String> {
         let Some(&(start, end)) = self.plan.get(self.next) else {
             return Ok(None);
         };
@@ -245,7 +248,12 @@ mod tests {
         let ms: Vec<(u64, u64)> = plan.iter().map(|&(s, e)| (millis(s), millis(e))).collect();
         assert_eq!(
             ms,
-            [(0, 30_000), (28_000, 58_000), (56_000, 86_000), (84_000, 95_000)]
+            [
+                (0, 30_000),
+                (28_000, 58_000),
+                (56_000, 86_000),
+                (84_000, 95_000)
+            ]
         );
         assert!(super::plan(0, 10, 2).is_empty());
         // A track that ends inside an overlap gets no window of overlap alone.
@@ -261,7 +269,10 @@ mod tests {
         while let Some(w) = reader.next_window(|i| i == 1).unwrap() {
             seen.push((w.index, w.start, w.pcm.len()));
             if w.index != 1 {
-                assert_eq!(w.pcm[..], pcm[w.start as usize..w.start as usize + w.pcm.len()]);
+                assert_eq!(
+                    w.pcm[..],
+                    pcm[w.start as usize..w.start as usize + w.pcm.len()]
+                );
             }
         }
         assert_eq!(

@@ -86,7 +86,9 @@ fn join(out: &mut String, word: &str) {
     if word.is_empty() {
         return;
     }
-    if !out.is_empty() && !word.starts_with(|c: char| c.is_ascii_punctuation() && c != '(' && c != '"') {
+    if !out.is_empty()
+        && !word.starts_with(|c: char| c.is_ascii_punctuation() && c != '(' && c != '"')
+    {
         out.push(' ');
     }
     out.push_str(word);
@@ -97,7 +99,8 @@ fn visible(text: &str) -> usize {
 }
 
 fn ends_sentence(word: &str) -> bool {
-    word.trim_end_matches(['"', '\'', ')']).ends_with(['.', '?', '!'])
+    word.trim_end_matches(['"', '\'', ')'])
+        .ends_with(['.', '?', '!'])
 }
 
 /// The speaker of the system word `[start, end)`: the span overlapping it
@@ -133,7 +136,8 @@ fn channel_turns(channel: Channel, words: Vec<(TimedWord, Option<String>)>) -> V
         if let Some(turn) = turns.last_mut() {
             let gap = word.start_ms.saturating_sub(turn.end_ms);
             let last = &turn.words.last().expect("a turn has a word").0;
-            let short = visible(&turn.text()) < SHORT_VISIBLE || visible(&word.text) < SHORT_VISIBLE;
+            let short =
+                visible(&turn.text()) < SHORT_VISIBLE || visible(&word.text) < SHORT_VISIBLE;
             let joins = gap <= MERGE_GAP_MS || (gap <= SHORT_GAP_MS && short);
             let long = turn.end_ms - turn.start_ms >= LONG_TURN_MS && ends_sentence(&last.text);
             if turn.speaker == speaker && joins && !long {
@@ -165,7 +169,10 @@ pub fn build_turns(
     system: &[TimedWord],
     system_speakers: Option<&[SpeakerSpan]>,
 ) -> Vec<Turn> {
-    let mic_words = mic.iter().map(|w| (w.clone(), Some(ME.to_owned()))).collect();
+    let mic_words = mic
+        .iter()
+        .map(|w| (w.clone(), Some(ME.to_owned())))
+        .collect();
     let mut previous: Option<String> = None;
     let system_words = system
         .iter()
@@ -212,17 +219,26 @@ mod tests {
         ];
         let spans = [span("S1", 0, 820), span("S2", 860, 1_500)];
         let turns = build_turns(&[], &system, Some(&spans));
-        let shown: Vec<(Option<&str>, String)> =
-            turns.iter().map(|t| (t.speaker.as_deref(), t.text())).collect();
+        let shown: Vec<(Option<&str>, String)> = turns
+            .iter()
+            .map(|t| (t.speaker.as_deref(), t.text()))
+            .collect();
         assert_eq!(
             shown,
-            [(Some("S1"), "so what now?".into()), (Some("S2"), "we ship.".into())]
+            [
+                (Some("S1"), "so what now?".into()),
+                (Some("S2"), "we ship.".into())
+            ]
         );
     }
 
     #[test]
     fn mic_words_are_me_and_channels_interleave_by_time() {
-        let mic = [w("hi", 0, 300), w("there", 350, 600), w("yes", 5_000, 5_300)];
+        let mic = [
+            w("hi", 0, 300),
+            w("there", 350, 600),
+            w("yes", 5_000, 5_300),
+        ];
         let system = [w("hello", 1_000, 1_400)];
         let turns = build_turns(&mic, &system, None);
         let shown: Vec<(Channel, Option<&str>, String)> = turns
@@ -242,7 +258,11 @@ mod tests {
     #[test]
     fn muesli_merge_rule_joins_short_fragments_across_longer_gaps() {
         // A 1.2 s gap joins only because one side is a short fragment.
-        let mic = [w("okay", 0, 300), w("let's", 1_500, 1_700), w("go", 1_750, 1_900)];
+        let mic = [
+            w("okay", 0, 300),
+            w("let's", 1_500, 1_700),
+            w("go", 1_750, 1_900),
+        ];
         assert_eq!(build_turns(&mic, &[], None).len(), 1);
         let mic = [
             w("absolutely", 0, 600),
@@ -256,11 +276,21 @@ mod tests {
     #[test]
     fn a_long_monologue_breaks_at_a_sentence_end() {
         let mic: Vec<TimedWord> = (0..80)
-            .map(|i| w(if i % 10 == 9 { "end." } else { "word" }, i * 400, i * 400 + 300))
+            .map(|i| {
+                w(
+                    if i % 10 == 9 { "end." } else { "word" },
+                    i * 400,
+                    i * 400 + 300,
+                )
+            })
             .collect();
         let turns = build_turns(&mic, &[], None);
         assert!(turns.len() >= 2, "{}", turns.len());
-        assert!(turns.iter().all(|t| t.end_ms - t.start_ms < LONG_TURN_MS + 4_000));
+        assert!(
+            turns
+                .iter()
+                .all(|t| t.end_ms - t.start_ms < LONG_TURN_MS + 4_000)
+        );
         assert_eq!(turns.iter().map(|t| t.words.len()).sum::<usize>(), 80);
     }
 

@@ -143,10 +143,9 @@ pub fn merge_windows(windows: &[WindowWords]) -> Vec<TimedWord> {
 fn shared_run(tail: &[TimedWord], head: &[TimedWord]) -> Option<usize> {
     let limit = MAX_MATCH_WORDS.min(tail.len()).min(head.len());
     (1..=limit).rev().find(|&n| {
-        tail[tail.len() - n..]
-            .iter()
-            .zip(&head[..n])
-            .all(|(a, b)| key(&a.text) == key(&b.text) && a.start_ms.abs_diff(b.start_ms) <= MATCH_TOLERANCE_MS)
+        tail[tail.len() - n..].iter().zip(&head[..n]).all(|(a, b)| {
+            key(&a.text) == key(&b.text) && a.start_ms.abs_diff(b.start_ms) <= MATCH_TOLERANCE_MS
+        })
     })
 }
 
@@ -194,9 +193,14 @@ mod tests {
                     .filter(|w| w.start_ms < end && w.end_ms > start)
                     .map(|w| {
                         let clipped = w.start_ms < start || w.end_ms > end;
-                        let shift = |t: u64| (t as i64 + jitter(k)).clamp(start as i64, end as i64) as u64;
+                        let shift =
+                            |t: u64| (t as i64 + jitter(k)).clamp(start as i64, end as i64) as u64;
                         TimedWord::new(
-                            if clipped { truncated(&w.text) } else { w.text.clone() },
+                            if clipped {
+                                truncated(&w.text)
+                            } else {
+                                w.text.clone()
+                            },
                             shift(w.start_ms.max(start)),
                             shift(w.end_ms.min(end)),
                         )
@@ -278,7 +282,10 @@ mod tests {
 
     #[test]
     fn a_single_window_is_returned_as_heard() {
-        let words = vec![TimedWord::new("hello", 0, 300), TimedWord::new("there", 400, 700)];
+        let words = vec![
+            TimedWord::new("hello", 0, 300),
+            TimedWord::new("there", 400, 700),
+        ];
         let merged = merge_windows(&[WindowWords {
             start_ms: 0,
             end_ms: 1_000,
