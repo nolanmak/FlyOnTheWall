@@ -41,7 +41,7 @@ subtle = "2.6"
 # rather than through `rand` because the only thing this crate wants is
 # "fill these 32 bytes from the OS", and every layer between that and
 # `getrandom` is a layer that could be a userspace PRNG by accident.
-getrandom = "0.3"
+getrandom = "0.4"
 
 # ING-11 / spec 5.6: the SPA is embedded in the binary. `debug-embed` is not
 # optional -- without it `rust-embed` reads from disk in debug builds, so the
