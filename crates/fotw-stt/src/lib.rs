@@ -52,6 +52,7 @@ pub mod store;
 pub mod stream;
 pub mod transcript;
 pub mod vocabulary;
+pub mod vocabulary_matcher;
 #[cfg(all(target_os = "macos", feature = "local-whisper"))]
 pub mod whisper;
 

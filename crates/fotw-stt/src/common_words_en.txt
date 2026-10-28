@@ -1,0 +1,47 @@
+# Frequent English words that a near miss never replaces. Hand-written for
+# FlyOnTheWall; base forms only (plural, -ed, -ing, -er, -est and -ly forms
+# are derived at lookup). Lowercase, whitespace-separated, # starts a comment.
+
+# Function words
+a about above across after again against ago ahead all almost along already also although always am among an and another any anybody anyone anything anyway anywhere are around as at away
+be because been before behind being below beneath beside besides between beyond both but by can cannot could did do does doing done down during each either else enough even ever every everybody everyone everything everywhere except
+few for from further had has have having he her here hers herself him himself his how however i if in inside instead into is it its itself just less like may maybe me might mine more most much must my myself
+near neither never next no nobody none nor not nothing now nowhere of off often on once one only onto or other others otherwise ought our ours ourselves out outside over own per perhaps quite rather same several shall she should since so some somebody someone something sometimes somewhere soon still such
+than that the their theirs them themselves then there therefore these they this those though through throughout thus till to together too toward towards under unless unlike until up upon us very via was we well were what whatever when whenever where wherever whether which while who whoever whole whom whose why will with within without would yes yet you your yours yourself yourselves
+ain't aren't can't couldn't didn't doesn't don't hadn't hasn't haven't he'd he'll he's i'd i'll i'm i've isn't it'd it'll it's let's she'd she'll she's shouldn't that's there's they'd they'll they're they've wasn't we'd we'll we're we've weren't what's where's who's won't wouldn't you'd you'll you're you've
+oh ok okay yeah hey hi hello um uh ah please thanks thank sorry bye
+
+# Numbers and time
+zero two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty thirty forty fifty sixty seventy eighty ninety hundred thousand million billion trillion
+first second third fourth fifth sixth seventh eighth ninth tenth last half quarter double single dozen
+time day week month year hour minute moment today tomorrow yesterday tonight morning afternoon evening night noon midnight
+monday tuesday wednesday thursday friday saturday sunday january february march april june july august september october november december
+spring summer autumn fall winter season date age era century decade future past present early late later recent soon
+
+# Common nouns
+man woman child boy girl baby people person family friend father mother parent son daughter brother sister husband wife king queen lord lady sir master servant gentleman fellow neighbor guest stranger enemy
+home house room door window wall floor roof kitchen bed table chair desk office building street road way path city town village country land world earth ground field farm garden tree flower grass forest wood river sea ocean lake water fire air wind rain snow sun moon star sky light dark shadow stone rock hill mountain island
+head face eye ear nose mouth lip tooth teeth tongue neck shoulder arm hand finger leg foot feet knee back heart blood bone skin hair body mind soul voice word name life death health
+thing things part place point side end case fact idea way kind sort type form group number area problem question answer reason result story history money business company market job work service system program project plan team member meeting call email message letter note paper book page line list item order record report file data code test build release version update change issue bug fix feature user account price cost value rate level size amount total
+food bread meat fish egg milk tea coffee wine beer soup dinner lunch breakfast meal sugar salt water drink
+car bus train plane ship boat horse dog cat bird animal
+color red blue green yellow white black brown gray grey orange pink purple gold silver
+school class student teacher lesson course college university church hospital doctor nurse police army war peace law court government state nation president party power control force game sport music song art picture film movie show news newspaper television radio phone computer machine tool box bag key glass cup bottle plate knife clothes dress shirt coat hat shoe
+air step stage start finish top bottom front edge center middle corner inside outside left right north south east west
+problem trouble chance choice decision effort experience interest matter mistake need opportunity purpose reason risk sense situation solution success support truth view
+
+# Common verbs
+accept add agree allow answer appear apply argue arrive ask avoid become begin believe belong bring build buy call care carry catch cause change check choose clean clear close come compare complete consider contain continue copy cost count cover create cross cry cut
+deal decide deliver depend describe design destroy develop die discover discuss divide draw dream dress drink drive drop eat enable enjoy enter escape explain fail fall feel fight fill find finish fit fly follow forget forgive form get give go grow guess hang happen hate hear help hide hit hold hope hurt
+improve include increase install introduce join jump keep kill know laugh lay lead learn leave lend let lie lift listen live look lose love make manage mark matter mean measure meet merge mind miss move need note notice offer open order own paint pass pay pick place plan play point prefer prepare press prevent print produce promise protect prove provide pull push put
+reach read realize receive recognize record reduce refuse remain remember remove repeat replace reply report require rest return ride ring rise roll run save say scale see seem sell send serve set settle shake share shine shoot shout show shut sing sink sit sleep slide smile sound speak spend stand start stay steal step stick stop study succeed suggest supply suppose swim
+take talk teach tear tell tend test thank think throw touch train travel treat try turn understand use visit vote wait wake walk want warn wash watch wear win wish wonder work worry write
+
+# Irregular forms
+ate began begun bent bit bitten blew blown bore born bought broke broken brought built burnt caught chose chosen came cost drank drew drawn driven drove eaten fell felt fed fled flew flown forgot forgotten fought found froze frozen gave given gone got gotten grew grown heard held hid hidden hung kept knew known laid led left lent lost made meant met paid ran rang risen rode rose run said sang sat saw seen sent shook shot shown shut slept sold sought spent spoke spoken stood stole stolen struck sung swam taken taught thought threw thrown told took tore torn understood went woke worn written wrote
+children men women feet geese mice
+better best worse worst
+
+# Common adjectives and adverbs
+able afraid alive alone bad beautiful big bitter black blind bold bright brief broad busy calm careful certain cheap clean clear clever close cold common complete cool correct crazy cruel curious current dangerous dark dead dear deep different difficult direct dirty dry due dull eager easy empty equal exact extra fair false familiar famous far fast fat fine firm flat free fresh full funny general gentle glad good grand great green happy hard heavy high honest hot huge human ill important large late lazy legal light likely little local long loud low lucky main major mere mild minor modern narrow natural nice noble normal old open ordinary pale perfect plain pleasant polite poor possible pretty private proper proud public pure quick quiet rapid rare ready real recent regular rich right rough round rude sad safe serious sharp short shy sick silent silly simple slight slow small smart smooth soft solid sorry special square steady straight strange strict strong stupid sudden sure sweet tall terrible thick thin tight tiny tired true ugly usual vast warm weak wet whole wide wild wise wrong young
+actually again almost already also always certainly clearly especially exactly finally generally hardly indeed instead just later likely mainly merely nearly never often only perhaps possibly probably quickly rather really simply slowly sometimes still suddenly surely together truly usually

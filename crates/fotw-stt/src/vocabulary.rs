@@ -13,6 +13,34 @@ pub struct Snippet {
     /// Literal local expansion, including multiline Unicode text.
     pub text: String,
 }
+/// A local correction target: a word or phrase that local-engine text is
+/// corrected to after recognition. Ported from Muesli's `CustomWord`, with the
+/// same `matching_threshold` wire name. Never sent to a provider.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Correction {
+    /// What the recognizer is expected to produce, matched case-, accent- and
+    /// near-miss-insensitively. One to eight words.
+    pub word: String,
+    /// What to write instead; defaults to `word` itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<String>,
+    /// Jaro–Winkler similarity a near miss needs, in
+    /// [`MIN_MATCHING_THRESHOLD`, `MAX_MATCHING_THRESHOLD`]; defaults to
+    /// [`DEFAULT_MATCHING_THRESHOLD`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matching_threshold: Option<f64>,
+}
+// JSON cannot encode NaN and validation rejects non-finite thresholds.
+impl Eq for Correction {}
+/// Muesli's default near-miss threshold.
+pub const DEFAULT_MATCHING_THRESHOLD: f64 = 0.85;
+/// Lowest accepted per-entry threshold (Muesli's clamp).
+pub const MIN_MATCHING_THRESHOLD: f64 = 0.70;
+/// Highest accepted per-entry threshold (Muesli's clamp).
+pub const MAX_MATCHING_THRESHOLD: f64 = 0.95;
+/// Maximum number of explicit local corrections.
+pub const MAX_CORRECTIONS: usize = 512;
 /// Stable version-1 wire shape, shared by applications and export/import.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -28,6 +56,11 @@ pub struct Profile {
     /// Exact deliberate cues, never sent as provider prompts.
     #[serde(default)]
     pub snippets: Vec<Snippet>,
+    /// Additive v1 field: local post-recognition corrections. Recognition
+    /// hints are correction targets too; an entry here adds a replacement or
+    /// threshold. Omitted when empty so older readers still accept exports.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub corrections: Vec<Correction>,
 }
 fn default_language() -> String {
     "en".into()
@@ -39,6 +72,7 @@ impl Default for Profile {
             language: default_language(),
             recognition_hints: vec![],
             snippets: vec![],
+            corrections: vec![],
         }
     }
 }
@@ -94,6 +128,7 @@ impl Profile {
                 return Err("Snippet text must be nonempty, at most 16 KiB, with no controls except newline and tab".into());
             }
         }
+        validate_corrections(&self.corrections)?;
         if serde_json::to_vec_pretty(self)
             .map_err(|_| "Cannot encode vocabulary profile")?
             .len()
@@ -182,6 +217,53 @@ pub fn validate_hints(hints: &[String]) -> Result<(), String> {
         }
         if !unique.insert(hint.to_lowercase()) {
             return Err("Recognition hints conflict ignoring case".into());
+        }
+    }
+    Ok(())
+}
+
+/// Validate local corrections: trimmed single-spaced words of one to eight
+/// words, distinct ignoring case, with bounded replacements and thresholds.
+pub fn validate_corrections(corrections: &[Correction]) -> Result<(), String> {
+    if corrections.len() > MAX_CORRECTIONS {
+        return Err(format!(
+            "At most {MAX_CORRECTIONS} vocabulary corrections are supported"
+        ));
+    }
+    let bounded = |text: &str| {
+        !text.is_empty()
+            && text.len() <= 128
+            && text.trim() == text
+            && !text.chars().any(char::is_control)
+    };
+    let mut words = std::collections::HashSet::new();
+    for correction in corrections {
+        let word = &correction.word;
+        let parts: Vec<&str> = word.split(' ').collect();
+        if !bounded(word)
+            || parts.len() > 8
+            || parts
+                .iter()
+                .any(|part| !crate::vocabulary_matcher::is_matchable_word(part))
+        {
+            return Err("Correction words must be 1–8 single-spaced words, trimmed, at most 128 UTF-8 bytes, with no controls".into());
+        }
+        if correction
+            .replacement
+            .as_deref()
+            .is_some_and(|r| !bounded(r))
+        {
+            return Err("Correction replacements must be trimmed, nonempty, at most 128 UTF-8 bytes and contain no controls".into());
+        }
+        if correction.matching_threshold.is_some_and(|t| {
+            !t.is_finite() || !(MIN_MATCHING_THRESHOLD..=MAX_MATCHING_THRESHOLD).contains(&t)
+        }) {
+            return Err(format!(
+                "Correction thresholds must be between {MIN_MATCHING_THRESHOLD} and {MAX_MATCHING_THRESHOLD}"
+            ));
+        }
+        if !words.insert(word.to_lowercase()) {
+            return Err("Correction words conflict ignoring case".into());
         }
     }
     Ok(())

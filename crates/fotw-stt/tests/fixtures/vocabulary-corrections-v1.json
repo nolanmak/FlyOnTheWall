@@ -1,0 +1,104 @@
+{
+  "source": "Cases ported from Muesli's CustomWordMatcherTests.swift (MIT, (c) 2026 Pranav Hari) at 97e455794112126a896cae17f5c829e8ffa820c8, plus FlyOnTheWall guards for common words, digits, partial words and split compounds.",
+  "groups": [
+    {
+      "name": "main",
+      "profile": {
+        "version": 1,
+        "recognition_hints": ["WebAssembly", "PostgreSQL", "H100"],
+        "corrections": [
+          {"word": "museli", "replacement": "muesli"},
+          {"word": "Pranav"},
+          {"word": "kubernetes", "replacement": "Kubernetes"},
+          {"word": "open telemetry", "replacement": "OpenTelemetry"},
+          {"word": "new york city", "replacement": "NYC"},
+          {"word": "Thier"},
+          {"word": "Ada"},
+          {"word": "Zoë"},
+          {"word": "José"},
+          {"word": "Ångström"},
+          {"word": "fly on the wall", "replacement": "FlyOnTheWall"}
+        ]
+      },
+      "cases": [
+        {"why": "exact match", "input": "I love museli", "output": "I love muesli"},
+        {"why": "case-insensitive exact match", "input": "hello pranav", "output": "hello Pranav"},
+        {"why": "upper-case exact match", "input": "HELLO PRANAV", "output": "HELLO Pranav"},
+        {"why": "trailing punctuation kept", "input": "I love museli!", "output": "I love muesli!"},
+        {"why": "surrounding punctuation kept", "input": "(museli)", "output": "(muesli)"},
+        {"why": "near miss above the default threshold", "input": "deploy to kubernete", "output": "deploy to Kubernetes"},
+        {"why": "dissimilar word below the threshold", "input": "deploy to cubes", "output": "deploy to cubes"},
+        {"why": "diacritic exact match", "input": "ask zoë", "output": "ask Zoë"},
+        {"why": "missing diacritic matches", "input": "ask zoe today", "output": "ask Zoë today"},
+        {"why": "missing acute accent matches", "input": "jose said", "output": "José said"},
+        {"why": "decomposed input matches", "input": "José said", "output": "José said"},
+        {"why": "missing ring and umlaut match", "input": "ten angstrom units", "output": "ten Ångström units"},
+        {"why": "multi-word exact match", "input": "ship open telemetry traces", "output": "ship OpenTelemetry traces"},
+        {"why": "multi-word near miss, every token above threshold", "input": "ship open telemtry traces", "output": "ship OpenTelemetry traces"},
+        {"why": "multi-word entry never matches a shorter utterance", "input": "book new york", "output": "book new york"},
+        {"why": "multi-word entry needs every token", "input": "book new york flights", "output": "book new york flights"},
+        {"why": "three-word exact match", "input": "book new york city flights", "output": "book NYC flights"},
+        {"why": "multi-word trailing punctuation kept", "input": "try open telemetry, please", "output": "try OpenTelemetry, please"},
+        {"why": "internal punctuation blocks a phrase", "input": "try open, telemetry now", "output": "try open, telemetry now"},
+        {"why": "a common word is never a near miss", "input": "their code works", "output": "their code works"},
+        {"why": "a common word at sentence start is never a near miss", "input": "Their code works", "output": "Their code works"},
+        {"why": "the entry itself still matches exactly", "input": "ask thier now", "output": "ask Thier now"},
+        {"why": "no replacement of a longer word containing the entry", "input": "Adams arrived", "output": "Adams arrived"},
+        {"why": "no replacement of a longer word containing a multi-letter entry", "input": "kubernetesish setup", "output": "kubernetesish setup"},
+        {"why": "short entry still matches itself", "input": "ada arrived", "output": "Ada arrived"},
+        {"why": "split compound joins to a one-word hint", "input": "check the web assembly output", "output": "check the WebAssembly output"},
+        {"why": "split compound joins to a hint", "input": "the postgres QL migration", "output": "the PostgreSQL migration"},
+        {"why": "spaced phrase entry", "input": "the fly on the wall records", "output": "the FlyOnTheWall records"},
+        {"why": "numbers are never near misses", "input": "the H200 has more memory", "output": "the H200 has more memory"},
+        {"why": "numbers still match exactly", "input": "the h100 has memory", "output": "the H100 has memory"},
+        {"why": "whitespace is preserved", "input": "museli\nand  museli", "output": "muesli\nand  muesli"},
+        {"why": "unrelated text unchanged", "input": "hello world", "output": "hello world"},
+        {"why": "empty text", "input": "", "output": ""}
+      ]
+    },
+    {
+      "name": "lowered threshold",
+      "profile": {"version": 1, "corrections": [{"word": "Caivex", "matching_threshold": 0.70}]},
+      "cases": [
+        {"why": "near miss above a lowered per-entry threshold", "input": "talk to Kvex tomorrow", "output": "talk to Caivex tomorrow"}
+      ]
+    },
+    {
+      "name": "raised threshold",
+      "profile": {"version": 1, "corrections": [{"word": "Caivex", "matching_threshold": 0.92}]},
+      "cases": [
+        {"why": "near miss below a raised per-entry threshold", "input": "talk to Kvex tomorrow", "output": "talk to Kvex tomorrow"},
+        {"why": "exact still matches with a raised threshold", "input": "talk to caivex tomorrow", "output": "talk to Caivex tomorrow"}
+      ]
+    },
+    {
+      "name": "longest phrase first",
+      "profile": {"version": 1, "corrections": [
+        {"word": "open", "replacement": "Open"},
+        {"word": "open telemetry", "replacement": "OpenTelemetry"}
+      ]},
+      "cases": [
+        {"why": "longest phrase wins before a shorter word", "input": "open telemetry helps open systems", "output": "OpenTelemetry helps Open systems"}
+      ]
+    },
+    {
+      "name": "larger profile guards",
+      "profile": {"version": 1, "recognition_hints": ["IAM", "Confluence", "MariaDB", "kubectl", "FluidAudio", "cargo"]},
+      "cases": [
+        {"why": "near miss with a sound-alike first letter", "input": "use Cubectal now", "output": "use kubectl now"},
+        {"why": "split compound joins to a camel-case hint", "input": "install Fluid Audio today", "output": "install FluidAudio today"},
+        {"why": "words never join into an all-caps hint", "input": "i am here", "output": "i am here"},
+        {"why": "words never join into a lowercase hint", "input": "the car go fast", "output": "the car go fast"},
+        {"why": "a different first letter is not a near miss", "input": "under its influence", "output": "under its influence"},
+        {"why": "a much shorter word is not a near miss", "input": "the maid left", "output": "the maid left"}
+      ]
+    },
+    {
+      "name": "no vocabulary",
+      "profile": {"version": 1},
+      "cases": [
+        {"why": "empty profile changes nothing", "input": "I love museli", "output": "I love museli"}
+      ]
+    }
+  ]
+}
