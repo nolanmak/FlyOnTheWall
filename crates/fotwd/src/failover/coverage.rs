@@ -125,8 +125,14 @@ pub struct CommittedAudio {
     pub from_sample: u64,
     /// Exclusive absolute audio sample, including acknowledged silence.
     pub through_sample: u64,
-    /// Finals for this interval. Empty only when inference confirmed silence.
+    /// Finals for this interval. Empty when inference confirmed silence, or
+    /// when [`gap`](Self::gap) says why it went untranscribed.
     pub segments: Vec<TranscriptSegment>,
+    /// Set when this interval's audio was kept but could not be transcribed
+    /// (#244: the speech helper failed on it twice), so a later interval could
+    /// still be. Absent in journals written before gaps existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap: Option<String>,
 }
 
 /// Whether a caller should publish the commit.
@@ -505,6 +511,30 @@ impl CoverageJournal {
         through_sample: u64,
         segments: Vec<TranscriptSegment>,
     ) -> io::Result<CommitOutcome> {
+        self.record(epoch, from_sample, through_sample, segments, None)
+    }
+
+    /// Record that an interval's audio is kept but could not be transcribed,
+    /// so coverage moves on to the speech after it. The audio stays in the
+    /// session for a later retry.
+    pub fn skip(
+        &mut self,
+        epoch: u64,
+        from_sample: u64,
+        through_sample: u64,
+        reason: String,
+    ) -> io::Result<CommitOutcome> {
+        self.record(epoch, from_sample, through_sample, Vec::new(), Some(reason))
+    }
+
+    fn record(
+        &mut self,
+        epoch: u64,
+        from_sample: u64,
+        through_sample: u64,
+        segments: Vec<TranscriptSegment>,
+        gap: Option<String>,
+    ) -> io::Result<CommitOutcome> {
         self.healthy()?;
         if epoch != self.epoch.number {
             return Err(invalid("stale provider epoch"));
@@ -514,6 +544,7 @@ impl CoverageJournal {
             from_sample,
             through_sample,
             segments,
+            gap,
         };
         if let Some(prior) = self
             .commits
@@ -575,6 +606,9 @@ impl CoverageJournal {
         if commit.epoch != self.epoch.number
             || commit.from_sample != self.committed
             || commit.through_sample <= commit.from_sample
+            || commit.gap.as_ref().is_some_and(|reason| {
+                reason.is_empty() || reason.len() > 512 || !commit.segments.is_empty()
+            })
         {
             return Err(invalid(
                 "coverage must extend the current epoch contiguously",

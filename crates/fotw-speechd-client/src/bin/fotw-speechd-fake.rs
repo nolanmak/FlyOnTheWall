@@ -24,6 +24,11 @@
 //! when `<models-root>/<id>/<revision>` exists, as the real store lays a model
 //! out; `load` refuses `model_missing` otherwise, and `install` (which opens no
 //! socket here) creates that directory.
+//!
+//! `--crash-on-sample <n>` exits with status 70 on any audio frame holding the
+//! sample value `n`, so a test can make one utterance kill the helper every
+//! time it is sent. With `--crash-once-marker <path>` it does so only while
+//! `path` does not exist, creating it first: one crash, then a healthy helper.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, BufReader, BufWriter, Write};
@@ -54,6 +59,8 @@ struct Args {
     misbehave: Option<String>,
     future: bool,
     slow_load_if: Option<std::path::PathBuf>,
+    crash_on_sample: Option<i16>,
+    crash_once_marker: Option<std::path::PathBuf>,
 }
 
 fn parse_args() -> Args {
@@ -64,6 +71,8 @@ fn parse_args() -> Args {
         misbehave: None,
         future: false,
         slow_load_if: None,
+        crash_on_sample: None,
+        crash_once_marker: None,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -88,6 +97,10 @@ fn parse_args() -> Args {
             "--misbehave-on-health" => args.misbehave = iter.next(),
             "--from-the-future" => args.future = true,
             "--slow-load-if" => args.slow_load_if = iter.next().map(Into::into),
+            "--crash-on-sample" => {
+                args.crash_on_sample = iter.next().and_then(|v| v.parse().ok());
+            }
+            "--crash-once-marker" => args.crash_once_marker = iter.next().map(Into::into),
             other => {
                 eprintln!("fotw-speechd-fake: unknown argument {other}");
                 exit(64);
@@ -246,6 +259,8 @@ struct Helper {
     misbehave: Option<String>,
     future: bool,
     slow_load_if: Option<std::path::PathBuf>,
+    crash_on_sample: Option<i16>,
+    crash_once_marker: Option<std::path::PathBuf>,
     /// `fake-batch` streams finishing on their own thread. Cancel removes one,
     /// and the thread only answers if it is still here, under this lock.
     finishing: Arc<Mutex<HashSet<u32>>>,
@@ -423,6 +438,18 @@ impl Helper {
             }
             out.fatal("audio for a stream that was never opened");
         };
+        if let Some(poison) = self.crash_on_sample
+            && pcm.contains(&poison)
+        {
+            match &self.crash_once_marker {
+                None => exit(EXIT_CRASH),
+                Some(marker) if !marker.exists() => {
+                    let _ = std::fs::write(marker, b"crashed");
+                    exit(EXIT_CRASH);
+                }
+                Some(_) => {}
+            }
+        }
         let start = stream.samples;
         stream.samples += pcm.len() as u64;
         match stream.engine.as_str() {
@@ -616,6 +643,8 @@ fn main() {
         misbehave: args.misbehave,
         future: args.future,
         slow_load_if: args.slow_load_if,
+        crash_on_sample: args.crash_on_sample,
+        crash_once_marker: args.crash_once_marker,
         finishing: Arc::new(Mutex::new(HashSet::new())),
         loaded: BTreeSet::new(),
         streams: HashMap::new(),

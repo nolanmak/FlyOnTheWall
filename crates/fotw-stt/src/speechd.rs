@@ -189,21 +189,65 @@ impl Recognizer for SpeechdRecognizer {
         // The leg's worker is an ordinary thread, so blocking it on the
         // runtime that owns the client is what it is for.
         self.runtime.block_on(async {
-            tokio::time::timeout(self.timeout, self.utterance(&pcm))
-                .await
-                .unwrap_or_else(|_| {
-                    Err(server(
-                        "the speech helper did not finish an utterance in time",
-                        None,
-                    ))
-                })
+            tokio::time::timeout(self.timeout, async {
+                match self.utterance(&pcm).await {
+                    // The client restarts a helper that died or hung and
+                    // replays its load and warmup, so one more try usually
+                    // costs the meeting nothing. A second failure is the
+                    // caller's to record as a gap.
+                    Err(Attempt::HelperLost(_)) => self.utterance(&pcm).await,
+                    other => other,
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(Attempt::Other(server(
+                    "the speech helper did not finish an utterance in time",
+                    None,
+                )))
+            })
+            .map_err(Attempt::into_error)
         })
     }
 }
 
+/// Why one try at an utterance failed.
+enum Attempt {
+    /// The helper died or stopped answering; a restarted one may succeed.
+    HelperLost(SttError),
+    /// Anything else, retried by no one here.
+    Other(SttError),
+}
+
+impl Attempt {
+    fn from_client(e: &ClientError) -> Self {
+        Self::classify(
+            e.code(),
+            server("the speech helper failed an utterance", Some(e)),
+        )
+    }
+
+    fn classify(code: ErrorCode, error: SttError) -> Self {
+        match code {
+            ErrorCode::HelperCrashed | ErrorCode::HelperUnresponsive => Self::HelperLost(error),
+            // The restart budget is spent: nothing later will succeed either.
+            ErrorCode::HelperFailed => {
+                Self::Other(error.not_retryable("the speech helper failed every restart"))
+            }
+            _ => Self::Other(error),
+        }
+    }
+
+    fn into_error(self) -> SttError {
+        match self {
+            Self::HelperLost(error) | Self::Other(error) => error,
+        }
+    }
+}
+
 impl SpeechdRecognizer {
-    async fn utterance(&self, pcm: &[i16]) -> Result<Vec<Recognized>, SttError> {
-        let failed = |e: ClientError| server("the speech helper failed an utterance", Some(&e));
+    async fn utterance(&self, pcm: &[i16]) -> Result<Vec<Recognized>, Attempt> {
+        let failed = |e: ClientError| Attempt::from_client(&e);
         let mut stream = self
             .client
             .open_stream(StreamConfig::new(&self.engine, SAMPLE_RATE))
@@ -220,16 +264,32 @@ impl SpeechdRecognizer {
                     if let Some(model) = &final_text.model
                         && *model != self.provenance
                     {
-                        return Err(server(
+                        return Err(Attempt::Other(server(
                             &format!(
                                 "the speech helper answered with {model}, not {}",
                                 self.provenance
                             ),
                             None,
-                        ));
+                        )));
                     }
+                    // The engine's own timed pieces when it sends them; else
+                    // the whole text, timed as the utterance.
+                    let timed: Vec<Recognized> = final_text
+                        .segments
+                        .iter()
+                        .filter_map(|s| {
+                            let text = s.text.as_deref()?.trim();
+                            (!text.is_empty()).then(|| Recognized {
+                                start_ms: s.start_ms,
+                                end_ms: s.end_ms,
+                                text: text.to_owned(),
+                            })
+                        })
+                        .collect();
                     let text = final_text.text.trim();
-                    if !text.is_empty() {
+                    if !timed.is_empty() {
+                        recognized.extend(timed);
+                    } else if !text.is_empty() {
                         recognized.push(Recognized {
                             start_ms: final_text.start_ms,
                             end_ms: final_text.end_ms,
@@ -239,19 +299,22 @@ impl SpeechdRecognizer {
                 }
                 Some(StreamEvent::Closed(_)) => return Ok(recognized),
                 Some(StreamEvent::Failed(failure)) => {
-                    return Err(SttError::new(
-                        SttErrorClass::Server,
-                        PROVIDER,
-                        "the speech helper failed an utterance",
-                    )
-                    .with_detail(format!("{:?}: {}", failure.code, failure.message)));
+                    return Err(Attempt::classify(
+                        failure.code,
+                        SttError::new(
+                            SttErrorClass::Server,
+                            PROVIDER,
+                            "the speech helper failed an utterance",
+                        )
+                        .with_detail(format!("{:?}: {}", failure.code, failure.message)),
+                    ));
                 }
                 Some(_) => {}
                 None => {
-                    return Err(server(
+                    return Err(Attempt::Other(server(
                         "the speech helper closed an utterance without a result",
                         None,
-                    ));
+                    )));
                 }
             }
         }
