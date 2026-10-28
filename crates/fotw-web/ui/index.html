@@ -71,6 +71,8 @@
         <label class="gh-field">Language
           <input id="speech-language" type="text" maxlength="16" placeholder="auto or en" autocomplete="off" spellcheck="false" />
         </label>
+        <label class="gh-field"><input id="speech-captions" type="checkbox" /> Live captions while a local meeting is recording</label>
+        <p id="speech-captions-note" class="gh-note"></p>
         <p class="gh-note"><code>parakeet-unified</code> (Parakeet Unified 0.6B, English, CC BY 4.0) is the default on-device model. Whisper stays available: name an installed whisper.cpp model, or give its full path. Only the setup buttons below start a download or copy. English-only models require English; multilingual Whisper models can detect supported languages.</p>
       </div>
       <button id="speech-save" type="button" disabled>Save transcription</button>

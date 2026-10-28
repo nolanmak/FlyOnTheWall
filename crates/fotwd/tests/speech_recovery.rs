@@ -442,6 +442,7 @@ fn installed_model_recovers_saved_public_audio_through_the_app_controller() {
             engine: fotwd::stt::SttEngine::Deepgram,
             model: model.to_string_lossy().into_owned(),
             language: "fr".into(),
+            live_captions: true,
         };
         settings.write(&mut db).unwrap();
         let original = std::fs::read(f.dir.join("system.stt16")).unwrap();

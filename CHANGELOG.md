@@ -81,6 +81,16 @@ Windows, but neither captures anything.
   field older builds do not read, so an older build cannot reopen that
   session's journal. Re-transcribing saved Parakeet audio is not supported
   yet; the audio is kept.
+- Live captions in local mode (#245): word-by-word text in the dashboard
+  while people talk, from Parakeet realtime EOU in the speech helper,
+  beside the final engine on each leg. Captions are greyed, revised in
+  place per utterance, and replaced by the final text; they are never
+  saved, exported or summarized. A caption engine that fails three times
+  in a row pauses captions for the meeting ("Live captions paused") and
+  nothing else. Install the caption model from Transcription settings or with
+  `fotwd stt models install parakeet-eou-320ms` (NVIDIA Open Model License);
+  captions are on by default once it is installed, can be switched off there,
+  and never start the speech helper for a Deepgram meeting.
 
 #### Library and keys
 

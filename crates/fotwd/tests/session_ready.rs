@@ -14,7 +14,7 @@
 //! the fix if it does not.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use fotw_audio::platform::file::{FileAudioSource, ReplaySpeed};
@@ -362,4 +362,168 @@ fn a_stop_during_startup_or_clock_rollback_never_precedes_capture_start() {
     assert_eq!(ready.capture_ended_at_ms(), Some(1_000));
     ready.signal_capture_stopped(2_000);
     assert_eq!(ready.capture_ended_at_ms(), Some(1_000));
+}
+
+/// Reproduced on macOS 26.3: system-first blocks AudioDeviceStart for the mic.
+/// Model that failure as an error so the regression terminates on every OS.
+struct OrderedTap {
+    inner: Box<dyn AudioTap>,
+    system_started: Arc<AtomicBool>,
+    is_mic: bool,
+    /// Mic starts refused because system capture was already running.
+    refused: Arc<AtomicUsize>,
+}
+impl AudioTap for OrderedTap {
+    fn id(&self) -> &TapId {
+        self.inner.id()
+    }
+    fn format_is_authoritative(&self) -> bool {
+        self.inner.format_is_authoritative()
+    }
+    fn format(&self) -> StreamFormat {
+        self.inner.format()
+    }
+    fn start(&mut self, sink: Box<dyn FrameSink>) -> Result<StreamFormat, TapError> {
+        if self.is_mic && self.system_started.load(Ordering::SeqCst) {
+            self.refused.fetch_add(1, Ordering::SeqCst);
+            return Err(TapError::platform(
+                "microphone cannot start after system capture",
+            ));
+        }
+        if !self.is_mic {
+            self.system_started.store(true, Ordering::SeqCst);
+        }
+        self.inner.start(sink)
+    }
+    fn stop(&mut self) -> Result<(), TapError> {
+        self.inner.stop()
+    }
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn microphone_starts_before_system_so_both_tracks_capture() {
+    let root = tmpdir("mic-first");
+    let flag = Arc::new(AtomicBool::new(false));
+    let system = Box::new(OrderedTap {
+        inner: file_tap(),
+        system_started: flag.clone(),
+        is_mic: false,
+        refused: Arc::default(),
+    });
+    let mic = Box::new(OrderedTap {
+        inner: file_tap(),
+        system_started: flag,
+        is_mic: true,
+        refused: Arc::default(),
+    });
+    let outcome = session::run_with_control(
+        &root.join("sessions"),
+        system,
+        Some(mic),
+        Transcription::Disabled,
+        Duration::from_millis(150),
+        SessionControl::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        std::fs::metadata(outcome.dir.join("mic.pcm"))
+            .unwrap()
+            .len()
+            > 0,
+        "startup order must preserve the microphone track"
+    );
+    assert!(
+        std::fs::metadata(outcome.dir.join("system.pcm"))
+            .unwrap()
+            .len()
+            > 0
+    );
+}
+
+struct OrderedPlatform {
+    inner: fotw_audio::platform::file::FilePlatform,
+    system_started: Arc<AtomicBool>,
+    refused: Arc<AtomicUsize>,
+}
+impl fotw_audio::AudioPlatform for OrderedPlatform {
+    fn caps(&self) -> fotw_audio::PlatformCaps {
+        self.inner.caps()
+    }
+    fn permission(&self, p: fotw_audio::Permission) -> fotw_audio::PermissionState {
+        self.inner.permission(p)
+    }
+    fn request_permission(
+        &self,
+        p: fotw_audio::Permission,
+    ) -> fotw_audio::BoxFuture<'static, fotw_audio::PermissionState> {
+        self.inner.request_permission(p)
+    }
+    fn mics(&self) -> Vec<fotw_audio::DeviceInfo> {
+        self.inner.mics()
+    }
+    fn capturable_apps(&self) -> Vec<fotw_audio::AppInfo> {
+        self.inner.capturable_apps()
+    }
+    fn events(&self) -> std::sync::mpsc::Receiver<fotw_audio::PlatformEvent> {
+        self.inner.events()
+    }
+    fn open_mic(
+        &self,
+        d: &fotw_audio::DeviceId,
+        h: fotw_audio::FormatRequest,
+    ) -> Result<Box<dyn AudioTap>, TapError> {
+        Ok(Box::new(OrderedTap {
+            inner: self.inner.open_mic(d, h)?,
+            system_started: self.system_started.clone(),
+            is_mic: true,
+            refused: self.refused.clone(),
+        }))
+    }
+    fn open_system(
+        &self,
+        s: fotw_audio::SystemScope,
+        h: fotw_audio::FormatRequest,
+    ) -> Result<Box<dyn AudioTap>, TapError> {
+        Ok(Box::new(OrderedTap {
+            inner: self.inner.open_system(s, h)?,
+            system_started: self.system_started.clone(),
+            is_mic: false,
+            refused: self.refused.clone(),
+        }))
+    }
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn supervised_start_preserves_both_tracks_with_order_sensitive_devices() {
+    let root = tmpdir("supervised-mic-first");
+    let platform = Arc::new(OrderedPlatform {
+        inner: fotw_audio::platform::file::FilePlatform::new(ReplaySpeed::Realtime)
+            .with_mic(tone(2.0))
+            .with_system(tone(2.0)),
+        system_started: Arc::new(AtomicBool::new(false)),
+        refused: Arc::default(),
+    });
+    let refused = platform.refused.clone();
+    let outcome = session::run_supervised(
+        &root.join("sessions"),
+        platform,
+        Arc::new(fotw_audio::clock::HostClock),
+        Transcription::Disabled,
+        Duration::from_millis(150),
+        SessionControl::new(),
+    )
+    .await
+    .unwrap();
+    for track in ["mic.pcm", "system.pcm"] {
+        assert!(
+            std::fs::metadata(outcome.dir.join(track)).unwrap().len() > 0,
+            "missing {track}"
+        );
+    }
+    // Recovery can mask a refused first start; on macOS 26.3 that first
+    // start never returns, so the mic must never be started after the tap.
+    assert_eq!(
+        refused.load(Ordering::SeqCst),
+        0,
+        "the microphone was started after system capture"
+    );
 }

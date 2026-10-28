@@ -9,7 +9,8 @@
 // - parakeet-unified: the int8 encoder, decoder, single-step joint, vocab and
 //   metadata (README.md left out).
 // - silero-vad: the unified 256 ms v6.2.1 model FluidAudio 0.17.3 loads.
-// - parakeet-eou-320ms: the 320 ms streaming encoder, decoder, joint and vocab.
+// - parakeet-eou-320ms, parakeet-eou-160ms: the streaming encoder, decoder,
+//   joint and vocab of the 320 ms and 160 ms variants (live captions, #245).
 // - nemotron-3.5-2240ms: multilingual/2240ms without decoder_joint.mlmodelc,
 //   which Muesli skips as well.
 // Weights are downloaded on demand by an explicit install and never committed.
@@ -90,6 +91,24 @@ public enum PinnedModels {
             PinnedFile(path: "streaming_encoder.mlmodelc/metadata.json", size: 5327, sha256: "3adc7839db0f5d20b19e2dcd1c009bcf935a7edc61d7473c8150be444bd80488"),
             PinnedFile(path: "streaming_encoder.mlmodelc/model.mil", size: 655998, sha256: "eb9d56d7467ad3a8796ec9098b27fb89197638b31e24ede6dd924807d25086e6"),
             PinnedFile(path: "streaming_encoder.mlmodelc/weights/weight.bin", size: 212865856, sha256: "ff553fcb4f4560cfce1e558e16bb9d856e4b4f6a4c08f800d5c126fce4196822"),
+            PinnedFile(path: "vocab.json", size: 17437, sha256: "83fd42ad33dae1bd3ceee6c0bb6c625f314cf0b2dc8430be441ac1e2643d5c36"),
+        ]),
+        PinnedModel(id: "parakeet-eou-160ms", repository: "FluidInference/parakeet-realtime-eou-120m-coreml", revision: "40a23f4c0b333aa17ad8c0f2ea47ec2347f2f355", license: "NVIDIA Open Model License", remoteDirectory: "160ms", files: [
+            PinnedFile(path: "decoder.mlmodelc/analytics/coremldata.bin", size: 243, sha256: "3996975a8cbc1949159c55605b3132b39b2484f51acbd55d796d93c70de02b49"),
+            PinnedFile(path: "decoder.mlmodelc/coremldata.bin", size: 497, sha256: "c3ccbff963d8cf07e2be2bd56ea3384a89ea49628922c6bd95ff62e2ae57dc34"),
+            PinnedFile(path: "decoder.mlmodelc/metadata.json", size: 3283, sha256: "0977480649f2756894b0acfe2fdf4231a991f25e3fe02562bfb71b65ca944575"),
+            PinnedFile(path: "decoder.mlmodelc/model.mil", size: 7409, sha256: "b7c084a35bdbc887d69d6226cd533e2c11b2792c37d7352cf878f9f6f3c13555"),
+            PinnedFile(path: "decoder.mlmodelc/weights/weight.bin", size: 7873600, sha256: "0b4cacecdcd9df79ab1e56de67230baf5a8664d2afe0bb8f3408eefa972cb2f4"),
+            PinnedFile(path: "joint_decision.mlmodelc/analytics/coremldata.bin", size: 243, sha256: "5bca32ad130dcad6605cc00044c752aa5b45ef57d14c17f2d1a2fa49d6cf55b5"),
+            PinnedFile(path: "joint_decision.mlmodelc/coremldata.bin", size: 493, sha256: "22d4abc4625b935ee035b5f8ce7cb28d1041b9b01c12173e287bf4b5f5d99625"),
+            PinnedFile(path: "joint_decision.mlmodelc/metadata.json", size: 3181, sha256: "e970ae87137730020690d24d971813db3633bbdfed602d43b6a9c84deced6dc8"),
+            PinnedFile(path: "joint_decision.mlmodelc/model.mil", size: 9608, sha256: "45e8590bc87e34c162b547e43a4f60e64db15b017f48395d7835a6867884804f"),
+            PinnedFile(path: "joint_decision.mlmodelc/weights/weight.bin", size: 2794182, sha256: "7039b2010a269153f5a96edf28637f921a86ef8822f248f2d6712f7a6bce84b4"),
+            PinnedFile(path: "streaming_encoder.mlmodelc/analytics/coremldata.bin", size: 243, sha256: "a981b257db79b4f86e6fa06a92562160a0ae71554746c24af24d8634b85f0356"),
+            PinnedFile(path: "streaming_encoder.mlmodelc/coremldata.bin", size: 670, sha256: "e762abc60d999bcd10aab985b68191a602f2e8e03165cf08671c60f93936037a"),
+            PinnedFile(path: "streaming_encoder.mlmodelc/metadata.json", size: 5327, sha256: "75be31534cdd91711b08ba3a46046523eb9be9909618cd569cce1ea79e842a95"),
+            PinnedFile(path: "streaming_encoder.mlmodelc/model.mil", size: 639646, sha256: "709f9280eb0bba1fd698cc252275ba802885c2c53cdb60d399277281dac09b5d"),
+            PinnedFile(path: "streaming_encoder.mlmodelc/weights/weight.bin", size: 212691776, sha256: "12cd781a4300b52b6687587b7d8e37e0ce5c8ccb1dbea036008275e6abf5070c"),
             PinnedFile(path: "vocab.json", size: 17437, sha256: "83fd42ad33dae1bd3ceee6c0bb6c625f314cf0b2dc8430be441ac1e2643d5c36"),
         ]),
         PinnedModel(id: "nemotron-3.5-2240ms", repository: "FluidInference/Nemotron-3.5-ASR-Streaming-Multilingual-0.6b-CoreML", revision: "1a41b75758b0337ff67db7d5408280aaaf23074e", license: "OpenMDW-1.1", remoteDirectory: "multilingual/2240ms", files: [

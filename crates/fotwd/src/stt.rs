@@ -64,6 +64,17 @@ pub struct SttSettings {
     /// ISO 639-1 code for the local engine. Empty detects per utterance.
     #[serde(default)]
     pub language: String,
+    /// Live captions (#245): word-by-word text while people talk, from the
+    /// speech helper's caption model beside the local engine. On by default,
+    /// but it only takes effect for a local meeting once the caption model
+    /// (`parakeet-eou-320ms`) is installed; Deepgram meetings never start the
+    /// helper for it. Captions are display-only either way.
+    #[serde(default = "live_captions_default")]
+    pub live_captions: bool,
+}
+
+fn live_captions_default() -> bool {
+    true
 }
 
 impl Default for SttSettings {
@@ -72,6 +83,7 @@ impl Default for SttSettings {
             engine: SttEngine::default(),
             model: crate::speechd::ENGINE.to_owned(),
             language: String::new(),
+            live_captions: true,
         }
     }
 }
@@ -731,11 +743,13 @@ pub(crate) fn local_transcription_with(
     let data_root = data_root.to_path_buf();
     let session_id = session_id.to_owned();
     Transcription::PreparingLocal(Box::pin(async move {
+        let launch = launch();
+        let captions = live_captions(&settings, &data_root, launch.as_ref().ok());
         // Parakeet refuses Start outright when it cannot run: unlike a Whisper
         // file, there is nothing to record an expected identity against, and
         // the fix (install it) is one command.
         if settings.uses_parakeet() {
-            let (engine, revision) = parakeet_factory(data_root, detector, launch).await?;
+            let (engine, revision) = parakeet_factory(data_root, detector, move || launch).await?;
             let mut legs = crate::session::LocalLegs::for_session(
                 engine,
                 &session_id,
@@ -743,9 +757,10 @@ pub(crate) fn local_transcription_with(
                 mic_enabled,
             );
             legs.revision = Some(revision);
+            legs.captions = captions;
             return Ok(legs);
         }
-        tokio::task::spawn_blocking(move || {
+        let mut legs = tokio::task::spawn_blocking(move || {
             use fotw_stt::RecognizerFactory;
             // Without the gate, music and noise become text (#242): refuse
             // capture rather than record a transcript of hallucinations.
@@ -789,11 +804,35 @@ pub(crate) fn local_transcription_with(
                 mic_enabled,
             );
             legs.revision = revision;
-            Ok(legs)
+            Ok::<_, String>(legs)
         })
         .await
-        .map_err(|_| "local model identity preparation failed".to_owned())?
+        .map_err(|_| "local model identity preparation failed".to_owned())??;
+        legs.captions = captions;
+        Ok(legs)
     }))
+}
+
+/// Live captions for a local meeting (#245), if they are on, their model is
+/// installed and the build has the helper. Checking the model's folder is
+/// cheap and starts nothing; the helper itself starts on the first caption
+/// stream, and its `load` is what decides whether the model is usable.
+#[cfg(target_os = "macos")]
+fn live_captions(
+    settings: &SttSettings,
+    data_root: &Path,
+    launch: Option<&crate::speechd::Launch>,
+) -> Option<std::sync::Arc<dyn crate::captions::CaptionEngine>> {
+    if !settings.live_captions
+        || !crate::speechd::present_model(data_root, &crate::speechd::CAPTIONS)
+    {
+        return None;
+    }
+    Some(std::sync::Arc::new(crate::captions::SpeechdCaptions::lazy(
+        launch?.clone(),
+        data_root.to_owned(),
+        crate::captions::ENGINE,
+    )))
 }
 
 /// Parakeet Unified behind its speech gate, in the daemon's shared helper, for
@@ -876,6 +915,7 @@ async fn unavailable_catalog_model_keeps_its_expected_identity_for_later_recover
             .to_string_lossy()
             .into_owned(),
         language: "en".into(),
+        live_captions: true,
     };
     let detector = fixture_detector(root.path());
     let prepared = local_transcription_with(
@@ -915,6 +955,7 @@ async fn local_identity_is_pinned_without_loading_native_weights_and_refuses_a_c
         engine: SttEngine::Local,
         model: path.to_string_lossy().into_owned(),
         language: "en".into(),
+        live_captions: true,
     };
     let expected = format!("sha256:{}", sha256_file(&path).unwrap());
     let detector = fixture_detector(root.path());
@@ -985,6 +1026,7 @@ mod tests {
             engine: SttEngine::Fallback,
             model: "/fixture/ggml-small.en.bin".into(),
             language: "en".into(),
+            live_captions: true,
         };
         settings.write(&mut db).unwrap();
         assert_eq!(SttSettings::read(&db).unwrap(), settings);
@@ -1008,6 +1050,7 @@ mod tests {
             engine: SttEngine::Local,
             model: "/m/ggml-base.en.bin".into(),
             language: "EN".into(),
+            live_captions: true,
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains(r#""engine":"local""#), "{json}");
@@ -1024,6 +1067,7 @@ mod tests {
             engine: SttEngine::Local,
             model: "/m/ggml-small.en.bin".into(),
             language: String::new(),
+            live_captions: true,
         };
         local.write(&mut db).unwrap();
         assert_eq!(SttSettings::read(&db).unwrap(), local);
@@ -1138,5 +1182,25 @@ mod tests {
             sha256_file(&path).unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+}
+
+#[cfg(test)]
+mod live_caption_setting_tests {
+    use super::SttSettings;
+
+    #[test]
+    fn a_choice_saved_before_live_captions_existed_reads_as_captions_on() {
+        let mut saved = serde_json::to_value(SttSettings::default()).unwrap();
+        saved.as_object_mut().unwrap().remove("live_captions");
+        let read: SttSettings = serde_json::from_value(saved).expect("an older row still reads");
+        assert!(read.live_captions);
+        let off = SttSettings {
+            live_captions: false,
+            ..SttSettings::default()
+        };
+        let round: SttSettings =
+            serde_json::from_value(serde_json::to_value(&off).unwrap()).unwrap();
+        assert!(!round.live_captions, "switching captions off is kept");
     }
 }
