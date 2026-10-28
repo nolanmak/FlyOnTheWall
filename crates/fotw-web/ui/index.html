@@ -31,8 +31,17 @@
       <span id="live" class="live" role="status" hidden>Updates connecting…</span>
     </header>
     <p id="recording-limit" class="recording-limit" hidden></p>
+    <details id="live-status" class="live-status" hidden>
+      <summary id="live-status-summary">Recording status</summary>
     <section id="capture-health" class="capture-health" aria-label="Audio capture health" hidden></section>
     <section id="speech-health" class="speech-health" aria-label="Current recording transcription" hidden></section>
+    </details>
+    <main>
+      <nav id="list" aria-label="Meetings"></nav>
+      <section id="detail" aria-label="Meeting details" aria-live="polite"></section>
+    </main>
+    <details id="settings-panel" class="settings-panel">
+      <summary>Settings</summary>
     <details id="capture-settings" class="gh-settings" hidden>
       <summary id="capture-summary">Audio exclusions: loading saved choice…</summary>
       <p id="capture-disclosure" class="gh-note">Exclude Spotify or all Brave audio from the system-audio track, including meetings in Brave. Chrome and other meeting apps remain included. Your microphone remains recorded; music audible through speakers can still reach it. Use headphones to avoid that.</p>
@@ -69,10 +78,6 @@
       <p id="speech-status" class="gh-note" role="status"></p>
       <div id="model-setup-mount"></div>
     </details>
-    <main>
-      <nav id="list" aria-label="Meetings"></nav>
-      <section id="detail" aria-label="Meeting details" aria-live="polite"></section>
-    </main>
     <details id="gh-settings" class="gh-settings" hidden>
       <summary>GitHub export</summary>
       <p class="gh-note">
@@ -179,6 +184,7 @@
       </label>
       <button id="sum-save" type="button">Save</button>
       <p id="sum-status" class="gh-note"></p>
+    </details>
     </details>
     <p id="status" role="status"></p>
     <script src="/assets/github.js"></script>

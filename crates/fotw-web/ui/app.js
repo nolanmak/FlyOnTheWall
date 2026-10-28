@@ -32,6 +32,8 @@ function openRequestedSettings() {
   const target = REQUESTED_SETTINGS === "#speech-settings" ? el.speechSettings
     : REQUESTED_SETTINGS === "#sum-settings" ? el.sumSettings : null;
   if (!target || target.hidden) return false;
+  // Every section lives inside the collapsed Settings panel.
+  if (el.settingsPanel) el.settingsPanel.open = true;
   target.open = true;
   target.scrollIntoView?.({block: "start", behavior: "auto"});
   return true;
@@ -53,6 +55,9 @@ const el = {
   recordingLimit: document.getElementById("recording-limit"),
   captureHealth: document.getElementById("capture-health"),
   speechHealth: document.getElementById("speech-health"),
+  liveStatus: document.getElementById("live-status"),
+  liveStatusSummary: document.getElementById("live-status-summary"),
+  settingsPanel: document.getElementById("settings-panel"),
   ghSettings: document.getElementById("gh-settings"),
   ghRepo: document.getElementById("gh-repo"),
   ghBranch: document.getElementById("gh-branch"),
@@ -1218,6 +1223,7 @@ function renderSpeechHealth(body) {
   if (recState === "idle" || !sources.length) {
     clear(el.speechHealth); speechRows.clear(); speechSession = null;
     el.speechHealth.hidden = true;
+    renderLiveStatus();
     return;
   }
   if (speechSession !== (body.session_id || null)) {
@@ -1250,6 +1256,9 @@ function renderSpeechHealth(body) {
     const provider = speechProviderName(source.provider);
     const heading = label + " · " + provider + " / " + String(source.model || "Unknown model");
     if (entry.heading.textContent !== heading) entry.heading.textContent = heading;
+    entry.engine = provider + " / " + String(source.model || "Unknown model");
+    entry.attention = ["reconnecting", "closed", "incomplete"].includes(source.state)
+      || Boolean(source.error) || Boolean(source.switch_reason);
     const parts = [states[source.state] || "Status unavailable"];
     if (typeof source.pending_audio_ms === "number" && Number.isFinite(source.pending_audio_ms) && source.pending_audio_ms >= 0) {
       parts.push((source.pending_audio_ms / 1000).toFixed(1) + "s audio pending");
@@ -1275,6 +1284,7 @@ function renderSpeechHealth(body) {
   }
   for (const [key, entry] of speechRows) if (!seen.has(key)) { entry.row.remove(); speechRows.delete(key); }
   el.speechHealth.hidden = seen.size === 0;
+  renderLiveStatus();
 }
 
 // Keep rows mounted between polls so status refreshes preserve keyboard focus.
@@ -1292,6 +1302,7 @@ function renderCaptureHealth(body) {
     captureHealthRows.clear();
     captureRetryPending.clear();
     captureHealthSession = null;
+    renderLiveStatus();
     return;
   }
   if (captureHealthSession !== body.session_id) captureRetryPending.clear();
@@ -1343,7 +1354,39 @@ function renderCaptureHealth(body) {
     }
     row.button.hidden = state !== "exhausted";
     row.button.disabled = captureRetryPending.has(source);
+    row.attention = !["healthy", "confirming"].includes(state);
   }
+  renderLiveStatus();
+}
+
+// The live capture and transcription cards fold into one line so the
+// transcript keeps the screen. A source that needs attention (recovering,
+// exhausted with its Retry button, quiet, a dropped stream) opens the panel
+// once, on the transition; the user's own collapse is respected afterwards.
+const LIVE_SOURCE_LABELS = { system: "System audio", mic: "Microphone" };
+let liveStatusAttention = false;
+function renderLiveStatus() {
+  const box = el.liveStatus;
+  if (!box) return;
+  const visible = el.captureHealth?.hidden === false || el.speechHealth?.hidden === false;
+  box.hidden = !visible;
+  if (!visible) { liveStatusAttention = false; return; }
+  const parts = [];
+  let attention = false;
+  for (const source of ["system", "mic"]) {
+    const capture = el.captureHealth?.hidden === false ? captureHealthRows.get(source) : null;
+    const speech = el.speechHealth?.hidden === false ? speechRows.get(source) : null;
+    if (!capture && !speech) continue;
+    attention = attention || Boolean(capture?.attention) || Boolean(speech?.attention);
+    const bits = [capture ? capture.message.textContent : LIVE_SOURCE_LABELS[source]];
+    if (speech?.engine) bits.push(speech.engine);
+    parts.push(bits.join(" · "));
+  }
+  const line = parts.join("   |   ") || "Recording status";
+  if (el.liveStatusSummary && el.liveStatusSummary.textContent !== line) el.liveStatusSummary.textContent = line;
+  box.classList?.toggle("attention", attention);
+  if (attention && !liveStatusAttention) box.open = true;
+  liveStatusAttention = attention;
 }
 
 async function retryCapture(source, button) {

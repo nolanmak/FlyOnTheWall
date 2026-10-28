@@ -51,6 +51,7 @@ body {
   background: var(--bg);
   color: var(--fg);
   font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  overflow-y: auto;
 }
 
 header {
@@ -160,7 +161,11 @@ main {
   display: grid;
   grid-template-columns: minmax(240px, 300px) minmax(0, 1fr);
   flex: 1;
-  min-height: 0;
+  /* The reading area is the point of the page: status and settings panels
+     above and below it may never squeeze it to a few lines (#232). When they
+     are open on a short window, the page scrolls instead. */
+  min-height: max(18rem, 55vh);
+  min-height: max(18rem, 55dvh);
 }
 
 nav {
@@ -810,3 +815,58 @@ button, summary { min-height: 36px; }
 .model-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
 .model-setup progress { display: block; width: min(100%, 36rem); margin-top: 12px; }
 .model-setup a { color: var(--accent); }
+
+/* ------------------------------------------------- compact chrome (#232)
+   Live status folds to one line, and every settings section shares one
+   collapsed panel, so the transcript and meeting list keep the screen. */
+.live-status {
+  flex: none;
+  max-height: 40vh;
+  max-height: 40dvh;
+  overflow-y: auto;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+}
+.live-status > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-weight: 600;
+  line-height: 36px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.live-status.attention > summary { color: #be762f; }
+.live-status[open] > summary { margin-bottom: 6px; }
+/* The generic `section` padding is for reading panes, not these strips. */
+.live-status .capture-health,
+.live-status .speech-health {
+  margin: 0;
+  padding: 0 0 6px;
+  border-bottom: 0;
+  gap: 8px;
+  overflow: visible;
+}
+.live-status .capture-source { padding: 6px 12px; }
+.live-status .speech-source { padding: 8px 12px; }
+
+.settings-panel {
+  flex: none;
+  padding: 0 16px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+}
+.settings-panel > summary {
+  line-height: 36px;
+  cursor: pointer;
+  color: var(--muted);
+  font-weight: 600;
+}
+.settings-panel[open] {
+  max-height: 45vh;
+  max-height: 45dvh;
+  overflow-y: auto;
+}
+.settings-panel .gh-settings { padding-left: 0; padding-right: 0; }
+.recording-limit { flex: none; padding: 0.4rem 1rem; }
