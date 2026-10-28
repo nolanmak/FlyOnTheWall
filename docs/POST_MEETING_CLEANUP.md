@@ -125,7 +125,7 @@ version. It does not depend on the recording's speech plan, so a meeting whose
 live Parakeet transcript was cut short still gets a complete Parakeet
 transcript from its saved audio once it is in the library: that is how saved
 Parakeet audio is re-transcribed today. Extending recovery itself to Parakeet
-plans can reuse the same helper engine and is left to #12/#124.
+plans is tracked in [#274](https://github.com/nolanmak/FlyOnTheWall/issues/274).
 
 ## Tests
 
