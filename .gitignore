@@ -3,3 +3,4 @@ target/
 .DS_Store
 /packaging/build/
 .claude/
+__pycache__/

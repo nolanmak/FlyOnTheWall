@@ -537,23 +537,24 @@ async fn a_result_written_just_before_the_helper_dies_is_still_delivered() {
 }
 
 #[tokio::test]
-async fn the_default_deadlines_find_a_helper_hung_after_finish_within_three_seconds() {
+async fn the_default_deadlines_find_a_helper_hung_after_finish_within_six_seconds() {
     // After finish a batch stream sends no audio, so only the heartbeat can
-    // notice. Default config: a 1 s heartbeat with a 2 s deadline.
+    // notice. Default config: a 1 s heartbeat with a 5 s deadline, slack
+    // enough for a heavily loaded Mac (see the slow-health test).
     let client = SpeechdClient::start(config(&[])).await.expect("start");
     client.load("fake-hang").await.expect("load");
     let mut stuck = client.open_stream(stream("fake-hang")).await.expect("open");
     stuck.send_audio(&[1; 16]).await.expect("audio");
     stuck.finish().await.expect("finish");
     let waited = Instant::now();
-    match next(&mut stuck).await {
-        Some(StreamEvent::Failed(failure)) => {
+    match tokio::time::timeout(Duration::from_secs(10), stuck.next_event()).await {
+        Ok(Some(StreamEvent::Failed(failure))) => {
             assert_eq!(failure.code, ErrorCode::HelperUnresponsive);
         }
         other => panic!("expected helper_unresponsive, got {other:?}"),
     }
     assert!(
-        waited.elapsed() < Duration::from_millis(3_500),
+        waited.elapsed() < Duration::from_millis(6_500),
         "{:?}",
         waited.elapsed()
     );
@@ -926,5 +927,39 @@ async fn a_pooled_engine_refuses_a_third_stream_and_a_cancelled_one_frees_its_sl
         .expect("the cancelled stream's slot is free");
     again.send_audio(&[1; 160]).await.expect("audio");
     assert_eq!(partial(&mut again).await.0, Some(1));
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_helper_slow_to_answer_health_under_load_is_not_killed() {
+    // A Mac at load average 40 delayed the real helper's health answers past
+    // the old 2 s deadline and got a working caption stream killed. Default
+    // deadlines must ride out a 2.5 s answer.
+    let Some(config) = fake_only(&["--slow-health", "2500"]) else {
+        return;
+    };
+    let client = SpeechdClient::start(config).await.expect("start");
+    client.load("fake-stream").await.expect("load");
+    let mut live = client
+        .open_stream(stream("fake-stream"))
+        .await
+        .expect("open");
+    let started = Instant::now();
+    let mut sent = 0;
+    while started.elapsed() < Duration::from_secs(6) {
+        live.send_audio(&[1; 160])
+            .await
+            .expect("audio keeps flowing");
+        sent += 160;
+        match next(&mut live).await {
+            Some(StreamEvent::Partial { text, .. }) => assert_eq!(text, format!("samples={sent}")),
+            other => panic!("the stream must stay up, got {other:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        client.health().await.is_ok(),
+        "a slow answer is still an answer"
+    );
     client.shutdown().await;
 }
