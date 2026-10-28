@@ -173,6 +173,11 @@ fn decode(response: &Value, input: usize) -> Result<LlmResponse, SummarizeError>
         .as_u64()
         .and_then(|n| usize::try_from(n).ok())
         .ok_or_else(|| SummarizeError::Decode("local response missing token accounting".into()))?;
+    if content.trim().is_empty() || output == 0 {
+        return Err(SummarizeError::Truncated(
+            "local model returned no answer".into(),
+        ));
+    }
     let evaluated = response["tokens_evaluated"]
         .as_u64()
         .and_then(|n| usize::try_from(n).ok())
@@ -231,6 +236,8 @@ mod tests {
             ("stop_type", json!("none")),
             ("tokens_evaluated", json!(19)),
             ("tokens_predicted", Value::Null),
+            ("content", json!("   ")),
+            ("tokens_predicted", json!(0)),
         ] {
             let mut bad = valid.clone();
             bad[field] = value;
