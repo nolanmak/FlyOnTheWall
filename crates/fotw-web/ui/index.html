@@ -153,17 +153,19 @@
     <details id="sum-settings" class="gh-settings" hidden>
       <summary>Summaries</summary>
       <p class="gh-note">
-        Turns a finished meeting into a summary with its action items, using a
-        CLI you already have logged in. Nothing is sent until this is enabled.
+        Choose where meeting summaries and action items are generated.
+        Transcription and export destinations are configured separately.
       </p>
       <label class="gh-field">
-        engine
+        summary destination
         <select id="sum-kind">
+          <option value="local_only">On this Mac (setup required)</option>
+          <option value="anthropic">Anthropic API (hosted)</option>
           <option value="claude">claude CLI</option>
           <option value="codex">codex CLI</option>
         </select>
       </label>
-      <label class="gh-field">
+      <label id="sum-binary-row" class="gh-field">
         binary
         <input
           id="sum-binary"
@@ -174,13 +176,13 @@
         />
       </label>
       <p id="sum-disclosure" class="gh-note"></p>
-      <label class="gh-check">
+      <label id="sum-ack-row" class="gh-check">
         <input id="sum-ack" type="checkbox" />
         I understand transcripts leave this machine
       </label>
       <label class="gh-check">
         <input id="sum-enabled" type="checkbox" />
-        enabled
+        Enable summaries
       </label>
       <button id="sum-save" type="button">Save</button>
       <p id="sum-status" class="gh-note"></p>

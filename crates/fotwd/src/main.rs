@@ -233,7 +233,7 @@ async fn run_cli(args: Vec<String>) -> ExitCode {
                  list [dir] | summarize <id> [dir] [--template <slug>] | disclose | \
                  onboard | detect [seconds] | \
                  retention [dir] [--apply] [--days <n>] [--budget-gib <n>] | \
-                 key <set <provider>|list> | engine [claude-cli|codex-cli|off] | \
+                 key <set <provider>|list> | engine [off|local|anthropic|claude-cli|codex-cli] | \
                  stt [models|local|fallback [--model <name|path>] [--language <code>]|deepgram|test <wav>] | \
                  dedupe <id|--all> [dir] [--revert <transcript-id>] | \
                  recover [dir] [--check] | \
@@ -1408,6 +1408,7 @@ fn dedupe_command(args: &[String]) -> ExitCode {
 /// through it exactly as it would through an API key (KEY-04), and the
 /// resolver refuses the CLI until the user has said they know that.
 fn engine_command(args: &[String]) -> ExitCode {
+    use fotw_web::SummaryPolicy;
     use fotwd::engine::{CliKind, SETTINGS_KEY, SummarizeSettings};
 
     let root = default_root();
@@ -1428,15 +1429,26 @@ fn engine_command(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         None => {
             let settings = SummarizeSettings::read(&db);
-            let has_key = secrets::keystore().ok().is_some_and(|s| {
-                s.contains(SecretKey::ApiKey(Provider::Anthropic))
-                    .unwrap_or(false)
-            });
+            if settings.policy == Some(SummaryPolicy::Off) {
+                println!("  engine     : off — no summary model calls, including stored API keys");
+                return ExitCode::SUCCESS;
+            }
+            if settings.policy == Some(SummaryPolicy::LocalOnly) {
+                println!(
+                    "  engine     : local-only — local model setup is required; no hosted fallback"
+                );
+                return ExitCode::SUCCESS;
+            }
+            let has_key = settings.allows_api_key()
+                && secrets::keystore().ok().is_some_and(|s| {
+                    s.contains(SecretKey::ApiKey(Provider::Anthropic))
+                        .unwrap_or(false)
+                });
             if has_key {
-                println!("  engine     : anthropic API (key in keychain — always wins)");
-            } else if settings.cli_enabled && settings.acknowledged_egress {
-                let name = settings.cli_kind.bare_name();
-                let sub = settings.cli_kind.subcommand();
+                println!("  engine     : anthropic API (selected hosted destination)");
+            } else if let Some(kind) = settings.selected_cli() {
+                let name = kind.bare_name();
+                let sub = kind.subcommand();
                 // Report what enrichment will actually do, not just what was
                 // configured. `resolve_binary` now probes the same install
                 // spots the daemon's own resolution does (#74) — before that
@@ -1479,9 +1491,25 @@ fn engine_command(args: &[String]) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Some("off") => match write(&mut db, &SummarizeSettings::default()) {
+        Some(mode @ ("off" | "local")) => match write(
+            &mut db,
+            &SummarizeSettings {
+                policy: Some(if mode == "off" {
+                    SummaryPolicy::Off
+                } else {
+                    SummaryPolicy::LocalOnly
+                }),
+                ..SummarizeSettings::default()
+            },
+        ) {
             Ok(()) => {
-                println!("  engine     : off");
+                if mode == "off" {
+                    println!("  engine     : off — stored hosted keys are not used");
+                } else {
+                    println!(
+                        "  engine     : local-only — local model setup required; no hosted fallback"
+                    );
+                }
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -1489,6 +1517,30 @@ fn engine_command(args: &[String]) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("anthropic") => {
+            if !args.iter().any(|arg| arg == "--i-acknowledge-egress") {
+                eprintln!("This sends meeting transcripts and notes to api.anthropic.com.");
+                eprintln!("Re-run with --i-acknowledge-egress to select that destination.");
+                return ExitCode::FAILURE;
+            }
+            match write(
+                &mut db,
+                &SummarizeSettings {
+                    policy: Some(SummaryPolicy::Anthropic),
+                    acknowledged_egress: true,
+                    ..SummarizeSettings::default()
+                },
+            ) {
+                Ok(()) => {
+                    println!("  engine     : anthropic selected; a stored API key is required");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("fotwd: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some(sub @ ("claude-cli" | "codex-cli")) => {
             // KEY-04: name the host, what leaves the device, and the provider's
             // retention/training default with a live doc link. The two CLIs
@@ -1515,6 +1567,11 @@ fn engine_command(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
             let settings = SummarizeSettings {
+                policy: Some(if kind == CliKind::Claude {
+                    SummaryPolicy::ClaudeCli
+                } else {
+                    SummaryPolicy::CodexCli
+                }),
                 cli_enabled: true,
                 acknowledged_egress: true,
                 cli_kind: kind,
@@ -1559,8 +1616,8 @@ fn engine_command(args: &[String]) -> ExitCode {
         }
         Some(other) => {
             eprintln!(
-                "usage: fotwd engine [claude-cli|codex-cli --i-acknowledge-egress \
-                 [--binary <path>] | off]"
+                "usage: fotwd engine [off|local|anthropic --i-acknowledge-egress|\
+                 claude-cli|codex-cli --i-acknowledge-egress [--binary <path>]]"
             );
             eprintln!("fotwd: unknown engine `{other}`");
             ExitCode::FAILURE
