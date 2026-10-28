@@ -20,12 +20,7 @@ impl PolicyStamp {
         };
         let stamp = Self(version);
         stamp.check(db)?;
-        let settings = match stamp.0.value() {
-            None => SummarizeSettings::default(),
-            Some(value) => {
-                serde_json::from_str::<SummarizeSettings>(value).map_err(|_| changed())?
-            }
-        };
+        let settings = SummarizeSettings::from_snapshot(db, stamp.0.value());
         let permitted = match settings.policy {
             // Injected engines support the same pre-policy test seam. Actual
             // resolvers additionally bind their settings generation above.
