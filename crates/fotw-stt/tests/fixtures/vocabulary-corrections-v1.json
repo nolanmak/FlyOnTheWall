@@ -83,14 +83,18 @@
     },
     {
       "name": "larger profile guards",
-      "profile": {"version": 1, "recognition_hints": ["IAM", "Confluence", "MariaDB", "kubectl", "FluidAudio", "cargo"]},
+      "profile": {"version": 1, "recognition_hints": ["IAM", "Confluence", "MariaDB", "kubectl", "FluidAudio", "cargo", "LinkedIn", "iPhone", "PowerPoint", "FlyOnTheWall"]},
       "cases": [
         {"why": "near miss with a sound-alike first letter", "input": "use Cubectal now", "output": "use kubectl now"},
         {"why": "split compound joins to a camel-case hint", "input": "install Fluid Audio today", "output": "install FluidAudio today"},
         {"why": "words never join into an all-caps hint", "input": "i am here", "output": "i am here"},
         {"why": "words never join into a lowercase hint", "input": "the car go fast", "output": "the car go fast"},
         {"why": "a different first letter is not a near miss", "input": "under its influence", "output": "under its influence"},
-        {"why": "a much shorter word is not a near miss", "input": "the maid left", "output": "the maid left"}
+        {"why": "a much shorter word is not a near miss", "input": "the maid left", "output": "the maid left"},
+        {"why": "common words never join into a camel-case hint", "input": "we linked in the docs", "output": "we linked in the docs"},
+        {"why": "a pronoun and a common word never join", "input": "I phone home daily", "output": "I phone home daily"},
+        {"why": "two common words never join", "input": "the power point is here", "output": "the power point is here"},
+        {"why": "all-common words stay apart even when they spell a hint", "input": "a fly on the wall", "output": "a fly on the wall"}
       ]
     },
     {

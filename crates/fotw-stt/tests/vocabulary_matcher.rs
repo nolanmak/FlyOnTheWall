@@ -78,6 +78,8 @@ fn invalid_corrections_are_rejected() {
         r#"{"version":1,"corrections":[{"word":"x","matching_threshold":0.99}]}"#,
         r#"{"version":1,"corrections":[{"word":"Open  Telemetry"}]}"#,
         r#"{"version":1,"corrections":[{"word":"open telemetry"},{"word":"OPEN TELEMETRY"}]}"#,
+        r#"{"version":1,"corrections":[{"word":"Jose"},{"word":"José","replacement":"José"}]}"#,
+        r#"{"version":1,"corrections":[{"word":"Zoe"},{"word":"zoe\u0308"}]}"#,
         r#"{"version":1,"corrections":[{"word":"x","api_key":"fixture"}]}"#,
     ] {
         assert!(Profile::parse(raw.as_bytes()).is_err(), "{raw}");
@@ -93,4 +95,12 @@ fn invalid_corrections_are_rejected() {
         ..Default::default()
     };
     assert!(too_many.validate().is_err());
+}
+
+#[test]
+fn accent_only_duplicates_are_rejected_with_a_clear_error() {
+    let error =
+        Profile::parse(br#"{"version":1,"corrections":[{"word":"Jose"},{"word":"Jos\u00e9"}]}"#)
+            .unwrap_err();
+    assert!(error.contains("accents"), "{error}");
 }

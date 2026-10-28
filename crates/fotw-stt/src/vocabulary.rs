@@ -223,7 +223,7 @@ pub fn validate_hints(hints: &[String]) -> Result<(), String> {
 }
 
 /// Validate local corrections: trimmed single-spaced words of one to eight
-/// words, distinct ignoring case, with bounded replacements and thresholds.
+/// words, distinct ignoring case and accents, with bounded replacements and thresholds.
 pub fn validate_corrections(corrections: &[Correction]) -> Result<(), String> {
     if corrections.len() > MAX_CORRECTIONS {
         return Err(format!(
@@ -262,8 +262,9 @@ pub fn validate_corrections(corrections: &[Correction]) -> Result<(), String> {
                 "Correction thresholds must be between {MIN_MATCHING_THRESHOLD} and {MAX_MATCHING_THRESHOLD}"
             ));
         }
-        if !words.insert(word.to_lowercase()) {
-            return Err("Correction words conflict ignoring case".into());
+        // The same key the matcher uses, so no entry is silently shadowed.
+        if !words.insert(crate::vocabulary_matcher::correction_key(word)) {
+            return Err("Correction words conflict ignoring case and accents".into());
         }
     }
     Ok(())

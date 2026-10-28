@@ -24,8 +24,11 @@
 //!   Muesli targets small dictionaries; these guards keep a 200-entry profile
 //!   from rewriting ordinary prose.
 //! - Adjacent words whose letters spell a camel-case entry match it exactly
-//!   (`web assembly` → `WebAssembly`, `Fly on the Wall` → `FlyOnTheWall`),
-//!   since recognizers often split compounds.
+//!   (`web assembly` → `WebAssembly`, `Fluid Audio` → `FluidAudio`), since
+//!   recognizers often split compounds, unless every one of them is a frequent
+//!   English word (`power point`, `linked in` and `fly on the wall` stay
+//!   prose). A multi-word correction such as `fly on the wall` →
+//!   `FlyOnTheWall` still matches those words exactly.
 use crate::vocabulary::{
     DEFAULT_MATCHING_THRESHOLD, MAX_MATCHING_THRESHOLD, MIN_MATCHING_THRESHOLD, Profile,
 };
@@ -78,10 +81,7 @@ impl VocabularyMatcher {
             .iter()
             .map(|h| (h.as_str(), h.as_str(), DEFAULT_MATCHING_THRESHOLD));
         for (word, replacement, threshold) in explicit.chain(hints) {
-            let tokens: Vec<Vec<char>> = word
-                .split_whitespace()
-                .filter_map(|w| split_punctuation(w).map(|(_, core, _)| fold(core)))
-                .collect();
+            let tokens = correction_key(word);
             // A word of combining marks alone folds to nothing.
             if tokens.is_empty() || tokens.iter().any(Vec::is_empty) || !seen.insert(tokens.clone())
             {
@@ -175,10 +175,12 @@ impl VocabularyMatcher {
                 return Some((count, exact));
             }
             let length: usize = window.iter().map(|w| w.folded.len()).sum();
+            // Ordinary words stay apart: "power point" is prose, not PowerPoint.
             if count > 1
                 && self
                     .compact_lengths
                     .is_some_and(|(low, high)| (low..=high).contains(&length))
+                && !window.iter().all(Word::is_common)
             {
                 let compact: String = window.iter().flat_map(|w| w.folded.iter()).collect();
                 if let Some(&joined) = self.compact.get(&compact) {
@@ -216,11 +218,14 @@ struct Word {
 }
 
 impl Word {
+    fn is_common(&self) -> bool {
+        *self
+            .common
+            .get_or_init(|| is_common_word(&self.folded.iter().collect::<String>()))
+    }
+
     fn near_miss_allowed(&self) -> bool {
-        !self.has_digit
-            && !*self
-                .common
-                .get_or_init(|| is_common_word(&self.folded.iter().collect::<String>()))
+        !self.has_digit && !self.is_common()
     }
 }
 
@@ -338,6 +343,14 @@ fn is_boundary_punctuation(c: char) -> bool {
             | '“'
             | '”'
     )
+}
+
+/// The comparison key of a correction word: its folded words, as the matcher
+/// compares them. Two words with the same key are the same correction.
+pub(crate) fn correction_key(word: &str) -> Vec<Vec<char>> {
+    word.split_whitespace()
+        .filter_map(|w| split_punctuation(w).map(|(_, core, _)| fold(core)))
+        .collect()
 }
 
 /// Whether a whitespace-free word has something besides boundary punctuation.

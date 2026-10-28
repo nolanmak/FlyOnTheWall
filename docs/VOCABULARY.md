@@ -17,7 +17,8 @@ UTF-8 bytes total including separators. These are conservative application
 budgets, not a claim about any provider's tokenizer. At most 128 snippets are
 allowed, with names up to 80 UTF-8 bytes and literal text up to 16 KiB. At
 most 512 corrections are allowed; each `word` is one to eight single-spaced
-words of up to 128 UTF-8 bytes, unique ignoring case, with an optional
+words of up to 128 UTF-8 bytes, unique ignoring case and accents (the
+matcher's comparison, so `Jose` and `José` conflict), with an optional
 `replacement` of the same size and an optional `matching_threshold` between
 0.70 and 0.95 (default 0.85), Muesli's names and range.
 
@@ -67,15 +68,26 @@ or its inflection (`src/common_words_en.txt`), a word containing a digit, or a
 longer word containing the entry; its length must be within one character of
 the entry's (two when the threshold is lowered), and its first letter the same
 or a sound-alike. Adjacent words that spell a camel-case entry (`web assembly`,
-`Fly on the Wall`) are joined. `tests/fixtures/vocabulary-corrections-v1.json`
+`Fluid Audio`) are joined unless every one of them is a frequent English word:
+`linked in`, `I phone`, `power point` and `fly on the wall` stay prose. Add a
+multi-word correction (`fly on the wall` → `FlyOnTheWall`) to rewrite such a
+phrase deliberately. `tests/fixtures/vocabulary-corrections-v1.json`
 pins every rule, and `conformance::vocabulary()` runs it for consumers.
 
 Measured for Murmur #102 with whisper large-v3-turbo on the #118 corpus: term
-recall on the 12 synthetic technical-term clips rose from 10/14 to 14/14 with a
-profile of their terms, and WER fell from 15.4% to 7.7%; 42 LibriSpeech clips
-were unchanged. With 200 entries (those terms plus 186 other product and
+recall on the 12 synthetic technical-term clips rose from 10/14 to 13/14 with a
+profile of their terms, and WER fell from 15.4% to 11.1%; 42 LibriSpeech clips
+were unchanged. (`Fly on the Wall` stays apart because all four words are
+common; a `fly on the wall` correction would recover it.) With 200 entries (those terms plus 186 other product and
 people names), recall and synthetic WER were the same, and 4 of 1,308
 LibriSpeech words were wrongly replaced (WER 3.4% → 3.7%). The
 `vocabulary_correct` example reproduces the timing; every utterance stayed
 under 1 ms at p95.
+
+### Constructing profiles in Rust
+
+`Profile` gains fields additively within version 1 (`corrections` was the
+first). Consumers that build one in code should write
+`Profile { recognition_hints, ..Default::default() }` rather than listing every
+field, so a new optional field does not break their build.
 
