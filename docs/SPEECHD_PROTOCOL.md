@@ -161,6 +161,7 @@ ordinary test suites use:
 | `fake-vad` | `speech_start` at the first sample with \|x\| ≥ 16384, `speech_end` at the next all-zero frame |
 | `fake-crash` | the process exits with status 70 on its first audio frame |
 | `fake-hang` | the process stops reading and answering on its first audio frame |
+| `fake-stall` | never answers `finish`, but keeps serving everything else |
 
 ## Models
 
@@ -194,4 +195,6 @@ Weights are never committed. They live under
   request that misses its deadline (10 s for `health`), or audio the helper
   stops reading for 2 s, marks the helper unresponsive: the client kills it and
   handles it as a crash, so a recording never blocks on transcription. The
-  helper must therefore answer `health` while an engine is busy.
+  helper must therefore answer `health` while an engine is busy. A stream with
+  no result 120 s after `finish` means a wedged engine in a helper that still
+  answers, and is handled the same way.

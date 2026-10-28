@@ -1,0 +1,258 @@
+// Model-free checks of the helper, runnable with Command Line Tools (no
+// XCTest), like tools/speech-eval/parakeet's protocol check. The protocol
+// itself is checked from Rust: crates/fotw-speechd-client/tests/protocol.rs
+// runs against this helper with FOTW_SPEECHD_BIN set (`just test` on macOS).
+import CryptoKit
+import Foundation
+import SpeechdCore
+
+struct CheckFailure: Error, CustomStringConvertible {
+    let description: String
+}
+
+func expect(_ condition: Bool, _ message: @autoclosure () -> String,
+            file: StaticString = #fileID, line: UInt = #line) throws {
+    if !condition { throw CheckFailure(description: "\(file):\(line): \(message())") }
+}
+
+func temporaryDirectory() throws -> URL {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("speechd-checks-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    return url
+}
+
+// MARK: - Frames
+
+func frameRoundTripAndRefusals() throws {
+    let audio = FrameCodec.encodeAudio(stream: 7, pcm: [Int16.min, -1, 0, 1, Int16.max])
+    try expect(Array(audio.prefix(5)) == [0, 0, 0, 15, Wire.kindAudio], "audio header \(Array(audio.prefix(5)))")
+    try expect(try FrameReader(data: audio).next() == .audio(stream: 7, pcm: [Int16.min, -1, 0, 1, Int16.max]),
+               "audio round trip")
+    let control = FrameCodec.encodeControl(Data(#"{"type":"health","id":1}"#.utf8))
+    guard case let .control(json)? = try FrameReader(data: control).next() else {
+        throw CheckFailure(description: "control round trip")
+    }
+    try expect(try Request.decode(json) == .health(id: 1), "health decodes")
+
+    let oversized = Data(withUnsafeBytes(of: UInt32(Wire.maxFrame + 1).bigEndian) { Array($0) } + [Wire.kindAudio])
+    let cases: [(Data, FrameError)] = [
+        (oversized, .tooLarge(Wire.maxFrame + 1)),
+        (Data([0, 0, 0, 0]), .empty),
+        (Data([0, 0, 0, 2, 0x7f, 0]), .unknownKind(0x7f)),
+        (Data([0, 0, 0, 3, Wire.kindAudio, 0, 0]), .badAudio("no stream id")),
+        (Data([0, 0, 0, 5, Wire.kindAudio, 0, 0, 0, 1]), .badAudio("no samples")),
+        (Data([0, 0, 0, 6, Wire.kindAudio, 0, 0, 0, 1, 7]), .badAudio("odd byte count")),
+        (Data([0, 0, 0, 9, Wire.kindControl, 0x7b]), .truncated),
+    ]
+    for (bytes, expected) in cases {
+        do {
+            _ = try FrameReader(data: bytes).next()
+            throw CheckFailure(description: "accepted \(Array(bytes.prefix(8)))")
+        } catch let error as FrameError {
+            try expect(error == expected, "\(error) != \(expected)")
+        }
+    }
+    try expect(try FrameReader(data: Data()).next() == nil, "clean end of input")
+    for bad in [#"{"type":"teleport","id":1}"#, #"{"type":"load","id":1}"#, "[1]", #"{"id":1}"#] {
+        try expect((try? Request.decode(Data(bad.utf8))) == nil, "decoded \(bad)")
+    }
+}
+
+// MARK: - Lifecycle (Muesli's generation guard)
+
+final class Manager: Sendable {
+    let name: String
+    init(_ name: String) { self.name = name }
+}
+
+actor Recorder {
+    var discarded: [String] = []
+    func discard(_ manager: Manager) { discarded.append(manager.name) }
+}
+
+/// A load that waits until released, so a shutdown can land in the middle.
+actor Gate {
+    private var waiting: CheckedContinuation<Void, Never>?
+    private var isOpen = false
+    private var entered: CheckedContinuation<Void, Never>?
+    private var hasEntered = false
+    func enter() async {
+        hasEntered = true
+        entered?.resume()
+        entered = nil
+        if isOpen { return }
+        await withCheckedContinuation { waiting = $0 }
+    }
+    func untilEntered() async {
+        if hasEntered { return }
+        await withCheckedContinuation { entered = $0 }
+    }
+    func open() {
+        isOpen = true
+        waiting?.resume()
+        waiting = nil
+    }
+}
+
+func loadShutdownRaceDiscardsTheStaleManager() async throws {
+    let lifecycle = ModelLifecycle<Manager>()
+    let recorder = Recorder()
+    let gate = Gate()
+    let slowLoad = Task {
+        try await lifecycle.load({
+            await gate.enter()
+            return Manager("stale")
+        }, discard: { await recorder.discard($0) })
+    }
+    await gate.untilEntered()
+    await lifecycle.shutdown()
+    await gate.open()
+    do {
+        _ = try await slowLoad.value
+        throw CheckFailure(description: "a load overtaken by shutdown returned its manager")
+    } catch is CancellationError {}
+    let current = await lifecycle.current
+    try expect(current == nil, "the stale manager was resurrected")
+    let discarded = await recorder.discarded
+    try expect(discarded == ["stale"], "the stale manager was not released: \(discarded)")
+
+    let fresh = try await lifecycle.load({ Manager("fresh") }, discard: { await recorder.discard($0) })
+    try expect(fresh.name == "fresh", "a later load works")
+    let kept = await lifecycle.current?.name
+    try expect(kept == "fresh", "and is kept")
+}
+
+actor Counter {
+    var value = 0
+    func increment() { value += 1 }
+}
+
+func concurrentLoadsShareOneLoad() async throws {
+    let lifecycle = ModelLifecycle<Manager>()
+    let loads = Counter()
+    let gate = Gate()
+    let make: @Sendable () async throws -> Manager = {
+        await loads.increment()
+        await gate.enter()
+        return Manager("only")
+    }
+    let first = Task { try await lifecycle.load(make, discard: { _ in }) }
+    await gate.untilEntered()
+    let second = Task { try await lifecycle.load(make, discard: { _ in }) }
+    try await Task.sleep(nanoseconds: 20_000_000)
+    await gate.open()
+    let (a, b) = try await (first.value, second.value)
+    try expect(a === b, "waiters get the same manager")
+    let count = await loads.value
+    try expect(count == 1, "loaded \(count) times")
+}
+
+// MARK: - Model store
+
+func file(_ path: String, _ bytes: Data) -> PinnedFile {
+    PinnedFile(path: path, size: Int64(bytes.count),
+               sha256: SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined())
+}
+
+func corruptModelFailsValidationAndKeepsThePreviousSelection() async throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let source = root.appendingPathComponent("source")
+    let weights = Data(repeating: 7, count: 4096), vocab = Data(#"{"0":"a"}"#.utf8)
+    try FileManager.default.createDirectory(at: source.appendingPathComponent("m.mlmodelc/weights"),
+                                            withIntermediateDirectories: true)
+    try weights.write(to: source.appendingPathComponent("m.mlmodelc/weights/weight.bin"))
+    try vocab.write(to: source.appendingPathComponent("vocab.json"))
+
+    let files = [file("m.mlmodelc/weights/weight.bin", weights), file("vocab.json", vocab)]
+    let good = PinnedModel(id: "test", repository: "test/test", revision: String(repeating: "a", count: 40),
+                           license: "MIT", remoteDirectory: "", files: files)
+    let store = ModelStore(root: root.appendingPathComponent("models"))
+    do {
+        _ = try store.loadableDirectory(good)
+        throw CheckFailure(description: "an uninstalled model was loadable")
+    } catch let error as SpeechdError {
+        try expect(error.code == "model_missing", "uninstalled: \(error)")
+    }
+    let installed = try await store.install(good, from: DirectoryFetcher(source: source))
+    try expect(store.selectedRevision("test") == good.revision, "selected after install")
+    try store.verify(good)
+
+    // A new revision whose weights do not match their pinned hash.
+    var tampered = weights
+    tampered[100] ^= 0xff
+    try tampered.write(to: source.appendingPathComponent("m.mlmodelc/weights/weight.bin"))
+    let next = PinnedModel(id: "test", repository: "test/test", revision: String(repeating: "b", count: 40),
+                           license: "MIT", remoteDirectory: "", files: [file("m.mlmodelc/weights/weight.bin", weights),
+                                                                         file("vocab.json", vocab)])
+    do {
+        _ = try await store.install(next, from: DirectoryFetcher(source: source))
+        throw CheckFailure(description: "a corrupt install succeeded")
+    } catch let error as SpeechdError {
+        try expect(error.code == "install_failed", "corrupt install: \(error)")
+    }
+    try expect(store.selectedRevision("test") == good.revision, "the previous selection was kept")
+    try expect(try store.loadableDirectory(good) == installed, "the previous revision still loads")
+    try store.verify(good)
+    try expect(!FileManager.default.fileExists(atPath: store.revisionDirectory(next).path),
+               "no partial revision left behind")
+    let leftovers = try FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("models/test").path)
+    try expect(Set(leftovers) == [good.revision, "selected"], "staging cleaned up: \(leftovers)")
+
+    // Corruption after install: same size passes the cheap load check and
+    // fails the full one; a size change fails both. Neither moves the selection.
+    let installedWeights = installed.appendingPathComponent("m.mlmodelc/weights/weight.bin")
+    try tampered.write(to: installedWeights)
+    do {
+        try store.verify(good)
+        throw CheckFailure(description: "verify accepted a corrupt file")
+    } catch let error as SpeechdError {
+        try expect(error.code == "model_invalid", "verify: \(error)")
+    }
+    try Data(repeating: 7, count: 10).write(to: installedWeights)
+    do {
+        _ = try store.loadableDirectory(good)
+        throw CheckFailure(description: "a truncated model was loadable")
+    } catch let error as SpeechdError {
+        try expect(error.code == "model_invalid", "load: \(error)")
+    }
+    try expect(store.selectedRevision("test") == good.revision, "selection unchanged by a failed check")
+}
+
+func pinsAreComplete() throws {
+    let ids = PinnedModels.all.map(\.id)
+    try expect(ids == ["parakeet-unified", "silero-vad", "parakeet-eou-320ms", "nemotron-3.5-2240ms"], "\(ids)")
+    for model in PinnedModels.all {
+        try expect(model.revision.count == 40 && model.revision.allSatisfy(\.isHexDigit), "\(model.id) revision")
+        try expect(!model.files.isEmpty && !model.license.isEmpty, "\(model.id) files and license")
+        for file in model.files {
+            try expect(file.sha256.count == 64 && file.sha256.allSatisfy(\.isHexDigit), "\(model.id) \(file.path)")
+            try expect(file.size > 0 && !file.path.contains(".."), "\(model.id) \(file.path)")
+        }
+    }
+    try expect(PinnedModels.named("parakeet-unified")?.totalBytes == 614_086_229 - 5_309,
+               "Parakeet Unified is the #118 snapshot without its README")
+}
+
+// MARK: - Runner
+
+let cases: [(String, () async throws -> Void)] = [
+    ("frame round trip and refusals", frameRoundTripAndRefusals),
+    ("a load-shutdown race discards the stale manager", loadShutdownRaceDiscardsTheStaleManager),
+    ("concurrent loads share one load", concurrentLoadsShareOneLoad),
+    ("a corrupt model fails validation and keeps the previous selection",
+     corruptModelFailsValidationAndKeepsThePreviousSelection),
+    ("every pin is a full revision with per-file hashes", pinsAreComplete),
+]
+var failures = 0
+for (name, check) in cases {
+    do {
+        try await check()
+        print("PASS: " + name)
+    } catch {
+        failures += 1
+        print("FAIL: \(name) (\(error))")
+    }
+}
+exit(failures == 0 ? 0 : 1)

@@ -382,6 +382,44 @@ async fn a_hung_helper_is_killed_and_fails_its_streams_instead_of_blocking_them(
 }
 
 #[tokio::test]
+async fn a_finished_stream_with_no_result_by_its_deadline_fails_instead_of_waiting_forever() {
+    // The helper still answers health, so the heartbeat alone cannot catch a
+    // wedged engine.
+    let mut config = config(&[]);
+    config.finish_timeout = Duration::from_millis(300);
+    let client = SpeechdClient::start(config).await.expect("start");
+    let first_pid = client.helper_pid().expect("a helper is running");
+    client.load("fake-stall").await.expect("load");
+    let mut stalled = client
+        .open_stream(stream("fake-stall"))
+        .await
+        .expect("open");
+    stalled.send_audio(&[1; 16]).await.expect("audio");
+    stalled.finish().await.expect("finish");
+    let waited = Instant::now();
+    match next(&mut stalled).await {
+        Some(StreamEvent::Failed(failure)) => {
+            assert_eq!(failure.code, ErrorCode::HelperUnresponsive)
+        }
+        other => panic!("expected helper_unresponsive, got {other:?}"),
+    }
+    assert!(waited.elapsed() < Duration::from_secs(1));
+    // The wedged helper was killed and a replacement started.
+    let replaced = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.helper_pid() {
+                Some(pid) if pid != first_pid => return pid,
+                _ => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await;
+    assert!(replaced.is_ok(), "no replacement helper");
+    client.shutdown().await;
+    assert_eq!(client.helper_pid(), None);
+}
+
+#[tokio::test]
 async fn restarts_stop_after_three_attempts_until_reset() {
     let mut config = config(&[]);
     config.restart.min_interval = Duration::from_millis(50);

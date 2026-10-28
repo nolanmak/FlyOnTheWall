@@ -57,6 +57,10 @@ pub struct SpeechdConfig {
     /// often, so a helper that hangs mid-stream is found and killed instead of
     /// leaving a caller waiting for a final forever.
     pub heartbeat_interval: Duration,
+    /// How long after `finish` a stream may go without its result. A helper
+    /// that still answers `health` but never finishes has a wedged engine; it
+    /// is killed like an unresponsive one.
+    pub finish_timeout: Duration,
 }
 
 impl SpeechdConfig {
@@ -77,6 +81,7 @@ impl SpeechdConfig {
             install_timeout: Duration::from_secs(6 * 3600),
             audio_stall_timeout: Duration::from_secs(2),
             heartbeat_interval: Duration::from_secs(5),
+            finish_timeout: Duration::from_secs(120),
         }
     }
 
@@ -511,6 +516,12 @@ impl SpeechdClient {
         }
     }
 
+    /// The live helper's process id, for diagnostics and resource checks.
+    #[must_use]
+    pub fn helper_pid(&self) -> Option<u32> {
+        self.live().and_then(|conn| conn.pid)
+    }
+
     /// A snapshot of the supervisor.
     #[must_use]
     pub fn status(&self) -> Status {
@@ -730,7 +741,25 @@ impl SpeechStream {
         self.finished = true;
         let bytes = frame::encode_control(&Request::Finish { stream: self.id })
             .map_err(|e| ClientError::Protocol(e.to_string()))?;
-        self.conn.write(bytes).await
+        self.conn.write(bytes).await?;
+        // The heartbeat cannot see a wedged engine in a helper that still
+        // answers; a finished stream with no result by its deadline can.
+        let (conn, stream, deadline) = (
+            Arc::downgrade(&self.conn),
+            self.id,
+            self.conn.finish_timeout,
+        );
+        tokio::spawn(async move {
+            tokio::time::sleep(deadline).await;
+            if let Some(conn) = conn.upgrade()
+                && lock(&conn.routes).streams.contains_key(&stream)
+            {
+                conn.fail(ClientError::HelperUnresponsive(format!(
+                    "stream {stream} had no result {deadline:?} after finish"
+                )));
+            }
+        });
+        Ok(())
     }
 
     /// Drop the stream now. Nothing more is yielded for it, and no other
@@ -782,6 +811,7 @@ impl Drop for SpeechStream {
 
 struct Conn {
     generation: u64,
+    pid: Option<u32>,
     capabilities: Capabilities,
     writer: mpsc::Sender<Vec<u8>>,
     routes: Mutex<Routes>,
@@ -793,6 +823,7 @@ struct Conn {
     owner: Weak<Shared>,
     stall: Duration,
     request_timeout: Duration,
+    finish_timeout: Duration,
 }
 
 #[derive(Default)]
@@ -824,6 +855,7 @@ impl Conn {
         let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             return Err(ClientError::Spawn("no pipes to the helper".into()));
         };
+        let pid = child.id();
         let mut stdout = BufReader::new(stdout);
         let capabilities = match tokio::time::timeout(
             config.handshake_timeout,
@@ -839,6 +871,7 @@ impl Conn {
         let (kill, killed) = oneshot::channel();
         let conn = Arc::new(Self {
             generation,
+            pid,
             capabilities,
             writer,
             routes: Mutex::new(Routes::default()),
@@ -849,6 +882,7 @@ impl Conn {
             owner,
             stall: config.audio_stall_timeout,
             request_timeout: config.request_timeout,
+            finish_timeout: config.finish_timeout,
         });
         tokio::spawn(write_loop(Arc::downgrade(&conn), stdin, queue));
         tokio::spawn(heartbeat(Arc::downgrade(&conn), config.heartbeat_interval));
