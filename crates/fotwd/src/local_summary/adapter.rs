@@ -260,7 +260,7 @@ mod tests {
     async fn cancelled_generation_stops_its_owned_runtime_and_cannot_be_reused() {
         // Deliberately slower than the former shared two-second deadline:
         // fixture boot under CI load must not consume the cancellation budget.
-        let (process, marker) = process::stalled_fixture(Duration::from_secs(3));
+        let (process, listening, marker) = process::stalled_fixture(Duration::from_secs(3));
         let config = RuntimeConfig {
             model_id: "fixture".into(),
             runtime_files: vec![],
@@ -291,6 +291,19 @@ mod tests {
             assert!(
                 tokio::time::Instant::now() < startup_deadline,
                 "owned fixture did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // bind() creates the path before listen(). The fixture deliberately
+        // pauses between them, so path existence cannot serve as readiness.
+        while !listening.exists() {
+            adapter
+                .process
+                .pid()
+                .expect("owned fixture exited before listening");
+            assert!(
+                tokio::time::Instant::now() < startup_deadline,
+                "owned fixture did not listen"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

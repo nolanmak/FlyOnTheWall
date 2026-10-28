@@ -485,15 +485,18 @@ fn inherit_model(command: &mut Command, model: &File) {
 }
 
 #[cfg(test)]
-pub(super) fn stalled_fixture(startup_delay: Duration) -> (Process, PathBuf) {
+/// Own a deliberately slow fixture and publish listening readiness separately
+/// from socket creation and request receipt.
+pub(super) fn stalled_fixture(startup_delay: Duration) -> (Process, PathBuf, PathBuf) {
     let root = tempfile::Builder::new()
         .prefix("fotw-summary-test-")
         .tempdir_in("/private/tmp")
         .unwrap();
     let socket = root.path().join("owned.sock");
     let marker = root.path().join("received");
+    let listening = root.path().join("listening");
     let code = r#"import socket,pathlib
-s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.bind('owned.sock');s.listen(1)
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.bind('owned.sock');time.sleep(0.2);s.listen(1);pathlib.Path('listening').write_text('ready')
 c,_=s.accept();c.recv(8192);pathlib.Path('received').write_text('received')
 while c.recv(8192):pass
 "#;
@@ -515,6 +518,7 @@ while c.recv(8192):pass
             _models: None,
             socket,
         },
+        listening,
         marker,
     )
 }
