@@ -300,7 +300,11 @@ mod selection_tests {
         {
             let mut db = Db::open(&path, &key).unwrap();
             let fresh = SttSettings::read(&db).unwrap();
-            assert_eq!(fresh.engine, SttEngine::Deepgram, "the engine default is unchanged");
+            assert_eq!(
+                fresh.engine,
+                SttEngine::Deepgram,
+                "the engine default is unchanged"
+            );
             assert!(is_engine(&fresh.model), "local default: {fresh:?}");
             SttSettings::for_selection(&db, SttEngine::Local)
                 .write(&mut db)

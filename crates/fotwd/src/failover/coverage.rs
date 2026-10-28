@@ -49,7 +49,9 @@ impl LocalPlan {
     pub fn validate(&self) -> io::Result<()> {
         validate_engine(&self.engine)?;
         let e = self.endpoint;
-        if self.engine.provider != fotw_stt::local::PROVIDER
+        // whisper.cpp in this process, or a FluidAudio engine in the helper.
+        let local = [fotw_stt::local::PROVIDER, fotw_stt::speechd::PROVIDER];
+        if !local.contains(&self.engine.provider.as_str())
             || self.language.as_ref().is_some_and(|l| {
                 l.is_empty()
                     || l.len() > 32
