@@ -125,5 +125,10 @@ Windows, but neither captures anything.
 - A Cargo workspace pinned to Rust 1.95.0, CI (formatting, clippy, tests on
   Ubuntu and macOS, cargo-deny, and the platform-seam guard), and `justfile`
   recipes to bundle, dev-sign, verify, release-sign and notarize the `.app`.
+- `FOTW_SPEECHD=1` (#243) adds the speech helper to the bundle as
+  `Contents/Helpers/fotw-speechd`, signed with its own identifier, the hardened
+  runtime and no entitlements. `just verify-bundle` fails if it ever carries the
+  microphone entitlement, and now also runs `codesign --verify --deep --strict`.
+  Without the variable the bundle is unchanged.
 
 [Unreleased]: https://github.com/nolanmak/FlyOnTheWall/commits/main
