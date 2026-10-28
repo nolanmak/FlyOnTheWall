@@ -138,7 +138,8 @@ impl From<fotw_web::CliEngine> for CliKind {
 
 /// The persisted summary destination and legacy CLI settings.
 ///
-/// An absent row preserves legacy behavior; invalid or unreadable settings
+/// New libraries start Off. An absent row preserves behavior only for a library
+/// marked legacy by migration; other missing, invalid or unreadable settings
 /// fail closed to Off rather than restoring hosted processing.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -175,9 +176,31 @@ impl SummarizeSettings {
     #[must_use]
     pub fn read(db: &Db) -> Self {
         match db.get_setting(SETTINGS_KEY) {
-            Ok(None) => Self::default(),
-            Ok(Some(value)) => serde_json::from_str(&value).unwrap_or_else(|_| Self::closed()),
+            Ok(value) => Self::from_snapshot(db, value.as_deref()),
             Err(_) => Self::closed(),
+        }
+    }
+
+    // Resolve every consumer from the same settings snapshot. Reading the row
+    // again after capturing its version could bind consent to different bytes.
+    pub(crate) fn from_snapshot(db: &Db, value: Option<&str>) -> Self {
+        match value {
+            Some(value) => serde_json::from_str(value).unwrap_or_else(|_| Self::closed()),
+            None => {
+                let legacy = db
+                    .conn()
+                    .query_row(
+                        "SELECT value FROM app_meta WHERE key='summary_destination_bootstrap'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .is_ok_and(|value| value == "legacy");
+                if legacy {
+                    Self::default()
+                } else {
+                    Self::closed()
+                }
+            }
         }
     }
 
@@ -336,13 +359,7 @@ pub fn resolve_engine_detailed(store: &dyn KeyStore, db: &Db) -> EngineResolutio
     let Ok(version) = db.setting_version(SETTINGS_KEY) else {
         return EngineResolution::NoneConfigured;
     };
-    let settings = match version.value() {
-        None => SummarizeSettings::default(),
-        Some(value) => match serde_json::from_str::<SummarizeSettings>(value) {
-            Ok(settings) => settings,
-            Err(_) => return EngineResolution::NoneConfigured,
-        },
-    };
+    let settings = SummarizeSettings::from_snapshot(db, version.value());
     if settings.allows_api_key()
         && let Ok(key) = store.get(SecretKey::ApiKey(Provider::Anthropic))
     {

@@ -1,7 +1,7 @@
 //! Which LLM engine a meeting gets, and what happens with none — #67, #68.
 //!
-//! The order is a policy, pinned here: an Anthropic API key always wins
-//! (today's behavior, untouched); with no key, the `claude` CLI serves — but
+//! Legacy rows retain API-key precedence. New libraries start Off; explicit
+//! destinations override stored keys. With no key, the `claude` CLI serves — but
 //! only when the user explicitly enabled it *and* acknowledged that the
 //! transcript leaves the machine (KEY-04 applies to this path exactly as it
 //! applies to a key: the words travel either way, only the bill differs).

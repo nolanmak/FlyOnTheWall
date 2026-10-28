@@ -727,3 +727,58 @@ fn ceremony_failures_are_distinguishable() {
     assert!(no_human.is_no_human());
     assert!(!no_human.is_declined());
 }
+
+#[test]
+fn a_new_library_defaults_summaries_off_even_with_an_existing_hosted_key() {
+    use fotw_secrets::Provider;
+    use fotwd::engine::{SummarizeSettings, resolve_engine};
+    let f = Fixture::new();
+    f.store
+        .set(
+            SecretKey::ApiKey(Provider::Anthropic),
+            &SecretString::new("sk-ant-synthetic-existing"),
+        )
+        .unwrap();
+    f.create();
+    for _ in 0..2 {
+        let db = fotwd::open_library_with(&f.root, &f.store, &mut Scripted::new(), KDF_FOR_TESTS)
+            .unwrap();
+        assert_eq!(
+            SummarizeSettings::read(&db).policy,
+            Some(fotw_web::SummaryPolicy::Off),
+            "new libraries need a persisted explicit destination, including after restart"
+        );
+        assert!(
+            resolve_engine(&f.store, &db).is_none(),
+            "a stored key is not consent for a new library"
+        );
+    }
+}
+
+#[test]
+fn upgrading_an_existing_missing_policy_library_keeps_its_hosted_configuration() {
+    use fotw_secrets::Provider;
+    let f = Fixture::new();
+    f.store
+        .set(
+            SecretKey::ApiKey(Provider::Anthropic),
+            &SecretString::new("sk-ant-synthetic-legacy"),
+        )
+        .unwrap();
+    f.create();
+    {
+        let db = fotwd::open_library_with(&f.root, &f.store, &mut Scripted::new(), KDF_FOR_TESTS)
+            .unwrap();
+        // Migration 9 adds only bootstrap rows. Removing those rows and
+        // restoring version 8 constructs the exact previous schema in this
+        // disposable encrypted fixture, without editing released migrations.
+        db.conn().execute_batch("DELETE FROM settings WHERE key='summarize'; DELETE FROM app_meta WHERE key='summary_destination_bootstrap'; PRAGMA user_version=8;").unwrap();
+    }
+    let db =
+        fotwd::open_library_with(&f.root, &f.store, &mut Scripted::new(), KDF_FOR_TESTS).unwrap();
+    assert_eq!(fotwd::engine::SummarizeSettings::read(&db).policy, None);
+    assert!(matches!(
+        fotwd::engine::resolve_engine(&f.store, &db),
+        Some(fotwd::engine::Engine::Anthropic { .. })
+    ));
+}
