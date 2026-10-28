@@ -9,11 +9,11 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::db::Db;
 use crate::error::{Result, StoreError};
-use crate::post_pass::HOLDS_ENRICHMENT;
 use crate::ids::{new_id, now_ms};
 use crate::models::{
     Meeting, NewMeeting, NewSegment, NewSummary, NoteAnchor, StoredSegment, Summary,
 };
+use crate::post_pass::HOLDS_ENRICHMENT;
 
 /// What "still awaiting enrichment" means, as a `WHERE` clause over `meetings
 /// m` — the one definition [`MeetingRepo::needing_summary`] and
@@ -297,8 +297,10 @@ impl MeetingRepo<'_> {
     pub fn count_needing_summary(&self) -> Result<i64> {
         let conn = self.db.conn();
         Ok(conn.query_row(
-            &format!("SELECT COUNT(*) FROM meetings m WHERE {AWAITING_ENRICHMENT}
-                AND NOT {HOLDS_ENRICHMENT}"),
+            &format!(
+                "SELECT COUNT(*) FROM meetings m WHERE {AWAITING_ENRICHMENT}
+                AND NOT {HOLDS_ENRICHMENT}"
+            ),
             [],
             |r| r.get(0),
         )?)

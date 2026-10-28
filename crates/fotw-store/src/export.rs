@@ -275,6 +275,35 @@ row_type!(
 );
 
 row_type!(
+    /// A post-meeting cleanup job (#246): its plan, progress, which transcript
+    /// was live and which one it produced, and the engines' provenance.
+    PostPassJobRow, "post_pass_jobs",
+    pk = ["meeting_id"], exclusive = [], {
+        meeting_id: String,
+        state: String,
+        created_at_ms: i64,
+        updated_at_ms: i64,
+        plan_json: String,
+        progress_permille: i64,
+        live_transcript_id: Option<String>,
+        cleaned_transcript_id: Option<String>,
+        provenance_json: Option<String>,
+        detail: Option<String>,
+    }
+);
+
+row_type!(
+    /// One checkpointed window of a pending cleanup job (#246).
+    PostPassWindowRow, "post_pass_windows",
+    pk = ["meeting_id", "channel", "idx"], exclusive = [], {
+        meeting_id: String,
+        channel: String,
+        idx: i64,
+        words_json: String,
+    }
+);
+
+row_type!(
     /// A row of `folders`.
     FolderRow, "folders",
     pk = ["id"], exclusive = [], {
@@ -623,6 +652,12 @@ pub struct MeetingDoc {
     /// Original interval receipts for idempotent recovery after import.
     #[serde(default)]
     pub speech_receipts: Vec<SpeechReceiptRow>,
+    /// The post-meeting cleanup job. Absent in older archives.
+    #[serde(default)]
+    pub post_pass_jobs: Vec<PostPassJobRow>,
+    /// A pending cleanup's checkpoints. Absent in older archives.
+    #[serde(default)]
+    pub post_pass_windows: Vec<PostPassWindowRow>,
     /// The note document, if there is one.
     pub notes: Vec<NoteRow>,
     /// Its anchors.
@@ -683,6 +718,8 @@ impl Db {
             segments: self.fetch_by_meeting("ORDER BY transcript_id, idx", meeting_id)?,
             speech_epochs: self.fetch_by_meeting("ORDER BY session_id,source,epoch", meeting_id)?,
             speech_receipts: self.fetch_by_meeting("ORDER BY epoch_id,from_sample", meeting_id)?,
+            post_pass_jobs: self.fetch_by_meeting("ORDER BY meeting_id", meeting_id)?,
+            post_pass_windows: self.fetch_by_meeting("ORDER BY channel, idx", meeting_id)?,
             notes: self.fetch_by_meeting("ORDER BY id", meeting_id)?,
             note_anchors: self.fetch_by_meeting("ORDER BY note_id, block_idx", meeting_id)?,
             summaries: self.fetch_by_meeting("ORDER BY version", meeting_id)?,
@@ -806,6 +843,8 @@ impl_table_row!(
     SegmentRow,
     SpeechEpochRow,
     SpeechReceiptRow,
+    PostPassJobRow,
+    PostPassWindowRow,
     NoteRow,
     NoteAnchorRow,
     SummaryRow,

@@ -34,7 +34,9 @@ impl PostPassState {
             "pending" => Ok(Self::Pending),
             "done" => Ok(Self::Done),
             "failed" => Ok(Self::Failed),
-            other => Err(StoreError::InvalidArgument(format!("unknown post-pass state {other}"))),
+            other => Err(StoreError::InvalidArgument(format!(
+                "unknown post-pass state {other}"
+            ))),
         }
     }
 
@@ -74,7 +76,8 @@ pub struct PostPassJob {
     pub detail: Option<String>,
 }
 
-const COLUMNS: &str = "meeting_id, state, created_at_ms, updated_at_ms, plan_json, progress_permille,
+const COLUMNS: &str =
+    "meeting_id, state, created_at_ms, updated_at_ms, plan_json, progress_permille,
      live_transcript_id, cleaned_transcript_id, provenance_json, detail";
 
 fn read_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<(PostPassJob, String)> {
@@ -186,7 +189,9 @@ impl Db {
             params![meeting_id, progress_permille.clamp(0, 1000), now_ms()],
         )?;
         if updated != 1 {
-            return Err(StoreError::InvalidArgument("the cleanup job is no longer pending".into()));
+            return Err(StoreError::InvalidArgument(
+                "the cleanup job is no longer pending".into(),
+            ));
         }
         tx.execute(
             "INSERT INTO post_pass_windows (meeting_id, channel, idx, words_json)
@@ -240,7 +245,9 @@ impl Db {
             )
             .optional()?;
         let Some(live) = live else {
-            return Err(StoreError::InvalidArgument("the cleanup job is no longer pending".into()));
+            return Err(StoreError::InvalidArgument(
+                "the cleanup job is no longer pending".into(),
+            ));
         };
         let primary: Option<String> = tx
             .query_row(
@@ -296,7 +303,10 @@ impl Db {
         Ok(self
             .conn()
             .query_row(
-                &format!("SELECT {} FROM meetings m WHERE m.id = ?1", HOLDS_ENRICHMENT),
+                &format!(
+                    "SELECT {} FROM meetings m WHERE m.id = ?1",
+                    HOLDS_ENRICHMENT
+                ),
                 params![meeting_id],
                 |r| r.get::<_, bool>(0),
             )
@@ -319,7 +329,10 @@ mod tests {
 
     fn db_with_meeting() -> (Db, String, String) {
         let mut db = Db::open_in_memory(&DbKey::from_bytes([0x46; 32])).unwrap();
-        let meeting = db.meetings().create(NewMeeting::new("dev-1", "UTC")).unwrap();
+        let meeting = db
+            .meetings()
+            .create(NewMeeting::new("dev-1", "UTC"))
+            .unwrap();
         let live = db
             .meetings()
             .create_transcript(&meeting, "fotw-speechd", "parakeet-unified", true)
@@ -354,16 +367,36 @@ mod tests {
     fn completing_adds_a_primary_version_beside_the_untouched_live_one() {
         let (mut db, meeting, live) = db_with_meeting();
         assert!(db.post_pass_queue(&meeting, "{}").unwrap());
-        assert!(!db.post_pass_queue(&meeting, "{}").unwrap(), "one job per meeting");
-        db.post_pass_checkpoint(&meeting, "mic", 0, "[]", 400).unwrap();
-        assert_eq!(db.post_pass_windows(&meeting, "mic").unwrap(), [(0, "[]".into())]);
+        assert!(
+            !db.post_pass_queue(&meeting, "{}").unwrap(),
+            "one job per meeting"
+        );
+        db.post_pass_checkpoint(&meeting, "mic", 0, "[]", 400)
+            .unwrap();
+        assert_eq!(
+            db.post_pass_windows(&meeting, "mic").unwrap(),
+            [(0, "[]".into())]
+        );
         assert!(db.post_pass_holds_enrichment(&meeting).unwrap());
 
         let cleaned = db
-            .post_pass_complete(&meeting, "fotw-speechd", "parakeet-unified", &[seg(0, "clean")], r#"{"a":1}"#, None)
+            .post_pass_complete(
+                &meeting,
+                "fotw-speechd",
+                "parakeet-unified",
+                &[seg(0, "clean")],
+                r#"{"a":1}"#,
+                None,
+            )
             .unwrap();
-        assert_eq!(db.meetings().primary_transcript_id(&meeting).unwrap(), Some(cleaned.clone()));
-        assert_eq!(db.meetings().transcript_text(&live).unwrap(), [(0, "live words".into())]);
+        assert_eq!(
+            db.meetings().primary_transcript_id(&meeting).unwrap(),
+            Some(cleaned.clone())
+        );
+        assert_eq!(
+            db.meetings().transcript_text(&live).unwrap(),
+            [(0, "live words".into())]
+        );
         let job = db.post_pass_job(&meeting).unwrap().unwrap();
         assert_eq!(job.state, PostPassState::Done);
         assert_eq!(job.live_transcript_id.as_deref(), Some(live.as_str()));
@@ -373,16 +406,26 @@ mod tests {
 
         // Reversible.
         db.meetings().set_primary_transcript(&live).unwrap();
-        assert_eq!(db.meetings().primary_transcript_id(&meeting).unwrap(), Some(live));
+        assert_eq!(
+            db.meetings().primary_transcript_id(&meeting).unwrap(),
+            Some(live)
+        );
     }
 
     #[test]
     fn a_person_who_switched_versions_meanwhile_keeps_their_choice() {
         let (mut db, meeting, live) = db_with_meeting();
         db.post_pass_queue(&meeting, "{}").unwrap();
-        let other = db.meetings().create_transcript(&meeting, "x", "y", true).unwrap();
-        db.post_pass_complete(&meeting, "p", "m", &[], "{}", None).unwrap();
-        assert_eq!(db.meetings().primary_transcript_id(&meeting).unwrap(), Some(other));
+        let other = db
+            .meetings()
+            .create_transcript(&meeting, "x", "y", true)
+            .unwrap();
+        db.post_pass_complete(&meeting, "p", "m", &[], "{}", None)
+            .unwrap();
+        assert_eq!(
+            db.meetings().primary_transcript_id(&meeting).unwrap(),
+            Some(other)
+        );
         assert_ne!(live, "");
     }
 
@@ -396,18 +439,29 @@ mod tests {
                 params![now_ms() - POST_PASS_WAIT_MS - 1_000],
             )
             .unwrap();
-        assert!(!db.post_pass_holds_enrichment(&meeting).unwrap(), "15 minutes passed");
-        assert_eq!(db.post_pass_pending().unwrap(), [meeting.clone()], "but it still resumes");
+        assert!(
+            !db.post_pass_holds_enrichment(&meeting).unwrap(),
+            "15 minutes passed"
+        );
+        assert_eq!(
+            db.post_pass_pending().unwrap(),
+            [meeting.clone()],
+            "but it still resumes"
+        );
         db.post_pass_fail(&meeting, "no model").unwrap();
         assert!(db.post_pass_pending().unwrap().is_empty());
-        assert!(db.post_pass_checkpoint(&meeting, "mic", 0, "[]", 1).is_err());
+        assert!(
+            db.post_pass_checkpoint(&meeting, "mic", 0, "[]", 1)
+                .is_err()
+        );
     }
 
     #[test]
     fn deleting_the_meeting_deletes_its_job_and_checkpoints() {
         let (mut db, meeting, _) = db_with_meeting();
         db.post_pass_queue(&meeting, "{}").unwrap();
-        db.post_pass_checkpoint(&meeting, "system", 3, r#"[{"t":"secret"}]"#, 10).unwrap();
+        db.post_pass_checkpoint(&meeting, "system", 3, r#"[{"t":"secret"}]"#, 10)
+            .unwrap();
         db.delete_meeting(&meeting).unwrap();
         let left: i64 = db
             .conn()
