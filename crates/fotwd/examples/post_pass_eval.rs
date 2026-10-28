@@ -75,7 +75,12 @@ mod imp {
             write(&out.join("live.json"), &live)?;
         }
         if !args.iter().any(|a| a == "--no-clean") {
-            let clean = runtime.block_on(clean(&data_root, &out, &mic, &system, &mut report))?;
+            // Archive both tracks as promotion does, then free the PCM: the
+            // job reads only the Opus files, so its memory is measured alone.
+            encode(&mic, &out.join("mic.opus"))?;
+            encode(&system, &out.join("system.opus"))?;
+            drop((mic, system));
+            let clean = runtime.block_on(clean(&data_root, &out, &mut report))?;
             write(&out.join("clean.json"), &clean)?;
         }
         write(&out.join("report.json"), &report)?;
@@ -159,14 +164,10 @@ mod imp {
     async fn clean(
         data_root: &Path,
         out: &Path,
-        mic: &[i16],
-        system: &[i16],
         report: &mut serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let mic_opus = out.join("mic.opus");
         let system_opus = out.join("system.opus");
-        encode(mic, &mic_opus)?;
-        encode(system, &system_opus)?;
 
         let mut db =
             Db::open_in_memory(&DbKey::from_bytes([0x46; 32])).map_err(|e| e.to_string())?;
