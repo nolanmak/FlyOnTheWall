@@ -9,6 +9,14 @@ use std::path::{Path, PathBuf};
 pub struct InstanceOwner {
     _file: File,
 }
+impl Drop for InstanceOwner {
+    fn drop(&mut self) {
+        // CLOEXEC closes inherited descriptors at exec, but a concurrent fork
+        // may still hold one when this owner drops. End our ownership explicitly
+        // instead of extending it until that unrelated child reaches exec.
+        let _ = self._file.unlock();
+    }
+}
 /// Why a second daemon cannot claim this library.
 #[derive(Debug, thiserror::Error)]
 pub enum InstanceError {
@@ -73,6 +81,45 @@ mod tests {
         drop(first);
         assert!(InstanceOwner::acquire(&sessions).is_ok());
         assert!(root.path().join(".fotw-daemon.lock").exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn dropping_owner_releases_ownership_while_a_fork_is_waiting_to_exec() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let owner = InstanceOwner::acquire(&sessions).unwrap();
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            // Only async-signal-safe calls after fork in this threaded test.
+            unsafe {
+                libc::close(pipe[1]);
+                let mut byte = 0_u8;
+                libc::read(pipe[0], (&mut byte as *mut u8).cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        struct Fork(libc::pid_t, libc::c_int);
+        impl Drop for Fork {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    libc::waitpid(self.0, std::ptr::null_mut(), 0);
+                    libc::close(self.1);
+                }
+            }
+        }
+        unsafe {
+            libc::close(pipe[0]);
+        }
+        let _child = Fork(pid, pipe[1]);
+        drop(owner);
+        assert!(
+            InstanceOwner::acquire(&sessions).is_ok(),
+            "an inherited descriptor must not extend the dropped owner's lock"
+        );
     }
     #[test]
     fn different_session_names_in_one_library_still_have_one_owner() {
