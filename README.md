@@ -159,9 +159,12 @@ fotwd stt models list
 fotwd stt models install small.en       # explicit HTTPS download; byte progress in the terminal
 # Or import the exact catalog file without networking:
 fotwd stt models import small.en /path/to/ggml-small.en.bin
+fotwd stt models import silero-v5.1.2 /path/to/ggml-silero-v5.1.2.bin   # offline only; install adds it
 fotwd stt local --model small.en --language en
 fotwd stt                             # the next recording's selected policy
 ```
+
+Every chunk of audio passes a speech detector, Silero VAD v5.1.2 (MIT, under 1 MB), before Whisper sees it, so music, noise and silence produce no text; Whisper's stock phrases ("Thank you.") are also dropped when the model itself doubted it heard speech. `install` downloads the detector with any Whisper model. An offline `import` brings only the file you name, so import `silero-v5.1.2` as well. Start refuses local or backup transcription, with the command that fixes it, while the detector is missing or not its pinned file.
 
 Install/import checks free space (including 64 MiB of headroom), size and SHA-256 before atomically replacing the model. Failures or cancellation before publication preserve the previous file. Ctrl-C during transfer leaves a reserved partial that a later explicit retry reclaims. Once Installing begins, publication has won the cancellation boundary; a directory-sync failure reports that verified weights were replaced and should be checked again after restart. An already verified installation works without source access or networking. Models are stored beside the library; `--data-root <directory>` selects an explicit alternative for setup. Choose that installed path in Transcription settings afterward.
 

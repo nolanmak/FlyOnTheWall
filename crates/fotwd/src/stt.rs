@@ -153,12 +153,13 @@ fn pinned_local_model(
                 .into(),
         );
     }
+    let vad = verify_vad_model(data_root)?;
     let known = verify_model(&path).map_err(|e| e.to_string())?;
     let digest = match known {
         Some(model) => model.sha256.to_owned(),
         None => sha256_file(&path)?,
     };
-    let engine = fotw_stt::WhisperEngine::new(&path, settings.language());
+    let engine = fotw_stt::WhisperEngine::new(&path, settings.language()).with_speech_gate(vad);
     engine.load().map_err(|e| e.message)?;
     // The context must correspond to the revision we will promise on restart.
     if sha256_file(&path)? != digest {
@@ -172,6 +173,16 @@ pub(crate) fn saved_local_model(
     plan: &crate::failover::coverage::LocalPlan,
     candidate: &Path,
     data_root: &Path,
+) -> Result<std::sync::Arc<dyn fotw_stt::RecognizerFactory>, String> {
+    saved_local_model_with(plan, candidate, data_root, &VAD_MODEL)
+}
+
+#[cfg(target_os = "macos")]
+fn saved_local_model_with(
+    plan: &crate::failover::coverage::LocalPlan,
+    candidate: &Path,
+    data_root: &Path,
+    detector: &'static KnownModel,
 ) -> Result<std::sync::Arc<dyn fotw_stt::RecognizerFactory>, String> {
     use fotw_stt::RecognizerFactory;
     plan.validate().map_err(|e| e.to_string())?;
@@ -196,7 +207,8 @@ pub(crate) fn saved_local_model(
         .ok_or_else(|| {
             "Install the original model revision before retrying; audio retained".to_owned()
         })?;
-    let engine = fotw_stt::WhisperEngine::new(&path, plan.language.clone());
+    let vad = verify_detector(data_root, detector).map_err(|e| format!("{e} Audio retained."))?;
+    let engine = fotw_stt::WhisperEngine::new(&path, plan.language.clone()).with_speech_gate(&vad);
     if engine.model() != plan.engine.model {
         return Err("Installed model identity differs from saved audio".into());
     }
@@ -207,6 +219,8 @@ pub(crate) fn saved_local_model(
         engine,
         path,
         digest: digest.into(),
+        vad,
+        vad_digest: detector.sha256,
     }))
 }
 
@@ -215,6 +229,25 @@ struct SavedFactory {
     engine: fotw_stt::WhisperEngine,
     path: PathBuf,
     digest: String,
+    /// The speech detector the engine is gated by, checked like the model.
+    vad: PathBuf,
+    vad_digest: &'static str,
+}
+
+/// A speech detector identity pinned to fixture bytes installed under
+/// `data_root`, so admission can be tested without real weights.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn fixture_detector(data_root: &Path) -> &'static KnownModel {
+    let bytes = b"metadata-only speech detector fixture; never native weights";
+    let path = models_dir(data_root).join(model_file_name("fixture-vad"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, bytes).unwrap();
+    Box::leak(Box::new(KnownModel {
+        name: "fixture-vad",
+        bytes: bytes.len() as u64,
+        sha256: Box::leak(sha256_file(&path).unwrap().into_boxed_str()),
+        ..VAD_MODEL
+    }))
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -243,7 +276,8 @@ fn saved_model_resolution_accepts_a_verified_configured_copy_beside_a_stale_mana
     };
     // Resolver construction checks identity/revision; create() is deliberately
     // not called, so these fake bytes never enter whisper.cpp.
-    let factory = saved_local_model(&plan, &candidate, root.path()).unwrap();
+    let detector = fixture_detector(root.path());
+    let factory = saved_local_model_with(&plan, &candidate, root.path(), detector).unwrap();
     assert_eq!(factory.model(), "small.en");
     assert_eq!(factory.language(), Some("en"));
 }
@@ -257,7 +291,9 @@ impl fotw_stt::RecognizerFactory for SavedFactory {
     }
     fn create(&self) -> Result<Box<dyn fotw_stt::Recognizer>, fotw_stt::SttError> {
         let verify = || {
-            if sha256_file(&self.path).is_ok_and(|hash| hash == self.digest) {
+            if sha256_file(&self.path).is_ok_and(|hash| hash == self.digest)
+                && sha256_file(&self.vad).is_ok_and(|hash| hash == self.vad_digest)
+            {
                 Ok(())
             } else {
                 Err(fotw_stt::SttError::new(
@@ -302,10 +338,34 @@ pub struct KnownModel {
     pub sha256: &'static str,
     /// One line on when to pick it.
     pub note: &'static str,
+    /// The Hugging Face repository that publishes it.
+    pub repo: &'static str,
+    /// The immutable repository revision it is fetched at.
+    pub revision: &'static str,
+    /// The license of the weights, as an SPDX identifier.
+    pub license: &'static str,
 }
 
 /// Immutable publisher revision for the catalog, including its MIT model card.
 pub const MODEL_REVISION: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
+
+/// Where the Whisper catalog is published.
+pub const WHISPER_REPO: &str = "ggerganov/whisper.cpp";
+
+/// The speech detector every local transcription is gated by (#242): Silero
+/// VAD v5.1.2 in whisper.cpp's ggml format, MIT, from
+/// `huggingface.co/ggml-org/whisper-vad`. It is not a transcription model and
+/// is never offered as one; it is installed with every Whisper model, and
+/// local capture is refused without it.
+pub const VAD_MODEL: KnownModel = KnownModel {
+    name: "silero-v5.1.2",
+    bytes: 885_098,
+    sha256: "29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf",
+    note: "speech detector (Silero VAD v5.1.2); keeps music and noise from becoming text",
+    repo: "ggml-org/whisper-vad",
+    revision: "9ffd54a1e1ee413ddf265af9913beaf518d1639b",
+    license: "MIT",
+};
 
 /// The models `fotwd stt local` knows by name, from
 /// `huggingface.co/ggerganov/whisper.cpp`.
@@ -315,24 +375,36 @@ pub const KNOWN_MODELS: &[KnownModel] = &[
         bytes: 574_041_195,
         sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
         note: "multilingual; Q5_0 quantized weights",
+        repo: WHISPER_REPO,
+        revision: MODEL_REVISION,
+        license: "MIT",
     },
     KnownModel {
         name: "large-v3-turbo",
         bytes: 1_624_555_275,
         sha256: "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
         note: "multilingual; unquantized weights",
+        repo: WHISPER_REPO,
+        revision: MODEL_REVISION,
+        license: "MIT",
     },
     KnownModel {
         name: "small.en",
         bytes: 487_614_201,
         sha256: "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
         note: "English only; smaller weights",
+        repo: WHISPER_REPO,
+        revision: MODEL_REVISION,
+        license: "MIT",
     },
     KnownModel {
         name: "base.en",
         bytes: 147_964_211,
         sha256: "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
         note: "English only; smallest catalog download",
+        repo: WHISPER_REPO,
+        revision: MODEL_REVISION,
+        license: "MIT",
     },
 ];
 
@@ -341,8 +413,20 @@ impl KnownModel {
     #[must_use]
     pub fn url(&self) -> String {
         format!(
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/{MODEL_REVISION}/{}",
+            "https://huggingface.co/{}/resolve/{}/{}",
+            self.repo,
+            self.revision,
             model_file_name(self.name)
+        )
+    }
+
+    /// The publisher's model card, which states the license, at the pinned
+    /// revision.
+    #[must_use]
+    pub fn license_url(&self) -> String {
+        format!(
+            "https://huggingface.co/{}/blob/{}/README.md",
+            self.repo, self.revision
         )
     }
 }
@@ -353,6 +437,73 @@ pub fn known_model(name: &str) -> Option<&'static KnownModel> {
     let name = name.strip_prefix("ggml-").unwrap_or(name);
     let name = name.strip_suffix(".bin").unwrap_or(name);
     KNOWN_MODELS.iter().find(|m| m.name == name)
+}
+
+/// A model `fotwd stt models` can install: a Whisper model or the speech
+/// detector.
+#[must_use]
+pub fn catalog_model(name: &str) -> Option<&'static KnownModel> {
+    let bare = name.strip_prefix("ggml-").unwrap_or(name);
+    let bare = bare.strip_suffix(".bin").unwrap_or(bare);
+    known_model(name).or((bare == VAD_MODEL.name).then_some(&VAD_MODEL))
+}
+
+/// Where the speech detector is installed.
+#[must_use]
+pub fn vad_model_path(data_root: &Path) -> PathBuf {
+    models_dir(data_root).join(model_file_name(VAD_MODEL.name))
+}
+
+/// Check the installed speech detector, with the message a user acts on when
+/// it is not there or not the published file.
+///
+/// # Errors
+///
+/// When the detector is missing, unreadable or not the pinned file.
+pub fn verify_vad_model(data_root: &Path) -> Result<PathBuf, String> {
+    verify_detector(data_root, &VAD_MODEL)
+}
+
+/// [`verify_vad_model`] against a given detector identity, so tests can pin a
+/// fixture instead of real weights.
+fn verify_detector(data_root: &Path, detector: &'static KnownModel) -> Result<PathBuf, String> {
+    let path = models_dir(data_root).join(model_file_name(detector.name));
+    let fix = format!(
+        "Install it with `fotwd stt models install {}` (installing a Whisper model from \
+         Transcription settings adds it too)",
+        detector.name
+    );
+    let checked = std::fs::metadata(&path)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => ModelError::Missing(path.clone()),
+            _ => ModelError::Unreadable(path.clone(), e.to_string()),
+        })
+        .and_then(|meta| {
+            if meta.is_file() {
+                verify_as(&path, &meta, detector)
+            } else {
+                Err(ModelError::Missing(path.clone()))
+            }
+        });
+    match checked {
+        Ok(_) => Ok(path),
+        Err(ModelError::Missing(_)) => Err(format!(
+            "Local transcription needs its speech detector, {} ({} KB, {}), which keeps music \
+             and noise from becoming text, and it is missing at {}. {fix}.",
+            detector.name,
+            detector.bytes / 1_000,
+            detector.license,
+            path.display()
+        )),
+        Err(error) => Err(format!(
+            "Local transcription needs its speech detector, {}, and {}: {error}. {fix}.",
+            detector.name,
+            match error {
+                ModelError::Mismatch { .. } => "the installed file is not the published one",
+                _ => "the installed file could not be read",
+            }
+        )),
+    }
 }
 
 /// `large-v3-turbo-q5_0` → `ggml-large-v3-turbo-q5_0.bin`.
@@ -414,6 +565,15 @@ pub fn verify_model(path: &Path) -> Result<Option<&'static KnownModel>, ModelErr
     else {
         return Ok(None);
     };
+    verify_as(path, &meta, known).map(Some)
+}
+
+/// Check that `path` is byte for byte the published `known` file.
+fn verify_as(
+    path: &Path,
+    meta: &std::fs::Metadata,
+    known: &'static KnownModel,
+) -> Result<&'static KnownModel, ModelError> {
     if meta.len() != known.bytes {
         return Err(ModelError::Mismatch {
             path: path.to_owned(),
@@ -429,7 +589,7 @@ pub fn verify_model(path: &Path) -> Result<Option<&'static KnownModel>, ModelErr
             reason: "checksum differs".to_owned(),
         });
     }
-    Ok(Some(known))
+    Ok(known)
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
@@ -464,14 +624,37 @@ pub fn local_transcription(
     mic_present: bool,
     mic_enabled: bool,
 ) -> Transcription {
+    local_transcription_with(
+        settings,
+        data_root,
+        session_id,
+        mic_present,
+        mic_enabled,
+        &VAD_MODEL,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn local_transcription_with(
+    settings: &SttSettings,
+    data_root: &Path,
+    session_id: &str,
+    mic_present: bool,
+    mic_enabled: bool,
+    detector: &'static KnownModel,
+) -> Transcription {
     let settings = settings.clone();
     let data_root = data_root.to_path_buf();
     let session_id = session_id.to_owned();
     Transcription::PreparingLocal(Box::pin(async move {
         tokio::task::spawn_blocking(move || {
             use fotw_stt::RecognizerFactory;
+            // Without the gate, music and noise become text (#242): refuse
+            // capture rather than record a transcript of hallucinations.
+            let vad = verify_detector(&data_root, detector)?;
             let path = settings.model_path(&data_root);
-            let engine = fotw_stt::WhisperEngine::new(&path, settings.language());
+            let engine =
+                fotw_stt::WhisperEngine::new(&path, settings.language()).with_speech_gate(&vad);
             let expected_revision =
                 known_model(engine.model()).map(|model| format!("sha256:{}", model.sha256));
             let checked = verify_model(&path)
@@ -487,6 +670,8 @@ pub fn local_transcription(
                             engine,
                             path,
                             digest: digest.clone(),
+                            vad,
+                            vad_digest: detector.sha256,
                         }),
                         Some(format!("sha256:{digest}")),
                     ),
@@ -506,10 +691,10 @@ pub fn local_transcription(
                 mic_enabled,
             );
             legs.revision = revision;
-            legs
+            Ok(legs)
         })
         .await
-        .map_err(|_| "local model identity preparation failed".to_owned())
+        .map_err(|_| "local model identity preparation failed".to_owned())?
     }))
 }
 
@@ -533,10 +718,12 @@ async fn unavailable_catalog_model_keeps_its_expected_identity_for_later_recover
             .into_owned(),
         language: "en".into(),
     };
-    let prepared = local_transcription(&settings, root.path(), "fixture", false, false)
-        .prepare(&crate::session::SessionControl::new())
-        .await
-        .unwrap();
+    let detector = fixture_detector(root.path());
+    let prepared =
+        local_transcription_with(&settings, root.path(), "fixture", false, false, detector)
+            .prepare(&crate::session::SessionControl::new())
+            .await
+            .unwrap();
     let Transcription::Local(legs) = prepared else {
         panic!("expected recording-capable local configuration");
     };
@@ -564,10 +751,12 @@ async fn local_identity_is_pinned_without_loading_native_weights_and_refuses_a_c
         language: "en".into(),
     };
     let expected = format!("sha256:{}", sha256_file(&path).unwrap());
-    let prepared = local_transcription(&settings, root.path(), "fixture", false, false)
-        .prepare(&crate::session::SessionControl::new())
-        .await
-        .unwrap();
+    let detector = fixture_detector(root.path());
+    let prepared =
+        local_transcription_with(&settings, root.path(), "fixture", false, false, detector)
+            .prepare(&crate::session::SessionControl::new())
+            .await
+            .unwrap();
     let Transcription::Local(legs) = prepared else {
         panic!("expected local configuration");
     };

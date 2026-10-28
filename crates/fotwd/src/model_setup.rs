@@ -153,10 +153,10 @@ impl Artifact {
     fn known(model: &crate::stt::KnownModel) -> Self {
         Self {
             name: model.name.into(),
-            revision: crate::stt::MODEL_REVISION.into(),
+            revision: model.revision.into(),
             sha256: model.sha256.into(),
             bytes: model.bytes,
-            license: "MIT".into(),
+            license: model.license.into(),
         }
     }
     fn validate(&self) -> Result<(), String> {
@@ -356,6 +356,41 @@ fn install_with_progress(
     report(Phase::Verified, copied);
     Ok(path)
 }
+/// Install a Whisper model together with the speech detector that gates it
+/// (#242), so a model that can transcribe is never on disk without the gate
+/// local capture requires. `open` is asked for each artifact's source only
+/// when that artifact is not already installed and verified.
+fn install_with_detector(
+    root: &Path,
+    model: &Artifact,
+    detector: &Artifact,
+    control: &Control,
+    available: impl Fn(&Path) -> Result<u64, String>,
+    mut open: impl FnMut(&Artifact) -> Result<Box<dyn Read + Send>, String>,
+    progress: impl FnMut(Progress),
+) -> Result<PathBuf, String> {
+    let mut progress = progress;
+    control.check()?;
+    // The detector first: it is small, so a failure costs nothing, and a model
+    // is never left installed without the gate it needs. It is under a
+    // megabyte, so it takes its own publication boundary and cancellation is
+    // observed again before the model's transfer begins.
+    install_with_progress(
+        root,
+        detector,
+        &Control::default(),
+        &available,
+        || open(detector),
+        &mut progress,
+    )
+    .map_err(|error| {
+        format!(
+            "The speech detector {} could not be installed, so the model was not either: {error}",
+            detector.name
+        )
+    })?;
+    install_with_progress(root, model, control, &available, || open(model), progress)
+}
 #[cfg(test)]
 fn install_from(
     root: &Path,
@@ -378,28 +413,58 @@ pub fn install(
     progress: impl FnMut(Progress),
 ) -> Result<PathBuf, String> {
     let known =
-        crate::stt::known_model(name).ok_or("Choose a model from `fotwd stt models list`")?;
-    install_with_progress(
+        crate::stt::catalog_model(name).ok_or("Choose a model from `fotwd stt models list`")?;
+    let detector = &crate::stt::VAD_MODEL;
+    let download = |model: &crate::stt::KnownModel| -> Result<Box<dyn Read + Send>, String> {
+        // No credentials, proxy discovery, cookies, metadata lookup or cloud ASR.
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .https_only(true)
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(900))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .referer(false)
+            .build()
+            .map_err(|_| "Cannot initialize the model download client")?;
+        download_response(&client, &model.url(), model.bytes)
+    };
+    if known.name == detector.name {
+        return install_with_progress(
+            root,
+            &Artifact::known(known),
+            control,
+            free_space,
+            || match source {
+                Source::Import(path) => open_import(&path),
+                Source::Download => download(known),
+            },
+            progress,
+        );
+    }
+    // A Whisper model comes with the speech detector local capture requires.
+    let mut source = Some(source);
+    install_with_detector(
         root,
         &Artifact::known(known),
+        &Artifact::known(detector),
         control,
         free_space,
-        || {
-            match source {
-                Source::Import(path) => open_import(&path),
-                Source::Download => {
-                    // No credentials, proxy discovery, cookies, metadata lookup or cloud ASR.
-                    let client = reqwest::blocking::Client::builder()
-                        .no_proxy()
-                        .https_only(true)
-                        .connect_timeout(Duration::from_secs(15))
-                        .timeout(Duration::from_secs(900))
-                        .redirect(reqwest::redirect::Policy::limited(5))
-                        .referer(false)
-                        .build()
-                        .map_err(|_| "Cannot initialize the model download client")?;
-                    download_response(&client, &known.url(), known.bytes)
-                }
+        |artifact| {
+            if artifact.name == detector.name {
+                return match source {
+                    Some(Source::Download) => download(detector),
+                    _ => Err(format!(
+                        "it is not installed and an import brings only the Whisper model; \
+                         import it with `fotwd stt models import {0} <file>` or download it with \
+                         `fotwd stt models install {0}`",
+                        detector.name
+                    )),
+                };
+            }
+            match source.take() {
+                Some(Source::Import(path)) => open_import(&path),
+                Some(Source::Download) => download(known),
+                None => Err("Model source was already used".into()),
             }
         },
         progress,
@@ -592,6 +657,68 @@ mod tests {
             .unwrap(),
             path
         );
+    }
+    fn artifact(name: &str, bytes: &[u8]) -> Artifact {
+        Artifact {
+            name: name.into(),
+            revision: "0".repeat(40),
+            sha256: Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+            bytes: bytes.len() as u64,
+            license: "MIT".into(),
+        }
+    }
+    #[test]
+    fn a_whisper_model_is_installed_with_its_speech_detector() {
+        let root = tempfile::tempdir().unwrap();
+        let model = artifact("fixture-asr", b"fixture asr weights");
+        let detector = artifact("fixture-vad", b"fixture vad weights");
+        let path = install_with_detector(
+            root.path(),
+            &model,
+            &detector,
+            &Control::default(),
+            |_| Ok(AUDIO_FREE_BYTES),
+            |a| {
+                Ok(reader(if a.name == "fixture-asr" {
+                    b"fixture asr weights"
+                } else {
+                    b"fixture vad weights"
+                }))
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(path, root.path().join("models/ggml-fixture-asr.bin"));
+        let detector = root.path().join("models/ggml-fixture-vad.bin");
+        assert!(
+            detector.is_file(),
+            "the detector was not installed with the model"
+        );
+        assert_eq!(std::fs::read(detector).unwrap(), b"fixture vad weights");
+    }
+    #[test]
+    fn a_detector_that_fails_verification_stops_setup_before_the_model() {
+        let root = tempfile::tempdir().unwrap();
+        let model = artifact("fixture-asr", b"fixture asr weights");
+        let detector = artifact("fixture-vad", b"fixture vad weights");
+        let error = install_with_detector(
+            root.path(),
+            &model,
+            &detector,
+            &Control::default(),
+            |_| Ok(AUDIO_FREE_BYTES),
+            |a| {
+                assert_eq!(a.name, "fixture-vad", "model fetched before the detector");
+                Ok(reader(b"tampered vad weight"))
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(error.contains("speech detector"), "{error}");
+        assert!(!root.path().join("models/ggml-fixture-asr.bin").exists());
     }
     #[test]
     fn capture_and_setup_are_exclusive_across_independent_file_owners() {

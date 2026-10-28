@@ -45,6 +45,11 @@ Windows, but neither captures anything.
   model. `fotwd stt test <wav>` runs a file through the same path. If the
   engine is set to local and the model is missing, the meeting is recorded
   without a transcript and the reason is shown. Nothing falls back to Deepgram.
+- A neural speech gate in front of the local model (#242): Silero VAD v5.1.2
+  (MIT), installed with every Whisper model, so music, noise and silence no
+  longer become "Thank you." lines. Bracketed annotations (`[BLANK_AUDIO]`,
+  `(applause)`) and stock phrases the model doubted were speech are dropped.
+  Start refuses local transcription while the detector is missing or corrupt.
 
 #### Library and keys
 
