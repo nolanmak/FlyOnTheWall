@@ -123,7 +123,7 @@ with `error {id, code, message}` instead.
 | `hello {protocol, client}` | `hello {protocol, helper, capabilities}` | first frame only |
 | `load {engine}` | `progress {phase: "load"}`…, then `loaded {engine, model, revision, elapsed_ms}` | local files only; refuses `model_missing` / `model_invalid`. A first load on a machine includes Core ML's compile, tens of seconds |
 | `warmup {engine}` | `progress {phase: "warmup"}`…, then `warmed {engine, elapsed_ms}` | runs one silent chunk so the first real request pays no Core ML compile |
-| `unload {engine}` | `unloaded {engine}` | |
+| `unload {engine}` | `unloaded {engine}` | refused with `busy` while a stream of that engine is open |
 | `open_stream {stream, engine, sample_rate, format, channels, options}` | `stream_opened {stream}` | `format` is `"s16le"`, `channels` 1 |
 | `health {}` | `health {uptime_ms, streams, loaded, rss_bytes}` | |
 | `install {model, from?}` | `progress {phase: "download" \| "verify", model, bytes, total}`…, then `installed {model, revision}` | **explicit setup only**; see Models |
@@ -212,7 +212,7 @@ ordinary test suites use:
 | `fake-hang` | the process stops reading and answering on its first audio frame |
 | `fake-stall` | never answers `finish`, but keeps serving everything else |
 | `fake-exit-after-final` | on `finish`, `final` and `closed`, then the process exits with status 70 |
-| `fake-dictation` | `nemotron-3.5` without a model, in 250 ms (4000-sample) steps: a `partial {text: "steps=<n> lang=<language or auto>", utterance: 1}` when a step completes; on `finish` the last partial step counts as one more, `final {utterance: 1}` with the same text. A frame holding a sample of −32768 fails the stream with `engine` |
+| `fake-dictation` | `nemotron-3.5` without a model, in 250 ms (4000-sample) steps: a `partial {text: "steps=<n> lang=<language or auto>", utterance: 1}` when a step completes; on `finish` the last partial step counts as one more, `final {utterance: 1}` with the same text. A frame holding a sample of −32768 fails the stream with `engine`. Like `nemotron-3.5` it has one recognizer, shared by its streams and reset when a stream ends; a second open stream is refused with `busy` |
 
 `load` and `warmup` of a fake engine send one `progress` each.
 

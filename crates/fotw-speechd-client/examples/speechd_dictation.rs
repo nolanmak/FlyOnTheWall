@@ -19,6 +19,11 @@
 //!    partial's arrival is recorded against the audio clock, then `finish` is
 //!    sent and the final timed (release → final).
 //!
+//! 5. **Nothing leaks between streams.** The six dictations of one clip must
+//!    give the same final, and no clip's final may contain a word (5+ letters)
+//!    that is in the previous clip's reference but not its own. Either failure
+//!    exits 1.
+//!
 //! Prints one JSON report on stdout: raw per-clip timings and texts. Onset,
 //! percentiles and WER are computed from it by the caller, with the same
 //! scoring as `tools/speech-eval`.
@@ -234,6 +239,31 @@ async fn main() {
     let health = client.health().await.expect("health");
     client.shutdown().await;
 
+    // 5. Stream state must not carry over: same audio, same final; and no
+    // word that only the previous clip said.
+    let finals: Vec<&str> = launch
+        .iter()
+        .map(|r| r["text"].as_str().unwrap_or(""))
+        .collect();
+    let repeatable = finals.iter().all(|t| *t == finals[0]);
+    let words = |text: &str| -> std::collections::HashSet<String> {
+        text.split(|c: char| !c.is_alphanumeric() && c != '\'')
+            .filter(|w| w.chars().count() >= 5)
+            .map(str::to_lowercase)
+            .collect()
+    };
+    let mut leaks = Vec::new();
+    for pair in replay.windows(2) {
+        let (before, now) = (&pair[0], &pair[1]);
+        let theirs = words(before["reference"].as_str().unwrap_or(""));
+        let ours = words(now["reference"].as_str().unwrap_or(""));
+        for word in words(now["text"].as_str().unwrap_or("")) {
+            if theirs.contains(&word) && !ours.contains(&word) {
+                leaks.push(json!({"clip": now["wav"], "word": word}));
+            }
+        }
+    }
+
     let report = json!({
         "engine": ENGINE,
         "model": loaded.model,
@@ -245,6 +275,12 @@ async fn main() {
         "helper_rss_bytes": health.rss_bytes,
         "launch": launch,
         "clips": replay,
+        "same_audio_same_final": repeatable,
+        "words_from_the_previous_stream": leaks,
     });
     println!("{}", serde_json::to_string_pretty(&report).expect("json"));
+    if !repeatable || !leaks.is_empty() {
+        eprintln!("stream state leaked between dictations");
+        std::process::exit(1);
+    }
 }

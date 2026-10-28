@@ -144,7 +144,7 @@ const ENGINES: [(&str, EngineKind, bool); 8] = [
     ("fake-exit-after-final", EngineKind::Batch, false),
     ("fake-dictation", EngineKind::Streaming, true),
 ];
-/// `fake-dictation` decodes in 250 ms steps, like `nemotron-3.5` in 2.24 s ones.
+/// `fake-dictation` decodes in 250 ms steps, as `nemotron-3.5` shows partials in 560 ms ones.
 const DICTATION_STEP: u64 = 4_000;
 
 fn capabilities(future: bool) -> serde_json::Value {
@@ -206,9 +206,19 @@ struct Helper {
     /// Ids that were open once. Audio already in flight for one is dropped;
     /// audio for an id never opened is a protocol error.
     closed: HashSet<u32>,
+    /// `fake-dictation` has one recognizer, like `nemotron-3.5`: the samples
+    /// it holds, kept across streams until a stream's end resets it.
+    dictation: u64,
 }
 
 impl Helper {
+    /// A `fake-dictation` stream is over, however it ended: reset the
+    /// recognizer for the next one.
+    fn end_dictation(&mut self, stream: &Stream) {
+        if stream.engine == "fake-dictation" {
+            self.dictation = 0;
+        }
+    }
     fn request(&mut self, request: Request) {
         let out = self.out.clone();
         match request {
@@ -249,6 +259,12 @@ impl Helper {
                 }
             }
             Request::Unload { id, engine } => {
+                // Not under a live stream: it would keep its model while a
+                // reload loaded a second copy.
+                if self.streams.values().any(|s| s.engine == engine) {
+                    out.fail(id, ErrorCode::Busy, "a stream of this engine is open");
+                    return;
+                }
                 self.loaded.remove(&engine);
                 out.send(&Reply::Unloaded { id, engine });
             }
@@ -270,7 +286,11 @@ impl Helper {
             Request::Finish { stream } => self.finish(stream),
             Request::Cancel { stream } => {
                 let was_finishing = lock(&self.finishing).remove(&stream);
-                if self.streams.remove(&stream).is_some() || was_finishing {
+                let removed = self.streams.remove(&stream);
+                if let Some(ended) = &removed {
+                    self.end_dictation(ended);
+                }
+                if removed.is_some() || was_finishing {
                     self.closed.insert(stream);
                     out.send(&Reply::Closed {
                         stream,
@@ -329,6 +349,13 @@ impl Helper {
             Some((ErrorCode::StreamExists, "stream ids are single-use"))
         } else if self.streams.len() >= MAX_STREAMS {
             Some((ErrorCode::Busy, "too many streams"))
+        } else if engine == "fake-dictation"
+            && self.streams.values().any(|s| s.engine == "fake-dictation")
+        {
+            Some((
+                ErrorCode::Busy,
+                "fake-dictation serves one stream at a time",
+            ))
         } else {
             None
         };
@@ -368,6 +395,7 @@ impl Helper {
             "fake-dictation" if pcm.contains(&i16::MIN) => {
                 self.streams.remove(&id);
                 self.closed.insert(id);
+                self.dictation = 0;
                 out.send(&Reply::Error {
                     id: None,
                     stream: Some(id),
@@ -379,8 +407,10 @@ impl Helper {
             }
             // A partial whenever a step completes.
             "fake-dictation" => {
-                let steps = stream.samples / DICTATION_STEP;
-                if steps > start / DICTATION_STEP {
+                let before = self.dictation;
+                self.dictation += pcm.len() as u64;
+                let steps = self.dictation / DICTATION_STEP;
+                if steps > before / DICTATION_STEP {
                     out.send(&Reply::Partial {
                         stream: id,
                         text: stream.dictation(steps),
@@ -447,12 +477,14 @@ impl Helper {
             return;
         };
         self.closed.insert(id);
+        let held = self.dictation;
+        self.end_dictation(&stream);
         let end_ms = stream.samples * 1000 / u64::from(SAMPLE_RATE);
         let final_text = FinalText {
             stream: id,
             // fake-dictation pads its last partial step and decodes it.
             text: if stream.engine == "fake-dictation" {
-                stream.dictation(stream.samples.div_ceil(DICTATION_STEP))
+                stream.dictation(held.div_ceil(DICTATION_STEP))
             } else {
                 format!("samples={}", stream.samples)
             },
@@ -580,6 +612,7 @@ fn main() {
         loaded: BTreeSet::new(),
         streams: HashMap::new(),
         closed: HashSet::new(),
+        dictation: 0,
     };
     loop {
         match frame::read_frame(&mut input) {

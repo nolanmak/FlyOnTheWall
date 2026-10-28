@@ -978,3 +978,70 @@ async fn an_engine_error_mid_dictation_fails_only_that_stream() {
     assert_eq!(final_text(&mut next_one).await, "steps=1 lang=en");
     client.shutdown().await;
 }
+
+#[tokio::test]
+async fn an_engine_is_not_unloaded_under_an_open_stream() {
+    // Unloading under a live dictation would leave its recognizer for a later
+    // load to duplicate (two ~1.1 GB sets for nemotron-3.5); refuse instead.
+    let client = dictation_client().await;
+    let mut live = client
+        .open_stream(dictation(Some("en")))
+        .await
+        .expect("open");
+    live.send_audio(&[100; 4_000]).await.expect("audio");
+    assert!(matches!(
+        next(&mut live).await,
+        Some(StreamEvent::Partial { .. })
+    ));
+    let refused = client.unload("fake-dictation").await;
+    assert!(
+        refused.as_ref().is_err_and(|e| e.code() == ErrorCode::Busy),
+        "unload under an open stream: {refused:?}"
+    );
+    live.finish().await.expect("finish");
+    assert_eq!(final_text(&mut live).await, "steps=1 lang=en");
+    client
+        .unload("fake-dictation")
+        .await
+        .expect("unload once the stream is over");
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_refused_unload_keeps_the_engine_in_the_restart_replay() {
+    // The helper refused the unload, so the engine is still wanted: after a
+    // crash the restarted helper must load it again.
+    let client = dictation_client().await;
+    client.load("fake-crash").await.expect("load");
+    let mut live = client
+        .open_stream(dictation(Some("en")))
+        .await
+        .expect("open");
+    live.send_audio(&[100; 4_000]).await.expect("audio");
+    assert!(matches!(
+        next(&mut live).await,
+        Some(StreamEvent::Partial { .. })
+    ));
+    let refused = client.unload("fake-dictation").await;
+    assert!(
+        refused.as_ref().is_err_and(|e| e.code() == ErrorCode::Busy),
+        "{refused:?}"
+    );
+    // Crash the helper; both streams fail and the client restarts it.
+    let mut doomed = client
+        .open_stream(stream("fake-crash"))
+        .await
+        .expect("open");
+    doomed.send_audio(&[1; 160]).await.expect("audio");
+    while next(&mut live).await.is_some() {}
+    while next(&mut doomed).await.is_some() {}
+    let mut after = client
+        .open_stream(dictation(Some("en")))
+        .await
+        .expect("fake-dictation is loaded again after the restart");
+    after.send_audio(&[100; 4_000]).await.expect("audio");
+    after.finish().await.expect("finish");
+    assert_eq!(final_text(&mut after).await, "steps=1 lang=en");
+    assert_eq!(client.status().spawns.len(), 2, "one restart");
+    client.shutdown().await;
+}

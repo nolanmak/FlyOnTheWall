@@ -59,7 +59,8 @@ public actor NemotronStreamingEngine: SpeechEngine {
     /// request (after a restart the client replays load and warmup).
     public func warmup() async throws {
         guard let pool = await lifecycle.current else { throw SpeechdError.notLoaded(descriptor.id) }
-        let recognizer = try await pool.checkout()
+        // A dictation holding the recognizer has warmed it already.
+        guard await pool.available > 0, let recognizer = try? await pool.checkout() else { return }
         do {
             try await recognizer.warm()
         } catch {
@@ -133,6 +134,9 @@ final class NemotronRecognizer: StepRecognizer, @unchecked Sendable {
 
     func process(_ samples: [Float]) async throws {
         _ = try await partial.process(samples: samples)
+    }
+
+    func processFinal(_ samples: [Float]) async throws {
         _ = try await final.process(samples: samples)
     }
 

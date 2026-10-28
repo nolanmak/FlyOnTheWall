@@ -23,8 +23,12 @@ public protocol StepRecognizer: AnyObject, Sendable {
     var stepSamples: Int { get }
     /// The language hint for the next utterance; nil auto-detects.
     func setLanguage(_ language: String?) async throws
-    /// Take more audio; every completed step is decoded now.
+    /// Take more audio for the shown text; every completed step is decoded now.
     func process(_ samples: [Float]) async throws
+    /// Take the same audio for the typed text, when a separate model makes it
+    /// (Nemotron's 1120 ms variant). Called after `process`, never
+    /// concurrently with another `processFinal` or `finish`.
+    func processFinal(_ samples: [Float]) async throws
     /// The utterance's text so far.
     func transcript() async -> String
     /// Pad the last partial step with silence, decode it, and return the text.
@@ -34,10 +38,14 @@ public protocol StepRecognizer: AnyObject, Sendable {
 }
 
 extension StepRecognizer {
+    public func processFinal(_ samples: [Float]) async throws {}
+
     /// One step of silence, then a reset, so Core ML compiles before the first
     /// real stream and nothing of the warmup leaks into it.
     public func warm() async throws {
-        try await process([Float](repeating: 0, count: stepSamples))
+        let silence = [Float](repeating: 0, count: stepSamples)
+        try await process(silence)
+        try await processFinal(silence)
         _ = await transcript()
         await reset()
     }
@@ -53,6 +61,10 @@ public final class StepStreamingSession<Recognizer: StepRecognizer>: EngineSessi
     private var samples = 0
     private var shown = ""
     private var closed = false
+    /// The typed model's steps, chained so they run in order but never hold
+    /// up a partial: the shown model's text goes out first.
+    private var typing: Task<Void, Error>?
+    private let typingFailed = StepFailure()
 
     /// Take `recognizer` from `pool` for one stream; it goes back on `close`.
     public init(recognizer: Recognizer, pool: SessionPool<Recognizer>, provenance: String) {
@@ -64,7 +76,19 @@ public final class StepStreamingSession<Recognizer: StepRecognizer>: EngineSessi
     public func append(_ chunk: [Float]) async throws -> [EngineEvent] {
         guard !chunk.isEmpty else { return [] }
         samples += chunk.count
+        try typingFailed.check()
         try await recognizer.process(chunk)
+        let previous = typing
+        let (recognizer, failed) = (recognizer, typingFailed)
+        typing = Task {
+            try await previous?.value
+            do {
+                try await recognizer.processFinal(chunk)
+            } catch {
+                failed.record(error)
+                throw error
+            }
+        }
         let text = await recognizer.transcript().trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, text != shown else { return [] }
         shown = text
@@ -72,6 +96,7 @@ public final class StepStreamingSession<Recognizer: StepRecognizer>: EngineSessi
     }
 
     public func finish() async throws -> [EngineEvent] {
+        try await typing?.value
         let text = samples == 0 ? "" : try await recognizer.finish()
         return [.final(text: text.trimmingCharacters(in: .whitespacesAndNewlines), startMs: 0,
                        endMs: milliseconds(samples: samples), segments: [], model: provenance, utterance: 1)]
@@ -80,6 +105,8 @@ public final class StepStreamingSession<Recognizer: StepRecognizer>: EngineSessi
     public func close() async {
         guard !closed else { return }
         closed = true
+        // A typed step in flight still uses the recognizer.
+        _ = try? await typing?.value
         await recognizer.reset()
         await pool.checkin(recognizer)
     }
@@ -99,6 +126,15 @@ public func openStepStream<Recognizer: StepRecognizer>(
         throw error
     }
     return StepStreamingSession(recognizer: recognizer, pool: pool, provenance: provenance)
+}
+
+/// The first error of the typed model's background steps.
+final class StepFailure: @unchecked Sendable {
+    // @unchecked: guarded by `lock`.
+    private let lock = NSLock()
+    private var error: Error?
+    func record(_ error: Error) { lock.withLock { if self.error == nil { self.error = error } } }
+    func check() throws { if let error = lock.withLock({ error }) { throw error } }
 }
 
 // MARK: - Fake
@@ -122,7 +158,8 @@ public actor FakeDictationEngine: SpeechEngine {
 
     public func warmup() async throws {
         guard let pool else { throw SpeechdError.notLoaded(descriptor.id) }
-        let recognizer = try await pool.checkout()
+        // A dictation holding it has warmed it already.
+        guard await pool.available > 0, let recognizer = try? await pool.checkout() else { return }
         try? await recognizer.warm()
         await pool.checkin(recognizer)
     }

@@ -453,18 +453,22 @@ impl SpeechdClient {
     ///
     /// # Errors
     /// As [`load`](Self::load).
+    ///
+    /// The engine stays in the set replayed after a restart until the helper
+    /// confirms the unload: a refused one (`busy` under an open stream) or a
+    /// failed one leaves it loaded.
     pub async fn unload(&self, engine: &str) -> Result<(), ClientError> {
-        lock(&self.shared.state).wanted.retain(|(e, _)| e != engine);
         let conn = self.conn().await?;
-        let engine = engine.to_owned();
+        let name = engine.to_owned();
         conn.call(
-            move |id| Request::Unload { id, engine },
+            move |id| Request::Unload { id, engine: name },
             self.shared.config.request_timeout,
             None,
             "unload",
         )
-        .await
-        .map(|_| ())
+        .await?;
+        lock(&self.shared.state).wanted.retain(|(e, _)| e != engine);
+        Ok(())
     }
 
     /// Open a stream. The engine and sample rate are checked against the
