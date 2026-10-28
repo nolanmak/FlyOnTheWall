@@ -166,9 +166,9 @@ impl Recognizer for GatedRecognizer {
     fn transcribe(&mut self, pcm: &[f32]) -> Result<Vec<Recognized>, SttError> {
         let probabilities = self.detector.probabilities(pcm)?;
         let regions = speech_regions(&probabilities, pcm.len(), &self.config);
-        match regions.as_slice() {
-            [] => Ok(Vec::new()),
-            [all] if *all == (0..pcm.len()) => self.inner.transcribe_speech(pcm, &regions),
+        let recognized = match regions.as_slice() {
+            [] => return Ok(Vec::new()),
+            [all] if *all == (0..pcm.len()) => self.inner.transcribe_speech(pcm, &regions)?,
             _ => {
                 // Silence in place rather than cut out: the chunk keeps its
                 // length, so the model's times inside it stay recording times.
@@ -176,9 +176,25 @@ impl Recognizer for GatedRecognizer {
                 for region in &regions {
                     masked[region.clone()].copy_from_slice(&pcm[region.clone()]);
                 }
-                self.inner.transcribe_speech(&masked, &regions)
+                self.inner.transcribe_speech(&masked, &regions)?
             }
-        }
+        };
+        // A batch engine that times its text as the whole chunk (Parakeet in
+        // the helper) says nothing about where in it the words are; the gate
+        // knows where the speech was.
+        let chunk_ms = (pcm.len() / SAMPLES_PER_MS) as u64;
+        let first = (regions[0].start / SAMPLES_PER_MS) as u64;
+        let last = (regions[regions.len() - 1].end / SAMPLES_PER_MS) as u64;
+        Ok(recognized
+            .into_iter()
+            .map(|mut r| {
+                if r.start_ms == 0 && r.end_ms + 1 >= chunk_ms {
+                    r.start_ms = first;
+                    r.end_ms = last;
+                }
+                r
+            })
+            .collect())
     }
 }
 
@@ -278,6 +294,46 @@ mod tests {
                 text: "heard".into(),
             }])
         }
+    }
+
+    struct Scripted(Vec<f32>);
+    impl SpeechDetector for Scripted {
+        fn probabilities(&mut self, _: &[f32]) -> Result<Vec<f32>, SttError> {
+            Ok(self.0.clone())
+        }
+    }
+    struct Fixed(Recognized);
+    impl Recognizer for Fixed {
+        fn transcribe(&mut self, _: &[f32]) -> Result<Vec<Recognized>, SttError> {
+            Ok(vec![self.0.clone()])
+        }
+    }
+
+    #[test]
+    fn a_result_with_no_timing_of_its_own_is_narrowed_to_the_speech_the_gate_kept() {
+        // Speech in windows 40..70 of 100 (1280..2240 ms of 3200 ms).
+        let probs = windows(&[(0.1, 40), (0.9, 30), (0.1, 30)]);
+        let pcm = vec![0.1; probs.len() * WINDOW_SAMPLES];
+        let chunk_ms = (pcm.len() / SAMPLES_PER_MS) as u64;
+        let pad = GateConfig::default().pad_ms;
+        let line = |start_ms, end_ms| Recognized {
+            start_ms,
+            end_ms,
+            text: "words".into(),
+        };
+        let gated = |inner: Recognized| {
+            GatedRecognizer::new(
+                Box::new(Scripted(probs.clone())),
+                Box::new(Fixed(inner)),
+                GateConfig::default(),
+            )
+            .transcribe(&pcm)
+            .unwrap()
+        };
+        // A batch engine that times its text as the whole chunk.
+        assert_eq!(gated(line(0, chunk_ms)), vec![line(1280 - pad, 2240 + pad)]);
+        // An engine that times its own text is left alone.
+        assert_eq!(gated(line(1500, 1900)), vec![line(1500, 1900)]);
     }
 
     #[test]
