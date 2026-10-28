@@ -89,6 +89,30 @@ synthetic integration tests. `just ci` runs both default and explicitly enabled 
 native backend, downloads no weights and does not qualify a canceller for release. Durable processing journals
 and replay remain readable without it. Acceptance in #72 remains open.
 
+### Local summary runtime development
+
+The low-level `fotwd::local_summary::LocalAdapter` runs an explicitly supplied
+llama.cpp package on macOS using an app-owned Unix socket and an OS network
+sandbox. It is not yet registered as a product engine: Local-only still shows
+setup required while catalog admission, downloads, capture scheduling and
+qualification are completed in #234.
+
+For a development smoke test, supply a JSON `RuntimeConfig` (see
+`crates/fotwd/src/local_summary/process.rs`) containing trusted SHA-256 digests
+for the installed GGUF, `llama-server` and every required adjacent dylib. Use
+regular files rather than symlinks. The caller authenticates this manifest;
+matching a caller-provided hash alone does not establish publisher trust.
+
+```sh
+cargo run -p fotwd --example local_summary_smoke -- /path/to/config.json
+```
+
+This example uses a fixed synthetic meeting, reads no meeting library or
+credentials, downloads nothing, prints timing/token counts and the synthetic
+answer, and confirms owned-process exit. It tests real inference, not model
+quality or hardware-tier qualification. Context and deadlines are explicit
+configuration values; larger Macs are not limited to a small-model tier.
+
 ### Dependency changes and third-party notices
 
 `THIRD_PARTY_NOTICES.md` carries the license texts for everything compiled into
