@@ -17,6 +17,8 @@
 //! health answer with a message of an unknown type. `--slow-load-if <path>`
 //! makes every `load` take 30 s (off the frame thread) while that file exists,
 //! so a test can slow down only the loads a restart replays.
+//! `--slow-health <ms>` answers every `health` that late, off the frame
+//! thread, like a helper starved of CPU on a heavily loaded Mac.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, BufReader, BufWriter, Write};
@@ -45,6 +47,7 @@ struct Args {
     misbehave: Option<String>,
     future: bool,
     slow_load_if: Option<std::path::PathBuf>,
+    slow_health: Option<Duration>,
 }
 
 fn parse_args() -> Args {
@@ -53,6 +56,7 @@ fn parse_args() -> Args {
         misbehave: None,
         future: false,
         slow_load_if: None,
+        slow_health: None,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -67,6 +71,12 @@ fn parse_args() -> Args {
             "--misbehave-on-health" => args.misbehave = iter.next(),
             "--from-the-future" => args.future = true,
             "--slow-load-if" => args.slow_load_if = iter.next().map(Into::into),
+            "--slow-health" => {
+                args.slow_health = iter
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .map(Duration::from_millis);
+            }
             other => {
                 eprintln!("fotw-speechd-fake: unknown argument {other}");
                 exit(64);
@@ -186,6 +196,7 @@ struct Helper {
     misbehave: Option<String>,
     future: bool,
     slow_load_if: Option<std::path::PathBuf>,
+    slow_health: Option<Duration>,
     /// `fake-batch` streams finishing on their own thread. Cancel removes one,
     /// and the thread only answers if it is still here, under this lock.
     finishing: Arc<Mutex<HashSet<u32>>>,
@@ -269,14 +280,23 @@ impl Helper {
                     out.send_json(&serde_json::json!({"type": "telemetry", "cpu": 0.5}));
                 }
                 let finishing = lock(&self.finishing).len();
-                out.send(&Reply::Health {
+                let reply = Reply::Health {
                     id,
                     uptime_ms: u64::try_from(self.started.elapsed().as_millis())
                         .unwrap_or(u64::MAX),
                     streams: u32::try_from(self.streams.len() + finishing).expect("bounded"),
                     loaded: self.loaded.iter().cloned().collect(),
                     rss_bytes: None,
-                });
+                };
+                match self.slow_health {
+                    Some(delay) => {
+                        std::thread::spawn(move || {
+                            std::thread::sleep(delay);
+                            out.send(&reply);
+                        });
+                    }
+                    None => out.send(&reply),
+                }
             }
             Request::Install { id, model, .. } => {
                 out.fail(
@@ -518,6 +538,7 @@ fn main() {
         misbehave: args.misbehave,
         future: args.future,
         slow_load_if: args.slow_load_if,
+        slow_health: args.slow_health,
         finishing: Arc::new(Mutex::new(HashSet::new())),
         loaded: BTreeSet::new(),
         streams: HashMap::new(),

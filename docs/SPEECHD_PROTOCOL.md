@@ -33,8 +33,9 @@ streams' audio while any engine is busy, however long that takes (a
 queues a stream's audio for that stream's engine, bounded (the Swift helper
 fails a stream with `busy` past 2 minutes of backlog). The client kills a
 helper that leaves its stdin unread for 2 s or a heartbeat unanswered for
-2 s, so a helper that blocked would be killed mid-meeting. `fake-batch` takes
-2.5 s to finish to hold both helpers to this.
+5 s, so a helper that blocked would be killed mid-meeting. `fake-batch` takes
+2.5 s to finish to hold both helpers to this (its test tightens both
+deadlines to 500 ms).
 
 ## Frames
 
@@ -237,9 +238,12 @@ Weights are never committed. They live under
   for at most 250 ms, then fails every open stream with `helper_crashed` and
   every pending request. A crash reaches open streams within 1 s; nothing
   waits on a dead helper.
-- **Hang.** While any stream is open the client sends `health` every 1 s with
-  a 2 s deadline, so a hung helper is found within 3 s by default, even after
-  `finish` when no audio flows. A queue to the helper that stays full for 2 s
+- **Hang.** While any stream is open the client sends `health` every 1 s,
+  one at a time, with a 5 s deadline, so a hung helper is found within 6 s by
+  default, even after `finish` when no audio flows. The deadline was 2 s; at
+  a load average around 40 a working helper answered late enough to be
+  killed mid-caption, so it allows for a starved CPU. Crashes do not wait on
+  it: they are found from the process exit, within 1 s. A queue to the helper that stays full for 2 s
   means the same. Either way the client kills it and handles it as a crash, so
   a recording never blocks on transcription. A stream with no result 120 s
   after `finish` means a wedged engine in a helper that still answers, and is
