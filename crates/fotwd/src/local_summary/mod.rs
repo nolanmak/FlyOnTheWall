@@ -19,3 +19,9 @@ pub mod probe;
 
 #[cfg(target_os = "macos")]
 mod package;
+
+/// Pinned public model/runtime inventory for explicit provisioning.
+pub mod catalog;
+
+/// Explicit, resumable provisioning of pinned model/runtime packages.
+pub mod provision;
