@@ -113,6 +113,14 @@ answer, and confirms owned-process exit. It tests real inference, not model
 quality or hardware-tier qualification. Context and deadlines are explicit
 configuration values; larger Macs are not limited to a small-model tier.
 
+To inspect the native resource inputs without loading a model or reading a
+meeting library, run `cargo run -p fotwd --example local_summary_resources --
+/path/to/installation-directory`. It reports physical RAM, estimated current
+headroom, OS pressure, CPU counts, OS compatibility and free space on that
+volume. Missing observations remain unknown. This metadata does not qualify a
+model or prove that a particular model fits; admission must refresh it before
+loading rather than cache a decision from installed RAM alone.
+
 ### Dependency changes and third-party notices
 
 `THIRD_PARTY_NOTICES.md` carries the license texts for everything compiled into
