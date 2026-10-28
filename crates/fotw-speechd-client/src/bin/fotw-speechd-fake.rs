@@ -29,6 +29,8 @@
 //! sample value `n`, so a test can make one utterance kill the helper every
 //! time it is sent. With `--crash-once-marker <path>` it does so only while
 //! `path` does not exist, creating it first: one crash, then a healthy helper.
+//! `--slow-health <ms>` answers every `health` that late, off the frame
+//! thread, like a helper starved of CPU on a heavily loaded Mac.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, BufReader, BufWriter, Write};
@@ -61,6 +63,7 @@ struct Args {
     slow_load_if: Option<std::path::PathBuf>,
     crash_on_sample: Option<i16>,
     crash_once_marker: Option<std::path::PathBuf>,
+    slow_health: Option<Duration>,
 }
 
 fn parse_args() -> Args {
@@ -73,6 +76,7 @@ fn parse_args() -> Args {
         slow_load_if: None,
         crash_on_sample: None,
         crash_once_marker: None,
+        slow_health: None,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -101,6 +105,12 @@ fn parse_args() -> Args {
                 args.crash_on_sample = iter.next().and_then(|v| v.parse().ok());
             }
             "--crash-once-marker" => args.crash_once_marker = iter.next().map(Into::into),
+            "--slow-health" => {
+                args.slow_health = iter
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .map(Duration::from_millis);
+            }
             other => {
                 eprintln!("fotw-speechd-fake: unknown argument {other}");
                 exit(64);
@@ -261,6 +271,7 @@ struct Helper {
     slow_load_if: Option<std::path::PathBuf>,
     crash_on_sample: Option<i16>,
     crash_once_marker: Option<std::path::PathBuf>,
+    slow_health: Option<Duration>,
     /// `fake-batch` streams finishing on their own thread. Cancel removes one,
     /// and the thread only answers if it is still here, under this lock.
     finishing: Arc<Mutex<HashSet<u32>>>,
@@ -358,14 +369,23 @@ impl Helper {
                     out.send_json(&serde_json::json!({"type": "telemetry", "cpu": 0.5}));
                 }
                 let finishing = lock(&self.finishing).len();
-                out.send(&Reply::Health {
+                let reply = Reply::Health {
                     id,
                     uptime_ms: u64::try_from(self.started.elapsed().as_millis())
                         .unwrap_or(u64::MAX),
                     streams: u32::try_from(self.streams.len() + finishing).expect("bounded"),
                     loaded: self.loaded.iter().cloned().collect(),
                     rss_bytes: None,
-                });
+                };
+                match self.slow_health {
+                    Some(delay) => {
+                        std::thread::spawn(move || {
+                            std::thread::sleep(delay);
+                            out.send(&reply);
+                        });
+                    }
+                    None => out.send(&reply),
+                }
             }
             Request::Install { id, model, .. } => {
                 if let Some(pinned) = self.pinned_engine(&model)
@@ -645,6 +665,7 @@ fn main() {
         slow_load_if: args.slow_load_if,
         crash_on_sample: args.crash_on_sample,
         crash_once_marker: args.crash_once_marker,
+        slow_health: args.slow_health,
         finishing: Arc::new(Mutex::new(HashSet::new())),
         loaded: BTreeSet::new(),
         streams: HashMap::new(),
