@@ -1,0 +1,43 @@
+[package]
+name = "fotw-speechd-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Protocol, process owner and fake for the fotw-speechd FluidAudio helper (#243)"
+
+# Pure Rust on every platform: the helper is a separate executable, so nothing
+# here links Swift, Core ML or a model runtime. The protocol is in
+# docs/SPEECHD_PROTOCOL.md.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "process",
+  "rt",
+  "sync",
+  "time",
+] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "process",
+  "rt",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
+
+# The model-free helper the ordinary test suites spawn, here and in Murmur.
+[[bin]]
+name = "fotw-speechd-fake"
+path = "src/bin/fotw-speechd-fake.rs"
+test = false
+doc = false

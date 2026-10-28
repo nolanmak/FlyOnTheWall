@@ -2,13 +2,12 @@
 //!
 //! # The resolution order is policy, not plumbing
 //!
-//! An Anthropic API key always wins: it is explicit configuration and keeps
-//! the pre-CLI behavior byte-for-byte. With no key, the `claude` CLI serves —
-//! but only when the user both enabled it and acknowledged that the
-//! transcript leaves the machine. KEY-04's disclosure duty applies to this
-//! path exactly as to a key: the words travel either way, only the bill
-//! differs. With neither, enrichment degrades to a local fallback title and
-//! nothing leaves the device at all.
+//! Explicit Off and Local-only choices prohibit hosted credential reads and
+//! calls. Explicit hosted choices require disclosure acknowledgement and do
+//! not change destination on failure. Libraries without a policy preserve the
+//! historical API-key-first/acknowledged-CLI resolution until a user chooses.
+//! Each resolved engine carries the setting revision so an old queued job
+//! cannot resume after a destination change. ASR and export are independent.
 //!
 //! # Why the acknowledgement is stored, not inferred
 //!
@@ -137,13 +136,16 @@ impl From<fotw_web::CliEngine> for CliKind {
     }
 }
 
-/// The persisted CLI-engine choice.
+/// The persisted summary destination and legacy CLI settings.
 ///
-/// Missing or unparseable reads as default — a fresh library, never an error
-/// — the same shape as [`crate::github`] and retention settings.
+/// An absent row preserves legacy behavior; invalid or unreadable settings
+/// fail closed to Off rather than restoring hosted processing.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SummarizeSettings {
+    /// Explicit destination. `None` preserves legacy library behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<fotw_web::SummaryPolicy>,
     /// The user turned the CLI engine on.
     pub cli_enabled: bool,
     /// The user was shown, and accepted, that transcripts leave the machine
@@ -172,11 +174,43 @@ impl SummarizeSettings {
     /// The settings in force for this library.
     #[must_use]
     pub fn read(db: &Db) -> Self {
-        db.get_setting(SETTINGS_KEY)
-            .ok()
-            .flatten()
-            .and_then(|v| serde_json::from_str(&v).ok())
-            .unwrap_or_default()
+        match db.get_setting(SETTINGS_KEY) {
+            Ok(None) => Self::default(),
+            Ok(Some(value)) => serde_json::from_str(&value).unwrap_or_else(|_| Self::closed()),
+            Err(_) => Self::closed(),
+        }
+    }
+
+    fn closed() -> Self {
+        Self {
+            policy: Some(fotw_web::SummaryPolicy::Off),
+            ..Self::default()
+        }
+    }
+
+    /// Whether this destination permits consulting a hosted API credential.
+    #[must_use]
+    pub fn allows_api_key(&self) -> bool {
+        match self.policy {
+            None => true,
+            Some(fotw_web::SummaryPolicy::Anthropic) => self.acknowledged_egress,
+            Some(_) => false,
+        }
+    }
+
+    /// Policy-selected CLI, if its destination was explicitly acknowledged.
+    #[must_use]
+    pub fn selected_cli(&self) -> Option<CliKind> {
+        use fotw_web::SummaryPolicy;
+        if !self.acknowledged_egress {
+            return None;
+        }
+        match self.policy {
+            None if self.cli_enabled => Some(self.cli_kind),
+            Some(SummaryPolicy::ClaudeCli) => Some(CliKind::Claude),
+            Some(SummaryPolicy::CodexCli) => Some(CliKind::Codex),
+            _ => None,
+        }
     }
 }
 
@@ -186,16 +220,22 @@ pub enum Engine {
     Anthropic {
         /// The key, read once from the credential store.
         key: SecretString,
+        /// Policy generation selected by the resolver; `None` for injected engines.
+        settings_version: Option<fotw_store::SettingVersion>,
     },
     /// The local `claude` CLI, BYO subscription.
     ClaudeCli {
         /// The resolved binary.
         binary: PathBuf,
+        /// Policy generation selected by the resolver; `None` for injected engines.
+        settings_version: Option<fotw_store::SettingVersion>,
     },
     /// The local `codex` CLI, BYO ChatGPT/Codex subscription.
     Codex {
         /// The resolved binary.
         binary: PathBuf,
+        /// Policy generation selected by the resolver; `None` for injected engines.
+        settings_version: Option<fotw_store::SettingVersion>,
     },
 }
 
@@ -204,13 +244,28 @@ impl std::fmt::Debug for Engine {
         // Never the key. §10's never-log rule does not stop at log files.
         match self {
             Self::Anthropic { .. } => f.write_str("Engine::Anthropic(<redacted>)"),
-            Self::ClaudeCli { binary } => f.debug_tuple("Engine::ClaudeCli").field(binary).finish(),
-            Self::Codex { binary } => f.debug_tuple("Engine::Codex").field(binary).finish(),
+            Self::ClaudeCli { binary, .. } => {
+                f.debug_tuple("Engine::ClaudeCli").field(binary).finish()
+            }
+            Self::Codex { binary, .. } => f.debug_tuple("Engine::Codex").field(binary).finish(),
         }
     }
 }
 
 impl Engine {
+    pub(crate) fn settings_version(&self) -> Option<&fotw_store::SettingVersion> {
+        match self {
+            Self::Anthropic {
+                settings_version, ..
+            }
+            | Self::ClaudeCli {
+                settings_version, ..
+            }
+            | Self::Codex {
+                settings_version, ..
+            } => settings_version.as_ref(),
+        }
+    }
     /// The binary this engine runs, for the CLI engines.
     ///
     /// `None` for the API engine, which runs no subprocess. Exists so a status
@@ -220,7 +275,7 @@ impl Engine {
     pub fn binary(&self) -> Option<&std::path::Path> {
         match self {
             Self::Anthropic { .. } => None,
-            Self::ClaudeCli { binary } | Self::Codex { binary } => Some(binary),
+            Self::ClaudeCli { binary, .. } | Self::Codex { binary, .. } => Some(binary),
         }
     }
 }
@@ -232,7 +287,7 @@ pub enum EngineResolution {
     /// An engine, ready to build adapters from.
     Engine(Engine),
     /// Nobody has configured one: no API key, and no acknowledged CLI.
-    /// Summaries stay local and nothing leaves the device.
+    /// No summary model calls are dispatched; ASR and export are separate.
     NoneConfigured,
     /// A CLI *is* configured and acknowledged, and this machine cannot find
     /// its binary. The string is what the settings row holds, because a status
@@ -255,10 +310,10 @@ impl EngineResolution {
     pub fn label(&self) -> String {
         match self {
             Self::Engine(Engine::Anthropic { .. }) => "anthropic-api".to_owned(),
-            Self::Engine(Engine::ClaudeCli { binary }) => {
+            Self::Engine(Engine::ClaudeCli { binary, .. }) => {
                 format!("claude-cli {}", binary.display())
             }
-            Self::Engine(Engine::Codex { binary }) => format!("codex-cli {}", binary.display()),
+            Self::Engine(Engine::Codex { binary, .. }) => format!("codex-cli {}", binary.display()),
             Self::NoneConfigured => "none".to_owned(),
             Self::Unresolvable { configured } => format!("unresolvable ({configured})"),
         }
@@ -268,10 +323,9 @@ impl EngineResolution {
 /// Pick the engine for this machine, and say which of the three states it is
 /// in when there is none.
 ///
-/// An Anthropic API key always wins — it is explicit configuration and keeps
-/// the pre-CLI behavior byte-for-byte. With no key, the enabled-and-
-/// acknowledged CLI serves, `cli_kind` deciding which. With neither,
-/// enrichment stays local and nothing leaves the device.
+/// Explicit destination policy is checked before credentials or binary
+/// lookup. Only legacy libraries retain API-key precedence. A resolved engine
+/// is bound to the current policy revision before it can dispatch model calls.
 ///
 /// An enabled-but-unacknowledged CLI reports as [`EngineResolution::NoneConfigured`],
 /// not as unresolvable: without the acknowledgement nothing is configured yet,
@@ -279,12 +333,32 @@ impl EngineResolution {
 /// wrong thing.
 #[must_use]
 pub fn resolve_engine_detailed(store: &dyn KeyStore, db: &Db) -> EngineResolution {
-    if let Ok(key) = store.get(SecretKey::ApiKey(Provider::Anthropic)) {
-        return EngineResolution::Engine(Engine::Anthropic { key });
+    let Ok(version) = db.setting_version(SETTINGS_KEY) else {
+        return EngineResolution::NoneConfigured;
+    };
+    let settings = match version.value() {
+        None => SummarizeSettings::default(),
+        Some(value) => match serde_json::from_str::<SummarizeSettings>(value) {
+            Ok(settings) => settings,
+            Err(_) => return EngineResolution::NoneConfigured,
+        },
+    };
+    if settings.allows_api_key()
+        && let Ok(key) = store.get(SecretKey::ApiKey(Provider::Anthropic))
+    {
+        if !version.is_current(db).unwrap_or(false) {
+            return EngineResolution::NoneConfigured;
+        }
+        return EngineResolution::Engine(Engine::Anthropic {
+            key,
+            settings_version: Some(version),
+        });
     }
 
-    let settings = SummarizeSettings::read(db);
-    if !settings.cli_enabled || !settings.acknowledged_egress || settings.binary.is_empty() {
+    let Some(kind) = settings.selected_cli() else {
+        return EngineResolution::NoneConfigured;
+    };
+    if settings.binary.is_empty() {
         return EngineResolution::NoneConfigured;
     }
     // Resolved now rather than at call time: "no engine" at resolution is a
@@ -295,9 +369,15 @@ pub fn resolve_engine_detailed(store: &dyn KeyStore, db: &Db) -> EngineResolutio
             configured: settings.binary,
         };
     };
-    EngineResolution::Engine(match settings.cli_kind {
-        CliKind::Claude => Engine::ClaudeCli { binary },
-        CliKind::Codex => Engine::Codex { binary },
+    EngineResolution::Engine(match kind {
+        CliKind::Claude => Engine::ClaudeCli {
+            binary,
+            settings_version: Some(version),
+        },
+        CliKind::Codex => Engine::Codex {
+            binary,
+            settings_version: Some(version),
+        },
     })
 }
 
@@ -817,6 +897,7 @@ mod tests {
 
     fn enable(db: &mut Db, kind: CliKind, binary: &str) {
         let settings = SummarizeSettings {
+            policy: None,
             cli_enabled: true,
             acknowledged_egress: true,
             cli_kind: kind,
@@ -888,6 +969,7 @@ mod tests {
         let store = InMemoryKeyStore::new();
         let mut db = db();
         let settings = SummarizeSettings {
+            policy: None,
             cli_enabled: true,
             acknowledged_egress: false, // enabled, but not acknowledged
             cli_kind: CliKind::Codex,

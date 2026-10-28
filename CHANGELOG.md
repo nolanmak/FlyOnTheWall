@@ -55,6 +55,18 @@ Windows, but neither captures anything.
   (or, offline, `fotwd stt models import silero-v5.1.2 <file>`), or reinstall
   your Whisper model from Transcription settings, which adds it. The refusal
   message names the same command.
+- `fotw-speechd-client` (#243): the protocol and process owner for the
+  FluidAudio speech helper that later issues run Parakeet, Silero VAD and the
+  streaming engines through
+  ([docs/SPEECHD_PROTOCOL.md](docs/SPEECHD_PROTOCOL.md)). It restarts a crashed
+  helper at most 3 times in a row, 2 s apart, and fails open streams at once
+  instead of waiting on it. Nothing uses it yet.
+- `fotw-speechd` (#243), the Swift helper itself
+  ([helpers/fotw-speechd](helpers/fotw-speechd/README.md)): Parakeet Unified
+  and Silero VAD through FluidAudio, models pinned to exact revisions with
+  per-file SHA-256 and installed only by an explicit setup action, and model-free
+  fake engines that the Rust protocol tests run against on macOS. Built only
+  with `FOTW_FLUIDAUDIO_SOURCE`; `just speechd-real` is its real-model suite.
 
 #### Library and keys
 
@@ -123,5 +135,10 @@ Windows, but neither captures anything.
 - A Cargo workspace pinned to Rust 1.95.0, CI (formatting, clippy, tests on
   Ubuntu and macOS, cargo-deny, and the platform-seam guard), and `justfile`
   recipes to bundle, dev-sign, verify, release-sign and notarize the `.app`.
+- `FOTW_SPEECHD=1` (#243) adds the speech helper to the bundle as
+  `Contents/Helpers/fotw-speechd`, signed with its own identifier, the hardened
+  runtime and no entitlements. `just verify-bundle` fails if it ever carries the
+  microphone entitlement, and now also runs `codesign --verify --deep --strict`.
+  Without the variable the bundle is unchanged.
 
 [Unreleased]: https://github.com/nolanmak/FlyOnTheWall/commits/main

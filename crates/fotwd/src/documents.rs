@@ -20,6 +20,7 @@ const AUTO_KEY: &str = "sharing_documents_automatic";
 const DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 const FAILED: &str = "Could not create the document. Check the summary engine settings and try again. Your previous draft is unchanged.";
 const STALE: &str = "This document changed in another window. Reload the saved draft before saving or regenerating.";
+use crate::summary_guard::{GuardedAdapter, PolicyStamp, changed};
 
 /// Whether enrichment should prepare a sharing draft. Uses the approved summary engine.
 pub fn automatic(db: &Db) -> bool {
@@ -64,12 +65,25 @@ fn save(
     revision: i64,
     document: &SharingDocument,
 ) -> Result<DocumentState, String> {
+    save_checked(db, id, revision, document, None)
+}
+
+fn save_checked(
+    db: &mut Db,
+    id: &str,
+    revision: i64,
+    document: &SharingDocument,
+    version: Option<&fotw_store::SettingVersion>,
+) -> Result<DocumentState, String> {
     if read(db, id)?.revision != revision {
         return Err(STALE.to_owned());
     }
     let json = serde_json::to_string(document).map_err(|_| FAILED.to_owned())?;
-    db.save_sharing_document(id, revision, &json)
-        .map_err(|_| STALE.to_owned())?;
+    match version {
+        Some(version) => db.save_sharing_document_if_setting(id, revision, &json, version),
+        None => db.save_sharing_document(id, revision, &json),
+    }
+    .map_err(|_| STALE.to_owned())?;
     read(db, id)
 }
 
@@ -363,13 +377,15 @@ async fn generate(
     engine: &crate::engine::Engine,
     input: &Input,
     prefs: &DocumentRequest,
+    check: &(dyn Fn() -> Result<(), fotw_summarize::SummarizeError> + Send + Sync),
 ) -> Result<SharingDocument, String> {
     let model = Preset::Balanced
         .prose_model()
         .ok_or_else(|| FAILED.to_owned())?;
     let transport = Arc::new(crate::transport::AllowlistedTransport::new());
     let adapters = crate::summarize::engine_adapters(engine, &transport, model, model, DEADLINE);
-    generate_with(adapters.prose.as_ref(), input, prefs, &adapters.model).await
+    let guarded = GuardedAdapter::new(adapters.prose.as_ref(), check);
+    generate_with(&guarded, input, prefs, &adapters.model).await
 }
 
 async fn generate_with(
@@ -432,14 +448,22 @@ pub async fn prepare_automatic(
         return Ok(());
     }
     let input = prepare(db, id)?;
-    let doc = generate(engine, &input, &DocumentRequest::default()).await?;
+    let stamp = PolicyStamp::capture(db, engine).map_err(|_| FAILED.to_owned())?;
+    let doc = {
+        let borrowed = Mutex::new(&mut *db);
+        let check = || {
+            let db = borrowed.lock().map_err(|_| changed())?;
+            stamp.check(&db)
+        };
+        generate(engine, &input, &DocumentRequest::default(), &check).await?
+    };
     // Another window may have saved one while the engine ran.
     if db
         .sharing_document(id)
         .map_err(|_| FAILED.to_owned())?
         .is_none()
     {
-        save(db, id, 0, &doc)?;
+        save_checked(db, id, 0, &doc, Some(stamp.version()))?;
     }
     Ok(())
 }
@@ -580,20 +604,28 @@ impl DocumentControl for Documents {
                                 "Choose a summary engine in Settings before creating a document."
                                     .to_owned()
                             })?;
-                        Ok((state, Some((input, engine))))
+                        let stamp =
+                            PolicyStamp::capture(&db, &engine).map_err(|_| FAILED.to_owned())?;
+                        Ok((state, Some((input, engine, stamp))))
                     }
                 }
             })
             .await
             .map_err(|_| FAILED.to_owned())??;
-            let Some((input, engine)) = work else {
+            let Some((input, engine, stamp)) = work else {
                 return Ok(state);
             };
-            let doc = generate(&engine, &input, &prefs).await?;
+            let doc = {
+                let check = || {
+                    let db = self.db.lock().map_err(|_| changed())?;
+                    stamp.check(&db)
+                };
+                generate(&engine, &input, &prefs, &check).await?
+            };
             let db = self.db.clone();
             tokio::task::spawn_blocking(move || {
                 let mut db = db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                save(&mut db, &id, prefs.revision, &doc)
+                save_checked(&mut db, &id, prefs.revision, &doc, Some(stamp.version()))
             })
             .await
             .map_err(|_| FAILED.to_owned())?
@@ -899,6 +931,7 @@ mod tests {
         let id = meeting(&mut db);
         let engine = crate::engine::Engine::ClaudeCli {
             binary: "/does-not-exist".into(),
+            settings_version: None,
         };
         db.meetings().set_state(&id, "recording").unwrap();
         prepare_automatic(&mut db, &engine, &id).await.unwrap();
@@ -925,6 +958,60 @@ mod tests {
     }
     #[cfg(unix)]
     #[tokio::test]
+    async fn policy_change_during_document_generation_prevents_a_late_draft_save() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.sqlite3");
+        let key = fotw_store::DbKey::from_bytes([5; 32]);
+        let mut db = Db::open(&path, &key).unwrap();
+        let id = meeting(&mut db);
+        let binary = dir.path().join(crate::testing::STUB_ENGINE_NAME);
+        let entered = dir.path().join("entered");
+        let release = dir.path().join("release");
+        let answer = json!({"title":"Demo recap","purpose":"Review a demo","audience":"Team",
+            "sections":[{"heading":"Discussion","body":"A demo meeting.","kind":"meeting","evidence":[0]}],
+            "end_index":0,"omit_ranges":[],"review_notes":[]});
+        let envelope = json!({"is_error":false,"result":answer.to_string()})
+            .to_string()
+            .replace('\'', "'\\''");
+        let quote =
+            |p: &std::path::Path| format!("'{}'", p.to_string_lossy().replace('\'', "'\\''"));
+        std::fs::write(&binary,format!("#!/bin/sh\ncat >/dev/null\n: > {}\nwhile [ ! -e {} ]; do /bin/sleep 0.01; done\nprintf '%s\\n' '{envelope}'\n",quote(&entered),quote(&release))).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let original = json!({"policy":"claude_cli","cli_enabled":true,"acknowledged_egress":true,"binary":binary.to_string_lossy()}).to_string();
+        db.put_setting("summarize", &original).unwrap();
+        let mut writer = Db::open(&path, &key).unwrap();
+        let store = Box::leak(Box::new(fotw_secrets::InMemoryKeyStore::new()));
+        let controller = Documents::new(db, store);
+        let request = DocumentRequest {
+            action: DocumentAction::Generate,
+            ..DocumentRequest::default()
+        };
+        let change = async {
+            let until = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !entered.exists() {
+                assert!(
+                    tokio::time::Instant::now() < until,
+                    "owned CLI did not reach its barrier"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            writer
+                .put_setting("summarize", r#"{"policy":"off"}"#)
+                .unwrap();
+            writer.put_setting("summarize", &original).unwrap();
+            std::fs::write(&release, "").unwrap();
+        };
+        let (result, ()) = tokio::join!(controller.run(id.clone(), request), change);
+        assert!(
+            result.is_err(),
+            "policy change must fence a late document response"
+        );
+        assert!(writer.sharing_document(&id).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn automatic_generation_saves_a_draft_through_the_cli_adapter() {
         use std::os::unix::fs::PermissionsExt;
         let mut db = Db::open_in_memory(&fotw_store::DbKey::from_bytes([5; 32])).unwrap();
@@ -942,7 +1029,10 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let engine = crate::engine::Engine::ClaudeCli { binary };
+        let engine = crate::engine::Engine::ClaudeCli {
+            binary,
+            settings_version: None,
+        };
         prepare_automatic(&mut db, &engine, &id).await.unwrap();
         let state = read(&mut db, &id).unwrap();
         assert_eq!(state.revision, 1);

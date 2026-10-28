@@ -63,6 +63,7 @@ impl SummarizeControl for FakeSummarize {
             resolved_binary: (!settings.binary.is_empty())
                 .then(|| format!("/opt/homebrew/bin/{}", settings.binary)),
             api_key_present: false,
+            api_key_checked: true,
             disclosures: SummarizeStatus::all_disclosures(),
         }
     }
@@ -402,6 +403,7 @@ async fn no_secret_field_exists_on_this_api() {
     assert_eq!(
         fields(&v["status"]),
         [
+            "api_key_checked",
             "api_key_present",
             "binary_resolves",
             "configured_binary",

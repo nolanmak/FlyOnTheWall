@@ -90,6 +90,8 @@ const el = {
   sumBinary: document.getElementById("sum-binary"),
   sumDisclosure: document.getElementById("sum-disclosure"),
   sumAck: document.getElementById("sum-ack"),
+  sumAckRow: document.getElementById("sum-ack-row"),
+  sumBinaryRow: document.getElementById("sum-binary-row"),
   sumEnabled: document.getElementById("sum-enabled"),
   sumSave: document.getElementById("sum-save"),
   sumStatus: document.getElementById("sum-status"),
@@ -1827,10 +1829,14 @@ let summarizeDisclosures = {};
 
 function renderSummarizeForm(body) {
   const s = body.settings;
-  el.sumKind.value = s.cli_kind || "claude";
+  const kind = s.policy === "local_only" || s.policy === "anthropic" ? s.policy
+    : s.policy === "codex_cli" ? "codex" : s.policy === "claude_cli" ? "claude"
+    : !s.policy && body.status.engine === "anthropic" ? "anthropic" : s.cli_kind || "claude";
+  el.sumKind.value = kind;
   el.sumBinary.value = s.binary || "";
   el.sumAck.checked = Boolean(s.acknowledged_egress);
-  el.sumEnabled.checked = Boolean(s.cli_enabled);
+  el.sumEnabled.checked = s.policy ? s.policy !== "off"
+    : Boolean(s.cli_enabled || body.status.engine === "anthropic");
   summarizeDisclosures = body.status.disclosures || {};
   paintDisclosure();
   el.sumStatus.textContent = summarizeStatusLine(body.status);
@@ -1842,15 +1848,34 @@ function renderSummarizeForm(body) {
 // wrong disclosure collects an acknowledgement of facts that are not true of
 // what is about to be saved.
 function paintDisclosure() {
-  const lines = summarizeDisclosures[el.sumKind.value] || [];
-  el.sumDisclosure.textContent = lines.join(" ");
+  const enabled = el.sumEnabled.checked, local = el.sumKind.value === "local_only";
+  const cli = ["claude", "codex"].includes(el.sumKind.value);
+  el.sumAckRow.hidden = !enabled || local;
+  el.sumAck.disabled = !enabled || local;
+  el.sumBinaryRow.hidden = !cli || !enabled;
+  el.sumBinary.disabled = !cli || !enabled;
+  if (!enabled || local) el.sumAck.checked = false;
+  el.sumDisclosure.textContent = !enabled ? "Summary model calls are off, including stored hosted keys."
+    : local ? "On-device summaries require local model setup. No automatic cloud fallback."
+    : (summarizeDisclosures[el.sumKind.value] || []).join(" ");
+}
+
+function onSummaryDestinationChange() {
+  el.sumAck.checked = false;
+  paintDisclosure();
 }
 
 // What the daemon actually resolves — the diagnostic that cannot lie, since it
 // is the daemon's own answer and not the shell's.
 function summarizeStatusLine(status) {
   if (status.engine === "anthropic") {
-    return "Engine: the Anthropic API (a key is in your keychain, and it wins over any CLI).";
+    return "Summary destination: Anthropic API (hosted).";
+  }
+  if (status.engine === "off") {
+    return "Summaries are off. Stored hosted keys are not used.";
+  }
+  if (status.engine === "local-setup-required") {
+    return "Summary destination: On this Mac. Local model setup required; no cloud fallback.";
   }
   if (status.engine === "none") {
     if (status.configured_binary && !status.binary_resolves) {
@@ -1885,14 +1910,19 @@ async function loadSummarize() {
 async function onSummarizeSave() {
   el.sumSave.disabled = true;
   try {
+    const policy = !el.sumEnabled.checked ? "off"
+      : ({claude:"claude_cli",codex:"codex_cli",anthropic:"anthropic",local_only:"local_only"}[el.sumKind.value] || "off");
+    const cli = ["claude_cli", "codex_cli"].includes(policy);
+    const hosted = ["anthropic", "claude_cli", "codex_cli"].includes(policy);
     const body = await api("/api/settings/summarize", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        cli_enabled: el.sumEnabled.checked,
-        acknowledged_egress: el.sumAck.checked,
-        cli_kind: el.sumKind.value,
-        binary: el.sumBinary.value,
+        policy,
+        cli_enabled: cli,
+        acknowledged_egress: hosted && el.sumAck.checked,
+        cli_kind: el.sumKind.value === "codex" ? "codex" : "claude",
+        binary: cli ? el.sumBinary.value : "",
       }),
     });
     if (body.error === "disclosure_required") {
@@ -1910,12 +1940,18 @@ async function onSummarizeSave() {
     renderSummarizeForm(body);
     // The open meeting's "no summary" line depends on the engine, so redraw.
     if (currentDetail) renderDetail(currentDetail);
-    if (body.settings.cli_enabled && body.status.binary_resolves) {
+    if (body.status.engine === "local-setup-required") {
+      say("Saved. On-device summaries: local model setup required; no cloud fallback.");
+    } else if (body.status.engine === "anthropic") {
+      say("Saved. Summaries use the hosted Anthropic API.");
+    } else if (body.settings.cli_enabled && body.status.binary_resolves) {
       say("Saved. Finished meetings now get a summary and action items.");
     } else if (body.settings.cli_enabled) {
       // Saved but inert: say so rather than promising summaries that will not
       // appear — the exact silence #74 is about.
       say("Saved, but `" + body.status.configured_binary + "` does not resolve here. Enter a full path.");
+    } else if (body.settings.policy === "anthropic") {
+      say("Saved. Anthropic selected, but an acknowledged stored API key is required.");
     } else {
       say("Saved. Summaries are off.");
     }
@@ -2237,7 +2273,8 @@ async function main() {
   el.sumSave.addEventListener("click", onSummarizeSave);
   // The disclosure differs per engine, so it follows the picker rather than
   // waiting for a save.
-  el.sumKind.addEventListener("change", paintDisclosure);
+  el.sumKind.addEventListener("change", onSummaryDestinationChange);
+  el.sumEnabled.addEventListener("change", paintDisclosure);
   el.ghSettings.addEventListener("toggle", function () {
     if (el.ghSettings.open) loadGithubRepos();
   });
