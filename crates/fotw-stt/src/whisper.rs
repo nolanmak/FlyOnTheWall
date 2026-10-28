@@ -21,9 +21,9 @@ use whisper_rs::{
     WhisperVadContext, WhisperVadContextParams,
 };
 
-use crate::cleanup::is_filler_hallucination;
+use crate::cleanup::should_drop;
 use crate::local::{PROVIDER, Recognized, Recognizer, RecognizerFactory, SAMPLE_RATE};
-use crate::vad::{GateConfig, GatedRecognizer, SpeechDetector, WINDOW_SAMPLES};
+use crate::vad::{GateConfig, GatedRecognizer, SpeechDetector, WINDOW_SAMPLES, overlaps_speech};
 use crate::{SttError, SttErrorClass};
 
 /// whisper.cpp declines input under 100 ms and is unreliable on much under a
@@ -294,6 +294,25 @@ struct WhisperRecognizer {
 
 impl Recognizer for WhisperRecognizer {
     fn transcribe(&mut self, pcm: &[f32]) -> Result<Vec<Recognized>, SttError> {
+        self.decode(pcm, None)
+    }
+
+    fn transcribe_speech(
+        &mut self,
+        pcm: &[f32],
+        speech: &[std::ops::Range<usize>],
+    ) -> Result<Vec<Recognized>, SttError> {
+        self.decode(pcm, Some(speech))
+    }
+}
+
+impl WhisperRecognizer {
+    /// Decode one chunk. `speech` is the gate's speech regions, when gated.
+    fn decode(
+        &mut self,
+        pcm: &[f32],
+        speech: Option<&[std::ops::Range<usize>]>,
+    ) -> Result<Vec<Recognized>, SttError> {
         let mut padded = Vec::new();
         let audio = if pcm.len() < MIN_SAMPLES {
             padded.extend_from_slice(pcm);
@@ -338,13 +357,18 @@ impl Recognizer for WhisperRecognizer {
                 )
                 .with_detail(error.to_string())
             })?;
-            // Whisper's stock phrases over audio it doubted was speech.
-            if is_filler_hallucination(&text, segment.no_speech_probability()) {
+            let start_ms = centiseconds_to_ms(segment.start_timestamp());
+            let end_ms = centiseconds_to_ms(segment.end_timestamp());
+            // Stock phrases and bare labels over audio the model doubted was
+            // speech — unless the gate heard speech there: silenced stretches
+            // raise the doubt of every segment in the window.
+            let heard = speech.is_some_and(|regions| overlaps_speech(start_ms, end_ms, regions));
+            if should_drop(&text, segment.no_speech_probability(), heard) {
                 continue;
             }
             recognized.push(Recognized {
-                start_ms: centiseconds_to_ms(segment.start_timestamp()),
-                end_ms: centiseconds_to_ms(segment.end_timestamp()),
+                start_ms,
+                end_ms,
                 text: text.trim().to_owned(),
             });
         }

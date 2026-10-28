@@ -186,3 +186,152 @@ async fn non_speech_around_a_speech_region_is_silenced_in_place() {
         "the speech itself was silenced"
     );
 }
+
+// ---- Timing through the gate: the model's times must come from the audio.
+
+/// Times its one segment by where the audio it was given is not silent, and
+/// remembers the speech regions the gate reported.
+struct AudioTimed {
+    regions: Arc<Mutex<Vec<Vec<std::ops::Range<usize>>>>>,
+}
+
+impl Recognizer for AudioTimed {
+    fn transcribe(&mut self, pcm: &[f32]) -> Result<Vec<Recognized>, SttError> {
+        let first = pcm.iter().position(|&s| s != 0.0).unwrap_or(0);
+        let last = pcm.iter().rposition(|&s| s != 0.0).map_or(0, |i| i + 1);
+        Ok(vec![Recognized {
+            start_ms: (first / RATE_PER_MS) as u64,
+            end_ms: (last / RATE_PER_MS) as u64,
+            text: "heard".into(),
+        }])
+    }
+
+    fn transcribe_speech(
+        &mut self,
+        pcm: &[f32],
+        speech: &[std::ops::Range<usize>],
+    ) -> Result<Vec<Recognized>, SttError> {
+        self.regions.lock().unwrap().push(speech.to_vec());
+        self.transcribe(pcm)
+    }
+}
+
+/// Scores the n-th chunk it sees with the n-th probability, every window.
+struct PerChunk(std::collections::VecDeque<f32>);
+
+impl SpeechDetector for PerChunk {
+    fn probabilities(&mut self, pcm: &[f32]) -> Result<Vec<f32>, SttError> {
+        let p = self.0.pop_front().unwrap_or(0.0);
+        Ok(vec![p; pcm.len().div_ceil(WINDOW_SAMPLES)])
+    }
+}
+
+struct Built<F: Fn() -> Box<dyn Recognizer> + Send + Sync>(F);
+
+impl<F: Fn() -> Box<dyn Recognizer> + Send + Sync> RecognizerFactory for Built<F> {
+    fn model(&self) -> &str {
+        "scripted"
+    }
+    fn language(&self) -> Option<&str> {
+        None
+    }
+    fn create(&self) -> Result<Box<dyn Recognizer>, SttError> {
+        Ok((self.0)())
+    }
+}
+
+async fn finals_for(engine: Arc<dyn RecognizerFactory>, pcm: &[i16]) -> Vec<TranscriptSegment> {
+    let config = LocalStreamConfig::new("s1", Source::System).with_session_offset_ms(5_000);
+    let (stream, mut rx) = LocalStream::open(config, engine);
+    for piece in pcm.chunks(320) {
+        stream.write(piece);
+    }
+    stream.close().await.unwrap();
+    let mut finals = Vec::new();
+    while let Some(event) = rx.recv().await {
+        if let StreamEvent::Final(segment) = event {
+            finals.push(segment);
+        }
+    }
+    finals
+}
+
+#[tokio::test]
+async fn timestamps_follow_the_audio_through_a_silenced_chunk() {
+    let regions = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&regions);
+    let engine = Arc::new(Built(move || -> Box<dyn Recognizer> {
+        Box::new(GatedRecognizer::new(
+            Box::new(Probabilities {
+                speech: 1_500..2_500,
+                high: 0.9,
+                low: 0.05,
+            }),
+            Box::new(AudioTimed {
+                regions: Arc::clone(&seen),
+            }),
+            GateConfig::default(),
+        ))
+    }));
+    let mut pcm = silence(990);
+    pcm.extend(loud(3_000));
+    pcm.extend(silence(990));
+    let finals = finals_for(engine, &pcm).await;
+    assert_eq!(finals.len(), 1);
+    // Speech windows run from 1504 ms (window 47) to 2528 ms (window 79), and
+    // 300 ms of padding either side leaves 1204..2828 ms of the chunk audible.
+    // The chunk starts at 690 ms and the leg at 5000 ms.
+    assert_eq!(
+        (finals[0].start_ms, finals[0].end_ms),
+        (5_000 + 690 + 1_204, 5_000 + 690 + 2_828),
+        "the model's times must be where the kept audio is"
+    );
+    assert_eq!(
+        *regions.lock().unwrap(),
+        vec![vec![1_204 * RATE_PER_MS..2_828 * RATE_PER_MS]],
+        "the model must be told which audio the gate heard as speech"
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_chunk_does_not_shift_the_next_one() {
+    let mut pcm = silence(990);
+    pcm.extend(loud(1_500));
+    pcm.extend(silence(990));
+    pcm.extend(loud(1_500));
+    pcm.extend(silence(990));
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let ungated = finals_for(
+        Arc::new(Factory {
+            heard: Arc::clone(&heard),
+            gate: None,
+        }),
+        &pcm,
+    )
+    .await;
+    assert_eq!(ungated.len(), 2);
+
+    let gated_heard = Arc::new(Mutex::new(Vec::new()));
+    let model_heard = Arc::clone(&gated_heard);
+    let gated = finals_for(
+        Arc::new(Built(move || -> Box<dyn Recognizer> {
+            Box::new(GatedRecognizer::new(
+                // First chunk is music, second is speech.
+                Box::new(PerChunk([0.1, 0.9].into())),
+                Box::new(Scripted {
+                    heard: Arc::clone(&model_heard),
+                }),
+                GateConfig::default(),
+            ))
+        })),
+        &pcm,
+    )
+    .await;
+    assert_eq!(gated.len(), 1, "{gated:?}");
+    assert_eq!(gated_heard.lock().unwrap().len(), 1);
+    assert_eq!(
+        (gated[0].start_ms, gated[0].end_ms),
+        (ungated[1].start_ms, ungated[1].end_ms),
+        "the surviving chunk keeps its own recording time"
+    );
+}

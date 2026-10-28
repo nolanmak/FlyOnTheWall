@@ -129,6 +129,16 @@ pub fn speech_regions(
     regions
 }
 
+/// Whether `start_ms..end_ms` of a chunk overlaps any of the gate's speech
+/// `regions` (sample ranges in the same chunk).
+#[must_use]
+pub fn overlaps_speech(start_ms: u64, end_ms: u64, regions: &[std::ops::Range<usize>]) -> bool {
+    let from = start_ms as usize * SAMPLES_PER_MS;
+    // A zero-length segment still sits somewhere: count its first sample.
+    let to = (end_ms as usize * SAMPLES_PER_MS).max(from + 1);
+    regions.iter().any(|r| from < r.end && to > r.start)
+}
+
 /// A [`Recognizer`] that only lets speech through to the one it wraps.
 pub struct GatedRecognizer {
     detector: Box<dyn SpeechDetector>,
@@ -158,15 +168,15 @@ impl Recognizer for GatedRecognizer {
         let regions = speech_regions(&probabilities, pcm.len(), &self.config);
         match regions.as_slice() {
             [] => Ok(Vec::new()),
-            [all] if *all == (0..pcm.len()) => self.inner.transcribe(pcm),
+            [all] if *all == (0..pcm.len()) => self.inner.transcribe_speech(pcm, &regions),
             _ => {
                 // Silence in place rather than cut out: the chunk keeps its
                 // length, so the model's times inside it stay recording times.
                 let mut masked = vec![0.0; pcm.len()];
-                for region in regions {
-                    masked[region.clone()].copy_from_slice(&pcm[region]);
+                for region in &regions {
+                    masked[region.clone()].copy_from_slice(&pcm[region.clone()]);
                 }
-                self.inner.transcribe(&masked)
+                self.inner.transcribe_speech(&masked, &regions)
             }
         }
     }
@@ -184,6 +194,20 @@ mod tests {
     }
 
     const MS_PER_WINDOW: usize = WINDOW_SAMPLES / SAMPLES_PER_MS;
+
+    #[test]
+    fn segment_overlap_with_speech_is_measured_in_chunk_time() {
+        let ms = SAMPLES_PER_MS;
+        let regions = [1_000 * ms..2_000 * ms, 5_000 * ms..6_000 * ms];
+        assert!(overlaps_speech(1_500, 1_600, &regions));
+        assert!(overlaps_speech(500, 1_001, &regions));
+        assert!(overlaps_speech(1_999, 5_500, &regions));
+        assert!(!overlaps_speech(2_000, 5_000, &regions));
+        assert!(!overlaps_speech(0, 1_000, &regions));
+        assert!(!overlaps_speech(6_000, 9_000, &regions));
+        // A zero-length segment inside speech still counts.
+        assert!(overlaps_speech(1_500, 1_500, &regions));
+    }
 
     #[test]
     fn nothing_above_the_threshold_is_no_speech() {

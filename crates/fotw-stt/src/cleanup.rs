@@ -172,6 +172,35 @@ const SOUND_LABELS: &[&str] = &[
     "no speech",
 ];
 
+/// Whether a sound label is marked as one — bracketed or written in notes,
+/// `(Music)`, `[Applause]`, `♪` — so it can be dropped with no other evidence.
+/// A bare `Music.` could be someone's one-word answer.
+#[must_use]
+pub fn is_marked_sound_label(text: &str) -> bool {
+    is_sound_label(text) && text.contains(['[', '(', '♪', '♫', '♬', '♩'])
+}
+
+/// Whether a model segment should be dropped as non-speech.
+///
+/// Judged on the text as it would be shown, after [`remove_artifacts`], so
+/// `[Music] Thank you.` is judged as `Thank you.`. Marked sound labels always
+/// go. Stock phrases and bare sound labels go only when the model doubted the
+/// audio was speech (`no_speech_probability` at least
+/// [`FILLER_NO_SPEECH_THRESHOLD`]) *and* the segment does not overlap audio the
+/// speech gate heard as speech: inside a gated chunk, the silenced stretches
+/// raise the model's doubt for every segment in its window, including a real
+/// "Thank you." beside them.
+#[must_use]
+pub fn should_drop(text: &str, no_speech_probability: f32, overlaps_speech: bool) -> bool {
+    let shown = remove_artifacts(text);
+    if shown.is_empty() || is_marked_sound_label(&shown) || crate::local::is_non_speech(&shown) {
+        return true;
+    }
+    !overlaps_speech
+        && (is_filler_hallucination(&shown, no_speech_probability)
+            || (no_speech_probability >= FILLER_NO_SPEECH_THRESHOLD && is_sound_label(&shown)))
+}
+
 /// Whisper's stock phrases over non-speech, normalised: lowercase, letters,
 /// digits, apostrophes and single spaces.
 const FILLERS: &[&str] = &[
@@ -283,6 +312,62 @@ mod tests {
             "♪ We will rock you ♪",
         ] {
             assert!(!is_sound_label(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn only_marked_sound_labels_drop_without_evidence() {
+        for text in [
+            "(Music)",
+            "[Music]",
+            "♪",
+            "♪ ♪",
+            "♪ Music ♪",
+            "[MUSIC PLAYING]",
+            "(laughter)",
+        ] {
+            assert!(is_marked_sound_label(text), "{text:?}");
+        }
+        for text in [
+            "Music",
+            "Music.",
+            "Applause.",
+            "",
+            "Thank you.",
+            "♪ We will rock you ♪",
+        ] {
+            assert!(!is_marked_sound_label(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn segments_are_judged_as_shown_with_their_doubt_and_the_gate() {
+        // (text, no-speech probability, overlaps gate speech, dropped?)
+        let table: &[(&str, f32, bool, bool)] = &[
+            // Artifacts stripped first: the #242 bug was this line surviving.
+            ("[Music] Thank you.", 0.5, false, true),
+            ("Thank you. [BLANK_AUDIO]", 0.5, false, true),
+            ("[Music] Thank you.", 0.1, false, false),
+            // A real "Thank you." beside silenced music keeps its place.
+            ("Thank you.", 0.8, true, false),
+            ("Thank you.", 0.8, false, true),
+            // Bare labels need the model's doubt; marked labels never do.
+            ("Music.", 0.5, false, true),
+            ("Music.", 0.1, false, false),
+            ("Music.", 0.5, true, false),
+            ("(Music)", 0.0, true, true),
+            ("♪", 0.0, true, true),
+            ("[BLANK_AUDIO]", 0.0, false, true),
+            // Speech is speech.
+            ("Turn the music down.", 0.9, false, false),
+            ("Thank you for the update.", 0.9, false, false),
+        ];
+        for &(text, p, overlaps, dropped) in table {
+            assert_eq!(
+                should_drop(text, p, overlaps),
+                dropped,
+                "{text:?} at no-speech {p}, overlapping speech: {overlaps}"
+            );
         }
     }
 

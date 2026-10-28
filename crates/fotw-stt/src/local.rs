@@ -374,6 +374,23 @@ pub trait Recognizer: Send {
     /// When the model fails on this chunk. The stream reports it and carries
     /// on with the next one.
     fn transcribe(&mut self, pcm: &[f32]) -> Result<Vec<Recognized>, SttError>;
+
+    /// Transcribe audio that a speech gate has already judged: `speech` holds
+    /// the sample ranges it heard as speech, and everything else in `pcm` has
+    /// been silenced. A model that judges its own segments' doubt can use it
+    /// to tell a real word from one it wrote over the silenced stretches.
+    ///
+    /// # Errors
+    ///
+    /// As [`transcribe`](Self::transcribe).
+    fn transcribe_speech(
+        &mut self,
+        pcm: &[f32],
+        speech: &[std::ops::Range<usize>],
+    ) -> Result<Vec<Recognized>, SttError> {
+        let _ = speech;
+        self.transcribe(pcm)
+    }
 }
 
 /// Makes a [`Recognizer`] per leg from one model held in memory once.
@@ -445,8 +462,11 @@ pub fn segments_for(
         .into_iter()
         .filter_map(|r| {
             let text = crate::cleanup::remove_artifacts(&r.text);
-            let speech =
-                !text.is_empty() && !is_non_speech(&text) && !crate::cleanup::is_sound_label(&text);
+            // Only a marked label (`(Music)`, `♪`) is dropped here; a bare
+            // "Music." needs the model's doubt, judged in the recognizer.
+            let speech = !text.is_empty()
+                && !is_non_speech(&text)
+                && !crate::cleanup::is_marked_sound_label(&text);
             speech.then_some((r, text))
         })
         .map(|(r, text)| {
@@ -1103,9 +1123,16 @@ mod tests {
             ],
         );
         let texts: Vec<_> = segments.iter().map(|s| s.text.as_str()).collect();
+        // A bare "Music" could be a one-word answer; without the model's doubt
+        // (judged in the recognizer) it stays. A marked label never does.
         assert_eq!(
             texts,
-            ["Hello there.", "Right, next item.", "Turn the music down."]
+            [
+                "Hello there.",
+                "Right, next item.",
+                "Music",
+                "Turn the music down."
+            ]
         );
     }
 
