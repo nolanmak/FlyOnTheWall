@@ -12,8 +12,8 @@ The helper never opens a capture device. The parent sends it PCM.
 
 | Path | What |
 |---|---|
-| `Sources/SpeechdCore` | Frames and messages, the server, the model store, lifecycle guards, the fake engines |
-| `Sources/SpeechdFluid` | The FluidAudio engines: `parakeet-unified`, `silero-vad` |
+| `Sources/SpeechdCore` | Frames and messages, the server, the model store, lifecycle guards, the model-free diarization session and word timings, the fake engines |
+| `Sources/SpeechdFluid` | The FluidAudio engines: `parakeet-unified`, `silero-vad`, `diarizer` |
 | `Sources/fotw-speechd` | The executable |
 | `Sources/SpeechdChecks` | Model-free checks (no XCTest needed) |
 
@@ -29,7 +29,8 @@ just speechd-check
 ```
 
 This runs the Swift checks (frames, Muesli's load/shutdown generation guard,
-shared loads, a corrupt install keeping the previous selection, the pins), then
+shared loads, a corrupt install keeping the previous selection, the pins, the
+diarization session's windows, merge and speaker cap, word timings), then
 `cargo test -p fotw-speechd-client --test protocol` against this helper in
 `--fake-engines` mode. `just test` runs it on macOS.
 
@@ -82,6 +83,7 @@ check leaves the previous selection as it was. Loading reads local files only.
 | `silero-vad` | MIT |
 | `parakeet-eou-320ms` (pinned; engine in #245) | NVIDIA Open Model License |
 | `nemotron-3.5-2240ms` (pinned; engine in Murmur #100) | OpenMDW-1.1 |
+| `diarizer` (#246) | Unconfirmed: the model card scopes CC-BY-4.0 to other files and lists these two as legacy exclusions (see `THIRD_PARTY_NOTICES.md`) |
 
 ## Real-model suite
 
@@ -98,6 +100,19 @@ under `sandbox-exec` with the network denied while `lsof -i` polls the helper:
 cold and warm start, first request against the 5th, a sanity WER over the
 corpus, VAD on speech and silence, and a check that an install fails inside the
 sandbox. It prints a JSON report and exits 1 if a gate fails.
+
+### Post-meeting pass smoke (#246)
+
+```sh
+PARAKEET_DIR=<hash-checked Parakeet copy> \
+  just speechd-postpass-real <models root> <voice a.wav> <voice b.wav>
+```
+
+Installs `diarizer` (and Parakeet, from `PARAKEET_DIR` if set), mixes 180 s
+of the voices from 300 s in (`OFFSET_S`, `DURATION_S`), and requires the
+diarizer to find at least two speakers in sorted segments, and Parakeet's
+`timings` words to match its text. The voices are 16 kHz mono WAVs, for
+example two AMI headset channels of one meeting.
 
 ## Credit
 

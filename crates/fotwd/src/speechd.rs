@@ -86,8 +86,23 @@ pub const PARAKEET: HelperModel = HelperModel {
     note: "Parakeet Unified 0.6B, English; the default on-device model, run by the speech helper",
 };
 
+/// The speaker diarizer of the post-meeting cleanup (#246): the two Core ML
+/// models FluidAudio's `DiarizerManager` loads, at the revision FluidAudio
+/// 0.17.3 itself pins. The model card at that revision scopes its
+/// CC-BY-4.0 to other files of the repository and names these two as legacy
+/// exclusions whose licensing is to be evaluated separately, so the license
+/// is shown as unconfirmed (THIRD_PARTY_NOTICES.md, "Speech models").
+pub const DIARIZER: HelperModel = HelperModel {
+    id: "diarizer",
+    repository: "FluidInference/speaker-diarization-coreml",
+    revision: "df2625ac79a7ac6b65ad868fee6d80f320da4232",
+    bytes: 13_720_676,
+    license: "Unconfirmed (card: scoped-cc-by-4.0, these legacy files excluded)",
+    note: "Speaker diarization (pyannote segmentation and WeSpeaker embeddings) for the post-meeting cleanup, run by the speech helper",
+};
+
 /// Every model installed through the helper. Live captions (#245) add theirs.
-pub const HELPER_MODELS: &[HelperModel] = &[PARAKEET];
+pub const HELPER_MODELS: &[HelperModel] = &[PARAKEET, DIARIZER];
 
 /// A helper model by id.
 #[must_use]
@@ -444,6 +459,26 @@ mod tests {
         again.shutdown().await;
         let fresh = helper_with(&fake_launch(), root.path()).await.unwrap();
         assert!(fresh.health().await.is_ok());
+    }
+
+    #[test]
+    fn the_diarizer_installs_by_name_at_the_revision_fluidaudio_pins() {
+        // `fotwd stt models install diarizer` (#246).
+        let model = helper_model("diarizer").expect("the diarizer is a helper model");
+        assert_eq!(
+            (model.repository, model.revision, model.bytes),
+            (
+                "FluidInference/speaker-diarization-coreml",
+                "df2625ac79a7ac6b65ad868fee6d80f320da4232",
+                13_720_676
+            )
+        );
+        assert!(
+            model.license.contains("scoped-cc-by-4.0"),
+            "{}",
+            model.license
+        );
+        assert!(model.license_url().contains(model.revision));
     }
 
     #[test]
