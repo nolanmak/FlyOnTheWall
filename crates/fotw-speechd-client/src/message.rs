@@ -174,16 +174,21 @@ pub enum Reply {
         #[serde(default)]
         rss_bytes: Option<u64>,
     },
-    /// Install progress.
+    /// Progress of a slow request: `install`, `load` or `warmup`.
     Progress {
-        /// Request id of the install.
+        /// Request id.
         id: u64,
-        /// Model id.
-        model: String,
-        /// Bytes done.
-        bytes: u64,
-        /// Bytes in total.
-        total: u64,
+        /// What it is doing now.
+        phase: ProgressPhase,
+        /// Model id, for an install.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// Bytes done, for a download or check.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bytes: Option<u64>,
+        /// Bytes in total, for a download or check.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total: Option<u64>,
     },
     /// A model is installed, validated and selected.
     Installed {
@@ -211,6 +216,10 @@ pub enum Reply {
         /// End, in ms from the stream's first sample.
         #[serde(default)]
         end_ms: u64,
+        /// The utterance this partial belongs to. A later partial or final
+        /// with the same id replaces it in place.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        utterance: Option<u64>,
     },
     /// Committed text.
     Final(FinalText),
@@ -274,6 +283,28 @@ pub struct FinalText {
     /// `<model id>@<revision>`, for segment provenance.
     #[serde(default)]
     pub model: Option<String>,
+    /// The utterance this commits, replacing its partials. Streaming engines
+    /// number utterances from 1 within a stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub utterance: Option<u64>,
+}
+
+/// What a slow request is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressPhase {
+    /// Downloading model files.
+    Download,
+    /// Checking model files against their pins.
+    Verify,
+    /// Loading a model; the first load on a machine includes Core ML's
+    /// compile and can take tens of seconds.
+    Load,
+    /// Running the warmup chunk.
+    Warmup,
+    /// A phase this version does not know.
+    #[serde(other)]
+    Other,
 }
 
 /// One timed piece of a final.
@@ -395,6 +426,9 @@ pub struct EngineInfo {
     /// The pinned model, for real engines.
     #[serde(default)]
     pub model: Option<ModelInfo>,
+    /// Most audio one stream may carry, if the engine bounds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_audio_ms: Option<u64>,
 }
 
 /// Engine kinds.
@@ -409,6 +443,10 @@ pub enum EngineKind {
     Vad,
     /// Speaker diarization.
     Diarization,
+    /// A kind this version does not know. The client leaves such engines out
+    /// of the capabilities it reports.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A pinned model.

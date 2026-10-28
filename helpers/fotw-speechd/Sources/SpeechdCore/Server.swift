@@ -18,12 +18,14 @@ enum StreamInput: Sendable {
 final class StreamWorker: @unchecked Sendable {
     // @unchecked: `backlog` is guarded by `lock`; the rest is immutable.
     let token = UUID()
+    let engine: String
     let input: AsyncStream<StreamInput>.Continuation
     private(set) var task: Task<Void, Never>?
     private let lock = NSLock()
     private var queued = 0
 
-    init(input: AsyncStream<StreamInput>.Continuation) {
+    init(engine: String, input: AsyncStream<StreamInput>.Continuation) {
+        self.engine = engine
         self.input = input
     }
 
@@ -102,6 +104,8 @@ public actor Server {
             let out = out
             Task {
                 let clock = ContinuousClock.now
+                // A first load includes Core ML's compile: tens of seconds.
+                out.send(["type": "progress", "id": id, "phase": "load"])
                 do {
                     let result = try await engine.load()
                     self.markLoaded(name, true)
@@ -116,6 +120,7 @@ public actor Server {
             let out = out
             Task {
                 let clock = ContinuousClock.now
+                out.send(["type": "progress", "id": id, "phase": "warmup"])
                 do {
                     try await engine.warmup()
                     out.send(["type": "warmed", "id": id, "engine": name, "elapsed_ms": clock.elapsedMilliseconds])
@@ -175,6 +180,7 @@ public actor Server {
             guard let descriptor = self.engines[id]?.descriptor else { return nil }
             var info: [String: Any] = ["id": id, "kind": descriptor.kind.rawValue, "partials": descriptor.partials,
                                        "languages": descriptor.languages, "sample_rates": descriptor.sampleRates]
+            if let maxAudioMs = descriptor.maxAudioMs { info["max_audio_ms"] = maxAudioMs }
             if let model = descriptor.model {
                 info["model"] = ["id": model.id, "repository": model.repository, "revision": model.revision,
                                  "license": model.license, "installed": store?.isInstalled(model) ?? false]
@@ -204,7 +210,7 @@ public actor Server {
             return
         }
         let (inputs, continuation) = AsyncStream.makeStream(of: StreamInput.self)
-        let worker = StreamWorker(input: continuation)
+        let worker = StreamWorker(engine: name, input: continuation)
         streams[stream] = worker
         let token = worker.token
         worker.start(Task {
@@ -288,10 +294,15 @@ public actor Server {
     }
 
     private func complete(token: UUID, stream: UInt32, _ events: [EngineEvent]) {
-        guard isCurrent(token, stream) else { return }
+        guard isCurrent(token, stream), let worker = streams[stream] else { return }
         emit(token: token, stream: stream, events)
         end(stream)
         out.send(["type": "closed", "stream": stream, "reason": "finished"])
+        if worker.engine == "fake-exit-after-final" {
+            // A helper that dies right after its last result (the client must
+            // still deliver it).
+            exit(70)
+        }
     }
 
     private func streamFailed(token: UUID, stream: UInt32, _ error: Error) {
@@ -307,9 +318,12 @@ public actor Server {
 
     static func encode(_ event: EngineEvent, stream: UInt32) -> [String: Any] {
         switch event {
-        case let .partial(text, startMs, endMs):
-            return ["type": "partial", "stream": stream, "text": text, "start_ms": startMs, "end_ms": endMs]
-        case let .final(text, startMs, endMs, segments, model):
+        case let .partial(text, startMs, endMs, utterance):
+            var reply: [String: Any] = ["type": "partial", "stream": stream, "text": text, "start_ms": startMs,
+                                        "end_ms": endMs]
+            if let utterance { reply["utterance"] = utterance }
+            return reply
+        case let .final(text, startMs, endMs, segments, model, utterance):
             var reply: [String: Any] = [
                 "type": "final", "stream": stream, "text": text, "start_ms": startMs, "end_ms": endMs,
                 "segments": segments.map { segment -> [String: Any] in
@@ -320,6 +334,7 @@ public actor Server {
                 },
             ]
             if let model { reply["model"] = model }
+            if let utterance { reply["utterance"] = utterance }
             return reply
         case let .vad(kind, sample, probability):
             return ["type": "vad", "stream": stream, "event": kind.rawValue, "sample": sample,
@@ -342,10 +357,12 @@ public actor Server {
             ?? HuggingFaceFetcher()
         let out = out
         let installs = installs
+        let phase = fetcher is DirectoryFetcher ? "verify" : "download"
         Task {
             do {
                 _ = try await installs.install(model, store: store, fetcher: fetcher) { bytes, total in
-                    out.send(["type": "progress", "id": id, "model": name, "bytes": bytes, "total": total])
+                    out.send(["type": "progress", "id": id, "phase": phase,
+                              "model": name, "bytes": bytes, "total": total])
                 }
                 out.send(["type": "installed", "id": id, "model": name, "revision": model.revision])
             } catch {

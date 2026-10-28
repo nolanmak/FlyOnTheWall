@@ -11,9 +11,11 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use fotw_speechd_client::frame::{self, Frame, KIND_AUDIO, KIND_CONTROL, MAX_FRAME};
-use fotw_speechd_client::message::{CloseReason, ErrorCode, PROTOCOL_VERSION, Reply};
+use fotw_speechd_client::message::{
+    CloseReason, ErrorCode, PROTOCOL_VERSION, ProgressPhase, Reply,
+};
 use fotw_speechd_client::{
-    ClientError, RestartPolicy, SpeechStream, SpeechdClient, SpeechdConfig, StreamConfig,
+    ClientError, Progress, RestartPolicy, SpeechStream, SpeechdClient, SpeechdConfig, StreamConfig,
     StreamEvent,
 };
 
@@ -233,7 +235,13 @@ async fn client_refuses_a_helper_of_another_protocol_version() {
 
 #[tokio::test]
 async fn client_fails_open_streams_on_a_malformed_or_oversized_frame_from_the_helper() {
-    for misbehaviour in ["oversized", "not-json", "unknown-type", "audio"] {
+    // A helper's own fatal error is followed at once by its exit: the client
+    // must still read the error rather than report a plain crash. Repeated,
+    // because which side notices first is a race.
+    let cases = ["oversized", "not-json", "missing-field", "audio"]
+        .into_iter()
+        .chain(std::iter::repeat_n("fatal-error", 10));
+    for misbehaviour in cases {
         let Some(config) = fake_only(&["--misbehave-on-health", misbehaviour]) else {
             return;
         };
@@ -340,10 +348,14 @@ async fn a_crash_fails_open_streams_within_a_second_and_the_next_stream_succeeds
     after.send_audio(&[3; 1600]).await.expect("audio");
     after.finish().await.expect("finish");
     assert_eq!(final_text(&mut after).await, "samples=1600");
+    let spawns = client.status().spawns;
+    assert_eq!(spawns.len(), 2, "one restart: {spawns:?}");
     assert!(
-        started.elapsed() >= RestartPolicy::default().min_interval,
-        "spawns at least 2 s apart"
+        spawns[1] - spawns[0] >= RestartPolicy::default().min_interval,
+        "spawns at least 2 s apart: {:?}",
+        spawns[1] - spawns[0]
     );
+    assert!(started.elapsed() < Duration::from_secs(10));
     let health = client.health().await.expect("health");
     assert!(
         health.loaded.contains(&"fake-batch".to_owned()),
@@ -361,7 +373,7 @@ async fn a_crash_fails_open_streams_within_a_second_and_the_next_stream_succeeds
 async fn a_hung_helper_is_killed_and_fails_its_streams_instead_of_blocking_them() {
     let mut config = config(&[]);
     config.heartbeat_interval = Duration::from_millis(100);
-    config.request_timeout = Duration::from_millis(400);
+    config.heartbeat_timeout = Duration::from_millis(400);
     let client = SpeechdClient::start(config).await.expect("start");
     client.load("fake-hang").await.expect("load");
     let mut stuck = client.open_stream(stream("fake-hang")).await.expect("open");
@@ -447,6 +459,11 @@ async fn restarts_stop_after_three_attempts_until_reset() {
         ),
     }
     assert!(client.status().failed);
+    let spawns = client.status().spawns;
+    assert_eq!(spawns.len(), 4, "the first spawn and 3 restarts");
+    for pair in spawns.windows(2) {
+        assert!(pair[1] - pair[0] >= Duration::from_millis(50), "{spawns:?}");
+    }
     client.reset().await;
     let mut ok = client
         .open_stream(stream("fake-batch"))
@@ -486,5 +503,257 @@ async fn the_client_validates_engine_format_and_frame_size_before_sending() {
         final_text(&mut big).await,
         format!("samples={}", samples.len())
     );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_result_written_just_before_the_helper_dies_is_still_delivered() {
+    // The helper writes final and closed, then exits at once. Which the client
+    // notices first, the exit or the frames, is a race, so run it repeatedly.
+    let mut config = config(&[]);
+    config.restart.min_interval = Duration::from_millis(50);
+    let client = SpeechdClient::start(config).await.expect("start");
+    client.load("fake-exit-after-final").await.expect("load");
+    for round in 0..10 {
+        let mut last = client
+            .open_stream(stream("fake-exit-after-final"))
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: {e:?}"));
+        last.send_audio(&[5; 320]).await.expect("audio");
+        last.finish().await.expect("finish");
+        assert_eq!(final_text(&mut last).await, "samples=320", "round {round}");
+        // The helper exits right after; wait for its replacement before the
+        // next round rather than racing a request into the dying one.
+        let spawned = client.status().spawns.len();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client.status().spawns.len() == spawned || client.capabilities().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a replacement helper");
+    }
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_default_deadlines_find_a_helper_hung_after_finish_within_three_seconds() {
+    // After finish a batch stream sends no audio, so only the heartbeat can
+    // notice. Default config: a 1 s heartbeat with a 2 s deadline.
+    let client = SpeechdClient::start(config(&[])).await.expect("start");
+    client.load("fake-hang").await.expect("load");
+    let mut stuck = client.open_stream(stream("fake-hang")).await.expect("open");
+    stuck.send_audio(&[1; 16]).await.expect("audio");
+    stuck.finish().await.expect("finish");
+    let waited = Instant::now();
+    match next(&mut stuck).await {
+        Some(StreamEvent::Failed(failure)) => {
+            assert_eq!(failure.code, ErrorCode::HelperUnresponsive);
+        }
+        other => panic!("expected helper_unresponsive, got {other:?}"),
+    }
+    assert!(
+        waited.elapsed() < Duration::from_millis(3_500),
+        "{:?}",
+        waited.elapsed()
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_slow_finish_never_blocks_other_streams_audio_or_health() {
+    // fake-batch takes over 2 s to finish, like a long batch on the real
+    // engine. Tight deadlines: a helper that read or answered nothing in the
+    // meantime would be killed.
+    let mut config = config(&[]);
+    config.audio_stall_timeout = Duration::from_millis(500);
+    config.heartbeat_interval = Duration::from_millis(100);
+    config.heartbeat_timeout = Duration::from_millis(500);
+    let client = SpeechdClient::start(config).await.expect("start");
+    client.load("fake-batch").await.expect("load");
+    client.load("fake-stream").await.expect("load");
+    let mut slow = client
+        .open_stream(stream("fake-batch"))
+        .await
+        .expect("open");
+    let mut live = client
+        .open_stream(stream("fake-stream"))
+        .await
+        .expect("open");
+    slow.send_audio(&[1; 1600]).await.expect("audio");
+    slow.finish().await.expect("finish");
+    let finished = Instant::now();
+    for round in 1..=20u32 {
+        live.send_audio(&[2; 160])
+            .await
+            .expect("audio while the other finishes");
+        match next(&mut live).await {
+            Some(StreamEvent::Partial { text, .. }) => {
+                assert_eq!(text, format!("samples={}", 160 * round));
+            }
+            other => panic!("expected a partial, got {other:?}"),
+        }
+        client
+            .health()
+            .await
+            .expect("health while the other finishes");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(final_text(&mut slow).await, "samples=1600");
+    assert!(
+        finished.elapsed() >= Duration::from_secs(2),
+        "fake-batch must model a slow finish: {:?}",
+        finished.elapsed()
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn unknown_messages_and_engine_kinds_from_a_newer_helper_are_ignored() {
+    let Some(config) = fake_only(&["--from-the-future"]) else {
+        return;
+    };
+    let client = SpeechdClient::start(config)
+        .await
+        .expect("start despite a new engine kind");
+    let caps = client.capabilities().expect("capabilities");
+    assert!(
+        caps.engine("fake-hologram").is_none(),
+        "unknown kinds are left out"
+    );
+    assert!(caps.engine("fake-batch").is_some());
+    assert!(matches!(
+        client.open_stream(stream("fake-hologram")).await,
+        Err(ClientError::UnknownEngine(_))
+    ));
+    // Each health answer is preceded by an id-less message of an unknown type.
+    for _ in 0..3 {
+        client
+            .health()
+            .await
+            .expect("unknown id-less messages are skipped");
+    }
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn streaming_partials_and_finals_carry_their_utterance() {
+    let client = SpeechdClient::start(config(&[])).await.expect("start");
+    client.load("fake-stream").await.expect("load");
+    let mut live = client
+        .open_stream(stream("fake-stream"))
+        .await
+        .expect("open");
+    live.send_audio(&[1; 160]).await.expect("audio");
+    match next(&mut live).await {
+        Some(StreamEvent::Partial { utterance, .. }) => assert_eq!(utterance, Some(1)),
+        other => panic!("expected a partial, got {other:?}"),
+    }
+    live.finish().await.expect("finish");
+    match next(&mut live).await {
+        Some(StreamEvent::Final(f)) => assert_eq!(f.utterance, Some(1)),
+        other => panic!("expected a final, got {other:?}"),
+    }
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn load_and_warmup_report_progress() {
+    let client = SpeechdClient::start(config(&[])).await.expect("start");
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Progress>();
+    client
+        .load_with_progress("fake-batch", Some(tx.clone()))
+        .await
+        .expect("load");
+    client
+        .warmup_with_progress("fake-batch", Some(tx))
+        .await
+        .expect("warmup");
+    let mut phases = Vec::new();
+    while let Ok(progress) = rx.try_recv() {
+        phases.push(progress.phase);
+    }
+    assert!(phases.contains(&ProgressPhase::Load), "{phases:?}");
+    assert!(phases.contains(&ProgressPhase::Warmup), "{phases:?}");
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn try_send_audio_reports_backpressure_instead_of_blocking() {
+    let mut config = config(&[]);
+    config.heartbeat_interval = Duration::from_secs(60);
+    let client = SpeechdClient::start(config).await.expect("start");
+    client.load("fake-hang").await.expect("load");
+    let stuck = client.open_stream(stream("fake-hang")).await.expect("open");
+    let started = Instant::now();
+    let mut outcome = None;
+    for _ in 0..10_000 {
+        if let Err(e) = stuck.try_send_audio(&[1; 1000]) {
+            outcome = Some(e);
+            break;
+        }
+    }
+    assert_eq!(outcome, Some(ClientError::Backpressure));
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "never blocked"
+    );
+    client.shutdown().await;
+}
+
+/// The fake behind a relay that hands its output on 100 ms late, in a wrapper
+/// process that exits as soon as the fake does: the client sees the exit
+/// before it has read what the helper wrote just before dying.
+fn behind_a_slow_relay(extra: &[&str]) -> Option<SpeechdConfig> {
+    let (fake, true) = helper() else { return None };
+    let script = r#"f="$(mktemp -u)"; mkfifo "$f"
+python3 -u -c 'import os, sys, time
+src = os.open(sys.argv[1], os.O_RDONLY)
+while True:
+    chunk = os.read(src, 65536)
+    if not chunk:
+        break
+    time.sleep(0.1)
+    os.write(1, chunk)' "$f" &
+"$0" "$@" > "$f"; status=$?; rm -f "$f"; exit $status"#;
+    let mut config = SpeechdConfig::new("/bin/sh", std::env::temp_dir());
+    let mut args: Vec<std::ffi::OsString> = vec!["-c".into(), script.into(), fake.into()];
+    args.append(&mut config.args);
+    args.push("--fake-engines".into());
+    args.extend(extra.iter().map(Into::into));
+    config.args = args;
+    config.restart.min_interval = Duration::from_millis(50);
+    Some(config)
+}
+
+#[tokio::test]
+async fn frames_written_before_the_helper_exits_are_read_before_it_is_declared_dead() {
+    let Some(config) = behind_a_slow_relay(&[]) else {
+        return;
+    };
+    let client = SpeechdClient::start(config).await.expect("start");
+    client.load("fake-exit-after-final").await.expect("load");
+    let mut last = client
+        .open_stream(stream("fake-exit-after-final"))
+        .await
+        .expect("open");
+    last.send_audio(&[5; 320]).await.expect("audio");
+    last.finish().await.expect("finish");
+    assert_eq!(
+        final_text(&mut last).await,
+        "samples=320",
+        "the final is not lost"
+    );
+    client.shutdown().await;
+
+    // The helper's own fatal error, then its exit: reported as what it is.
+    let config = behind_a_slow_relay(&["--misbehave-on-health", "fatal-error"]).unwrap();
+    let client = SpeechdClient::start(config).await.expect("start");
+    match client.health().await {
+        Err(ClientError::Protocol(message)) => {
+            assert!(message.contains("told to fail"), "{message}")
+        }
+        other => panic!("expected the helper's protocol error, got {other:?}"),
+    }
     client.shutdown().await;
 }

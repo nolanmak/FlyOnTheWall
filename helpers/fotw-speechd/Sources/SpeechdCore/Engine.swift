@@ -12,11 +12,15 @@ public struct EngineDescriptor: Sendable {
     public let partials: Bool
     public let languages: [String]
     public let sampleRates: [UInt32]
+    /// Most audio one stream may carry, if the engine bounds it.
+    public let maxAudioMs: UInt64?
     /// The pinned model; nil for fakes.
     public let model: PinnedModel?
 
     public init(id: String, kind: EngineKind, partials: Bool = false, languages: [String] = ["en"],
-                sampleRates: [UInt32] = [Wire.sampleRate], model: PinnedModel? = nil) {
+                sampleRates: [UInt32] = [Wire.sampleRate], maxAudioMs: UInt64? = nil,
+                model: PinnedModel? = nil) {
+        self.maxAudioMs = maxAudioMs
         self.id = id
         self.kind = kind
         self.partials = partials
@@ -46,8 +50,9 @@ public struct TimedSegment: Sendable, Equatable {
 }
 
 public enum EngineEvent: Sendable, Equatable {
-    case partial(text: String, startMs: UInt64, endMs: UInt64)
-    case final(text: String, startMs: UInt64, endMs: UInt64, segments: [TimedSegment], model: String?)
+    case partial(text: String, startMs: UInt64, endMs: UInt64, utterance: UInt64?)
+    case final(text: String, startMs: UInt64, endMs: UInt64, segments: [TimedSegment], model: String?,
+               utterance: UInt64?)
     case vad(VadKind, sample: UInt64, probability: Float)
 }
 
@@ -79,6 +84,7 @@ public protocol EngineSession: AnyObject, Sendable {
 
 /// A batch stream holds at most 10 minutes of audio.
 public let maxBatchSamples = 600 * Int(Wire.sampleRate)
+public let maxBatchMs: UInt64 = 600_000
 
 public func milliseconds(samples: Int) -> UInt64 {
     UInt64(samples) * 1000 / UInt64(Wire.sampleRate)
@@ -87,7 +93,8 @@ public func milliseconds(samples: Int) -> UInt64 {
 // MARK: - Fakes
 
 public actor FakeEngine: SpeechEngine {
-    public static let ids = ["fake-batch", "fake-stream", "fake-vad", "fake-crash", "fake-hang", "fake-stall"]
+    public static let ids = ["fake-batch", "fake-stream", "fake-vad", "fake-crash", "fake-hang", "fake-stall",
+                              "fake-exit-after-final"]
     public nonisolated let descriptor: EngineDescriptor
     private var loaded = false
 
@@ -97,7 +104,8 @@ public actor FakeEngine: SpeechEngine {
         case "fake-vad": .vad
         default: .batch
         }
-        descriptor = EngineDescriptor(id: id, kind: kind, partials: id == "fake-stream")
+        descriptor = EngineDescriptor(id: id, kind: kind, partials: id == "fake-stream",
+                                      maxAudioMs: kind == .batch ? maxBatchMs : nil)
     }
 
     public static func all() -> [any SpeechEngine] { ids.map { FakeEngine(id: $0) } }
@@ -142,7 +150,8 @@ final class FakeSession: EngineSession, @unchecked Sendable {
             kill(getpid(), SIGSTOP)
             return []
         case "fake-stream":
-            return [.partial(text: "samples=\(samples)", startMs: 0, endMs: milliseconds(samples: samples))]
+            return [.partial(text: "samples=\(samples)", startMs: 0, endMs: milliseconds(samples: samples),
+                             utterance: 1)]
         case "fake-vad":
             if inSpeech {
                 guard chunk.allSatisfy({ $0 == 0 }) else { return [] }
@@ -165,10 +174,15 @@ final class FakeSession: EngineSession, @unchecked Sendable {
             // A wedged engine in a helper that still answers everything else.
             while true { try await Task.sleep(nanoseconds: 3_600_000_000_000) }
         }
+        if engine == "fake-batch" {
+            // Slow, like a long batch on a real engine. The server keeps
+            // serving everything else meanwhile (docs/SPEECHD_PROTOCOL.md).
+            try await Task.sleep(nanoseconds: 2_500_000_000)
+        }
         if engine == "fake-vad" {
             return inSpeech ? [.vad(.speechEnd, sample: UInt64(samples), probability: 0)] : []
         }
         return [.final(text: "samples=\(samples)", startMs: 0, endMs: milliseconds(samples: samples),
-                       segments: [], model: "\(engine)@fake")]
+                       segments: [], model: "\(engine)@fake", utterance: engine == "fake-stream" ? 1 : nil)]
     }
 }
