@@ -220,6 +220,33 @@ func corruptModelFailsValidationAndKeepsThePreviousSelection() async throws {
     try expect(store.selectedRevision("test") == good.revision, "selection unchanged by a failed check")
 }
 
+func aFailedSwapKeepsTheWorkingRevision() throws {
+    // Reinstalling the selected revision (a repair after `verify` fails, say)
+    // must not lose the working copy if putting the new one in place fails.
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let destination = root.appendingPathComponent("rev"), staging = root.appendingPathComponent(".staging")
+    let aside = root.appendingPathComponent(".replaced")
+    try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
+    try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false)
+    try Data("old".utf8).write(to: destination.appendingPathComponent("weight.bin"))
+    try Data("new".utf8).write(to: staging.appendingPathComponent("weight.bin"))
+    do {
+        try ModelStore.swapIn(staging, at: destination, aside: aside) { from, to in
+            if from == staging { throw CocoaError(.fileWriteOutOfSpace) }
+            try FileManager.default.moveItem(at: from, to: to)
+        }
+        throw CheckFailure(description: "the failing swap did not throw")
+    } catch is CocoaError {}
+    let kept = try? Data(contentsOf: destination.appendingPathComponent("weight.bin"))
+    try expect(kept == Data("old".utf8), "the working revision is gone after a failed swap")
+
+    try ModelStore.swapIn(staging, at: destination, aside: aside)
+    try expect(try Data(contentsOf: destination.appendingPathComponent("weight.bin")) == Data("new".utf8),
+               "a successful swap puts the new revision in place")
+    try expect(!FileManager.default.fileExists(atPath: aside.path), "and removes the old one after")
+}
+
 func pinsAreComplete() throws {
     let ids = PinnedModels.all.map(\.id)
     try expect(ids == ["parakeet-unified", "silero-vad", "parakeet-eou-320ms", "nemotron-3.5-2240ms"], "\(ids)")
@@ -243,6 +270,7 @@ let cases: [(String, () async throws -> Void)] = [
     ("concurrent loads share one load", concurrentLoadsShareOneLoad),
     ("a corrupt model fails validation and keeps the previous selection",
      corruptModelFailsValidationAndKeepsThePreviousSelection),
+    ("a failed swap keeps the working revision", aFailedSwapKeepsTheWorkingRevision),
     ("every pin is a full revision with per-file hashes", pinsAreComplete),
 ]
 var failures = 0

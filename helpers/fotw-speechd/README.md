@@ -40,9 +40,12 @@ Swift 6.2 or later, and FluidAudio 0.17.3 at
 
 ```sh
 export FOTW_FLUIDAUDIO_SOURCE=/absolute/path/to/FluidAudio
-just speechd-helper                  # verifies the checkout, builds release
-FOTW_SPEECHD=1 just dev-sign          # bundles it into Contents/Helpers and signs it
+just speechd-helper   # verifies the checkout, builds packaging/build/speechd-swift/release/fotw-speechd
 ```
+
+Putting it into the app bundle (`Contents/Helpers`, signed with the hardened
+runtime and no entitlements) comes with #254: `FOTW_SPEECHD=1 just dev-sign`.
+Until that merges, `just dev-sign` bundles `fotwd` only.
 
 `speechd-helper` checks the checkout with
 `tools/speech-eval/parakeet/verify_runtime.py` first. SwiftPM may still fetch
@@ -52,10 +55,14 @@ linked.
 ## Models
 
 ```sh
-fotw-speechd models --models-root <dir>              # pins, licenses, installed?
-fotw-speechd install parakeet-unified --models-root <dir> [--from <dir>]
-fotw-speechd verify parakeet-unified --models-root <dir>
+speechd=packaging/build/speechd-swift/release/fotw-speechd    # from `just speechd-helper`
+"$speechd" models --models-root <abs dir>                   # pins, licenses, installed?
+"$speechd" install parakeet-unified --models-root <abs dir> [--from <abs dir>]
+"$speechd" verify parakeet-unified --models-root <abs dir>
 ```
+
+`--models-root` and `--from` take absolute paths only; the helper refuses a
+relative one rather than resolving it against wherever it was started.
 
 Every model is pinned to a revision with each file's size and SHA-256
 (`Sources/SpeechdCore/PinnedModels.swift`). Installing is the only thing that

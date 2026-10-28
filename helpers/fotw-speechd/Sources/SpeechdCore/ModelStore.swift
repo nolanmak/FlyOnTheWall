@@ -181,15 +181,35 @@ public struct ModelStore: Sendable {
 
         // Only now does anything outside the staging directory change.
         let destination = revisionDirectory(model)
-        if manager.fileExists(atPath: destination.path) {
-            let aside = modelDirectory.appendingPathComponent(".replaced-\(UUID().uuidString)")
-            try manager.moveItem(at: destination, to: aside)
-            try? manager.removeItem(at: aside)
-        }
-        try manager.moveItem(at: staging, to: destination)
+        try Self.swapIn(staging, at: destination,
+                        aside: modelDirectory.appendingPathComponent(".replaced-\(UUID().uuidString)"))
         try Data((model.revision + "\n").utf8).write(
             to: modelDirectory.appendingPathComponent("selected"), options: .atomic)
         return destination
+    }
+
+    /// Put `staging` at `destination`, replacing what is there. The old
+    /// directory is moved aside, put back if the new one cannot take its
+    /// place, and deleted only once it has, so a failed reinstall of the
+    /// selected revision still leaves a working model. `move` is
+    /// FileManager's, except in the checks.
+    public static func swapIn(
+        _ staging: URL, at destination: URL, aside: URL,
+        move: (URL, URL) throws -> Void = { try FileManager.default.moveItem(at: $0, to: $1) }
+    ) throws {
+        let manager = FileManager.default
+        guard manager.fileExists(atPath: destination.path) else {
+            try move(staging, destination)
+            return
+        }
+        try move(destination, aside)
+        do {
+            try move(staging, destination)
+        } catch {
+            try? move(aside, destination)
+            throw error
+        }
+        try? manager.removeItem(at: aside)
     }
 
     static func sha256(of url: URL) throws -> String {

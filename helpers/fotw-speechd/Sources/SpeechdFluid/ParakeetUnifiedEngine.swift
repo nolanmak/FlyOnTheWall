@@ -33,7 +33,11 @@ public actor ParakeetUnifiedEngine: SpeechEngine {
             // The explicit-directory overload reads local files only.
             try await manager.loadModels(from: directory)
             return manager
-        }, discard: { await $0.cleanup() })
+        }, discard: { [gate] stale in
+            // Nothing can be using a manager that was never published, but
+            // take the gate anyway: cleanup and inference never overlap.
+            try? await gate.run { await stale.cleanup() }
+        })
         return LoadResult(model: model.id, revision: model.revision)
     }
 
@@ -42,7 +46,11 @@ public actor ParakeetUnifiedEngine: SpeechEngine {
     }
 
     public func unload() async {
-        if let old = await lifecycle.shutdown() { await old.cleanup() }
+        // A transcription may still hold the manager. Release it only once
+        // that finishes: cleanup runs under the same gate as inference.
+        if let old = await lifecycle.shutdown() {
+            try? await gate.run { await old.cleanup() }
+        }
     }
 
     public func isLoaded() async -> Bool { await lifecycle.current != nil }

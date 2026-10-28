@@ -881,12 +881,15 @@ impl SpeechStream {
         );
         tokio::spawn(async move {
             tokio::time::sleep(deadline).await;
-            if let Some(conn) = conn.upgrade()
-                && lock(&conn.routes).streams.contains_key(&stream)
-            {
-                conn.fail(ClientError::HelperUnresponsive(format!(
-                    "stream {stream} had no result {deadline:?} after finish"
-                )));
+            if let Some(conn) = conn.upgrade() {
+                // Atomic with the check: a stream that completes at the last
+                // moment cannot get a healthy helper killed.
+                conn.fail_if(
+                    ClientError::HelperUnresponsive(format!(
+                        "stream {stream} had no result {deadline:?} after finish"
+                    )),
+                    |routes| routes.streams.contains_key(&stream),
+                );
             }
         });
         Ok(())
@@ -965,6 +968,32 @@ struct Routes {
     streams: HashMap<u32, mpsc::UnboundedSender<StreamEvent>>,
 }
 
+/// What a failing connection hands back to be told of the failure.
+type Orphans = (
+    HashMap<u64, Waiter>,
+    HashMap<u32, mpsc::UnboundedSender<StreamEvent>>,
+);
+
+impl Routes {
+    /// Mark the connection dead with `error` and take everything waiting on
+    /// it, if it is not dead already and `condition` holds. One lock covers
+    /// the check and the change.
+    fn mark_dead_if(
+        &mut self,
+        error: &ClientError,
+        condition: impl FnOnce(&Routes) -> bool,
+    ) -> Option<Orphans> {
+        if self.dead.is_some() || !condition(self) {
+            return None;
+        }
+        self.dead = Some(error.clone());
+        Some((
+            std::mem::take(&mut self.pending),
+            std::mem::take(&mut self.streams),
+        ))
+    }
+}
+
 struct Waiter {
     reply: oneshot::Sender<Result<Reply, ClientError>>,
     progress: Option<mpsc::UnboundedSender<Progress>>,
@@ -1037,21 +1066,20 @@ impl Conn {
 
     /// Fail everything waiting on this helper and kill it. Idempotent.
     fn fail(self: &Arc<Self>, error: ClientError) {
+        self.fail_if(error, |_| true);
+    }
+
+    /// [`fail`](Self::fail), but only if `condition` holds, checked under the
+    /// same lock that marks the connection dead, so nothing can change in
+    /// between.
+    fn fail_if(self: &Arc<Self>, error: ClientError, condition: impl FnOnce(&Routes) -> bool) {
         let error = if self.closing.load(Ordering::SeqCst) {
             ClientError::ShutDown
         } else {
             error
         };
-        let (pending, streams) = {
-            let mut routes = lock(&self.routes);
-            if routes.dead.is_some() {
-                return;
-            }
-            routes.dead = Some(error.clone());
-            (
-                std::mem::take(&mut routes.pending),
-                std::mem::take(&mut routes.streams),
-            )
+        let Some((pending, streams)) = lock(&self.routes).mark_dead_if(&error, condition) else {
+            return;
         };
         self.kill();
         for waiter in pending.into_values() {
@@ -1537,4 +1565,31 @@ fn unknown_type(json: &[u8]) -> Option<Option<u64>> {
         return None;
     }
     Some(value.get("id").and_then(serde_json::Value::as_u64))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_conditional_failure_is_decided_and_applied_together() {
+        let error = ClientError::HelperUnresponsive("late".into());
+        let still_routed = |routes: &Routes| routes.streams.contains_key(&7);
+
+        // The stream completed first: nothing happens to the connection.
+        let mut done = Routes::default();
+        assert!(done.mark_dead_if(&error, still_routed).is_none());
+        assert_eq!(done.dead, None, "a healthy helper stays alive");
+
+        // Still waiting: the connection is failed and the stream handed back.
+        let mut waiting = Routes::default();
+        let (events, _rx) = mpsc::unbounded_channel();
+        waiting.streams.insert(7, events);
+        let (_, streams) = waiting.mark_dead_if(&error, still_routed).expect("failed");
+        assert!(streams.contains_key(&7));
+        assert_eq!(waiting.dead, Some(error.clone()));
+
+        // Already dead: the first failure stands.
+        assert!(waiting.mark_dead_if(&error, |_| true).is_none());
+    }
 }

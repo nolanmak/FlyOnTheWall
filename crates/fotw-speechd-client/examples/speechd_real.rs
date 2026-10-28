@@ -12,7 +12,8 @@
 //! 1. **Setup** (network allowed, the only phase that may download): install
 //!    Parakeet Unified (imported from `--parakeet-from` if given) and Silero VAD.
 //! 2. Everything after runs the helper under `sandbox-exec` with the network
-//!    denied, while a poller runs `lsof -i` on it every 250 ms:
+//!    denied, while a poller runs `lsof -i` on each helper every 100 ms from
+//!    the moment it is spawned, through its loads and warmups:
 //!    - **cold start**: spawn to both engines loaded and warmed, after removing
 //!      `--coreml-cache` (Core ML's compiled-model cache) if given;
 //!    - **warm start**: the same, five times, with the cache in place;
@@ -77,11 +78,14 @@ fn args() -> Args {
             other => panic!("unknown argument {other}"),
         }
     }
+    // The helper takes only absolute paths, and a relative one would resolve
+    // against wherever it was started.
+    let absolute = |path: PathBuf| std::path::absolute(&path).unwrap_or(path);
     Args {
-        helper: helper.expect("--helper"),
-        models_root: models_root.expect("--models-root"),
+        helper: absolute(helper.expect("--helper")),
+        models_root: absolute(models_root.expect("--models-root")),
         corpus: corpus.expect("--corpus"),
-        parakeet_from,
+        parakeet_from: parakeet_from.map(absolute),
         coreml_cache,
         trials: trials.max(6),
     }
@@ -205,10 +209,15 @@ async fn vad_starts(client: &SpeechdClient, pcm: &[i16]) -> usize {
     starts
 }
 
-/// Spawn to both engines loaded and warmed.
-async fn ready(config: SpeechdConfig) -> (SpeechdClient, Duration) {
+/// Spawn to both engines loaded and warmed. The socket watch starts as soon
+/// as the helper exists, so it covers the loads and warmups too.
+async fn ready(
+    config: SpeechdConfig,
+    seen: &Arc<Mutex<Vec<String>>>,
+) -> (SpeechdClient, Duration, Watch) {
     let started = Instant::now();
     let client = SpeechdClient::start(config).await.expect("start");
+    let watch = watch_sockets(client.clone(), seen.clone());
     for engine in [PARAKEET, VAD] {
         client
             .load(engine)
@@ -219,34 +228,59 @@ async fn ready(config: SpeechdConfig) -> (SpeechdClient, Duration) {
             .await
             .unwrap_or_else(|e| panic!("warmup {engine}: {e}"));
     }
-    (client, started.elapsed())
+    watch.starting.store(false, Ordering::SeqCst);
+    (client, started.elapsed(), watch)
 }
 
-/// Polls `lsof -i` on the live helper; any line is a network socket.
-fn watch_sockets(
-    client: SpeechdClient,
+/// A thread polling `lsof -i` on one client's helper every 100 ms; any line
+/// is a network socket. Counts polls while the helper starts (spawn, load,
+/// warmup) and after.
+struct Watch {
     stop: Arc<AtomicBool>,
-    seen: Arc<Mutex<Vec<String>>>,
-) -> std::thread::JoinHandle<usize> {
-    std::thread::spawn(move || {
-        let mut polls = 0;
-        while !stop.load(Ordering::SeqCst) {
+    starting: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<(usize, usize)>,
+}
+
+impl Watch {
+    /// Stop it; (polls while starting, polls after).
+    fn finish(self) -> (usize, usize) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.handle.join().unwrap()
+    }
+}
+
+fn watch_sockets(client: SpeechdClient, seen: Arc<Mutex<Vec<String>>>) -> Watch {
+    let stop = Arc::new(AtomicBool::new(false));
+    let starting = Arc::new(AtomicBool::new(true));
+    let (thread_stop, thread_starting) = (stop.clone(), starting.clone());
+    let handle = std::thread::spawn(move || {
+        let (mut while_starting, mut after) = (0, 0);
+        while !thread_stop.load(Ordering::SeqCst) {
             if let Some(pid) = client.helper_pid() {
                 let out = Command::new("lsof")
                     .args(["-a", "-n", "-P", "-i", "-p", &pid.to_string()])
                     .output();
                 if let Ok(out) = out {
-                    polls += 1;
+                    if thread_starting.load(Ordering::SeqCst) {
+                        while_starting += 1;
+                    } else {
+                        after += 1;
+                    }
                     let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
                     if !text.is_empty() {
                         seen.lock().unwrap().push(text);
                     }
                 }
             }
-            std::thread::sleep(Duration::from_millis(250));
+            std::thread::sleep(Duration::from_millis(100));
         }
-        polls
-    })
+        (while_starting, after)
+    });
+    Watch {
+        stop,
+        starting,
+        handle,
+    }
 }
 
 fn words(text: &str) -> Vec<String> {
@@ -320,8 +354,13 @@ async fn main() {
     setup.shutdown().await;
 
     // 2. Network denied from here on.
-    let stop = Arc::new(AtomicBool::new(false));
     let sockets = Arc::new(Mutex::new(Vec::new()));
+    let (mut starting_polls, mut later_polls) = (0, 0);
+    let mut tally = |watch: Watch| {
+        let (starting, later) = watch.finish();
+        starting_polls += starting;
+        later_polls += later;
+    };
 
     let cache_cleared = match &args.coreml_cache {
         Some(dir) if dir.exists() => {
@@ -330,8 +369,7 @@ async fn main() {
         }
         _ => false,
     };
-    let (cold, cold_ms) = ready(config(&args, true)).await;
-    let poller = watch_sockets(cold.clone(), stop.clone(), sockets.clone());
+    let (cold, cold_ms, cold_watch) = ready(config(&args, true), &sockets).await;
     gates.push((
         "cold start to ready ≤ 30 s".into(),
         cold_ms <= Duration::from_secs(30),
@@ -349,28 +387,25 @@ async fn main() {
         format!("{:?}", denied.err().map(|e| e.to_string())),
     ));
     cold.shutdown().await;
-    stop.store(true, Ordering::SeqCst);
-    let mut polls = poller.join().unwrap();
+    tally(cold_watch);
 
     let mut warm_ms = Vec::new();
     let mut warm = None;
     for _ in 0..5 {
-        let (client, took) = ready(config(&args, true)).await;
+        let (client, took, watch) = ready(config(&args, true), &sockets).await;
         warm_ms.push(ms(took));
-        if let Some(previous) = warm.replace(client) {
+        if let Some((previous, previous_watch)) = warm.replace((client, watch)) {
             SpeechdClient::shutdown(&previous).await;
+            tally(previous_watch);
         }
     }
-    let warm = warm.unwrap();
+    let (warm, warm_watch) = warm.unwrap();
     let worst_warm = warm_ms.iter().copied().fold(0.0, f64::max);
     gates.push((
         "warm start to ready ≤ 3 s (worst of 5)".into(),
         worst_warm <= 3000.0,
         format!("{warm_ms:?} ms"),
     ));
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let poller = watch_sockets(warm.clone(), stop.clone(), sockets.clone());
 
     // First request after warmup vs the 5th, on one 10 s clip.
     let probe = clips
@@ -417,13 +452,15 @@ async fn main() {
 
     let health = warm.health().await.expect("health");
     warm.shutdown().await;
-    stop.store(true, Ordering::SeqCst);
-    polls += poller.join().unwrap();
+    tally(warm_watch);
     let sockets = sockets.lock().unwrap().clone();
     gates.push((
-        "no network socket after setup (lsof)".into(),
-        sockets.is_empty() && polls > 0,
-        format!("{polls} polls, {} with sockets", sockets.len()),
+        "no network socket after setup (lsof, from spawn on)".into(),
+        sockets.is_empty() && starting_polls > 0 && later_polls > 0,
+        format!(
+            "{starting_polls} polls during spawn/load/warmup of 6 helpers, {later_polls} after; {} with sockets",
+            sockets.len()
+        ),
     ));
 
     let pass = gates.iter().all(|g| g.1);
