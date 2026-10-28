@@ -50,6 +50,11 @@ Windows, but neither captures anything.
   longer become "Thank you." lines. Bracketed annotations (`[BLANK_AUDIO]`,
   `(applause)`) and stock phrases the model doubted were speech are dropped.
   Start refuses local transcription while the detector is missing or corrupt.
+  **Upgrade step for existing local or backup users:** Start is refused until
+  the detector is installed. Run `fotwd stt models install silero-v5.1.2`
+  (or, offline, `fotwd stt models import silero-v5.1.2 <file>`), or reinstall
+  your Whisper model from Transcription settings, which adds it. The refusal
+  message names the same command.
 
 #### Library and keys
 

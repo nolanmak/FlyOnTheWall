@@ -101,6 +101,14 @@ impl Control {
             _ => Err("This model setup control has already entered publication".into()),
         }
     }
+    /// After one artifact of a set has been published, admit cancellation
+    /// again for the next. Only a published (committing) control reopens.
+    fn reopen(&self) -> Result<(), String> {
+        self.0
+            .compare_exchange(2, 0, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| "Model setup control was not between publications".into())
+    }
     fn commit(&self) -> Result<(), String> {
         self.0
             .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
@@ -370,15 +378,14 @@ fn install_with_detector(
     progress: impl FnMut(Progress),
 ) -> Result<PathBuf, String> {
     let mut progress = progress;
-    control.check()?;
     // The detector first: it is small, so a failure costs nothing, and a model
-    // is never left installed without the gate it needs. It is under a
-    // megabyte, so it takes its own publication boundary and cancellation is
-    // observed again before the model's transfer begins.
+    // is never left installed without the gate it needs. Both share the one
+    // control, so Cancel stops whichever is transferring; once the detector
+    // is published, the control reopens for the model's own boundary.
     install_with_progress(
         root,
         detector,
-        &Control::default(),
+        control,
         &available,
         || open(detector),
         &mut progress,
@@ -389,6 +396,7 @@ fn install_with_detector(
             detector.name
         )
     })?;
+    control.reopen()?;
     install_with_progress(root, model, control, &available, || open(model), progress)
 }
 #[cfg(test)]
@@ -718,6 +726,74 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("speech detector"), "{error}");
+        assert!(!root.path().join("models/ggml-fixture-asr.bin").exists());
+    }
+    #[test]
+    fn cancelling_during_the_detector_transfer_publishes_nothing() {
+        struct Cancelling(Control, Box<dyn Read + Send>);
+        impl Read for Cancelling {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.cancel();
+                self.1.read(buf)
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let model = artifact("fixture-asr", b"fixture asr weights");
+        let detector = artifact("fixture-vad", b"fixture vad weights");
+        let control = Control::default();
+        let cancel = control.clone();
+        let error = install_with_detector(
+            root.path(),
+            &model,
+            &detector,
+            &control,
+            |_| Ok(AUDIO_FREE_BYTES),
+            |a| {
+                assert_eq!(a.name, "fixture-vad", "cancelled setup opened the model");
+                Ok(Box::new(Cancelling(
+                    cancel.clone(),
+                    reader(b"fixture vad weights"),
+                )))
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(error.contains("cancelled"), "{error}");
+        assert!(
+            !root.path().join("models/ggml-fixture-vad.bin").exists(),
+            "Cancel during the detector download did not stop it"
+        );
+    }
+    #[test]
+    fn a_cancelled_model_after_its_detector_still_cancels() {
+        let root = tempfile::tempdir().unwrap();
+        let model = artifact("fixture-asr", b"fixture asr weights");
+        let detector = artifact("fixture-vad", b"fixture vad weights");
+        let control = Control::default();
+        let cancel = control.clone();
+        let error = install_with_detector(
+            root.path(),
+            &model,
+            &detector,
+            &control,
+            |_| Ok(AUDIO_FREE_BYTES),
+            |a| {
+                if a.name == "fixture-asr" {
+                    assert!(
+                        cancel.cancel(),
+                        "the model's transfer must still be cancellable"
+                    );
+                }
+                Ok(reader(if a.name == "fixture-asr" {
+                    b"fixture asr weights"
+                } else {
+                    b"fixture vad weights"
+                }))
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(error.contains("cancelled"), "{error}");
         assert!(!root.path().join("models/ggml-fixture-asr.bin").exists());
     }
     #[test]
