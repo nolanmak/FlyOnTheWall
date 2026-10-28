@@ -61,9 +61,11 @@ pub struct SpeechdConfig {
     /// often (1 s by default), so a helper that hangs mid-stream is found and
     /// killed instead of leaving a caller waiting for a final forever.
     pub heartbeat_interval: Duration,
-    /// How long a heartbeat may go unanswered (2 s by default). With the
-    /// interval this bounds how long a hung helper goes unnoticed: 3 s by
-    /// default, even after `finish`, when no audio is flowing.
+    /// How long a heartbeat may go unanswered (5 s by default). With the
+    /// interval this bounds how long a hung helper goes unnoticed: 6 s by
+    /// default, even after `finish`, when no audio is flowing. Long enough
+    /// for a helper starved of CPU on a heavily loaded Mac; a crash is still
+    /// found within 1 s, from the process exiting, not from here.
     pub heartbeat_timeout: Duration,
     /// How long after `finish` a stream may go without its result. A helper
     /// that still answers `health` but never finishes has a wedged engine; it
@@ -89,7 +91,7 @@ impl SpeechdConfig {
             install_timeout: Duration::from_secs(6 * 3600),
             audio_stall_timeout: Duration::from_secs(2),
             heartbeat_interval: Duration::from_secs(1),
-            heartbeat_timeout: Duration::from_secs(2),
+            heartbeat_timeout: Duration::from_secs(5),
             finish_timeout: Duration::from_secs(120),
         }
     }

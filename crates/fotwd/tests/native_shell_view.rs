@@ -79,6 +79,7 @@ fn speech(
         diarization_supported: Some(false),
         worker_running: Some(true),
         error: None,
+        captions: None,
     }
 }
 

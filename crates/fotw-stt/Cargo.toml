@@ -15,6 +15,9 @@ conformance = []
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# The FluidAudio helper's client (#243, #244): pure Rust, so every platform
+# builds it. Parakeet Unified runs in that helper, never in this process.
+fotw-speechd-client = { path = "../fotw-speechd-client" }
 ulid = { workspace = true }
 # The streaming transport (spec 7.4). Declared here rather than in
 # [workspace.dependencies] because no other crate opens a socket to a provider.
@@ -58,3 +61,5 @@ tokio = { workspace = true, features = [
   "time",
   "test-util",
 ] }
+# Throwaway model stores for the helper tests; already in the lock.
+tempfile = "3"

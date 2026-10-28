@@ -398,6 +398,13 @@ pub trait RecognizerFactory: Send + Sync {
     /// The model id recorded on each segment, e.g. `large-v3-turbo-q5_0`.
     fn model(&self) -> &str;
 
+    /// The runtime that serves the model, recorded on each segment beside it:
+    /// [`PROVIDER`] for whisper.cpp, [`crate::speechd::PROVIDER`] for the
+    /// FluidAudio helper.
+    fn provider(&self) -> &str {
+        PROVIDER
+    }
+
     /// The language the model was told to expect, `None` for detection.
     fn language(&self) -> Option<&str>;
 
@@ -451,6 +458,7 @@ impl LocalStreamConfig {
 #[must_use]
 pub fn segments_for(
     config: &LocalStreamConfig,
+    provider: &str,
     model: &str,
     language: Option<&str>,
     chunk: &Chunk,
@@ -471,7 +479,7 @@ pub fn segments_for(
         })
         .map(|(r, text)| {
             let mut segment =
-                TranscriptSegment::new(config.session_id.clone(), config.source, PROVIDER, model);
+                TranscriptSegment::new(config.session_id.clone(), config.source, provider, model);
             segment.speaker = (config.source == Source::Mic).then(|| ME.to_owned());
             segment.text = text;
             segment.start_ms = base + r.start_ms.min(length);
@@ -817,6 +825,7 @@ impl Worker {
             Ok(recognized) => {
                 for segment in segments_for(
                     &self.config,
+                    self.engine.provider(),
                     self.engine.model(),
                     self.engine.language(),
                     chunk,
@@ -1062,6 +1071,7 @@ mod tests {
         };
         let segments = segments_for(
             &config,
+            PROVIDER,
             "tiny",
             Some("en"),
             &chunk,
@@ -1110,6 +1120,7 @@ mod tests {
         };
         let segments = segments_for(
             &config,
+            PROVIDER,
             "tiny",
             None,
             &chunk,
@@ -1145,6 +1156,7 @@ mod tests {
         };
         let segments = segments_for(
             &config,
+            PROVIDER,
             "tiny",
             None,
             &chunk,

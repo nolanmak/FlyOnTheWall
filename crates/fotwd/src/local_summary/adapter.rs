@@ -258,7 +258,9 @@ mod tests {
     }
     #[tokio::test]
     async fn cancelled_generation_stops_its_owned_runtime_and_cannot_be_reused() {
-        let (process, marker) = process::stalled_fixture();
+        // Deliberately slower than the former shared two-second deadline:
+        // fixture boot under CI load must not consume the cancellation budget.
+        let (process, marker) = process::stalled_fixture(Duration::from_secs(3));
         let config = RuntimeConfig {
             model_id: "fixture".into(),
             runtime_files: vec![],
@@ -280,9 +282,16 @@ mod tests {
             queue: Semaphore::new(5),
             serial: Semaphore::new(1),
         });
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let startup_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while !adapter.process.socket.exists() {
-            assert!(tokio::time::Instant::now() < deadline);
+            adapter
+                .process
+                .pid()
+                .expect("owned fixture exited before readiness");
+            assert!(
+                tokio::time::Instant::now() < startup_deadline,
+                "owned fixture did not start"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let request = LlmRequest {
@@ -299,12 +308,22 @@ mod tests {
         let copy = adapter.clone();
         let req = request.clone();
         let call = tokio::spawn(async move { copy.complete(&req).await });
+        let dispatch_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while !marker.exists() {
-            assert!(tokio::time::Instant::now() < deadline);
+            assert!(
+                !call.is_finished(),
+                "request ended before reaching the fixture"
+            );
+            assert!(
+                tokio::time::Instant::now() < dispatch_deadline,
+                "request did not reach the ready fixture"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         call.abort();
-        let _ = call.await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), call)
+            .await
+            .expect("cancellation must complete within its own one-second budget");
         assert!(adapter.process.pid().is_err());
         let next = tokio::time::timeout(Duration::from_millis(250), adapter.complete(&request))
             .await

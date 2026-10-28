@@ -1549,6 +1549,7 @@ fn native_capture_recovery(archived: bool, prefix_only: bool, reconstruct: bool,
         engine: fotwd::stt::SttEngine::Deepgram,
         model: model.to_string_lossy().into_owned(),
         language: "fr".into(),
+        live_captions: true,
     };
     settings.write(&mut db).unwrap();
     let c = SavedSpeechRecovery::new(db, f.root.path().to_owned());

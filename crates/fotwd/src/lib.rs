@@ -7,6 +7,7 @@
 #![warn(missing_docs)]
 
 pub mod audit;
+pub mod captions;
 pub mod consent;
 pub mod detect;
 pub mod detection_preferences;
@@ -35,6 +36,7 @@ pub mod retention;
 pub mod secrets;
 pub mod serve;
 pub mod session;
+pub mod speechd;
 pub mod stt;
 pub mod summarize;
 mod summary_guard;

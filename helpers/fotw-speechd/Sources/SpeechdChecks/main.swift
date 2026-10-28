@@ -396,9 +396,50 @@ func warmingUpWhileADictationHoldsTheRecognizerIsANoOp() async throws {
     await session.close()
 }
 
+func aPoolLendsWarmedInstancesUpToItsCapacity() async throws {
+    let warmed = Counter()
+    let pool = try await SessionPool<Int>(capacity: 2, make: { 7 }, warm: { _ in await warmed.increment() })
+    let warmCount = await warmed.value
+    try expect(warmCount == 2, "every instance is warmed when the pool is built, not on a stream")
+    let first = try await pool.checkout()
+    _ = try await pool.checkout()
+    do {
+        _ = try await pool.checkout()
+        throw CheckFailure(description: "a third stream got an instance")
+    } catch let error as SpeechdError {
+        try expect(error.code == "busy", "refused as busy: \(error)")
+    }
+    // An instance coming back a moment later is waited for, not refused.
+    Task {
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        await pool.checkin(first)
+    }
+    _ = try await pool.checkout(within: .seconds(1))
+    let started = ContinuousClock.now
+    do {
+        _ = try await pool.checkout(within: .milliseconds(100))
+        throw CheckFailure(description: "a full pool lent an instance")
+    } catch let error as SpeechdError {
+        try expect(error.code == "busy", "still busy after the wait: \(error)")
+    }
+    try expect(ContinuousClock.now - started >= .milliseconds(100), "waited before refusing")
+
+    // Unload while streams still hold instances: drain releases the idle
+    // ones, and each lent one is handed back for release when it returns.
+    let drainable = try await SessionPool<Int>(capacity: 2, make: { 9 }, warm: { _ in })
+    let lent = try await drainable.checkout()
+    let idleAtUnload = await drainable.drain()
+    try expect(idleAtUnload.count == 1, "the idle instance is released at unload")
+    let returned = await drainable.checkin(lent)
+    try expect(returned == lent, "a lent instance coming back after unload is handed back to release")
+    let left = await drainable.available
+    try expect(left == 0, "the drained pool keeps nothing")
+}
+
 func pinsAreComplete() throws {
     let ids = PinnedModels.all.map(\.id)
-    try expect(ids == ["parakeet-unified", "silero-vad", "parakeet-eou-320ms", "nemotron-3.5"], "\(ids)")
+    try expect(ids == ["parakeet-unified", "silero-vad", "parakeet-eou-320ms", "parakeet-eou-160ms",
+                       "nemotron-3.5"], "\(ids)")
     for model in PinnedModels.all {
         try expect(model.revision.count == 40 && model.revision.allSatisfy(\.isHexDigit), "\(model.id) revision")
         try expect(!model.files.isEmpty && !model.license.isEmpty, "\(model.id) files and license")
@@ -420,6 +461,7 @@ let cases: [(String, () async throws -> Void)] = [
     ("a corrupt model fails validation and keeps the previous selection",
      corruptModelFailsValidationAndKeepsThePreviousSelection),
     ("a failed swap keeps the working revision", aFailedSwapKeepsTheWorkingRevision),
+    ("a pool lends warmed instances up to its capacity", aPoolLendsWarmedInstancesUpToItsCapacity),
     ("a dictation stream shows each step once and returns its recognizer reset",
      aDictationStreamShowsEachStepOnceAndReturnsItsRecognizerReset),
     ("a cancelled stream stops decoding its backlog and frees the recognizer",

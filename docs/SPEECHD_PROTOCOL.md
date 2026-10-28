@@ -33,8 +33,9 @@ streams' audio while any engine is busy, however long that takes (a
 queues a stream's audio for that stream's engine, bounded (the Swift helper
 fails a stream with `busy` past 2 minutes of backlog). The client kills a
 helper that leaves its stdin unread for 2 s or a heartbeat unanswered for
-2 s, so a helper that blocked would be killed mid-meeting. `fake-batch` takes
-2.5 s to finish to hold both helpers to this.
+5 s, so a helper that blocked would be killed mid-meeting. `fake-batch` takes
+2.5 s to finish to hold both helpers to this (its test tightens both
+deadlines to 500 ms).
 
 ## Frames
 
@@ -168,7 +169,8 @@ Error codes: `version_mismatch`, `protocol`, `bad_request`, `unknown_engine`,
 |---|---|---|---|
 | `parakeet-unified` | batch | `FluidInference/parakeet-unified-en-0.6b-coreml` | CC-BY-4.0 |
 | `silero-vad` | vad | `FluidInference/silero-vad-coreml` | MIT |
-| `parakeet-eou-320ms` | streaming (planned, #245) | `FluidInference/parakeet-realtime-eou-120m-coreml` | NVIDIA Open Model License |
+| `parakeet-eou-320ms` | streaming, pooled (#245) | `FluidInference/parakeet-realtime-eou-120m-coreml` | NVIDIA Open Model License |
+| `parakeet-eou-160ms` | streaming, pooled (#245, not the default) | same repository, its `160ms/` variant | NVIDIA Open Model License |
 | `nemotron-3.5` | streaming, one dictation at a time (Murmur #100) | `FluidInference/Nemotron-3.5-ASR-Streaming-Multilingual-0.6b-CoreML` | OpenMDW-1.1 |
 
 Each engine states its per-stream bound as `max_audio_ms` in the
@@ -180,6 +182,16 @@ capabilities, and a stream past it fails with `too_long`.
 - A **vad** stream answers as audio arrives, in 256 ms steps. Unbounded.
 - A **streaming** stream sends `partial`s as audio arrives and a `final` per
   utterance, with `utterance` ids. Unbounded; state is the engine's cache.
+  `parakeet-eou-320ms` (live captions, #245) keeps one stream's state per
+  model instance, so it loads a pool of two, one per capture leg, each warmed
+  at load. A third concurrent stream waits up to 1 s for a slot, then is
+  refused with `busy`; a stream that ends in any way returns its slot. Its
+  first partial needs about 630 ms of audio (one 320 ms-shift chunk). An
+  utterance ends at the model's end-of-utterance signal, held for 640 ms;
+  the instance is then reset for the next utterance, so up to one chunk at
+  the boundary is not captioned. Captions are display-only. `parakeet-eou-160ms` is the
+  same model's 160 ms variant: about half the latency for about three times
+  the CPU (see #245 for both measured).
   `nemotron-3.5` (streaming dictation, Murmur #100) treats the whole stream
   as utterance 1. It runs the model's 560 ms and 1120 ms variants in lockstep
   on the same audio: a `partial` with the 560 ms variant's running text
@@ -212,6 +224,7 @@ ordinary test suites use:
 | `fake-hang` | the process stops reading and answering on its first audio frame |
 | `fake-stall` | never answers `finish`, but keeps serving everything else |
 | `fake-exit-after-final` | on `finish`, `final` and `closed`, then the process exits with status 70 |
+| `fake-captions` | pooled like `parakeet-eou-320ms` (two streams). An utterance runs until an all-zero frame: a `partial {text: "utterance=<u> samples=<n>", utterance: u}` per frame within it, then `final {utterance: u}` with the same text, and the next utterance is `u + 1`. `finish` commits the last one |
 | `fake-dictation` | `nemotron-3.5` without a model, in 250 ms (4000-sample) steps: a `partial {text: "steps=<n> lang=<language or auto>", utterance: 1}` when a step completes; on `finish` the last partial step counts as one more, `final {utterance: 1}` with the same text. A frame holding a sample of −32768 fails the stream with `engine`. Like `nemotron-3.5` it has one recognizer, shared by its streams and reset when a stream ends; a second open stream is refused with `busy` |
 
 `load` and `warmup` of a fake engine send one `progress` each.
@@ -249,9 +262,12 @@ Weights are never committed. They live under
   for at most 250 ms, then fails every open stream with `helper_crashed` and
   every pending request. A crash reaches open streams within 1 s; nothing
   waits on a dead helper.
-- **Hang.** While any stream is open the client sends `health` every 1 s with
-  a 2 s deadline, so a hung helper is found within 3 s by default, even after
-  `finish` when no audio flows. A queue to the helper that stays full for 2 s
+- **Hang.** While any stream is open the client sends `health` every 1 s,
+  one at a time, with a 5 s deadline, so a hung helper is found within 6 s by
+  default, even after `finish` when no audio flows. The deadline was 2 s; at
+  a load average around 40 a working helper answered late enough to be
+  killed mid-caption, so it allows for a starved CPU. Crashes do not wait on
+  it: they are found from the process exit, within 1 s. A queue to the helper that stays full for 2 s
   means the same. Either way the client kills it and handles it as a crash, so
   a recording never blocks on transcription. A stream with no result 120 s
   after `finish` means a wedged engine in a helper that still answers, and is

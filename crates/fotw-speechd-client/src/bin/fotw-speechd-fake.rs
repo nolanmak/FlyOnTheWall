@@ -17,6 +17,20 @@
 //! health answer with a message of an unknown type. `--slow-load-if <path>`
 //! makes every `load` take 30 s (off the frame thread) while that file exists,
 //! so a test can slow down only the loads a restart replays.
+//!
+//! `--pinned <id>@<revision>` adds a batch engine that stands in for a real,
+//! pinned one (`parakeet-unified` in the app's tests): it answers at once with
+//! `final {text: "samples=<n>", model: "<id>@<revision>"}`. It is installed
+//! when `<models-root>/<id>/<revision>` exists, as the real store lays a model
+//! out; `load` refuses `model_missing` otherwise, and `install` (which opens no
+//! socket here) creates that directory.
+//!
+//! `--crash-on-sample <n>` exits with status 70 on any audio frame holding the
+//! sample value `n`, so a test can make one utterance kill the helper every
+//! time it is sent. With `--crash-once-marker <path>` it does so only while
+//! `path` does not exist, creating it first: one crash, then a healthy helper.
+//! `--slow-health <ms>` answers every `health` that late, off the frame
+//! thread, like a helper starved of CPU on a heavily loaded Mac.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, BufReader, BufWriter, Write};
@@ -27,7 +41,7 @@ use std::time::{Duration, Instant};
 use fotw_speechd_client::frame::{self, Frame, KIND_AUDIO, KIND_CONTROL, MAX_FRAME};
 use fotw_speechd_client::message::{
     Capabilities, CloseReason, EngineInfo, EngineKind, ErrorCode, FORMAT_S16LE, FinalText,
-    PROTOCOL_VERSION, ProgressPhase, Reply, Request, VadKind,
+    ModelInfo, PROTOCOL_VERSION, ProgressPhase, Reply, Request, VadKind,
 };
 
 const MAX_STREAMS: usize = 8;
@@ -42,31 +56,61 @@ const BATCH_FINISH: Duration = Duration::from_millis(2_500);
 
 struct Args {
     announce: u32,
+    models_root: Option<std::path::PathBuf>,
+    pinned: Vec<Pinned>,
     misbehave: Option<String>,
     future: bool,
     slow_load_if: Option<std::path::PathBuf>,
+    crash_on_sample: Option<i16>,
+    crash_once_marker: Option<std::path::PathBuf>,
+    slow_health: Option<Duration>,
 }
 
 fn parse_args() -> Args {
     let mut args = Args {
         announce: PROTOCOL_VERSION,
+        models_root: None,
+        pinned: Vec::new(),
         misbehave: None,
         future: false,
         slow_load_if: None,
+        crash_on_sample: None,
+        crash_once_marker: None,
+        slow_health: None,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "serve" | "--fake-engines" => {}
-            "--models-root" => {
-                iter.next();
-            }
+            "--models-root" => args.models_root = iter.next().map(Into::into),
+            "--pinned" => match iter.next().as_deref().and_then(|v| v.split_once('@')) {
+                Some((id, revision)) if !id.is_empty() && !revision.is_empty() => {
+                    args.pinned.push(Pinned {
+                        id: id.to_owned(),
+                        revision: revision.to_owned(),
+                    });
+                }
+                _ => {
+                    eprintln!("fotw-speechd-fake: --pinned takes <id>@<revision>");
+                    exit(64);
+                }
+            },
             "--announce-protocol" => {
                 args.announce = iter.next().and_then(|v| v.parse().ok()).unwrap_or(0);
             }
             "--misbehave-on-health" => args.misbehave = iter.next(),
             "--from-the-future" => args.future = true,
             "--slow-load-if" => args.slow_load_if = iter.next().map(Into::into),
+            "--crash-on-sample" => {
+                args.crash_on_sample = iter.next().and_then(|v| v.parse().ok());
+            }
+            "--crash-once-marker" => args.crash_once_marker = iter.next().map(Into::into),
+            "--slow-health" => {
+                args.slow_health = iter
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .map(Duration::from_millis);
+            }
             other => {
                 eprintln!("fotw-speechd-fake: unknown argument {other}");
                 exit(64);
@@ -74,6 +118,23 @@ fn parse_args() -> Args {
         }
     }
     args
+}
+
+/// A stand-in for a real, pinned engine (`--pinned`).
+#[derive(Clone)]
+struct Pinned {
+    id: String,
+    revision: String,
+}
+
+impl Pinned {
+    fn dir(&self, root: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+        root.map(|root| root.join(&self.id).join(&self.revision))
+    }
+
+    fn installed(&self, root: Option<&std::path::Path>) -> bool {
+        self.dir(root).is_some_and(|dir| dir.is_dir())
+    }
 }
 
 /// Shared by the main loop and the threads that finish `fake-batch` streams.
@@ -134,7 +195,10 @@ impl Out {
     }
 }
 
-const ENGINES: [(&str, EngineKind, bool); 8] = [
+/// fake-captions is pooled like parakeet-eou-320ms: at most two streams.
+const CAPTION_POOL: usize = 2;
+
+const ENGINES: [(&str, EngineKind, bool); 9] = [
     ("fake-batch", EngineKind::Batch, false),
     ("fake-stream", EngineKind::Streaming, true),
     ("fake-vad", EngineKind::Vad, false),
@@ -142,27 +206,48 @@ const ENGINES: [(&str, EngineKind, bool); 8] = [
     ("fake-hang", EngineKind::Batch, false),
     ("fake-stall", EngineKind::Batch, false),
     ("fake-exit-after-final", EngineKind::Batch, false),
+    ("fake-captions", EngineKind::Streaming, true),
     ("fake-dictation", EngineKind::Streaming, true),
 ];
 /// `fake-dictation` decodes in 250 ms steps, as `nemotron-3.5` shows partials in 560 ms ones.
 const DICTATION_STEP: u64 = 4_000;
 
-fn capabilities(future: bool) -> serde_json::Value {
+fn capabilities(
+    future: bool,
+    pinned: &[Pinned],
+    root: Option<&std::path::Path>,
+) -> serde_json::Value {
+    let mut engines: Vec<EngineInfo> = ENGINES
+        .iter()
+        .map(|&(id, kind, partials)| EngineInfo {
+            id: id.to_owned(),
+            kind,
+            partials,
+            languages: vec!["en".to_owned()],
+            sample_rates: vec![SAMPLE_RATE],
+            model: None,
+            max_audio_ms: (kind == EngineKind::Batch).then_some(600_000),
+        })
+        .collect();
+    engines.extend(pinned.iter().map(|p| EngineInfo {
+        id: p.id.clone(),
+        kind: EngineKind::Batch,
+        partials: false,
+        languages: vec!["en".to_owned()],
+        sample_rates: vec![SAMPLE_RATE],
+        model: Some(ModelInfo {
+            id: p.id.clone(),
+            repository: format!("fake/{}", p.id),
+            revision: p.revision.clone(),
+            license: "CC-BY-4.0".to_owned(),
+            installed: p.installed(root),
+        }),
+        max_audio_ms: Some(600_000),
+    }));
     let mut value = serde_json::to_value(Capabilities {
         max_frame_bytes: u32::try_from(MAX_FRAME).expect("1 MiB"),
         max_streams: u32::try_from(MAX_STREAMS).expect("small"),
-        engines: ENGINES
-            .iter()
-            .map(|&(id, kind, partials)| EngineInfo {
-                id: id.to_owned(),
-                kind,
-                partials,
-                languages: vec!["en".to_owned()],
-                sample_rates: vec![SAMPLE_RATE],
-                model: None,
-                max_audio_ms: (kind == EngineKind::Batch).then_some(600_000),
-            })
-            .collect(),
+        engines,
     })
     .expect("serializable");
     if future {
@@ -181,6 +266,11 @@ struct Stream {
     engine: String,
     samples: u64,
     in_speech: bool,
+    /// fake-captions: the utterance being spoken, where it began, and how
+    /// much of it there is so far.
+    utterance: u64,
+    utterance_start: u64,
+    utterance_samples: u64,
     /// `fake-dictation`: the language hint, or "auto".
     language: String,
 }
@@ -190,14 +280,45 @@ impl Stream {
     fn dictation(&self, steps: u64) -> String {
         format!("steps={steps} lang={}", self.language)
     }
+
+    /// fake-captions: end the current utterance at sample `end`.
+    fn end_utterance(&mut self, id: u32, end: u64) -> Option<Reply> {
+        if self.utterance_samples == 0 {
+            return None;
+        }
+        let reply = Reply::Final(FinalText {
+            stream: id,
+            text: format!(
+                "utterance={} samples={}",
+                self.utterance, self.utterance_samples
+            ),
+            start_ms: ms(self.utterance_start),
+            end_ms: ms(end),
+            segments: Vec::new(),
+            model: Some("fake-captions@fake".to_owned()),
+            utterance: Some(self.utterance),
+        });
+        self.utterance += 1;
+        self.utterance_samples = 0;
+        Some(reply)
+    }
+}
+
+fn ms(samples: u64) -> u64 {
+    samples * 1000 / u64::from(SAMPLE_RATE)
 }
 
 struct Helper {
     out: Out,
+    models_root: Option<std::path::PathBuf>,
+    pinned: Vec<Pinned>,
     started: Instant,
     misbehave: Option<String>,
     future: bool,
     slow_load_if: Option<std::path::PathBuf>,
+    crash_on_sample: Option<i16>,
+    crash_once_marker: Option<std::path::PathBuf>,
+    slow_health: Option<Duration>,
     /// `fake-batch` streams finishing on their own thread. Cancel removes one,
     /// and the thread only answers if it is still here, under this lock.
     finishing: Arc<Mutex<HashSet<u32>>>,
@@ -212,19 +333,26 @@ struct Helper {
 }
 
 impl Helper {
-    /// A `fake-dictation` stream is over, however it ended: reset the
-    /// recognizer for the next one.
-    fn end_dictation(&mut self, stream: &Stream) {
-        if stream.engine == "fake-dictation" {
-            self.dictation = 0;
-        }
-    }
     fn request(&mut self, request: Request) {
         let out = self.out.clone();
         match request {
             Request::Hello { .. } => out.fatal("hello after the handshake"),
             Request::Load { id, engine } => {
-                if ENGINES.iter().any(|e| e.0 == engine) {
+                if let Some(pinned) = self.pinned_engine(&engine) {
+                    if pinned.installed(self.models_root.as_deref()) {
+                        out.progress(id, ProgressPhase::Load);
+                        self.loaded.insert(engine.clone());
+                        out.send(&Reply::Loaded {
+                            id,
+                            model: pinned.id,
+                            engine,
+                            revision: pinned.revision,
+                            elapsed_ms: 0,
+                        });
+                    } else {
+                        out.fail(id, ErrorCode::ModelMissing, "the model is not installed");
+                    }
+                } else if ENGINES.iter().any(|e| e.0 == engine) {
                     out.progress(id, ProgressPhase::Load);
                     self.loaded.insert(engine.clone());
                     let loaded = Reply::Loaded {
@@ -307,16 +435,39 @@ impl Helper {
                     out.send_json(&serde_json::json!({"type": "telemetry", "cpu": 0.5}));
                 }
                 let finishing = lock(&self.finishing).len();
-                out.send(&Reply::Health {
+                let reply = Reply::Health {
                     id,
                     uptime_ms: u64::try_from(self.started.elapsed().as_millis())
                         .unwrap_or(u64::MAX),
                     streams: u32::try_from(self.streams.len() + finishing).expect("bounded"),
                     loaded: self.loaded.iter().cloned().collect(),
                     rss_bytes: None,
-                });
+                };
+                match self.slow_health {
+                    Some(delay) => {
+                        std::thread::spawn(move || {
+                            std::thread::sleep(delay);
+                            out.send(&reply);
+                        });
+                    }
+                    None => out.send(&reply),
+                }
             }
             Request::Install { id, model, .. } => {
+                if let Some(pinned) = self.pinned_engine(&model)
+                    && let Some(dir) = pinned.dir(self.models_root.as_deref())
+                {
+                    out.progress(id, ProgressPhase::Verify);
+                    match std::fs::create_dir_all(&dir) {
+                        Ok(()) => out.send(&Reply::Installed {
+                            id,
+                            model,
+                            revision: pinned.revision,
+                        }),
+                        Err(e) => out.fail(id, ErrorCode::InstallFailed, &e.to_string()),
+                    }
+                    return;
+                }
                 out.fail(
                     id,
                     ErrorCode::InstallFailed,
@@ -330,6 +481,18 @@ impl Helper {
         }
     }
 
+    fn pinned_engine(&self, id: &str) -> Option<Pinned> {
+        self.pinned.iter().find(|p| p.id == id).cloned()
+    }
+
+    /// A `fake-dictation` stream is over, however it ended: reset the
+    /// recognizer for the next one.
+    fn end_dictation(&mut self, stream: &Stream) {
+        if stream.engine == "fake-dictation" {
+            self.dictation = 0;
+        }
+    }
+
     fn open(
         &mut self,
         id: u64,
@@ -338,8 +501,9 @@ impl Helper {
         format: (u32, &str, u16),
         language: Option<String>,
     ) {
+        let known = ENGINES.iter().any(|e| e.0 == engine) || self.pinned_engine(&engine).is_some();
         let out = &self.out;
-        let refusal = if !ENGINES.iter().any(|e| e.0 == engine) {
+        let refusal = if !known {
             Some((ErrorCode::UnknownEngine, "no such engine"))
         } else if !self.loaded.contains(&engine) {
             Some((ErrorCode::NotLoaded, "load it first"))
@@ -347,8 +511,15 @@ impl Helper {
             Some((ErrorCode::UnsupportedFormat, "16 kHz mono s16le only"))
         } else if self.streams.contains_key(&stream) || self.closed.contains(&stream) {
             Some((ErrorCode::StreamExists, "stream ids are single-use"))
-        } else if self.streams.len() >= MAX_STREAMS {
-            Some((ErrorCode::Busy, "too many streams"))
+        } else if engine == "fake-captions"
+            && self
+                .streams
+                .values()
+                .filter(|s| s.engine == "fake-captions")
+                .count()
+                >= CAPTION_POOL
+        {
+            Some((ErrorCode::Busy, "both fake-captions sessions are in use"))
         } else if engine == "fake-dictation"
             && self.streams.values().any(|s| s.engine == "fake-dictation")
         {
@@ -356,6 +527,8 @@ impl Helper {
                 ErrorCode::Busy,
                 "fake-dictation serves one stream at a time",
             ))
+        } else if self.streams.len() >= MAX_STREAMS {
+            Some((ErrorCode::Busy, "too many streams"))
         } else {
             None
         };
@@ -369,6 +542,9 @@ impl Helper {
                 engine,
                 samples: 0,
                 in_speech: false,
+                utterance: 1,
+                utterance_start: 0,
+                utterance_samples: 0,
                 language: language.unwrap_or_else(|| "auto".to_owned()),
             },
         );
@@ -383,6 +559,18 @@ impl Helper {
             }
             out.fatal("audio for a stream that was never opened");
         };
+        if let Some(poison) = self.crash_on_sample
+            && pcm.contains(&poison)
+        {
+            match &self.crash_once_marker {
+                None => exit(EXIT_CRASH),
+                Some(marker) if !marker.exists() => {
+                    let _ = std::fs::write(marker, b"crashed");
+                    exit(EXIT_CRASH);
+                }
+                Some(_) => {}
+            }
+        }
         let start = stream.samples;
         stream.samples += pcm.len() as u64;
         match stream.engine.as_str() {
@@ -391,6 +579,30 @@ impl Helper {
             "fake-hang" => loop {
                 std::thread::park();
             },
+            // An utterance runs until an all-zero frame: a partial per frame
+            // within it, a final at its end.
+            "fake-captions" => {
+                if pcm.iter().all(|&s| s == 0) {
+                    if let Some(reply) = stream.end_utterance(id, start) {
+                        out.send(&reply);
+                    }
+                } else {
+                    if stream.utterance_samples == 0 {
+                        stream.utterance_start = start;
+                    }
+                    stream.utterance_samples += pcm.len() as u64;
+                    out.send(&Reply::Partial {
+                        stream: id,
+                        text: format!(
+                            "utterance={} samples={}",
+                            stream.utterance, stream.utterance_samples
+                        ),
+                        start_ms: ms(stream.utterance_start),
+                        end_ms: ms(stream.samples),
+                        utterance: Some(stream.utterance),
+                    });
+                }
+            }
             // A full-scale negative sample is the failure trigger.
             "fake-dictation" if pcm.contains(&i16::MIN) => {
                 self.streams.remove(&id);
@@ -473,12 +685,23 @@ impl Helper {
         {
             return;
         }
-        let Some(stream) = self.streams.remove(&id) else {
+        let Some(mut stream) = self.streams.remove(&id) else {
             return;
         };
         self.closed.insert(id);
         let held = self.dictation;
         self.end_dictation(&stream);
+        if stream.engine == "fake-captions" {
+            let end = stream.samples;
+            if let Some(reply) = stream.end_utterance(id, end) {
+                out.send(&reply);
+            }
+            out.send(&Reply::Closed {
+                stream: id,
+                reason: CloseReason::Finished,
+            });
+            return;
+        }
         let end_ms = stream.samples * 1000 / u64::from(SAMPLE_RATE);
         let final_text = FinalText {
             stream: id,
@@ -491,7 +714,10 @@ impl Helper {
             start_ms: 0,
             end_ms,
             segments: Vec::new(),
-            model: Some(format!("{}@fake", stream.engine)),
+            model: Some(self.pinned_engine(&stream.engine).map_or_else(
+                || format!("{}@fake", stream.engine),
+                |p| format!("{}@{}", p.id, p.revision),
+            )),
             utterance: matches!(stream.engine.as_str(), "fake-stream" | "fake-dictation")
                 .then_some(1),
         };
@@ -594,7 +820,7 @@ fn main() {
                 id,
                 protocol: args.announce,
                 helper: format!("fotw-speechd-fake/{}", env!("CARGO_PKG_VERSION")),
-                capabilities: capabilities(args.future),
+                capabilities: capabilities(args.future, &args.pinned, args.models_root.as_deref()),
             }),
             _ => out.fatal("the first frame must be hello"),
         },
@@ -604,10 +830,15 @@ fn main() {
 
     let mut helper = Helper {
         out: out.clone(),
+        models_root: args.models_root,
+        pinned: args.pinned,
         started: Instant::now(),
         misbehave: args.misbehave,
         future: args.future,
         slow_load_if: args.slow_load_if,
+        crash_on_sample: args.crash_on_sample,
+        crash_once_marker: args.crash_once_marker,
+        slow_health: args.slow_health,
         finishing: Arc::new(Mutex::new(HashSet::new())),
         loaded: BTreeSet::new(),
         streams: HashMap::new(),

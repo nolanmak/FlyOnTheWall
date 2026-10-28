@@ -537,23 +537,24 @@ async fn a_result_written_just_before_the_helper_dies_is_still_delivered() {
 }
 
 #[tokio::test]
-async fn the_default_deadlines_find_a_helper_hung_after_finish_within_three_seconds() {
+async fn the_default_deadlines_find_a_helper_hung_after_finish_within_six_seconds() {
     // After finish a batch stream sends no audio, so only the heartbeat can
-    // notice. Default config: a 1 s heartbeat with a 2 s deadline.
+    // notice. Default config: a 1 s heartbeat with a 5 s deadline, slack
+    // enough for a heavily loaded Mac (see the slow-health test).
     let client = SpeechdClient::start(config(&[])).await.expect("start");
     client.load("fake-hang").await.expect("load");
     let mut stuck = client.open_stream(stream("fake-hang")).await.expect("open");
     stuck.send_audio(&[1; 16]).await.expect("audio");
     stuck.finish().await.expect("finish");
     let waited = Instant::now();
-    match next(&mut stuck).await {
-        Some(StreamEvent::Failed(failure)) => {
+    match tokio::time::timeout(Duration::from_secs(10), stuck.next_event()).await {
+        Ok(Some(StreamEvent::Failed(failure))) => {
             assert_eq!(failure.code, ErrorCode::HelperUnresponsive);
         }
         other => panic!("expected helper_unresponsive, got {other:?}"),
     }
     assert!(
-        waited.elapsed() < Duration::from_millis(3_500),
+        waited.elapsed() < Duration::from_millis(6_500),
         "{:?}",
         waited.elapsed()
     );
@@ -834,6 +835,133 @@ async fn shutdown_during_a_slow_restart_returns_at_once_and_leaves_no_helper() {
     .await;
     std::fs::remove_file(&marker).unwrap();
     assert!(gone.is_ok(), "the replacement helper was left running");
+}
+
+/// The next event, which must be a partial; returns (utterance, text, start_ms).
+async fn partial(stream: &mut SpeechStream) -> (Option<u64>, String, u64) {
+    match next(stream).await {
+        Some(StreamEvent::Partial {
+            utterance,
+            text,
+            start_ms,
+            ..
+        }) => (utterance, text, start_ms),
+        other => panic!("expected a partial, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn live_captions_number_utterances_and_commit_each_one() {
+    // #245: partials within an utterance carry its id, so the parent can
+    // replace a caption in place; a final with the same id commits it, and
+    // the next utterance gets the next id.
+    let client = SpeechdClient::start(config(&[])).await.expect("start");
+    client.load("fake-captions").await.expect("load");
+    let mut live = client
+        .open_stream(stream("fake-captions"))
+        .await
+        .expect("open");
+    live.send_audio(&[1; 1600]).await.expect("speech");
+    assert_eq!(
+        partial(&mut live).await,
+        (Some(1), "utterance=1 samples=1600".into(), 0)
+    );
+    live.send_audio(&[1; 1600]).await.expect("speech");
+    assert_eq!(
+        partial(&mut live).await,
+        (Some(1), "utterance=1 samples=3200".into(), 0)
+    );
+    live.send_audio(&[0; 320]).await.expect("a pause");
+    match next(&mut live).await {
+        Some(StreamEvent::Final(f)) => {
+            assert_eq!(
+                (f.utterance, f.text.as_str()),
+                (Some(1), "utterance=1 samples=3200")
+            );
+            assert_eq!((f.start_ms, f.end_ms), (0, 200));
+        }
+        other => panic!("expected the first utterance's final, got {other:?}"),
+    }
+    live.send_audio(&[1; 800]).await.expect("speech");
+    assert_eq!(
+        partial(&mut live).await,
+        (Some(2), "utterance=2 samples=800".into(), 220)
+    );
+    live.finish().await.expect("finish");
+    match next(&mut live).await {
+        Some(StreamEvent::Final(f)) => assert_eq!(f.utterance, Some(2)),
+        other => panic!("expected the last utterance's final, got {other:?}"),
+    }
+    assert_eq!(
+        next(&mut live).await,
+        Some(StreamEvent::Closed(CloseReason::Finished))
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_pooled_engine_refuses_a_third_stream_and_a_cancelled_one_frees_its_slot() {
+    // One caption session per capture leg: two at once. A stream that ends
+    // in any way must give its slot back.
+    let client = SpeechdClient::start(config(&[])).await.expect("start");
+    client.load("fake-captions").await.expect("load");
+    let mut mic = client
+        .open_stream(stream("fake-captions"))
+        .await
+        .expect("mic");
+    let _system = client
+        .open_stream(stream("fake-captions"))
+        .await
+        .expect("system");
+    match client.open_stream(stream("fake-captions")).await {
+        Err(ClientError::Remote {
+            code: ErrorCode::Busy,
+            ..
+        }) => {}
+        other => panic!("expected busy, got {:?}", other.map(|s| s.id())),
+    }
+    mic.cancel();
+    let mut again = client
+        .open_stream(stream("fake-captions"))
+        .await
+        .expect("the cancelled stream's slot is free");
+    again.send_audio(&[1; 160]).await.expect("audio");
+    assert_eq!(partial(&mut again).await.0, Some(1));
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_helper_slow_to_answer_health_under_load_is_not_killed() {
+    // A Mac at load average 40 delayed the real helper's health answers past
+    // the old 2 s deadline and got a working caption stream killed. Default
+    // deadlines must ride out a 2.5 s answer.
+    let Some(config) = fake_only(&["--slow-health", "2500"]) else {
+        return;
+    };
+    let client = SpeechdClient::start(config).await.expect("start");
+    client.load("fake-stream").await.expect("load");
+    let mut live = client
+        .open_stream(stream("fake-stream"))
+        .await
+        .expect("open");
+    let started = Instant::now();
+    let mut sent = 0;
+    while started.elapsed() < Duration::from_secs(6) {
+        live.send_audio(&[1; 160])
+            .await
+            .expect("audio keeps flowing");
+        sent += 160;
+        match next(&mut live).await {
+            Some(StreamEvent::Partial { text, .. }) => assert_eq!(text, format!("samples={sent}")),
+            other => panic!("the stream must stay up, got {other:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        client.health().await.is_ok(),
+        "a slow answer is still an answer"
+    );
+    client.shutdown().await;
 }
 
 // ------------------------------------------------- streaming dictation (Murmur #100)

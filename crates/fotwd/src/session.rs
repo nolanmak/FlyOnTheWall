@@ -908,6 +908,9 @@ pub struct LocalLegs {
     /// The near end: the user. `None` with no input device or the opt-out set,
     /// and not opened if the mic tap did not actually start.
     pub mic: Option<Box<LocalStreamConfig>>,
+    /// Live captions (#245): a second, display-only engine on each leg.
+    /// `None` keeps the leg exactly as it was.
+    pub captions: Option<Arc<dyn crate::captions::CaptionEngine>>,
 }
 
 impl LocalLegs {
@@ -925,6 +928,7 @@ impl LocalLegs {
             system: Box::new(LocalStreamConfig::new(session_id, Source::System)),
             mic: (mic_present && mic_enabled)
                 .then(|| Box::new(LocalStreamConfig::new(session_id, Source::Mic))),
+            captions: None,
         }
     }
 }
@@ -2637,6 +2641,11 @@ fn spawn_leg_collector(
     speech: crate::speech_status::SpeechMonitor,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // The end of the last final on this leg. A live caption (#245)
+        // commits after its own end-of-utterance debounce, often after the
+        // final engine's text for the same speech has landed; one that starts
+        // before this mark would bring back a grey row the final replaced.
+        let mut covered_ms = 0u64;
         while let Some(ev) = rx.recv().await {
             speech.observe_legacy(
                 if leg == "system" {
@@ -2648,6 +2657,7 @@ fn spawn_leg_collector(
             );
             match ev {
                 StreamEvent::Final(seg) => {
+                    covered_ms = covered_ms.max(seg.end_ms);
                     // Live first, then the buffer: a viewer watching the
                     // meeting should not be behind the file on disk.
                     tap.emit(&seg, TapKind::Final);
@@ -2658,6 +2668,8 @@ fn spawn_leg_collector(
                 // dropping them here is why the "live" transcript only
                 // moved at utterance boundaries — one to three seconds
                 // after the speaker paused, which reads as "not realtime".
+                StreamEvent::Partial(seg)
+                    if seg.provider == crate::captions::PROVIDER && seg.start_ms < covered_ms => {}
                 StreamEvent::Partial(seg) => tap.emit(&seg, TapKind::Partial),
                 StreamEvent::Error(e) => {
                     crate::diag!("  ! transcription ({leg}): {e}");
@@ -2701,6 +2713,9 @@ enum LegStream {
         stream: crate::failover::stream::FailoverStream,
         errors: SttErrors,
         write_failed: AtomicBool,
+        /// Live captions' copy of what the final engine hears. Offering never
+        /// blocks, so a slow caption engine cannot slow this leg.
+        captions: Option<crate::captions::CaptionFeed>,
     },
     Failover {
         stream: crate::failover::stream::FailoverStream,
@@ -2767,7 +2782,15 @@ impl PcmFeed for LegStream {
                 stream,
                 errors,
                 write_failed,
+                ..
             } => {
+                if let Self::DurableLocal {
+                    captions: Some(captions),
+                    ..
+                } = self
+                {
+                    captions.offer(&Downmixer::to_i16(&output.samples));
+                }
                 if let Err(error) = stream.write_processed(output)
                     && !write_failed.swap(true, Ordering::AcqRel)
                 {
@@ -2793,7 +2816,15 @@ impl PcmFeed for LegStream {
                 stream,
                 errors,
                 write_failed,
+                ..
             } => {
+                if let Self::DurableLocal {
+                    captions: Some(captions),
+                    ..
+                } = self
+                {
+                    captions.offer(pcm);
+                }
                 if let Err(error) = stream.write(pcm)
                     && !write_failed.swap(true, Ordering::AcqRel)
                 {
@@ -2872,7 +2903,7 @@ async fn open_legs(
                             errors.clone(),
                             Source::Mic,
                             speech.clone(),
-                            false,
+                            Durable::Failover,
                         )
                     } else {
                         let (m, rx) = DeepgramStream::open(*cfg);
@@ -2884,6 +2915,17 @@ async fn open_legs(
             (Some(Arc::new(LegStream::Deepgram(s))), Some(s_rx), m, m_rx)
         }
         Transcription::Local(mut legs) => {
+            let captions = |source, anchor_ms| {
+                legs.captions.clone().map(|engine| CaptionSetup {
+                    engine,
+                    source,
+                    session_id: session_id.to_owned(),
+                    anchor_ms,
+                    speech: speech.clone(),
+                })
+            };
+            let system_captions = captions(Source::System, anchors.system_ms);
+            let mic_captions = captions(Source::Mic, anchors.mic_ms);
             legs.system.session_id = session_id.to_owned();
             legs.system.session_offset_ms = anchors.system_ms;
             let mut config = crate::failover::stream::LocalSourceConfig::new(
@@ -2896,7 +2938,7 @@ async fn open_legs(
                 errors.clone(),
                 Source::System,
                 speech.clone(),
-                true,
+                Durable::Local(system_captions),
             );
             let mic = match legs.mic {
                 Some(mut cfg) if mic_started => {
@@ -2911,7 +2953,7 @@ async fn open_legs(
                         errors,
                         Source::Mic,
                         speech,
-                        true,
+                        Durable::Local(mic_captions),
                     )
                 }
                 _ => (None, None),
@@ -2973,8 +3015,25 @@ async fn open_failover_source(
         errors,
         source,
         speech,
-        false,
+        Durable::Failover,
     )
+}
+
+/// What kind of leg a durable stream becomes.
+enum Durable {
+    /// Cloud first, local on failure.
+    Failover,
+    /// Local only, with live captions beside it when set up.
+    Local(Option<CaptionSetup>),
+}
+
+/// A leg's live captions, before the leg exists.
+struct CaptionSetup {
+    engine: Arc<dyn crate::captions::CaptionEngine>,
+    source: Source,
+    session_id: String,
+    anchor_ms: u64,
+    speech: crate::speech_status::SpeechMonitor,
 }
 
 fn bind_durable_source(
@@ -2988,12 +3047,16 @@ fn bind_durable_source(
     errors: SttErrors,
     source: Source,
     speech: crate::speech_status::SpeechMonitor,
-    local_only: bool,
+    kind: Durable,
 ) -> (Option<Arc<LegStream>>, Option<LegEvents>) {
     match opened {
         Ok((stream, mut events)) => {
             speech.bind_durable(source, stream.status_reader());
             let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+            // Live captions write into the same channel. The collector stops
+            // at the leg's Closed state, not at channel close, so this extra
+            // sender cannot hold a stop open; captions after it are dropped.
+            let caption_events = sender.clone();
             tokio::spawn(async move {
                 while let Some(event) = events.recv().await {
                     match event {
@@ -3008,18 +3071,32 @@ fn bind_durable_source(
                     }
                 }
             });
-            let stream = if local_only {
-                LegStream::DurableLocal {
+            let stream = match kind {
+                Durable::Local(captions) => LegStream::DurableLocal {
                     stream,
                     errors,
                     write_failed: AtomicBool::new(false),
-                }
-            } else {
-                LegStream::Failover {
+                    // Captions share the leg's event channel, so they take
+                    // the collector's display-only path for partials.
+                    captions: captions.map(|setup| {
+                        let monitor = setup.speech;
+                        crate::captions::start(crate::captions::CaptionLeg {
+                            engine: setup.engine,
+                            source: setup.source,
+                            session_id: setup.session_id,
+                            anchor_ms: setup.anchor_ms,
+                            events: caption_events.clone(),
+                            state: Arc::new(move |source, state| {
+                                monitor.set_captions(source, state)
+                            }),
+                        })
+                    }),
+                },
+                Durable::Failover => LegStream::Failover {
                     stream,
                     errors,
                     write_failed: AtomicBool::new(false),
-                }
+                },
             };
             (Some(Arc::new(stream)), Some(receiver))
         }
@@ -5478,6 +5555,77 @@ mod local_collector_shutdown_tests {
         assert!(
             completed,
             "stalled inference sender must not hold a closed session collector alive"
+        );
+    }
+
+    fn caption(utterance: u64, start_ms: u64, end_ms: u64, text: &str) -> TranscriptSegment {
+        TranscriptSegment {
+            id: format!("caption-system-1-{utterance}"),
+            session_id: "s".into(),
+            source: Source::System,
+            speaker: None,
+            text: text.into(),
+            start_ms,
+            end_ms,
+            words: Vec::new(),
+            confidence: None,
+            language: None,
+            is_final: false,
+            revision: 0,
+            provider: crate::captions::PROVIDER.into(),
+            model: "captions".into(),
+            timestamp_source: fotw_stt::TimestampSource::Estimated,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_caption_arriving_after_the_final_text_it_covers_is_not_shown_again() {
+        // #245 review: the caption engine commits ~640 ms after an utterance
+        // ends, the final engine ~190 ms after; its late caption must not
+        // bring back a grey row the final text already replaced.
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let tapped = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = tapped.clone();
+        let task = spawn_leg_collector(
+            "system",
+            receiver,
+            Arc::default(),
+            SttErrors::default(),
+            SegmentTap::new(move |seg, kind| seen.lock().unwrap().push((seg.text.clone(), kind))),
+            crate::speech_status::SpeechMonitor::default(),
+        );
+        let mut final_text = caption(0, 1_000, 3_000, "Hello there.");
+        final_text.is_final = true;
+        final_text.provider = "parakeet-unified".into();
+        sender
+            .send(StreamEvent::Partial(caption(1, 1_000, 2_000, "hello")))
+            .unwrap();
+        sender.send(StreamEvent::Final(final_text)).unwrap();
+        sender
+            .send(StreamEvent::Partial(caption(
+                1,
+                1_000,
+                3_000,
+                "hello there",
+            )))
+            .unwrap();
+        sender
+            .send(StreamEvent::Partial(caption(2, 3_200, 3_600, "how")))
+            .unwrap();
+        sender
+            .send(StreamEvent::State(fotw_stt::StreamState::Closed))
+            .unwrap();
+        task.await.unwrap();
+        let texts: Vec<_> = tapped
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(t, _)| t.clone())
+            .collect();
+        assert_eq!(
+            texts,
+            ["hello", "Hello there.", "how"],
+            "the late caption is dropped, the next kept"
         );
     }
 }

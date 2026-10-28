@@ -35,10 +35,13 @@ public protocol StepRecognizer: AnyObject, Sendable {
     func finish() async throws -> String
     /// Forget the utterance: caches, decoder state and buffered audio.
     func reset() async
+    /// Release the models, for a recognizer its engine has unloaded.
+    func cleanup() async
 }
 
 extension StepRecognizer {
     public func processFinal(_ samples: [Float]) async throws {}
+    public func cleanup() async {}
 
     /// One step of silence, then a reset, so Core ML compiles before the first
     /// real stream and nothing of the warmup leaks into it.
@@ -108,7 +111,11 @@ public final class StepStreamingSession<Recognizer: StepRecognizer>: EngineSessi
         // A typed step in flight still uses the recognizer.
         _ = try? await typing?.value
         await recognizer.reset()
-        await pool.checkin(recognizer)
+        // An engine unloaded since this stream opened has drained its pool;
+        // the recognizer comes back to be released here.
+        if let stale = await pool.checkin(recognizer) {
+            await stale.cleanup()
+        }
     }
 }
 
@@ -122,7 +129,7 @@ public func openStepStream<Recognizer: StepRecognizer>(
     do {
         try await recognizer.setLanguage(options.language)
     } catch {
-        await pool.checkin(recognizer)
+        if let stale = await pool.checkin(recognizer) { await stale.cleanup() }
         throw error
     }
     return StepStreamingSession(recognizer: recognizer, pool: pool, provenance: provenance)
@@ -161,7 +168,7 @@ public actor FakeDictationEngine: SpeechEngine {
         // A dictation holding it has warmed it already.
         guard await pool.available > 0, let recognizer = try? await pool.checkout() else { return }
         try? await recognizer.warm()
-        await pool.checkin(recognizer)
+        if let stale = await pool.checkin(recognizer) { await stale.cleanup() }
     }
 
     public func unload() async { pool = nil }

@@ -80,6 +80,8 @@ const el = {
   speechMode: document.getElementById("speech-mode"),
   speechModel: document.getElementById("speech-model"),
   speechLanguage: document.getElementById("speech-language"),
+  speechCaptions: document.getElementById("speech-captions"),
+  speechCaptionsNote: document.getElementById("speech-captions-note"),
   speechDisclosure: document.getElementById("speech-disclosure"),
   speechLocalFields: document.getElementById("speech-local-fields"),
   speechSave: document.getElementById("speech-save"),
@@ -537,7 +539,7 @@ function renderSavedSpeechProvenance(history) {
   return section;
 }
 function speechProviderName(provider) {
-  return new Map([["deepgram", "Deepgram"], ["whispercpp", "Whisper"], ["local-whisper", "Whisper"], ["whisper.cpp", "Whisper"]]).get(provider) || String(provider || "Unknown provider");
+  return new Map([["deepgram", "Deepgram"], ["whispercpp", "Whisper"], ["local-whisper", "Whisper"], ["whisper.cpp", "Whisper"], ["fotw-speechd", "FluidAudio"]]).get(provider) || String(provider || "Unknown provider");
 }
 
 // Why this meeting has no summary, in words, or null to stay silent.
@@ -865,6 +867,9 @@ function speechOrigin(segments) {
 let liveSessionId = null;
 let liveFinals = new Map();
 let livePartials = new Map();
+// Per channel: the end of the latest final or clearing event. A live caption
+// starting before it is late text for speech the final already covers (#245).
+let liveCovered = new Map();
 let liveHistoryMissing = false;
 let liveSnapshotOrigin = null;
 let liveSavedMeetingId = null;
@@ -873,6 +878,7 @@ function selectLiveSession(id) {
   liveSessionId = id;
   liveFinals = new Map();
   livePartials = new Map();
+  liveCovered = new Map();
   liveSegments = [];
   liveHistoryMissing = false;
   liveSnapshotOrigin = null;
@@ -906,16 +912,33 @@ function liveOrigin() {
   if (liveSnapshotOrigin === null) return current;
   return current === null ? liveSnapshotOrigin : Math.min(current, liveSnapshotOrigin);
 }
+// One pending row per channel, plus one per live-caption utterance (#245),
+// which stays greyed until the final engine's text covers it.
+function partialKey(d) {
+  return d.utterance ? d.channel + "#" + d.utterance : d.channel;
+}
+function clearCoveredPartials(channel, endMs) {
+  liveCovered.set(channel, Math.max(liveCovered.get(channel) || 0, endMs));
+  for (const [key, partial] of livePartials) {
+    if (partial.channel === channel && partial.start_ms < endMs) livePartials.delete(key);
+  }
+}
 function appendDeltas(deltas) {
   let finalsChanged = false;
   for (const d of deltas) {
     if (!liveSessionId || d.meeting_id !== liveSessionId) continue;
     if (d.is_final === false) {
-      if (d.text) livePartials.set(d.channel, d);
-      else livePartials.delete(d.channel);
+      if (d.utterance && d.start_ms < (liveCovered.get(d.channel) || 0)) continue;
+      if (d.text) livePartials.set(partialKey(d), d);
+      else if (d.utterance) livePartials.delete(partialKey(d));
+      else {
+        // An empty partial clears the channel's pending text, including live
+        // captions it covers (a suppressed echo final sends one).
+        livePartials.delete(d.channel);
+        clearCoveredPartials(d.channel, d.end_ms);
+      }
     } else {
-      const partial = livePartials.get(d.channel);
-      if (!partial || partial.start_ms < d.end_ms) livePartials.delete(d.channel);
+      clearCoveredPartials(d.channel, d.end_ms);
       if (d.text.trim()) {
         liveFinals.set(d.idx, { ...d, speaker: d.channel === "mic" ? "me" : null });
         finalsChanged = true;
@@ -954,7 +977,7 @@ function renderLiveTranscript(forceFollow = false) {
   } else {
     visible.push(...liveSegments.slice(-(MAX_ROWS - livePartials.size))
       .map(d => ({key: "final:" + d.idx, d, partial: false})));
-    for (const [channel, d] of livePartials) visible.push({key: "partial:" + channel, d, partial: true});
+    for (const [key, d] of livePartials) visible.push({key: "partial:" + key, d, partial: true});
   }
   for (const {key, d, partial} of visible) {
     const at = origin !== null && d.start_ms >= origin ? d.start_ms - origin : null;
@@ -1261,13 +1284,16 @@ function renderSpeechHealth(body) {
     entry.engine = provider + " / " + String(source.model || "Unknown model");
     // Which speech condition needs attention, if any; a new one reopens the bar.
     entry.attention = ["reconnecting", "closed", "incomplete"].includes(source.state) ? source.state
-      : source.error ? "error" : source.switch_reason ? "switched:" + source.switch_reason : "";
+      : source.error ? "error" : source.switch_reason ? "switched:" + source.switch_reason
+      : source.captions === "paused" ? "captions_paused" : "";
     entry.stateText = states[source.state] || "Status unavailable";
     const parts = [states[source.state] || "Status unavailable"];
     if (typeof source.pending_audio_ms === "number" && Number.isFinite(source.pending_audio_ms) && source.pending_audio_ms >= 0) {
       parts.push((source.pending_audio_ms / 1000).toFixed(1) + "s audio pending");
     } else parts.push("Coverage not measured");
     if (source.source === "system" && source.diarization_supported === false) parts.push("No remote speaker labels");
+    // Live captions (#245) are display-only: pausing them changes nothing saved.
+    if (source.captions === "paused") parts.push("Live captions paused");
     const summary = parts.join(" · ");
     if (entry.summary.textContent !== summary) entry.summary.textContent = summary;
     const from = typeof source.from_ms === "number" ? "Coverage from audio " + formatElapsed(source.from_ms) + ": " : "Provider change: ";
@@ -1773,9 +1799,18 @@ function renderSpeechSettings(body) {
   el.speechMode.value = settings?.engine || "";
   el.speechModel.value = settings?.model || "";
   el.speechLanguage.value = settings?.language || "";
+  // Live captions (#245): on unless saved off; they need their own model.
+  if (el.speechCaptions) el.speechCaptions.checked = settings?.live_captions !== false;
+  if (el.speechCaptionsNote) {
+    el.speechCaptionsNote.textContent = settings?.engine === "deepgram"
+      ? "Live captions run only for on-device meetings; Deepgram shows its own live text."
+      : body.captions_installed
+        ? "Word-by-word text in the live view, greyed until the final text replaces it. Never saved."
+        : "Live captions need their model (parakeet-eou-320ms, NVIDIA Open Model License): install it below or with fotwd stt models install parakeet-eou-320ms.";
+  }
   const messages = {
     present_unchecked: "Model file found. Start verifies its contents and prepares native memory before capture in backup mode.",
-    missing: "Model file missing. Choose an installed model. Offline backup refuses Start until repaired.",
+    missing: "Model not installed. Install it below, or choose an installed model. Start refuses on-device speech until it is installed.",
     unsupported: "Local speech is currently supported only on macOS.",
     not_required: "Deepgram requires a configured key. No local model is used.",
     unknown: "The saved speech choice cannot be read. Select a mode to repair it.",
@@ -1797,14 +1832,15 @@ async function loadSpeech() {
 async function onSpeechSave() {
   if (speechSaving || !["local", "deepgram", "fallback"].includes(el.speechMode.value)) return;
   speechSaving = true;
-  const controls = [el.speechMode, el.speechModel, el.speechLanguage, el.speechReload];
+  const controls = [el.speechMode, el.speechModel, el.speechLanguage, el.speechCaptions, el.speechReload].filter(Boolean);
   controls.forEach(control => { control.disabled = true; });
   paintSpeechPolicy();
   el.speechStatus.textContent = "Checking the selected model and saving…";
   try {
     const body = await api("/api/settings/speech", {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({engine: el.speechMode.value, model: el.speechModel.value, language: el.speechLanguage.value}),
+      body: JSON.stringify({engine: el.speechMode.value, model: el.speechModel.value, language: el.speechLanguage.value,
+        live_captions: el.speechCaptions ? el.speechCaptions.checked : true}),
     });
     if (body.error) {
       el.speechStatus.textContent = "Not saved. " + body.error;

@@ -65,10 +65,10 @@ public actor NemotronStreamingEngine: SpeechEngine {
             try await recognizer.warm()
         } catch {
             await recognizer.reset()
-            await pool.checkin(recognizer)
+            if let stale = await pool.checkin(recognizer) { await stale.cleanup() }
             throw error
         }
-        await pool.checkin(recognizer)
+        if let stale = await pool.checkin(recognizer) { await stale.cleanup() }
     }
 
     public func unload() async {

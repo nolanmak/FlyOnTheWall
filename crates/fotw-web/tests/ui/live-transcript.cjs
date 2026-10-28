@@ -376,6 +376,10 @@ test('the actual whisper.cpp provider ID renders the friendly engine name',()=>{
  const h=harness();h.ctx.renderRecording({state:'recording',session_id:'real-provider',started_at_ms:1000,speech_status:[speechStatus({provider:'whispercpp',model:'small.en',state:'local'})]});
  const panel=h.nodes.get('speech-health');assert.match(panel.textContent,/Whisper \/ small.en/);assert.doesNotMatch(panel.textContent,/whispercpp/);
 });
+test('the speech helper provider ID renders the runtime name beside Parakeet',()=>{
+ const h=harness();h.ctx.renderRecording({state:'recording',session_id:'parakeet',started_at_ms:1000,speech_status:[speechStatus({provider:'fotw-speechd',model:'parakeet-unified',state:'local'})]});
+ const panel=h.nodes.get('speech-health');assert.match(panel.textContent,/FluidAudio \/ parakeet-unified/);assert.doesNotMatch(panel.textContent,/fotw-speechd/);
+});
 test('legacy failures retain their warning while a durable epoch zero uses a recovery notice',()=>{
  const h=harness();const base={state:'recording',session_id:'errors',started_at_ms:1000,transcription_error:'The API key was rejected'};
  h.ctx.renderRecording({...base,speech_status:[speechStatus({epoch:null,from_ms:null,pending_audio_ms:null,state:'closed',worker_running:null})]});
@@ -468,4 +472,47 @@ test('scrolling back to the bottom resumes finals, and navigation cannot reuse a
  h.old();h.ctx.appendDeltas([d(207,207000,'while away')]);h.ctx.showLive();
  assert.match(h.document.getElementById('segments').textContent,/while away/);
  assert.notEqual(h.document.getElementById('segments'),paused);
+});
+
+// #245: live captions are pending rows keyed by utterance, never copied or saved.
+const caption=(utterance,start_ms,text,channel='system')=>({...d(-1,start_ms,text,channel),is_final:false,utterance:`caption-${channel}-1-${utterance}`});
+test('live captions keep one greyed row per utterance, revise it in place, and give way to final text',()=>{
+ // A reader following the bottom; a scrolled-up reader's view stays frozen.
+ const h=harness();start(h);h.nodes.get('detail').scrollTop=900;const rows=()=>h.document.getElementById('segments').textContent;
+ h.ctx.appendDeltas([caption(1,17000,'hello'),caption(1,17000,'hello there')]);
+ assert.match(rows(),/hello there/);assert.equal((rows().match(/hello/g)||[]).length,1,'a revision replaces its row');
+ h.ctx.appendDeltas([caption(2,19000,'how are')]);
+ assert.match(rows(),/hello there/);assert.match(rows(),/how are/);
+ // The final engine's text for the first utterance covers its caption only.
+ h.ctx.appendDeltas([d(0,17000,'Hello there.')]);
+ assert.match(rows(),/Hello there\./);assert.doesNotMatch(rows(),/hello there/);assert.match(rows(),/how are/);
+ assert.doesNotMatch(h.ctx.livePayload().text,/how are/,'captions are never copied');
+ // A caption on the other channel is untouched by this channel's final.
+ h.ctx.appendDeltas([caption(1,17500,'mine','mic'),d(1,19000,'How are you?')]);
+ assert.match(rows(),/mine/);assert.doesNotMatch(rows(),/how are(?! you)/);
+});
+test('an echo-suppressed final clears the captions it covers on that channel',()=>{
+ const h=harness();start(h);
+ h.ctx.appendDeltas([caption(1,17000,'echo','mic'),{...d(-1,17000,'','mic'),is_final:false}]);
+ assert.doesNotMatch(h.document.getElementById('segments').textContent,/echo/);
+});
+test('paused live captions are reported on the source without implying lost transcription',()=>{
+ const h=harness();
+ h.ctx.renderRecording({state:'recording',session_id:'cap',started_at_ms:1000,speech_status:[speechStatus({provider:'whispercpp',model:'small.en',state:'local',captions:'paused'})]});
+ const panel=h.nodes.get('speech-health');assert.equal(panel.hidden,false);
+ assert.match(panel.textContent,/Live captions paused/);assert.match(panel.textContent,/Local transcription/);
+ assert.doesNotMatch(panel.textContent,/incomplete|failing/i);
+ h.ctx.renderRecording({state:'recording',session_id:'cap',started_at_ms:1000,speech_status:[speechStatus({provider:'whispercpp',model:'small.en',state:'local',captions:'live'})]});
+ assert.doesNotMatch(panel.textContent,/paused/);
+});
+test('a live caption arriving after the final text that covers it stays gone',()=>{
+ // #245 review: the caption engine commits after the final engine has landed.
+ const h=harness();start(h);h.nodes.get('detail').scrollTop=900;const rows=()=>h.document.getElementById('segments').textContent;
+ h.ctx.appendDeltas([caption(1,17000,'hello'),d(0,17000,'Hello there.'),caption(1,17000,'hello there')]);
+ assert.match(rows(),/Hello there\./);assert.doesNotMatch(rows(),/hello there/);
+ // A suppressed echo's clearing partial covers the mic channel the same way.
+ h.ctx.appendDeltas([{...d(-1,20000,'','mic'),is_final:false},caption(1,20000,'echo','mic')]);
+ assert.doesNotMatch(rows(),/echo/);
+ // The next utterance still shows.
+ h.ctx.appendDeltas([caption(2,18500,'how are')]);assert.match(rows(),/how are/);
 });

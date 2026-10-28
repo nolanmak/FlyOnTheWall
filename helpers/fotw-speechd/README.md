@@ -13,7 +13,7 @@ The helper never opens a capture device. The parent sends it PCM.
 | Path | What |
 |---|---|
 | `Sources/SpeechdCore` | Frames and messages, the server, the model store, lifecycle guards, the fake engines |
-| `Sources/SpeechdFluid` | The FluidAudio engines: `parakeet-unified`, `silero-vad`, `nemotron-3.5` |
+| `Sources/SpeechdFluid` | The FluidAudio engines: `parakeet-unified`, `silero-vad`, `parakeet-eou-320ms`, `parakeet-eou-160ms`, `nemotron-3.5` |
 | `Sources/fotw-speechd` | The executable |
 | `Sources/SpeechdChecks` | Model-free checks (no XCTest needed) |
 
@@ -80,7 +80,8 @@ check leaves the previous selection as it was. Loading reads local files only.
 |---|---|
 | `parakeet-unified` | CC BY 4.0 |
 | `silero-vad` | MIT |
-| `parakeet-eou-320ms` (pinned; engine in #245) | NVIDIA Open Model License |
+| `parakeet-eou-320ms` (live captions, #245) | NVIDIA Open Model License |
+| `parakeet-eou-160ms` (live captions, faster variant, not the default) | NVIDIA Open Model License |
 | `nemotron-3.5` (560 ms + 1120 ms variants; streaming dictation, Murmur #100) | OpenMDW-1.1 |
 
 ## Real-model suite
