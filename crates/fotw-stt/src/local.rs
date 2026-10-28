@@ -1120,6 +1120,7 @@ mod tests {
         };
         let segments = segments_for(
             &config,
+            PROVIDER,
             "tiny",
             None,
             &chunk,

@@ -76,6 +76,6 @@ pub use store::{
 };
 pub use stream::{StreamEvent, StreamState};
 pub use transcript::{Source, TimestampSource, TranscriptSegment, Word};
-pub use vad::{GateConfig, GatedRecognizer, SpeechDetector};
+pub use vad::{GateConfig, GatedFactory, GatedRecognizer, SpeechDetector};
 #[cfg(all(target_os = "macos", feature = "local-whisper"))]
 pub use whisper::WhisperEngine;

@@ -20,7 +20,7 @@
 //! own `get_speech_timestamps` hysteresis, which whisper.cpp also uses.
 
 use crate::SttError;
-use crate::local::{Recognized, Recognizer, SAMPLE_RATE};
+use crate::local::{Recognized, Recognizer, RecognizerFactory, SAMPLE_RATE};
 
 /// Silero's analysis window at 16 kHz: one probability per 32 ms.
 pub const WINDOW_SAMPLES: usize = 512;
@@ -182,9 +182,128 @@ impl Recognizer for GatedRecognizer {
     }
 }
 
+/// A [`RecognizerFactory`] whose every recognizer is behind the gate.
+///
+/// For an engine that does not gate itself, such as Parakeet Unified in the
+/// speech helper (#244): each leg gets a detector of its own from `detector`
+/// and the engine's recognizer behind it, so the engine only ever sees
+/// utterances the detector heard as speech. Provenance is the engine's.
+pub struct GatedFactory<F> {
+    inner: std::sync::Arc<dyn RecognizerFactory>,
+    detector: F,
+    config: GateConfig,
+}
+
+impl<F> GatedFactory<F>
+where
+    F: Fn() -> Result<Box<dyn SpeechDetector>, SttError> + Send + Sync,
+{
+    /// Gate `inner` behind a fresh `detector()` per leg, with
+    /// [`GateConfig::default`].
+    pub fn new(inner: std::sync::Arc<dyn RecognizerFactory>, detector: F) -> Self {
+        Self {
+            inner,
+            detector,
+            config: GateConfig::default(),
+        }
+    }
+
+    /// Where the gate draws the line.
+    #[must_use]
+    pub fn with_config(mut self, config: GateConfig) -> Self {
+        self.config = config;
+        self
+    }
+}
+
+impl<F> RecognizerFactory for GatedFactory<F>
+where
+    F: Fn() -> Result<Box<dyn SpeechDetector>, SttError> + Send + Sync,
+{
+    fn model(&self) -> &str {
+        self.inner.model()
+    }
+
+    fn language(&self) -> Option<&str> {
+        self.inner.language()
+    }
+
+    fn provider(&self) -> &str {
+        self.inner.provider()
+    }
+
+    fn create(&self) -> Result<Box<dyn Recognizer>, SttError> {
+        let detector = (self.detector)()?;
+        Ok(Box::new(GatedRecognizer::new(
+            detector,
+            self.inner.create()?,
+            self.config,
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Constant(f32);
+    impl SpeechDetector for Constant {
+        fn probabilities(&mut self, pcm: &[f32]) -> Result<Vec<f32>, SttError> {
+            Ok(vec![self.0; pcm.len().div_ceil(WINDOW_SAMPLES)])
+        }
+    }
+
+    struct Engine(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl RecognizerFactory for Engine {
+        fn model(&self) -> &str {
+            "engine-model"
+        }
+        fn language(&self) -> Option<&str> {
+            Some("en")
+        }
+        fn provider(&self) -> &str {
+            "engine-runtime"
+        }
+        fn create(&self) -> Result<Box<dyn Recognizer>, SttError> {
+            Ok(Box::new(Counting(self.0.clone())))
+        }
+    }
+    struct Counting(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl Recognizer for Counting {
+        fn transcribe(&mut self, _: &[f32]) -> Result<Vec<Recognized>, SttError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![Recognized {
+                start_ms: 0,
+                end_ms: 1,
+                text: "heard".into(),
+            }])
+        }
+    }
+
+    #[test]
+    fn a_gated_factory_keeps_the_engines_provenance_and_shows_it_only_speech() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine: std::sync::Arc<dyn RecognizerFactory> =
+            std::sync::Arc::new(Engine(calls.clone()));
+        let chunk = vec![0.1; 16_000];
+        for (p, reached) in [(0.1, 0), (0.9, 1)] {
+            let gated = GatedFactory::new(engine.clone(), move || {
+                Ok(Box::new(Constant(p)) as Box<dyn SpeechDetector>)
+            });
+            assert_eq!(
+                (gated.provider(), gated.model(), gated.language()),
+                ("engine-runtime", "engine-model", Some("en"))
+            );
+            calls.store(0, std::sync::atomic::Ordering::SeqCst);
+            let heard = gated.create().unwrap().transcribe(&chunk).unwrap();
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                reached,
+                "p = {p}"
+            );
+            assert_eq!(heard.len(), reached, "p = {p}");
+        }
+    }
 
     fn windows(probabilities: &[(f32, usize)]) -> Vec<f32> {
         probabilities
