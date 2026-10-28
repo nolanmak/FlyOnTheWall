@@ -339,6 +339,16 @@ pub fn install_model(
                 },
             }
         };
+        // The client forwards a progress event before the answer that follows
+        // it, so it is already queued; select! may simply have taken the
+        // answer first.
+        while let Ok(p) = rx.try_recv() {
+            progress(InstallProgress {
+                phase: p.phase,
+                bytes: p.bytes.unwrap_or(0),
+                total: p.total.unwrap_or(model.bytes),
+            });
+        }
         client.shutdown().await;
         let revision = result.map_err(|e| format!("{} was not installed: {e}", model.id))?;
         if revision != model.revision {
@@ -405,6 +415,26 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::fake_launch;
     use super::*;
+
+    /// The fake answers `install` right behind its `verify` progress, so the
+    /// answer and the progress are often ready together. Every install must
+    /// still report the progress the helper sent; one try in ten or twenty
+    /// used to lose it, so this repeats enough to catch that.
+    #[test]
+    fn install_reports_progress_the_helper_sent_just_before_answering() {
+        for attempt in 0..128 {
+            let root = tempfile::tempdir().unwrap();
+            let mut seen = Vec::new();
+            install(&fake_launch(), root.path(), None, &|| false, &mut |p| {
+                seen.push(p.phase);
+            })
+            .unwrap();
+            assert!(
+                seen.contains(&ProgressPhase::Verify),
+                "attempt {attempt}: {seen:?}"
+            );
+        }
+    }
 
     #[test]
     fn install_selects_the_pinned_revision_and_prepare_then_loads_it() {
