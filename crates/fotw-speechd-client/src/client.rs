@@ -302,12 +302,16 @@ struct Shared {
     /// Serializes spawning, so concurrent callers share one restart.
     spawn_lock: tokio::sync::Mutex<()>,
     state: Mutex<State>,
-    /// Cuts short a restart's wait when the client shuts down.
-    stopping: tokio::sync::Notify,
+    /// Set by `shutdown`. Every step of a restart (its spacing, the spawn
+    /// and handshake, the replayed loads) gives up as soon as it is.
+    stop: tokio::sync::watch::Sender<bool>,
 }
 
 struct State {
     current: Option<Arc<Conn>>,
+    /// A helper a restart has spawned but not finished replaying loads into,
+    /// so `shutdown` can kill it without waiting for the restart.
+    starting: Option<Arc<Conn>>,
     budget: RestartBudget,
     failed: Option<ClientError>,
     generation: u64,
@@ -354,9 +358,10 @@ impl SpeechdClient {
         let shared = Arc::new(Shared {
             config,
             spawn_lock: tokio::sync::Mutex::new(()),
-            stopping: tokio::sync::Notify::new(),
+            stop: tokio::sync::watch::Sender::new(false),
             state: Mutex::new(State {
                 current: None,
+                starting: None,
                 budget,
                 failed: None,
                 generation: 1,
@@ -598,9 +603,17 @@ impl SpeechdClient {
     /// Ask the helper to exit, then make sure it has. Every later call fails
     /// with [`ClientError::ShutDown`].
     pub async fn shutdown(&self) {
-        lock(&self.shared.state).failed = Some(ClientError::ShutDown);
-        // A restart may be waiting out its spacing while holding the lock.
-        self.shared.stopping.notify_one();
+        let starting = {
+            let mut state = lock(&self.shared.state);
+            state.failed = Some(ClientError::ShutDown);
+            state.starting.take()
+        };
+        // A restart may be in progress, holding the lock: stop it at whatever
+        // step it is on, and kill the helper it is replaying loads into.
+        self.shared.stop.send_replace(true);
+        if let Some(conn) = starting {
+            conn.close(ClientError::ShutDown);
+        }
         let _spawning = self.shared.spawn_lock.lock().await;
         let conn = lock(&self.shared.state).current.take();
         if let Some(conn) = conn {
@@ -653,41 +666,69 @@ impl SpeechdClient {
                     }
                 }
             };
-            tokio::select! {
-                () = tokio::time::sleep(wait) => {}
-                () = self.shared.stopping.notified() => {}
+            if self.until_stopped(tokio::time::sleep(wait)).await.is_none() {
+                return Err(ClientError::ShutDown);
             }
             if let Some(failed) = &lock(&self.shared.state).failed {
                 return Err(failed.clone());
             }
             lock(&self.shared.state).spawned(Instant::now());
-            let conn = match Conn::spawn(
-                &self.shared.config,
-                generation,
-                Arc::downgrade(&self.shared),
-            )
-            .await
-            {
-                Ok(conn) => conn,
-                Err(e @ ClientError::VersionMismatch { .. }) => {
+            // Dropping an unfinished spawn kills its child (kill_on_drop).
+            let spawned = self
+                .until_stopped(Conn::spawn(
+                    &self.shared.config,
+                    generation,
+                    Arc::downgrade(&self.shared),
+                ))
+                .await;
+            let conn = match spawned {
+                None => return Err(ClientError::ShutDown),
+                Some(Ok(conn)) => conn,
+                Some(Err(e @ ClientError::VersionMismatch { .. })) => {
                     lock(&self.shared.state).failed = Some(e.clone());
                     return Err(e);
                 }
-                Err(_) => continue,
+                Some(Err(_)) => continue,
             };
-            if self.replay(&conn).await.is_err() {
-                conn.close(ClientError::HelperCrashed(
-                    "failed while reloading engines".into(),
-                ));
-                continue;
+            {
+                let mut state = lock(&self.shared.state);
+                if let Some(failed) = &state.failed {
+                    conn.close(failed.clone());
+                    return Err(failed.clone());
+                }
+                state.starting = Some(conn.clone());
             }
+            let replayed = self.until_stopped(self.replay(&conn)).await;
             let mut state = lock(&self.shared.state);
+            state.starting = None;
+            match replayed {
+                None => {
+                    conn.close(ClientError::ShutDown);
+                    return Err(ClientError::ShutDown);
+                }
+                Some(Err(_)) => {
+                    conn.close(ClientError::HelperCrashed(
+                        "failed while reloading engines".into(),
+                    ));
+                    continue;
+                }
+                Some(Ok(())) => {}
+            }
             if let Some(failed) = &state.failed {
                 conn.close(failed.clone());
                 return Err(failed.clone());
             }
             state.current = Some(conn.clone());
             return Ok(conn);
+        }
+    }
+
+    /// Run `step` unless the client is shut down first; `None` if it was.
+    async fn until_stopped<T>(&self, step: impl std::future::Future<Output = T>) -> Option<T> {
+        let mut stop = self.shared.stop.subscribe();
+        tokio::select! {
+            value = step => Some(value),
+            _ = stop.wait_for(|stopped| *stopped) => None,
         }
     }
 

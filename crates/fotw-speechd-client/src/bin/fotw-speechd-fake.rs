@@ -14,7 +14,9 @@
 //! `--misbehave-on-health <oversized|not-json|missing-field|audio|fatal-error>`
 //! answers a health request with that frame (`fatal-error` then exits 65); and
 //! `--from-the-future` adds an engine of an unknown kind and precedes each
-//! health answer with a message of an unknown type.
+//! health answer with a message of an unknown type. `--slow-load-if <path>`
+//! makes every `load` take 30 s (off the frame thread) while that file exists,
+//! so a test can slow down only the loads a restart replays.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, BufReader, BufWriter, Write};
@@ -42,6 +44,7 @@ struct Args {
     announce: u32,
     misbehave: Option<String>,
     future: bool,
+    slow_load_if: Option<std::path::PathBuf>,
 }
 
 fn parse_args() -> Args {
@@ -49,6 +52,7 @@ fn parse_args() -> Args {
         announce: PROTOCOL_VERSION,
         misbehave: None,
         future: false,
+        slow_load_if: None,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -62,6 +66,7 @@ fn parse_args() -> Args {
             }
             "--misbehave-on-health" => args.misbehave = iter.next(),
             "--from-the-future" => args.future = true,
+            "--slow-load-if" => args.slow_load_if = iter.next().map(Into::into),
             other => {
                 eprintln!("fotw-speechd-fake: unknown argument {other}");
                 exit(64);
@@ -179,6 +184,7 @@ struct Helper {
     started: Instant,
     misbehave: Option<String>,
     future: bool,
+    slow_load_if: Option<std::path::PathBuf>,
     /// `fake-batch` streams finishing on their own thread. Cancel removes one,
     /// and the thread only answers if it is still here, under this lock.
     finishing: Arc<Mutex<HashSet<u32>>>,
@@ -198,13 +204,21 @@ impl Helper {
                 if ENGINES.iter().any(|e| e.0 == engine) {
                     out.progress(id, ProgressPhase::Load);
                     self.loaded.insert(engine.clone());
-                    out.send(&Reply::Loaded {
+                    let loaded = Reply::Loaded {
                         id,
                         model: engine.clone(),
                         engine,
                         revision: "fake".to_owned(),
                         elapsed_ms: 0,
-                    });
+                    };
+                    if self.slow_load_if.as_ref().is_some_and(|p| p.exists()) {
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_secs(30));
+                            out.send(&loaded);
+                        });
+                    } else {
+                        out.send(&loaded);
+                    }
                 } else {
                     out.fail(id, ErrorCode::UnknownEngine, "no such engine");
                 }
@@ -494,6 +508,7 @@ fn main() {
         started: Instant::now(),
         misbehave: args.misbehave,
         future: args.future,
+        slow_load_if: args.slow_load_if,
         finishing: Arc::new(Mutex::new(HashSet::new())),
         loaded: BTreeSet::new(),
         streams: HashMap::new(),

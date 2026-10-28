@@ -228,6 +228,9 @@ Weights are never committed. They live under
   2 s after the previous spawn. A stream that completes resets the count. When
   the budget is spent the client reports `helper_failed` until the app resets
   it. After a restart it replays every `load` and `warmup` the app asked for.
+- **Shut down.** `shutdown` returns promptly even mid-restart: the restart
+  stops at whatever step it is on (spacing, spawn and handshake, or replayed
+  loads) and the helper it started is killed.
 - **Crash.** When the helper exits, the client reads what it wrote before
   dying (a last `final`, its own fatal `error`) to the end of its output,
   for at most 250 ms, then fails every open stream with `helper_crashed` and
