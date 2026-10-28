@@ -7,6 +7,7 @@ on:
       - 'crates/fotw-audio/**'
       - 'crates/fotw-stt/**'
       - 'crates/fotw-dsp/**'
+      - 'crates/fotw-speechd-client/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/murmur-compatibility.yml'
@@ -17,6 +18,7 @@ on:
       - 'crates/fotw-audio/**'
       - 'crates/fotw-stt/**'
       - 'crates/fotw-dsp/**'
+      - 'crates/fotw-speechd-client/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/murmur-compatibility.yml'
@@ -55,7 +57,9 @@ jobs:
           import json, os, pathlib
           root = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
           patch = '[patch."https://github.com/nolanmak/FlyOnTheWall"]\n'
-          for name in ('fotw-audio', 'fotw-stt', 'fotw-secrets', 'fotw-dsp'):
+          # fotw-speechd-client is listed ahead of Murmur #101 consuming it. Until
+          # the pinned consumer depends on it, Cargo warns that the patch is unused.
+          for name in ('fotw-audio', 'fotw-stt', 'fotw-secrets', 'fotw-dsp', 'fotw-speechd-client'):
               crate = root / 'producer/crates' / name
               patch += name + ' = { path = ' + json.dumps(str(crate)) + ' }\n'
           pathlib.Path('compatibility.toml').write_text(patch)

@@ -68,7 +68,11 @@ The DSP tests cover supported rates, stereo channel order and anti-aliasing.
 Its `conformance::streaming()` also checks identical output across arbitrary
 callback splits (including split stereo frames), filter phase continuity,
 finite samples, output duration and PCM encoding across six input rates.
-The pinned consumer compatibility job now substitutes all four shared crates.
+The pinned consumer compatibility job now substitutes all four shared crates. It also substitutes
+`fotw-speechd-client` and runs on changes to it, ahead of Murmur #101 consuming
+it. Until the pinned consumer depends on it, Cargo reports that patch as unused,
+so advance the pin when #101 lands. The Swift helper itself is not built here:
+Murmur bundles a built `fotw-speechd` rather than compiling it through Cargo.
 
 ## Local language validation
 

@@ -5,14 +5,17 @@ use std::{
     os::fd::AsRawFd,
     path::{Path, PathBuf},
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 use tokio::process::{Child, Command};
 
-use super::ipc::{self, Endpoint};
+use super::{
+    ipc::{self, Endpoint},
+    package::{BoundModel, bind_models_with_cancellation},
+};
 
 /// A regular artifact from an authenticated catalog. Digests bind bytes, not
 /// publisher trust: callers must authenticate the catalog before using this.
@@ -36,6 +39,10 @@ pub struct RuntimeConfig {
     pub executable: String,
     /// Installed, verified GGUF weights. Downloading is a separate opt-in step.
     pub model: Artifact,
+    /// Remaining GGUF shards in the same pinned package, when split. Each
+    /// artifact is verified and held open; filenames preserve native discovery.
+    #[serde(default)]
+    pub model_shards: Vec<Artifact>,
     /// Explicit context allocation, including prompt and output.
     pub context_tokens: usize,
     /// Maximum output tokens admitted for a call.
@@ -48,6 +55,37 @@ pub struct RuntimeConfig {
     pub call_timeout_seconds: u64,
 }
 
+/// Cancellation request for one owned model load. Requesting cancellation is
+/// nonblocking; the owner must retain and await the load future to confirm
+/// verification/native cleanup before admitting a replacement.
+#[derive(Clone, Default)]
+pub struct LoadCancellation(Arc<AtomicBool>);
+impl LoadCancellation {
+    /// Request cancellation. This acknowledges intent, not compute release.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+    pub(super) fn check(&self) -> Result<(), String> {
+        if self.0.load(Ordering::Acquire) {
+            Err("local model load cancelled".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct CancelOnDrop {
+    control: LoadCancellation,
+    armed: bool,
+}
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.control.cancel();
+        }
+    }
+}
+
 pub(super) struct Process {
     child: Mutex<Child>,
     pid: u32,
@@ -55,6 +93,7 @@ pub(super) struct Process {
     // Kept alive until the owner is dropped, including after cancellation.
     _root: tempfile::TempDir,
     pub(super) socket: PathBuf,
+    _models: Option<BoundModel>,
 }
 
 impl Process {
@@ -142,11 +181,27 @@ pub(super) fn validate(config: &RuntimeConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn verified_copy(
+#[cfg(test)]
+pub(super) fn verified_copy(
     artifact: &Artifact,
     destination: Option<&Path>,
     max_bytes: Option<u64>,
 ) -> Result<File, String> {
+    verified_copy_cancellable(
+        artifact,
+        destination,
+        max_bytes,
+        &LoadCancellation::default(),
+    )
+}
+
+pub(super) fn verified_copy_cancellable(
+    artifact: &Artifact,
+    destination: Option<&Path>,
+    max_bytes: Option<u64>,
+    cancellation: &LoadCancellation,
+) -> Result<File, String> {
+    cancellation.check()?;
     if !artifact.path.is_absolute()
         || artifact.sha256.len() != 64
         || !artifact
@@ -178,36 +233,8 @@ fn verified_copy(
         })
         .transpose()
         .map_err(|_| "private runtime staging failed")?;
-    let mut hash = Sha256::new();
-    let mut buffer = [0; 128 * 1024];
-    let mut read_bytes = 0_u64;
-    loop {
-        let n = input
-            .read(&mut buffer)
-            .map_err(|_| "local artifact read failed")?;
-        if n == 0 {
-            break;
-        }
-        read_bytes = read_bytes
-            .checked_add(n as u64)
-            .ok_or("local artifact size overflow")?;
-        if read_bytes > metadata.len() {
-            return Err("local artifact changed during verification".into());
-        }
-        hash.update(&buffer[..n]);
-        if let Some(output) = &mut output {
-            output
-                .write_all(&buffer[..n])
-                .map_err(|_| "private runtime staging failed")?;
-        }
-    }
-    if hash
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>()
-        != artifact.sha256
-    {
+    let digest = hash_chunks(&mut input, &mut output, metadata.len(), cancellation)?;
+    if digest != artifact.sha256 {
         return Err("local artifact checksum mismatch".into());
     }
     if let Some(mut output) = output {
@@ -221,7 +248,51 @@ fn verified_copy(
     Ok(input)
 }
 
-fn prepare(config: &RuntimeConfig) -> Result<(tempfile::TempDir, File), String> {
+fn hash_chunks(
+    input: &mut dyn Read,
+    output: &mut Option<File>,
+    expected_length: u64,
+    cancellation: &LoadCancellation,
+) -> Result<String, String> {
+    let mut hash = Sha256::new();
+    let mut buffer = [0; 128 * 1024];
+    let mut read_bytes = 0_u64;
+    loop {
+        cancellation.check()?;
+        let n = input
+            .read(&mut buffer)
+            .map_err(|_| "local artifact read failed")?;
+        if n == 0 {
+            break;
+        }
+        read_bytes = read_bytes
+            .checked_add(n as u64)
+            .ok_or("local artifact size overflow")?;
+        if read_bytes > expected_length {
+            return Err("local artifact changed during verification".into());
+        }
+        hash.update(&buffer[..n]);
+        if let Some(output) = output {
+            output
+                .write_all(&buffer[..n])
+                .map_err(|_| "private runtime staging failed")?;
+        }
+    }
+    cancellation.check()?;
+    if read_bytes != expected_length {
+        return Err("local artifact changed during verification".into());
+    }
+    Ok(hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn prepare(
+    config: &RuntimeConfig,
+    cancellation: &LoadCancellation,
+) -> Result<(tempfile::TempDir, BoundModel), String> {
     validate(config)?;
     // A short canonical socket path also avoids Darwin's 104-byte sun_path.
     let root = tempfile::Builder::new()
@@ -244,7 +315,12 @@ fn prepare(config: &RuntimeConfig) -> Result<(tempfile::TempDir, File), String> 
             return Err("invalid runtime file set".into());
         }
         let destination = root.path().join(name);
-        verified_copy(artifact, Some(&destination), Some(256 * 1024 * 1024))?;
+        verified_copy_cancellable(
+            artifact,
+            Some(&destination),
+            Some(256 * 1024 * 1024),
+            cancellation,
+        )?;
         if name == config.executable {
             std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
                 .map_err(|_| "private runtime executable permissions failed")?;
@@ -253,15 +329,43 @@ fn prepare(config: &RuntimeConfig) -> Result<(tempfile::TempDir, File), String> 
     if !names.contains(&config.executable) {
         return Err("runtime executable missing from manifest".into());
     }
-    let model = verified_copy(&config.model, None, None)?;
+    let model = bind_models_with_cancellation(
+        &config.model,
+        &config.model_shards,
+        root.path(),
+        cancellation,
+    )?;
     Ok((root, model))
 }
 
-pub(super) async fn launch(config: &RuntimeConfig) -> Result<Process, String> {
+pub(super) async fn launch(
+    config: &RuntimeConfig,
+    cancellation: &LoadCancellation,
+) -> Result<Process, String> {
+    cancellation.check()?;
+    validate(config)?;
+    let mut guard = CancelOnDrop {
+        control: cancellation.clone(),
+        armed: true,
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(config.load_timeout_seconds);
     let copy = config.clone();
-    let (root, model) = tokio::task::spawn_blocking(move || prepare(&copy))
-        .await
-        .map_err(|_| "local artifact verification failed")??;
+    let control = cancellation.clone();
+    let mut verification = tokio::task::spawn_blocking(move || prepare(&copy, &control));
+    let (root, model) = match tokio::time::timeout_at(deadline, &mut verification).await {
+        Ok(result) => result.map_err(|_| "local artifact verification failed")??,
+        Err(_) => {
+            cancellation.cancel();
+            // Retain ownership until the blocking reader observes cancellation
+            // and destroys its private staging files. A timeout is not release.
+            let _ = verification.await;
+            return Err("local model load timed out".into());
+        }
+    };
+    cancellation.check()?;
+    if tokio::time::Instant::now() >= deadline {
+        return Err("local model load timed out".into());
+    }
     let socket = root.path().join("server.sock");
     let mut command =
         sandboxed_command(&root.path().join(&config.executable), root.path(), &socket);
@@ -277,7 +381,7 @@ pub(super) async fn launch(config: &RuntimeConfig) -> Result<Process, String> {
         .arg("--host")
         .arg(&socket)
         .arg("--model")
-        .arg(format!("/dev/fd/{}", model.as_raw_fd()))
+        .arg(&model.first_path)
         .arg("--alias")
         .arg(&config.model_id)
         .arg("--ctx-size")
@@ -285,7 +389,9 @@ pub(super) async fn launch(config: &RuntimeConfig) -> Result<Process, String> {
         .arg("--threads")
         .arg(config.threads.to_string())
         .args(["--parallel", "1", "--cache-ram", "0", "--no-warmup"]);
-    inherit_model(&mut command, &model);
+    for file in &model.files {
+        inherit_model(&mut command, file);
+    }
     let child = command
         .spawn()
         .map_err(|_| "network-isolated local runtime launch failed")?;
@@ -296,10 +402,18 @@ pub(super) async fn launch(config: &RuntimeConfig) -> Result<Process, String> {
         stopped: AtomicBool::new(false),
         socket,
         _root: root,
+        _models: Some(model),
     };
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(config.load_timeout_seconds);
     loop {
-        let pid = process.pid()?;
+        if let Err(error) = cancellation.check() {
+            return finish_failed_load(process, error).await;
+        }
+        let pid = match process.pid() {
+            Ok(pid) => pid,
+            Err(error) => {
+                return finish_failed_load(process, error).await;
+            }
+        };
         if let Ok(value) = ipc::request(
             &process.socket,
             pid,
@@ -310,13 +424,27 @@ pub(super) async fn launch(config: &RuntimeConfig) -> Result<Process, String> {
         .await
             && value["status"] == "ok"
         {
+            if let Err(error) = cancellation.check() {
+                return finish_failed_load(process, error).await;
+            }
+            guard.armed = false;
             return Ok(process);
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err("local model load timed out".into());
+            return finish_failed_load(process, "local model load timed out".into()).await;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+async fn finish_failed_load(process: Process, error: String) -> Result<Process, String> {
+    // An unconfirmed exit must keep this load's owner and staging resources
+    // alive. The service acknowledges cancellation separately and retains this
+    // future until cleanup actually finishes; it must not abort-and-replace.
+    while process.shutdown().await.is_err() {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Err(error)
 }
 
 fn sandboxed_command(executable: &Path, root: &Path, socket: &Path) -> Command {
@@ -380,6 +508,7 @@ while c.recv(8192):pass
             pid,
             stopped: AtomicBool::new(false),
             _root: root,
+            _models: None,
             socket,
         },
         marker,
@@ -389,6 +518,65 @@ while c.recv(8192):pass
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_load_never_opens_missing_artifacts_or_spawns_a_child() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = Artifact {
+            path: root.path().join("model.gguf"),
+            sha256: "0".repeat(64),
+        };
+        let runtime = Artifact {
+            path: root.path().join("llama-server"),
+            sha256: "0".repeat(64),
+        };
+        let config = RuntimeConfig {
+            model_id: "cancelled fixture".into(),
+            runtime_files: vec![runtime],
+            executable: "llama-server".into(),
+            model: missing,
+            model_shards: vec![],
+            context_tokens: 8192,
+            output_tokens: 512,
+            threads: 1,
+            load_timeout_seconds: 1,
+            call_timeout_seconds: 1,
+        };
+        let cancellation = LoadCancellation::default();
+        cancellation.cancel();
+        let error = launch(&config, &cancellation).await.err().unwrap();
+        assert!(error.contains("cancelled"), "{error}");
+    }
+
+    #[test]
+    fn cancelled_verification_stops_before_another_chunk_read() {
+        struct CancelOnRead {
+            control: LoadCancellation,
+            reads: usize,
+        }
+        impl Read for CancelOnRead {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                assert_eq!(
+                    self.reads, 0,
+                    "cancelled verification must not read another chunk"
+                );
+                self.reads += 1;
+                bytes[0] = 7;
+                self.control.cancel();
+                Ok(1)
+            }
+        }
+        let cancellation = LoadCancellation::default();
+        let mut input = CancelOnRead {
+            control: cancellation.clone(),
+            reads: 0,
+        };
+        let error = hash_chunks(&mut input, &mut None, 1, &cancellation)
+            .err()
+            .unwrap();
+        assert!(error.contains("cancelled"), "{error}");
+        assert_eq!(input.reads, 1);
+    }
 
     #[tokio::test]
     async fn child_opens_verified_inode_even_if_cache_path_is_replaced() {
@@ -541,6 +729,7 @@ print(json.dumps(results))
             pid,
             stopped: AtomicBool::new(false),
             _root: root,
+            _models: None,
             socket,
         };
         assert_eq!(process.pid().unwrap(), pid);

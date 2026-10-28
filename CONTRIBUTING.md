@@ -113,6 +113,22 @@ answer, and confirms owned-process exit. It tests real inference, not model
 quality or hardware-tier qualification. Context and deadlines are explicit
 configuration values; larger Macs are not limited to a small-model tier.
 
+For a split GGUF, set `model` to its first shard and `model_shards` to the
+remaining pinned artifacts. Each shard keeps its verified read-only descriptor
+and original filename in a private binding directory; cache pathname changes
+cannot substitute another inode. `LocalAdapter::launch_with_cancellation` lets
+the service request cancellation during verification/loading. The service must
+retain and await that future before replacing the model; acknowledging a cancel
+request does not prove that native work or file I/O has finished.
+
+To inspect the native resource inputs without loading a model or reading a
+meeting library, run `cargo run -p fotwd --example local_summary_resources --
+/path/to/installation-directory`. It reports physical RAM, estimated current
+headroom, OS pressure, CPU counts, OS compatibility and free space on that
+volume. Missing observations remain unknown. This metadata does not qualify a
+model or prove that a particular model fits; admission must refresh it before
+loading rather than cache a decision from installed RAM alone.
+
 ### Dependency changes and third-party notices
 
 `THIRD_PARTY_NOTICES.md` carries the license texts for everything compiled into

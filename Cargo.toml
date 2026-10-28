@@ -5,6 +5,7 @@ members = [
   "crates/fotw-pipeline",
   "crates/fotw-dsp",
   "crates/fotw-stt",
+  "crates/fotw-speechd-client",
   "crates/fotw-summarize",
   "crates/fotw-store",
   "crates/fotw-secrets",

@@ -180,6 +180,17 @@ jobs:
       - name: Check Parakeet protocol without runtime or model dependencies
         if: runner.os == 'macOS'
         run: env -u FOTW_FLUIDAUDIO_SOURCE swift run --package-path tools/speech-eval/parakeet -j 3 parakeet-protocol-check
+      # fotw-speechd (#243) without FluidAudio or models: its Swift checks, then
+      # the Rust protocol tests against the helper in --fake-engines mode.
+      - name: Check the speech helper without FluidAudio or models
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          pkg=helpers/fotw-speechd
+          env -u FOTW_FLUIDAUDIO_SOURCE swift run --package-path "$pkg" -j 3 speechd-checks
+          env -u FOTW_FLUIDAUDIO_SOURCE swift build --package-path "$pkg" -j 3 --product fotw-speechd
+          FOTW_SPEECHD_BIN="$(env -u FOTW_FLUIDAUDIO_SOURCE swift build --package-path "$pkg" --show-bin-path)/fotw-speechd" \
+            cargo test -p fotw-speechd-client --test protocol
       - name: Check opt-in resource QA entry point without assets
         run: python3 scripts/qa-local-contention.py --help
 

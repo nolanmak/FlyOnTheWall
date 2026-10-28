@@ -786,6 +786,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fotw-speechd-client"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "fotw-store"
 version = "0.1.0"
 dependencies = [
