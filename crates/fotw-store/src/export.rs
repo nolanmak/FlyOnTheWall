@@ -295,7 +295,8 @@ row_type!(
 row_type!(
     /// One checkpointed window of a pending cleanup job (#246).
     PostPassWindowRow, "post_pass_windows",
-    pk = ["meeting_id", "channel", "idx"], exclusive = [], {
+    pk = ["id"], exclusive = [], {
+        id: String,
         meeting_id: String,
         channel: String,
         idx: i64,

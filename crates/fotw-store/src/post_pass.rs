@@ -9,7 +9,7 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::db::Db;
 use crate::error::{Result, StoreError};
-use crate::ids::now_ms;
+use crate::ids::{new_id, now_ms};
 use crate::models::NewSegment;
 use crate::repo::{insert_segments, insert_transcript};
 
@@ -194,9 +194,9 @@ impl Db {
             ));
         }
         tx.execute(
-            "INSERT INTO post_pass_windows (meeting_id, channel, idx, words_json)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![meeting_id, channel, idx, words_json],
+            "INSERT INTO post_pass_windows (id, meeting_id, channel, idx, words_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![new_id(), meeting_id, channel, idx, words_json],
         )?;
         tx.commit()?;
         Ok(())

@@ -22,9 +22,10 @@ CREATE TABLE post_pass_jobs (
 CREATE INDEX post_pass_jobs_state_idx ON post_pass_jobs(state);
 
 CREATE TABLE post_pass_windows (
+  id TEXT PRIMARY KEY,
   meeting_id TEXT NOT NULL REFERENCES post_pass_jobs(meeting_id) ON DELETE CASCADE,
   channel TEXT NOT NULL CHECK(channel IN ('mic', 'system')),
   idx INTEGER NOT NULL CHECK(idx >= 0),
   words_json TEXT NOT NULL CHECK(json_valid(words_json)),
-  PRIMARY KEY (meeting_id, channel, idx)
+  UNIQUE (meeting_id, channel, idx)
 ) STRICT;

@@ -365,8 +365,8 @@ VALUES ('fixture-receipt','mtg-1','tr-1','fixture-epoch',0,16000,'{"epoch":0,"fr
 -- A cleanup job mid-way: its live version, a checkpoint and no result yet.
 INSERT INTO post_pass_jobs(meeting_id,state,created_at_ms,updated_at_ms,plan_json,progress_permille,live_transcript_id,cleaned_transcript_id,provenance_json,detail)
 VALUES ('mtg-1','pending',1000,2000,'{"version":1}',420,'tr-1',NULL,NULL,NULL);
-INSERT INTO post_pass_windows(meeting_id,channel,idx,words_json)
-VALUES ('mtg-1','system',3,'[{"t":"café","s":84000,"e":84300}]');
+INSERT INTO post_pass_windows(id,meeting_id,channel,idx,words_json)
+VALUES ('fixture-window','mtg-1','system',3,'[{"t":"café","s":84000,"e":84300}]');
 
 INSERT INTO session_note_links(session_id,meeting_id,started_at_ms,elapsed_ms)
 VALUES ('saved-fixture','mtg-1',1000,500);
