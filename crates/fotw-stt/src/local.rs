@@ -443,12 +443,15 @@ pub fn segments_for(
     let length = chunk.duration_ms();
     recognized
         .into_iter()
-        .filter(|r| !is_non_speech(&r.text))
-        .map(|r| {
+        .filter_map(|r| {
+            let text = crate::cleanup::remove_artifacts(&r.text);
+            (!text.is_empty() && !is_non_speech(&text)).then_some((r, text))
+        })
+        .map(|(r, text)| {
             let mut segment =
                 TranscriptSegment::new(config.session_id.clone(), config.source, PROVIDER, model);
             segment.speaker = (config.source == Source::Mic).then(|| ME.to_owned());
-            segment.text = r.text.trim().to_owned();
+            segment.text = text;
             segment.start_ms = base + r.start_ms.min(length);
             segment.end_ms = (base + r.end_ms.min(length)).max(segment.start_ms);
             segment.language = language.map(str::to_owned);
@@ -1069,6 +1072,33 @@ mod tests {
         assert!(first.is_final);
         assert_eq!(segments[1].end_ms, 2_250 + 3_000);
         assert_ne!(first.id, segments[1].id);
+    }
+
+    #[test]
+    fn annotations_inside_a_line_are_removed_and_the_speech_kept() {
+        let config = LocalStreamConfig::new("s1", Source::System);
+        let chunk = Chunk {
+            start_sample: 0,
+            samples: vec![0; 32_000],
+        };
+        let line = |text: &str| Recognized {
+            start_ms: 0,
+            end_ms: 900,
+            text: text.into(),
+        };
+        let segments = segments_for(
+            &config,
+            "tiny",
+            None,
+            &chunk,
+            vec![
+                line("Hello there. [BLANK_AUDIO]"),
+                line("<|nospeech|>"),
+                line("[Music] Right, next item."),
+            ],
+        );
+        let texts: Vec<_> = segments.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["Hello there.", "Right, next item."]);
     }
 
     #[test]
