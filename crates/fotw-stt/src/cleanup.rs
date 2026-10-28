@@ -131,6 +131,47 @@ fn artifact_len(text: &str) -> Option<usize> {
     artifact.then_some(end + close.len_utf8())
 }
 
+/// Whether a whole segment is only a sound label — `Music`, `(Music)`,
+/// `[Applause]`, `♪` — rather than speech. Only the whole segment counts: a
+/// label word inside a sentence is speech.
+#[must_use]
+pub fn is_sound_label(text: &str) -> bool {
+    let notes = ['♪', '♫', '♬', '♩'];
+    let label = text
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if label.is_empty() {
+        // Nothing but notes is the model's way of writing music.
+        return text.contains(notes);
+    }
+    SOUND_LABELS.contains(&label.as_str())
+}
+
+/// What Whisper writes, bracketed or bare, as the whole of a segment over
+/// non-speech.
+const SOUND_LABELS: &[&str] = &[
+    "music",
+    "music playing",
+    "instrumental music",
+    "applause",
+    "laughter",
+    "cheering",
+    "silence",
+    "inaudible",
+    "blank audio",
+    "no speech",
+];
+
 /// Whisper's stock phrases over non-speech, normalised: lowercase, letters,
 /// digits, apostrophes and single spaces.
 const FILLERS: &[&str] = &[
@@ -212,6 +253,36 @@ mod tests {
                 dropped,
                 "{text:?} at no-speech {p}"
             );
+        }
+    }
+
+    #[test]
+    fn a_segment_that_is_only_a_sound_label_is_not_speech() {
+        for text in [
+            "Music",
+            "Music.",
+            " music ",
+            "(Music)",
+            "[Music]",
+            "♪",
+            "♪ ♪",
+            "♪ Music ♪",
+            "[MUSIC PLAYING]",
+            "Applause.",
+            "(laughter)",
+        ] {
+            assert!(is_sound_label(text), "{text:?}");
+        }
+        for text in [
+            "",
+            "Music is my life.",
+            "Turn the music down.",
+            "The applause was loud.",
+            "Thank you.",
+            "So, music.",
+            "♪ We will rock you ♪",
+        ] {
+            assert!(!is_sound_label(text), "{text:?}");
         }
     }
 

@@ -445,7 +445,9 @@ pub fn segments_for(
         .into_iter()
         .filter_map(|r| {
             let text = crate::cleanup::remove_artifacts(&r.text);
-            (!text.is_empty() && !is_non_speech(&text)).then_some((r, text))
+            let speech =
+                !text.is_empty() && !is_non_speech(&text) && !crate::cleanup::is_sound_label(&text);
+            speech.then_some((r, text))
         })
         .map(|(r, text)| {
             let mut segment =
@@ -1095,10 +1097,16 @@ mod tests {
                 line("Hello there. [BLANK_AUDIO]"),
                 line("<|nospeech|>"),
                 line("[Music] Right, next item."),
+                line("Music"),
+                line("♪ Music ♪"),
+                line("Turn the music down."),
             ],
         );
         let texts: Vec<_> = segments.iter().map(|s| s.text.as_str()).collect();
-        assert_eq!(texts, ["Hello there.", "Right, next item."]);
+        assert_eq!(
+            texts,
+            ["Hello there.", "Right, next item.", "Turn the music down."]
+        );
     }
 
     #[test]
