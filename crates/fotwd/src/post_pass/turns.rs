@@ -130,17 +130,27 @@ pub fn speaker_at(spans: &[SpeakerSpan], start: u64, end: u64) -> Option<&str> {
 }
 
 /// Group one channel's words into turns.
-fn channel_turns(channel: Channel, words: Vec<(TimedWord, Option<String>)>) -> Vec<Turn> {
+///
+/// `other` is the other channel's word starts, sorted: a turn also breaks
+/// where someone on the other channel started speaking in its gap, so a
+/// back-and-forth reads in the order it was said.
+fn channel_turns(
+    channel: Channel,
+    words: Vec<(TimedWord, Option<String>)>,
+    other: &[u64],
+) -> Vec<Turn> {
     let mut turns: Vec<Turn> = Vec::new();
     for (word, speaker) in words {
         if let Some(turn) = turns.last_mut() {
+            let from = other.partition_point(|&t| t <= turn.end_ms);
+            let interrupted = other.get(from).is_some_and(|&t| t < word.start_ms);
             let gap = word.start_ms.saturating_sub(turn.end_ms);
             let last = &turn.words.last().expect("a turn has a word").0;
             let short =
                 visible(&turn.text()) < SHORT_VISIBLE || visible(&word.text) < SHORT_VISIBLE;
             let joins = gap <= MERGE_GAP_MS || (gap <= SHORT_GAP_MS && short);
             let long = turn.end_ms - turn.start_ms >= LONG_TURN_MS && ends_sentence(&last.text);
-            if turn.speaker == speaker && joins && !long {
+            if turn.speaker == speaker && joins && !long && !interrupted {
                 turn.end_ms = turn.end_ms.max(word.end_ms);
                 turn.words.push((word, speaker));
                 continue;
@@ -186,8 +196,13 @@ pub fn build_turns(
             (w.clone(), speaker)
         })
         .collect();
-    let mut turns = channel_turns(Channel::Mic, mic_words);
-    turns.extend(channel_turns(Channel::System, system_words));
+    let starts = |words: &[TimedWord]| {
+        let mut out: Vec<u64> = words.iter().map(|w| w.start_ms).collect();
+        out.sort_unstable();
+        out
+    };
+    let mut turns = channel_turns(Channel::Mic, mic_words, &starts(system));
+    turns.extend(channel_turns(Channel::System, system_words, &starts(mic)));
     turns.sort_by_key(|t| (t.start_ms, t.channel == Channel::System, t.end_ms));
     turns
 }
@@ -292,6 +307,17 @@ mod tests {
                 .all(|t| t.end_ms - t.start_ms < LONG_TURN_MS + 4_000)
         );
         assert_eq!(turns.iter().map(|t| t.words.len()).sum::<usize>(), 80);
+    }
+
+    #[test]
+    fn a_turn_breaks_where_the_other_channel_spoke_in_its_gap() {
+        // "so what now" on the mic with a 300 ms pause in which the far end
+        // says "yes": three turns in spoken order, not one mic turn first.
+        let mic = [w("so", 0, 200), w("what", 250, 400), w("now", 700, 900)];
+        let system = [w("yes", 450, 650)];
+        let turns = build_turns(&mic, &system, None);
+        let shown: Vec<String> = turns.iter().map(Turn::text).collect();
+        assert_eq!(shown, ["so what", "yes", "now"]);
     }
 
     #[test]

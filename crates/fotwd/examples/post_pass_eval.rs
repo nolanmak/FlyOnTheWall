@@ -179,7 +179,11 @@ mod imp {
             .map_err(|e| e.to_string())?;
 
         let prepared = Instant::now();
-        let engine = HelperEngine::prepare(data_root).await?;
+        let engine = Probe {
+            inner: HelperEngine::prepare(data_root).await?,
+            vad_off: std::env::args().any(|a| a == "--vad-off"),
+            spans: Arc::new(Mutex::new(None)),
+        };
         let prepare_seconds = prepared.elapsed().as_secs_f64();
         let plan = serde_json::to_string(&Plan::current(&engine)).map_err(|e| e.to_string())?;
         db.post_pass_queue(&meeting, &plan)
@@ -234,6 +238,14 @@ mod imp {
             "helper": peaks.helper_footprint.load(Ordering::SeqCst),
         });
         report["clean_detail"] = job.detail.clone().into();
+        report["vad_off"] = engine.vad_off.into();
+        if let Some(spans) = engine.spans.lock().unwrap().take() {
+            let rows: Vec<serde_json::Value> = spans
+                .iter()
+                .map(|s| serde_json::json!({"start_ms": s.start_ms, "end_ms": s.end_ms, "speaker": s.speaker, "channel": "system", "text": ""}))
+                .collect();
+            write(&out.join("spans.json"), &rows.into())?;
+        }
         report["provenance"] = job
             .provenance_json
             .as_deref()
@@ -252,6 +264,66 @@ mod imp {
             })
             .collect();
         Ok(rows.into())
+    }
+
+    use fotwd::post_pass::engine::{Diarization, PassEngine};
+    use fotwd::post_pass::merge::TimedWord;
+    use fotwd::post_pass::turns::SpeakerSpan;
+    use futures_util::future::BoxFuture;
+
+    /// The production engine, optionally without speech detection, keeping
+    /// the diarizer's raw spans for scoring.
+    struct Probe {
+        inner: HelperEngine,
+        vad_off: bool,
+        spans: Arc<Mutex<Option<Vec<SpeakerSpan>>>>,
+    }
+
+    impl PassEngine for Probe {
+        fn speech<'a>(&'a self, pcm: &'a [i16]) -> BoxFuture<'a, Result<Vec<(u64, u64)>, String>> {
+            if self.vad_off {
+                let len = pcm.len() as u64;
+                return Box::pin(async move { Ok(vec![(0, len)]) });
+            }
+            self.inner.speech(pcm)
+        }
+        fn transcribe<'a>(
+            &'a self,
+            pcm: &'a [i16],
+        ) -> BoxFuture<'a, Result<Vec<TimedWord>, String>> {
+            self.inner.transcribe(pcm)
+        }
+        fn diarize(&self) -> BoxFuture<'_, Result<Option<Box<dyn Diarization>>, String>> {
+            let spans = Arc::clone(&self.spans);
+            Box::pin(async move {
+                Ok(self
+                    .inner
+                    .diarize()
+                    .await?
+                    .map(|inner| Box::new(Keep { inner, spans }) as Box<dyn Diarization>))
+            })
+        }
+        fn provenance(&self) -> serde_json::Value {
+            self.inner.provenance()
+        }
+    }
+
+    struct Keep {
+        inner: Box<dyn Diarization>,
+        spans: Arc<Mutex<Option<Vec<SpeakerSpan>>>>,
+    }
+
+    impl Diarization for Keep {
+        fn push<'a>(&'a mut self, pcm: &'a [i16]) -> BoxFuture<'a, Result<(), String>> {
+            self.inner.push(pcm)
+        }
+        fn finish(self: Box<Self>) -> BoxFuture<'static, Result<Vec<SpeakerSpan>, String>> {
+            Box::pin(async move {
+                let spans = self.inner.finish().await?;
+                *self.spans.lock().unwrap() = Some(spans.clone());
+                Ok(spans)
+            })
+        }
     }
 
     /// Peak resident size and physical footprint of two processes.
