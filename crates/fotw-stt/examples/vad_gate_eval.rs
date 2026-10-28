@@ -14,6 +14,8 @@
 //!
 //! `CLIPS.tsv` holds `id<TAB>/absolute/path.wav` per line; each WAV must be
 //! mono 16 kHz PCM16. No capture, credentials or network.
+//! `FOTW_EVAL_VAD_THRESHOLD` overrides the gate's start threshold (its
+//! continue threshold follows 0.15 below) to explore operating points.
 
 #[cfg(all(target_os = "macos", feature = "local-whisper"))]
 fn main() -> Result<(), String> {
@@ -32,6 +34,18 @@ fn main() -> Result<(), String> {
     let mut engine = WhisperEngine::new(model, Some("en".into()));
     if let Some(vad) = vad {
         engine = engine.with_speech_gate(vad);
+        // Explore the gate's operating point without a rebuild.
+        if let Some(threshold) = std::env::var("FOTW_EVAL_VAD_THRESHOLD")
+            .ok()
+            .and_then(|t| t.parse::<f32>().ok())
+        {
+            engine = engine.with_gate_config(fotw_stt::GateConfig {
+                threshold,
+                neg_threshold: threshold - 0.15,
+                ..fotw_stt::GateConfig::default()
+            });
+            eprintln!("gate threshold {threshold}");
+        }
     }
     let loading = Instant::now();
     engine.load().map_err(|e| e.message)?;
@@ -68,9 +82,10 @@ fn main() -> Result<(), String> {
             };
             let feed = async {
                 // The pump's 20 ms pieces, faster than real time but never
-                // more than 20 s ahead of the model, under the stream's bound.
+                // more than 2 s ahead of the model, so `close` only waits for
+                // the last utterance and stays inside its drain deadline.
                 for piece in pcm.chunks(320) {
-                    while stream.queued_samples() > 20 * 16_000 {
+                    while stream.queued_samples() > 2 * 16_000 {
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     }
                     stream.write(piece);
