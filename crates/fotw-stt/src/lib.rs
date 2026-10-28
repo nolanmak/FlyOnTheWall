@@ -48,6 +48,7 @@ pub mod error;
 pub mod local;
 pub mod replay;
 pub mod speaker;
+pub mod speechd;
 pub mod store;
 pub mod stream;
 pub mod transcript;
@@ -67,6 +68,7 @@ pub use local::{
 };
 pub use replay::{PcmRing, Replay, to_linear16_le};
 pub use speaker::{SpeakerNormalizer, SpeakerRegistry};
+pub use speechd::SpeechdEngine;
 pub use store::{
     CountingIdFactory, SegmentIdFactory, SegmentStore, StoreOutcome, UlidFactory, UtteranceTracker,
 };

@@ -134,7 +134,7 @@ impl LocalSourceConfig {
     fn plan(&self) -> LocalPlan {
         LocalPlan {
             engine: EngineDescriptor {
-                provider: fotw_stt::local::PROVIDER.into(),
+                provider: self.local.provider().into(),
                 model: self.local.model().into(),
                 revision: self.revision.clone(),
                 capabilities: local_capabilities(),
@@ -164,7 +164,7 @@ impl FailoverConfig {
     fn local_plan(&self) -> LocalPlan {
         LocalPlan {
             engine: EngineDescriptor {
-                provider: fotw_stt::local::PROVIDER.into(),
+                provider: self.local.provider().into(),
                 model: self.local.model().into(),
                 revision: self.local_revision.clone(),
                 capabilities: self.local_capabilities.clone(),
@@ -1456,7 +1456,7 @@ impl Worker {
             .journal
             .switch(
                 EngineDescriptor {
-                    provider: fotw_stt::local::PROVIDER.into(),
+                    provider: local.factory.provider().into(),
                     model: local.factory.model().into(),
                     revision: local.plan.engine.revision.clone(),
                     capabilities: local.plan.engine.capabilities.clone(),
@@ -1501,6 +1501,7 @@ impl Worker {
             .ok_or_else(|| failure("local inference was not selected"))?;
         let segments = segments_for(
             &config,
+            local.factory.provider(),
             local.factory.model(),
             local.factory.language(),
             &chunk,
