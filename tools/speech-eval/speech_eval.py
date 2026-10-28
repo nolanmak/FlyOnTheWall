@@ -21,8 +21,9 @@ def tokenize(text):
     return re.findall(pattern, normalized)
 
 
-def edit_counts(reference, hypothesis):
-    if len(reference) * len(hypothesis) > MAX_ALIGNMENT_CELLS:
+def edit_counts(reference, hypothesis, limit=None):
+    # Full-length meeting scoring passes an explicit, larger limit.
+    if len(reference) * len(hypothesis) > (MAX_ALIGNMENT_CELLS if limit is None else limit):
         raise ValueError("scoring alignment exceeds the documented work limit")
     # Cost, substitutions, deletions, insertions. Two rows bound memory.
     row = [(n, 0, 0, n) for n in range(len(hypothesis) + 1)]
