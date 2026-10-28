@@ -23,7 +23,7 @@ public actor ParakeetUnifiedEngine: SpeechEngine {
     public init(store: ModelStore, model: PinnedModel) {
         self.store = store
         self.model = model
-        descriptor = EngineDescriptor(id: "parakeet-unified", kind: .batch, model: model)
+        descriptor = EngineDescriptor(id: "parakeet-unified", kind: .batch, maxAudioMs: maxBatchMs, model: model)
     }
 
     public func load() async throws -> LoadResult {
@@ -83,6 +83,6 @@ final class BatchSession: EngineSession, @unchecked Sendable {
         let text = samples.isEmpty ? "" : try await engine.transcribe(samples)
         samples = []
         return [.final(text: text.trimmingCharacters(in: .whitespacesAndNewlines), startMs: 0, endMs: endMs,
-                       segments: [], model: provenance)]
+                       segments: [], model: provenance, utterance: nil)]
     }
 }
