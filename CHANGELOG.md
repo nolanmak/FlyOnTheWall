@@ -67,6 +67,20 @@ Windows, but neither captures anything.
   per-file SHA-256 and installed only by an explicit setup action, and model-free
   fake engines that the Rust protocol tests run against on macOS. Built only
   with `FOTW_FLUIDAUDIO_SOURCE`; `just speechd-real` is its real-model suite.
+- Parakeet Unified 0.6B (English, CC BY 4.0) is the default on-device meeting
+  engine for new libraries (#244). It runs in the `fotw-speechd` helper behind
+  the same Silero speech gate, one batch request per utterance, and every
+  segment records `parakeet-unified` and its pinned revision. Install it from
+  Transcription settings or with `fotwd stt models install parakeet-unified`;
+  Start refuses with that hint while it is missing. A saved Whisper choice is
+  left as it was, and Whisper stays available.
+  If the helper fails an utterance, it is retried once after the helper
+  restarts; if it fails again, that stretch is kept as audio and recorded as
+  an untranscribed gap, and the rest of the meeting is still transcribed.
+  **Downgrade note:** a speech journal that records such a gap has a `gap`
+  field older builds do not read, so an older build cannot reopen that
+  session's journal. Re-transcribing saved Parakeet audio is not supported
+  yet; the audio is kept.
 
 #### Library and keys
 

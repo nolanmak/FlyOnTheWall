@@ -376,6 +376,10 @@ test('the actual whisper.cpp provider ID renders the friendly engine name',()=>{
  const h=harness();h.ctx.renderRecording({state:'recording',session_id:'real-provider',started_at_ms:1000,speech_status:[speechStatus({provider:'whispercpp',model:'small.en',state:'local'})]});
  const panel=h.nodes.get('speech-health');assert.match(panel.textContent,/Whisper \/ small.en/);assert.doesNotMatch(panel.textContent,/whispercpp/);
 });
+test('the speech helper provider ID renders the runtime name beside Parakeet',()=>{
+ const h=harness();h.ctx.renderRecording({state:'recording',session_id:'parakeet',started_at_ms:1000,speech_status:[speechStatus({provider:'fotw-speechd',model:'parakeet-unified',state:'local'})]});
+ const panel=h.nodes.get('speech-health');assert.match(panel.textContent,/FluidAudio \/ parakeet-unified/);assert.doesNotMatch(panel.textContent,/fotw-speechd/);
+});
 test('legacy failures retain their warning while a durable epoch zero uses a recovery notice',()=>{
  const h=harness();const base={state:'recording',session_id:'errors',started_at_ms:1000,transcription_error:'The API key was rejected'};
  h.ctx.renderRecording({...base,speech_status:[speechStatus({epoch:null,from_ms:null,pending_audio_ms:null,state:'closed',worker_running:null})]});

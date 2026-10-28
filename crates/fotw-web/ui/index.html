@@ -66,12 +66,12 @@
       <p id="speech-disclosure" class="gh-note"></p>
       <div id="speech-local-fields">
         <label class="gh-field">Installed model name or full path
-          <input id="speech-model" type="text" maxlength="4096" placeholder="small.en or /path/to/ggml-model.bin" autocomplete="off" spellcheck="false" />
+          <input id="speech-model" type="text" maxlength="4096" placeholder="parakeet-unified, small.en or /path/to/ggml-model.bin" autocomplete="off" spellcheck="false" />
         </label>
         <label class="gh-field">Language
           <input id="speech-language" type="text" maxlength="16" placeholder="auto or en" autocomplete="off" spellcheck="false" />
         </label>
-        <p class="gh-note">Import an installed whisper.cpp model by its full path, or use a model already in the app’s models folder. Only the setup buttons below start a download or copy. English-only models require English; other models can detect supported languages.</p>
+        <p class="gh-note"><code>parakeet-unified</code> (Parakeet Unified 0.6B, English, CC BY 4.0) is the default on-device model. Whisper stays available: name an installed whisper.cpp model, or give its full path. Only the setup buttons below start a download or copy. English-only models require English; multilingual Whisper models can detect supported languages.</p>
       </div>
       <button id="speech-save" type="button" disabled>Save transcription</button>
       <button id="speech-reload" type="button">Reload saved choice</button>

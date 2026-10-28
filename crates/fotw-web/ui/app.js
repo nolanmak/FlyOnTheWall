@@ -537,7 +537,7 @@ function renderSavedSpeechProvenance(history) {
   return section;
 }
 function speechProviderName(provider) {
-  return new Map([["deepgram", "Deepgram"], ["whispercpp", "Whisper"], ["local-whisper", "Whisper"], ["whisper.cpp", "Whisper"]]).get(provider) || String(provider || "Unknown provider");
+  return new Map([["deepgram", "Deepgram"], ["whispercpp", "Whisper"], ["local-whisper", "Whisper"], ["whisper.cpp", "Whisper"], ["fotw-speechd", "FluidAudio"]]).get(provider) || String(provider || "Unknown provider");
 }
 
 // Why this meeting has no summary, in words, or null to stay silent.
@@ -1775,7 +1775,7 @@ function renderSpeechSettings(body) {
   el.speechLanguage.value = settings?.language || "";
   const messages = {
     present_unchecked: "Model file found. Start verifies its contents and prepares native memory before capture in backup mode.",
-    missing: "Model file missing. Choose an installed model. Offline backup refuses Start until repaired.",
+    missing: "Model not installed. Install it below, or choose an installed model. Start refuses on-device speech until it is installed.",
     unsupported: "Local speech is currently supported only on macOS.",
     not_required: "Deepgram requires a configured key. No local model is used.",
     unknown: "The saved speech choice cannot be read. Select a mode to repair it.",

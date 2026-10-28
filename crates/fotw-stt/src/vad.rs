@@ -20,7 +20,7 @@
 //! own `get_speech_timestamps` hysteresis, which whisper.cpp also uses.
 
 use crate::SttError;
-use crate::local::{Recognized, Recognizer, SAMPLE_RATE};
+use crate::local::{Recognized, Recognizer, RecognizerFactory, SAMPLE_RATE};
 
 /// Silero's analysis window at 16 kHz: one probability per 32 ms.
 pub const WINDOW_SAMPLES: usize = 512;
@@ -166,9 +166,9 @@ impl Recognizer for GatedRecognizer {
     fn transcribe(&mut self, pcm: &[f32]) -> Result<Vec<Recognized>, SttError> {
         let probabilities = self.detector.probabilities(pcm)?;
         let regions = speech_regions(&probabilities, pcm.len(), &self.config);
-        match regions.as_slice() {
-            [] => Ok(Vec::new()),
-            [all] if *all == (0..pcm.len()) => self.inner.transcribe_speech(pcm, &regions),
+        let recognized = match regions.as_slice() {
+            [] => return Ok(Vec::new()),
+            [all] if *all == (0..pcm.len()) => self.inner.transcribe_speech(pcm, &regions)?,
             _ => {
                 // Silence in place rather than cut out: the chunk keeps its
                 // length, so the model's times inside it stay recording times.
@@ -176,15 +176,190 @@ impl Recognizer for GatedRecognizer {
                 for region in &regions {
                     masked[region.clone()].copy_from_slice(&pcm[region.clone()]);
                 }
-                self.inner.transcribe_speech(&masked, &regions)
+                self.inner.transcribe_speech(&masked, &regions)?
             }
+        };
+        // A batch engine that times its text as the whole chunk (Parakeet in
+        // the helper) says nothing about where in it the words are; the gate
+        // knows where the speech was.
+        let chunk_ms = (pcm.len() / SAMPLES_PER_MS) as u64;
+        let first = (regions[0].start / SAMPLES_PER_MS) as u64;
+        let last = (regions[regions.len() - 1].end / SAMPLES_PER_MS) as u64;
+        Ok(recognized
+            .into_iter()
+            .map(|mut r| {
+                if r.start_ms == 0 && r.end_ms + 1 >= chunk_ms {
+                    r.start_ms = first;
+                    r.end_ms = last;
+                }
+                r
+            })
+            .collect())
+    }
+}
+
+/// A [`RecognizerFactory`] whose every recognizer is behind the gate.
+///
+/// For an engine that does not gate itself, such as Parakeet Unified in the
+/// speech helper (#244): each leg gets a detector of its own from `detector`
+/// and the engine's recognizer behind it, so the engine only ever sees
+/// utterances the detector heard as speech. Provenance is the engine's.
+pub struct GatedFactory<F> {
+    inner: std::sync::Arc<dyn RecognizerFactory>,
+    detector: F,
+    config: GateConfig,
+}
+
+impl<F> GatedFactory<F>
+where
+    F: Fn() -> Result<Box<dyn SpeechDetector>, SttError> + Send + Sync,
+{
+    /// Gate `inner` behind a fresh `detector()` per leg, with
+    /// [`GateConfig::default`].
+    pub fn new(inner: std::sync::Arc<dyn RecognizerFactory>, detector: F) -> Self {
+        Self {
+            inner,
+            detector,
+            config: GateConfig::default(),
         }
+    }
+
+    /// Where the gate draws the line.
+    #[must_use]
+    pub fn with_config(mut self, config: GateConfig) -> Self {
+        self.config = config;
+        self
+    }
+}
+
+impl<F> RecognizerFactory for GatedFactory<F>
+where
+    F: Fn() -> Result<Box<dyn SpeechDetector>, SttError> + Send + Sync,
+{
+    fn model(&self) -> &str {
+        self.inner.model()
+    }
+
+    fn language(&self) -> Option<&str> {
+        self.inner.language()
+    }
+
+    fn provider(&self) -> &str {
+        self.inner.provider()
+    }
+
+    fn create(&self) -> Result<Box<dyn Recognizer>, SttError> {
+        let detector = (self.detector)()?;
+        Ok(Box::new(GatedRecognizer::new(
+            detector,
+            self.inner.create()?,
+            self.config,
+        )))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Constant(f32);
+    impl SpeechDetector for Constant {
+        fn probabilities(&mut self, pcm: &[f32]) -> Result<Vec<f32>, SttError> {
+            Ok(vec![self.0; pcm.len().div_ceil(WINDOW_SAMPLES)])
+        }
+    }
+
+    struct Engine(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl RecognizerFactory for Engine {
+        fn model(&self) -> &str {
+            "engine-model"
+        }
+        fn language(&self) -> Option<&str> {
+            Some("en")
+        }
+        fn provider(&self) -> &str {
+            "engine-runtime"
+        }
+        fn create(&self) -> Result<Box<dyn Recognizer>, SttError> {
+            Ok(Box::new(Counting(self.0.clone())))
+        }
+    }
+    struct Counting(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl Recognizer for Counting {
+        fn transcribe(&mut self, _: &[f32]) -> Result<Vec<Recognized>, SttError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![Recognized {
+                start_ms: 0,
+                end_ms: 1,
+                text: "heard".into(),
+            }])
+        }
+    }
+
+    struct Scripted(Vec<f32>);
+    impl SpeechDetector for Scripted {
+        fn probabilities(&mut self, _: &[f32]) -> Result<Vec<f32>, SttError> {
+            Ok(self.0.clone())
+        }
+    }
+    struct Fixed(Recognized);
+    impl Recognizer for Fixed {
+        fn transcribe(&mut self, _: &[f32]) -> Result<Vec<Recognized>, SttError> {
+            Ok(vec![self.0.clone()])
+        }
+    }
+
+    #[test]
+    fn a_result_with_no_timing_of_its_own_is_narrowed_to_the_speech_the_gate_kept() {
+        // Speech in windows 40..70 of 100 (1280..2240 ms of 3200 ms).
+        let probs = windows(&[(0.1, 40), (0.9, 30), (0.1, 30)]);
+        let pcm = vec![0.1; probs.len() * WINDOW_SAMPLES];
+        let chunk_ms = (pcm.len() / SAMPLES_PER_MS) as u64;
+        let pad = GateConfig::default().pad_ms;
+        let line = |start_ms, end_ms| Recognized {
+            start_ms,
+            end_ms,
+            text: "words".into(),
+        };
+        let gated = |inner: Recognized| {
+            GatedRecognizer::new(
+                Box::new(Scripted(probs.clone())),
+                Box::new(Fixed(inner)),
+                GateConfig::default(),
+            )
+            .transcribe(&pcm)
+            .unwrap()
+        };
+        // A batch engine that times its text as the whole chunk.
+        assert_eq!(gated(line(0, chunk_ms)), vec![line(1280 - pad, 2240 + pad)]);
+        // An engine that times its own text is left alone.
+        assert_eq!(gated(line(1500, 1900)), vec![line(1500, 1900)]);
+    }
+
+    #[test]
+    fn a_gated_factory_keeps_the_engines_provenance_and_shows_it_only_speech() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine: std::sync::Arc<dyn RecognizerFactory> =
+            std::sync::Arc::new(Engine(calls.clone()));
+        let chunk = vec![0.1; 16_000];
+        for (p, reached) in [(0.1, 0), (0.9, 1)] {
+            let gated = GatedFactory::new(engine.clone(), move || {
+                Ok(Box::new(Constant(p)) as Box<dyn SpeechDetector>)
+            });
+            assert_eq!(
+                (gated.provider(), gated.model(), gated.language()),
+                ("engine-runtime", "engine-model", Some("en"))
+            );
+            calls.store(0, std::sync::atomic::Ordering::SeqCst);
+            let heard = gated.create().unwrap().transcribe(&chunk).unwrap();
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                reached,
+                "p = {p}"
+            );
+            assert_eq!(heard.len(), reached, "p = {p}");
+        }
+    }
 
     fn windows(probabilities: &[(f32, usize)]) -> Vec<f32> {
         probabilities

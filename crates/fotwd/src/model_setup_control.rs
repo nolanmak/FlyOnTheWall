@@ -95,29 +95,49 @@ impl ModelSetupControl for DashboardModels {
             .unwrap_or_default();
         // The speech detector is listed so its license and pin are visible;
         // installing any Whisper model installs it too.
-        let models = crate::stt::KNOWN_MODELS
-            .iter()
-            .chain(std::iter::once(&crate::stt::VAD_MODEL))
-            .map(|model| Model {
-                name: model.name.into(),
-                description: model.note.into(),
-                bytes: model.bytes,
-                sha256: model.sha256.into(),
-                revision: model.revision.into(),
-                license: model.license.into(),
-                license_url: model.license_url(),
-                present: std::fs::symlink_metadata(
-                    crate::stt::models_dir(&self.root)
-                        .join(crate::stt::model_file_name(model.name)),
-                )
-                .is_ok_and(|m| m.is_file()),
-            })
+        // The helper's models first, Parakeet Unified (the default on-device
+        // model, #244) leading: each a set of pinned files in its store.
+        let helper = crate::speechd::HELPER_MODELS.iter().map(|model| Model {
+            name: model.id.into(),
+            description: model.note.into(),
+            bytes: model.bytes,
+            sha256: "every file pinned by size and SHA-256 in fotw-speechd".into(),
+            revision: model.revision.into(),
+            license: model.license.into(),
+            license_url: model.license_url(),
+            present: crate::speechd::present_model(&self.root, model),
+        });
+        let models = helper
+            .chain(
+                crate::stt::KNOWN_MODELS
+                    .iter()
+                    .chain(std::iter::once(&crate::stt::VAD_MODEL))
+                    .map(|model| Model {
+                        name: model.name.into(),
+                        description: model.note.into(),
+                        bytes: model.bytes,
+                        sha256: model.sha256.into(),
+                        revision: model.revision.into(),
+                        license: model.license.into(),
+                        license_url: model.license_url(),
+                        present: std::fs::symlink_metadata(
+                            crate::stt::models_dir(&self.root)
+                                .join(crate::stt::model_file_name(model.name)),
+                        )
+                        .is_ok_and(|m| m.is_file()),
+                    }),
+            )
             .collect();
         Status { models, job }
     }
     fn start(&self, request: Request) -> Result<Status, String> {
-        let model =
-            crate::stt::catalog_model(request.model()).ok_or("Choose a model from the catalog.")?;
+        let (name, total) = if let Some(model) = crate::speechd::helper_model(request.model()) {
+            (model.id, model.bytes)
+        } else {
+            let model = crate::stt::catalog_model(request.model())
+                .ok_or("Choose a model from the catalog.")?;
+            (model.name, model.bytes)
+        };
         let source = match request {
             Request::Download { .. } => Source::Download,
             Request::Import { path, .. } => {
@@ -148,10 +168,10 @@ impl ModelSetupControl for DashboardModels {
         let job = Arc::new(OwnedJob {
             status: Mutex::new(Job {
                 id,
-                model: Some(model.name.into()),
+                model: Some(name.into()),
                 phase: Phase::Checking,
                 bytes: 0,
-                total: model.bytes,
+                total,
                 worker_running: true,
                 message: None,
             }),
@@ -161,7 +181,7 @@ impl ModelSetupControl for DashboardModels {
         let worker = job.clone();
         let root = self.root.clone();
         let run = self.run.clone();
-        let name = model.name.to_owned();
+        let name = name.to_owned();
         let spawned = std::thread::Builder::new()
             .name("model-setup".into())
             .spawn(move || {
@@ -283,9 +303,24 @@ mod tests {
         let mut c = DashboardModels::new(root.path().to_owned());
         c.run = Arc::new(|_, _, _, _, _| panic!("source accessed"));
         let s = c.read();
-        // Four Whisper models and the speech detector, each with its license.
-        assert_eq!(s.models.len(), 5);
-        assert!(s.models.iter().all(|m| m.license == "MIT"
+        // Parakeet Unified first, then four Whisper models and the speech
+        // detector, each with its license.
+        assert_eq!(s.models.len(), 6);
+        let parakeet = &s.models[0];
+        assert_eq!(
+            (
+                parakeet.name.as_str(),
+                parakeet.license.as_str(),
+                parakeet.present
+            ),
+            ("parakeet-unified", "CC-BY-4.0", false)
+        );
+        assert!(
+            parakeet
+                .license_url
+                .starts_with("https://huggingface.co/FluidInference/")
+        );
+        assert!(s.models[1..].iter().all(|m| m.license == "MIT"
             && m.revision.len() == 40
             && m.sha256.len() == 64
             && m.license_url.ends_with("/README.md")
