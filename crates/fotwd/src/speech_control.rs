@@ -42,12 +42,23 @@ impl SpeechControl for SpeechSettingsControl {
             let doc: SpeechSettingsDoc =
                 serde_json::from_value(serde_json::to_value(&saved).map_err(|e| e.to_string())?)
                     .map_err(|e| e.to_string())?;
-            let path = saved.model_path(&self.data_root);
+            let (path, present) = if saved.uses_parakeet() {
+                (
+                    crate::speechd::models_root(&self.data_root)
+                        .join(crate::speechd::ENGINE)
+                        .join(crate::speechd::REVISION),
+                    crate::speechd::present(&self.data_root),
+                )
+            } else {
+                let path = saved.model_path(&self.data_root);
+                let present = path.is_file();
+                (path, present)
+            };
             let availability = if doc.engine == SpeechMode::Deepgram {
                 ModelAvailability::NotRequired
             } else if !cfg!(target_os = "macos") {
                 ModelAvailability::Unsupported
-            } else if path.is_file() && crate::stt::vad_model_path(&self.data_root).is_file() {
+            } else if present && crate::stt::vad_model_path(&self.data_root).is_file() {
                 ModelAvailability::PresentUnchecked
             } else {
                 ModelAvailability::Missing
@@ -70,7 +81,12 @@ impl SpeechControl for SpeechSettingsControl {
     }
     fn set(&self, doc: SpeechSettingsDoc) -> Result<(), String> {
         let mut doc = doc.normalized()?;
-        if doc.engine != SpeechMode::Deepgram && !doc.model.is_empty() {
+        if doc.engine != SpeechMode::Deepgram && crate::speechd::is_engine(&doc.model) {
+            if !doc.language.is_empty() && doc.language != "en" {
+                return Err("Parakeet Unified transcribes English only; use en or auto.".into());
+            }
+            doc.model = crate::speechd::ENGINE.into();
+        } else if doc.engine != SpeechMode::Deepgram && !doc.model.is_empty() {
             let path = if !doc.model.contains('/') {
                 crate::stt::known_model(&doc.model).map(|m| {
                     crate::stt::models_dir(&self.data_root)
@@ -100,6 +116,20 @@ impl SpeechControl for SpeechSettingsControl {
 
 #[cfg(target_os = "macos")]
 fn check_model(settings: &SttSettings, root: &Path) -> Result<(), String> {
+    if settings.uses_parakeet() {
+        // Ready means what Start needs: the detector, and the helper loading
+        // and warming the installed model. The helper exits with the runtime.
+        crate::stt::verify_vad_model(root)?;
+        let launch = crate::speechd::Launch::bundled()?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        return runtime
+            .block_on(crate::speechd::prepare_private(&launch, root))
+            .map(drop);
+    }
     let path = settings.model_path(root);
     crate::stt::verify_model(&path).map_err(|e| e.to_string())?;
     let vad = crate::stt::verify_vad_model(root)?;
@@ -147,6 +177,32 @@ mod tests {
         c.check = Arc::new(|_, _| Err("fixture invalid model/language".into()));
         assert!(c.set(doc(SpeechMode::Fallback)).is_err());
         assert_eq!(c.read().settings, before);
+    }
+    #[test]
+    fn parakeet_is_saved_by_name_and_reported_missing_until_installed() {
+        let mut c = control();
+        c.check = Arc::new(|settings, _| {
+            assert!(settings.uses_parakeet());
+            Ok(())
+        });
+        let mut parakeet = doc(SpeechMode::Local);
+        parakeet.model = " parakeet-unified ".into();
+        c.set(parakeet.clone()).unwrap();
+        let read = c.read();
+        assert_eq!(read.settings.unwrap().model, crate::speechd::ENGINE);
+        assert_eq!(read.model_availability, ModelAvailability::Missing);
+        assert!(
+            read.model_path
+                .unwrap()
+                .contains("speechd/parakeet-unified/")
+        );
+        parakeet.language = "de".into();
+        assert!(c.set(parakeet).unwrap_err().contains("English only"));
+    }
+    #[test]
+    fn a_fresh_library_shows_parakeet_as_the_local_model() {
+        let c = control();
+        assert_eq!(c.read().settings.unwrap().model, crate::speechd::ENGINE);
     }
     #[test]
     fn cloud_save_never_loads_a_local_model() {

@@ -399,6 +399,71 @@ fn install_with_detector(
     control.reopen()?;
     install_with_progress(root, model, control, &available, || open(model), progress)
 }
+/// A helper model such as Parakeet Unified (#244): its speech detector first,
+/// then the helper's own install of the pinned revision, under the same setup
+/// admission as any model, so it never runs beside a capture. Only the helper
+/// touches the network for it, and only here.
+fn install_helper_model(
+    root: &Path,
+    model: &crate::speechd::HelperModel,
+    source: Source,
+    control: &Control,
+    mut progress: impl FnMut(Progress),
+    detector: impl FnOnce(&mut dyn FnMut(Progress)) -> Result<PathBuf, String>,
+    launch: impl FnOnce() -> Result<crate::speechd::Launch, String>,
+) -> Result<PathBuf, String> {
+    use fotw_speechd_client::message::ProgressPhase;
+    control.check()?;
+    let launch = launch()?;
+    detector(&mut progress).map_err(|error| {
+        format!(
+            "The speech detector {} could not be installed, so {} was not either: {error}",
+            crate::stt::VAD_MODEL.name,
+            model.id
+        )
+    })?;
+    control.check()?;
+    // Declared before the helper, so admission outlives it.
+    let _lease = WorkLease::setup(root)?;
+    let total = model.bytes;
+    progress(Progress {
+        phase: Phase::Checking,
+        bytes: 0,
+        total,
+    });
+    let from = match source {
+        Source::Import(path) => Some(path),
+        Source::Download => None,
+    };
+    let revision = crate::speechd::install_model(
+        &launch,
+        root,
+        model,
+        from.as_deref(),
+        &|| control.check().is_err(),
+        &mut |p| {
+            progress(Progress {
+                phase: match p.phase {
+                    ProgressPhase::Download => Phase::Transferring,
+                    ProgressPhase::Verify => Phase::Verifying,
+                    _ => Phase::Installing,
+                },
+                bytes: p.bytes,
+                total: p.total,
+            });
+        },
+    )?;
+    // The helper has already selected it; a late cancel cannot undo that.
+    let _ = control.commit();
+    progress(Progress {
+        phase: Phase::Verified,
+        bytes: total,
+        total,
+    });
+    Ok(crate::speechd::models_root(root)
+        .join(model.id)
+        .join(revision))
+}
 #[cfg(test)]
 fn install_from(
     root: &Path,
@@ -420,8 +485,6 @@ pub fn install(
     control: &Control,
     progress: impl FnMut(Progress),
 ) -> Result<PathBuf, String> {
-    let known =
-        crate::stt::catalog_model(name).ok_or("Choose a model from `fotwd stt models list`")?;
     let detector = &crate::stt::VAD_MODEL;
     let download = |model: &crate::stt::KnownModel| -> Result<Box<dyn Read + Send>, String> {
         // No credentials, proxy discovery, cookies, metadata lookup or cloud ASR.
@@ -436,6 +499,40 @@ pub fn install(
             .map_err(|_| "Cannot initialize the model download client")?;
         download_response(&client, &model.url(), model.bytes)
     };
+    if let Some(model) = crate::speechd::helper_model(name) {
+        // The helper's models are gated by the same detector Whisper is. A
+        // download brings it; an import brings only the named model, as for
+        // Whisper.
+        let importing = matches!(source, Source::Import(_));
+        return install_helper_model(
+            root,
+            model,
+            source,
+            control,
+            progress,
+            |progress| {
+                if importing {
+                    crate::stt::verify_vad_model(root)
+                } else {
+                    // Cancel stops the detector's transfer too; once it is
+                    // published the control reopens for the model.
+                    let path = install_with_progress(
+                        root,
+                        &Artifact::known(detector),
+                        control,
+                        free_space,
+                        || download(detector),
+                        progress,
+                    )?;
+                    control.reopen()?;
+                    Ok(path)
+                }
+            },
+            crate::speechd::Launch::bundled,
+        );
+    }
+    let known =
+        crate::stt::catalog_model(name).ok_or("Choose a model from `fotwd stt models list`")?;
     if known.name == detector.name {
         return install_with_progress(
             root,
@@ -795,6 +892,68 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("cancelled"), "{error}");
         assert!(!root.path().join("models/ggml-fixture-asr.bin").exists());
+    }
+    #[test]
+    fn parakeet_installs_through_the_helper_after_its_speech_detector() {
+        let root = tempfile::tempdir().unwrap();
+        let mut phases = Vec::new();
+        let mut detector_first = false;
+        let path = install_helper_model(
+            root.path(),
+            &crate::speechd::PARAKEET,
+            Source::Download,
+            &Control::default(),
+            |p| phases.push(p.phase),
+            |_| {
+                detector_first = true;
+                Ok(root.path().join("models/ggml-fixture-vad.bin"))
+            },
+            || Ok(crate::speechd::testing::fake_launch()),
+        )
+        .unwrap();
+        assert!(detector_first);
+        assert!(crate::speechd::present(root.path()));
+        assert_eq!(
+            path,
+            crate::speechd::models_root(root.path())
+                .join(crate::speechd::ENGINE)
+                .join(crate::speechd::REVISION)
+        );
+        assert_eq!(phases.first(), Some(&Phase::Checking));
+        assert_eq!(phases.last(), Some(&Phase::Verified));
+    }
+    #[test]
+    fn a_parakeet_install_without_its_detector_never_starts_the_helper() {
+        let root = tempfile::tempdir().unwrap();
+        let error = install_helper_model(
+            root.path(),
+            &crate::speechd::PARAKEET,
+            Source::Import(root.path().join("parakeet")),
+            &Control::default(),
+            |_| {},
+            |_| Err("missing at /fixture".into()),
+            || Ok(crate::speechd::testing::fake_launch()),
+        )
+        .unwrap_err();
+        assert!(error.contains("speech detector"), "{error}");
+        assert!(!crate::speechd::present(root.path()));
+    }
+    #[test]
+    fn a_parakeet_install_waits_for_capture_to_release_the_library() {
+        let root = tempfile::tempdir().unwrap();
+        let _capture = WorkLease::capture(&root.path().join("sessions")).unwrap();
+        let error = install_helper_model(
+            root.path(),
+            &crate::speechd::PARAKEET,
+            Source::Download,
+            &Control::default(),
+            |_| {},
+            |_| Ok(PathBuf::new()),
+            || Ok(crate::speechd::testing::fake_launch()),
+        )
+        .unwrap_err();
+        assert!(error.contains("Capture"), "{error}");
+        assert!(!crate::speechd::present(root.path()));
     }
     #[test]
     fn capture_and_setup_are_exclusive_across_independent_file_owners() {

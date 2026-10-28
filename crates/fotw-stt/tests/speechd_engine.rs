@@ -152,8 +152,7 @@ async fn a_missing_model_is_refused_with_the_command_that_installs_it() {
     let root = tempfile::tempdir().unwrap();
     let refused = SpeechdEngine::prepare(client(root.path(), false).await, PARAKEET_UNIFIED)
         .await
-        .err()
-        .expect("no model, no engine");
+        .expect_err("no model, no engine");
     assert_eq!(refused.class, SttErrorClass::Unsupported);
     assert!(!refused.retryable);
     assert!(

@@ -105,9 +105,9 @@ impl SpeechdEngine {
             )
             .not_retryable("unknown engine")
         })?;
-        if info.model.as_ref().is_some_and(|model| !model.installed) {
-            return Err(not_installed(engine, "not installed"));
-        }
+        // `installed` in the capabilities is as of the helper's start, and a
+        // long-lived helper may predate an install; `load` reads the store now.
+        let _ = info;
         let loaded = client.load(engine).await.map_err(|e| match e.code() {
             ErrorCode::ModelMissing => not_installed(engine, "not installed"),
             ErrorCode::ModelInvalid => not_installed(engine, "installed copy failed its check"),
