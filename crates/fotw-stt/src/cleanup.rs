@@ -100,7 +100,7 @@ fn artifact_len(text: &str) -> Option<usize> {
         '<' => '>',
         _ => return None,
     };
-    let end = text[1..].find(|c| c == close || c == '\n')? + 1;
+    let end = text[1..].find([close, '\n'])? + 1;
     if !text[end..].starts_with(close) {
         return None;
     }
