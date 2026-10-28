@@ -111,6 +111,7 @@ pub use crate::state_file::{
 pub use crate::stream::{Delta, DeltaHub, FLUSH_INTERVAL, Frame, MeetingReady, MeetingReadyReason};
 pub use crate::summarize::{
     CliEngine, SummarizeControl, SummarizeError, SummarizeSettingsDoc, SummarizeStatus,
+    SummaryPolicy,
 };
 pub use crate::tokens::{HANDOFF_TTL, TokenTable, WS_TICKET_TTL};
 

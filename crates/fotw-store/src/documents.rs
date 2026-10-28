@@ -3,6 +3,17 @@ use crate::{Db, Result, StoreError, new_id, now_ms};
 use rusqlite::{OptionalExtension, params};
 
 impl Db {
+    /// Append a generated document only while its settings are current.
+    pub fn save_sharing_document_if_setting(
+        &mut self,
+        meeting_id: &str,
+        expected: i64,
+        json: &str,
+        version: &crate::SettingVersion,
+    ) -> Result<i64> {
+        self.save_sharing_document_checked(meeting_id, expected, json, Some(version))
+    }
+
     /// Read the newest sharing draft (revision, JSON payload).
     ///
     /// # Errors
@@ -25,9 +36,22 @@ impl Db {
         expected: i64,
         json: &str,
     ) -> Result<i64> {
+        self.save_sharing_document_checked(meeting_id, expected, json, None)
+    }
+
+    fn save_sharing_document_checked(
+        &mut self,
+        meeting_id: &str,
+        expected: i64,
+        json: &str,
+        version: Option<&crate::SettingVersion>,
+    ) -> Result<i64> {
         let tx = self
             .conn_mut()
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(version) = version {
+            version.ensure_current(&tx)?;
+        }
         let current: i64 = tx.query_row(
             "SELECT COALESCE(MAX(version),0) FROM meeting_documents WHERE meeting_id=?1",
             [meeting_id],

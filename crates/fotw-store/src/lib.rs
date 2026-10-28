@@ -48,6 +48,7 @@ mod notes;
 mod repo;
 mod search;
 mod session_notes;
+mod setting_version;
 mod speech;
 
 pub use crate::archive::{
@@ -70,5 +71,6 @@ pub use crate::repo::MeetingRepo;
 pub use crate::search::{FTS_TABLES, SearchHit, SearchQuery, SearchSource, SearchWeights};
 
 pub use crate::session_notes::{SessionNoteDocument, SessionNoteDraftSummary};
+pub use crate::setting_version::SettingVersion;
 
 pub use crate::speech::{SpeechCommit, SpeechEpoch, SpeechProvenance, SpeechSegment, SpeechSource};

@@ -18,6 +18,199 @@ use fotwd::persist;
 use fotwd::session::{LegBuffers, SessionOutcome};
 use fotwd::summarize;
 
+struct ChangePolicyDuringReply {
+    mock: MockTransport,
+    writer: std::sync::Mutex<Db>,
+    restore: bool,
+    original: String,
+}
+
+impl fotw_summarize::HttpTransport for ChangePolicyDuringReply {
+    fn post<'a>(
+        &'a self,
+        request: fotw_summarize::HttpRequest,
+    ) -> fotw_summarize::transport::BoxFuture<
+        'a,
+        Result<fotw_summarize::HttpResponse, fotw_summarize::SummarizeError>,
+    > {
+        Box::pin(async move {
+            let response = self.mock.post(request).await?;
+            if self.mock.call_count() == 1 {
+                let mut writer = self.writer.lock().unwrap();
+                writer
+                    .put_setting("summarize", r#"{"policy":"off"}"#)
+                    .unwrap();
+                if self.restore {
+                    writer.put_setting("summarize", &self.original).unwrap();
+                }
+            }
+            Ok(response)
+        })
+    }
+}
+
+#[tokio::test]
+async fn policy_changes_during_prose_prevent_extraction_and_preserve_the_previous_summary() {
+    check_policy_change(false).await;
+}
+
+#[tokio::test]
+async fn changing_policy_off_and_back_does_not_revive_an_old_job() {
+    check_policy_change(true).await;
+}
+
+async fn check_policy_change(restore: bool) {
+    let dir = tmpdir(&format!("policy-reply-{restore}"));
+    let mut db = db_at(&dir);
+    let id = seeded_meeting(&mut db, &dir);
+    let old = db
+        .meetings()
+        .insert_summary(
+            &id,
+            fotw_store::NewSummary {
+                transcript_id: None,
+                provider: "fixture".into(),
+                model: "fixture".into(),
+                prompt_hash: "fixture".into(),
+                body_md: "Keep the previous valid summary".into(),
+                coverage: None,
+                input_tokens: None,
+                output_tokens: None,
+                cost_micros: None,
+                template_id: None,
+                origin_device_id: "fixture".into(),
+            },
+        )
+        .unwrap();
+    let original = r#"{"policy":"anthropic","acknowledged_egress":true}"#.to_owned();
+    db.put_setting("summarize", &original).unwrap();
+    let response = |text: &str| serde_json::json!({"content":[{"type":"text","text":text}],"usage":{"input_tokens":100,"output_tokens":10},"stop_reason":"end_turn"});
+    let transport = Arc::new(ChangePolicyDuringReply {
+            mock: MockTransport::new()
+                .with_json(response("Numbers were above target."))
+                .with_json(response(r#"{"action_items":[],"decisions":[],"open_questions":[],"follow_ups":[],"topics":[]}"#)),
+            writer: std::sync::Mutex::new(db_at(&dir)), restore, original,
+        });
+    let result = summarize::summarize_meeting_with(
+        &mut db,
+        &anthropic(),
+        &id,
+        &general(),
+        Arc::clone(&transport),
+    )
+    .await;
+    assert_eq!(
+        transport.mock.call_count(),
+        1,
+        "a captured engine sent another request after the policy changed (restore={restore})"
+    );
+    assert!(result.is_err(), "stale generated output must be refused");
+    assert_eq!(
+        db.meetings().current_summary(&id).unwrap().unwrap().id,
+        old.id
+    );
+}
+
+#[tokio::test]
+async fn a_queued_engine_cannot_revive_after_policy_changes_before_its_first_call() {
+    use fotw_secrets::{KeyStore, Provider, SecretKey};
+    let dir = tmpdir("queued-policy");
+    let mut db = db_at(&dir);
+    let id = seeded_meeting(&mut db, &dir);
+    let settings = r#"{"policy":"anthropic","acknowledged_egress":true}"#;
+    db.put_setting("summarize", settings).unwrap();
+    let store = InMemoryKeyStore::new();
+    store
+        .set(
+            SecretKey::ApiKey(Provider::Anthropic),
+            &SecretString::new("fixture-key"),
+        )
+        .unwrap();
+    let engine = fotwd::engine::resolve_engine(&store, &db).unwrap();
+    db.put_setting("summarize", r#"{"policy":"off"}"#).unwrap();
+    db.put_setting("summarize", settings).unwrap();
+    let transport = Arc::new(MockTransport::new());
+    let result = summarize::summarize_meeting_with(
+        &mut db,
+        &engine,
+        &id,
+        &general(),
+        Arc::clone(&transport),
+    )
+    .await;
+    assert_eq!(
+        transport.call_count(),
+        0,
+        "a queued engine must retain its original policy generation"
+    );
+    assert!(result.is_err());
+}
+
+struct NeverReply {
+    entered: tokio::sync::Notify,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl fotw_summarize::HttpTransport for NeverReply {
+    fn post<'a>(
+        &'a self,
+        _request: fotw_summarize::HttpRequest,
+    ) -> fotw_summarize::transport::BoxFuture<
+        'a,
+        Result<fotw_summarize::HttpResponse, fotw_summarize::SummarizeError>,
+    > {
+        Box::pin(async move {
+            struct OnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for OnDrop {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let _drop = OnDrop(Arc::clone(&self.dropped));
+            self.entered.notify_one();
+            std::future::pending().await
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_policy_change_cancels_waiting_for_an_unresponsive_provider_within_one_second() {
+    let dir = tmpdir("waiting-policy");
+    let mut db = db_at(&dir);
+    let id = seeded_meeting(&mut db, &dir);
+    let mut writer = db_at(&dir);
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let transport = Arc::new(NeverReply {
+        entered: tokio::sync::Notify::new(),
+        dropped: Arc::clone(&dropped),
+    });
+    let engine = anthropic();
+    let template = general();
+    let work = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        summarize::summarize_meeting_with(&mut db, &engine, &id, &template, Arc::clone(&transport)),
+    );
+    let change = async {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            transport.entered.notified(),
+        )
+        .await
+        .expect("fake provider must start");
+        writer
+            .put_setting("summarize", r#"{"policy":"off"}"#)
+            .unwrap();
+    };
+    let (result, ()) = tokio::join!(work, change);
+    assert!(
+        result
+            .expect("policy cancellation must not wait for the provider deadline")
+            .is_err()
+    );
+    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(db.meetings().current_summary(&id).unwrap().is_none());
+}
+
 fn tmpdir(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("fotwd-sum-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -46,6 +239,7 @@ fn general() -> Template {
 fn anthropic() -> Engine {
     Engine::Anthropic {
         key: SecretString::new("test-key"),
+        settings_version: None,
     }
 }
 

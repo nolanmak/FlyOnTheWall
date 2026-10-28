@@ -46,6 +46,42 @@ impl Db {
 }
 
 impl MeetingRepo<'_> {
+    /// Save a generated title only while its settings observation is current.
+    pub fn set_title_if_setting(
+        &mut self,
+        meeting_id: &str,
+        title: &str,
+        version: &crate::SettingVersion,
+    ) -> Result<()> {
+        let tx = self
+            .db
+            .conn_mut()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        version.ensure_current(&tx)?;
+        let count = tx.execute(
+            "UPDATE meetings SET title=?2,updated_at=?3,lamport=lamport+1 WHERE id=?1",
+            params![meeting_id, title, now_ms()],
+        )?;
+        if count == 0 {
+            return Err(StoreError::NotFound {
+                kind: "meeting",
+                id: meeting_id.into(),
+            });
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Append a generated summary only while its settings are current.
+    pub fn insert_summary_if_setting(
+        &mut self,
+        meeting_id: &str,
+        summary: NewSummary,
+        version: &crate::SettingVersion,
+    ) -> Result<Summary> {
+        self.insert_summary_checked(meeting_id, summary, Some(version))
+    }
+
     // ------------------------------------------------------------ meetings
 
     /// Insert a meeting and return its id.
@@ -517,10 +553,22 @@ impl MeetingRepo<'_> {
     /// a caller that reimplemented this badly would get an error instead of
     /// two current summaries.
     pub fn insert_summary(&mut self, meeting_id: &str, s: NewSummary) -> Result<Summary> {
+        self.insert_summary_checked(meeting_id, s, None)
+    }
+
+    fn insert_summary_checked(
+        &mut self,
+        meeting_id: &str,
+        s: NewSummary,
+        version: Option<&crate::SettingVersion>,
+    ) -> Result<Summary> {
         let id = new_id();
         let now = now_ms();
 
         let tx = self.db.conn_mut().transaction()?;
+        if let Some(version) = version {
+            version.ensure_current(&tx)?;
+        }
 
         // Guard explicitly: a summary for a nonexistent meeting would
         // otherwise surface as an opaque FK violation.

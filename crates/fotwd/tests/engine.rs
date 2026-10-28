@@ -81,7 +81,7 @@ fn the_cli_serves_when_enabled_and_acknowledged_and_present() {
     write_settings(&mut db, &cli_settings("/bin/echo", true));
 
     match resolve_engine(&InMemoryKeyStore::new(), &db) {
-        Some(Engine::ClaudeCli { binary }) => {
+        Some(Engine::ClaudeCli { binary, .. }) => {
             assert_eq!(binary, std::path::PathBuf::from("/bin/echo"));
         }
         other => panic!("expected the CLI engine, got {other:?}"),
@@ -480,7 +480,7 @@ fn a_resolvable_cli_reports_the_engine_it_resolved() {
     let mut db = db();
     write_settings(&mut db, &cli_settings("/bin/echo", true));
     match resolve_engine_detailed(&InMemoryKeyStore::new(), &db) {
-        EngineResolution::Engine(Engine::ClaudeCli { binary }) => {
+        EngineResolution::Engine(Engine::ClaudeCli { binary, .. }) => {
             assert_eq!(binary, std::path::PathBuf::from("/bin/echo"));
         }
         other => panic!("expected the CLI engine, got {other:?}"),

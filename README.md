@@ -91,7 +91,7 @@ Nothing marked no needs a key to read: the transcript text in `sessions/<id>/stt
 There is no FlyOnTheWall server. Data leaves only for services you configure, under your own accounts:
 
 - **Audio, to Deepgram** — only while recording, only when a Deepgram key is configured, and never once you switch to on-device transcription with `fotwd stt local`. Both streams go straight to `api.deepgram.com`, and every request carries `mip_opt_out=true`, Deepgram's opt-out from model training.
-- **Transcripts and notes, to your summary engine** — for each finished meeting, once an engine is configured. That is the Anthropic API when an Anthropic key is stored, otherwise the `claude` or `codex` CLI you enabled, which sends it to Anthropic or OpenAI through that CLI's own login. Meeting documents use the same engine. With no engine configured nothing is sent, and meetings get a local fallback title.
+- **Transcripts and notes, to your selected summary engine** — hosted choices are the Anthropic API or the acknowledged `claude`/`codex` CLI. Those CLIs send text to their hosted provider; running the CLI locally does not make inference local. Off and Local-only override stored hosted keys and CLI settings. Local-only currently reports that model setup is required; on-device summary generation is not available yet ([#234](https://github.com/nolanmak/FlyOnTheWall/issues/234)). Titles, notes augmentation and meeting documents obey the same destination. Transcription and GitHub export have separate settings.
 - **Transcripts, to GitHub** — only if you turn GitHub export on; it is off by default. It uses your `gh` login to commit each meeting's full transcript and notes, its summary and its saved document brief as Markdown to the repository you choose. In auto mode the daemon syncs each meeting once it has finished and been summarised, and syncs it again when its summary or saved brief changes; every meeting shows its own sync state in the dashboard, and a meeting whose push failed is retried on a bounded schedule without being asked. Meetings recorded before auto was switched on are left alone unless you also turn on *sync every meeting in the library*. A meeting no automatic pass covers — any meeting while the mode is manual, and anything from before the cutoff — says so and offers *Sync now*, which is the only way one of those reaches the repository. It refuses any repository GitHub does not confirm is private, unless the export settings store your acknowledgement that it may be public; see [GitHub sync](docs/SHARING_DOCUMENTS.md#github-sync).
 - **Library contents, to an agent** — only if you point an agent at `fotwd mcp`. The reading is local; what that agent then sends to its own model is up to the agent.
 
@@ -192,12 +192,17 @@ of immediate compute interruption.
 Pick one:
 
 ```sh
-fotwd key set anthropic                          # the Anthropic API, with your own key
+fotwd key set anthropic                         # store your own Anthropic API key
+fotwd engine anthropic --i-acknowledge-egress   # explicitly select the hosted API
 fotwd engine claude-cli --i-acknowledge-egress   # the claude CLI you are logged in to
 fotwd engine codex-cli --i-acknowledge-egress    # the codex CLI you are logged in to
+fotwd engine off                               # disable all summary model calls
+fotwd engine local                             # local-only policy; model setup still required
 ```
 
-Run `fotwd engine claude-cli` or `fotwd engine codex-cli` without the flag first: it prints what that CLI sends, to whom, and the provider's training default, and does not enable it. Add `--binary /full/path/to/claude` if the daemon cannot find the CLI. A stored Anthropic key always takes precedence over a CLI engine. `fotwd engine` with no arguments reports what enrichment will actually use, and `fotwd engine off` turns the CLI engine off. The dashboard's **Summaries** panel configures the CLI engines too.
+Run a hosted engine command without the acknowledgement flag first to see its disclosure without enabling it. Add `--binary /full/path/to/claude` if the daemon cannot find the CLI. `fotwd engine` reports the selected destination; the dashboard's **Summaries** panel selects the same policy. Existing libraries without an explicit policy keep their previous API-key/CLI precedence until you choose a destination. Malformed settings fail closed until explicitly resaved.
+
+Changing destination fences queued jobs and future calls from an active job, cancels waiting for a response, and prevents old results from being published. A request already dispatched to a hosted service cannot be recalled. Off and Local-only do not inspect hosted keys. Local-only does not silently provision a model or fall back to cloud; it is a privacy gate pending the runtime/setup work, not a working local summary engine yet. For fully private meeting processing, transcription and export destinations must also be configured appropriately.
 
 ## Your Recovery Key
 
