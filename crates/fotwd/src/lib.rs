@@ -223,3 +223,7 @@ pub mod native_host;
 pub mod native_launch;
 /// Capture and persistence shutdown observations.
 pub mod recorder_lifecycle;
+
+/// App-owned, network-isolated local summary inference.
+#[cfg(unix)]
+pub mod local_summary;
