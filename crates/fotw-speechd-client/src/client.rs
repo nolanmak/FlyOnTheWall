@@ -23,13 +23,17 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::frame::{self, Frame, FrameError, MAX_SAMPLES_PER_FRAME};
 use crate::message::{
-    Capabilities, CloseReason, ErrorCode, FORMAT_S16LE, FinalText, PROTOCOL_VERSION, Reply,
-    Request, StreamOptions, VadKind,
+    Capabilities, CloseReason, EngineKind, ErrorCode, FORMAT_S16LE, FinalText, PROTOCOL_VERSION,
+    ProgressPhase, Reply, Request, StreamOptions, VadKind,
 };
 use crate::restart::{RestartBudget, RestartPolicy};
 
 /// Frames queued for the helper's stdin before senders wait.
 const WRITE_QUEUE: usize = 32;
+/// After the helper exits, or stops taking input, how long the reader may
+/// keep reading what it wrote before dying (a final, its own fatal error)
+/// before the connection is failed anyway. Well inside the 1 s crash budget.
+const DRAIN_AFTER_EXIT: Duration = Duration::from_millis(250);
 
 /// How to run the helper, and how long to wait for it.
 #[derive(Debug, Clone)]
@@ -50,13 +54,17 @@ pub struct SpeechdConfig {
     pub load_timeout: Duration,
     /// `install`, which may download hundreds of megabytes.
     pub install_timeout: Duration,
-    /// How long a frame may wait for the helper to read its stdin. Past this
-    /// the helper is unresponsive and is killed, so capture never blocks on it.
+    /// How long [`SpeechStream::send_audio`] may wait for room in the queue to
+    /// the helper. Past this the helper is unresponsive and is killed.
     pub audio_stall_timeout: Duration,
     /// While any stream is open the client asks the helper for `health` this
-    /// often, so a helper that hangs mid-stream is found and killed instead of
-    /// leaving a caller waiting for a final forever.
+    /// often (1 s by default), so a helper that hangs mid-stream is found and
+    /// killed instead of leaving a caller waiting for a final forever.
     pub heartbeat_interval: Duration,
+    /// How long a heartbeat may go unanswered (2 s by default). With the
+    /// interval this bounds how long a hung helper goes unnoticed: 3 s by
+    /// default, even after `finish`, when no audio is flowing.
+    pub heartbeat_timeout: Duration,
 }
 
 impl SpeechdConfig {
@@ -76,7 +84,8 @@ impl SpeechdConfig {
             load_timeout: Duration::from_secs(180),
             install_timeout: Duration::from_secs(6 * 3600),
             audio_stall_timeout: Duration::from_secs(2),
-            heartbeat_interval: Duration::from_secs(5),
+            heartbeat_interval: Duration::from_secs(1),
+            heartbeat_timeout: Duration::from_secs(2),
         }
     }
 
@@ -138,6 +147,10 @@ pub enum ClientError {
     /// The engine does not take this format.
     #[error("unsupported audio format: {0}")]
     UnsupportedFormat(String),
+    /// [`SpeechStream::try_send_audio`]: the queue to the helper is full.
+    /// Nothing was sent; the caller decides whether to drop or retry.
+    #[error("the speech helper is not keeping up; audio was not queued")]
+    Backpressure,
     /// The stream was finished, cancelled or failed.
     #[error("the speech stream is closed")]
     StreamClosed,
@@ -160,7 +173,7 @@ impl ClientError {
             Self::Remote { code, .. } => *code,
             Self::UnknownEngine(_) => ErrorCode::UnknownEngine,
             Self::UnsupportedFormat(_) => ErrorCode::UnsupportedFormat,
-            Self::StreamClosed | Self::ShutDown => ErrorCode::Other,
+            Self::StreamClosed | Self::ShutDown | Self::Backpressure => ErrorCode::Other,
         }
     }
 }
@@ -185,6 +198,9 @@ pub enum StreamEvent {
         start_ms: u64,
         /// End, in ms from the stream's first sample.
         end_ms: u64,
+        /// The utterance it belongs to; a later partial or final with the
+        /// same id replaces it.
+        utterance: Option<u64>,
     },
     /// Committed text.
     Final(FinalText),
@@ -249,13 +265,15 @@ pub struct Loaded {
     pub elapsed: Duration,
 }
 
-/// Install progress.
+/// Progress of a slow request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InstallProgress {
-    /// Bytes done.
-    pub bytes: u64,
-    /// Bytes in total.
-    pub total: u64,
+pub struct Progress {
+    /// What it is doing now.
+    pub phase: ProgressPhase,
+    /// Bytes done, for a download or check.
+    pub bytes: Option<u64>,
+    /// Bytes in total, for a download or check.
+    pub total: Option<u64>,
 }
 
 /// A snapshot of the supervisor.
@@ -267,6 +285,8 @@ pub struct Status {
     pub restart_attempts: u32,
     /// The restart budget is spent, or the client was shut down.
     pub failed: bool,
+    /// When the most recent helpers were spawned (up to 16), oldest first.
+    pub spawns: Vec<Instant>,
 }
 
 // ------------------------------------------------------------------ client
@@ -291,6 +311,7 @@ struct State {
     budget: RestartBudget,
     failed: Option<ClientError>,
     generation: u64,
+    spawns: std::collections::VecDeque<Instant>,
     /// Every engine the app loaded, and whether it warmed it, to replay after
     /// a restart.
     wanted: Vec<(String, bool)>,
@@ -302,6 +323,16 @@ impl Drop for Shared {
         if let Some(conn) = current {
             conn.close(ClientError::ShutDown);
         }
+    }
+}
+
+impl State {
+    fn spawned(&mut self, at: Instant) {
+        self.budget.spawned(at);
+        if self.spawns.len() == 16 {
+            self.spawns.pop_front();
+        }
+        self.spawns.push_back(at);
     }
 }
 
@@ -329,10 +360,11 @@ impl SpeechdClient {
                 budget,
                 failed: None,
                 generation: 1,
+                spawns: std::collections::VecDeque::new(),
                 wanted: Vec::new(),
             }),
         });
-        lock(&shared.state).budget.spawned(Instant::now());
+        lock(&shared.state).spawned(Instant::now());
         let conn = Conn::spawn(&shared.config, 1, Arc::downgrade(&shared)).await?;
         lock(&shared.state).current = Some(conn);
         Ok(Self { shared })
@@ -350,8 +382,24 @@ impl SpeechdClient {
     /// # Errors
     /// The helper's refusal (for example `model_missing`) or a helper failure.
     pub async fn load(&self, engine: &str) -> Result<Loaded, ClientError> {
+        self.load_with_progress(engine, None).await
+    }
+
+    /// [`load`](Self::load), reporting `progress` events as they arrive. A
+    /// first load on a machine includes Core ML's compile, which can take tens
+    /// of seconds.
+    ///
+    /// # Errors
+    /// As [`load`](Self::load).
+    pub async fn load_with_progress(
+        &self,
+        engine: &str,
+        progress: Option<mpsc::UnboundedSender<Progress>>,
+    ) -> Result<Loaded, ClientError> {
         let conn = self.conn().await?;
-        let reply = conn.load(engine, self.shared.config.load_timeout).await?;
+        let reply = conn
+            .load(engine, self.shared.config.load_timeout, progress)
+            .await?;
         let mut state = lock(&self.shared.state);
         if !state.wanted.iter().any(|(e, _)| e == engine) {
             state.wanted.push((engine.to_owned(), false));
@@ -365,8 +413,22 @@ impl SpeechdClient {
     /// # Errors
     /// As [`load`](Self::load).
     pub async fn warmup(&self, engine: &str) -> Result<Duration, ClientError> {
+        self.warmup_with_progress(engine, None).await
+    }
+
+    /// [`warmup`](Self::warmup), reporting `progress` events as they arrive.
+    ///
+    /// # Errors
+    /// As [`load`](Self::load).
+    pub async fn warmup_with_progress(
+        &self,
+        engine: &str,
+        progress: Option<mpsc::UnboundedSender<Progress>>,
+    ) -> Result<Duration, ClientError> {
         let conn = self.conn().await?;
-        let elapsed = conn.warmup(engine, self.shared.config.load_timeout).await?;
+        let elapsed = conn
+            .warmup(engine, self.shared.config.load_timeout, progress)
+            .await?;
         if let Some(wanted) = lock(&self.shared.state)
             .wanted
             .iter_mut()
@@ -492,7 +554,7 @@ impl SpeechdClient {
         &self,
         model: &str,
         from: Option<&Path>,
-        progress: Option<mpsc::UnboundedSender<InstallProgress>>,
+        progress: Option<mpsc::UnboundedSender<Progress>>,
     ) -> Result<String, ClientError> {
         let conn = self.conn().await?;
         let model = model.to_owned();
@@ -519,6 +581,7 @@ impl SpeechdClient {
             generation: state.generation,
             restart_attempts: state.budget.attempts(),
             failed: state.failed.is_some(),
+            spawns: state.spawns.iter().copied().collect(),
         }
     }
 
@@ -597,7 +660,7 @@ impl SpeechdClient {
             if let Some(failed) = &lock(&self.shared.state).failed {
                 return Err(failed.clone());
             }
-            lock(&self.shared.state).budget.spawned(Instant::now());
+            lock(&self.shared.state).spawned(Instant::now());
             let conn = match Conn::spawn(
                 &self.shared.config,
                 generation,
@@ -635,9 +698,9 @@ impl SpeechdClient {
         let wanted = lock(&self.shared.state).wanted.clone();
         let timeout = self.shared.config.load_timeout;
         for (engine, warm) in wanted {
-            let mut result = conn.load(&engine, timeout).await.map(|_| ());
+            let mut result = conn.load(&engine, timeout, None).await.map(|_| ());
             if warm && result.is_ok() {
-                result = conn.warmup(&engine, timeout).await.map(|_| ());
+                result = conn.warmup(&engine, timeout, None).await.map(|_| ());
             }
             match result {
                 Ok(()) => {}
@@ -704,8 +767,12 @@ impl SpeechStream {
         self.id
     }
 
-    /// Send mono s16le PCM. Split into as many frames as it needs. Waits at
-    /// most the stall timeout for the helper to take it.
+    /// Send mono s16le PCM, split into as many frames as it needs.
+    ///
+    /// This waits for room in the queue to the helper, at most
+    /// `audio_stall_timeout` (2 s by default); past that the helper is treated
+    /// as hung and killed. Call it from a task, never from a real-time capture
+    /// callback; there, use [`try_send_audio`](Self::try_send_audio).
     ///
     /// # Errors
     /// [`ClientError::StreamClosed`] after `finish`, `cancel` or a stream
@@ -718,6 +785,28 @@ impl SpeechStream {
             self.conn.write(bytes).await?;
         }
         Ok(())
+    }
+
+    /// Queue one frame's worth of PCM without waiting. Returns
+    /// [`ClientError::Backpressure`] when the queue to the helper is full, and
+    /// sends nothing; the caller decides whether to drop, buffer or retry.
+    ///
+    /// # Errors
+    /// [`ClientError::Backpressure`]; [`ClientError::Protocol`] for more than
+    /// [`MAX_SAMPLES_PER_FRAME`] samples; otherwise as
+    /// [`send_audio`](Self::send_audio).
+    pub fn try_send_audio(&self, pcm: &[i16]) -> Result<(), ClientError> {
+        self.check_open()?;
+        if pcm.is_empty() {
+            return Ok(());
+        }
+        let bytes =
+            frame::encode_audio(self.id, pcm).map_err(|e| ClientError::Protocol(e.to_string()))?;
+        match self.conn.writer.try_send(bytes) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(ClientError::Backpressure),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(self.conn.dead_error()),
+        }
     }
 
     /// No more audio: the engine flushes, then the stream yields its last
@@ -790,9 +879,11 @@ struct Conn {
     kill: Mutex<Option<oneshot::Sender<()>>>,
     /// Set before a deliberate shutdown, so its exit is not a crash.
     closing: AtomicBool,
+    /// How the process ended, once the reaper knows.
+    exit_status: Mutex<Option<String>>,
     owner: Weak<Shared>,
     stall: Duration,
-    request_timeout: Duration,
+    heartbeat_timeout: Duration,
 }
 
 #[derive(Default)]
@@ -804,7 +895,7 @@ struct Routes {
 
 struct Waiter {
     reply: oneshot::Sender<Result<Reply, ClientError>>,
-    progress: Option<mpsc::UnboundedSender<InstallProgress>>,
+    progress: Option<mpsc::UnboundedSender<Progress>>,
 }
 
 impl Conn {
@@ -846,9 +937,10 @@ impl Conn {
             next_stream: AtomicU32::new(1),
             kill: Mutex::new(Some(kill)),
             closing: AtomicBool::new(false),
+            exit_status: Mutex::new(None),
             owner,
             stall: config.audio_stall_timeout,
-            request_timeout: config.request_timeout,
+            heartbeat_timeout: config.heartbeat_timeout,
         });
         tokio::spawn(write_loop(Arc::downgrade(&conn), stdin, queue));
         tokio::spawn(heartbeat(Arc::downgrade(&conn), config.heartbeat_interval));
@@ -972,7 +1064,7 @@ impl Conn {
         self: &Arc<Self>,
         build: impl FnOnce(u64) -> Request,
         timeout: Duration,
-        progress: Option<mpsc::UnboundedSender<InstallProgress>>,
+        progress: Option<mpsc::UnboundedSender<Progress>>,
         what: &'static str,
     ) -> Result<Reply, ClientError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -1004,13 +1096,14 @@ impl Conn {
         self: &Arc<Self>,
         engine: &str,
         timeout: Duration,
+        progress: Option<mpsc::UnboundedSender<Progress>>,
     ) -> Result<Loaded, ClientError> {
         let engine = engine.to_owned();
         match self
             .call(
                 move |id| Request::Load { id, engine },
                 timeout,
-                None,
+                progress,
                 "load",
             )
             .await?
@@ -1033,13 +1126,14 @@ impl Conn {
         self: &Arc<Self>,
         engine: &str,
         timeout: Duration,
+        progress: Option<mpsc::UnboundedSender<Progress>>,
     ) -> Result<Duration, ClientError> {
         let engine = engine.to_owned();
         match self
             .call(
                 move |id| Request::Warmup { id, engine },
                 timeout,
-                None,
+                progress,
                 "warmup",
             )
             .await?
@@ -1053,14 +1147,22 @@ impl Conn {
     fn dispatch(self: &Arc<Self>, reply: Reply) -> Result<(), ClientError> {
         match reply {
             Reply::Progress {
-                id, bytes, total, ..
+                id,
+                phase,
+                bytes,
+                total,
+                ..
             } => {
                 if let Some(Waiter {
                     progress: Some(progress),
                     ..
                 }) = lock(&self.routes).pending.get(&id)
                 {
-                    let _ = progress.send(InstallProgress { bytes, total });
+                    let _ = progress.send(Progress {
+                        phase,
+                        bytes,
+                        total,
+                    });
                 }
             }
             Reply::Error {
@@ -1087,12 +1189,14 @@ impl Conn {
                 text,
                 start_ms,
                 end_ms,
+                utterance,
             } => self.to_stream(
                 stream,
                 StreamEvent::Partial {
                     text,
                     start_ms,
                     end_ms,
+                    utterance,
                 },
             ),
             Reply::Final(text) => self.to_stream(text.stream, StreamEvent::Final(text)),
@@ -1181,8 +1285,15 @@ async fn handshake(
             protocol: PROTOCOL_VERSION,
             capabilities,
             ..
-        } => serde_json::from_value(capabilities)
-            .map_err(|e| ClientError::Protocol(format!("capabilities: {e}"))),
+        } => {
+            let mut capabilities: Capabilities = serde_json::from_value(capabilities)
+                .map_err(|e| ClientError::Protocol(format!("capabilities: {e}")))?;
+            // A newer helper's engine of a kind this version cannot drive.
+            capabilities
+                .engines
+                .retain(|engine| engine.kind != EngineKind::Unknown);
+            Ok(capabilities)
+        }
         Reply::Hello { protocol, .. } => Err(ClientError::VersionMismatch {
             client: PROTOCOL_VERSION,
             helper: Some(protocol),
@@ -1219,9 +1330,13 @@ async fn write_loop(conn: Weak<Conn>, mut stdin: ChildStdin, mut queue: mpsc::Re
         }
         .await
         {
-            if let Some(conn) = conn.upgrade() {
-                conn.fail(ClientError::HelperCrashed(format!("writing to it: {e}")));
-            }
+            // Usually the helper has exited: let the reader take what it wrote
+            // first, and fail only if nothing else does.
+            fail_after_drain(
+                &conn,
+                ClientError::HelperCrashed(format!("writing to it: {e}")),
+            )
+            .await;
             return;
         }
     }
@@ -1237,12 +1352,25 @@ async fn read_loop(conn: Arc<Conn>, mut stdout: BufReader<ChildStdout>) {
                         break e;
                     }
                 }
-                Err(e) => break ClientError::Protocol(format!("malformed reply: {e}")),
+                Err(e) => match unknown_type(&json) {
+                    // From a newer helper: skip it, or fail just its request.
+                    Some(None) => {}
+                    Some(Some(id)) => conn.answer(
+                        id,
+                        Err(ClientError::Protocol("a reply of an unknown type".into())),
+                    ),
+                    None => break ClientError::Protocol(format!("malformed reply: {e}")),
+                },
             },
             Ok(Some(Frame::Audio { .. })) => {
                 break ClientError::Protocol("the helper sent audio".into());
             }
-            Ok(None) => break ClientError::HelperCrashed("it closed its output".into()),
+            Ok(None) => {
+                let status = lock(&conn.exit_status).clone();
+                break ClientError::HelperCrashed(
+                    status.unwrap_or_else(|| "it closed its output".into()),
+                );
+            }
             Err(e) => break frame_failure(e),
         }
     };
@@ -1265,7 +1393,7 @@ async fn heartbeat(conn: Weak<Conn>, interval: Duration) {
             let _ = conn
                 .call(
                     |id| Request::Health { id },
-                    conn.request_timeout,
+                    conn.heartbeat_timeout,
                     None,
                     "a heartbeat",
                 )
@@ -1277,14 +1405,61 @@ async fn heartbeat(conn: Weak<Conn>, interval: Duration) {
 async fn reap(conn: Weak<Conn>, mut child: Child, killed: oneshot::Receiver<()>) {
     tokio::select! {
         status = child.wait() => {
+            let detail = status.map_or_else(|e| e.to_string(), |s| s.to_string());
             if let Some(conn) = conn.upgrade() {
-                let detail = status.map_or_else(|e| e.to_string(), |s| s.to_string());
-                conn.fail(ClientError::HelperCrashed(detail));
+                *lock(&conn.exit_status) = Some(detail.clone());
             }
+            // The reader fails the connection at EOF once it has read what the
+            // helper wrote before exiting. This catches a stdout that never
+            // closes (a grandchild holding it, say).
+            fail_after_drain(&conn, ClientError::HelperCrashed(detail)).await;
         }
         _ = killed => {
             let _ = child.start_kill();
             let _ = child.wait().await;
         }
     }
+}
+
+/// Fail the connection unless something else does within [`DRAIN_AFTER_EXIT`].
+async fn fail_after_drain(conn: &Weak<Conn>, error: ClientError) {
+    let deadline = Instant::now() + DRAIN_AFTER_EXIT;
+    while Instant::now() < deadline {
+        match conn.upgrade() {
+            Some(conn) if conn.is_alive() => {}
+            _ => return,
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if let Some(conn) = conn.upgrade() {
+        conn.fail(error);
+    }
+}
+
+/// For a reply that did not parse: `Some(id)` if it is an object whose `type`
+/// this version does not know (with its `id`, if any), `None` if it is
+/// malformed in a way no version allows.
+fn unknown_type(json: &[u8]) -> Option<Option<u64>> {
+    const KNOWN: [&str; 14] = [
+        "hello",
+        "loaded",
+        "warmed",
+        "unloaded",
+        "stream_opened",
+        "health",
+        "progress",
+        "installed",
+        "bye",
+        "partial",
+        "final",
+        "vad",
+        "error",
+        "closed",
+    ];
+    let value: serde_json::Value = serde_json::from_slice(json).ok()?;
+    let kind = value.get("type")?.as_str()?;
+    if KNOWN.contains(&kind) {
+        return None;
+    }
+    Some(value.get("id").and_then(serde_json::Value::as_u64))
 }

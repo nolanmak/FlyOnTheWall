@@ -20,8 +20,8 @@ pub mod message;
 pub mod restart;
 
 pub use client::{
-    ClientError, Health, InstallProgress, Loaded, SpeechStream, SpeechdClient, SpeechdConfig,
-    Status, StreamConfig, StreamEvent, StreamFailure,
+    ClientError, Health, Loaded, Progress, SpeechStream, SpeechdClient, SpeechdConfig, Status,
+    StreamConfig, StreamEvent, StreamFailure,
 };
 pub use restart::RestartPolicy;
 
