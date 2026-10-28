@@ -118,7 +118,9 @@ public actor FakeEngine: SpeechEngine {
                                       maxAudioMs: kind == .batch ? maxBatchMs : nil)
     }
 
-    public static func all() -> [any SpeechEngine] { ids.map { FakeEngine(id: $0) } }
+    public static func all() -> [any SpeechEngine] {
+        ids.map { FakeEngine(id: $0) } + [FakeDictationEngine()]
+    }
 
     public func load() async throws -> LoadResult {
         if descriptor.id == "fake-captions", captionPool == nil {

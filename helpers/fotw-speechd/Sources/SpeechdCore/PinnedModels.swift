@@ -11,8 +11,12 @@
 // - silero-vad: the unified 256 ms v6.2.1 model FluidAudio 0.17.3 loads.
 // - parakeet-eou-320ms, parakeet-eou-160ms: the streaming encoder, decoder,
 //   joint and vocab of the 320 ms and 160 ms variants (live captions, #245).
-// - nemotron-3.5-2240ms: multilingual/2240ms without decoder_joint.mlmodelc,
-//   which Muesli skips as well.
+// - nemotron-3.5: multilingual/560ms (partials) and multilingual/1120ms (the
+//   final), run in lockstep (Murmur #100: 2240 ms steps cannot show a word
+//   within a second, 560 ms alone misses the WER gate). Without
+//   decoder_joint.mlmodelc, which Muesli skips as well and which made no
+//   measurable difference, and without preprocessor.mlmodelc, which
+//   FluidAudio 0.17.3 replaces with its native mel front end.
 // Weights are downloaded on demand by an explicit install and never committed.
 
 public struct PinnedFile: Sendable, Equatable {
@@ -111,25 +115,35 @@ public enum PinnedModels {
             PinnedFile(path: "streaming_encoder.mlmodelc/weights/weight.bin", size: 212691776, sha256: "12cd781a4300b52b6687587b7d8e37e0ce5c8ccb1dbea036008275e6abf5070c"),
             PinnedFile(path: "vocab.json", size: 17437, sha256: "83fd42ad33dae1bd3ceee6c0bb6c625f314cf0b2dc8430be441ac1e2643d5c36"),
         ]),
-        PinnedModel(id: "nemotron-3.5-2240ms", repository: "FluidInference/Nemotron-3.5-ASR-Streaming-Multilingual-0.6b-CoreML", revision: "1a41b75758b0337ff67db7d5408280aaaf23074e", license: "OpenMDW-1.1", remoteDirectory: "multilingual/2240ms", files: [
-            PinnedFile(path: "decoder.mlmodelc/analytics/coremldata.bin", size: 243, sha256: "fdb14a08e42b4806a2d1505501586be71e4f04ca9256c719544fd7ed6937e509"),
-            PinnedFile(path: "decoder.mlmodelc/coremldata.bin", size: 433, sha256: "3a89047b6f74ee3d0a74c72f8c8e5016d76d9487d030f0661fe80220b441a6fd"),
-            PinnedFile(path: "decoder.mlmodelc/model.mil", size: 11743, sha256: "f3ed3e9cac9b70e1b00df48b53868dbd3c4dd8cf158af79ded0d05a96e0bf5dc"),
-            PinnedFile(path: "decoder.mlmodelc/weights/weight.bin", size: 29870592, sha256: "dcdeccd4ccf46e2675224f9f030d46c1a89e2bda4abb316e901e1a21f1597f8f"),
-            PinnedFile(path: "encoder.mlmodelc/analytics/coremldata.bin", size: 243, sha256: "af569fd95237bdf8b91d38094691bfc990fcf3534316fa615bac5964c02809e4"),
-            PinnedFile(path: "encoder.mlmodelc/coremldata.bin", size: 573, sha256: "d5471a4edf55ce02dab51e5d01c86b419a7659bcdd6aac216ba6f0b795eae8bf"),
-            PinnedFile(path: "encoder.mlmodelc/model.mil", size: 1010788, sha256: "3ee65463908bbc06c92691ea9172499aea3f7ae4ba619d39783c4a639936fae5"),
-            PinnedFile(path: "encoder.mlmodelc/weights/weight.bin", size: 565336640, sha256: "2e00be98049a22e095452c020f183d2b23728e145cc814ba031436931b4f2e8f"),
-            PinnedFile(path: "joint.mlmodelc/analytics/coremldata.bin", size: 243, sha256: "a1a90a7d5f8b86f564a42ab45b42a43eb0bbce6682176916bd94591b28cca447"),
-            PinnedFile(path: "joint.mlmodelc/coremldata.bin", size: 341, sha256: "8f750980da8ea3397d860f69e0755d3adf61ee763d7f189405d50d4e2d9f8ca0"),
-            PinnedFile(path: "joint.mlmodelc/model.mil", size: 5072, sha256: "521da827005ddcf3fbd439d12f85c34b1273642635b39a87bfbc931131cd3bf6"),
-            PinnedFile(path: "joint.mlmodelc/weights/weight.bin", size: 18911744, sha256: "c0ef0a3a6598f962d2aad598dc6850e4428874033419817121e11f1fff4a9cfe"),
-            PinnedFile(path: "metadata.json", size: 3005, sha256: "070ae181941003ff3e7d7ff8e5c5d47aebd026e8458549cef0c9a6803dbec004"),
-            PinnedFile(path: "preprocessor.mlmodelc/analytics/coremldata.bin", size: 243, sha256: "e918fd75105ef01a971d29b5ec28f531467b42dd60978c29afb1914c4af838af"),
-            PinnedFile(path: "preprocessor.mlmodelc/coremldata.bin", size: 371, sha256: "3d1aa8c8e7e283e4944af4b0b701db760ed99ef14919d3f989c599b9f63335a2"),
-            PinnedFile(path: "preprocessor.mlmodelc/model.mil", size: 18449, sha256: "12637d7ddfabea2d58e6b7986699c1be7fe970dc589eeac52fcb9ad25ae06ec9"),
-            PinnedFile(path: "preprocessor.mlmodelc/weights/weight.bin", size: 592384, sha256: "297514e2b211d14b0e53cb97193d679bb89ead98d28e578f3f1d049ddbcc36b3"),
-            PinnedFile(path: "tokenizer.json", size: 284969, sha256: "fb70c8fcb6472cda2bdb799b156a8941e72762344a7c636d3b1275f1d53c4a6b"),
+        PinnedModel(id: "nemotron-3.5", repository: "FluidInference/Nemotron-3.5-ASR-Streaming-Multilingual-0.6b-CoreML", revision: "1a41b75758b0337ff67db7d5408280aaaf23074e", license: "OpenMDW-1.1", remoteDirectory: "multilingual", files: [
+            PinnedFile(path: "1120ms/decoder.mlmodelc/analytics/coremldata.bin", size: 243, sha256: "fdb14a08e42b4806a2d1505501586be71e4f04ca9256c719544fd7ed6937e509"),
+            PinnedFile(path: "1120ms/decoder.mlmodelc/coremldata.bin", size: 433, sha256: "6d13f9f434a2485bf9bac16e353f0c2ea850ec5a98e44effc33bfe17da8559d5"),
+            PinnedFile(path: "1120ms/decoder.mlmodelc/model.mil", size: 11743, sha256: "f3ed3e9cac9b70e1b00df48b53868dbd3c4dd8cf158af79ded0d05a96e0bf5dc"),
+            PinnedFile(path: "1120ms/decoder.mlmodelc/weights/weight.bin", size: 29870592, sha256: "dcdeccd4ccf46e2675224f9f030d46c1a89e2bda4abb316e901e1a21f1597f8f"),
+            PinnedFile(path: "1120ms/encoder.mlmodelc/analytics/coremldata.bin", size: 243, sha256: "5488ed81fa1e370dd5411218d9b0e0562d01ca33c45b9ea1935bab6c8e8dc943"),
+            PinnedFile(path: "1120ms/encoder.mlmodelc/coremldata.bin", size: 572, sha256: "93d7f1b6412b965b379f3359e38f9c4330099b5b41f9d30b85bf7286b098a78d"),
+            PinnedFile(path: "1120ms/encoder.mlmodelc/model.mil", size: 998158, sha256: "a6341253a353e57d546060d5a2add769229be06781200216be866d6cdecb382a"),
+            PinnedFile(path: "1120ms/encoder.mlmodelc/weights/weight.bin", size: 564646848, sha256: "e3dbd37659c7ef51d2dc691afac42fbdd1f04998fa62816ff0f2eebec5cc3d01"),
+            PinnedFile(path: "1120ms/joint.mlmodelc/analytics/coremldata.bin", size: 243, sha256: "a1a90a7d5f8b86f564a42ab45b42a43eb0bbce6682176916bd94591b28cca447"),
+            PinnedFile(path: "1120ms/joint.mlmodelc/coremldata.bin", size: 341, sha256: "15415f76583ac18c78be1a4192aad2023432acd9095baf4862b86e5122cf0958"),
+            PinnedFile(path: "1120ms/joint.mlmodelc/model.mil", size: 5072, sha256: "521da827005ddcf3fbd439d12f85c34b1273642635b39a87bfbc931131cd3bf6"),
+            PinnedFile(path: "1120ms/joint.mlmodelc/weights/weight.bin", size: 18911744, sha256: "c0ef0a3a6598f962d2aad598dc6850e4428874033419817121e11f1fff4a9cfe"),
+            PinnedFile(path: "1120ms/metadata.json", size: 3005, sha256: "c76ea7b1d9f0d32f872424bf6ba0cde46a9d05347e1b8595c09cef74180c5f8c"),
+            PinnedFile(path: "1120ms/tokenizer.json", size: 284969, sha256: "fb70c8fcb6472cda2bdb799b156a8941e72762344a7c636d3b1275f1d53c4a6b"),
+            PinnedFile(path: "560ms/decoder.mlmodelc/analytics/coremldata.bin", size: 243, sha256: "fdb14a08e42b4806a2d1505501586be71e4f04ca9256c719544fd7ed6937e509"),
+            PinnedFile(path: "560ms/decoder.mlmodelc/coremldata.bin", size: 433, sha256: "754cd5f784e66cd0361f13c211141f94d15f4269a354c1531bb98c5722b88251"),
+            PinnedFile(path: "560ms/decoder.mlmodelc/model.mil", size: 11743, sha256: "f3ed3e9cac9b70e1b00df48b53868dbd3c4dd8cf158af79ded0d05a96e0bf5dc"),
+            PinnedFile(path: "560ms/decoder.mlmodelc/weights/weight.bin", size: 29870592, sha256: "dcdeccd4ccf46e2675224f9f030d46c1a89e2bda4abb316e901e1a21f1597f8f"),
+            PinnedFile(path: "560ms/encoder.mlmodelc/analytics/coremldata.bin", size: 243, sha256: "3409887ed9eadc8689bd4c64754d95e4119152dc0b9ee1650664d2a6a689c783"),
+            PinnedFile(path: "560ms/encoder.mlmodelc/coremldata.bin", size: 572, sha256: "269d7188428298be3d0b2803c0e42bf6d44f7b4a9371030ae690beac443afbfa"),
+            PinnedFile(path: "560ms/encoder.mlmodelc/model.mil", size: 991266, sha256: "990af9875f58889a98113a536801b7c121bed1eac1aa8421138c50018108d622"),
+            PinnedFile(path: "560ms/encoder.mlmodelc/weights/weight.bin", size: 564307200, sha256: "0e994440ed6c936ac375d375eaab16eb445881ff2d9bc62384de991b411e234e"),
+            PinnedFile(path: "560ms/joint.mlmodelc/analytics/coremldata.bin", size: 243, sha256: "a1a90a7d5f8b86f564a42ab45b42a43eb0bbce6682176916bd94591b28cca447"),
+            PinnedFile(path: "560ms/joint.mlmodelc/coremldata.bin", size: 341, sha256: "94b7eac58dc52a40bff8965c04d941357fed87c77265f61a0288a289ad9e9dfb"),
+            PinnedFile(path: "560ms/joint.mlmodelc/model.mil", size: 5072, sha256: "521da827005ddcf3fbd439d12f85c34b1273642635b39a87bfbc931131cd3bf6"),
+            PinnedFile(path: "560ms/joint.mlmodelc/weights/weight.bin", size: 18911744, sha256: "c0ef0a3a6598f962d2aad598dc6850e4428874033419817121e11f1fff4a9cfe"),
+            PinnedFile(path: "560ms/metadata.json", size: 3003, sha256: "5a09e646e9cc1b204f6c25b414a819c51b006587a425f66f3220cf1ef0645113"),
+            PinnedFile(path: "560ms/tokenizer.json", size: 284969, sha256: "fb70c8fcb6472cda2bdb799b156a8941e72762344a7c636d3b1275f1d53c4a6b"),
         ]),
     ]
 }

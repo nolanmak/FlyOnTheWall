@@ -124,7 +124,7 @@ with `error {id, code, message}` instead.
 | `hello {protocol, client}` | `hello {protocol, helper, capabilities}` | first frame only |
 | `load {engine}` | `progress {phase: "load"}`…, then `loaded {engine, model, revision, elapsed_ms}` | local files only; refuses `model_missing` / `model_invalid`. A first load on a machine includes Core ML's compile, tens of seconds |
 | `warmup {engine}` | `progress {phase: "warmup"}`…, then `warmed {engine, elapsed_ms}` | runs one silent chunk so the first real request pays no Core ML compile |
-| `unload {engine}` | `unloaded {engine}` | |
+| `unload {engine}` | `unloaded {engine}` | refused with `busy` while a stream of that engine is open |
 | `open_stream {stream, engine, sample_rate, format, channels, options}` | `stream_opened {stream}` | `format` is `"s16le"`, `channels` 1 |
 | `health {}` | `health {uptime_ms, streams, loaded, rss_bytes}` | |
 | `install {model, from?}` | `progress {phase: "download" \| "verify", model, bytes, total}`…, then `installed {model, revision}` | **explicit setup only**; see Models |
@@ -171,7 +171,7 @@ Error codes: `version_mismatch`, `protocol`, `bad_request`, `unknown_engine`,
 | `silero-vad` | vad | `FluidInference/silero-vad-coreml` | MIT |
 | `parakeet-eou-320ms` | streaming, pooled (#245) | `FluidInference/parakeet-realtime-eou-120m-coreml` | NVIDIA Open Model License |
 | `parakeet-eou-160ms` | streaming, pooled (#245, not the default) | same repository, its `160ms/` variant | NVIDIA Open Model License |
-| `nemotron-3.5` | streaming (planned, Murmur #100) | `FluidInference/Nemotron-3.5-ASR-Streaming-Multilingual-0.6b-CoreML` | OpenMDW-1.1 |
+| `nemotron-3.5` | streaming, one dictation at a time (Murmur #100) | `FluidInference/Nemotron-3.5-ASR-Streaming-Multilingual-0.6b-CoreML` | OpenMDW-1.1 |
 
 Each engine states its per-stream bound as `max_audio_ms` in the
 capabilities, and a stream past it fails with `too_long`.
@@ -192,6 +192,17 @@ capabilities, and a stream past it fails with `too_long`.
   the boundary is not captioned. Captions are display-only. `parakeet-eou-160ms` is the
   same model's 160 ms variant: about half the latency for about three times
   the CPU (see #245 for both measured).
+  `nemotron-3.5` (streaming dictation, Murmur #100) treats the whole stream
+  as utterance 1. It runs the model's 560 ms and 1120 ms variants in lockstep
+  on the same audio: a `partial` with the 560 ms variant's running text
+  whenever a step changes it, and on `finish` the 1120 ms variant's last
+  partial step padded with silence and decoded into the one `final`. Its
+  `options.language` is a language code the model has a prompt for (`en`,
+  `de`, `en-GB`…); absent or unknown, the model detects the language. It
+  holds one stream's state, so it serves one stream at a time: a second
+  waits up to 1 s for the first to end, then is refused with `busy`. Each
+  stream starts from a reset state, and `warmup` runs one step of silence
+  and resets.
 - A **diarization** stream (#246) takes a whole channel of a meeting, up to
   `max_audio_ms` (4 hours for the planned `diarizer`). It processes audio as
   it arrives in bounded windows, as Muesli's `diarizeRecordedAudio` does, and
@@ -214,6 +225,7 @@ ordinary test suites use:
 | `fake-stall` | never answers `finish`, but keeps serving everything else |
 | `fake-exit-after-final` | on `finish`, `final` and `closed`, then the process exits with status 70 |
 | `fake-captions` | pooled like `parakeet-eou-320ms` (two streams). An utterance runs until an all-zero frame: a `partial {text: "utterance=<u> samples=<n>", utterance: u}` per frame within it, then `final {utterance: u}` with the same text, and the next utterance is `u + 1`. `finish` commits the last one |
+| `fake-dictation` | `nemotron-3.5` without a model, in 250 ms (4000-sample) steps: a `partial {text: "steps=<n> lang=<language or auto>", utterance: 1}` when a step completes; on `finish` the last partial step counts as one more, `final {utterance: 1}` with the same text. A frame holding a sample of −32768 fails the stream with `engine`. Like `nemotron-3.5` it has one recognizer, shared by its streams and reset when a stream ends; a second open stream is refused with `busy` |
 
 `load` and `warmup` of a fake engine send one `progress` each.
 
