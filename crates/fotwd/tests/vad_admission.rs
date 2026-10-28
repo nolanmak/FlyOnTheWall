@@ -24,6 +24,7 @@ async fn start_local(data_root: &Path) -> (String, usize) {
         engine: stt::SttEngine::Local,
         model: model.to_string_lossy().into_owned(),
         language: "en".into(),
+        live_captions: true,
     };
     let opens = Arc::new(AtomicUsize::new(0));
     let observed = opens.clone();

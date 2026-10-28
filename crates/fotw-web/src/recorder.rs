@@ -150,6 +150,21 @@ pub struct SpeechSourceStatus {
     pub worker_running: Option<bool>,
     /// Actionable current failure without transcript content or credentials.
     pub error: Option<String>,
+    /// Live captions on this source (#245), when they run. `paused` means
+    /// the caption engine failed repeatedly and is off for the session;
+    /// recording and final text are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captions: Option<CaptionStatus>,
+}
+
+/// Live-caption state of one source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptionStatus {
+    /// Captions are running.
+    Live,
+    /// Off for the rest of the session after repeated caption-engine errors.
+    Paused,
 }
 
 /// What the recorder is doing, with the timings the UI renders.

@@ -201,7 +201,10 @@ impl Out {
     }
 }
 
-const ENGINES: [(&str, EngineKind, bool); 7] = [
+/// fake-captions is pooled like parakeet-eou-320ms: at most two streams.
+const CAPTION_POOL: usize = 2;
+
+const ENGINES: [(&str, EngineKind, bool); 8] = [
     ("fake-batch", EngineKind::Batch, false),
     ("fake-stream", EngineKind::Streaming, true),
     ("fake-vad", EngineKind::Vad, false),
@@ -209,6 +212,7 @@ const ENGINES: [(&str, EngineKind, bool); 7] = [
     ("fake-hang", EngineKind::Batch, false),
     ("fake-stall", EngineKind::Batch, false),
     ("fake-exit-after-final", EngineKind::Batch, false),
+    ("fake-captions", EngineKind::Streaming, true),
 ];
 
 fn capabilities(
@@ -268,6 +272,39 @@ struct Stream {
     in_speech: bool,
     /// `fake-diarizer` and `fake-words` (#246).
     postpass: Option<postpass::State>,
+    /// fake-captions: the utterance being spoken, where it began, and how
+    /// much of it there is so far.
+    utterance: u64,
+    utterance_start: u64,
+    utterance_samples: u64,
+}
+
+impl Stream {
+    /// fake-captions: end the current utterance at sample `end`.
+    fn end_utterance(&mut self, id: u32, end: u64) -> Option<Reply> {
+        if self.utterance_samples == 0 {
+            return None;
+        }
+        let reply = Reply::Final(FinalText {
+            stream: id,
+            text: format!(
+                "utterance={} samples={}",
+                self.utterance, self.utterance_samples
+            ),
+            start_ms: ms(self.utterance_start),
+            end_ms: ms(end),
+            segments: Vec::new(),
+            model: Some("fake-captions@fake".to_owned()),
+            utterance: Some(self.utterance),
+        });
+        self.utterance += 1;
+        self.utterance_samples = 0;
+        Some(reply)
+    }
+}
+
+fn ms(samples: u64) -> u64 {
+    samples * 1000 / u64::from(SAMPLE_RATE)
 }
 
 struct Helper {
@@ -441,6 +478,15 @@ impl Helper {
             Some((ErrorCode::UnsupportedFormat, "16 kHz mono s16le only"))
         } else if self.streams.contains_key(&stream) || self.closed.contains(&stream) {
             Some((ErrorCode::StreamExists, "stream ids are single-use"))
+        } else if engine == "fake-captions"
+            && self
+                .streams
+                .values()
+                .filter(|s| s.engine == "fake-captions")
+                .count()
+                >= CAPTION_POOL
+        {
+            Some((ErrorCode::Busy, "both fake-captions sessions are in use"))
         } else if self.streams.len() >= MAX_STREAMS {
             Some((ErrorCode::Busy, "too many streams"))
         } else {
@@ -457,6 +503,9 @@ impl Helper {
                 engine,
                 samples: 0,
                 in_speech: false,
+                utterance: 1,
+                utterance_start: 0,
+                utterance_samples: 0,
             },
         );
         out.send(&Reply::StreamOpened { id, stream });
@@ -508,6 +557,30 @@ impl Helper {
             "fake-hang" => loop {
                 std::thread::park();
             },
+            // An utterance runs until an all-zero frame: a partial per frame
+            // within it, a final at its end.
+            "fake-captions" => {
+                if pcm.iter().all(|&s| s == 0) {
+                    if let Some(reply) = stream.end_utterance(id, start) {
+                        out.send(&reply);
+                    }
+                } else {
+                    if stream.utterance_samples == 0 {
+                        stream.utterance_start = start;
+                    }
+                    stream.utterance_samples += pcm.len() as u64;
+                    out.send(&Reply::Partial {
+                        stream: id,
+                        text: format!(
+                            "utterance={} samples={}",
+                            stream.utterance, stream.utterance_samples
+                        ),
+                        start_ms: ms(stream.utterance_start),
+                        end_ms: ms(stream.samples),
+                        utterance: Some(stream.utterance),
+                    });
+                }
+            }
             "fake-stream" => out.send(&Reply::Partial {
                 stream: id,
                 text: format!("samples={}", stream.samples),
@@ -568,6 +641,17 @@ impl Helper {
         if let Some(state) = stream.postpass.take() {
             // At once, unlike fake-batch.
             out.send(&Reply::Final(state.finish(id, &stream.engine)));
+            out.send(&Reply::Closed {
+                stream: id,
+                reason: CloseReason::Finished,
+            });
+            return;
+        }
+        if stream.engine == "fake-captions" {
+            let end = stream.samples;
+            if let Some(reply) = stream.end_utterance(id, end) {
+                out.send(&reply);
+            }
             out.send(&Reply::Closed {
                 stream: id,
                 reason: CloseReason::Finished,

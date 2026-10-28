@@ -8,6 +8,7 @@ fn delta(session: &str, idx: i64, start: i64) -> Delta {
         channel: "system".into(),
         text: "word".into(),
         is_final: true,
+        utterance: None,
     }
 }
 #[test]

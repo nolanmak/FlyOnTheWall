@@ -43,3 +43,23 @@ test('temporary settings failure is visible and retryable, and absent control hi
   ctx.api=async()=>response('fallback');await ctx.loadSpeech();assert.equal(node('speech-mode').value,'fallback');
   ctx.api=async()=>{throw Object.assign(new Error('absent'),{status:404});};await ctx.loadSpeech();assert.equal(node('speech-settings').hidden,true);
 });
+// #245: live captions are a separate, saved choice with an install hint.
+test('live captions show the saved choice and are sent on save',async()=>{
+  const {ctx,node}=harness();
+  ctx.renderSpeechSettings({...response(),settings:{...response().settings,live_captions:false},captions_installed:true});
+  assert.equal(node('speech-captions').checked,false);
+  ctx.renderSpeechSettings({...response(),captions_installed:true});
+  assert.equal(node('speech-captions').checked,true,'on unless saved off');
+  node('speech-captions').checked=false;let submitted;
+  ctx.api=async(url,options)=>{submitted=JSON.parse(options.body);return {...response(),settings:{...response().settings,live_captions:false},captions_installed:true};};
+  await ctx.onSpeechSave();assert.equal(submitted.live_captions,false);
+});
+test('live captions without their model say how to install it',()=>{
+  const {ctx,node}=harness();
+  ctx.renderSpeechSettings({...response(),captions_installed:false});
+  assert.match(node('speech-captions-note').textContent,/parakeet-eou-320ms/);
+  ctx.renderSpeechSettings({...response(),captions_installed:true});
+  assert.doesNotMatch(node('speech-captions-note').textContent,/install/i);
+  ctx.renderSpeechSettings({...response('deepgram'),captions_installed:false});
+  assert.match(node('speech-captions-note').textContent,/on-device/i,'only local meetings caption');
+});

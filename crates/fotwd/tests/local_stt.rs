@@ -245,6 +245,7 @@ async fn installed_local_only_session_preserves_public_audio_and_its_verified_re
         engine: fotwd::stt::SttEngine::Local,
         model: model.to_string_lossy().into_owned(),
         language: "en".into(),
+        live_captions: true,
     };
     let transcription =
         fotwd::stt::local_transcription(&settings, root.path(), "placeholder", false, false);
