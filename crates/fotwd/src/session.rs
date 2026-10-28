@@ -1876,13 +1876,15 @@ pub async fn run_with_control(
     let (sys_prod, sys_cons) = AudioRing::with_capacity_frames(RING_SAMPLES);
     let (mic_prod, mic_cons) = AudioRing::with_capacity_frames(RING_SAMPLES);
 
-    let sys_format = system
-        .start(sys_counters.sink(sys_prod))
-        .map_err(|e| format!("could not start the system tap: {e}"))?;
-
+    // Microphone first: macOS 26.3 can block the mic's AudioDeviceStart while a
+    // process-tap aggregate is already running (see run_supervised).
     let mic_format = mic
         .as_mut()
         .and_then(|t| t.start(mic_counters.sink(mic_prod)).ok());
+
+    let sys_format = system
+        .start(sys_counters.sink(sys_prod))
+        .map_err(|e| format!("could not start the system tap: {e}"))?;
 
     // A format per leg, because the two taps are two devices: the system tap
     // is 48 kHz stereo and the mic is usually mono. Recording the system's
@@ -2257,6 +2259,41 @@ pub async fn run_supervised(
     let sys_activity = Arc::new(ActivityCounters::new());
     let mic_activity = Arc::new(ActivityCounters::new());
 
+    // Start physical input before the system-audio process tap. macOS 26.3 can
+    // block the microphone's AudioDeviceStart indefinitely while a process-tap
+    // aggregate is already running: coreaudiod parks the mic's IO context in
+    // BlockStartOnTapStart waiting for a tap that never starts. Bringing the
+    // mic up first avoids it. (Ported from 0606865, "Start microphone before
+    // system tap to avoid macOS capture hang".)
+    // The mic leg: its own device, ring, supervisor and counters, and optional
+    // — a machine with no working input records the far end alone, exactly as
+    // the prebuilt path allows a `None` mic.
+    let mut mic_supervisor = {
+        let plat = Arc::clone(&plat);
+        let slot = mic_slot.clone();
+        let activity = Arc::clone(&mic_activity);
+        let counters = mic_counters.clone();
+        CaptureSupervisor::new(
+            SupervisorConfig {
+                id: TapId::mic("default"),
+                ..SupervisorConfig::default()
+            },
+            Arc::clone(&clock),
+            move || plat.open_mic(&DeviceId::new("default"), FormatRequest::any()),
+            move || slot.sink(Arc::clone(&activity), counters.clone(), 1),
+        )
+    };
+    let mic_format = mic_supervisor.start_recovering().ok();
+    if mic_format.is_none() {
+        mic_cons = mic_slot.0.discard_initial_attempt();
+    }
+    let discarded_mic_buffers = if mic_format.is_none() {
+        mic_counters.snapshot()
+    } else {
+        LegBuffers::default()
+    };
+    let _mic_watch = plat.watch_devices(mic_supervisor.signal()).ok();
+
     // The system leg's supervisor owns the tap and reopens it on a stall. Its
     // sink draws the parked producer from the slot and reports to both counter
     // sets. Channels are guessed stereo here — the sink is built before
@@ -2287,34 +2324,6 @@ pub async fn run_supervised(
     // watchdog, so a failure here is not fatal.
     let _system_watch = plat.watch_devices(sys_supervisor.signal()).ok();
 
-    // The mic leg: its own device, ring, supervisor and counters, and optional
-    // — a machine with no working input records the far end alone, exactly as
-    // the prebuilt path allows a `None` mic.
-    let mut mic_supervisor = {
-        let plat = Arc::clone(&plat);
-        let slot = mic_slot.clone();
-        let activity = Arc::clone(&mic_activity);
-        let counters = mic_counters.clone();
-        CaptureSupervisor::new(
-            SupervisorConfig {
-                id: TapId::mic("default"),
-                ..SupervisorConfig::default()
-            },
-            Arc::clone(&clock),
-            move || plat.open_mic(&DeviceId::new("default"), FormatRequest::any()),
-            move || slot.sink(Arc::clone(&activity), counters.clone(), 1),
-        )
-    };
-    let mic_format = mic_supervisor.start_recovering().ok();
-    if mic_format.is_none() {
-        mic_cons = mic_slot.0.discard_initial_attempt();
-    }
-    let discarded_mic_buffers = if mic_format.is_none() {
-        mic_counters.snapshot()
-    } else {
-        LegBuffers::default()
-    };
-    let _mic_watch = plat.watch_devices(mic_supervisor.signal()).ok();
     // This is an archive policy, not a claim about an unavailable device's
     // native format. Recovery installs conversion from its authoritative format.
     let mic_archive =
