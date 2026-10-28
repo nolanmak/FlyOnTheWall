@@ -356,35 +356,9 @@ pub(crate) mod testing {
     //! The model-free helper for the daemon's tests.
     use super::*;
 
-    /// `target/<profile>/fotw-speechd-fake`, built on first use when this
-    /// test binary was built on its own.
+    /// The model-free helper, rebuilt if its source changed.
     pub(crate) fn fake_helper() -> PathBuf {
-        static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-        PATH.get_or_init(|| {
-            let exe = std::env::current_exe().unwrap();
-            let path = exe
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("fotw-speechd-fake");
-            if !path.is_file() {
-                let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-                let status = std::process::Command::new(cargo)
-                    .args([
-                        "build",
-                        "-p",
-                        "fotw-speechd-client",
-                        "--bin",
-                        "fotw-speechd-fake",
-                    ])
-                    .status()
-                    .unwrap();
-                assert!(status.success(), "could not build fotw-speechd-fake");
-            }
-            path
-        })
-        .clone()
+        fotw_speechd_client::testing::fake_helper()
     }
 
     /// The fake, serving `parakeet-unified` at the pinned revision; installed
@@ -688,29 +662,32 @@ mod start_tests {
         let legs = whisper_legs(root.path(), true, Launch::bundled_from(None)).await;
         assert!(legs.captions.is_none());
         // With one, preparing the meeting spawns nothing: the helper starts on
-        // the first caption stream, after capture has begun.
-        let before = pids_of_fake();
-        let legs = whisper_legs(root.path(), true, Ok(fake_launch())).await;
+        // the first caption stream, after capture has begun. This test's own
+        // launcher leaves a mark if it is ever run, so helpers other tests
+        // start in parallel cannot confuse it.
+        let marker = root.path().join("spawned");
+        let launcher = root.path().join("launch-fake");
+        std::fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nexec '{}' \"$@\"\n",
+                marker.display(),
+                super::testing::fake_helper().display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &launcher,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let launch = Launch {
+            program: launcher,
+            ..fake_launch()
+        };
+        let legs = whisper_legs(root.path(), true, Ok(launch)).await;
         assert!(legs.captions.is_some());
-        assert_eq!(
-            pids_of_fake(),
-            before,
-            "no helper spawned to prepare captions"
-        );
-    }
-
-    /// Running fake helpers, by pid.
-    fn pids_of_fake() -> Vec<String> {
-        let out = std::process::Command::new("pgrep")
-            .args(["-f", "fotw-speechd-fake"])
-            .output()
-            .unwrap();
-        let mut pids: Vec<String> = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::to_owned)
-            .collect();
-        pids.sort();
-        pids
+        assert!(!marker.exists(), "no helper spawned to prepare captions");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

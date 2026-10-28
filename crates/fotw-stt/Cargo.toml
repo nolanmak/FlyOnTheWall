@@ -51,6 +51,8 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = [
 whisper-rs = { version = "=0.16.0", features = ["metal"], optional = true }
 
 [dev-dependencies]
+# The model-free speech helper, rebuilt for each test run (`testing::fake_helper`).
+fotw-speechd-client = { path = "../fotw-speechd-client", features = ["testing"] }
 tokio = { workspace = true, features = [
   "io-util",
   "macros",

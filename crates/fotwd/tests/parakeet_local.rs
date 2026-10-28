@@ -14,34 +14,9 @@ use fotwd::failover::coverage::CoverageJournal;
 use fotwd::failover::stream::{FailoverStream, LocalSourceConfig, Phase};
 use fotwd::speechd::{ENGINE, Launch, REVISION};
 
-/// `target/<profile>/fotw-speechd-fake`, built on first use if needed.
+/// The model-free helper, rebuilt if its source changed.
 fn fake_helper() -> PathBuf {
-    static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    PATH.get_or_init(|| {
-        let exe = std::env::current_exe().unwrap();
-        let path = exe
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("fotw-speechd-fake");
-        if !path.is_file() {
-            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-            let status = std::process::Command::new(cargo)
-                .args([
-                    "build",
-                    "-p",
-                    "fotw-speechd-client",
-                    "--bin",
-                    "fotw-speechd-fake",
-                ])
-                .status()
-                .unwrap();
-            assert!(status.success(), "could not build fotw-speechd-fake");
-        }
-        path
-    })
-    .clone()
+    fotw_speechd_client::testing::fake_helper()
 }
 
 fn launch() -> Launch {
