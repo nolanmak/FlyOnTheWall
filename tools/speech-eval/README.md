@@ -298,3 +298,117 @@ There are at most 10 repetitions and 10,000 requests. Per-request deadlines are
 bounded by the remaining execution-phase budget (default one hour after artifact
 verification). `just ci` and both hosted test platforms run the model/provider-free
 unit suite. Real-model runs require separately provisioned, approved assets.
+
+## Meeting scoring: AMI all-speaker reference (#246)
+
+### Why the #118 AMI numbers are invalid
+
+The #118 run cropped AMI ES2004c, IS1009c and TS3003c to 120–720 s and scored a
+"mic" headset and a "system" headset each against **only that headset's
+speaker**. A real call's system track carries every remote participant, and a
+meeting transcript must contain everyone's words. Per-headset scoring rewarded a
+track that dropped other speakers (crosstalk words counted as insertions, and
+missing remote speakers were never deletions), and it left two of the four
+participants unscored. Those numbers must not be compared with #246 results.
+
+### Corrected reference
+
+`ami_reference.py` reads `words/<meeting>.<agent>.words.xml` for **all four
+agents** of the AMI manual annotations v1.6.2 (`ami_public_manual_1.6.2.zip`).
+A `<w>` is used when it is not punctuation (`punc="true"`), has a `starttime`,
+and its midpoint `(start + end) / 2` lies in `[window_start, window_end)` (the
+same rule as #118; a missing `endtime` counts as the start). Words are sorted by
+start time, then agent letter, then file order, and joined into one reference.
+Per-word records carry speaker (`<meeting>.<agent>`), channel (`mic` for the mic
+headset's agent, otherwise `system`) and window-relative milliseconds. The
+headset-channel → agent map comes from `corpusResources/meetings.xml`.
+Normalization and alignment are the shared `speech_eval` code (NFC, casefold,
+technical/numeric tokens); disfluencies such as "um" stay in the reference.
+
+### Two-track replays
+
+`ami_replay.py` builds, per meeting, a **mic** track (the #118 mic headset:
+ES2004c Headset-2, IS1009c Headset-1, TS3003c Headset-1, copied unchanged) and a
+**system** track: `clip_int16(floor((h_a + h_b + h_c) / 2))` over the other three
+headsets, sample by sample. The pre-clip peak and clipped-sample counts are in
+the manifest. AMI headsets are already mono PCM16 16 kHz; nothing is resampled and
+other formats are refused. Each headset also carries some bleed of the others,
+like a real laptop mic. Outputs:
+
+- `cropped/`: 120–720 s, a schema v1 `corpus.json` (each fixture's `reference` is
+  the all-speaker reference; isolated per-track runner WER is therefore not a
+  meeting score) and `<meeting>.reference.json`;
+- `full/`: full-length tracks and references (over the 30-minute schema v1 limit,
+  so listed only in `replay-manifest.json`);
+- `timing-60min/`: the full-length replays concatenated in meeting order (mic
+  with mic, system with system) and cut at exactly 60:00, with a concatenated
+  reference;
+- `replay-manifest.json`: source URLs/SHA-256s, the annotation zip SHA-256, mix
+  recipe, clipping, output hashes and word counts.
+
+Download all four headsets of each meeting from
+`https://groups.inf.ed.ac.uk/ami/AMICorpusMirror/amicorpus/<meeting>/audio/<meeting>.Headset-<n>.wav`
+(CC BY 4.0) outside Git, then:
+
+```sh
+python3 -I tools/speech-eval/ami_replay.py --audio-dir /abs/dl/ami \
+  --annotations /abs/dl/ami-annot --output /abs/corpus-ami-v2
+```
+
+### Meeting WER
+
+A hypothesis is a JSON list (or `{"segments": [...]}`) of
+`{start_ms, end_ms, text, channel: "mic"|"system", speaker?}` with integer times
+relative to the crop start. The **combined** transcript is every segment sorted by
+`(start_ms, mic before system, input order)` and joined; its WER against the
+all-speaker reference is the meeting score. Per-channel WERs (mic text vs the
+mic speaker's words; system text vs the other three speakers' words, each in
+time order) are diagnostics. Overlapped speech can make the combined order differ
+from the reference order, which the combined WER counts as errors; compare the
+per-channel numbers when that matters. Even the oracle hypothesis (each reference
+word as its own segment) scores 0.35% combined WER on cropped ES2004c, from
+mic/system words with identical millisecond starts; per-channel WER is 0.
+
+```sh
+python3 -I tools/speech-eval/meeting_score.py wer \
+  --reference /abs/corpus-ami-v2/cropped/ES2004c.reference.json --hypothesis /abs/hyp.json
+```
+
+Full-length references exceed the 12M-cell default alignment limit; `wer`
+defaults to `--max-alignment-cells 200000000` (pure Python: the 60-minute reference, ~10k words, takes a few minutes).
+
+### DER
+
+`meeting_score.py der` scores `[{start_ms, end_ms, speaker}]` (items whose
+`channel` is not `system` are ignored, so the WER hypothesis file can be reused;
+unlabelled system segments are ignored too and reported as
+`unlabelled_segments_ignored`, so their speech scores as missed)
+against the activity of the three system-track speakers in the window:
+
+- Reference activity: `segments/<meeting>.<agent>.segments.xml`
+  (`transcriber_start`/`transcriber_end`, which include vocal sounds such as
+  laughter) when present, otherwise the union of the agent's timed words.
+  `--activity words` forces word-derived activity. Each speaker's turns are
+  unioned, then clipped to the window.
+- Collar: no scoring within **±0.25 s** of every reference turn boundary
+  (`--collar 0.25`, per side). A turn cut by the window edge gets no collar
+  there. This is `pyannote.metrics` `DiarizationErrorRate(collar=0.5)` (pyannote's
+  collar is the total width) and NIST md-eval `-c 0.25`.
+- Overlapped speech **is scored**. Per elementary region with `N_ref`, `N_hyp`
+  active speakers and `N_correct` mapped pairs both active: missed
+  `max(0, N_ref − N_hyp)`, false alarm `max(0, N_hyp − N_ref)`, confusion
+  `min(N_ref, N_hyp) − N_correct`, total `N_ref`, each times the duration.
+- Mapping: the optimal one-to-one speaker mapping (maximum overlap in the scored
+  region; exact subset DP, equivalent to Hungarian).
+- DER = (missed + false alarm + confusion) / total. An empty reference gives
+  `null` (pyannote reports 1.0).
+
+```sh
+python3 -I tools/speech-eval/meeting_score.py der \
+  --reference /abs/corpus-ami-v2/cropped/ES2004c.reference.json --hypothesis /abs/hyp.json
+```
+
+Validation: hand-computed unit cases (collar, overlap, mapping, false alarm) and
+a cross-check against `pyannote.metrics` 4.2.0 (`collar=0.5`, `skip_overlap=False`)
+on 300 random cases with disjoint per-speaker turns (all agreed except the
+zero-reference convention) plus one jittered AMI hypothesis.

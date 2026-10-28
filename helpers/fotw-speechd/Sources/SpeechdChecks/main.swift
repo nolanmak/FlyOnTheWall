@@ -247,6 +247,155 @@ func aFailedSwapKeepsTheWorkingRevision() throws {
     try expect(!FileManager.default.fileExists(atPath: aside.path), "and removes the old one after")
 }
 
+func aDictationStreamShowsEachStepOnceAndReturnsItsRecognizerReset() async throws {
+    let pool = try await SessionPool(capacity: 1, make: { FakeStepRecognizer() }, warm: { try await $0.warm() })
+    let first = try await openStepStream(pool: pool, options: StreamOptions(language: "de"), provenance: "f@1")
+    var events = try await first.append([Float](repeating: 0.1, count: 3000))
+    try expect(events.isEmpty, "nothing to show before a step completes: \(events)")
+    events = try await first.append([Float](repeating: 0.1, count: 2000))
+    try expect(events == [.partial(text: "steps=1 lang=de", startMs: 0, endMs: 312, utterance: 1)], "\(events)")
+    events = try await first.append([Float](repeating: 0.1, count: 100))
+    try expect(events.isEmpty, "unchanged text is not sent again: \(events)")
+    // Ended mid-step (cancelled): the recognizer goes back, reset.
+    await first.close()
+    await first.close()
+    let available = await pool.available
+    try expect(available == 1, "returned once, however often close runs")
+
+    let second = try await openStepStream(pool: pool, options: StreamOptions(), provenance: "f@1")
+    let busy = ContinuousClock.now
+    do {
+        _ = try await openStepStream(pool: pool, options: StreamOptions(), provenance: "f@1")
+        throw CheckFailure(description: "two dictations shared one recognizer")
+    } catch let error as SpeechdError {
+        try expect(error.code == "busy", "\(error)")
+    }
+    try expect(ContinuousClock.now - busy >= .milliseconds(900), "waited for the recognizer before refusing")
+    events = try await second.finish()
+    try expect(events == [.final(text: "", startMs: 0, endMs: 0, segments: [], model: "f@1", utterance: 1)],
+               "an empty dictation still ends with a final: \(events)")
+    _ = try await second.append([Float](repeating: 0.1, count: 4500))
+    events = try await second.finish()
+    try expect(events.first == .final(text: "steps=2 lang=auto", startMs: 0, endMs: 281, segments: [],
+                                       model: "f@1", utterance: 1),
+               "the next stream starts from zero, in its own language, and pads its last step: \(events)")
+    await second.close()
+}
+
+// MARK: - Streaming dictation review fixes (#263)
+
+/// A recognizer whose steps block their thread, as a Core ML prediction does
+/// (not cancellable). `process` is the shown model, `processFinal` the typed one.
+final class BlockingRecognizer: StepRecognizer, @unchecked Sendable {
+    let stepSamples = 1600
+    let partialMs: UInt32
+    let finalMs: UInt32
+    private let lock = NSLock()
+    private var _calls = 0
+    private var steps = 0
+    init(partialMs: UInt32, finalMs: UInt32) {
+        self.partialMs = partialMs
+        self.finalMs = finalMs
+    }
+    var calls: Int { lock.withLock { _calls } }
+    func setLanguage(_ language: String?) async throws {}
+    func process(_ samples: [Float]) async throws {
+        usleep(partialMs * 1000)
+        lock.withLock {
+            _calls += 1
+            steps += 1
+        }
+    }
+    func processFinal(_ samples: [Float]) async throws { usleep(finalMs * 1000) }
+    func transcript() async -> String { lock.withLock { "steps=\(steps)" } }
+    func finish() async throws -> String { await transcript() }
+    func reset() async { lock.withLock { steps = 0 } }
+}
+
+/// One pooled BlockingRecognizer behind the engine interface.
+actor BlockingEngine: SpeechEngine {
+    nonisolated let descriptor = EngineDescriptor(id: "blocking-dictation", kind: .streaming, partials: true)
+    let recognizer: BlockingRecognizer
+    private var pool: SessionPool<BlockingRecognizer>?
+    init(_ recognizer: BlockingRecognizer) { self.recognizer = recognizer }
+    func load() async throws -> LoadResult {
+        let recognizer = recognizer
+        pool = try await SessionPool(capacity: 1, make: { recognizer }, warm: { _ in })
+        return LoadResult(model: "blocking", revision: "test")
+    }
+    func warmup() async throws {}
+    func unload() async { pool = nil }
+    func isLoaded() async -> Bool { pool != nil }
+    func makeSession(options: StreamOptions) async throws -> any EngineSession {
+        guard let pool else { throw SpeechdError.notLoaded(descriptor.id) }
+        return try await openStepStream(pool: pool, options: options, provenance: "blocking@test")
+    }
+    func available() async -> Int { await pool?.available ?? -1 }
+}
+
+func control(_ object: [String: Any]) throws -> Frame {
+    .control(try JSONSerialization.data(withJSONObject: object))
+}
+
+func aCancelledStreamStopsDecodingItsBacklogAndFreesTheRecognizer() async throws {
+    let recognizer = BlockingRecognizer(partialMs: 100, finalMs: 0)
+    let engine = BlockingEngine(recognizer)
+    let devNull = open("/dev/null", O_WRONLY)
+    defer { close(devNull) }
+    let server = Server(out: FrameWriter(fd: devNull), engines: [engine], store: nil)
+    await server.receive(try control(["type": "hello", "id": 1, "protocol": Int(Wire.protocolVersion), "client": "checks"]))
+    // Loaded through the server, as the parent would.
+    await server.receive(try control(["type": "load", "id": 2, "engine": "blocking-dictation"]))
+    try await Task.sleep(for: .milliseconds(50))
+    await server.receive(try control(["type": "open_stream", "id": 3, "stream": 1, "engine": "blocking-dictation",
+                                      "sample_rate": 16000, "format": "s16le", "channels": 1]))
+    try await Task.sleep(for: .milliseconds(50))
+    // Twenty steps queue up behind a 100 ms decode each: 2 s of backlog.
+    for _ in 0..<20 {
+        await server.receive(.audio(stream: 1, pcm: [Int16](repeating: 100, count: 1600)))
+    }
+    try await Task.sleep(for: .milliseconds(30))
+    await server.receive(try control(["type": "cancel", "stream": 1]))
+    try await Task.sleep(for: .milliseconds(400))
+    let calls = recognizer.calls
+    try expect(calls <= 3, "a cancelled stream kept decoding its backlog: \(calls) of 20 steps")
+    let available = await engine.available()
+    try expect(available == 1, "the recognizer is back for the next dictation within 400 ms")
+}
+
+func aPartialIsNotHeldBehindTheFinalModelsStep() async throws {
+    // The shown (560 ms) step is fast; the typed (1120 ms) step is slow. The
+    // partial must go out before the slow step, not after it.
+    let pool = try await SessionPool(capacity: 1, make: { BlockingRecognizer(partialMs: 5, finalMs: 300) },
+                                     warm: { _ in })
+    let session = try await openStepStream(pool: pool, options: StreamOptions(), provenance: "b@1")
+    let started = ContinuousClock.now
+    let events = try await session.append([Float](repeating: 0.1, count: 1600))
+    let took = ContinuousClock.now - started
+    try expect(events.count == 1, "the step's partial: \(events)")
+    try expect(took < .milliseconds(150), "the partial waited \(took) for the final model's step")
+    // The final still includes every step, and close waits for the step in flight.
+    let final = try await session.finish()
+    try expect(final.first == .final(text: "steps=1", startMs: 0, endMs: 100, segments: [], model: "b@1", utterance: 1),
+               "\(final)")
+    await session.close()
+    let available = await pool.available
+    try expect(available == 1, "returned after the step in flight")
+}
+
+func warmingUpWhileADictationHoldsTheRecognizerIsANoOp() async throws {
+    let engine = FakeDictationEngine()
+    _ = try await engine.load()
+    let session = try await engine.makeSession(options: StreamOptions())
+    do {
+        try await engine.warmup()
+    } catch {
+        throw CheckFailure(description: "warmup during a dictation failed: \(error)")
+    }
+    _ = try await session.append([Float](repeating: 0.1, count: 4000))
+    await session.close()
+}
+
 func aPoolLendsWarmedInstancesUpToItsCapacity() async throws {
     let warmed = Counter()
     let pool = try await SessionPool<Int>(capacity: 2, make: { 7 }, warm: { _ in await warmed.increment() })
@@ -290,7 +439,7 @@ func aPoolLendsWarmedInstancesUpToItsCapacity() async throws {
 func pinsAreComplete() throws {
     let ids = PinnedModels.all.map(\.id)
     try expect(ids == ["parakeet-unified", "silero-vad", "parakeet-eou-320ms", "parakeet-eou-160ms",
-                       "nemotron-3.5-2240ms", "diarizer"], "\(ids)")
+                       "nemotron-3.5", "diarizer"], "\(ids)")
     for model in PinnedModels.all {
         try expect(model.revision.count == 40 && model.revision.allSatisfy(\.isHexDigit), "\(model.id) revision")
         try expect(!model.files.isEmpty && !model.license.isEmpty, "\(model.id) files and license")
@@ -320,6 +469,13 @@ let cases: [(String, () async throws -> Void)] = [
      corruptModelFailsValidationAndKeepsThePreviousSelection),
     ("a failed swap keeps the working revision", aFailedSwapKeepsTheWorkingRevision),
     ("a pool lends warmed instances up to its capacity", aPoolLendsWarmedInstancesUpToItsCapacity),
+    ("a dictation stream shows each step once and returns its recognizer reset",
+     aDictationStreamShowsEachStepOnceAndReturnsItsRecognizerReset),
+    ("a cancelled stream stops decoding its backlog and frees the recognizer",
+     aCancelledStreamStopsDecodingItsBacklogAndFreesTheRecognizer),
+    ("a partial is not held behind the final model's step", aPartialIsNotHeldBehindTheFinalModelsStep),
+    ("warming up while a dictation holds the recognizer is a no-op",
+     warmingUpWhileADictationHoldsTheRecognizerIsANoOp),
     ("every pin is a full revision with per-file hashes", pinsAreComplete),
 ]
     + diarizationCases.map { name, check in (name, { try await check() }) }

@@ -1,7 +1,6 @@
 import SpeechdCore
 
-/// The model-backed engines this build serves. Nemotron 3.5 (Murmur #100) is
-/// pinned in PinnedModels.swift and joins here with that issue.
+/// The model-backed engines this build serves.
 public enum FluidEngines {
     public static func all(store: ModelStore) -> [any SpeechEngine] {
         var engines: [any SpeechEngine] = []
@@ -16,6 +15,9 @@ public enum FluidEngines {
         }
         if let model = PinnedModels.named("parakeet-eou-160ms") {
             engines.append(ParakeetEouEngine(store: store, model: model, chunkSize: .ms160))
+        }
+        if let model = PinnedModels.named("nemotron-3.5") {
+            engines.append(NemotronStreamingEngine(store: store, model: model))
         }
         if let model = PinnedModels.named("diarizer") {
             engines.append(DiarizerEngine(store: store, model: model))

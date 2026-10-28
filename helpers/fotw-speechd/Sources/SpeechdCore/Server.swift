@@ -130,6 +130,13 @@ public actor Server {
             }
         case let .unload(id, name):
             guard let engine = engine(name, request: id) else { return }
+            // Not under a live stream: it keeps its model (a whole recognizer
+            // set for nemotron-3.5) until it ends, and a reload meanwhile
+            // would load a second.
+            if streams.values.contains(where: { $0.engine == name }) {
+                Self.fail(out, id: id, SpeechdError("busy", "a stream of \(name) is open"))
+                return
+            }
             loaded.remove(name)
             let out = out
             Task {
@@ -235,9 +242,13 @@ public actor Server {
         }
         do {
             loop: for await input in inputs {
+                // Cancel ends the input, but AsyncStream still delivers what
+                // was buffered; a cancelled stream must not decode it.
+                if Task.isCancelled { break loop }
                 switch input {
                 case let .audio(pcm):
                     let events = try await session.append(pcm.map { Float($0) / 32768 })
+                    if Task.isCancelled { break loop }
                     _ = worker.adjustBacklog(by: -pcm.count)
                     await server.emit(token: token, stream: stream, events)
                 case .finish:

@@ -91,6 +91,11 @@ Windows, but neither captures anything.
   `fotwd stt models install parakeet-eou-320ms` (NVIDIA Open Model License);
   captions are on by default once it is installed, can be switched off there,
   and never start the speech helper for a Deepgram meeting.
+- Streaming dictation in `fotw-speechd` (Murmur #100): the `nemotron-3.5`
+  engine (Nemotron 3.5 ASR Streaming 0.6B, multilingual, OpenMDW-1.1), its
+  560 ms variant for partials and its 1120 ms variant for the final, and the
+  model-free `fake-dictation` engine for tests. `speechd_dictation` replays
+  the corpus through it in real time.
 
 #### Library and keys
 

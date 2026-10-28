@@ -204,7 +204,7 @@ impl Out {
 /// fake-captions is pooled like parakeet-eou-320ms: at most two streams.
 const CAPTION_POOL: usize = 2;
 
-const ENGINES: [(&str, EngineKind, bool); 8] = [
+const ENGINES: [(&str, EngineKind, bool); 9] = [
     ("fake-batch", EngineKind::Batch, false),
     ("fake-stream", EngineKind::Streaming, true),
     ("fake-vad", EngineKind::Vad, false),
@@ -213,7 +213,10 @@ const ENGINES: [(&str, EngineKind, bool); 8] = [
     ("fake-stall", EngineKind::Batch, false),
     ("fake-exit-after-final", EngineKind::Batch, false),
     ("fake-captions", EngineKind::Streaming, true),
+    ("fake-dictation", EngineKind::Streaming, true),
 ];
+/// `fake-dictation` decodes in 250 ms steps, as `nemotron-3.5` shows partials in 560 ms ones.
+const DICTATION_STEP: u64 = 4_000;
 
 fn capabilities(
     future: bool,
@@ -277,9 +280,16 @@ struct Stream {
     utterance: u64,
     utterance_start: u64,
     utterance_samples: u64,
+    /// `fake-dictation`: the language hint, or "auto".
+    language: String,
 }
 
 impl Stream {
+    /// `fake-dictation`'s running text after `steps` decoded steps.
+    fn dictation(&self, steps: u64) -> String {
+        format!("steps={steps} lang={}", self.language)
+    }
+
     /// fake-captions: end the current utterance at sample `end`.
     fn end_utterance(&mut self, id: u32, end: u64) -> Option<Reply> {
         if self.utterance_samples == 0 {
@@ -326,6 +336,9 @@ struct Helper {
     /// Ids that were open once. Audio already in flight for one is dropped;
     /// audio for an id never opened is a protocol error.
     closed: HashSet<u32>,
+    /// `fake-dictation` has one recognizer, like `nemotron-3.5`: the samples
+    /// it holds, kept across streams until a stream's end resets it.
+    dictation: u64,
 }
 
 impl Helper {
@@ -383,6 +396,12 @@ impl Helper {
                 }
             }
             Request::Unload { id, engine } => {
+                // Not under a live stream: it would keep its model while a
+                // reload loaded a second copy.
+                if self.streams.values().any(|s| s.engine == engine) {
+                    out.fail(id, ErrorCode::Busy, "a stream of this engine is open");
+                    return;
+                }
                 self.loaded.remove(&engine);
                 out.send(&Reply::Unloaded { id, engine });
             }
@@ -393,12 +412,22 @@ impl Helper {
                 sample_rate,
                 format,
                 channels,
-                ..
-            } => self.open(id, stream, engine, (sample_rate, &format, channels)),
+                options,
+            } => self.open(
+                id,
+                stream,
+                engine,
+                (sample_rate, &format, channels),
+                options.language,
+            ),
             Request::Finish { stream } => self.finish(stream),
             Request::Cancel { stream } => {
                 let was_finishing = lock(&self.finishing).remove(&stream);
-                if self.streams.remove(&stream).is_some() || was_finishing {
+                let removed = self.streams.remove(&stream);
+                if let Some(ended) = &removed {
+                    self.end_dictation(ended);
+                }
+                if removed.is_some() || was_finishing {
                     self.closed.insert(stream);
                     out.send(&Reply::Closed {
                         stream,
@@ -465,7 +494,22 @@ impl Helper {
         self.pinned.iter().find(|p| p.id == id).cloned()
     }
 
-    fn open(&mut self, id: u64, stream: u32, engine: String, format: (u32, &str, u16)) {
+    /// A `fake-dictation` stream is over, however it ended: reset the
+    /// recognizer for the next one.
+    fn end_dictation(&mut self, stream: &Stream) {
+        if stream.engine == "fake-dictation" {
+            self.dictation = 0;
+        }
+    }
+
+    fn open(
+        &mut self,
+        id: u64,
+        stream: u32,
+        engine: String,
+        format: (u32, &str, u16),
+        language: Option<String>,
+    ) {
         let known = ENGINES.iter().any(|e| e.0 == engine)
             || postpass::is_engine(&engine)
             || self.pinned_engine(&engine).is_some();
@@ -487,6 +531,13 @@ impl Helper {
                 >= CAPTION_POOL
         {
             Some((ErrorCode::Busy, "both fake-captions sessions are in use"))
+        } else if engine == "fake-dictation"
+            && self.streams.values().any(|s| s.engine == "fake-dictation")
+        {
+            Some((
+                ErrorCode::Busy,
+                "fake-dictation serves one stream at a time",
+            ))
         } else if self.streams.len() >= MAX_STREAMS {
             Some((ErrorCode::Busy, "too many streams"))
         } else {
@@ -506,6 +557,7 @@ impl Helper {
                 utterance: 1,
                 utterance_start: 0,
                 utterance_samples: 0,
+                language: language.unwrap_or_else(|| "auto".to_owned()),
             },
         );
         out.send(&Reply::StreamOpened { id, stream });
@@ -581,6 +633,35 @@ impl Helper {
                     });
                 }
             }
+            // A full-scale negative sample is the failure trigger.
+            "fake-dictation" if pcm.contains(&i16::MIN) => {
+                self.streams.remove(&id);
+                self.closed.insert(id);
+                self.dictation = 0;
+                out.send(&Reply::Error {
+                    id: None,
+                    stream: Some(id),
+                    code: ErrorCode::Engine,
+                    message: "fake-dictation was told to fail".to_owned(),
+                    fatal: false,
+                    supported: Vec::new(),
+                });
+            }
+            // A partial whenever a step completes.
+            "fake-dictation" => {
+                let before = self.dictation;
+                self.dictation += pcm.len() as u64;
+                let steps = self.dictation / DICTATION_STEP;
+                if steps > before / DICTATION_STEP {
+                    out.send(&Reply::Partial {
+                        stream: id,
+                        text: stream.dictation(steps),
+                        start_ms: 0,
+                        end_ms: stream.samples * 1000 / u64::from(SAMPLE_RATE),
+                        utterance: Some(1),
+                    });
+                }
+            }
             "fake-stream" => out.send(&Reply::Partial {
                 stream: id,
                 text: format!("samples={}", stream.samples),
@@ -647,6 +728,8 @@ impl Helper {
             });
             return;
         }
+        let held = self.dictation;
+        self.end_dictation(&stream);
         if stream.engine == "fake-captions" {
             let end = stream.samples;
             if let Some(reply) = stream.end_utterance(id, end) {
@@ -661,7 +744,12 @@ impl Helper {
         let end_ms = stream.samples * 1000 / u64::from(SAMPLE_RATE);
         let final_text = FinalText {
             stream: id,
-            text: format!("samples={}", stream.samples),
+            // fake-dictation pads its last partial step and decodes it.
+            text: if stream.engine == "fake-dictation" {
+                stream.dictation(held.div_ceil(DICTATION_STEP))
+            } else {
+                format!("samples={}", stream.samples)
+            },
             start_ms: 0,
             end_ms,
             segments: Vec::new(),
@@ -669,7 +757,8 @@ impl Helper {
                 || format!("{}@fake", stream.engine),
                 |p| format!("{}@{}", p.id, p.revision),
             )),
-            utterance: (stream.engine == "fake-stream").then_some(1),
+            utterance: matches!(stream.engine.as_str(), "fake-stream" | "fake-dictation")
+                .then_some(1),
         };
         if stream.engine == "fake-batch" {
             // Slow, and off the frame-reading thread.
@@ -793,6 +882,7 @@ fn main() {
         loaded: BTreeSet::new(),
         streams: HashMap::new(),
         closed: HashSet::new(),
+        dictation: 0,
     };
     loop {
         match frame::read_frame(&mut input) {

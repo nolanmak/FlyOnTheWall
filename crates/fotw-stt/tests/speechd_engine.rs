@@ -18,32 +18,9 @@ use fotw_stt::{
 
 const RATE_PER_MS: usize = 16;
 
-/// `target/<profile>/fotw-speechd-fake`, built on first use if this test
-/// binary was built on its own (`cargo test -p fotw-stt`).
+/// The model-free helper, rebuilt if its source changed.
 fn fake_helper() -> PathBuf {
-    static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    PATH.get_or_init(|| {
-        let exe = std::env::current_exe().unwrap();
-        let profile_dir = exe.parent().unwrap().parent().unwrap();
-        let path = profile_dir.join("fotw-speechd-fake");
-        if !path.is_file() {
-            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-            let status = std::process::Command::new(cargo)
-                .args([
-                    "build",
-                    "-p",
-                    "fotw-speechd-client",
-                    "--bin",
-                    "fotw-speechd-fake",
-                ])
-                .status()
-                .unwrap();
-            assert!(status.success(), "could not build fotw-speechd-fake");
-        }
-        assert!(path.is_file(), "no fake helper at {}", path.display());
-        path
-    })
-    .clone()
+    fotw_speechd_client::testing::fake_helper()
 }
 
 /// A fake helper serving `parakeet-unified` at the pinned revision, installed
