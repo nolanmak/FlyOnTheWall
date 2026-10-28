@@ -67,6 +67,8 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 
 [dev-dependencies]
+# The model-free speech helper, rebuilt for each test run (`testing::fake_helper`).
+fotw-speechd-client = { path = "../fotw-speechd-client", features = ["testing"] }
 # This crate, on itself, purely to turn `test-guards` on for the library that
 # `tests/*.rs` link against. It reads like a cycle and is not one: cargo allows
 # a dev-dependency back onto the same package, and a dev-dependency's features

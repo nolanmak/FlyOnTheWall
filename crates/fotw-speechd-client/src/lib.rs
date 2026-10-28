@@ -18,6 +18,8 @@ mod client;
 pub mod frame;
 pub mod message;
 pub mod restart;
+#[cfg(feature = "testing")]
+pub mod testing;
 
 pub use client::{
     ClientError, Health, Loaded, Progress, SpeechStream, SpeechdClient, SpeechdConfig, Status,
