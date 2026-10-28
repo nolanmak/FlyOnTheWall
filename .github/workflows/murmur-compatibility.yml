@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           repository: nolanmak/Murmur
-          ref: 27af0621845a8ffeffb8c84214b30d543943fdef # main after Murmur #86
+          ref: 1977905df561d6cf1885af36521d0b8ca9aa6835 # Murmur #102 branch: Profile gains `corrections`
           path: consumer
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@46817827a5bfabe028bf34e1cce71fd40e2ff697 # 1.95.0
