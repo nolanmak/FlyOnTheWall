@@ -14,3 +14,5 @@ mod process;
 pub use adapter::LocalAdapter;
 #[cfg(target_os = "macos")]
 pub use process::{Artifact, RuntimeConfig};
+
+pub mod probe;
