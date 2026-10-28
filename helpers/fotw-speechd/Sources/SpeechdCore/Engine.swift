@@ -119,7 +119,9 @@ public actor FakeEngine: SpeechEngine {
     }
 
     /// Every fake, the post-meeting pass's (#246, PostPassFakes.swift) last.
-    public static func all() -> [any SpeechEngine] { ids.map { FakeEngine(id: $0) } + PostPassFakeEngine.all() }
+    public static func all() -> [any SpeechEngine] {
+        ids.map { FakeEngine(id: $0) } + [FakeDictationEngine()] + PostPassFakeEngine.all()
+    }
 
     public func load() async throws -> LoadResult {
         if descriptor.id == "fake-captions", captionPool == nil {

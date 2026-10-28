@@ -441,6 +441,11 @@ Parts of fotw-speechd, and fotw-stt's local vocabulary correction
 (`crates/fotw-stt/src/vocabulary_matcher.rs`, compiled into fotwd itself), are
 ported from Muesli, https://github.com/Muesli-HQ/muesli, at commit
 97e455794112126a896cae17f5c829e8ffa820c8. Each ported file names its source.
+The streaming dictation engine (Murmur #100) is among them:
+`helpers/fotw-speechd/Sources/SpeechdCore/StepStreaming.swift`, from
+`native/MuesliNative/Sources/MuesliNativeApp/StreamingDictationController.swift`,
+and `helpers/fotw-speechd/Sources/SpeechdFluid/NemotronStreamingEngine.swift`,
+from `Nemotron35StreamingBackend.swift` in the same directory.
 
 ````text
 MIT License
