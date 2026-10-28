@@ -304,9 +304,9 @@ mod tests {
         c.run = Arc::new(|_, _, _, _, _| panic!("source accessed"));
         let s = c.read();
         // The helper's models first (Parakeet Unified, then the live-caption
-        // model, #245), then four Whisper models and the speech detector, each
-        // with its license.
-        assert_eq!(s.models.len(), 7);
+        // model, #245, and the diarizer, #246), then four Whisper models and
+        // the speech detector, each with its license.
+        assert_eq!(s.models.len(), 8);
         let parakeet = &s.models[0];
         assert_eq!(
             (
@@ -334,7 +334,13 @@ mod tests {
                 false
             )
         );
-        assert!(s.models[2..].iter().all(|m| m.license == "MIT"
+        let diarizer = &s.models[2];
+        assert_eq!(
+            (diarizer.name.as_str(), diarizer.present),
+            ("diarizer", false)
+        );
+        assert!(diarizer.license.contains("scoped-cc-by-4.0"));
+        assert!(s.models[3..].iter().all(|m| m.license == "MIT"
             && m.revision.len() == 40
             && m.sha256.len() == 64
             && m.license_url.ends_with("/README.md")

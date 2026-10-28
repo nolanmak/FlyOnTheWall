@@ -19,6 +19,9 @@ use fotw_speechd_client::{
     StreamEvent,
 };
 
+#[path = "protocol/postpass.rs"]
+mod postpass;
+
 fn helper() -> (PathBuf, bool) {
     match std::env::var_os("FOTW_SPEECHD_BIN") {
         Some(path) => (PathBuf::from(path), false),

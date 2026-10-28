@@ -106,6 +106,11 @@ pub struct StreamOptions {
     /// BCP 47 language hint, for multilingual engines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// Batch recognizers (`parakeet-unified`): also report each word as a
+    /// `final` segment `{start_ms, end_ms, text}`, from the stream's first
+    /// sample. Off, the `final` is unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub timings: bool,
 }
 
 /// Helper → parent: responses (with `id`) and stream events (with `stream`).
@@ -483,6 +488,50 @@ mod tests {
         assert_eq!(json["type"], "open_stream");
         assert_eq!(json["options"], serde_json::json!({}));
         assert_eq!(serde_json::from_value::<Request>(json).unwrap(), open);
+    }
+
+    #[test]
+    fn post_pass_shapes_round_trip() {
+        // #246: word timings are asked for with `timings`, which is left off
+        // the wire when false, so the default request is unchanged.
+        let options = StreamOptions {
+            timings: true,
+            ..StreamOptions::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&options).unwrap(),
+            serde_json::json!({"timings": true})
+        );
+        assert_eq!(
+            serde_json::to_value(StreamOptions::default()).unwrap(),
+            serde_json::json!({})
+        );
+        // A final carries speaker segments (diarization) or word segments.
+        let json = serde_json::json!({
+            "type": "final", "stream": 2, "text": "", "start_ms": 0, "end_ms": 20550,
+            "model": "diarizer@df2625ac79a7ac6b65ad868fee6d80f320da4232",
+            "segments": [
+                {"start_ms": 2000, "end_ms": 5000, "speaker": "S1"},
+                {"start_ms": 6000, "end_ms": 6400, "text": "hello"},
+            ],
+        });
+        let reply: Reply = serde_json::from_value(json.clone()).unwrap();
+        let Reply::Final(ref f) = reply else {
+            panic!("{reply:?}")
+        };
+        assert_eq!(f.segments[0].speaker.as_deref(), Some("S1"));
+        assert_eq!(f.segments[1].text.as_deref(), Some("hello"));
+        let back: Reply = serde_json::from_value(serde_json::to_value(&reply).unwrap()).unwrap();
+        assert_eq!(back, reply);
+        // And the capabilities name the diarization kind.
+        let caps: Capabilities = serde_json::from_value(serde_json::json!({
+            "max_frame_bytes": 1_048_576, "max_streams": 8,
+            "engines": [{"id": "diarizer", "kind": "diarization", "partials": true,
+                         "sample_rates": [16000], "max_audio_ms": 14_400_000}],
+        }))
+        .unwrap();
+        assert_eq!(caps.engines[0].kind, EngineKind::Diarization);
+        assert_eq!(caps.engines[0].max_audio_ms, Some(14_400_000));
     }
 
     #[test]
