@@ -141,9 +141,11 @@ class CliTests(unittest.TestCase):
             hyp = Path(tmp) / "hyp.json"
             ref.write_text(json.dumps(REFERENCE))
             hyp.write_text(json.dumps([
-                {"start_ms": 0, "end_ms": 2500, "text": "hello fine thanks", "channel": "mic"},
+                {"start_ms": 0, "end_ms": 300, "text": "hello", "channel": "mic"},
+                {"start_ms": 2000, "end_ms": 2500, "text": "fine thanks", "channel": "mic"},
                 {"start_ms": 0, "end_ms": 6000, "text": "how are you", "channel": "system", "speaker": "a"},
-                {"start_ms": 6000, "end_ms": 10_000, "text": "", "channel": "system", "speaker": "b"}]))
+                {"start_ms": 6000, "end_ms": 10_000, "text": "", "channel": "system", "speaker": "b"},
+                {"start_ms": 500, "end_ms": 900, "text": "", "channel": "system"}]))
             script = str(HERE / "meeting_score.py")
             wer = json.loads(subprocess.run([sys.executable, "-I", script, "wer", "--reference", str(ref),
                                              "--hypothesis", str(hyp)], check=True, capture_output=True).stdout)
@@ -153,6 +155,7 @@ class CliTests(unittest.TestCase):
                                             check=True, capture_output=True).stdout)
             self.assertEqual(der["der"], 0)
             self.assertEqual(der["reference_speakers"], ["S1", "S2"])
+            self.assertEqual(der["unlabelled_segments_ignored"], 1)
 
 
 if __name__ == "__main__":

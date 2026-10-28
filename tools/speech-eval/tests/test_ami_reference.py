@@ -99,12 +99,13 @@ class AmiReferenceTests(unittest.TestCase):
 
     def test_speaker_segments_are_merged_clipped_and_window_relative(self):
         doc = ami_reference.build_reference(self.root, self.meeting, mic_channel=1, window_s=(10.0, 20.0))
-        self.assertEqual(doc["speaker_segment_source"], "segments")
+        # A, C and D have segments files; B falls back to its timed word intervals.
+        self.assertEqual(doc["speaker_segment_source"], "segments+words")
         system = [(s["speaker"], s["start_ms"], s["end_ms"]) for s in doc["speaker_segments"] if s["channel"] == "system"]
         self.assertEqual(system, [("XX0001a.A", 0, 500), ("XX0001a.C", 1000, 2000), ("XX0001a.A", 2000, 3000),
                                   ("XX0001a.A", 9000, 10000)])
-        mic = [s for s in doc["speaker_segments"] if s["channel"] == "mic"]
-        self.assertEqual(mic, [])  # agent B has no segments file in this fixture
+        mic = [(s["start_ms"], s["end_ms"]) for s in doc["speaker_segments"] if s["channel"] == "mic"]
+        self.assertEqual(mic, [(0, 400), (2000, 2200), (9700, 10000)])
 
     def test_concatenation_offsets_meetings_and_keeps_speakers_distinct(self):
         one = ami_reference.build_reference(self.root, self.meeting, mic_channel=1, window_s=(10.0, 20.0))
