@@ -71,7 +71,14 @@ public actor DiarizerEngine: SpeechEngine {
     public func isLoaded() async -> Bool { await lifecycle.current != nil }
 
     public func makeSession(options: StreamOptions) async throws -> any EngineSession {
-        let state = StreamSpeakers(try await initialSpeakers())
+        var speakers = try await initialSpeakers()
+        if let threshold = options.speakerThreshold {
+            guard threshold.isFinite, threshold > 0, threshold < 2 else {
+                throw SpeechdError("bad_request", "speaker_threshold is a cosine distance in (0, 2)")
+            }
+            speakers.speakerThreshold = threshold
+        }
+        let state = StreamSpeakers(speakers)
         return WindowedDiarizationSession(model: "\(model.id)@\(model.revision)") { [self] window, start in
             let (result, speakers) = try await self.diarize(window, startSample: start, speakers: state.speakers)
             state.speakers = speakers

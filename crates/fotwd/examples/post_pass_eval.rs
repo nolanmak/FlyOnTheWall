@@ -180,7 +180,17 @@ mod imp {
 
         let prepared = Instant::now();
         let engine = Probe {
-            inner: HelperEngine::prepare(data_root).await?,
+            inner: HelperEngine::prepare(data_root)
+                .await?
+                .with_speaker_threshold({
+                    let args: Vec<String> = std::env::args().collect();
+                    match args.iter().position(|a| a == "--speaker-threshold") {
+                        Some(i) => {
+                            Some(args[i + 1].parse().map_err(|_| "bad --speaker-threshold")?)
+                        }
+                        None => fotwd::post_pass::speechd_engine::SPEAKER_THRESHOLD,
+                    }
+                }),
             vad_off: std::env::args().any(|a| a == "--vad-off"),
             spans: Arc::new(Mutex::new(None)),
         };

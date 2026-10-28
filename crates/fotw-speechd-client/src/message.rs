@@ -111,6 +111,11 @@ pub struct StreamOptions {
     /// sample. Off, the `final` is unchanged.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub timings: bool,
+    /// Diarization (`diarizer`): the cosine distance under which a window's
+    /// voice joins a known speaker of the stream. Absent, the engine's
+    /// default (FluidAudio's: 1.2 × its 0.7 clustering threshold).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker_threshold: Option<f32>,
 }
 
 /// Helper → parent: responses (with `id`) and stream events (with `stream`).
@@ -532,6 +537,19 @@ mod tests {
         .unwrap();
         assert_eq!(caps.engines[0].kind, EngineKind::Diarization);
         assert_eq!(caps.engines[0].max_audio_ms, Some(14_400_000));
+        // #246: so is a diarizer's speaker threshold.
+        let options = StreamOptions {
+            speaker_threshold: Some(0.6),
+            ..StreamOptions::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&options).unwrap(),
+            serde_json::json!({"speaker_threshold": 0.6f32})
+        );
+        assert_eq!(
+            serde_json::to_value(StreamOptions::default()).unwrap(),
+            serde_json::json!({})
+        );
     }
 
     #[test]

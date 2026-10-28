@@ -21,6 +21,9 @@ use crate::speechd::{DIARIZER, PARAKEET};
 
 /// The diarizer's engine id in the helper.
 pub const DIARIZER_ENGINE: &str = "diarizer";
+/// The diarizer's speaker threshold for meetings: `None` is FluidAudio's
+/// default.
+pub const SPEAKER_THRESHOLD: Option<f32> = None;
 /// PCM per audio frame to the helper: 5 s, well under its 1 MiB frame.
 const FRAME: usize = 16_000 * 5;
 
@@ -42,6 +45,7 @@ pub struct HelperEngine {
     diarizer_engine: &'static str,
     detector: Arc<Mutex<Box<dyn SpeechDetector>>>,
     diarizer: bool,
+    speaker_threshold: Option<f32>,
 }
 
 impl HelperEngine {
@@ -87,7 +91,15 @@ impl HelperEngine {
             diarizer_engine: DIARIZER_ENGINE,
             detector: Arc::new(Mutex::new(detector)),
             diarizer,
+            speaker_threshold: SPEAKER_THRESHOLD,
         })
+    }
+
+    /// Diarize with this speaker threshold instead (evaluation).
+    #[must_use]
+    pub fn with_speaker_threshold(mut self, threshold: Option<f32>) -> Self {
+        self.speaker_threshold = threshold;
+        self
     }
 
     async fn send(stream: &SpeechStream, pcm: &[i16]) -> Result<(), String> {
@@ -172,7 +184,13 @@ impl PassEngine for HelperEngine {
             }
             let stream = self
                 .client
-                .open_stream(StreamConfig::new(self.diarizer_engine, RATE))
+                .open_stream(StreamConfig {
+                    options: StreamOptions {
+                        speaker_threshold: self.speaker_threshold,
+                        ..StreamOptions::default()
+                    },
+                    ..StreamConfig::new(self.diarizer_engine, RATE)
+                })
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(Some(Box::new(HelperDiarization {
@@ -275,6 +293,7 @@ mod tests {
             diarizer_engine: "fake-diarizer",
             detector: Arc::new(Mutex::new(Box::new(Silent))),
             diarizer: true,
+            speaker_threshold: None,
         }
     }
 
