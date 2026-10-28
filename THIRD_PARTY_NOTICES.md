@@ -414,6 +414,12 @@ checked against a SHA-256, only when the user asks:
   9ffd54a1e1ee413ddf265af9913beaf518d1639b: MIT, Copyright (c) 2020-present
   Silero Team,
   https://github.com/snakers4/silero-vad.
+- Parakeet Unified 0.6B, English, int8 Core ML (`parakeet-unified`), the
+  default on-device meeting model, run by the `fotw-speechd` helper,
+  https://huggingface.co/FluidInference/parakeet-unified-en-0.6b-coreml at
+  revision d32e972dd4315f1dc3f6be28fb2aab0ab3e80358, every file pinned by size
+  and SHA-256: CC-BY-4.0, https://creativecommons.org/licenses/by/4.0/.
+  Converted by FluidInference from NVIDIA's Parakeet model.
 
 ## The speech helper, fotw-speechd
 

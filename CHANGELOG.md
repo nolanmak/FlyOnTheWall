@@ -67,6 +67,13 @@ Windows, but neither captures anything.
   per-file SHA-256 and installed only by an explicit setup action, and model-free
   fake engines that the Rust protocol tests run against on macOS. Built only
   with `FOTW_FLUIDAUDIO_SOURCE`; `just speechd-real` is its real-model suite.
+- Parakeet Unified 0.6B (English, CC BY 4.0) is the default on-device meeting
+  engine for new libraries (#244). It runs in the `fotw-speechd` helper behind
+  the same Silero speech gate, one batch request per utterance, and every
+  segment records `parakeet-unified` and its pinned revision. Install it from
+  Transcription settings or with `fotwd stt models install parakeet-unified`;
+  Start refuses with that hint while it is missing. A saved Whisper choice is
+  left as it was, and Whisper stays available.
 
 #### Library and keys
 

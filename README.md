@@ -152,7 +152,17 @@ The key goes into the macOS keychain. It is looked up each time you press **Star
 
 ### Or transcribe on this Mac
 
-whisper.cpp runs inside the app, with Metal on Apple silicon. Choose a model by language and file size; the catalog lists pinned source revision, SHA-256 and MIT license. Setup is an explicit command and never starts from a recording:
+New libraries default to **Parakeet Unified 0.6B** (English, int8 Core ML, CC BY 4.0) for on-device speech. It runs in the `fotw-speechd` helper in the app bundle (`Contents/Helpers`), which the app starts when you press **Start** and stops after the meeting (a build without the helper refuses Start and says so); every utterance passes the same speech detector first, and every segment records `parakeet-unified` and its pinned revision. Installing it is the only step that touches the network:
+
+```sh
+fotwd stt models install parakeet-unified          # explicit download, every file pinned by size and SHA-256
+fotwd stt models import parakeet-unified /path/to/parakeet-unified-en-0.6b-coreml   # offline copy
+fotwd stt local --model parakeet-unified
+```
+
+Start refuses Parakeet, with the command that fixes it, while it or its speech detector is missing. A choice you saved before Parakeet existed is left as it was.
+
+Whisper stays available. whisper.cpp runs inside the app, with Metal on Apple silicon. Choose a model by language and file size; the catalog lists pinned source revision, SHA-256 and MIT license. Setup is an explicit command and never starts from a recording:
 
 ```sh
 fotwd stt models list
@@ -235,7 +245,7 @@ The library and the audio live in `~/Library/Application Support/com.flyonthewal
 | `db.sqlite3`, with its `-wal` and `-shm` files | the encrypted library |
 | `db.sqlite3.recovery` | the library key, sealed under your Recovery Key |
 | `media/` | archived audio, **unencrypted** |
-| `models/` | Whisper models for on-device transcription, which you download yourself |
+| `models/` | On-device speech models, which you install yourself: Whisper files, and Parakeet under `models/speechd/` |
 | `sessions/` | meetings not yet archived, raw audio and transcript, **unencrypted** |
 | `audit.jsonl` | who started each recording and the consent warning shown |
 | `fotwd.log` | daemon diagnostics |
