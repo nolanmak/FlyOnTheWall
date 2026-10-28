@@ -108,7 +108,8 @@ public actor FakeEngine: SpeechEngine {
                                       maxAudioMs: kind == .batch ? maxBatchMs : nil)
     }
 
-    public static func all() -> [any SpeechEngine] { ids.map { FakeEngine(id: $0) } }
+    /// Every fake, the post-meeting pass's (#246, PostPassFakes.swift) last.
+    public static func all() -> [any SpeechEngine] { ids.map { FakeEngine(id: $0) } + PostPassFakeEngine.all() }
 
     public func load() async throws -> LoadResult {
         loaded = true

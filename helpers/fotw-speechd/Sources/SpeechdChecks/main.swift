@@ -249,7 +249,8 @@ func aFailedSwapKeepsTheWorkingRevision() throws {
 
 func pinsAreComplete() throws {
     let ids = PinnedModels.all.map(\.id)
-    try expect(ids == ["parakeet-unified", "silero-vad", "parakeet-eou-320ms", "nemotron-3.5-2240ms"], "\(ids)")
+    try expect(ids == ["parakeet-unified", "silero-vad", "parakeet-eou-320ms", "nemotron-3.5-2240ms",
+                       "diarizer"], "\(ids)")
     for model in PinnedModels.all {
         try expect(model.revision.count == 40 && model.revision.allSatisfy(\.isHexDigit), "\(model.id) revision")
         try expect(!model.files.isEmpty && !model.license.isEmpty, "\(model.id) files and license")
@@ -260,6 +261,13 @@ func pinsAreComplete() throws {
     }
     try expect(PinnedModels.named("parakeet-unified")?.totalBytes == 614_086_229 - 5_309,
                "Parakeet Unified is the #118 snapshot without its README")
+    // The diarizer: exactly the two models FluidAudio 0.17.3's DiarizerManager
+    // loads (ModelNames.Diarizer.requiredModels), at the revision it pins.
+    let diarizer = PinnedModels.named("diarizer")
+    try expect(diarizer?.revision == "df2625ac79a7ac6b65ad868fee6d80f320da4232", "diarizer revision")
+    try expect(Set(diarizer?.files.map { String($0.path.prefix { $0 != "/" }) } ?? [])
+               == ["pyannote_segmentation.mlmodelc", "wespeaker_v2.mlmodelc"], "diarizer files")
+    try expect(diarizer?.totalBytes == 13_720_676, "diarizer bytes")
 }
 
 // MARK: - Runner
@@ -273,6 +281,7 @@ let cases: [(String, () async throws -> Void)] = [
     ("a failed swap keeps the working revision", aFailedSwapKeepsTheWorkingRevision),
     ("every pin is a full revision with per-file hashes", pinsAreComplete),
 ]
+    + diarizationCases.map { name, check in (name, { try await check() }) }
 var failures = 0
 for (name, check) in cases {
     do {

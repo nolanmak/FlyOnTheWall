@@ -8,7 +8,10 @@
 //
 // Changed for the helper: models load only from the pinned, validated
 // directory (never downloaded here), audio arrives as PCM over the protocol
-// instead of a WAV file, and inference is single-flight per engine.
+// instead of a WAV file, and inference is single-flight per engine. With
+// `options.timings` (#246) the `final` also carries each word's time, from
+// FluidAudio's `transcribeWithTimings` token timings merged into words by
+// SpeechdCore.WordTimings.
 import FluidAudio
 import Foundation
 import SpeechdCore
@@ -57,12 +60,23 @@ public actor ParakeetUnifiedEngine: SpeechEngine {
 
     public func makeSession(options: StreamOptions) async throws -> any EngineSession {
         guard await lifecycle.current != nil else { throw SpeechdError.notLoaded(descriptor.id) }
-        return BatchSession(engine: self, provenance: "\(model.id)@\(model.revision)")
+        return BatchSession(engine: self, provenance: "\(model.id)@\(model.revision)",
+                            timings: options.timings ?? false)
     }
 
     func transcribe(_ samples: [Float]) async throws -> String {
         guard let manager = await lifecycle.current else { throw SpeechdError.notLoaded(descriptor.id) }
         return try await gate.run { try await manager.transcribe(samples) }
+    }
+
+    /// The text and its words, each timed from the first sample.
+    func transcribeWithTimings(_ samples: [Float]) async throws -> (String, [TimedSegment]) {
+        guard let manager = await lifecycle.current else { throw SpeechdError.notLoaded(descriptor.id) }
+        let result = try await gate.run { try await manager.transcribeWithTimings(samples) }
+        let pieces = result.tokenTimings.map {
+            TimedPiece(text: $0.token, startSeconds: $0.startTime, endSeconds: $0.endTime)
+        }
+        return (result.text, WordTimings.words(pieces))
     }
 }
 
@@ -71,11 +85,13 @@ final class BatchSession: EngineSession, @unchecked Sendable {
     // @unchecked: confined to its stream's task.
     private let engine: ParakeetUnifiedEngine
     private let provenance: String
+    private let timings: Bool
     private var samples: [Float] = []
 
-    init(engine: ParakeetUnifiedEngine, provenance: String) {
+    init(engine: ParakeetUnifiedEngine, provenance: String, timings: Bool) {
         self.engine = engine
         self.provenance = provenance
+        self.timings = timings
     }
 
     func append(_ chunk: [Float]) async throws -> [EngineEvent] {
@@ -88,9 +104,15 @@ final class BatchSession: EngineSession, @unchecked Sendable {
 
     func finish() async throws -> [EngineEvent] {
         let endMs = milliseconds(samples: samples.count)
-        let text = samples.isEmpty ? "" : try await engine.transcribe(samples)
+        var text = ""
+        var words: [TimedSegment] = []
+        if !samples.isEmpty && timings {
+            (text, words) = try await engine.transcribeWithTimings(samples)
+        } else if !samples.isEmpty {
+            text = try await engine.transcribe(samples)
+        }
         samples = []
         return [.final(text: text.trimmingCharacters(in: .whitespacesAndNewlines), startMs: 0, endMs: endMs,
-                       segments: [], model: provenance, utterance: nil)]
+                       segments: words, model: provenance, utterance: nil)]
     }
 }
