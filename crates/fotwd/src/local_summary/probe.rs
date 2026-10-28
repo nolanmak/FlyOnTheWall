@@ -77,7 +77,7 @@ pub fn probe(installation_directory: &Path) -> DeviceProfile {
     }
 }
 
-fn disk_available(directory: &Path) -> Option<u64> {
+pub(super) fn disk_available(directory: &Path) -> Option<u64> {
     use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
     let file = std::fs::OpenOptions::new()
         .read(true)

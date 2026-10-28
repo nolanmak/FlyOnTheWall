@@ -26,8 +26,8 @@ fn a_fresh_database_lands_on_the_latest_version() {
     let db = Db::open(&path, &test_key()).unwrap();
     assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
     assert_eq!(
-        LATEST_SCHEMA_VERSION, 9,
-        "0001 initial schema, 0002 fts5 search indexes, 0003 enrich report, 0004 sharing documents, 0005 session notes, 0006 note handoff aliases, 0007 durable speech receipts, 0008 capture clock state, 0009 post-meeting cleanup jobs"
+        LATEST_SCHEMA_VERSION, 10,
+        "0001 initial schema, 0002 fts5 search indexes, 0003 enrich report, 0004 sharing documents, 0005 session notes, 0006 note handoff aliases, 0007 durable speech receipts, 0008 capture clock state, 0009 summary destination defaults, 0010 post-meeting cleanup jobs"
     );
 }
 
@@ -356,4 +356,42 @@ fn v6_notes_and_capture_alias_survive_the_speech_receipt_migration() {
     let doc = db.export_meeting("saved-meeting").unwrap();
     assert_eq!(doc.meeting.title, "owned title");
     assert!(doc.speech_epochs.is_empty() && doc.speech_receipts.is_empty());
+}
+
+#[test]
+fn fresh_library_bootstrap_persists_off_before_becoming_current() {
+    let (_dir, path) = tmp_db();
+    let db = Db::open(&path, &test_key()).unwrap();
+    assert_eq!(
+        db.get_setting("summarize").unwrap().as_deref(),
+        Some(r#"{"policy":"off"}"#)
+    );
+    drop(db);
+    let db = Db::open(&path, &test_key()).unwrap();
+    assert_eq!(
+        db.get_setting("summarize").unwrap().as_deref(),
+        Some(r#"{"policy":"off"}"#)
+    );
+}
+
+#[test]
+fn existing_libraries_keep_missing_or_explicit_destinations_during_upgrade() {
+    for policy in [
+        None,
+        Some(r#"{"policy":"local_only"}"#),
+        Some(r#"{"policy":"anthropic","acknowledged_egress":true}"#),
+    ] {
+        let (_dir, path) = tmp_db();
+        {
+            let c = raw(&path);
+            c.execute_batch(include_str!("../src/schema/0001_initial.sql"))
+                .unwrap();
+            if let Some(value) = policy {
+                c.execute("INSERT INTO settings(key,value,updated_at,lamport,origin_device_id) VALUES('summarize',?1,0,0,'fixture')",[value]).unwrap();
+            }
+            c.execute_batch("PRAGMA user_version=1").unwrap();
+        }
+        let db = Db::open(&path, &test_key()).unwrap();
+        assert_eq!(db.get_setting("summarize").unwrap().as_deref(), policy);
+    }
 }

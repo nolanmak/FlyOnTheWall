@@ -66,6 +66,11 @@ hyper = { version = "1.11", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 
+# Stream the pinned optional runtime archive; entries are validated and written
+# explicitly rather than using automatic archive filesystem extraction.
+flate2 = "1"
+tar = { version = "0.4.46", default-features = false }
+
 [dev-dependencies]
 # The model-free speech helper, rebuilt for each test run (`testing::fake_helper`).
 fotw-speechd-client = { path = "../fotw-speechd-client", features = ["testing"] }

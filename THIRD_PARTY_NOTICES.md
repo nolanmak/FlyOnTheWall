@@ -4153,6 +4153,7 @@ Used by:
 - equivalent 1.0.2
 - errno 0.3.14
 - fastrand 2.5.0
+- filetime 0.2.29
 - flate2 1.1.9
 - fnv 1.0.7
 - form_urlencoded 1.2.2
@@ -4181,6 +4182,7 @@ Used by:
 - smallvec 1.15.2
 - socket2 0.6.5
 - stable_deref_trait 1.2.1
+- tar 0.4.46
 - tempfile 3.27.0
 - tray-icon 0.24.2
 - tungstenite 0.29.0
