@@ -1257,8 +1257,10 @@ function renderSpeechHealth(body) {
     const heading = label + " · " + provider + " / " + String(source.model || "Unknown model");
     if (entry.heading.textContent !== heading) entry.heading.textContent = heading;
     entry.engine = provider + " / " + String(source.model || "Unknown model");
-    entry.attention = ["reconnecting", "closed", "incomplete"].includes(source.state)
-      || Boolean(source.error) || Boolean(source.switch_reason);
+    // Which speech condition needs attention, if any; a new one reopens the bar.
+    entry.attention = ["reconnecting", "closed", "incomplete"].includes(source.state) ? source.state
+      : source.error ? "error" : source.switch_reason ? "switched:" + source.switch_reason : "";
+    entry.stateText = states[source.state] || "Status unavailable";
     const parts = [states[source.state] || "Status unavailable"];
     if (typeof source.pending_audio_ms === "number" && Number.isFinite(source.pending_audio_ms) && source.pending_audio_ms >= 0) {
       parts.push((source.pending_audio_ms / 1000).toFixed(1) + "s audio pending");
@@ -1354,7 +1356,7 @@ function renderCaptureHealth(body) {
     }
     row.button.hidden = state !== "exhausted";
     row.button.disabled = captureRetryPending.has(source);
-    row.attention = !["healthy", "confirming"].includes(state);
+    row.attention = ["healthy", "confirming"].includes(state) ? "" : (state || "unavailable");
   }
   renderLiveStatus();
 }
@@ -1362,30 +1364,39 @@ function renderCaptureHealth(body) {
 // The live capture and transcription cards fold into one line so the
 // transcript keeps the screen. A source that needs attention (recovering,
 // exhausted with its Retry button, quiet, a dropped stream) opens the panel
-// once, on the transition; the user's own collapse is respected afterwards.
+// when a new problem appears; the user's own collapse is respected while the
+// same problems persist.
 const LIVE_SOURCE_LABELS = { system: "System audio", mic: "Microphone" };
-let liveStatusAttention = false;
+let liveStatusAttention = new Set();
 function renderLiveStatus() {
   const box = el.liveStatus;
   if (!box) return;
   const visible = el.captureHealth?.hidden === false || el.speechHealth?.hidden === false;
   box.hidden = !visible;
-  if (!visible) { liveStatusAttention = false; return; }
+  if (!visible) {
+    // The next recording starts collapsed, whatever this one needed.
+    box.open = false;
+    liveStatusAttention = new Set();
+    return;
+  }
   const parts = [];
-  let attention = false;
+  const attention = new Set();
   for (const source of ["system", "mic"]) {
     const capture = el.captureHealth?.hidden === false ? captureHealthRows.get(source) : null;
     const speech = el.speechHealth?.hidden === false ? speechRows.get(source) : null;
     if (!capture && !speech) continue;
-    attention = attention || Boolean(capture?.attention) || Boolean(speech?.attention);
+    if (capture?.attention) attention.add(source + ":capture:" + capture.attention);
+    if (speech?.attention) attention.add(source + ":speech:" + speech.attention);
     const bits = [capture ? capture.message.textContent : LIVE_SOURCE_LABELS[source]];
     if (speech?.engine) bits.push(speech.engine);
+    // A healthy capture must not mask a transcription that has stopped.
+    if (speech?.attention) bits.push(speech.stateText);
     parts.push(bits.join(" · "));
   }
   const line = parts.join("   |   ") || "Recording status";
   if (el.liveStatusSummary && el.liveStatusSummary.textContent !== line) el.liveStatusSummary.textContent = line;
-  box.classList?.toggle("attention", attention);
-  if (attention && !liveStatusAttention) box.open = true;
+  box.classList?.toggle("attention", attention.size > 0);
+  for (const key of attention) if (!liveStatusAttention.has(key)) { box.open = true; break; }
   liveStatusAttention = attention;
 }
 

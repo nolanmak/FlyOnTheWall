@@ -837,7 +837,7 @@ button, summary { min-height: 36px; }
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.live-status.attention > summary { color: #be762f; }
+.live-status.attention > summary { color: var(--caution); }
 .live-status[open] > summary { margin-bottom: 6px; }
 /* The generic `section` padding is for reading panes, not these strips. */
 .live-status .capture-health,

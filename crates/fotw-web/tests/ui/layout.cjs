@@ -77,3 +77,37 @@ test('the status bar disappears when nothing is recording', () => {
   render(h, {});
   assert.equal(h.node('live-status').hidden, true);
 });
+
+const speechState = (body, source, state) => ({
+  ...body,
+  speech_status: body.speech_status.map(s => (s.source === source ? { ...s, state } : s)),
+});
+
+test('a recording that ended while expanded leaves the next one collapsed', () => {
+  const h = harness();
+  render(h, status('exhausted'));
+  assert.equal(h.node('live-status').open, true);
+  vm.runInContext('recState = "idle"', h.ctx);
+  render(h, {});
+  vm.runInContext('recState = "recording"', h.ctx);
+  render(h, { ...status('healthy'), session_id: 's2' });
+  assert.equal(h.node('live-status').open, false);
+});
+
+test('a stopped transcription is named in the collapsed line even while capture is healthy', () => {
+  const h = harness();
+  render(h, speechState(status('healthy'), 'system', 'closed'));
+  assert.match(h.node('live-status-summary').textContent, /System audio: Healthy[^|]*Stream closed/);
+});
+
+test('a second source needing attention reopens a collapsed bar', () => {
+  const h = harness();
+  render(h, status('exhausted'));
+  const box = h.node('live-status');
+  box.open = false; // user collapses after seeing the system problem
+  render(h, status('exhausted', 'recovering'));
+  assert.equal(box.open, true, 'the microphone problem is new and must be shown');
+  box.open = false;
+  render(h, status('exhausted', 'recovering'));
+  assert.equal(box.open, false, 'repeating the same problems stays collapsed');
+});
