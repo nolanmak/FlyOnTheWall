@@ -202,7 +202,7 @@ async fn cancelling_local_identity_preparation_waits_for_owned_work_and_never_st
 /// small.en model and public JFK fixture; no device or provider is opened.
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires approved cached small.en/JFK assets"]
+#[ignore = "requires approved cached small.en/JFK assets and the Silero VAD model"]
 async fn installed_local_only_session_preserves_public_audio_and_its_verified_restart_identity() {
     use sha2::{Digest, Sha256};
     let model = std::path::PathBuf::from(
@@ -232,6 +232,15 @@ async fn installed_local_only_session_preserves_public_audio_and_its_verified_re
     let decoded = fotw_audio::wav::parse(&bytes).unwrap();
     assert_eq!(decoded.frames(), 176000);
     let root = tempfile::tempdir().unwrap();
+    // Local capture is refused without the speech detector (#242).
+    let detector = fotwd::stt::vad_model_path(root.path());
+    std::fs::create_dir_all(detector.parent().unwrap()).unwrap();
+    std::fs::copy(
+        std::env::var_os("FOTW_SILERO_VAD_MODEL")
+            .expect("set FOTW_SILERO_VAD_MODEL to ggml-silero-v5.1.2.bin"),
+        &detector,
+    )
+    .unwrap();
     let settings = fotwd::stt::SttSettings {
         engine: fotwd::stt::SttEngine::Local,
         model: model.to_string_lossy().into_owned(),

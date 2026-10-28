@@ -17,6 +17,8 @@ those and regenerate rather than editing this file.
 - [C libraries compiled into fotwd](#c-libraries-compiled-into-fotwd):
   [SQLCipher](#sqlcipher), [SQLite](#sqlite), [OpenSSL](#openssl),
   [libopus](#libopus), [whisper.cpp and ggml](#whispercpp-and-ggml)
+- [Source code ported from Muesli](#source-code-ported-from-muesli)
+- [Models downloaded on demand](#models-downloaded-on-demand)
 - [The speech helper, fotw-speechd](#the-speech-helper-fotw-speechd):
   [Muesli](#muesli), [FluidAudio](#fluidaudio), [fastcluster](#fastcluster),
   [Speech models](#speech-models)
@@ -361,6 +363,57 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ````
+
+## Source code ported from Muesli
+
+Parts of fotw-stt's local speech pipeline are translated from Muesli,
+https://github.com/Muesli-HQ/muesli, at commit
+97e455794112126a896cae17f5c829e8ffa820c8: the speech gate in front of the
+local model (`crates/fotw-stt/src/vad.rs`, from
+`native/MuesliNative/Sources/MuesliNativeApp/TranscriptionRuntime.swift`) and
+the transcript artifact cleanup (`crates/fotw-stt/src/cleanup.rs`, from
+`TranscriptionEngineArtifactsFilter.swift` and
+`native/MuesliNative/Sources/MuesliCore/InsightsWordAnalyzer.swift`). Each
+ported file names its source in its header. Muesli is licensed as follows:
+
+````text
+MIT License
+
+Copyright (c) 2026 Pranav Hari
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+````
+
+## Models downloaded on demand
+
+No model weights ship in the app. `fotwd stt models install` and the
+dashboard's model setup download these, pinned to an exact revision and
+checked against a SHA-256, only when the user asks:
+
+- Whisper models in ggml format, https://huggingface.co/ggerganov/whisper.cpp
+  at revision 5359861c739e955e79d9a303bcbc70fb988958b1: MIT.
+- Silero VAD v5.1.2 in ggml format (`ggml-silero-v5.1.2.bin`), the speech
+  detector that gates local transcription,
+  https://huggingface.co/ggml-org/whisper-vad at revision
+  9ffd54a1e1ee413ddf265af9913beaf518d1639b: MIT, Copyright (c) 2020-present
+  Silero Team,
+  https://github.com/snakers4/silero-vad.
 
 ## The speech helper, fotw-speechd
 

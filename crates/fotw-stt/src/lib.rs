@@ -37,6 +37,7 @@
 
 pub mod backoff;
 pub mod capabilities;
+pub mod cleanup;
 pub mod clock;
 #[cfg(any(test, feature = "conformance"))]
 pub mod conformance;
@@ -51,6 +52,7 @@ pub mod speaker;
 pub mod store;
 pub mod stream;
 pub mod transcript;
+pub mod vad;
 pub mod vocabulary;
 #[cfg(all(target_os = "macos", feature = "local-whisper"))]
 pub mod whisper;
@@ -72,5 +74,6 @@ pub use store::{
 };
 pub use stream::{StreamEvent, StreamState};
 pub use transcript::{Source, TimestampSource, TranscriptSegment, Word};
+pub use vad::{GateConfig, GatedRecognizer, SpeechDetector};
 #[cfg(all(target_os = "macos", feature = "local-whisper"))]
 pub use whisper::WhisperEngine;
