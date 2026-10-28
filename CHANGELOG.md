@@ -87,7 +87,10 @@ Windows, but neither captures anything.
   place per utterance, and replaced by the final text; they are never
   saved, exported or summarized. A caption engine that fails three times
   in a row pauses captions for the meeting ("Live captions paused") and
-  nothing else.
+  nothing else. Install the caption model from Transcription settings or with
+  `fotwd stt models install parakeet-eou-320ms` (NVIDIA Open Model License);
+  captions are on by default once it is installed, can be switched off there,
+  and never start the speech helper for a Deepgram meeting.
 
 #### Library and keys
 

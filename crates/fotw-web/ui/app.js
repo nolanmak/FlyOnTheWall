@@ -80,6 +80,8 @@ const el = {
   speechMode: document.getElementById("speech-mode"),
   speechModel: document.getElementById("speech-model"),
   speechLanguage: document.getElementById("speech-language"),
+  speechCaptions: document.getElementById("speech-captions"),
+  speechCaptionsNote: document.getElementById("speech-captions-note"),
   speechDisclosure: document.getElementById("speech-disclosure"),
   speechLocalFields: document.getElementById("speech-local-fields"),
   speechSave: document.getElementById("speech-save"),
@@ -1797,6 +1799,15 @@ function renderSpeechSettings(body) {
   el.speechMode.value = settings?.engine || "";
   el.speechModel.value = settings?.model || "";
   el.speechLanguage.value = settings?.language || "";
+  // Live captions (#245): on unless saved off; they need their own model.
+  if (el.speechCaptions) el.speechCaptions.checked = settings?.live_captions !== false;
+  if (el.speechCaptionsNote) {
+    el.speechCaptionsNote.textContent = settings?.engine === "deepgram"
+      ? "Live captions run only for on-device meetings; Deepgram shows its own live text."
+      : body.captions_installed
+        ? "Word-by-word text in the live view, greyed until the final text replaces it. Never saved."
+        : "Live captions need their model (parakeet-eou-320ms, NVIDIA Open Model License): install it below or with fotwd stt models install parakeet-eou-320ms.";
+  }
   const messages = {
     present_unchecked: "Model file found. Start verifies its contents and prepares native memory before capture in backup mode.",
     missing: "Model not installed. Install it below, or choose an installed model. Start refuses on-device speech until it is installed.",
@@ -1821,14 +1832,15 @@ async function loadSpeech() {
 async function onSpeechSave() {
   if (speechSaving || !["local", "deepgram", "fallback"].includes(el.speechMode.value)) return;
   speechSaving = true;
-  const controls = [el.speechMode, el.speechModel, el.speechLanguage, el.speechReload];
+  const controls = [el.speechMode, el.speechModel, el.speechLanguage, el.speechCaptions, el.speechReload].filter(Boolean);
   controls.forEach(control => { control.disabled = true; });
   paintSpeechPolicy();
   el.speechStatus.textContent = "Checking the selected model and saving…";
   try {
     const body = await api("/api/settings/speech", {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({engine: el.speechMode.value, model: el.speechModel.value, language: el.speechLanguage.value}),
+      body: JSON.stringify({engine: el.speechMode.value, model: el.speechModel.value, language: el.speechLanguage.value,
+        live_captions: el.speechCaptions ? el.speechCaptions.checked : true}),
     });
     if (body.error) {
       el.speechStatus.textContent = "Not saved. " + body.error;

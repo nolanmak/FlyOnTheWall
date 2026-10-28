@@ -110,7 +110,11 @@ pub trait CaptionEngine: Send + Sync + 'static {
 
 /// Captions from the speech helper's `parakeet-eou-320ms` engine.
 pub struct SpeechdCaptions {
-    client: fotw_speechd_client::SpeechdClient,
+    /// The daemon's shared helper, fetched on the first caption stream when
+    /// built with [`SpeechdCaptions::lazy`], so preparing a meeting never
+    /// starts it.
+    client: tokio::sync::OnceCell<fotw_speechd_client::SpeechdClient>,
+    launch: Option<(crate::speechd::Launch, std::path::PathBuf)>,
     engine: String,
     /// Loaded and warmed once, by the first stream to open, so a recording's
     /// Start never waits for the caption model: until it is ready the caption
@@ -124,10 +128,41 @@ impl SpeechdCaptions {
     #[must_use]
     pub fn new(client: fotw_speechd_client::SpeechdClient, engine: impl Into<String>) -> Self {
         Self {
-            client,
+            client: tokio::sync::OnceCell::new_with(Some(client)),
+            launch: None,
             engine: engine.into(),
             ready: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Captions on the daemon's shared helper for `data_root`, started (or
+    /// joined) only when the first caption stream opens. That is on the
+    /// daemon's runtime, after capture has begun, never at Start.
+    #[must_use]
+    pub fn lazy(
+        launch: crate::speechd::Launch,
+        data_root: std::path::PathBuf,
+        engine: impl Into<String>,
+    ) -> Self {
+        Self {
+            client: tokio::sync::OnceCell::new(),
+            launch: Some((launch, data_root)),
+            engine: engine.into(),
+            ready: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    async fn client(&self) -> Result<&fotw_speechd_client::SpeechdClient, OpenError> {
+        self.client
+            .get_or_try_init(|| async {
+                let Some((launch, data_root)) = &self.launch else {
+                    return Err(OpenError::Failed("no speech helper".into()));
+                };
+                crate::speechd::helper_with(launch, data_root)
+                    .await
+                    .map_err(OpenError::Failed)
+            })
+            .await
     }
 }
 
@@ -139,13 +174,13 @@ impl CaptionEngine for SpeechdCaptions {
     fn open(&self) -> OpenFuture<'_> {
         Box::pin(async move {
             use fotw_speechd_client::{StreamConfig, StreamEvent as Helper};
+            let client = self.client().await?;
+            // The helper's own load decides whether the model is usable; a
+            // shared helper may predate an install.
             self.ready
                 .get_or_try_init(|| async {
-                    self.client
-                        .load(&self.engine)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    self.client
+                    client.load(&self.engine).await.map_err(|e| e.to_string())?;
+                    client
                         .warmup(&self.engine)
                         .await
                         .map(|_| ())
@@ -153,8 +188,7 @@ impl CaptionEngine for SpeechdCaptions {
                 })
                 .await
                 .map_err(|e: String| OpenError::Failed(e))?;
-            let mut stream = self
-                .client
+            let mut stream = client
                 .open_stream(StreamConfig::new(&self.engine, 16_000))
                 .await
                 .map_err(|e| match e {
