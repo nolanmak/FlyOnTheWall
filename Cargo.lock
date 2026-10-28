@@ -866,6 +866,7 @@ dependencies = [
  "fotw-pipeline",
  "fotw-secrets",
  "fotw-shell",
+ "fotw-speechd-client",
  "fotw-store",
  "fotw-stt",
  "fotw-summarize",

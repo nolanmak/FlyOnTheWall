@@ -203,7 +203,7 @@ fn options() -> OpenOptions {
     }
 }
 
-fn private_dir(path: &Path) -> Result<(), String> {
+pub(crate) fn private_dir(path: &Path) -> Result<(), String> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if !meta.file_type().is_dir() => {
             return Err("Model setup directory must be an ordinary directory".into());

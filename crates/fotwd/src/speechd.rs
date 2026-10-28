@@ -1,0 +1,287 @@
+//! Parakeet Unified, the default local meeting engine (#244), served by the
+//! `fotw-speechd` helper (#243).
+//!
+//! This is the daemon's side of it: where the helper and its model store are,
+//! preparing the engine before a recording, and the one explicit action that
+//! may download it. The engine itself is [`fotw_stt::SpeechdEngine`].
+//!
+//! - **Selection.** A saved transcription choice names it by
+//!   [`ENGINE`] in place of a ggml path (see [`crate::stt::SttSettings`]).
+//! - **Preparation.** Start spawns the helper, loads the model and warms it up
+//!   before capture opens. A model that is not installed refuses Start with
+//!   the command that installs it; nothing downloads during capture.
+//! - **Install.** `fotwd stt models install parakeet-unified` and the
+//!   Transcription settings send the helper its `install` request, the only
+//!   request that may touch the network. `import parakeet-unified <dir>` sends
+//!   `install {from}`, which opens no socket.
+//!
+//! The helper process lives as long as the prepared engine: dropping the last
+//! handle closes its stdin and kills it.
+
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use fotw_speechd_client::message::ProgressPhase;
+use fotw_speechd_client::{SpeechdClient, SpeechdConfig};
+use fotw_stt::SpeechdEngine;
+
+pub use fotw_stt::speechd::{
+    PARAKEET_UNIFIED as ENGINE, PARAKEET_UNIFIED_LICENSE as LICENSE,
+    PARAKEET_UNIFIED_REPOSITORY as REPOSITORY, PARAKEET_UNIFIED_REVISION as REVISION,
+};
+
+/// Bytes the pinned files add up to (the helper's pin list, which leaves out
+/// the repository's README).
+pub const BYTES: u64 = 614_080_920;
+
+/// The model card, which states the license, at the pinned revision.
+#[must_use]
+pub fn license_url() -> String {
+    format!("https://huggingface.co/{REPOSITORY}/blob/{REVISION}/README.md")
+}
+
+/// Whether a saved model choice names Parakeet Unified.
+#[must_use]
+pub fn is_engine(model: &str) -> bool {
+    model.trim() == ENGINE
+}
+
+/// The helper's model store: beside the Whisper files, in a folder of its own.
+#[must_use]
+pub fn models_root(data_root: &Path) -> PathBuf {
+    crate::stt::models_dir(data_root).join("speechd")
+}
+
+/// Whether the pinned revision is in the store, by the layout the protocol
+/// fixes (`<models-root>/<model>/<revision>/`). Unchecked: the helper checks
+/// every file's size when it loads.
+#[must_use]
+pub fn present(data_root: &Path) -> bool {
+    models_root(data_root).join(ENGINE).join(REVISION).is_dir()
+}
+
+/// How to start the helper.
+#[derive(Debug, Clone)]
+pub struct Launch {
+    /// The executable.
+    pub program: PathBuf,
+    /// Arguments after `serve --models-root <dir>`; empty in production.
+    pub extra_args: Vec<OsString>,
+}
+
+impl Launch {
+    /// The helper bundled with the app (`Contents/Helpers/fotw-speechd`), or
+    /// `FOTW_SPEECHD_PATH`.
+    ///
+    /// # Errors
+    ///
+    /// When this build has no helper.
+    pub fn bundled() -> Result<Self, String> {
+        fotw_speechd_client::locate_helper()
+            .map(|program| Self {
+                program,
+                extra_args: Vec::new(),
+            })
+            .ok_or_else(|| {
+                "Parakeet Unified runs in the speech helper (fotw-speechd), which this build of \
+                 FlyOnTheWall does not include. Choose a Whisper model in Transcription settings, \
+                 or use a build with the helper."
+                    .to_owned()
+            })
+    }
+
+    fn config(&self, data_root: &Path) -> SpeechdConfig {
+        let mut config = SpeechdConfig::new(&self.program, models_root(data_root));
+        config.client_name = concat!("fotwd/", env!("CARGO_PKG_VERSION")).to_owned();
+        for arg in &self.extra_args {
+            config = config.arg(arg.clone());
+        }
+        config
+    }
+}
+
+/// Start the helper, load Parakeet Unified and warm it up, ready for a
+/// recording. Returns the engine and the revision to record as provenance.
+///
+/// # Errors
+///
+/// When the model is not installed (with how to install it), or the helper
+/// does not start, load or answer.
+pub async fn prepare(
+    launch: &Launch,
+    data_root: &Path,
+) -> Result<(Arc<SpeechdEngine>, String), String> {
+    let client = SpeechdClient::start(launch.config(data_root))
+        .await
+        .map_err(|e| format!("Could not start the speech helper for Parakeet Unified: {e}"))?;
+    let engine = SpeechdEngine::prepare(client, ENGINE)
+        .await
+        .map_err(|e| match e.detail {
+            Some(detail) if e.class != fotw_stt::SttErrorClass::Unsupported => {
+                format!("{} ({detail})", e.message)
+            }
+            _ => e.message,
+        })?;
+    let revision = engine.revision().to_owned();
+    Ok((Arc::new(engine), revision))
+}
+
+/// Install progress, in the helper's words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstallProgress {
+    /// Downloading or checking.
+    pub phase: ProgressPhase,
+    /// Bytes done.
+    pub bytes: u64,
+    /// Bytes in all.
+    pub total: u64,
+}
+
+/// Explicit setup: have the helper download Parakeet Unified at its pinned
+/// revision, or import it from `from` (a copy of the repository's files)
+/// without opening a socket. Blocks; run it on a worker. Every file is
+/// checked against its pin before the revision is selected, and a failure
+/// leaves any previous install as it was.
+///
+/// `cancelled` is polled while the helper works; when it turns true the
+/// helper is stopped and nothing is selected.
+///
+/// # Errors
+///
+/// When the helper is missing or refuses, or setup is cancelled.
+pub fn install(
+    launch: &Launch,
+    data_root: &Path,
+    from: Option<&Path>,
+    cancelled: &dyn Fn() -> bool,
+    progress: &mut dyn FnMut(InstallProgress),
+) -> Result<String, String> {
+    let root = models_root(data_root);
+    crate::model_setup::private_dir(&root)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    runtime.block_on(async {
+        let client = SpeechdClient::start(launch.config(data_root))
+            .await
+            .map_err(|e| format!("Could not start the speech helper: {e}"))?;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let install = client.install(ENGINE, from, Some(tx));
+        tokio::pin!(install);
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(200));
+        let result = loop {
+            tokio::select! {
+                result = &mut install => break result,
+                Some(p) = rx.recv() => progress(InstallProgress {
+                    phase: p.phase,
+                    bytes: p.bytes.unwrap_or(0),
+                    total: p.total.unwrap_or(BYTES),
+                }),
+                _ = ticker.tick() => if cancelled() {
+                    client.shutdown().await;
+                    return Err("Model setup cancelled; previous model preserved".to_owned());
+                },
+            }
+        };
+        client.shutdown().await;
+        let revision = result.map_err(|e| format!("Parakeet Unified was not installed: {e}"))?;
+        if revision != REVISION {
+            return Err(format!(
+                "the speech helper installed revision {revision}, but this build expects {REVISION}"
+            ));
+        }
+        Ok(revision)
+    })
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    //! The model-free helper for the daemon's tests.
+    use super::*;
+
+    /// `target/<profile>/fotw-speechd-fake`, built on first use when this
+    /// test binary was built on its own.
+    pub(crate) fn fake_helper() -> PathBuf {
+        static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        PATH.get_or_init(|| {
+            let exe = std::env::current_exe().unwrap();
+            let path = exe
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("fotw-speechd-fake");
+            if !path.is_file() {
+                let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+                let status = std::process::Command::new(cargo)
+                    .args([
+                        "build",
+                        "-p",
+                        "fotw-speechd-client",
+                        "--bin",
+                        "fotw-speechd-fake",
+                    ])
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "could not build fotw-speechd-fake");
+            }
+            path
+        })
+        .clone()
+    }
+
+    /// The fake, serving `parakeet-unified` at the pinned revision; installed
+    /// when `<models_root>/parakeet-unified/<revision>` exists.
+    pub(crate) fn fake_launch() -> Launch {
+        Launch {
+            program: fake_helper(),
+            extra_args: vec![
+                "--fake-engines".into(),
+                "--pinned".into(),
+                format!("{ENGINE}@{REVISION}").into(),
+            ],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::fake_launch;
+    use super::*;
+
+    #[test]
+    fn install_selects_the_pinned_revision_and_prepare_then_loads_it() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(!present(root.path()));
+        let mut seen = Vec::new();
+        let revision = install(&fake_launch(), root.path(), None, &|| false, &mut |p| {
+            seen.push(p.phase);
+        })
+        .unwrap();
+        assert_eq!(revision, REVISION);
+        assert!(present(root.path()));
+        assert!(seen.contains(&ProgressPhase::Verify), "{seen:?}");
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (engine, revision) = runtime
+            .block_on(prepare(&fake_launch(), root.path()))
+            .unwrap();
+        assert_eq!(revision, REVISION);
+        use fotw_stt::RecognizerFactory;
+        assert_eq!(engine.model(), ENGINE);
+        assert_eq!(engine.provider(), fotw_stt::speechd::PROVIDER);
+    }
+
+    #[test]
+    fn the_license_is_shown_from_the_pinned_model_card() {
+        assert_eq!(LICENSE, "CC-BY-4.0");
+        assert!(license_url().starts_with("https://huggingface.co/FluidInference/"));
+        assert!(license_url().contains(REVISION));
+    }
+}
