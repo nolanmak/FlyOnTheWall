@@ -316,6 +316,8 @@ pub struct DaemonRecorder {
     live: Arc<Mutex<Option<Live>>>,
     start_visibility: Option<StartVisibility>,
     lifecycle: Arc<crate::recorder_lifecycle::Lifecycle>,
+    /// The post-meeting cleanup worker (#246), bound once the daemon has one.
+    post_pass: Arc<std::sync::OnceLock<Arc<crate::post_pass::controller::Controller>>>,
 }
 
 impl std::fmt::Debug for DaemonRecorder {
@@ -570,6 +572,7 @@ impl DaemonRecorder {
             finish,
             self.on_ready.clone(),
             pending.work.take().expect("accepted work owner"),
+            self.post_pass.get().cloned(),
         ));
         pending.armed = false;
 
@@ -699,6 +702,7 @@ impl DaemonRecorder {
             live: Arc::new(Mutex::new(None)),
             start_visibility: None,
             lifecycle: Arc::default(),
+            post_pass: Arc::default(),
         }
     }
 
@@ -723,6 +727,12 @@ impl DaemonRecorder {
     pub const fn with_finish_deadlines(mut self, deadlines: FinishDeadlines) -> Self {
         self.finish_deadlines = deadlines;
         self
+    }
+
+    /// Bind the post-meeting cleanup worker (#246). Sessions stopped from
+    /// now on queue their meeting and wait for it before summarizing.
+    pub fn set_post_pass(&self, controller: Arc<crate::post_pass::controller::Controller>) {
+        let _ = self.post_pass.set(controller);
     }
 
     /// Require native visibility before any transcription configuration or tap
@@ -1022,6 +1032,7 @@ async fn spawn_session(
     finish: Arc<Finisher>,
     on_ready: ReadyTap,
     mut work: crate::recorder_lifecycle::WorkLease,
+    post_pass: Option<Arc<crate::post_pass::controller::Controller>>,
 ) {
     // Prebuilt taps run the session that hands them over pre-started; the
     // supervised backend runs the one that builds a per-leg supervisor and
@@ -1146,6 +1157,20 @@ async fn spawn_session(
     // Persist/enrichment do not wait for a retained native worker. Once that
     // worker releases, a fresh meeting may start while enrichment continues.
     if let Some(meeting_id) = persisted {
+        // Summaries and the GitHub push wait for the cleaned transcript, for
+        // at most 15 minutes; then they use the live one (#246).
+        if let Some(cleanup) = post_pass {
+            let queued = cleanup.after_stop(&meeting_id);
+            journal::record(&format!("cleanup  : meeting {meeting_id} {queued:?}"));
+            if queued == crate::post_pass::Queued::Yes {
+                let wait = Duration::from_millis(fotw_store::POST_PASS_WAIT_MS as u64);
+                if !cleanup.wait(&meeting_id, wait).await {
+                    journal::record(&format!(
+                        "cleanup  : meeting {meeting_id} still running; summarizing the live transcript"
+                    ));
+                }
+            }
+        }
         enrich_and_announce(&root, &meeting_id, &on_ready).await;
     }
 }

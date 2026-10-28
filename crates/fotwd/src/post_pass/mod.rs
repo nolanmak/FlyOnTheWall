@@ -32,6 +32,7 @@ pub mod controller;
 pub mod engine;
 pub mod job;
 pub mod merge;
+pub mod speechd_engine;
 pub mod turns;
 pub mod web;
 pub mod windows;
