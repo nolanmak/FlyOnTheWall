@@ -502,4 +502,50 @@ mod tests {
         assert_eq!(left, 0);
         assert!(db.post_pass_job(&meeting).unwrap().is_none());
     }
+
+    #[test]
+    fn exports_carry_both_versions_and_where_each_came_from() {
+        let (mut db, meeting, live) = db_with_meeting();
+        db.post_pass_queue(&meeting, "{}").unwrap();
+        let provenance = r#"{"engines":{"asr":"parakeet-unified@d32e","vad":"silero-v5.1.2@2994","diarizer":"diarizer@abc"},"window_ms":30000,"overlap_ms":2000,"speaker_labels":true}"#;
+        let mut cleaned = seg(0, "clean words");
+        cleaned.channel = "system".into();
+        cleaned.speaker_label = Some("S1".into());
+        let cleaned_id = db
+            .post_pass_complete(
+                &meeting,
+                "fotw-speechd",
+                "parakeet-unified+diarizer",
+                &[cleaned],
+                provenance,
+                None,
+            )
+            .unwrap();
+
+        let markdown = db.export_meeting(&meeting).unwrap().to_markdown();
+        let shown = markdown.find("S1: clean words").expect("cleaned lines");
+        let other = markdown.find("## Live transcript").expect("live version");
+        assert!(shown < other, "{markdown}");
+        assert!(markdown[other..].contains("me: live words"), "{markdown}");
+        assert!(markdown.contains("parakeet-unified@d32e"), "{markdown}");
+        assert!(
+            markdown.contains("30 s windows with 2 s overlap, with speaker labels"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains(
+                "Live: transcribed during the meeting by fotw-speechd / parakeet-unified"
+            ),
+            "{markdown}"
+        );
+
+        // "Show live transcript": the export follows what is shown.
+        db.meetings().set_primary_transcript(&live).unwrap();
+        let text = db.export_meeting(&meeting).unwrap().to_plain_text();
+        let shown = text.find("me: live words").expect("live lines");
+        let other = text.find("Cleaned transcript\n").expect("cleaned version");
+        assert!(shown < other, "{text}");
+        assert!(text.contains("Live (shown above)"), "{text}");
+        assert_ne!(cleaned_id, live);
+    }
 }
