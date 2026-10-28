@@ -32,6 +32,7 @@ test('settings entry opens and scrolls the requested available section only',()=
     assert.equal(vm.runInContext('openRequestedSettings()',h.ctx),true);
     assert.equal(h.node(id).open,true);
     assert.equal(h.node(id).scrolls,1);
+    assert.equal(h.node('settings-panel').open,true,'the collapsed Settings panel must open around the section');
     const other = id === 'speech-settings' ? 'sum-settings' : 'speech-settings';
     assert.equal(h.node(other).open,false);
   }
