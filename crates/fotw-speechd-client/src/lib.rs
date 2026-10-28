@@ -17,12 +17,14 @@
 mod client;
 pub mod frame;
 pub mod message;
+mod pacing;
 pub mod restart;
 
 pub use client::{
     ClientError, Health, Loaded, Progress, SpeechStream, SpeechdClient, SpeechdConfig, Status,
     StreamConfig, StreamEvent, StreamFailure,
 };
+pub use pacing::DIARIZATION_MAX_UNACKED_MS;
 pub use restart::RestartPolicy;
 
 use std::ffi::OsString;
