@@ -22,6 +22,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use fotw_stt::{Source, StreamEvent, TimestampSource, TranscriptSegment};
 use tokio::sync::mpsc;
@@ -77,8 +78,27 @@ pub struct CaptionSession {
     pub events: mpsc::Receiver<CaptionEvent>,
 }
 
+/// Why a caption stream did not open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenError {
+    /// Every engine instance is in use for now (a stream that just ended is
+    /// still handing its instance back). Retried, never counted as a failure.
+    Busy(String),
+    /// The engine failed. Counts toward pausing captions.
+    Failed(String),
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy(m) | Self::Failed(m) => f.write_str(m),
+        }
+    }
+}
+
 /// Future returned by [`CaptionEngine::open`].
-pub type OpenFuture<'a> = Pin<Box<dyn Future<Output = Result<CaptionSession, String>> + Send + 'a>>;
+pub type OpenFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<CaptionSession, OpenError>> + Send + 'a>>;
 
 /// Something that can open caption streams.
 pub trait CaptionEngine: Send + Sync + 'static {
@@ -131,12 +151,19 @@ impl CaptionEngine for SpeechdCaptions {
                         .map(|_| ())
                         .map_err(|e| e.to_string())
                 })
-                .await?;
+                .await
+                .map_err(|e: String| OpenError::Failed(e))?;
             let mut stream = self
                 .client
                 .open_stream(StreamConfig::new(&self.engine, 16_000))
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| match e {
+                    fotw_speechd_client::ClientError::Remote {
+                        code: fotw_speechd_client::message::ErrorCode::Busy,
+                        message,
+                    } => OpenError::Busy(message),
+                    other => OpenError::Failed(other.to_string()),
+                })?;
             let (audio, mut pcm) = mpsc::channel::<Vec<i16>>(FEED_QUEUE);
             let (events, receiver) = mpsc::channel(256);
             tokio::spawn(async move {
@@ -250,13 +277,25 @@ pub fn start(leg: CaptionLeg) -> CaptionFeed {
     }
 }
 
-/// The open caption stream: its session, the leg sample it started at, and
-/// its number within the recording (for segment ids).
+/// The open caption stream: its session, the leg sample its first audio was
+/// at (once it has had any), and its number within the recording (for
+/// segment ids).
 struct Open {
     session: CaptionSession,
-    base: u64,
+    base: Option<u64>,
     generation: u64,
 }
+
+/// After a failed or refused open, how long to wait before the next try.
+const RETRY_AFTER: Duration = Duration::from_millis(500);
+
+/// How long to let an ending stream deliver its last captions and hand its
+/// engine instance back before the next stream opens.
+const CLOSE_WAIT: Duration = Duration::from_secs(2);
+
+/// An open that takes longer than this (the first one loads and warms the
+/// model) has let stale audio queue up behind it.
+const SLOW_OPEN: Duration = Duration::from_millis(50);
 
 async fn run(leg: CaptionLeg, mut audio: mpsc::Receiver<(u64, Vec<i16>)>) {
     let model = leg.engine.model();
@@ -264,6 +303,7 @@ async fn run(leg: CaptionLeg, mut audio: mpsc::Receiver<(u64, Vec<i16>)>) {
     let mut next_sample = 0u64;
     let mut generation = 0u64;
     let mut errors = 0u32;
+    let mut retry_at: Option<tokio::time::Instant> = None;
     (leg.state)(leg.source, CaptionState::Live);
     loop {
         tokio::select! {
@@ -271,25 +311,53 @@ async fn run(leg: CaptionLeg, mut audio: mpsc::Receiver<(u64, Vec<i16>)>) {
                 // The leg ended: let the open stream commit what it has.
                 let Some((start, pcm)) = chunk else { break };
                 let len = pcm.len() as u64;
-                // A gap (dropped chunks) or no stream: start one here, so its
-                // clock lines up with the leg's again.
-                if open.is_none() || start != next_sample {
-                    open = None;
+                // A gap (dropped chunks): finish this stream, and only then
+                // start one on the leg's new position, so the old stream's
+                // engine instance is back before the new one asks for it.
+                if open.as_ref().is_some_and(|o| o.base.is_some())
+                    && start != next_sample
+                    && let Some(old) = open.take()
+                {
+                    finish(&leg, &model, old).await;
+                }
+                if open.is_none() {
+                    if retry_at.is_some_and(|at| tokio::time::Instant::now() < at) {
+                        continue;
+                    }
                     generation += 1;
+                    let opening = tokio::time::Instant::now();
                     match leg.engine.open().await {
-                        Ok(session) => open = Some(Open { session, base: start, generation }),
-                        Err(_) => {
+                        Ok(session) => {
+                            retry_at = None;
+                            open = Some(Open { session, base: None, generation });
+                            if opening.elapsed() > SLOW_OPEN {
+                                // Audio queued (and overflowed) while it
+                                // opened: drop it, and start on fresh audio
+                                // rather than on a gap that restarts at once.
+                                while audio.try_recv().is_ok() {}
+                                continue;
+                            }
+                        }
+                        Err(OpenError::Busy(_)) => {
+                            retry_at = Some(tokio::time::Instant::now() + RETRY_AFTER);
+                            continue;
+                        }
+                        Err(OpenError::Failed(_)) => {
                             errors += 1;
                             if errors >= MAX_CONSECUTIVE_ERRORS {
                                 break;
                             }
+                            retry_at = Some(tokio::time::Instant::now() + RETRY_AFTER);
+                            continue;
                         }
                     }
                 }
+                let Some(current) = open.as_mut() else { continue };
+                if current.base.is_none() {
+                    current.base = Some(start);
+                }
                 next_sample = start + len;
-                if let Some(current) = &open
-                    && current.session.audio.try_send(pcm).is_err()
-                {
+                if current.session.audio.try_send(pcm).is_err() {
                     // Behind: restart at the next chunk rather than drift.
                     next_sample = u64::MAX;
                 }
@@ -302,13 +370,12 @@ async fn run(leg: CaptionLeg, mut audio: mpsc::Receiver<(u64, Vec<i16>)>) {
                     None => std::future::pending().await,
                 }
             } => match event {
-                Some(CaptionEvent::Partial(text)) | Some(CaptionEvent::Final(text)) => {
+                Some(CaptionEvent::Partial(text) | CaptionEvent::Final(text)) => {
                     errors = 0;
-                    if let Some(current) = &open {
-                        let segment = caption_segment(&leg, &model, current, text);
-                        if leg.events.send(StreamEvent::Partial(segment)).is_err() {
-                            return;
-                        }
+                    if let Some(current) = &open
+                        && leg.events.send(StreamEvent::Partial(caption_segment(&leg, &model, current, text))).is_err()
+                    {
+                        return;
                     }
                 }
                 Some(CaptionEvent::Failed(_)) => {
@@ -317,6 +384,7 @@ async fn run(leg: CaptionLeg, mut audio: mpsc::Receiver<(u64, Vec<i16>)>) {
                     if errors >= MAX_CONSECUTIVE_ERRORS {
                         break;
                     }
+                    retry_at = Some(tokio::time::Instant::now() + RETRY_AFTER);
                 }
                 None => open = None,
             }
@@ -330,15 +398,24 @@ async fn run(leg: CaptionLeg, mut audio: mpsc::Receiver<(u64, Vec<i16>)>) {
         return;
     }
     // Leg ended normally: finish the stream and pass on its last captions.
-    if let Some(mut current) = open.take() {
-        let (closed, _) = mpsc::channel(1);
-        current.session.audio = closed;
-        while let Some(event) = current.session.events.recv().await {
-            if let CaptionEvent::Partial(text) | CaptionEvent::Final(text) = event {
-                let segment = caption_segment(&leg, &model, &current, text);
-                if leg.events.send(StreamEvent::Partial(segment)).is_err() {
-                    break;
-                }
+    if let Some(current) = open.take() {
+        finish(&leg, &model, current).await;
+    }
+}
+
+/// End a stream: no more audio, then its remaining captions until it closes
+/// (by which point its engine instance is free again), bounded.
+async fn finish(leg: &CaptionLeg, model: &str, mut current: Open) {
+    let (closed, _) = mpsc::channel(1);
+    current.session.audio = closed;
+    let deadline = tokio::time::Instant::now() + CLOSE_WAIT;
+    while let Ok(Some(event)) =
+        tokio::time::timeout_at(deadline, current.session.events.recv()).await
+    {
+        if let CaptionEvent::Partial(text) | CaptionEvent::Final(text) = event {
+            let segment = caption_segment(leg, model, &current, text);
+            if leg.events.send(StreamEvent::Partial(segment)).is_err() {
+                return;
             }
         }
     }
@@ -350,7 +427,7 @@ fn caption_segment(
     open: &Open,
     text: CaptionText,
 ) -> TranscriptSegment {
-    let base_ms = leg.anchor_ms + open.base / SAMPLES_PER_MS;
+    let base_ms = leg.anchor_ms + open.base.unwrap_or(0) / SAMPLES_PER_MS;
     let source = match leg.source {
         Source::System => "system",
         Source::Mic => "mic",
@@ -380,7 +457,6 @@ fn caption_segment(
 mod tests {
     use super::*;
     use std::sync::Mutex;
-    use std::time::Duration;
 
     /// A caption engine scripted per opened stream: each stream echoes a
     /// partial per audio chunk ("<n> samples"), or fails on open or on its
@@ -390,11 +466,18 @@ mod tests {
         Echo,
         FailOnOpen,
         FailOnAudio,
+        /// Refused as busy, like a pool whose instance is not back yet.
+        Busy,
+        /// Echo, after a slow first open (load and warmup).
+        SlowOpen,
     }
 
     struct Scripted {
         scripts: Mutex<Vec<Script>>,
         opened: AtomicU64,
+        /// Streams open right now, and the most ever open at once.
+        live: Arc<AtomicU64>,
+        most_live: Arc<AtomicU64>,
     }
 
     impl Scripted {
@@ -402,6 +485,8 @@ mod tests {
             Arc::new(Self {
                 scripts: Mutex::new(scripts.iter().rev().copied().collect()),
                 opened: AtomicU64::new(0),
+                live: Arc::default(),
+                most_live: Arc::default(),
             })
         }
     }
@@ -415,12 +500,21 @@ mod tests {
             Box::pin(async move {
                 self.opened.fetch_add(1, Ordering::SeqCst);
                 let script = self.scripts.lock().unwrap().pop().unwrap_or(Script::Echo);
-                if script == Script::FailOnOpen {
-                    return Err("scripted open failure".into());
+                match script {
+                    Script::FailOnOpen => {
+                        return Err(OpenError::Failed("scripted open failure".into()));
+                    }
+                    Script::Busy => return Err(OpenError::Busy("scripted busy".into())),
+                    Script::SlowOpen => tokio::time::sleep(Duration::from_millis(300)).await,
+                    _ => {}
                 }
+                let live = self.live.clone();
+                let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                self.most_live.fetch_max(now, Ordering::SeqCst);
                 let (audio, mut pcm) = mpsc::channel::<Vec<i16>>(8);
                 let (events, receiver) = mpsc::channel(64);
                 tokio::spawn(async move {
+                    let _live = Live(live);
                     let mut samples = 0u64;
                     while let Some(chunk) = pcm.recv().await {
                         if script == Script::FailOnAudio {
@@ -450,6 +544,22 @@ mod tests {
                     events: receiver,
                 })
             })
+        }
+    }
+
+    /// Counts a scripted stream as live until its task ends.
+    struct Live(Arc<AtomicU64>);
+    impl Drop for Live {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Offer `count` 10 ms chunks, `every` apart.
+    async fn feed(feed: &CaptionFeed, count: usize, every: Duration) {
+        for _ in 0..count {
+            feed.offer(&[1; 160]);
+            tokio::time::sleep(every).await;
         }
     }
 
@@ -514,11 +624,8 @@ mod tests {
         let engine = Scripted::new(&[Script::FailOnOpen, Script::FailOnAudio, Script::FailOnOpen]);
         let (leg, mut rx, states) = leg(engine.clone());
         let feed = start(leg);
-        for _ in 0..20 {
-            feed.offer(&[1; 160]);
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Opens are retried 500 ms apart.
+        self::feed(&feed, 40, Duration::from_millis(50)).await;
         assert_eq!(
             *states.lock().unwrap(),
             vec![CaptionState::Live, CaptionState::Paused]
@@ -538,9 +645,7 @@ mod tests {
         let engine = Scripted::new(&[Script::FailOnOpen, Script::FailOnOpen, Script::Echo]);
         let (leg, mut rx, states) = leg(engine);
         let feed = start(leg);
-        for _ in 0..3 {
-            feed.offer(&[1; 160]);
-        }
+        self::feed(&feed, 30, Duration::from_millis(50)).await;
         let caption = next(&mut rx).await;
         assert!(caption.text.ends_with("samples"));
         assert_eq!(*states.lock().unwrap(), vec![CaptionState::Live]);
@@ -556,7 +661,11 @@ mod tests {
         // Chunks the caption task never sees, as when its queue was full.
         feed.position.fetch_add(16_000, Ordering::Relaxed);
         feed.offer(&[1; 160]);
-        let after = next(&mut rx).await;
+        // The old stream is finished first and may deliver its last caption.
+        let mut after = next(&mut rx).await;
+        while after.id == first.id {
+            after = next(&mut rx).await;
+        }
         assert_eq!(
             engine.opened.load(Ordering::SeqCst),
             2,
@@ -571,5 +680,71 @@ mod tests {
             after.id, first.id,
             "a new stream's utterances are new captions"
         );
+    }
+
+    #[tokio::test]
+    async fn busy_engines_are_waited_out_and_never_pause_captions() {
+        // #245 review: right after a restart the engine instance may not be
+        // back yet; that is not a failure.
+        let engine = Scripted::new(&[
+            Script::Busy,
+            Script::Busy,
+            Script::Busy,
+            Script::Busy,
+            Script::Echo,
+        ]);
+        let (leg, mut rx, states) = leg(engine.clone());
+        let feed = start(leg);
+        self::feed(&feed, 60, Duration::from_millis(50)).await;
+        assert!(next(&mut rx).await.text.ends_with("samples"));
+        assert_eq!(*states.lock().unwrap(), vec![CaptionState::Live]);
+        assert_eq!(
+            engine.opened.load(Ordering::SeqCst),
+            5,
+            "retried 500 ms apart, not every chunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gap_finishes_the_old_stream_before_the_next_one_opens() {
+        let engine = Scripted::new(&[Script::Echo, Script::Echo]);
+        let (leg, mut rx, _) = leg(engine.clone());
+        let feed = start(leg);
+        feed.offer(&[1; 160]);
+        let _ = next(&mut rx).await;
+        feed.position.fetch_add(16_000, Ordering::Relaxed);
+        feed.offer(&[1; 160]);
+        // The old stream's last caption, then the new stream's first.
+        let _ = next(&mut rx).await;
+        let _ = next(&mut rx).await;
+        assert_eq!(engine.opened.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            engine.most_live.load(Ordering::SeqCst),
+            1,
+            "never two streams at once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_first_open_starts_on_fresh_audio_instead_of_restarting() {
+        // #245 review: the first open loads and warms the model while the
+        // 64-chunk queue overflows; that must not restart the stream at once.
+        let engine = Scripted::new(&[Script::SlowOpen]);
+        let (leg, mut rx, states) = leg(engine.clone());
+        let feed = start(leg);
+        for _ in 0..200 {
+            feed.offer(&[1; 160]);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let caption = next(&mut rx).await;
+        assert!(caption.text.ends_with("samples"));
+        self::feed(&feed, 10, Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            engine.opened.load(Ordering::SeqCst),
+            1,
+            "one stream, no restart"
+        );
+        assert_eq!(*states.lock().unwrap(), vec![CaptionState::Live]);
     }
 }

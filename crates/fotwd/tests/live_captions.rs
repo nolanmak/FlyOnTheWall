@@ -16,7 +16,9 @@ use fotw_audio::wav::WavData;
 use fotw_audio::{AudioTap, SampleFormat, StreamFormat, TapId};
 use fotw_stt::{Recognized, Recognizer, RecognizerFactory, SttError, TranscriptSegment};
 use fotw_web::recorder::CaptionStatus;
-use fotwd::captions::{CaptionEngine, CaptionEvent, CaptionSession, CaptionText, OpenFuture};
+use fotwd::captions::{
+    CaptionEngine, CaptionEvent, CaptionSession, CaptionText, OpenError, OpenFuture,
+};
 use fotwd::session::{self, LocalLegs, SegmentTap, SessionControl, TapKind, Transcription};
 use tokio::sync::mpsc;
 
@@ -90,7 +92,7 @@ impl CaptionEngine for Captions {
         let fail = self.fail;
         Box::pin(async move {
             if fail {
-                return Err("scripted caption failure".into());
+                return Err(OpenError::Failed("scripted caption failure".into()));
             }
             let (audio, mut pcm) = mpsc::channel::<Vec<i16>>(64);
             let (events, receiver) = mpsc::channel(256);

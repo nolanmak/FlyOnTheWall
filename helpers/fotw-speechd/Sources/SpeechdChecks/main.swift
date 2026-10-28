@@ -274,6 +274,17 @@ func aPoolLendsWarmedInstancesUpToItsCapacity() async throws {
         try expect(error.code == "busy", "still busy after the wait: \(error)")
     }
     try expect(ContinuousClock.now - started >= .milliseconds(100), "waited before refusing")
+
+    // Unload while streams still hold instances: drain releases the idle
+    // ones, and each lent one is handed back for release when it returns.
+    let drainable = try await SessionPool<Int>(capacity: 2, make: { 9 }, warm: { _ in })
+    let lent = try await drainable.checkout()
+    let idleAtUnload = await drainable.drain()
+    try expect(idleAtUnload.count == 1, "the idle instance is released at unload")
+    let returned = await drainable.checkin(lent)
+    try expect(returned == lent, "a lent instance coming back after unload is handed back to release")
+    let left = await drainable.available
+    try expect(left == 0, "the drained pool keeps nothing")
 }
 
 func pinsAreComplete() throws {

@@ -2641,6 +2641,11 @@ fn spawn_leg_collector(
     speech: crate::speech_status::SpeechMonitor,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // The end of the last final on this leg. A live caption (#245)
+        // commits after its own end-of-utterance debounce, often after the
+        // final engine's text for the same speech has landed; one that starts
+        // before this mark would bring back a grey row the final replaced.
+        let mut covered_ms = 0u64;
         while let Some(ev) = rx.recv().await {
             speech.observe_legacy(
                 if leg == "system" {
@@ -2652,6 +2657,7 @@ fn spawn_leg_collector(
             );
             match ev {
                 StreamEvent::Final(seg) => {
+                    covered_ms = covered_ms.max(seg.end_ms);
                     // Live first, then the buffer: a viewer watching the
                     // meeting should not be behind the file on disk.
                     tap.emit(&seg, TapKind::Final);
@@ -2662,6 +2668,8 @@ fn spawn_leg_collector(
                 // dropping them here is why the "live" transcript only
                 // moved at utterance boundaries — one to three seconds
                 // after the speaker paused, which reads as "not realtime".
+                StreamEvent::Partial(seg)
+                    if seg.provider == crate::captions::PROVIDER && seg.start_ms < covered_ms => {}
                 StreamEvent::Partial(seg) => tap.emit(&seg, TapKind::Partial),
                 StreamEvent::Error(e) => {
                     crate::diag!("  ! transcription ({leg}): {e}");
@@ -5547,6 +5555,77 @@ mod local_collector_shutdown_tests {
         assert!(
             completed,
             "stalled inference sender must not hold a closed session collector alive"
+        );
+    }
+
+    fn caption(utterance: u64, start_ms: u64, end_ms: u64, text: &str) -> TranscriptSegment {
+        TranscriptSegment {
+            id: format!("caption-system-1-{utterance}"),
+            session_id: "s".into(),
+            source: Source::System,
+            speaker: None,
+            text: text.into(),
+            start_ms,
+            end_ms,
+            words: Vec::new(),
+            confidence: None,
+            language: None,
+            is_final: false,
+            revision: 0,
+            provider: crate::captions::PROVIDER.into(),
+            model: "captions".into(),
+            timestamp_source: fotw_stt::TimestampSource::Estimated,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_caption_arriving_after_the_final_text_it_covers_is_not_shown_again() {
+        // #245 review: the caption engine commits ~640 ms after an utterance
+        // ends, the final engine ~190 ms after; its late caption must not
+        // bring back a grey row the final text already replaced.
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let tapped = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = tapped.clone();
+        let task = spawn_leg_collector(
+            "system",
+            receiver,
+            Arc::default(),
+            SttErrors::default(),
+            SegmentTap::new(move |seg, kind| seen.lock().unwrap().push((seg.text.clone(), kind))),
+            crate::speech_status::SpeechMonitor::default(),
+        );
+        let mut final_text = caption(0, 1_000, 3_000, "Hello there.");
+        final_text.is_final = true;
+        final_text.provider = "parakeet-unified".into();
+        sender
+            .send(StreamEvent::Partial(caption(1, 1_000, 2_000, "hello")))
+            .unwrap();
+        sender.send(StreamEvent::Final(final_text)).unwrap();
+        sender
+            .send(StreamEvent::Partial(caption(
+                1,
+                1_000,
+                3_000,
+                "hello there",
+            )))
+            .unwrap();
+        sender
+            .send(StreamEvent::Partial(caption(2, 3_200, 3_600, "how")))
+            .unwrap();
+        sender
+            .send(StreamEvent::State(fotw_stt::StreamState::Closed))
+            .unwrap();
+        task.await.unwrap();
+        let texts: Vec<_> = tapped
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(t, _)| t.clone())
+            .collect();
+        assert_eq!(
+            texts,
+            ["hello", "Hello there.", "how"],
+            "the late caption is dropped, the next kept"
         );
     }
 }

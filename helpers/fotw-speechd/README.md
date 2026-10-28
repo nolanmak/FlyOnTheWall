@@ -81,6 +81,7 @@ check leaves the previous selection as it was. Loading reads local files only.
 | `parakeet-unified` | CC BY 4.0 |
 | `silero-vad` | MIT |
 | `parakeet-eou-320ms` (live captions, #245) | NVIDIA Open Model License |
+| `parakeet-eou-160ms` (live captions, faster variant, not the default) | NVIDIA Open Model License |
 | `nemotron-3.5-2240ms` (pinned; engine in Murmur #100) | OpenMDW-1.1 |
 
 ## Real-model suite

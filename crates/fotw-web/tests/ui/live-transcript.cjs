@@ -501,3 +501,14 @@ test('paused live captions are reported on the source without implying lost tran
  h.ctx.renderRecording({state:'recording',session_id:'cap',started_at_ms:1000,speech_status:[speechStatus({provider:'whispercpp',model:'small.en',state:'local',captions:'live'})]});
  assert.doesNotMatch(panel.textContent,/paused/);
 });
+test('a live caption arriving after the final text that covers it stays gone',()=>{
+ // #245 review: the caption engine commits after the final engine has landed.
+ const h=harness();start(h);h.nodes.get('detail').scrollTop=900;const rows=()=>h.document.getElementById('segments').textContent;
+ h.ctx.appendDeltas([caption(1,17000,'hello'),d(0,17000,'Hello there.'),caption(1,17000,'hello there')]);
+ assert.match(rows(),/Hello there\./);assert.doesNotMatch(rows(),/hello there/);
+ // A suppressed echo's clearing partial covers the mic channel the same way.
+ h.ctx.appendDeltas([{...d(-1,20000,'','mic'),is_final:false},caption(1,20000,'echo','mic')]);
+ assert.doesNotMatch(rows(),/echo/);
+ // The next utterance still shows.
+ h.ctx.appendDeltas([caption(2,18500,'how are')]);assert.match(rows(),/how are/);
+});

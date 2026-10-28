@@ -10,6 +10,7 @@ import Foundation
 public actor SessionPool<Instance: Sendable> {
     private var idle: [Instance] = []
     private var lent = 0
+    private var drained = false
     public let capacity: Int
 
     /// Build `capacity` instances with `make`, one after another, warming each.
@@ -50,18 +51,24 @@ public actor SessionPool<Instance: Sendable> {
         }
     }
 
-    /// Take an instance back. The caller has reset it.
-    public func checkin(_ instance: Instance) {
+    /// Take an instance back. The caller has reset it. After `drain()` the
+    /// pool keeps nothing: the instance is returned for the caller to release.
+    @discardableResult
+    public func checkin(_ instance: Instance) -> Instance? {
         lent -= 1
+        if drained { return instance }
         idle.append(instance)
+        return nil
     }
 
     public var available: Int { idle.count }
     public var inUse: Int { lent }
 
-    /// Every instance, idle ones only, for shutdown. Lent ones are released
-    /// by their streams' close.
+    /// The idle instances, for release at unload. Instances still lent out
+    /// come back through `checkin`, which hands them to their stream's close
+    /// to release from then on.
     public func drain() -> [Instance] {
+        drained = true
         defer { idle.removeAll() }
         return idle
     }

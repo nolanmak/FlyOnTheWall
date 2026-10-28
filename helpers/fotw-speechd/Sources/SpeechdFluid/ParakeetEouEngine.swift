@@ -67,18 +67,20 @@ public actor ParakeetEouEngine: SpeechEngine {
     /// chunk through an idle one so an explicit warmup still does work.
     public func warmup() async throws {
         guard let pool = await lifecycle.current else { throw SpeechdError.notLoaded(descriptor.id) }
-        let manager = try await pool.checkout()
+        // Both instances may be streaming; they were warmed at load, so a
+        // warmup that finds none idle has nothing left to do.
+        guard let manager = try? await pool.checkout(within: .milliseconds(200)) else { return }
         do {
             _ = try await manager.process(audioBuffer: try pcmBuffer(
                 [Float](repeating: 0, count: chunkSize.chunkSamples)))
             _ = try await manager.finish()
         } catch {
             await manager.reset()
-            await pool.checkin(manager)
+            if let stale = await pool.checkin(manager) { await stale.cleanup() }
             throw error
         }
         await manager.reset()
-        await pool.checkin(manager)
+        if let stale = await pool.checkin(manager) { await stale.cleanup() }
     }
 
     public func unload() async {
@@ -182,7 +184,8 @@ final class EouSession: EngineSession, @unchecked Sendable {
         await manager.setPartialCallback { _ in }
         await manager.setEouCallback { _ in }
         await manager.reset()
-        await pool.checkin(manager)
+        // After an unload the pool keeps nothing: release the model here.
+        if let stale = await pool.checkin(manager) { await stale.cleanup() }
     }
 
     /// End the current utterance with `text` and start the next one.

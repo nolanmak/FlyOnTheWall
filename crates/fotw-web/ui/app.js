@@ -865,6 +865,9 @@ function speechOrigin(segments) {
 let liveSessionId = null;
 let liveFinals = new Map();
 let livePartials = new Map();
+// Per channel: the end of the latest final or clearing event. A live caption
+// starting before it is late text for speech the final already covers (#245).
+let liveCovered = new Map();
 let liveHistoryMissing = false;
 let liveSnapshotOrigin = null;
 let liveSavedMeetingId = null;
@@ -873,6 +876,7 @@ function selectLiveSession(id) {
   liveSessionId = id;
   liveFinals = new Map();
   livePartials = new Map();
+  liveCovered = new Map();
   liveSegments = [];
   liveHistoryMissing = false;
   liveSnapshotOrigin = null;
@@ -912,6 +916,7 @@ function partialKey(d) {
   return d.utterance ? d.channel + "#" + d.utterance : d.channel;
 }
 function clearCoveredPartials(channel, endMs) {
+  liveCovered.set(channel, Math.max(liveCovered.get(channel) || 0, endMs));
   for (const [key, partial] of livePartials) {
     if (partial.channel === channel && partial.start_ms < endMs) livePartials.delete(key);
   }
@@ -921,6 +926,7 @@ function appendDeltas(deltas) {
   for (const d of deltas) {
     if (!liveSessionId || d.meeting_id !== liveSessionId) continue;
     if (d.is_final === false) {
+      if (d.utterance && d.start_ms < (liveCovered.get(d.channel) || 0)) continue;
       if (d.text) livePartials.set(partialKey(d), d);
       else if (d.utterance) livePartials.delete(partialKey(d));
       else {
