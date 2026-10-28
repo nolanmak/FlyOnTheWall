@@ -113,6 +113,9 @@ pub enum MeetingReadyReason {
     Persisted,
     /// Enrichment finished, so the title and summary are final.
     Enriched,
+    /// The post-meeting cleanup finished or stopped, so the transcript shown
+    /// may have changed (#246).
+    Cleaned,
 }
 
 /// The library-changed frame: a meeting is queryable, go and fetch it.

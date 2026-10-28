@@ -42,6 +42,7 @@ struct Inner {
     capture: OnceLock<Arc<dyn crate::capture::CaptureControl>>,
     speech_recovery: OnceLock<Arc<dyn crate::speech_recovery::SpeechRecoveryControl>>,
     documents: OnceLock<Arc<dyn crate::documents::DocumentControl>>,
+    cleanup: OnceLock<Arc<dyn crate::cleanup::CleanupControl>>,
 }
 
 impl std::fmt::Debug for dyn RecorderControl {
@@ -123,6 +124,16 @@ impl AppState {
         self.inner.speech.get().cloned()
     }
 
+    /// Attach the post-meeting cleanup before serving requests (#246).
+    pub fn set_cleanup(&self, control: Arc<dyn crate::cleanup::CleanupControl>) {
+        let _ = self.inner.cleanup.set(control);
+    }
+
+    /// Absent on read-only servers.
+    pub fn cleanup(&self) -> Option<Arc<dyn crate::cleanup::CleanupControl>> {
+        self.inner.cleanup.get().cloned()
+    }
+
     /// Attach the document generator before serving requests.
     pub fn set_documents(&self, control: Arc<dyn crate::documents::DocumentControl>) {
         let _ = self.inner.documents.set(control);
@@ -197,6 +208,7 @@ impl AppState {
                 speech: OnceLock::new(),
                 capture: OnceLock::new(),
                 speech_recovery: OnceLock::new(),
+                cleanup: OnceLock::new(),
                 tickets: TokenTable::new(WS_TICKET_TTL),
                 handoff: TokenTable::new(HANDOFF_TTL),
                 hub: Arc::new(DeltaHub::new()),

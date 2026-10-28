@@ -33,6 +33,7 @@ pub mod engine;
 pub mod job;
 pub mod merge;
 pub mod turns;
+pub mod web;
 pub mod windows;
 
 use std::path::{Path, PathBuf};
