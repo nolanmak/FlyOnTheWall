@@ -13,7 +13,10 @@ public enum FluidEngines {
             engines.append(SileroVadEngine(store: store, model: model))
         }
         if let model = PinnedModels.named("parakeet-eou-320ms") {
-            engines.append(ParakeetEouEngine(store: store, model: model))
+            engines.append(ParakeetEouEngine(store: store, model: model, chunkSize: .ms320))
+        }
+        if let model = PinnedModels.named("parakeet-eou-160ms") {
+            engines.append(ParakeetEouEngine(store: store, model: model, chunkSize: .ms160))
         }
         return engines
     }

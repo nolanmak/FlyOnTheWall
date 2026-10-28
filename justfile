@@ -88,6 +88,7 @@ speechd-real models_root corpus_dir:
     if [[ -n "${COREML_CACHE:-}" ]]; then args+=(--coreml-cache "$COREML_CACHE"); fi
     # #245: live-caption latency and CPU on a LibriSpeech corpus directory.
     if [[ -n "${CAPTIONS_CORPUS:-}" ]]; then args+=(--captions "$CAPTIONS_CORPUS"); fi
+    if [[ -n "${CAPTION_ENGINE:-}" ]]; then args+=(--caption-engine "$CAPTION_ENGINE"); fi
     CARGO_BUILD_JOBS={{jobs}} cargo run --release -p fotw-speechd-client --example speechd_real -- "${args[@]}"
 
 lint:

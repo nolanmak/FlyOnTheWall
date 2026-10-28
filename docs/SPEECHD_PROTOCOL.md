@@ -169,6 +169,7 @@ Error codes: `version_mismatch`, `protocol`, `bad_request`, `unknown_engine`,
 | `parakeet-unified` | batch | `FluidInference/parakeet-unified-en-0.6b-coreml` | CC-BY-4.0 |
 | `silero-vad` | vad | `FluidInference/silero-vad-coreml` | MIT |
 | `parakeet-eou-320ms` | streaming, pooled (#245) | `FluidInference/parakeet-realtime-eou-120m-coreml` | NVIDIA Open Model License |
+| `parakeet-eou-160ms` | streaming, pooled (#245, not the default) | same repository, its `160ms/` variant | NVIDIA Open Model License |
 | `nemotron-3.5` | streaming (planned, Murmur #100) | `FluidInference/Nemotron-3.5-ASR-Streaming-Multilingual-0.6b-CoreML` | OpenMDW-1.1 |
 
 Each engine states its per-stream bound as `max_audio_ms` in the
@@ -187,7 +188,9 @@ capabilities, and a stream past it fails with `too_long`.
   first partial needs about 630 ms of audio (one 320 ms-shift chunk). An
   utterance ends at the model's end-of-utterance signal, held for 640 ms;
   the instance is then reset for the next utterance, so up to one chunk at
-  the boundary is not captioned. Captions are display-only.
+  the boundary is not captioned. Captions are display-only. `parakeet-eou-160ms` is the
+  same model's 160 ms variant: about half the latency for about three times
+  the CPU (see #245 for both measured).
 - A **diarization** stream (#246) takes a whole channel of a meeting, up to
   `max_audio_ms` (4 hours for the planned `diarizer`). It processes audio as
   it arrives in bounded windows, as Muesli's `diarizeRecordedAudio` does, and

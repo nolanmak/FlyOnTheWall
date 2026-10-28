@@ -38,7 +38,15 @@ use serde_json::json;
 const SANDBOX: &str = "(version 1)(allow default)(deny network*)";
 const PARAKEET: &str = "parakeet-unified";
 const VAD: &str = "silero-vad";
-const CAPTIONS: &str = "parakeet-eou-320ms";
+/// The caption engine, `--caption-engine` (default `parakeet-eou-320ms`).
+static CAPTION_ENGINE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+fn caption_engine() -> &'static str {
+    CAPTION_ENGINE
+        .get()
+        .copied()
+        .unwrap_or("parakeet-eou-320ms")
+}
 /// 20 ms at 16 kHz: how the capture pipeline hands audio over.
 const FRAME: usize = 320;
 
@@ -80,6 +88,10 @@ fn args() -> Args {
             "--parakeet-from" => parakeet_from = Some(value()),
             "--coreml-cache" => coreml_cache = Some(value()),
             "--captions" => captions = Some(value()),
+            "--caption-engine" => {
+                let engine = value().to_string_lossy().into_owned();
+                let _ = CAPTION_ENGINE.set(Box::leak(engine.into_boxed_str()));
+            }
             "--cpu-minutes" => {
                 cpu_minutes = value()
                     .to_string_lossy()
@@ -347,7 +359,7 @@ async fn main() {
     let clips = corpus(&args.corpus);
     let mut gates: Vec<(String, bool, String)> = Vec::new();
     let engines: Vec<&str> = if args.captions.is_some() {
-        vec![PARAKEET, VAD, CAPTIONS]
+        vec![PARAKEET, VAD, caption_engine()]
     } else {
         vec![PARAKEET, VAD]
     };
@@ -394,7 +406,7 @@ async fn main() {
         }
         _ => false,
     };
-    let (cold, cold_ms, cold_watch) = ready(config(&args, true), &sockets, &engines).await;
+    let (cold, cold_ms, cold_watch) = ready(config(&args, true), &sockets, &[PARAKEET, VAD]).await;
     gates.push((
         "cold start to ready ≤ 30 s".into(),
         cold_ms <= Duration::from_secs(30),
@@ -417,7 +429,7 @@ async fn main() {
     let mut warm_ms = Vec::new();
     let mut warm = None;
     for _ in 0..5 {
-        let (client, took, watch) = ready(config(&args, true), &sockets, &engines).await;
+        let (client, took, watch) = ready(config(&args, true), &sockets, &[PARAKEET, VAD]).await;
         warm_ms.push(ms(took));
         if let Some((previous, previous_watch)) = warm.replace((client, watch)) {
             SpeechdClient::shutdown(&previous).await;
@@ -477,6 +489,20 @@ async fn main() {
 
     let mut caption_report = serde_json::Value::Null;
     if let Some(dir) = &args.captions {
+        // Loaded only now, so the #243 start-up gates above measure exactly
+        // what they always have.
+        let engine = caption_engine();
+        let loaded = Instant::now();
+        warm.load(engine)
+            .await
+            .unwrap_or_else(|e| panic!("load {engine}: {e}"));
+        warm.warmup(engine)
+            .await
+            .unwrap_or_else(|e| panic!("warmup {engine}: {e}"));
+        eprintln!(
+            "captions: {engine} loaded and warmed in {} ms",
+            ms(loaded.elapsed())
+        );
         caption_report = captions(&warm, dir, args.cpu_minutes, &mut gates).await;
     }
 
@@ -551,7 +577,7 @@ async fn caption_utterance(client: &SpeechdClient, speech: &[i16]) -> CaptionTim
     let voiced = voiced_frames(speech);
     let first_voiced = lead + voiced.iter().position(|&v| v).unwrap_or(0) * FRAME;
     let mut stream = client
-        .open_stream(StreamConfig::new(CAPTIONS, 16_000))
+        .open_stream(StreamConfig::new(caption_engine(), 16_000))
         .await
         .expect("open a caption stream");
     let mut tick = tokio::time::interval(Duration::from_millis(20));
@@ -651,7 +677,7 @@ async fn caption_cpu(client: &SpeechdClient, audio: &[i16], minutes: u64) -> f64
     for _ in 0..2 {
         streams.push(
             client
-                .open_stream(StreamConfig::new(CAPTIONS, 16_000))
+                .open_stream(StreamConfig::new(caption_engine(), 16_000))
                 .await
                 .expect("open a caption stream"),
         );
@@ -774,6 +800,7 @@ async fn captions(
         format!("{cpu:.1}% of one core"),
     ));
     json!({
+        "engine": caption_engine(),
         "utterances": utterances.len(),
         "first_partial_ms": {"p50": p(&firsts, 50.0), "p95": first_p95, "missing": missing,
                              "from_first_voiced_frame": true},

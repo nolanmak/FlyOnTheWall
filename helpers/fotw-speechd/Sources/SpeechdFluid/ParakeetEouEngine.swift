@@ -29,26 +29,31 @@ public actor ParakeetEouEngine: SpeechEngine {
     static let eouDebounceMs = 640
     private let store: ModelStore
     private let model: PinnedModel
+    private let chunkSize: StreamingChunkSize
     private let lifecycle = ModelLifecycle<SessionPool<StreamingEouAsrManager>>()
 
-    public init(store: ModelStore, model: PinnedModel) {
+    /// `model` is the pinned variant matching `chunkSize`: 320 ms (Muesli's
+    /// choice) or 160 ms (half the latency, about twice the work).
+    public init(store: ModelStore, model: PinnedModel, chunkSize: StreamingChunkSize) {
         self.store = store
         self.model = model
-        descriptor = EngineDescriptor(id: "parakeet-eou-320ms", kind: .streaming, partials: true, model: model)
+        self.chunkSize = chunkSize
+        descriptor = EngineDescriptor(id: model.id, kind: .streaming, partials: true, model: model)
     }
 
     public func load() async throws -> LoadResult {
         let directory = try store.loadableDirectory(model)
+        let chunkSize = chunkSize
         _ = try await lifecycle.load({
             try await SessionPool(capacity: Self.poolSize, make: {
-                let manager = StreamingEouAsrManager(chunkSize: .ms320, eouDebounceMs: Self.eouDebounceMs)
+                let manager = StreamingEouAsrManager(chunkSize: chunkSize, eouDebounceMs: Self.eouDebounceMs)
                 // The explicit-directory overload reads local files only.
                 try await manager.loadModels(from: directory)
                 return manager
             }, warm: { manager in
                 // Every pooled instance compiles once here, not on a live stream.
                 _ = try await manager.process(audioBuffer: try pcmBuffer(
-                    [Float](repeating: 0, count: StreamingChunkSize.ms320.chunkSamples)))
+                    [Float](repeating: 0, count: chunkSize.chunkSamples)))
                 _ = try await manager.finish()
                 await manager.reset()
             })
@@ -65,7 +70,7 @@ public actor ParakeetEouEngine: SpeechEngine {
         let manager = try await pool.checkout()
         do {
             _ = try await manager.process(audioBuffer: try pcmBuffer(
-                [Float](repeating: 0, count: StreamingChunkSize.ms320.chunkSamples)))
+                [Float](repeating: 0, count: chunkSize.chunkSamples)))
             _ = try await manager.finish()
         } catch {
             await manager.reset()
