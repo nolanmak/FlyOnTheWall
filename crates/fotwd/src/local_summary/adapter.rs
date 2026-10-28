@@ -8,7 +8,7 @@ use tokio::sync::Semaphore;
 
 use super::{
     ipc::{self, Endpoint},
-    process::{self, Process, RuntimeConfig},
+    process::{self, LoadCancellation, Process, RuntimeConfig},
 };
 
 /// One owned model process. This low-level adapter is not registered as a
@@ -42,7 +42,19 @@ impl LocalAdapter {
     /// Rejects unsupported configuration, artifact mismatch, launch failure or
     /// load deadline. It never downloads models or falls back to a provider.
     pub async fn launch(config: RuntimeConfig) -> Result<Arc<Self>, String> {
-        let process = process::launch(&config).await?;
+        Self::launch_with_cancellation(config, LoadCancellation::default()).await
+    }
+
+    /// Load with an explicit cancellation request retained by the service.
+    /// Await completion after requesting cancellation to confirm cleanup.
+    ///
+    /// # Errors
+    /// The same verification/load errors as `launch`, including cancellation.
+    pub async fn launch_with_cancellation(
+        config: RuntimeConfig,
+        cancellation: LoadCancellation,
+    ) -> Result<Arc<Self>, String> {
+        let process = process::launch(&config, &cancellation).await?;
         Ok(Arc::new(Self {
             process,
             config,
@@ -255,6 +267,7 @@ mod tests {
                 path: "/unused".into(),
                 sha256: "0".repeat(64),
             },
+            model_shards: vec![],
             context_tokens: 8192,
             output_tokens: 512,
             threads: 1,
