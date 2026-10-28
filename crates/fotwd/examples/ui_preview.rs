@@ -641,6 +641,7 @@ impl fotw_web::RecorderControl for SpeechPreview {
             diarization_supported: Some(true),
             worker_running: Some(true),
             error: None,
+            captions: None,
         };
         let mut mic = system.clone();
         mic.source = CaptureSource::Mic;

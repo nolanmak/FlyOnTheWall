@@ -57,6 +57,13 @@ Windows, but neither captures anything.
   per-file SHA-256 and installed only by an explicit setup action, and model-free
   fake engines that the Rust protocol tests run against on macOS. Built only
   with `FOTW_FLUIDAUDIO_SOURCE`; `just speechd-real` is its real-model suite.
+- Live captions in local mode (#245): word-by-word text in the dashboard
+  while people talk, from Parakeet realtime EOU in the speech helper,
+  beside the final engine on each leg. Captions are greyed, revised in
+  place per utterance, and replaced by the final text; they are never
+  saved, exported or summarized. A caption engine that fails three times
+  in a row pauses captions for the meeting ("Live captions paused") and
+  nothing else.
 
 #### Library and keys
 

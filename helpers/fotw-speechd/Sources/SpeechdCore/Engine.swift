@@ -80,6 +80,13 @@ public protocol SpeechEngine: Sendable {
 public protocol EngineSession: AnyObject, Sendable {
     func append(_ samples: [Float]) async throws -> [EngineEvent]
     func finish() async throws -> [EngineEvent]
+    /// The stream is over, however it ended (finished, cancelled, failed).
+    /// Pooled engines take their instance back here.
+    func close() async
+}
+
+extension EngineSession {
+    public func close() async {}
 }
 
 /// A batch stream holds at most 10 minutes of audio.
@@ -94,23 +101,29 @@ public func milliseconds(samples: Int) -> UInt64 {
 
 public actor FakeEngine: SpeechEngine {
     public static let ids = ["fake-batch", "fake-stream", "fake-vad", "fake-crash", "fake-hang", "fake-stall",
-                              "fake-exit-after-final"]
+                              "fake-exit-after-final", "fake-captions"]
     public nonisolated let descriptor: EngineDescriptor
     private var loaded = false
+    /// fake-captions is pooled like parakeet-eou-320ms: two streams at once.
+    private var captionPool: SessionPool<Int>?
+    public static let captionPoolSize = 2
 
     public init(id: String) {
         let kind: EngineKind = switch id {
-        case "fake-stream": .streaming
+        case "fake-stream", "fake-captions": .streaming
         case "fake-vad": .vad
         default: .batch
         }
-        descriptor = EngineDescriptor(id: id, kind: kind, partials: id == "fake-stream",
+        descriptor = EngineDescriptor(id: id, kind: kind, partials: kind == .streaming,
                                       maxAudioMs: kind == .batch ? maxBatchMs : nil)
     }
 
     public static func all() -> [any SpeechEngine] { ids.map { FakeEngine(id: $0) } }
 
     public func load() async throws -> LoadResult {
+        if descriptor.id == "fake-captions", captionPool == nil {
+            captionPool = try await SessionPool(capacity: Self.captionPoolSize, make: { 0 }, warm: { _ in })
+        }
         loaded = true
         return LoadResult(model: descriptor.id, revision: "fake")
     }
@@ -119,12 +132,16 @@ public actor FakeEngine: SpeechEngine {
         guard loaded else { throw SpeechdError.notLoaded(descriptor.id) }
     }
 
-    public func unload() async { loaded = false }
+    public func unload() async {
+        loaded = false
+        captionPool = nil
+    }
     public func isLoaded() async -> Bool { loaded }
 
     public func makeSession(options: StreamOptions) async throws -> any EngineSession {
         guard loaded else { throw SpeechdError.notLoaded(descriptor.id) }
-        return FakeSession(engine: descriptor.id)
+        guard let pool = captionPool else { return FakeSession(engine: descriptor.id) }
+        return FakeSession(engine: descriptor.id, slot: (pool, try await pool.checkout(within: .seconds(1))))
     }
 }
 
@@ -133,9 +150,23 @@ final class FakeSession: EngineSession, @unchecked Sendable {
     private let engine: String
     private var samples = 0
     private var inSpeech = false
+    // fake-captions: the utterance being spoken, where it began, and how much
+    // of it there is so far.
+    private var utterance: UInt64 = 1
+    private var utteranceStart = 0
+    private var utteranceSamples = 0
 
-    init(engine: String) {
+    private var slot: (SessionPool<Int>, Int)?
+
+    init(engine: String, slot: (SessionPool<Int>, Int)? = nil) {
         self.engine = engine
+        self.slot = slot
+    }
+
+    func close() async {
+        guard let held = slot else { return }
+        slot = nil
+        await held.0.checkin(held.1)
     }
 
     func append(_ chunk: [Float]) async throws -> [EngineEvent] {
@@ -149,6 +180,17 @@ final class FakeSession: EngineSession, @unchecked Sendable {
             // through its heartbeat and kill us.
             kill(getpid(), SIGSTOP)
             return []
+        case "fake-captions":
+            // Live captions without a model: an utterance runs until an
+            // all-zero frame, a partial per frame within it, a final at its end.
+            if chunk.allSatisfy({ $0 == 0 }) {
+                return endUtterance(at: start)
+            }
+            if utteranceSamples == 0 { utteranceStart = start }
+            utteranceSamples += chunk.count
+            return [.partial(text: "utterance=\(utterance) samples=\(utteranceSamples)",
+                             startMs: milliseconds(samples: utteranceStart), endMs: milliseconds(samples: samples),
+                             utterance: utterance)]
         case "fake-stream":
             return [.partial(text: "samples=\(samples)", startMs: 0, endMs: milliseconds(samples: samples),
                              utterance: 1)]
@@ -179,10 +221,24 @@ final class FakeSession: EngineSession, @unchecked Sendable {
             // serving everything else meanwhile (docs/SPEECHD_PROTOCOL.md).
             try await Task.sleep(nanoseconds: 2_500_000_000)
         }
+        if engine == "fake-captions" {
+            return endUtterance(at: samples)
+        }
         if engine == "fake-vad" {
             return inSpeech ? [.vad(.speechEnd, sample: UInt64(samples), probability: 0)] : []
         }
         return [.final(text: "samples=\(samples)", startMs: 0, endMs: milliseconds(samples: samples),
                        segments: [], model: "\(engine)@fake", utterance: engine == "fake-stream" ? 1 : nil)]
+    }
+
+    private func endUtterance(at end: Int) -> [EngineEvent] {
+        guard utteranceSamples > 0 else { return [] }
+        let event = EngineEvent.final(
+            text: "utterance=\(utterance) samples=\(utteranceSamples)",
+            startMs: milliseconds(samples: utteranceStart), endMs: milliseconds(samples: end),
+            segments: [], model: "fake-captions@fake", utterance: utterance)
+        utterance += 1
+        utteranceSamples = 0
+        return [event]
     }
 }

@@ -79,6 +79,12 @@ pub struct Delta {
     pub text: String,
     /// Whether the provider considers this text settled.
     pub is_final: bool,
+    /// For a live caption (#245): which utterance this revises. The UI keeps
+    /// one pending row per caption utterance, replaced in place by the next
+    /// revision and removed when the final engine's text covers it. Absent
+    /// for every other partial, which keeps one pending row per channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub utterance: Option<String>,
 }
 
 /// What a subscriber receives: one 100 ms batch.
@@ -487,6 +493,7 @@ mod tests {
             channel: "mic".into(),
             text: text.into(),
             is_final: false,
+            utterance: None,
         }
     }
 

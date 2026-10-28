@@ -1,7 +1,7 @@
 //! Session-scoped transcription telemetry without stream, model or file ownership.
 use crate::failover::stream::{Phase, StatusReader};
 use fotw_stt::{Source, StreamEvent, StreamState};
-use fotw_web::recorder::{CaptureSource, SpeechSourceStatus, SpeechState};
+use fotw_web::recorder::{CaptionStatus, CaptureSource, SpeechSourceStatus, SpeechState};
 use std::sync::{Arc, Mutex};
 
 enum Reader {
@@ -10,6 +10,8 @@ enum Reader {
 }
 #[derive(Default)]
 struct Inner {
+    /// Live-caption state per leg (#245), when captions run.
+    captions: Vec<(CaptureSource, crate::captions::CaptionState)>,
     readers: Vec<(CaptureSource, Reader)>,
     processing: Option<fotw_pipeline::aec_worker::Status>,
 }
@@ -59,21 +61,38 @@ fn durable(source: CaptureSource, reader: &StatusReader) -> SpeechSourceStatus {
         diarization_supported: Some(speakers),
         worker_running: Some(status.worker_running),
         error: status.error,
+        captions: None,
     }
 }
 impl SpeechMonitor {
     /// Bounded metadata reads, with no IO, credential lookup or native work.
     pub fn snapshot(&self) -> Vec<SpeechSourceStatus> {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        let inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        inner
             .readers
             .iter()
-            .map(|(source, read)| match read {
-                Reader::Legacy(status) => status.clone(),
-                Reader::Durable(reader) => durable(*source, reader),
+            .map(|(source, read)| {
+                let mut status = match read {
+                    Reader::Legacy(status) => status.clone(),
+                    Reader::Durable(reader) => durable(*source, reader),
+                };
+                status.captions = inner.captions.iter().find(|(s, _)| s == source).map(
+                    |(_, state)| match state {
+                        crate::captions::CaptionState::Live => CaptionStatus::Live,
+                        crate::captions::CaptionState::Paused => CaptionStatus::Paused,
+                    },
+                );
+                status
             })
             .collect()
+    }
+
+    /// Record a leg's live-caption state (#245).
+    pub(crate) fn set_captions(&self, source: Source, state: crate::captions::CaptionState) {
+        let source = capture_source(source);
+        let mut inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        inner.captions.retain(|(s, _)| *s != source);
+        inner.captions.push((source, state));
     }
     /// Known native work still outstanding after capture's drain ended.
     pub fn has_retained_native_worker(&self) -> bool {
@@ -124,6 +143,7 @@ impl SpeechMonitor {
                 diarization_supported: Some(speakers),
                 worker_running: None,
                 error: None,
+                captions: None,
             }),
         );
     }

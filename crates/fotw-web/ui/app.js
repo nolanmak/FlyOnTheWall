@@ -906,16 +906,31 @@ function liveOrigin() {
   if (liveSnapshotOrigin === null) return current;
   return current === null ? liveSnapshotOrigin : Math.min(current, liveSnapshotOrigin);
 }
+// One pending row per channel, plus one per live-caption utterance (#245),
+// which stays greyed until the final engine's text covers it.
+function partialKey(d) {
+  return d.utterance ? d.channel + "#" + d.utterance : d.channel;
+}
+function clearCoveredPartials(channel, endMs) {
+  for (const [key, partial] of livePartials) {
+    if (partial.channel === channel && partial.start_ms < endMs) livePartials.delete(key);
+  }
+}
 function appendDeltas(deltas) {
   let finalsChanged = false;
   for (const d of deltas) {
     if (!liveSessionId || d.meeting_id !== liveSessionId) continue;
     if (d.is_final === false) {
-      if (d.text) livePartials.set(d.channel, d);
-      else livePartials.delete(d.channel);
+      if (d.text) livePartials.set(partialKey(d), d);
+      else if (d.utterance) livePartials.delete(partialKey(d));
+      else {
+        // An empty partial clears the channel's pending text, including live
+        // captions it covers (a suppressed echo final sends one).
+        livePartials.delete(d.channel);
+        clearCoveredPartials(d.channel, d.end_ms);
+      }
     } else {
-      const partial = livePartials.get(d.channel);
-      if (!partial || partial.start_ms < d.end_ms) livePartials.delete(d.channel);
+      clearCoveredPartials(d.channel, d.end_ms);
       if (d.text.trim()) {
         liveFinals.set(d.idx, { ...d, speaker: d.channel === "mic" ? "me" : null });
         finalsChanged = true;
@@ -954,7 +969,7 @@ function renderLiveTranscript(forceFollow = false) {
   } else {
     visible.push(...liveSegments.slice(-(MAX_ROWS - livePartials.size))
       .map(d => ({key: "final:" + d.idx, d, partial: false})));
-    for (const [channel, d] of livePartials) visible.push({key: "partial:" + channel, d, partial: true});
+    for (const [key, d] of livePartials) visible.push({key: "partial:" + key, d, partial: true});
   }
   for (const {key, d, partial} of visible) {
     const at = origin !== null && d.start_ms >= origin ? d.start_ms - origin : null;
@@ -1261,13 +1276,16 @@ function renderSpeechHealth(body) {
     entry.engine = provider + " / " + String(source.model || "Unknown model");
     // Which speech condition needs attention, if any; a new one reopens the bar.
     entry.attention = ["reconnecting", "closed", "incomplete"].includes(source.state) ? source.state
-      : source.error ? "error" : source.switch_reason ? "switched:" + source.switch_reason : "";
+      : source.error ? "error" : source.switch_reason ? "switched:" + source.switch_reason
+      : source.captions === "paused" ? "captions_paused" : "";
     entry.stateText = states[source.state] || "Status unavailable";
     const parts = [states[source.state] || "Status unavailable"];
     if (typeof source.pending_audio_ms === "number" && Number.isFinite(source.pending_audio_ms) && source.pending_audio_ms >= 0) {
       parts.push((source.pending_audio_ms / 1000).toFixed(1) + "s audio pending");
     } else parts.push("Coverage not measured");
     if (source.source === "system" && source.diarization_supported === false) parts.push("No remote speaker labels");
+    // Live captions (#245) are display-only: pausing them changes nothing saved.
+    if (source.captions === "paused") parts.push("Live captions paused");
     const summary = parts.join(" · ");
     if (entry.summary.textContent !== summary) entry.summary.textContent = summary;
     const from = typeof source.from_ms === "number" ? "Coverage from audio " + formatElapsed(source.from_ms) + ": " : "Provider change: ";

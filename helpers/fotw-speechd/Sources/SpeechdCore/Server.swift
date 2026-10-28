@@ -229,9 +229,12 @@ public actor Server {
             await server.openFailed(token: token, request: request, stream: stream, error)
             return
         }
-        guard await server.opened(token: token, request: request, stream: stream) else { return }
+        guard await server.opened(token: token, request: request, stream: stream) else {
+            await session.close()
+            return
+        }
         do {
-            for await input in inputs {
+            loop: for await input in inputs {
                 switch input {
                 case let .audio(pcm):
                     let events = try await session.append(pcm.map { Float($0) / 32768 })
@@ -240,12 +243,15 @@ public actor Server {
                 case .finish:
                     let events = try await session.finish()
                     await server.complete(token: token, stream: stream, events)
-                    return
+                    break loop
                 }
             }
         } catch {
             await server.streamFailed(token: token, stream: stream, error)
         }
+        // Finished, cancelled (the input ended) or failed: a pooled engine
+        // takes its instance back now.
+        await session.close()
     }
 
     private func audio(_ stream: UInt32, _ pcm: [Int16]) {

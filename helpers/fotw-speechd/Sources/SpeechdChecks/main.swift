@@ -247,6 +247,35 @@ func aFailedSwapKeepsTheWorkingRevision() throws {
     try expect(!FileManager.default.fileExists(atPath: aside.path), "and removes the old one after")
 }
 
+func aPoolLendsWarmedInstancesUpToItsCapacity() async throws {
+    let warmed = Counter()
+    let pool = try await SessionPool<Int>(capacity: 2, make: { 7 }, warm: { _ in await warmed.increment() })
+    let warmCount = await warmed.value
+    try expect(warmCount == 2, "every instance is warmed when the pool is built, not on a stream")
+    let first = try await pool.checkout()
+    _ = try await pool.checkout()
+    do {
+        _ = try await pool.checkout()
+        throw CheckFailure(description: "a third stream got an instance")
+    } catch let error as SpeechdError {
+        try expect(error.code == "busy", "refused as busy: \(error)")
+    }
+    // An instance coming back a moment later is waited for, not refused.
+    Task {
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        await pool.checkin(first)
+    }
+    _ = try await pool.checkout(within: .seconds(1))
+    let started = ContinuousClock.now
+    do {
+        _ = try await pool.checkout(within: .milliseconds(100))
+        throw CheckFailure(description: "a full pool lent an instance")
+    } catch let error as SpeechdError {
+        try expect(error.code == "busy", "still busy after the wait: \(error)")
+    }
+    try expect(ContinuousClock.now - started >= .milliseconds(100), "waited before refusing")
+}
+
 func pinsAreComplete() throws {
     let ids = PinnedModels.all.map(\.id)
     try expect(ids == ["parakeet-unified", "silero-vad", "parakeet-eou-320ms", "nemotron-3.5-2240ms"], "\(ids)")
@@ -271,6 +300,7 @@ let cases: [(String, () async throws -> Void)] = [
     ("a corrupt model fails validation and keeps the previous selection",
      corruptModelFailsValidationAndKeepsThePreviousSelection),
     ("a failed swap keeps the working revision", aFailedSwapKeepsTheWorkingRevision),
+    ("a pool lends warmed instances up to its capacity", aPoolLendsWarmedInstancesUpToItsCapacity),
     ("every pin is a full revision with per-file hashes", pinsAreComplete),
 ]
 var failures = 0

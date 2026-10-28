@@ -1094,6 +1094,7 @@ pub fn delta_from(idx: i64, seg: &fotw_stt::TranscriptSegment) -> fotw_web::Delt
         },
         text: seg.text.clone(),
         is_final: true,
+        utterance: None,
     }
 }
 
@@ -1108,6 +1109,9 @@ pub fn delta_partial(seg: &fotw_stt::TranscriptSegment) -> fotw_web::Delta {
     fotw_web::Delta {
         idx: -1,
         is_final: false,
+        // A live caption is keyed by its utterance, so several can stand
+        // pending at once until the final engine's text covers each.
+        utterance: (seg.provider == crate::captions::PROVIDER).then(|| seg.id.clone()),
         ..delta_from(-1, seg)
     }
 }

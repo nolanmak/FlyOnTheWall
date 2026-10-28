@@ -28,6 +28,9 @@ fotw-stt = { path = "../fotw-stt", features = ["local-whisper"] }
 fotw-summarize = { path = "../fotw-summarize" }
 fotw-web = { path = "../fotw-web" }
 fotw-secrets = { path = "../fotw-secrets" }
+# The speech helper's client (#243): live captions (#245) and the local
+# engines it serves. Pure Rust; the helper itself is a separate executable.
+fotw-speechd-client = { path = "../fotw-speechd-client" }
 fotw-store = { path = "../fotw-store" }
 serde = { workspace = true }
 serde_json = { workspace = true }
