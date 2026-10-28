@@ -485,7 +485,7 @@ fn inherit_model(command: &mut Command, model: &File) {
 }
 
 #[cfg(test)]
-pub(super) fn stalled_fixture() -> (Process, PathBuf) {
+pub(super) fn stalled_fixture(startup_delay: Duration) -> (Process, PathBuf) {
     let root = tempfile::Builder::new()
         .prefix("fotw-summary-test-")
         .tempdir_in("/private/tmp")
@@ -497,8 +497,12 @@ s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.bind('owned.sock');s.listen
 c,_=s.accept();c.recv(8192);pathlib.Path('received').write_text('received')
 while c.recv(8192):pass
 "#;
+    let code = format!(
+        "import time;time.sleep({});\n{code}",
+        startup_delay.as_secs_f64()
+    );
     let child = sandboxed_command(Path::new("/usr/bin/python3"), root.path(), &socket)
-        .args(["-I", "-S", "-c", code])
+        .args(["-I", "-S", "-c", &code])
         .spawn()
         .unwrap();
     let pid = child.id().unwrap();
