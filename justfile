@@ -88,6 +88,21 @@ speechd-real models_root corpus_dir:
     if [[ -n "${COREML_CACHE:-}" ]]; then args+=(--coreml-cache "$COREML_CACHE"); fi
     CARGO_BUILD_JOBS={{jobs}} cargo run --release -p fotw-speechd-client --example speechd_real -- "${args[@]}"
 
+# The #246 real-model smoke, separate from `ci`: the diarizer on a mix of two
+# or more voices (16 kHz mono WAVs of different speakers, e.g. two AMI headset
+# channels) must find at least two speakers, and Parakeet's word timings must
+# match its text. Setup installs `diarizer` from Hugging Face and imports
+# Parakeet from PARAKEET_DIR or downloads it; OFFSET_S and DURATION_S pick the span.
+speechd-postpass-real models_root +voices:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just speechd-helper >&2
+    args=(--helper "{{speechd_build}}/release/fotw-speechd" --models-root "{{models_root}}")
+    for voice in {{voices}}; do args+=(--voice "$voice"); done
+    if [[ -n "${PARAKEET_DIR:-}" ]]; then args+=(--parakeet-from "$PARAKEET_DIR"); fi
+    args+=(--offset-s "${OFFSET_S:-300}" --seconds "${DURATION_S:-180}")
+    CARGO_BUILD_JOBS={{jobs}} cargo run --release -p fotw-speechd-client --example speechd_postpass_real -- "${args[@]}"
+
 lint:
     cargo fmt --all --check
     CARGO_BUILD_JOBS={{jobs}} cargo clippy --workspace --all-targets -- -D warnings
