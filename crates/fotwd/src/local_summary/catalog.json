@@ -1,0 +1,330 @@
+{
+  "format_version": 1,
+  "revision": "2026-10-28.1",
+  "runtime": {
+    "protocol": "llama_cpp_http_v1",
+    "source_revision": "8ca4060b7e30e76baaa5670ee1ec1b760b7f8552",
+    "tag": "b11946",
+    "archive_name": "llama-b11946-bin-macos-arm64.tar.gz",
+    "archive_bytes": 16438371,
+    "archive_sha256": "d618da5e7bbb19077f086e6a7e1d77eab55b9bfd481f7531aadada86d13db9ed",
+    "unpack_extra_bytes": 106538556,
+    "license": "MIT",
+    "files": [
+      {
+        "name": "libggml-base.0.27.0.dylib",
+        "source_path": "libggml-base.0.27.0.dylib",
+        "bytes": 751896,
+        "sha256": "192d8625c2c9430210eeada263b8c404b1f9389a54b77b4779779e36609bb6bb"
+      },
+      {
+        "name": "libggml-base.0.dylib",
+        "source_path": "libggml-base.0.27.0.dylib",
+        "bytes": 751896,
+        "sha256": "192d8625c2c9430210eeada263b8c404b1f9389a54b77b4779779e36609bb6bb"
+      },
+      {
+        "name": "libggml-base.dylib",
+        "source_path": "libggml-base.0.27.0.dylib",
+        "bytes": 751896,
+        "sha256": "192d8625c2c9430210eeada263b8c404b1f9389a54b77b4779779e36609bb6bb"
+      },
+      {
+        "name": "libggml-blas.0.27.0.dylib",
+        "source_path": "libggml-blas.0.27.0.dylib",
+        "bytes": 58776,
+        "sha256": "12aefdc8dd4873d69554dc85a0dd09fffef9828e1fc9ecf6b48913ef2106b33a"
+      },
+      {
+        "name": "libggml-blas.0.dylib",
+        "source_path": "libggml-blas.0.27.0.dylib",
+        "bytes": 58776,
+        "sha256": "12aefdc8dd4873d69554dc85a0dd09fffef9828e1fc9ecf6b48913ef2106b33a"
+      },
+      {
+        "name": "libggml-blas.dylib",
+        "source_path": "libggml-blas.0.27.0.dylib",
+        "bytes": 58776,
+        "sha256": "12aefdc8dd4873d69554dc85a0dd09fffef9828e1fc9ecf6b48913ef2106b33a"
+      },
+      {
+        "name": "libggml-cpu.0.27.0.dylib",
+        "source_path": "libggml-cpu.0.27.0.dylib",
+        "bytes": 941200,
+        "sha256": "d3e86b1cfdedbabe63a37e1e216ab12a0292d67e93447684111220c530281023"
+      },
+      {
+        "name": "libggml-cpu.0.dylib",
+        "source_path": "libggml-cpu.0.27.0.dylib",
+        "bytes": 941200,
+        "sha256": "d3e86b1cfdedbabe63a37e1e216ab12a0292d67e93447684111220c530281023"
+      },
+      {
+        "name": "libggml-cpu.dylib",
+        "source_path": "libggml-cpu.0.27.0.dylib",
+        "bytes": 941200,
+        "sha256": "d3e86b1cfdedbabe63a37e1e216ab12a0292d67e93447684111220c530281023"
+      },
+      {
+        "name": "libggml-metal.0.27.0.dylib",
+        "source_path": "libggml-metal.0.27.0.dylib",
+        "bytes": 5620936,
+        "sha256": "f4e31c355e06c1a6d6489c953145cc1572eef7ac9627d16201d865fe5293b35c"
+      },
+      {
+        "name": "libggml-metal.0.dylib",
+        "source_path": "libggml-metal.0.27.0.dylib",
+        "bytes": 5620936,
+        "sha256": "f4e31c355e06c1a6d6489c953145cc1572eef7ac9627d16201d865fe5293b35c"
+      },
+      {
+        "name": "libggml-metal.dylib",
+        "source_path": "libggml-metal.0.27.0.dylib",
+        "bytes": 5620936,
+        "sha256": "f4e31c355e06c1a6d6489c953145cc1572eef7ac9627d16201d865fe5293b35c"
+      },
+      {
+        "name": "libggml-rpc.0.27.0.dylib",
+        "source_path": "libggml-rpc.0.27.0.dylib",
+        "bytes": 242800,
+        "sha256": "456460720893a4d3ed484c421205695dcbf004f1afdb8376ae46246f0fa2f5a1"
+      },
+      {
+        "name": "libggml-rpc.0.dylib",
+        "source_path": "libggml-rpc.0.27.0.dylib",
+        "bytes": 242800,
+        "sha256": "456460720893a4d3ed484c421205695dcbf004f1afdb8376ae46246f0fa2f5a1"
+      },
+      {
+        "name": "libggml-rpc.dylib",
+        "source_path": "libggml-rpc.0.27.0.dylib",
+        "bytes": 242800,
+        "sha256": "456460720893a4d3ed484c421205695dcbf004f1afdb8376ae46246f0fa2f5a1"
+      },
+      {
+        "name": "libggml.0.27.0.dylib",
+        "source_path": "libggml.0.27.0.dylib",
+        "bytes": 60016,
+        "sha256": "a97bc40525aea78834fdf28197b5b21f149b6d5ac2d3b615b95b86f775a69477"
+      },
+      {
+        "name": "libggml.0.dylib",
+        "source_path": "libggml.0.27.0.dylib",
+        "bytes": 60016,
+        "sha256": "a97bc40525aea78834fdf28197b5b21f149b6d5ac2d3b615b95b86f775a69477"
+      },
+      {
+        "name": "libggml.dylib",
+        "source_path": "libggml.0.27.0.dylib",
+        "bytes": 60016,
+        "sha256": "a97bc40525aea78834fdf28197b5b21f149b6d5ac2d3b615b95b86f775a69477"
+      },
+      {
+        "name": "libllama-batched-bench-impl.dylib",
+        "source_path": "libllama-batched-bench-impl.dylib",
+        "bytes": 56576,
+        "sha256": "7254f18fd16105ae17fddeb19783089ee2554b445da162c325132b0f22498dc6"
+      },
+      {
+        "name": "libllama-bench-impl.dylib",
+        "source_path": "libllama-bench-impl.dylib",
+        "bytes": 323016,
+        "sha256": "ea6fa62e642e08cbbd2ca581299cac911a9f30f4dfa70f2d7d51c17a3c27ccc7"
+      },
+      {
+        "name": "libllama-cli-impl.dylib",
+        "source_path": "libllama-cli-impl.dylib",
+        "bytes": 255144,
+        "sha256": "81b1ecdc3511dfaaf9d65b5bb65120ab8fa46a65cc23f8e2b1fab0a7c2ee2b17"
+      },
+      {
+        "name": "libllama-common.0.7.0.dylib",
+        "source_path": "libllama-common.0.7.0.dylib",
+        "bytes": 8025192,
+        "sha256": "cd47b03296d26f10306af1f7e7ea5f6c0669a77d92bceff128140e4b1112b8a5"
+      },
+      {
+        "name": "libllama-common.0.dylib",
+        "source_path": "libllama-common.0.7.0.dylib",
+        "bytes": 8025192,
+        "sha256": "cd47b03296d26f10306af1f7e7ea5f6c0669a77d92bceff128140e4b1112b8a5"
+      },
+      {
+        "name": "libllama-common.dylib",
+        "source_path": "libllama-common.0.7.0.dylib",
+        "bytes": 8025192,
+        "sha256": "cd47b03296d26f10306af1f7e7ea5f6c0669a77d92bceff128140e4b1112b8a5"
+      },
+      {
+        "name": "libllama-completion-impl.dylib",
+        "source_path": "libllama-completion-impl.dylib",
+        "bytes": 121808,
+        "sha256": "89e6da25325f3ba7357f44f32d527e0811f85d36960881987d10d74c5511bd2e"
+      },
+      {
+        "name": "libllama-fit-params-impl.dylib",
+        "source_path": "libllama-fit-params-impl.dylib",
+        "bytes": 55264,
+        "sha256": "abaccd747bb36df8fb67cb4a708ab3e0e7a07ce4dfeeb0bc3fb9b06a6b5aed58"
+      },
+      {
+        "name": "libllama-perplexity-impl.dylib",
+        "source_path": "libllama-perplexity-impl.dylib",
+        "bytes": 156384,
+        "sha256": "f2ecb7bf44b61b943c9075ba0dfe3108b76ea10f76993ebaea3462b0b95bf849"
+      },
+      {
+        "name": "libllama-quantize-impl.dylib",
+        "source_path": "libllama-quantize-impl.dylib",
+        "bytes": 96496,
+        "sha256": "582dadbf515289d7a5dd5aa27be5fdcbe58cad0a2eb4eaa72a15087ad9d26864"
+      },
+      {
+        "name": "libllama-server-impl.dylib",
+        "source_path": "libllama-server-impl.dylib",
+        "bytes": 9719384,
+        "sha256": "fab57579f7ac28a51278279b8dcf10da864d4cdcbab122777a43fff314cfd4ac"
+      },
+      {
+        "name": "libllama.0.7.0.dylib",
+        "source_path": "libllama.0.7.0.dylib",
+        "bytes": 3654016,
+        "sha256": "9d64f8803c83c36682ad170899fc91aa897b3861fd7911d9268844040c98f6cc"
+      },
+      {
+        "name": "libllama.0.dylib",
+        "source_path": "libllama.0.7.0.dylib",
+        "bytes": 3654016,
+        "sha256": "9d64f8803c83c36682ad170899fc91aa897b3861fd7911d9268844040c98f6cc"
+      },
+      {
+        "name": "libllama.dylib",
+        "source_path": "libllama.0.7.0.dylib",
+        "bytes": 3654016,
+        "sha256": "9d64f8803c83c36682ad170899fc91aa897b3861fd7911d9268844040c98f6cc"
+      },
+      {
+        "name": "libmtmd.0.7.0.dylib",
+        "source_path": "libmtmd.0.7.0.dylib",
+        "bytes": 1600096,
+        "sha256": "ca00bc96c7d75b3944c5c20878ccc20fc2a329f0d48d0f2343d8dfd40a588261"
+      },
+      {
+        "name": "libmtmd.0.dylib",
+        "source_path": "libmtmd.0.7.0.dylib",
+        "bytes": 1600096,
+        "sha256": "ca00bc96c7d75b3944c5c20878ccc20fc2a329f0d48d0f2343d8dfd40a588261"
+      },
+      {
+        "name": "libmtmd.dylib",
+        "source_path": "libmtmd.0.7.0.dylib",
+        "bytes": 1600096,
+        "sha256": "ca00bc96c7d75b3944c5c20878ccc20fc2a329f0d48d0f2343d8dfd40a588261"
+      },
+      {
+        "name": "llama-server",
+        "source_path": "llama-server",
+        "bytes": 49984,
+        "sha256": "981b460a278e9a0c880cef32d6fab42785a119084456b16845304cf38c32cf69"
+      }
+    ],
+    "notices": [
+      {
+        "name": "LICENSE",
+        "source_path": "LICENSE",
+        "bytes": 1078,
+        "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"
+      }
+    ]
+  },
+  "models": [
+    {
+      "id": "qwen3-06b-q8-0",
+      "label": "Qwen3 0.6B",
+      "quantization": "Q8_0",
+      "repository": "Qwen/Qwen3-0.6B-GGUF",
+      "revision": "23749fefcc72300e3a2ad315e1317431b06b590a",
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "name": "Qwen3-0.6B-Q8_0.gguf",
+          "source_path": "Qwen3-0.6B-Q8_0.gguf",
+          "bytes": 639446688,
+          "sha256": "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031"
+        }
+      ]
+    },
+    {
+      "id": "qwen3-8b-q4-k-m",
+      "label": "Qwen3 8B",
+      "quantization": "Q4_K_M",
+      "repository": "Qwen/Qwen3-8B-GGUF",
+      "revision": "7c41481f57cb95916b40956ab2f0b139b296d974",
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "name": "Qwen3-8B-Q4_K_M.gguf",
+          "source_path": "Qwen3-8B-Q4_K_M.gguf",
+          "bytes": 5027783488,
+          "sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"
+        }
+      ]
+    },
+    {
+      "id": "qwen3-32b-q4-k-m",
+      "label": "Qwen3 32B",
+      "quantization": "Q4_K_M",
+      "repository": "Qwen/Qwen3-32B-GGUF",
+      "revision": "938a7432affaec9157f883a87164e2646ae17555",
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "name": "Qwen3-32B-Q4_K_M.gguf",
+          "source_path": "Qwen3-32B-Q4_K_M.gguf",
+          "bytes": 19762149024,
+          "sha256": "efd971561896866f0e910cce52761ca77b1b138090c7f15fe284676d57d1f689"
+        }
+      ]
+    },
+    {
+      "id": "qwen3-235b-a22b-q4-k-m",
+      "label": "Qwen3 235B-A22B",
+      "quantization": "Q4_K_M",
+      "repository": "Qwen/Qwen3-235B-A22B-GGUF",
+      "revision": "211e807ecd6d37446a747409108783e39a04e80f",
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "name": "Qwen3-235B-A22B-Q4_K_M-00001-of-00005.gguf",
+          "source_path": "Q4_K_M/Qwen3-235B-A22B-Q4_K_M-00001-of-00005.gguf",
+          "bytes": 29742283872,
+          "sha256": "ce666f562eb8eefda48eec0aa93680ba40ca5727d0ba9918f3fb1771141375e6"
+        },
+        {
+          "name": "Qwen3-235B-A22B-Q4_K_M-00002-of-00005.gguf",
+          "source_path": "Q4_K_M/Qwen3-235B-A22B-Q4_K_M-00002-of-00005.gguf",
+          "bytes": 29974106496,
+          "sha256": "ac73c457aac5993d02444063c976062c70be609c03ca6584d0c3be0632e79ce6"
+        },
+        {
+          "name": "Qwen3-235B-A22B-Q4_K_M-00003-of-00005.gguf",
+          "source_path": "Q4_K_M/Qwen3-235B-A22B-Q4_K_M-00003-of-00005.gguf",
+          "bytes": 29933980640,
+          "sha256": "6357074e14a748446c2b0dcc64a1a7c64b1c124fbfb9cb48114147645d3310fe"
+        },
+        {
+          "name": "Qwen3-235B-A22B-Q4_K_M-00004-of-00005.gguf",
+          "source_path": "Q4_K_M/Qwen3-235B-A22B-Q4_K_M-00004-of-00005.gguf",
+          "bytes": 29936094304,
+          "sha256": "2eb47718eaeeebee3726cd2ca4ac11b5768faded5d7adddec5b754aeb7c387dd"
+        },
+        {
+          "name": "Qwen3-235B-A22B-Q4_K_M-00005-of-00005.gguf",
+          "source_path": "Q4_K_M/Qwen3-235B-A22B-Q4_K_M-00005-of-00005.gguf",
+          "bytes": 22567608864,
+          "sha256": "dbe2c7547c0d397d2ef16e08218a586383771dc12e9678cfd6fa8cc23e94e8f8"
+        }
+      ]
+    }
+  ]
+}

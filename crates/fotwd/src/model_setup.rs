@@ -94,7 +94,7 @@ impl Control {
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
-    fn check(&self) -> Result<(), String> {
+    pub(crate) fn check(&self) -> Result<(), String> {
         match self.0.load(Ordering::Acquire) {
             0 => Ok(()),
             1 => Err("Model setup cancelled; previous model preserved".into()),
@@ -109,7 +109,7 @@ impl Control {
             .map(|_| ())
             .map_err(|_| "Model setup control was not between publications".into())
     }
-    fn commit(&self) -> Result<(), String> {
+    pub(crate) fn commit(&self) -> Result<(), String> {
         self.0
             .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
             .map(|_| ())

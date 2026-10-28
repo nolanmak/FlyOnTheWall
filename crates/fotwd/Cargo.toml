@@ -66,6 +66,11 @@ hyper = { version = "1.11", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 
+# Stream the pinned optional runtime archive; entries are validated and written
+# explicitly rather than using automatic archive filesystem extraction.
+flate2 = "1"
+tar = { version = "0.4.46", default-features = false }
+
 [dev-dependencies]
 # This crate, on itself, purely to turn `test-guards` on for the library that
 # `tests/*.rs` link against. It reads like a cycle and is not one: cargo allows
