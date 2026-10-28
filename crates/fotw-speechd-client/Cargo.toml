@@ -24,6 +24,11 @@ tokio = { workspace = true, features = [
   "time",
 ] }
 
+[features]
+# Test support for crates that run `fotw-speechd-fake`: `testing::fake_helper`.
+# Enable it only from [dev-dependencies].
+testing = []
+
 [dev-dependencies]
 tokio = { workspace = true, features = [
   "io-util",
