@@ -66,6 +66,7 @@ pub mod coverage;
 pub mod document;
 pub mod error;
 pub mod hash;
+pub mod local_model;
 pub mod note_context;
 pub mod pipeline;
 pub mod pricing;
