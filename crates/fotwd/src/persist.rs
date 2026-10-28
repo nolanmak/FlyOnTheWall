@@ -527,7 +527,7 @@ fn outcome_shallow(o: &SessionOutcome) -> SessionOutcome {
     }
 }
 
-fn to_row(idx: i64, s: &TranscriptSegment) -> NewSegment {
+pub(crate) fn to_row(idx: i64, s: &TranscriptSegment) -> NewSegment {
     NewSegment {
         idx,
         start_ms: s.start_ms as i64,

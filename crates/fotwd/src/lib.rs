@@ -28,6 +28,7 @@ pub mod native_shell;
 pub mod okf;
 pub mod onboard;
 pub mod persist;
+pub mod post_pass;
 pub mod recording;
 mod recording_limit;
 pub mod recovery;

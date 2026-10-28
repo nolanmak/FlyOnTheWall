@@ -494,3 +494,22 @@ fn page_positions_match_decoded_packet_samples_and_leave_room_for_preskip() {
     }
     assert!(saw_eos);
 }
+
+#[test]
+fn the_stream_reader_yields_exactly_what_the_whole_file_decoder_does() {
+    use fotw_pipeline::opus::OpusStreamReader;
+    // Odd lengths, so the end trim lands mid-frame.
+    for secs in [0.0f32, 0.013, 1.0, 7.31] {
+        let bytes = encode(&tone(440.0, secs, 0.4), RATE);
+        let dir = tmpdir(&format!("stream-{secs}"));
+        let path = dir.join("t.opus");
+        std::fs::write(&path, &bytes).unwrap();
+        let whole = decode(&bytes).samples;
+        let mut reader = OpusStreamReader::open(&path, RATE).unwrap();
+        assert_eq!(reader.total_samples(), Some(whole.len() as u64), "{secs}s");
+        let mut streamed = Vec::new();
+        // Reads that never line up with a frame.
+        while reader.read_into(&mut streamed, 997).unwrap() > 0 {}
+        assert_eq!(streamed, whole, "{secs}s");
+    }
+}
