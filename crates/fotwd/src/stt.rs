@@ -47,12 +47,18 @@ pub enum SttEngine {
 ///
 /// Only a missing settings row uses the fresh-library default. An unreadable
 /// or invalid saved choice must never silently enable cloud transcription.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The fresh-library default for local transcription is Parakeet Unified
+/// (#244). A saved row keeps what it says: one written before Parakeet, with
+/// no model or an empty one, still means [`DEFAULT_MODEL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SttSettings {
     /// Which engine.
     pub engine: SttEngine,
-    /// The ggml model file the local engine loads, as an absolute path.
+    /// What the local engine runs: [`crate::speechd::ENGINE`] for Parakeet
+    /// Unified, else the ggml model file whisper.cpp loads, as an absolute
+    /// path. Empty means [`DEFAULT_MODEL`], as it always has.
     #[serde(default)]
     pub model: String,
     /// ISO 639-1 code for the local engine. Empty detects per utterance.
@@ -60,7 +66,23 @@ pub struct SttSettings {
     pub language: String,
 }
 
+impl Default for SttSettings {
+    fn default() -> Self {
+        Self {
+            engine: SttEngine::default(),
+            model: crate::speechd::ENGINE.to_owned(),
+            language: String::new(),
+        }
+    }
+}
+
 impl SttSettings {
+    /// Whether the local engine is Parakeet Unified rather than Whisper.
+    #[must_use]
+    pub fn uses_parakeet(&self) -> bool {
+        crate::speechd::is_engine(&self.model)
+    }
+
     /// The settings in force for this library.
     pub fn read(db: &Db) -> Result<Self, String> {
         match db.get_setting(SETTINGS_KEY).map_err(|e| e.to_string())? {

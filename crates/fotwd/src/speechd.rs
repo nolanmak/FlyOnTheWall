@@ -285,3 +285,66 @@ mod tests {
         assert!(license_url().contains(REVISION));
     }
 }
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use crate::stt::{SETTINGS_KEY, SttEngine, SttSettings};
+    use fotw_store::{Db, DbKey};
+
+    #[test]
+    fn a_new_library_defaults_local_transcription_to_parakeet_and_the_choice_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.db");
+        let key = DbKey::from_bytes([0x51; 32]);
+        {
+            let mut db = Db::open(&path, &key).unwrap();
+            let fresh = SttSettings::read(&db).unwrap();
+            assert_eq!(fresh.engine, SttEngine::Deepgram, "the engine default is unchanged");
+            assert!(is_engine(&fresh.model), "local default: {fresh:?}");
+            SttSettings::for_selection(&db, SttEngine::Local)
+                .write(&mut db)
+                .unwrap();
+        }
+        // A restart is a fresh handle on the same library.
+        let db = Db::open(&path, &key).unwrap();
+        let saved = SttSettings::read(&db).unwrap();
+        assert_eq!(saved.engine, SttEngine::Local);
+        assert_eq!(saved.model, ENGINE);
+        assert!(
+            db.get_setting(SETTINGS_KEY)
+                .unwrap()
+                .unwrap()
+                .contains(r#""model":"parakeet-unified""#)
+        );
+    }
+
+    #[test]
+    fn an_existing_saved_whisper_choice_is_left_as_it_was() {
+        let mut db = Db::open_in_memory(&DbKey::from_bytes([0x52; 32])).unwrap();
+        let data_root = Path::new("/data");
+        for (row, expected) in [
+            (
+                r#"{"engine":"local"}"#,
+                "/data/models/ggml-large-v3-turbo-q5_0.bin",
+            ),
+            (
+                r#"{"engine":"local","model":"","language":"en"}"#,
+                "/data/models/ggml-large-v3-turbo-q5_0.bin",
+            ),
+            (
+                r#"{"engine":"fallback","model":"/m/ggml-small.en.bin"}"#,
+                "/m/ggml-small.en.bin",
+            ),
+        ] {
+            db.put_setting(SETTINGS_KEY, row).unwrap();
+            for settings in [
+                SttSettings::read(&db).unwrap(),
+                SttSettings::for_selection(&db, SttEngine::Local),
+            ] {
+                assert!(!is_engine(&settings.model), "{row}: {settings:?}");
+                assert_eq!(settings.model_path(data_root), Path::new(expected), "{row}");
+            }
+        }
+    }
+}
