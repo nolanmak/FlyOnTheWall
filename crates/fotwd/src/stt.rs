@@ -99,7 +99,12 @@ impl SttSettings {
     /// selecting an engine again. This never persists or starts transcription.
     #[must_use]
     pub fn for_selection(db: &Db, engine: SttEngine) -> Self {
-        let mut settings = Self::read(db).unwrap_or_default();
+        // A corrupt row is repaired to what an empty model always meant, the
+        // Whisper default, not to the fresh-library Parakeet default.
+        let mut settings = Self::read(db).unwrap_or_else(|_| Self {
+            model: String::new(),
+            ..Self::default()
+        });
         settings.engine = engine;
         settings
     }
@@ -256,6 +261,9 @@ fn saved_local_model_with(
     detector: &'static KnownModel,
 ) -> Result<std::sync::Arc<dyn fotw_stt::RecognizerFactory>, String> {
     use fotw_stt::RecognizerFactory;
+    if plan.engine.provider == fotw_stt::speechd::PROVIDER {
+        return Err("Parakeet recovery isn't supported yet; the audio is kept.".into());
+    }
     plan.validate().map_err(|e| e.to_string())?;
     let digest = plan
         .engine
@@ -537,7 +545,10 @@ pub fn verify_vad_model(data_root: &Path) -> Result<PathBuf, String> {
 
 /// [`verify_vad_model`] against a given detector identity, so tests can pin a
 /// fixture instead of real weights.
-fn verify_detector(data_root: &Path, detector: &'static KnownModel) -> Result<PathBuf, String> {
+pub(crate) fn verify_detector(
+    data_root: &Path,
+    detector: &'static KnownModel,
+) -> Result<PathBuf, String> {
     let path = models_dir(data_root).join(model_file_name(detector.name));
     let fix = format!(
         "Install it with `fotwd stt models install {}` (installing a Whisper model from \

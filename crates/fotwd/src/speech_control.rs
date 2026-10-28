@@ -117,18 +117,11 @@ impl SpeechControl for SpeechSettingsControl {
 #[cfg(target_os = "macos")]
 fn check_model(settings: &SttSettings, root: &Path) -> Result<(), String> {
     if settings.uses_parakeet() {
-        // Ready means what Start needs: the detector, and the helper loading
-        // and warming the installed model. The helper exits with the runtime.
-        crate::stt::verify_vad_model(root)?;
-        let launch = crate::speechd::Launch::bundled()?;
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?;
-        return runtime
-            .block_on(crate::speechd::prepare_private(&launch, root))
-            .map(drop);
+        return check_parakeet(
+            root,
+            &crate::stt::VAD_MODEL,
+            crate::speechd::Launch::bundled(),
+        );
     }
     let path = settings.model_path(root);
     crate::stt::verify_model(&path).map_err(|e| e.to_string())?;
@@ -137,6 +130,27 @@ fn check_model(settings: &SttSettings, root: &Path) -> Result<(), String> {
         .with_speech_gate(vad)
         .load()
         .map_err(|e| e.message)
+}
+#[cfg(target_os = "macos")]
+fn check_parakeet(
+    root: &Path,
+    detector: &'static crate::stt::KnownModel,
+    launch: Result<crate::speechd::Launch, String>,
+) -> Result<(), String> {
+    // Cheap on purpose: a save may come during a recording, and loading a
+    // second ~600 MB model would compete with the live legs. Start loads it
+    // and refuses with the same hint if it does not load.
+    crate::stt::verify_detector(root, detector)?;
+    launch?;
+    if crate::speechd::present(root) {
+        Ok(())
+    } else {
+        Err(format!(
+            "The {} speech model is not installed. {}.",
+            crate::speechd::ENGINE,
+            fotw_stt::speechd::install_hint(crate::speechd::ENGINE)
+        ))
+    }
 }
 #[cfg(not(target_os = "macos"))]
 fn check_model(_: &SttSettings, _: &Path) -> Result<(), String> {
@@ -198,6 +212,36 @@ mod tests {
         );
         parakeet.language = "de".into();
         assert!(c.set(parakeet).unwrap_err().contains("English only"));
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn saving_parakeet_checks_its_files_without_starting_a_helper() {
+        let root = tempfile::tempdir().unwrap();
+        let detector = crate::stt::fixture_detector(root.path());
+        // A program that does not exist: any attempt to start it fails.
+        let no_spawn = || {
+            Ok(crate::speechd::Launch {
+                program: "/nonexistent/fotw-speechd".into(),
+                extra_args: Vec::new(),
+            })
+        };
+        let missing = check_parakeet(root.path(), detector, no_spawn()).unwrap_err();
+        assert!(
+            missing.contains("fotwd stt models install parakeet-unified"),
+            "{missing}"
+        );
+        std::fs::create_dir_all(
+            crate::speechd::models_root(root.path())
+                .join(crate::speechd::ENGINE)
+                .join(crate::speechd::REVISION),
+        )
+        .unwrap();
+        assert_eq!(check_parakeet(root.path(), detector, no_spawn()), Ok(()));
+        assert!(
+            check_parakeet(root.path(), detector, Err("no helper in this build".into()))
+                .unwrap_err()
+                .contains("no helper")
+        );
     }
     #[test]
     fn a_fresh_library_shows_parakeet_as_the_local_model() {

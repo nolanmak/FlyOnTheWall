@@ -492,6 +492,19 @@ mod selection_tests {
     }
 
     #[test]
+    fn repairing_a_corrupt_choice_keeps_the_whisper_default_it_had() {
+        let mut db = Db::open_in_memory(&DbKey::from_bytes([0x53; 32])).unwrap();
+        db.put_setting(SETTINGS_KEY, "{").unwrap();
+        let repaired = SttSettings::for_selection(&db, SttEngine::Local);
+        assert_eq!(repaired.engine, SttEngine::Local);
+        assert!(!is_engine(&repaired.model), "{repaired:?}");
+        assert_eq!(
+            repaired.model_path(Path::new("/data")),
+            Path::new("/data/models/ggml-large-v3-turbo-q5_0.bin")
+        );
+    }
+
+    #[test]
     fn an_existing_saved_whisper_choice_is_left_as_it_was() {
         let mut db = Db::open_in_memory(&DbKey::from_bytes([0x52; 32])).unwrap();
         let data_root = Path::new("/data");
@@ -630,6 +643,34 @@ mod fallback_tests {
         assert!(
             refused.contains("fotwd stt models install parakeet-unified"),
             "{refused}"
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod recovery_tests {
+    use super::*;
+    use crate::failover::coverage::{EngineDescriptor, LocalPlan};
+
+    #[test]
+    fn recovering_saved_parakeet_audio_is_refused_plainly_and_the_audio_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let plan = LocalPlan {
+            engine: EngineDescriptor {
+                provider: fotw_stt::speechd::PROVIDER.into(),
+                model: ENGINE.into(),
+                revision: Some(REVISION.into()),
+                capabilities: fotw_stt::SttCapabilities::deepgram(),
+            },
+            language: Some("en".into()),
+            endpoint: Default::default(),
+        };
+        let Err(refused) = crate::stt::saved_local_model(&plan, root.path(), root.path()) else {
+            panic!("Parakeet recovery is not supported yet");
+        };
+        assert_eq!(
+            refused,
+            "Parakeet recovery isn't supported yet; the audio is kept."
         );
     }
 }
