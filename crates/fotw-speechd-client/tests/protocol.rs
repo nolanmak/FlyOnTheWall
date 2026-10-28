@@ -835,3 +835,146 @@ async fn shutdown_during_a_slow_restart_returns_at_once_and_leaves_no_helper() {
     std::fs::remove_file(&marker).unwrap();
     assert!(gone.is_ok(), "the replacement helper was left running");
 }
+
+// ------------------------------------------------- streaming dictation (Murmur #100)
+
+/// `fake-dictation` behaves like `nemotron-3.5` without a model: it decodes in
+/// 250 ms steps (4000 samples), so a partial arrives once per completed step,
+/// and `finish` pads the last partial step and flushes it into the final.
+fn dictation(language: Option<&str>) -> StreamConfig {
+    let mut config = stream("fake-dictation");
+    config.options.language = language.map(str::to_owned);
+    config
+}
+
+async fn dictation_client() -> SpeechdClient {
+    let client = SpeechdClient::start(config(&[])).await.expect("start");
+    let engines = client.capabilities().expect("capabilities").engines;
+    let engine = engines
+        .iter()
+        .find(|e| e.id == "fake-dictation")
+        .unwrap_or_else(|| panic!("fake-dictation is served: {engines:?}"));
+    assert!(
+        engine.partials,
+        "a streaming dictation engine sends partials"
+    );
+    client.load("fake-dictation").await.expect("load");
+    client.warmup("fake-dictation").await.expect("warmup");
+    client
+}
+
+#[tokio::test]
+async fn dictation_sends_a_partial_per_completed_step_and_a_padded_final_on_finish() {
+    let client = dictation_client().await;
+    let mut live = client
+        .open_stream(dictation(Some("en")))
+        .await
+        .expect("open");
+    // Less than a step: nothing to show yet.
+    live.send_audio(&[100; 3_000]).await.expect("audio");
+    // Completes step 1 and starts step 2.
+    live.send_audio(&[100; 2_000]).await.expect("audio");
+    match next(&mut live).await {
+        Some(StreamEvent::Partial {
+            text,
+            utterance,
+            end_ms,
+            ..
+        }) => {
+            assert_eq!(text, "steps=1 lang=en");
+            assert_eq!(utterance, Some(1));
+            assert_eq!(end_ms, 312, "the partial covers the audio received so far");
+        }
+        other => panic!("expected the first step's partial, got {other:?}"),
+    }
+    // 5000 samples in: finish pads the second, partial step and decodes it.
+    live.finish().await.expect("finish");
+    match next(&mut live).await {
+        Some(StreamEvent::Final(f)) => {
+            assert_eq!(f.text, "steps=2 lang=en");
+            assert_eq!(f.utterance, Some(1));
+            assert_eq!(f.model.as_deref(), Some("fake-dictation@fake"));
+        }
+        other => panic!("expected the padded final, got {other:?}"),
+    }
+    assert_eq!(
+        next(&mut live).await,
+        Some(StreamEvent::Closed(CloseReason::Finished))
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn dictation_without_a_language_auto_detects() {
+    let client = dictation_client().await;
+    let mut live = client.open_stream(dictation(None)).await.expect("open");
+    live.send_audio(&[100; 4_000]).await.expect("audio");
+    assert!(matches!(
+        next(&mut live).await,
+        Some(StreamEvent::Partial { ref text, .. }) if text == "steps=1 lang=auto"
+    ));
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_cancelled_dictation_sends_nothing_more_and_the_next_one_starts_clean() {
+    let client = dictation_client().await;
+    let mut first = client
+        .open_stream(dictation(Some("en")))
+        .await
+        .expect("open");
+    first.send_audio(&[100; 4_000]).await.expect("audio");
+    assert!(matches!(
+        next(&mut first).await,
+        Some(StreamEvent::Partial { .. })
+    ));
+    // Mid-step, then cancel: no late partial, final or close may follow.
+    first.send_audio(&[100; 3_999]).await.expect("audio");
+    first.cancel();
+    assert_eq!(next(&mut first).await, None, "nothing after cancel");
+
+    // The engine holds one dictation's state at a time; the next stream gets
+    // it back reset, so its steps count from zero.
+    let mut second = client
+        .open_stream(dictation(Some("en")))
+        .await
+        .expect("a second dictation opens right after a cancel");
+    second.send_audio(&[100; 4_000]).await.expect("audio");
+    assert!(matches!(
+        next(&mut second).await,
+        Some(StreamEvent::Partial { ref text, .. }) if text == "steps=1 lang=en"
+    ));
+    second.finish().await.expect("finish");
+    assert_eq!(final_text(&mut second).await, "steps=1 lang=en");
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_engine_error_mid_dictation_fails_only_that_stream() {
+    let client = dictation_client().await;
+    let mut live = client
+        .open_stream(dictation(Some("en")))
+        .await
+        .expect("open");
+    live.send_audio(&[100; 4_000]).await.expect("audio");
+    assert!(matches!(
+        next(&mut live).await,
+        Some(StreamEvent::Partial { .. })
+    ));
+    // The fake's failure trigger: a full-scale negative sample.
+    live.send_audio(&[i16::MIN; 10]).await.expect("audio");
+    match next(&mut live).await {
+        Some(StreamEvent::Failed(failure)) => assert_eq!(failure.code, ErrorCode::Engine),
+        other => panic!("expected the engine error, got {other:?}"),
+    }
+    assert_eq!(next(&mut live).await, None, "an error is terminal");
+    // The helper and the engine keep serving.
+    let mut next_one = client
+        .open_stream(dictation(Some("en")))
+        .await
+        .expect("open after an error");
+    next_one.send_audio(&[100; 4_000]).await.expect("audio");
+    next_one.finish().await.expect("finish");
+    assert_eq!(final_text(&mut next_one).await, "steps=1 lang=en");
+    client.shutdown().await;
+}

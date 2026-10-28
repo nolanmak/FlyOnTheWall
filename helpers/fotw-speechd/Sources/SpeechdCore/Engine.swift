@@ -80,6 +80,13 @@ public protocol SpeechEngine: Sendable {
 public protocol EngineSession: AnyObject, Sendable {
     func append(_ samples: [Float]) async throws -> [EngineEvent]
     func finish() async throws -> [EngineEvent]
+    /// The stream is over, however it ended (finished, cancelled, failed).
+    /// Pooled engines take their instance back here.
+    func close() async
+}
+
+extension EngineSession {
+    public func close() async {}
 }
 
 /// A batch stream holds at most 10 minutes of audio.
@@ -108,7 +115,9 @@ public actor FakeEngine: SpeechEngine {
                                       maxAudioMs: kind == .batch ? maxBatchMs : nil)
     }
 
-    public static func all() -> [any SpeechEngine] { ids.map { FakeEngine(id: $0) } }
+    public static func all() -> [any SpeechEngine] {
+        ids.map { FakeEngine(id: $0) } + [FakeDictationEngine()]
+    }
 
     public func load() async throws -> LoadResult {
         loaded = true

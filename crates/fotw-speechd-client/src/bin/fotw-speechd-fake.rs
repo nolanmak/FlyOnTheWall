@@ -134,7 +134,7 @@ impl Out {
     }
 }
 
-const ENGINES: [(&str, EngineKind, bool); 7] = [
+const ENGINES: [(&str, EngineKind, bool); 8] = [
     ("fake-batch", EngineKind::Batch, false),
     ("fake-stream", EngineKind::Streaming, true),
     ("fake-vad", EngineKind::Vad, false),
@@ -142,7 +142,10 @@ const ENGINES: [(&str, EngineKind, bool); 7] = [
     ("fake-hang", EngineKind::Batch, false),
     ("fake-stall", EngineKind::Batch, false),
     ("fake-exit-after-final", EngineKind::Batch, false),
+    ("fake-dictation", EngineKind::Streaming, true),
 ];
+/// `fake-dictation` decodes in 250 ms steps, like `nemotron-3.5` in 2.24 s ones.
+const DICTATION_STEP: u64 = 4_000;
 
 fn capabilities(future: bool) -> serde_json::Value {
     let mut value = serde_json::to_value(Capabilities {
@@ -178,6 +181,15 @@ struct Stream {
     engine: String,
     samples: u64,
     in_speech: bool,
+    /// `fake-dictation`: the language hint, or "auto".
+    language: String,
+}
+
+impl Stream {
+    /// `fake-dictation`'s running text after `steps` decoded steps.
+    fn dictation(&self, steps: u64) -> String {
+        format!("steps={steps} lang={}", self.language)
+    }
 }
 
 struct Helper {
@@ -247,8 +259,14 @@ impl Helper {
                 sample_rate,
                 format,
                 channels,
-                ..
-            } => self.open(id, stream, engine, (sample_rate, &format, channels)),
+                options,
+            } => self.open(
+                id,
+                stream,
+                engine,
+                (sample_rate, &format, channels),
+                options.language,
+            ),
             Request::Finish { stream } => self.finish(stream),
             Request::Cancel { stream } => {
                 let was_finishing = lock(&self.finishing).remove(&stream);
@@ -292,7 +310,14 @@ impl Helper {
         }
     }
 
-    fn open(&mut self, id: u64, stream: u32, engine: String, format: (u32, &str, u16)) {
+    fn open(
+        &mut self,
+        id: u64,
+        stream: u32,
+        engine: String,
+        format: (u32, &str, u16),
+        language: Option<String>,
+    ) {
         let out = &self.out;
         let refusal = if !ENGINES.iter().any(|e| e.0 == engine) {
             Some((ErrorCode::UnknownEngine, "no such engine"))
@@ -317,6 +342,7 @@ impl Helper {
                 engine,
                 samples: 0,
                 in_speech: false,
+                language: language.unwrap_or_else(|| "auto".to_owned()),
             },
         );
         out.send(&Reply::StreamOpened { id, stream });
@@ -338,6 +364,32 @@ impl Helper {
             "fake-hang" => loop {
                 std::thread::park();
             },
+            // A full-scale negative sample is the failure trigger.
+            "fake-dictation" if pcm.contains(&i16::MIN) => {
+                self.streams.remove(&id);
+                self.closed.insert(id);
+                out.send(&Reply::Error {
+                    id: None,
+                    stream: Some(id),
+                    code: ErrorCode::Engine,
+                    message: "fake-dictation was told to fail".to_owned(),
+                    fatal: false,
+                    supported: Vec::new(),
+                });
+            }
+            // A partial whenever a step completes.
+            "fake-dictation" => {
+                let steps = stream.samples / DICTATION_STEP;
+                if steps > start / DICTATION_STEP {
+                    out.send(&Reply::Partial {
+                        stream: id,
+                        text: stream.dictation(steps),
+                        start_ms: 0,
+                        end_ms: stream.samples * 1000 / u64::from(SAMPLE_RATE),
+                        utterance: Some(1),
+                    });
+                }
+            }
             "fake-stream" => out.send(&Reply::Partial {
                 stream: id,
                 text: format!("samples={}", stream.samples),
@@ -398,12 +450,18 @@ impl Helper {
         let end_ms = stream.samples * 1000 / u64::from(SAMPLE_RATE);
         let final_text = FinalText {
             stream: id,
-            text: format!("samples={}", stream.samples),
+            // fake-dictation pads its last partial step and decodes it.
+            text: if stream.engine == "fake-dictation" {
+                stream.dictation(stream.samples.div_ceil(DICTATION_STEP))
+            } else {
+                format!("samples={}", stream.samples)
+            },
             start_ms: 0,
             end_ms,
             segments: Vec::new(),
             model: Some(format!("{}@fake", stream.engine)),
-            utterance: (stream.engine == "fake-stream").then_some(1),
+            utterance: matches!(stream.engine.as_str(), "fake-stream" | "fake-dictation")
+                .then_some(1),
         };
         if stream.engine == "fake-batch" {
             // Slow, and off the frame-reading thread.

@@ -247,6 +247,41 @@ func aFailedSwapKeepsTheWorkingRevision() throws {
     try expect(!FileManager.default.fileExists(atPath: aside.path), "and removes the old one after")
 }
 
+func aDictationStreamShowsEachStepOnceAndReturnsItsRecognizerReset() async throws {
+    let pool = try await SessionPool(capacity: 1, make: { FakeStepRecognizer() }, warm: { try await $0.warm() })
+    let first = try await openStepStream(pool: pool, options: StreamOptions(language: "de"), provenance: "f@1")
+    var events = try await first.append([Float](repeating: 0.1, count: 3000))
+    try expect(events.isEmpty, "nothing to show before a step completes: \(events)")
+    events = try await first.append([Float](repeating: 0.1, count: 2000))
+    try expect(events == [.partial(text: "steps=1 lang=de", startMs: 0, endMs: 312, utterance: 1)], "\(events)")
+    events = try await first.append([Float](repeating: 0.1, count: 100))
+    try expect(events.isEmpty, "unchanged text is not sent again: \(events)")
+    // Ended mid-step (cancelled): the recognizer goes back, reset.
+    await first.close()
+    await first.close()
+    let available = await pool.available
+    try expect(available == 1, "returned once, however often close runs")
+
+    let second = try await openStepStream(pool: pool, options: StreamOptions(), provenance: "f@1")
+    let busy = ContinuousClock.now
+    do {
+        _ = try await openStepStream(pool: pool, options: StreamOptions(), provenance: "f@1")
+        throw CheckFailure(description: "two dictations shared one recognizer")
+    } catch let error as SpeechdError {
+        try expect(error.code == "busy", "\(error)")
+    }
+    try expect(ContinuousClock.now - busy >= .milliseconds(900), "waited for the recognizer before refusing")
+    events = try await second.finish()
+    try expect(events == [.final(text: "", startMs: 0, endMs: 0, segments: [], model: "f@1", utterance: 1)],
+               "an empty dictation still ends with a final: \(events)")
+    _ = try await second.append([Float](repeating: 0.1, count: 4500))
+    events = try await second.finish()
+    try expect(events.first == .final(text: "steps=2 lang=auto", startMs: 0, endMs: 281, segments: [],
+                                       model: "f@1", utterance: 1),
+               "the next stream starts from zero, in its own language, and pads its last step: \(events)")
+    await second.close()
+}
+
 func pinsAreComplete() throws {
     let ids = PinnedModels.all.map(\.id)
     try expect(ids == ["parakeet-unified", "silero-vad", "parakeet-eou-320ms", "nemotron-3.5-2240ms"], "\(ids)")
@@ -271,6 +306,8 @@ let cases: [(String, () async throws -> Void)] = [
     ("a corrupt model fails validation and keeps the previous selection",
      corruptModelFailsValidationAndKeepsThePreviousSelection),
     ("a failed swap keeps the working revision", aFailedSwapKeepsTheWorkingRevision),
+    ("a dictation stream shows each step once and returns its recognizer reset",
+     aDictationStreamShowsEachStepOnceAndReturnsItsRecognizerReset),
     ("every pin is a full revision with per-file hashes", pinsAreComplete),
 ]
 var failures = 0
