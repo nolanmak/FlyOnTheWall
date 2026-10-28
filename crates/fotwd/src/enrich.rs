@@ -337,8 +337,24 @@ async fn title_from_engine(
     receipt: &mut EnrichReceipt,
     report: &mut EnrichReport,
 ) {
-    match title_meeting_on(engine, meeting_id, segments).await {
-        Ok(named) => mint(db, meeting_id, &named, receipt, report),
+    let stamp = match crate::summary_guard::PolicyStamp::capture(db, engine) {
+        Ok(stamp) => stamp,
+        Err(error) => {
+            report.problems.push(format!("title: {error}"));
+            return;
+        }
+    };
+    match title_meeting_on(db, engine, meeting_id, segments).await {
+        Ok(named) => match db
+            .meetings()
+            .set_title_if_setting(meeting_id, &named, stamp.version())
+        {
+            Ok(()) => {
+                receipt.minted_title = named.clone();
+                report.title = Some(named);
+            }
+            Err(error) => report.problems.push(format!("title: {error}")),
+        },
         Err(e) => report.problems.push(format!("title: {e}")),
     }
 }

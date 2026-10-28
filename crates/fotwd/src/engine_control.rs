@@ -67,9 +67,27 @@ impl SummarizeControl for EngineControl {
     ) -> Result<SummarizeSettingsDoc, SummarizeError> {
         let mut db = self.lock_db();
         let previous = SummarizeSettings::read(&db);
+        let mut settings = settings.normalized()?;
+        // An old client which cannot express a destination must not erase a
+        // saved Local-only/Off choice and restore legacy key precedence.
+        settings.policy = settings.policy.or(previous.policy);
+        let settings = settings.normalized()?;
 
-        let kind = CliKind::from(settings.cli_kind);
+        let inactive_cli = matches!(
+            settings.policy,
+            Some(
+                fotw_web::SummaryPolicy::Off
+                    | fotw_web::SummaryPolicy::LocalOnly
+                    | fotw_web::SummaryPolicy::Anthropic
+            )
+        );
+        let kind = if inactive_cli && settings.binary.is_empty() {
+            previous.cli_kind
+        } else {
+            CliKind::from(settings.cli_kind)
+        };
         let stored = SummarizeSettings {
+            policy: settings.policy,
             cli_enabled: settings.cli_enabled,
             // The handler already refused enablement without this (KEY-04);
             // storing it verbatim keeps the resolver's own second check —
@@ -99,21 +117,28 @@ impl SummarizeControl for EngineControl {
         let settings = SummarizeSettings::read(&self.lock_db());
         // Presence, never the value. KEY-01 keeps the key in the keychain, and
         // "is one configured" is all a settings form needs to render.
-        let api_key_present = self
-            .store
-            .contains(SecretKey::ApiKey(Provider::Anthropic))
-            .unwrap_or(false);
+        let api_key_checked = settings.allows_api_key();
+        let api_key_present = api_key_checked
+            && self
+                .store
+                .contains(SecretKey::ApiKey(Provider::Anthropic))
+                .unwrap_or(false);
 
-        let resolved = (settings.cli_enabled && settings.acknowledged_egress)
+        let selected_cli = settings.selected_cli();
+        let resolved = selected_cli
+            .is_some()
             .then(|| resolve_binary(&settings.binary))
             .flatten();
 
         let engine = if api_key_present {
-            // An explicit key always wins, whatever the CLI settings say —
-            // saying otherwise here would describe an engine that never runs.
+            // Only policies which permit this key consulted its presence.
             "anthropic"
         } else if resolved.is_some() {
-            settings.cli_kind.subcommand()
+            selected_cli.unwrap().subcommand()
+        } else if settings.policy == Some(fotw_web::SummaryPolicy::Off) {
+            "off"
+        } else if settings.policy == Some(fotw_web::SummaryPolicy::LocalOnly) {
+            "local-setup-required"
         } else {
             "none"
         };
@@ -124,6 +149,7 @@ impl SummarizeControl for EngineControl {
             configured_binary: settings.binary.clone(),
             resolved_binary: resolved.map(|p| p.to_string_lossy().into_owned()),
             api_key_present,
+            api_key_checked,
             disclosures: SummarizeStatus::all_disclosures(),
         }
     }
@@ -131,6 +157,7 @@ impl SummarizeControl for EngineControl {
 
 fn to_doc(settings: &SummarizeSettings) -> SummarizeSettingsDoc {
     SummarizeSettingsDoc {
+        policy: settings.policy,
         cli_enabled: settings.cli_enabled,
         acknowledged_egress: settings.acknowledged_egress,
         cli_kind: settings.cli_kind.into(),
@@ -164,6 +191,7 @@ mod tests {
 
     fn enable(binary: &str, kind: CliEngine) -> SummarizeSettingsDoc {
         SummarizeSettingsDoc {
+            policy: None,
             cli_enabled: true,
             acknowledged_egress: true,
             cli_kind: kind,

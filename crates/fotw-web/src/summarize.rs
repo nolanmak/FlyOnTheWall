@@ -32,6 +32,25 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Explicit destination for every summary-related model call.
+///
+/// Missing policy in old settings retains their historical resolution. A
+/// present but unknown value is invalid, never a request for legacy fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryPolicy {
+    /// Disable model calls, including configured hosted API keys.
+    Off,
+    /// Use a verified on-device runtime; never fall back to hosted inference.
+    LocalOnly,
+    /// Explicitly acknowledged Anthropic API processing.
+    Anthropic,
+    /// Explicitly acknowledged Claude CLI processing.
+    ClaudeCli,
+    /// Explicitly acknowledged Codex CLI processing.
+    CodexCli,
+}
+
 /// Which local CLI serves as the engine.
 ///
 /// The wire spelling matches the daemon's own persisted `cli_kind`, so the
@@ -65,7 +84,7 @@ impl CliEngine {
 
 /// KEY-04 for the claude CLI: the host, what leaves, and the training default.
 const CLAUDE_DISCLOSURE: &[&str] = &[
-    "Enabling this sends each finished meeting's transcript to Anthropic",
+    "Enabling this sends each finished meeting's transcript and notes to Anthropic",
     "(api.anthropic.com) through your local `claude` login. On a Claude",
     "subscription, conversations are not used for training by default;",
     "confirm current terms: https://www.anthropic.com/legal/privacy",
@@ -77,7 +96,7 @@ const CLAUDE_DISCLOSURE: &[&str] = &[
 /// implying "same as an API key": a consumer ChatGPT subscription trains on
 /// conversations by default, where the Anthropic API does not.
 const CODEX_DISCLOSURE: &[&str] = &[
-    "Enabling this sends each finished meeting's transcript to OpenAI",
+    "Enabling this sends each finished meeting's transcript and notes to OpenAI",
     "(chatgpt.com / api.openai.com) through your local `codex` login.",
     "NOTE: a consumer ChatGPT subscription MAY be used to train OpenAI's",
     "models by default — unlike a no-training API key. Review and opt out:",
@@ -96,6 +115,9 @@ const CODEX_DISCLOSURE: &[&str] = &[
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SummarizeSettingsDoc {
+    /// Explicit destination; absent only for legacy settings/clients.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<SummaryPolicy>,
     /// Whether the local CLI engine is on. Off by default: nothing leaves the
     /// machine until a person turns this on.
     pub cli_enabled: bool,
@@ -121,6 +143,28 @@ impl SummarizeSettingsDoc {
     /// [`SummarizeError::Invalid`] with a human-readable reason.
     pub fn normalized(mut self) -> Result<Self, SummarizeError> {
         self.binary = self.binary.trim().to_owned();
+
+        match self.policy {
+            Some(SummaryPolicy::Off | SummaryPolicy::LocalOnly) => {
+                self.cli_enabled = false;
+                self.acknowledged_egress = false;
+            }
+            Some(SummaryPolicy::Anthropic) => {
+                self.cli_enabled = false;
+                if !self.acknowledged_egress {
+                    return Err(SummarizeError::DisclosureRequired);
+                }
+            }
+            Some(SummaryPolicy::ClaudeCli | SummaryPolicy::CodexCli) => {
+                self.cli_enabled = true;
+                self.cli_kind = if self.policy == Some(SummaryPolicy::ClaudeCli) {
+                    CliEngine::Claude
+                } else {
+                    CliEngine::Codex
+                };
+            }
+            None => {}
+        }
 
         if self.cli_enabled && !self.acknowledged_egress {
             // The API shape of `--i-acknowledge-egress`. A `claude` binary on
@@ -157,7 +201,8 @@ impl SummarizeSettingsDoc {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SummarizeStatus {
-    /// `anthropic`, `claude-cli`, `codex-cli` or `none` — which engine a
+    /// `anthropic`, `claude-cli`, `codex-cli`, `off`, `local-setup-required`
+    /// or `none` — which destination/state a
     /// meeting finishing now would get.
     pub engine: String,
     /// Whether the configured binary resolves for the daemon.
@@ -174,6 +219,9 @@ pub struct SummarizeStatus {
     /// Whether an Anthropic API key is in the keychain. **Presence only** —
     /// KEY-01 keeps the key itself off every surface, including this one.
     pub api_key_present: bool,
+    /// Whether presence was checked. Local-only/Off never consult hosted keys;
+    /// in those modes `api_key_present == false` does not assert key absence.
+    pub api_key_checked: bool,
     /// KEY-04's disclosure for **every** engine, keyed by its wire spelling
     /// (`claude`, `codex`), one line at a time.
     ///
@@ -202,6 +250,10 @@ impl SummarizeStatus {
                 let lines = kind.disclosure().iter().map(|l| (*l).to_owned()).collect();
                 (key, lines)
             })
+            .chain(std::iter::once((
+                "anthropic".to_owned(),
+                vec!["Sends meeting transcripts and notes to Anthropic at api.anthropic.com using your stored API key.".to_owned()],
+            )))
             .collect()
     }
 }
@@ -252,6 +304,7 @@ mod tests {
 
     fn enabled(acknowledged: bool) -> SummarizeSettingsDoc {
         SummarizeSettingsDoc {
+            policy: None,
             cli_enabled: true,
             acknowledged_egress: acknowledged,
             cli_kind: CliEngine::Claude,
@@ -331,12 +384,16 @@ mod tests {
         assert!(codex.contains("train OpenAI"));
     }
 
-    /// Keyed by the same strings the settings document uses for `cli_kind`,
-    /// so the client can index one by the other without a lookup table.
+    /// Keyed by the settings picker's CLI names and explicit API destination.
     #[test]
     fn every_engine_has_a_disclosure_under_its_own_wire_spelling() {
         let all = SummarizeStatus::all_disclosures();
-        assert_eq!(all.len(), 2);
+        assert_eq!(
+            all.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["anthropic", "claude", "codex"]
+        );
+        assert!(all["anthropic"].join(" ").contains("api.anthropic.com"));
+        assert!(all.values().all(|lines| lines.join(" ").contains("notes")));
         assert!(all["claude"].join(" ").contains("anthropic.com"));
         assert!(all["codex"].join(" ").contains("openai.com"));
     }
