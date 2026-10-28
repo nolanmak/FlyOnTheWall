@@ -43,9 +43,15 @@ export FOTW_FLUIDAUDIO_SOURCE=/absolute/path/to/FluidAudio
 just speechd-helper   # verifies the checkout, builds packaging/build/speechd-swift/release/fotw-speechd
 ```
 
-Putting it into the app bundle (`Contents/Helpers`, signed with the hardened
-runtime and no entitlements) comes with #254: `FOTW_SPEECHD=1 just dev-sign`.
-Until that merges, `just dev-sign` bundles `fotwd` only.
+To put it into the app bundle, set `FOTW_SPEECHD=1` for `just bundle`,
+`just dev-sign` or `just release-sign`. It lands in `Contents/Helpers`, signed
+before the app with the hardened runtime, its own identifier and no
+entitlements, and `just verify-bundle` fails if it ever carries the
+microphone entitlement:
+
+```sh
+FOTW_SPEECHD=1 just dev-sign && FOTW_SPEECHD=1 just verify-bundle
+```
 
 `speechd-helper` checks the checkout with
 `tools/speech-eval/parakeet/verify_runtime.py` first. SwiftPM may still fetch

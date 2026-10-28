@@ -21,7 +21,13 @@ dev_cert   := env_var_or_default("FOTW_DEV_CERT_DIR", env_var("HOME") / ".fotw-d
 dev_ident  := "FlyOnTheWall Dev"
 # Keep local builds off every core so an interactive machine stays usable.
 jobs       := env_var_or_default("CARGO_BUILD_JOBS", "3")
-# Where `just speechd-helper` builds the FluidAudio speech helper (#243).
+# Opt-in: FOTW_SPEECHD=1 builds the FluidAudio speech helper (#243) and puts
+# it in Contents/Helpers. It needs Swift 6.2+ and a verified local FluidAudio
+# checkout in FOTW_FLUIDAUDIO_SOURCE (helpers/fotw-speechd/README.md). Without
+# it the bundle is exactly what it was: no Swift, no helper.
+speechd    := env_var_or_default("FOTW_SPEECHD", "")
+speechd_id := bundle_id + ".speechd"
+# Where `just speechd-helper` builds it.
 speechd_build := build_dir / "speechd-swift"
 
 default:
@@ -151,6 +157,11 @@ bundle profile="release":
     rm -rf "{{app}}"
     mkdir -p "{{app}}/Contents/MacOS" "{{app}}/Contents/Resources"
     cp "target/{{profile}}/fotwd" "{{app}}/Contents/MacOS/fotwd"
+    if [[ -n "{{speechd}}" ]]; then
+        just speechd-helper
+        mkdir -p "{{app}}/Contents/Helpers"
+        cp "{{speechd_build}}/release/fotw-speechd" "{{app}}/Contents/Helpers/fotw-speechd"
+    fi
     cp packaging/Info.plist "{{app}}/Contents/Info.plist"
     cp packaging/AppIcon.icns "{{app}}/Contents/Resources/AppIcon.icns"
     cp THIRD_PARTY_NOTICES.md "{{app}}/Contents/Resources/THIRD_PARTY_NOTICES.md"
@@ -274,6 +285,28 @@ verify-bundle:
             *) echo "✗ $bin is not hardened-runtime signed" >&2; fail=1 ;;
         esac
     done < <(find "{{app}}/Contents/MacOS" -type f -perm +111)
+    # Contents/Helpers holds fotw-speechd (#243), which never captures: the
+    # parent sends it PCM. It must run hardened and must NOT carry the capture
+    # entitlement, so it can never become a second process asking for the mic.
+    if [[ -n "{{speechd}}" && ! -x "{{app}}/Contents/Helpers/fotw-speechd" ]]; then
+        echo "✗ FOTW_SPEECHD is set but the bundle lacks Contents/Helpers/fotw-speechd" >&2; fail=1
+    fi
+    if [[ -d "{{app}}/Contents/Helpers" ]]; then
+        while IFS= read -r bin; do
+            ents=$(codesign -d --entitlements :- "$bin" 2>/dev/null || true)
+            case "$ents" in
+                *com.apple.security.device.audio-input*) echo "✗ $bin carries the capture entitlement" >&2; fail=1 ;;
+            esac
+            info=$(codesign -d --verbose=2 "$bin" 2>&1 || true)
+            case "$info" in
+                *"(runtime)"*) ;;
+                *) echo "✗ $bin is not hardened-runtime signed" >&2; fail=1 ;;
+            esac
+        done < <(find "{{app}}/Contents/Helpers" -type f -perm +111)
+    fi
+    if ! codesign --verify --deep --strict "{{app}}" 2>/dev/null; then
+        echo "✗ codesign --verify --deep --strict fails" >&2; fail=1
+    fi
     [[ $fail -eq 0 ]] && echo "✓ bundle verified" || exit 1
 
 # ---------------------------------------------------------------- dev signing
@@ -415,6 +448,15 @@ dev-sign: (bundle "debug")
     fi
     # --timestamp=none in dev only: Apple's timestamp server is a needless
     # network dependency and point of failure for contributors.
+    # Nested code before the bundle that seals it. The speech helper gets its
+    # own identifier and no entitlements (packaging/speechd-entitlements.plist).
+    if [[ -d "{{app}}/Contents/Helpers" ]]; then
+        while IFS= read -r helper; do
+            codesign --force --options runtime --timestamp=none -i "{{speechd_id}}" \
+                --entitlements packaging/speechd-entitlements.plist \
+                --sign "{{dev_ident}}" "$helper"
+        done < <(find "{{app}}/Contents/Helpers" -type f -perm +111)
+    fi
     codesign --force --options runtime --timestamp=none \
         --entitlements packaging/entitlements.plist \
         --sign "{{dev_ident}}" "{{app}}"
@@ -583,6 +625,12 @@ release-sign identity:
     find "{{app}}/Contents/MacOS" -type f -perm +111 -mindepth 2 -print0 \
       | xargs -0 -r -n1 codesign --force --options runtime --timestamp \
             --entitlements packaging/entitlements.plist --sign "{{identity}}"
+    # The speech helper (#243): its own identifier, no entitlements.
+    if [[ -d "{{app}}/Contents/Helpers" ]]; then
+        find "{{app}}/Contents/Helpers" -type f -perm +111 -print0 \
+          | xargs -0 -r -n1 codesign --force --options runtime --timestamp -i "{{speechd_id}}" \
+                --entitlements packaging/speechd-entitlements.plist --sign "{{identity}}"
+    fi
     # --timestamp is not optional: omitting it passes local verification and is
     # rejected only after the round trip to Apple.
     codesign --force --options runtime --timestamp \
