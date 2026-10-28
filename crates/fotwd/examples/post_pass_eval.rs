@@ -41,7 +41,6 @@ mod imp {
     use std::time::Instant;
 
     use fotw_store::{Db, DbKey, NewMeeting};
-    use fotwd::post_pass::engine::PassEngine;
     use fotwd::post_pass::job::{self, Plan};
     use fotwd::post_pass::speechd_engine::HelperEngine;
     use fotwd::post_pass::turns::Channel;
@@ -80,30 +79,44 @@ mod imp {
             write(&out.join("clean.json"), &clean)?;
         }
         write(&out.join("report.json"), &report)?;
-        println!("{}", serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
         Ok(())
     }
 
     fn write(path: &Path, value: &serde_json::Value) -> Result<(), String> {
-        std::fs::write(path, serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?)
-            .map_err(|e| format!("{}: {e}", path.display()))
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("{}: {e}", path.display()))
     }
 
     /// The live local pipeline over each track, unpaced.
-    async fn live(data_root: &Path, mic: &[i16], system: &[i16]) -> Result<serde_json::Value, String> {
+    async fn live(
+        data_root: &Path,
+        mic: &[i16],
+        system: &[i16],
+    ) -> Result<serde_json::Value, String> {
         use fotw_stt::{LocalStream, LocalStreamConfig, Source, StreamEvent};
         let client = fotwd::speechd::helper(data_root).await?;
         let engine = fotw_stt::SpeechdEngine::prepare(client, fotw_stt::speechd::PARAKEET_UNIFIED)
             .await
             .map_err(|e| e.message)?;
         let vad = fotwd::stt::verify_vad_model(data_root)?;
-        let gated: Arc<dyn fotw_stt::RecognizerFactory> =
-            Arc::new(fotw_stt::vad::GatedFactory::new(Arc::new(engine), move || {
+        let gated: Arc<dyn fotw_stt::RecognizerFactory> = Arc::new(
+            fotw_stt::vad::GatedFactory::new(Arc::new(engine), move || {
                 fotw_stt::whisper::SileroDetector::load(&vad)
                     .map(|d| Box::new(d) as Box<dyn fotw_stt::SpeechDetector>)
-            }));
+            }),
+        );
         let mut rows = Vec::new();
-        for (source, pcm, channel) in [(Source::Mic, mic, "mic"), (Source::System, system, "system")] {
+        for (source, pcm, channel) in [
+            (Source::Mic, mic, "mic"),
+            (Source::System, system, "system"),
+        ] {
             let (stream, mut events) =
                 LocalStream::open(LocalStreamConfig::new("eval", source), Arc::clone(&gated));
             let collect = async {
@@ -135,7 +148,8 @@ mod imp {
     }
 
     fn encode(pcm: &[i16], path: &Path) -> Result<(), String> {
-        let mut w = fotw_pipeline::opus::OpusOggWriter::create(path, 16_000).map_err(|e| e.to_string())?;
+        let mut w =
+            fotw_pipeline::opus::OpusOggWriter::create(path, 16_000).map_err(|e| e.to_string())?;
         let floats: Vec<f32> = pcm.iter().map(|&x| f32::from(x) / 32768.0).collect();
         w.push_f32(&floats).map_err(|e| e.to_string())?;
         w.finish().map_err(|e| e.to_string())?;
@@ -154,8 +168,12 @@ mod imp {
         encode(mic, &mic_opus)?;
         encode(system, &system_opus)?;
 
-        let mut db = Db::open_in_memory(&DbKey::from_bytes([0x46; 32])).map_err(|e| e.to_string())?;
-        let meeting = db.meetings().create(NewMeeting::new("eval", "UTC")).map_err(|e| e.to_string())?;
+        let mut db =
+            Db::open_in_memory(&DbKey::from_bytes([0x46; 32])).map_err(|e| e.to_string())?;
+        let meeting = db
+            .meetings()
+            .create(NewMeeting::new("eval", "UTC"))
+            .map_err(|e| e.to_string())?;
         db.meetings()
             .create_transcript(&meeting, "eval", "live", true)
             .map_err(|e| e.to_string())?;
@@ -164,7 +182,8 @@ mod imp {
         let engine = HelperEngine::prepare(data_root).await?;
         let prepare_seconds = prepared.elapsed().as_secs_f64();
         let plan = serde_json::to_string(&Plan::current(&engine)).map_err(|e| e.to_string())?;
-        db.post_pass_queue(&meeting, &plan).map_err(|e| e.to_string())?;
+        db.post_pass_queue(&meeting, &plan)
+            .map_err(|e| e.to_string())?;
         let db = Mutex::new(db);
 
         let helper_pid = fotwd::speechd::helper(data_root).await?.helper_pid();
@@ -197,7 +216,10 @@ mod imp {
         };
 
         let mut db = db.into_inner().map_err(|e| e.to_string())?;
-        let job = db.post_pass_job(&meeting).map_err(|e| e.to_string())?.ok_or("no job")?;
+        let job = db
+            .post_pass_job(&meeting)
+            .map_err(|e| e.to_string())?
+            .ok_or("no job")?;
         let audio = report["audio_seconds"].as_f64().unwrap_or(1.0);
         report["clean_prepare_seconds"] = prepare_seconds.into();
         report["clean_wall_seconds"] = wall.into();
@@ -274,13 +296,17 @@ mod imp {
             return Err(bad("not a RIFF/WAVE file"));
         }
         let u16_at = |i: usize| u16::from_le_bytes([bytes[i], bytes[i + 1]]);
-        let u32_at = |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+        let u32_at =
+            |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
         let mut at = 12;
         let mut format_ok = false;
         while at + 8 <= bytes.len() {
             let len = u32_at(at + 4) as usize;
             let body = at + 8;
-            let end = body.checked_add(len).filter(|&e| e <= bytes.len()).ok_or_else(|| bad("truncated chunk"))?;
+            let end = body
+                .checked_add(len)
+                .filter(|&e| e <= bytes.len())
+                .ok_or_else(|| bad("truncated chunk"))?;
             match &bytes[at..at + 4] {
                 b"fmt " => {
                     format_ok = len >= 16
@@ -293,7 +319,10 @@ mod imp {
                     if !format_ok {
                         return Err(bad("expected mono 16 kHz PCM16"));
                     }
-                    return Ok(bytes[body..end].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect());
+                    return Ok(bytes[body..end]
+                        .chunks_exact(2)
+                        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+                        .collect());
                 }
                 _ => {}
             }
