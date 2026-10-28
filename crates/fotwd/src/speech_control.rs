@@ -204,7 +204,14 @@ mod tests {
         c.set(parakeet.clone()).unwrap();
         let read = c.read();
         assert_eq!(read.settings.unwrap().model, crate::speechd::ENGINE);
-        assert_eq!(read.model_availability, ModelAvailability::Missing);
+        // Parakeet runs only on macOS; elsewhere the dashboard says local
+        // speech is unsupported rather than asking for an install.
+        let expected = if cfg!(target_os = "macos") {
+            ModelAvailability::Missing
+        } else {
+            ModelAvailability::Unsupported
+        };
+        assert_eq!(read.model_availability, expected);
         assert!(
             read.model_path
                 .unwrap()
