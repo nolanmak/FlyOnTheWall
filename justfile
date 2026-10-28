@@ -21,6 +21,14 @@ dev_cert   := env_var_or_default("FOTW_DEV_CERT_DIR", env_var("HOME") / ".fotw-d
 dev_ident  := "FlyOnTheWall Dev"
 # Keep local builds off every core so an interactive machine stays usable.
 jobs       := env_var_or_default("CARGO_BUILD_JOBS", "3")
+# Opt-in: FOTW_SPEECHD=1 builds the FluidAudio speech helper (#243) and puts
+# it in Contents/Helpers. It needs Swift 6.2+ and a verified local FluidAudio
+# checkout in FOTW_FLUIDAUDIO_SOURCE (helpers/fotw-speechd/README.md). Without
+# it the bundle is exactly what it was: no Swift, no helper.
+speechd    := env_var_or_default("FOTW_SPEECHD", "")
+speechd_id := bundle_id + ".speechd"
+# Where `just speechd-helper` builds it.
+speechd_build := build_dir / "speechd-swift"
 
 default:
     @just --list
@@ -38,6 +46,47 @@ test:
     python3 -m unittest discover -s tools/speech-eval/tests
     CARGO_BUILD_JOBS={{jobs}} cargo test --locked -p fotw-stt --example local_whisper_smoke
     if [[ "$(uname -s)" == Darwin ]]; then env -u FOTW_FLUIDAUDIO_SOURCE swift run --package-path tools/speech-eval/parakeet -j {{jobs}} parakeet-protocol-check; fi
+    if [[ "$(uname -s)" == Darwin ]]; then just speechd-check; fi
+
+# Its Swift checks run first, then the Rust protocol tests against it in
+# --fake-engines mode, so the Swift and Rust ends are held to one contract.
+# macOS only; Command Line Tools suffice.
+# Check fotw-speechd (#243) without FluidAudio or models.
+speechd-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pkg=helpers/fotw-speechd
+    env -u FOTW_FLUIDAUDIO_SOURCE swift run --package-path "$pkg" -j {{jobs}} speechd-checks
+    env -u FOTW_FLUIDAUDIO_SOURCE swift build --package-path "$pkg" -j {{jobs}} --product fotw-speechd
+    bin="$(env -u FOTW_FLUIDAUDIO_SOURCE swift build --package-path "$pkg" --show-bin-path)/fotw-speechd"
+    FOTW_SPEECHD_BIN="$bin" CARGO_BUILD_JOBS={{jobs}} cargo test -p fotw-speechd-client --test protocol
+
+# Verifies the FluidAudio checkout against its pin first; downloads no model.
+# Build the speech helper with FluidAudio, release.
+speechd-helper:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [[ "$(uname -s)" == Darwin ]] || { echo "error: fotw-speechd is macOS-only" >&2; exit 1; }
+    src="${FOTW_FLUIDAUDIO_SOURCE:?set FOTW_FLUIDAUDIO_SOURCE to a FluidAudio 0.17.3 checkout (helpers/fotw-speechd/README.md)}"
+    python3 tools/speech-eval/parakeet/verify_runtime.py "$src"
+    FOTW_FLUIDAUDIO_SOURCE="$src" swift build --package-path helpers/fotw-speechd \
+        --scratch-path "{{speechd_build}}" -c release -j {{jobs}} --product fotw-speechd
+    echo "✓ built {{speechd_build}}/release/fotw-speechd"
+
+# Pinned Parakeet Unified and Silero VAD: startup and warmup gates, and
+# offline/loopback checks with the network denied after setup. Setup installs
+# Silero VAD from Hugging Face and imports Parakeet from PARAKEET_DIR (a
+# hash-checked copy) or downloads it. COREML_CACHE, if set, is deleted first so
+# the cold start includes Core ML's compile (~/Library/Caches/fotw-speechd).
+# The real-model suite (#243), separate from `ci`.
+speechd-real models_root corpus_dir:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just speechd-helper >&2
+    args=(--helper "{{speechd_build}}/release/fotw-speechd" --models-root "{{models_root}}" --corpus "{{corpus_dir}}")
+    if [[ -n "${PARAKEET_DIR:-}" ]]; then args+=(--parakeet-from "$PARAKEET_DIR"); fi
+    if [[ -n "${COREML_CACHE:-}" ]]; then args+=(--coreml-cache "$COREML_CACHE"); fi
+    CARGO_BUILD_JOBS={{jobs}} cargo run --release -p fotw-speechd-client --example speechd_real -- "${args[@]}"
 
 lint:
     cargo fmt --all --check
@@ -108,6 +157,11 @@ bundle profile="release":
     rm -rf "{{app}}"
     mkdir -p "{{app}}/Contents/MacOS" "{{app}}/Contents/Resources"
     cp "target/{{profile}}/fotwd" "{{app}}/Contents/MacOS/fotwd"
+    if [[ -n "{{speechd}}" ]]; then
+        just speechd-helper
+        mkdir -p "{{app}}/Contents/Helpers"
+        cp "{{speechd_build}}/release/fotw-speechd" "{{app}}/Contents/Helpers/fotw-speechd"
+    fi
     cp packaging/Info.plist "{{app}}/Contents/Info.plist"
     cp packaging/AppIcon.icns "{{app}}/Contents/Resources/AppIcon.icns"
     cp THIRD_PARTY_NOTICES.md "{{app}}/Contents/Resources/THIRD_PARTY_NOTICES.md"
@@ -231,6 +285,28 @@ verify-bundle:
             *) echo "✗ $bin is not hardened-runtime signed" >&2; fail=1 ;;
         esac
     done < <(find "{{app}}/Contents/MacOS" -type f -perm +111)
+    # Contents/Helpers holds fotw-speechd (#243), which never captures: the
+    # parent sends it PCM. It must run hardened and must NOT carry the capture
+    # entitlement, so it can never become a second process asking for the mic.
+    if [[ -n "{{speechd}}" && ! -x "{{app}}/Contents/Helpers/fotw-speechd" ]]; then
+        echo "✗ FOTW_SPEECHD is set but the bundle lacks Contents/Helpers/fotw-speechd" >&2; fail=1
+    fi
+    if [[ -d "{{app}}/Contents/Helpers" ]]; then
+        while IFS= read -r bin; do
+            ents=$(codesign -d --entitlements :- "$bin" 2>/dev/null || true)
+            case "$ents" in
+                *com.apple.security.device.audio-input*) echo "✗ $bin carries the capture entitlement" >&2; fail=1 ;;
+            esac
+            info=$(codesign -d --verbose=2 "$bin" 2>&1 || true)
+            case "$info" in
+                *"(runtime)"*) ;;
+                *) echo "✗ $bin is not hardened-runtime signed" >&2; fail=1 ;;
+            esac
+        done < <(find "{{app}}/Contents/Helpers" -type f -perm +111)
+    fi
+    if ! codesign --verify --deep --strict "{{app}}" 2>/dev/null; then
+        echo "✗ codesign --verify --deep --strict fails" >&2; fail=1
+    fi
     [[ $fail -eq 0 ]] && echo "✓ bundle verified" || exit 1
 
 # ---------------------------------------------------------------- dev signing
@@ -372,6 +448,15 @@ dev-sign: (bundle "debug")
     fi
     # --timestamp=none in dev only: Apple's timestamp server is a needless
     # network dependency and point of failure for contributors.
+    # Nested code before the bundle that seals it. The speech helper gets its
+    # own identifier and no entitlements (packaging/speechd-entitlements.plist).
+    if [[ -d "{{app}}/Contents/Helpers" ]]; then
+        while IFS= read -r helper; do
+            codesign --force --options runtime --timestamp=none -i "{{speechd_id}}" \
+                --entitlements packaging/speechd-entitlements.plist \
+                --sign "{{dev_ident}}" "$helper"
+        done < <(find "{{app}}/Contents/Helpers" -type f -perm +111)
+    fi
     codesign --force --options runtime --timestamp=none \
         --entitlements packaging/entitlements.plist \
         --sign "{{dev_ident}}" "{{app}}"
@@ -540,6 +625,12 @@ release-sign identity:
     find "{{app}}/Contents/MacOS" -type f -perm +111 -mindepth 2 -print0 \
       | xargs -0 -r -n1 codesign --force --options runtime --timestamp \
             --entitlements packaging/entitlements.plist --sign "{{identity}}"
+    # The speech helper (#243): its own identifier, no entitlements.
+    if [[ -d "{{app}}/Contents/Helpers" ]]; then
+        find "{{app}}/Contents/Helpers" -type f -perm +111 -print0 \
+          | xargs -0 -r -n1 codesign --force --options runtime --timestamp -i "{{speechd_id}}" \
+                --entitlements packaging/speechd-entitlements.plist --sign "{{identity}}"
+    fi
     # --timestamp is not optional: omitting it passes local verification and is
     # rejected only after the round trip to Apple.
     codesign --force --options runtime --timestamp \

@@ -47,7 +47,7 @@ impl SpeechControl for SpeechSettingsControl {
                 ModelAvailability::NotRequired
             } else if !cfg!(target_os = "macos") {
                 ModelAvailability::Unsupported
-            } else if path.is_file() {
+            } else if path.is_file() && crate::stt::vad_model_path(&self.data_root).is_file() {
                 ModelAvailability::PresentUnchecked
             } else {
                 ModelAvailability::Missing
@@ -102,7 +102,9 @@ impl SpeechControl for SpeechSettingsControl {
 fn check_model(settings: &SttSettings, root: &Path) -> Result<(), String> {
     let path = settings.model_path(root);
     crate::stt::verify_model(&path).map_err(|e| e.to_string())?;
+    let vad = crate::stt::verify_vad_model(root)?;
     fotw_stt::WhisperEngine::new(path, settings.language())
+        .with_speech_gate(vad)
         .load()
         .map_err(|e| e.message)
 }

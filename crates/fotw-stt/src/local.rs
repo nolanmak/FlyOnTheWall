@@ -374,6 +374,23 @@ pub trait Recognizer: Send {
     /// When the model fails on this chunk. The stream reports it and carries
     /// on with the next one.
     fn transcribe(&mut self, pcm: &[f32]) -> Result<Vec<Recognized>, SttError>;
+
+    /// Transcribe audio that a speech gate has already judged: `speech` holds
+    /// the sample ranges it heard as speech, and everything else in `pcm` has
+    /// been silenced. A model that judges its own segments' doubt can use it
+    /// to tell a real word from one it wrote over the silenced stretches.
+    ///
+    /// # Errors
+    ///
+    /// As [`transcribe`](Self::transcribe).
+    fn transcribe_speech(
+        &mut self,
+        pcm: &[f32],
+        speech: &[std::ops::Range<usize>],
+    ) -> Result<Vec<Recognized>, SttError> {
+        let _ = speech;
+        self.transcribe(pcm)
+    }
 }
 
 /// Makes a [`Recognizer`] per leg from one model held in memory once.
@@ -451,12 +468,20 @@ pub fn segments_for(
     let length = chunk.duration_ms();
     recognized
         .into_iter()
-        .filter(|r| !is_non_speech(&r.text))
-        .map(|r| {
+        .filter_map(|r| {
+            let text = crate::cleanup::remove_artifacts(&r.text);
+            // Only a marked label (`(Music)`, `♪`) is dropped here; a bare
+            // "Music." needs the model's doubt, judged in the recognizer.
+            let speech = !text.is_empty()
+                && !is_non_speech(&text)
+                && !crate::cleanup::is_marked_sound_label(&text);
+            speech.then_some((r, text))
+        })
+        .map(|(r, text)| {
             let mut segment =
                 TranscriptSegment::new(config.session_id.clone(), config.source, provider, model);
             segment.speaker = (config.source == Source::Mic).then(|| ME.to_owned());
-            segment.text = r.text.trim().to_owned();
+            segment.text = text;
             segment.start_ms = base + r.start_ms.min(length);
             segment.end_ms = (base + r.end_ms.min(length)).max(segment.start_ms);
             segment.language = language.map(str::to_owned);
@@ -1079,6 +1104,46 @@ mod tests {
         assert!(first.is_final);
         assert_eq!(segments[1].end_ms, 2_250 + 3_000);
         assert_ne!(first.id, segments[1].id);
+    }
+
+    #[test]
+    fn annotations_inside_a_line_are_removed_and_the_speech_kept() {
+        let config = LocalStreamConfig::new("s1", Source::System);
+        let chunk = Chunk {
+            start_sample: 0,
+            samples: vec![0; 32_000],
+        };
+        let line = |text: &str| Recognized {
+            start_ms: 0,
+            end_ms: 900,
+            text: text.into(),
+        };
+        let segments = segments_for(
+            &config,
+            "tiny",
+            None,
+            &chunk,
+            vec![
+                line("Hello there. [BLANK_AUDIO]"),
+                line("<|nospeech|>"),
+                line("[Music] Right, next item."),
+                line("Music"),
+                line("♪ Music ♪"),
+                line("Turn the music down."),
+            ],
+        );
+        let texts: Vec<_> = segments.iter().map(|s| s.text.as_str()).collect();
+        // A bare "Music" could be a one-word answer; without the model's doubt
+        // (judged in the recognizer) it stays. A marked label never does.
+        assert_eq!(
+            texts,
+            [
+                "Hello there.",
+                "Right, next item.",
+                "Music",
+                "Turn the music down."
+            ]
+        );
     }
 
     #[test]

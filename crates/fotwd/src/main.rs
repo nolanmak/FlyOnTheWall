@@ -1736,7 +1736,10 @@ async fn stt_command(args: &[String]) -> ExitCode {
             // Validate the actual model metadata before persisting this choice.
             // Renaming an English-only model must not bypass language validation.
             #[cfg(target_os = "macos")]
-            if let Err(error) = fotw_stt::WhisperEngine::new(&path, settings.language()).load() {
+            if let Err(error) = fotw_stt::WhisperEngine::new(&path, settings.language())
+                .with_speech_gate(fotwd::stt::vad_model_path(&data_root))
+                .load()
+            {
                 eprintln!("fotwd: {}", error.message);
                 return ExitCode::FAILURE;
             }
@@ -1802,6 +1805,21 @@ async fn model_setup_command(default_data_root: &std::path::Path, args: &[String
                 model.url()
             );
         }
+        let vad = fotwd::stt::VAD_MODEL;
+        println!();
+        println!(
+            "Speech detector, installed with every model above and required for local transcription:"
+        );
+        println!(
+            "{}: {} bytes; {}\n  SHA-256 {}\n  {}\n  License: {} — {}",
+            vad.name,
+            vad.bytes,
+            vad.note,
+            vad.sha256,
+            vad.url(),
+            vad.license,
+            vad.license_url()
+        );
         return ExitCode::SUCCESS;
     }
     let mut options = args;
@@ -1833,6 +1851,7 @@ async fn model_setup_command(default_data_root: &std::path::Path, args: &[String
             return ExitCode::FAILURE;
         }
     };
+    let root_for_report = root.clone();
     let result = tokio::task::spawn_blocking(move || {
         let mut last = None;
         fotwd::model_setup::install(&root, &name, source, &Control::default(), |progress| {
@@ -1851,6 +1870,10 @@ async fn model_setup_command(default_data_root: &std::path::Path, args: &[String
     match result {
         Ok(Ok(path)) => {
             println!("Verified model: {}", path.display());
+            let vad = fotwd::stt::vad_model_path(&root_for_report);
+            if vad != path && vad.is_file() {
+                println!("Verified speech detector: {}", vad.display());
+            }
             println!(
                 "Select Fully offline speech or offline backup and this path in Transcription settings. Native model/language readiness is checked before capture."
             );
@@ -1883,9 +1906,28 @@ fn resolve_model_arg(model: &str, data_root: &std::path::Path) -> Result<PathBuf
 /// Verify a model, printing what was found and, when it is missing, how to
 /// fetch it. `true` when it is usable.
 fn check_model(path: &std::path::Path, data_root: &std::path::Path) -> bool {
+    println!("  checking   : {}", path.display());
+    if !check_whisper_model(path, data_root) {
+        return false;
+    }
+    match fotwd::stt::verify_vad_model(data_root) {
+        Ok(vad) => {
+            println!(
+                "  detector   : {} matches its published checksum",
+                vad.display()
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!("fotwd: {e}");
+            false
+        }
+    }
+}
+
+fn check_whisper_model(path: &std::path::Path, data_root: &std::path::Path) -> bool {
     use fotwd::stt::{KNOWN_MODELS, ModelError};
 
-    println!("  checking   : {}", path.display());
     match fotwd::stt::verify_model(path) {
         Ok(Some(known)) => {
             println!(
@@ -1960,6 +2002,14 @@ fn print_stt_status(settings: &fotwd::stt::SttSettings, data_root: &std::path::P
             } else if !path.is_file() {
                 println!("  ! the model file is missing, so meetings record without a transcript;");
                 println!("    run `fotwd stt local` to see how to fetch it");
+            } else if !fotwd::stt::vad_model_path(data_root).is_file() {
+                println!(
+                    "  ! the speech detector is missing, so Start is refused; install it with"
+                );
+                println!(
+                    "    `fotwd stt models install {}`",
+                    fotwd::stt::VAD_MODEL.name
+                );
             }
         }
         fotwd::stt::SttEngine::Fallback => {
@@ -1973,7 +2023,10 @@ fn print_stt_status(settings: &fotwd::stt::SttSettings, data_root: &std::path::P
                 settings.language().unwrap_or_else(|| "automatic".into())
             );
             println!("  admission  : backup model and both native states prepare before capture");
-            if !cfg!(target_os = "macos") || !path.is_file() {
+            if !cfg!(target_os = "macos")
+                || !path.is_file()
+                || !fotwd::stt::vad_model_path(data_root).is_file()
+            {
                 println!("  ! backup unavailable; Start refuses recording until repaired");
             }
         }
@@ -2032,7 +2085,10 @@ async fn stt_test(
     if !check_model(&path, data_root) {
         return ExitCode::FAILURE;
     }
-    let engine = Arc::new(WhisperEngine::new(&path, settings.language()));
+    let engine = Arc::new(
+        WhisperEngine::new(&path, settings.language())
+            .with_speech_gate(fotwd::stt::vad_model_path(data_root)),
+    );
     let loading = Instant::now();
     if let Err(e) = engine.load() {
         eprintln!("fotwd: {e}");

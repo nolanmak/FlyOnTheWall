@@ -214,6 +214,19 @@ library; it does not alter the running daemon's library or speech policy.
 Setup returns before key/library lookup and runs blocking IO off the async
 runtime. There is no automatic download from recording, readiness or settings.
 
+Every Whisper model is gated by a speech detector (#242): Silero VAD v5.1.2 in
+ggml format, `silero-v5.1.2`, pinned to revision
+`9ffd54a1e1ee413ddf265af9913beaf518d1639b` of
+[ggml-org/whisper-vad](https://huggingface.co/ggml-org/whisper-vad/blob/9ffd54a1e1ee413ddf265af9913beaf518d1639b/README.md)
+(MIT, 885,098 bytes, SHA-256
+`29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf`).
+`install <whisper model>` installs it first; `import` brings only the named
+file, so an offline setup imports `silero-v5.1.2` too. Local, backup and
+saved-audio recovery transcription refuse to start without it, and say how to
+install it. Audio the detector does not hear as speech never reaches Whisper,
+and non-speech around speech inside a chunk is silenced in place, so segment
+times are unchanged.
+
 The catalog uses publisher revision
 `5359861c739e955e79d9a303bcbc70fb988958b1`; [its model card](https://huggingface.co/ggerganov/whisper.cpp/blob/5359861c739e955e79d9a303bcbc70fb988958b1/README.md)
 and LFS metadata were checked against the pinned hashes/sizes. Transferred

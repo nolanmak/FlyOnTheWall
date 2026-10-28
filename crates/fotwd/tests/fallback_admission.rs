@@ -258,7 +258,7 @@ async fn cancel_retains_both_native_states_until_late_success_is_discarded() {
 /// Explicit public-weight admission smoke: no capture, credentials or provider.
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires cached published small.en weights"]
+#[ignore = "requires cached published small.en weights and the Silero VAD model"]
 async fn installed_backup_prepares_both_sources_without_cloud_or_capture() {
     let model = std::path::PathBuf::from(
         std::env::var_os("FOTW_NATIVE_HANDOFF_MODEL").expect("set FOTW_NATIVE_HANDOFF_MODEL"),
@@ -275,6 +275,15 @@ async fn installed_backup_prepares_both_sources_without_cloud_or_capture() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let root = tempfile::tempdir().unwrap();
+    // The backup is refused without the speech detector (#242).
+    let detector = fotwd::stt::vad_model_path(root.path());
+    std::fs::create_dir_all(detector.parent().unwrap()).unwrap();
+    std::fs::copy(
+        std::env::var_os("FOTW_SILERO_VAD_MODEL")
+            .expect("set FOTW_SILERO_VAD_MODEL to ggml-silero-v5.1.2.bin"),
+        &detector,
+    )
+    .unwrap();
     let transcription = fotwd::stt::fallback_transcription(
         fotwd::stt::SttSettings {
             engine: fotwd::stt::SttEngine::Fallback,
