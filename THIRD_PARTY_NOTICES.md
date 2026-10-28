@@ -424,8 +424,9 @@ below; a bundle built without it contains none of this.
 
 ### Muesli
 
-Parts of fotw-speechd are ported from Muesli,
-https://github.com/Muesli-HQ/muesli, at commit
+Parts of fotw-speechd, and fotw-stt's local vocabulary correction
+(`crates/fotw-stt/src/vocabulary_matcher.rs`, compiled into fotwd itself), are
+ported from Muesli, https://github.com/Muesli-HQ/muesli, at commit
 97e455794112126a896cae17f5c829e8ffa820c8. Each ported file names its source.
 
 ````text
