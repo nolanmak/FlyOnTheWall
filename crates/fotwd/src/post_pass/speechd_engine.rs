@@ -21,9 +21,11 @@ use crate::speechd::{DIARIZER, PARAKEET};
 
 /// The diarizer's engine id in the helper.
 pub const DIARIZER_ENGINE: &str = "diarizer";
-/// The diarizer's speaker threshold for meetings: `None` is FluidAudio's
-/// default.
-pub const SPEAKER_THRESHOLD: Option<f32> = None;
+/// The diarizer's speaker threshold for meetings. FluidAudio's default
+/// (0.84) merged two of three remote speakers on AMI ES2004c; swept over
+/// 0.84/0.7/0.6/0.5/0.4 on the three AMI meetings, 0.6 had the lowest or
+/// equal-lowest DER on each (docs/POST_MEETING_CLEANUP.md).
+pub const SPEAKER_THRESHOLD: Option<f32> = Some(0.6);
 /// PCM per audio frame to the helper: 5 s, well under its 1 MiB frame.
 const FRAME: usize = 16_000 * 5;
 
@@ -35,6 +37,7 @@ pub fn provenance() -> serde_json::Value {
         "asr": format!("{}@{}", PARAKEET.id, PARAKEET.revision),
         "vad": format!("silero-v5.1.2@{}", crate::stt::VAD_MODEL.sha256),
         "diarizer": format!("{}@{}", DIARIZER.id, DIARIZER.revision),
+        "speaker_threshold": SPEAKER_THRESHOLD,
     })
 }
 
