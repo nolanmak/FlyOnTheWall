@@ -174,6 +174,7 @@ async fn deltas_arrive_batched_not_one_message_per_word() {
             channel: "mic".to_owned(),
             text: format!("word{i}"),
             is_final: false,
+            utterance: None,
         });
     }
     assert_eq!(h.state.hub().flush(), 300);
@@ -250,6 +251,7 @@ async fn a_meeting_ready_frame_reaches_an_open_socket() {
         channel: "system".to_owned(),
         text: "still here".to_owned(),
         is_final: true,
+        utterance: None,
     });
     assert_eq!(h.state.hub().flush(), 1);
     let message = tokio::time::timeout(Duration::from_secs(5), socket.next())

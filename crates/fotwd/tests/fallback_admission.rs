@@ -131,6 +131,7 @@ async fn real_fallback_factory_rejects_missing_model_before_cloud_or_capture() {
                         .to_string_lossy()
                         .into_owned(),
                     language: "en".into(),
+                    live_captions: true,
                 },
                 data_root.clone(),
                 Box::new(move || {
@@ -289,6 +290,7 @@ async fn installed_backup_prepares_both_sources_without_cloud_or_capture() {
             engine: fotwd::stt::SttEngine::Fallback,
             model: model.to_string_lossy().into_owned(),
             language: "en".into(),
+            live_captions: true,
         },
         root.path().to_owned(),
         Box::new(move || {

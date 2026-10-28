@@ -17,6 +17,7 @@ impl SpeechControl for Fake {
             model_availability: ModelAvailability::PresentUnchecked,
             model_path: Some("/fixture/model.bin".into()),
             error: None,
+            captions_installed: false,
         }
     }
     fn set(&self, s: SpeechSettingsDoc) -> Result<(), String> {
@@ -35,6 +36,7 @@ async fn rig() -> (common::Harness, Arc<Fake>) {
             engine: SpeechMode::Local,
             model: "/fixture/model.bin".into(),
             language: "en".into(),
+            live_captions: true,
         }),
         writes: AtomicUsize::new(0),
     });

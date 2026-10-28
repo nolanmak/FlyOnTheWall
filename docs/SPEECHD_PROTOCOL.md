@@ -169,7 +169,8 @@ Error codes: `version_mismatch`, `protocol`, `bad_request`, `unknown_engine`,
 |---|---|---|---|
 | `parakeet-unified` | batch | `FluidInference/parakeet-unified-en-0.6b-coreml` | CC-BY-4.0 |
 | `silero-vad` | vad | `FluidInference/silero-vad-coreml` | MIT |
-| `parakeet-eou-320ms` | streaming (planned, #245) | `FluidInference/parakeet-realtime-eou-120m-coreml` | NVIDIA Open Model License |
+| `parakeet-eou-320ms` | streaming, pooled (#245) | `FluidInference/parakeet-realtime-eou-120m-coreml` | NVIDIA Open Model License |
+| `parakeet-eou-160ms` | streaming, pooled (#245, not the default) | same repository, its `160ms/` variant | NVIDIA Open Model License |
 | `nemotron-3.5` | streaming (planned, Murmur #100) | `FluidInference/Nemotron-3.5-ASR-Streaming-Multilingual-0.6b-CoreML` | OpenMDW-1.1 |
 
 Each engine states its per-stream bound as `max_audio_ms` in the
@@ -181,6 +182,16 @@ capabilities, and a stream past it fails with `too_long`.
 - A **vad** stream answers as audio arrives, in 256 ms steps. Unbounded.
 - A **streaming** stream sends `partial`s as audio arrives and a `final` per
   utterance, with `utterance` ids. Unbounded; state is the engine's cache.
+  `parakeet-eou-320ms` (live captions, #245) keeps one stream's state per
+  model instance, so it loads a pool of two, one per capture leg, each warmed
+  at load. A third concurrent stream waits up to 1 s for a slot, then is
+  refused with `busy`; a stream that ends in any way returns its slot. Its
+  first partial needs about 630 ms of audio (one 320 ms-shift chunk). An
+  utterance ends at the model's end-of-utterance signal, held for 640 ms;
+  the instance is then reset for the next utterance, so up to one chunk at
+  the boundary is not captioned. Captions are display-only. `parakeet-eou-160ms` is the
+  same model's 160 ms variant: about half the latency for about three times
+  the CPU (see #245 for both measured).
 - A **diarization** stream (#246) takes a whole channel of a meeting, up to
   `max_audio_ms` (4 hours for the planned `diarizer`). It processes audio as
   it arrives in bounded windows, as Muesli's `diarizeRecordedAudio` does, and
@@ -202,6 +213,7 @@ ordinary test suites use:
 | `fake-hang` | the process stops reading and answering on its first audio frame |
 | `fake-stall` | never answers `finish`, but keeps serving everything else |
 | `fake-exit-after-final` | on `finish`, `final` and `closed`, then the process exits with status 70 |
+| `fake-captions` | pooled like `parakeet-eou-320ms` (two streams). An utterance runs until an all-zero frame: a `partial {text: "utterance=<u> samples=<n>", utterance: u}` per frame within it, then `final {utterance: u}` with the same text, and the next utterance is `u + 1`. `finish` commits the last one |
 
 `load` and `warmup` of a fake engine send one `progress` each.
 

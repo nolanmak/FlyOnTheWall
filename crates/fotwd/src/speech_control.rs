@@ -70,6 +70,10 @@ impl SpeechControl for SpeechSettingsControl {
                 model_availability: availability,
                 model_path,
                 error: None,
+                captions_installed: crate::speechd::present_model(
+                    &self.data_root,
+                    &crate::speechd::CAPTIONS,
+                ),
             })
         });
         result.unwrap_or_else(|error| SpeechSettingsResponse {
@@ -77,6 +81,7 @@ impl SpeechControl for SpeechSettingsControl {
             model_availability: ModelAvailability::Unknown,
             model_path: None,
             error: Some(error),
+            captions_installed: false,
         })
     }
     fn set(&self, doc: SpeechSettingsDoc) -> Result<(), String> {
@@ -171,6 +176,7 @@ mod tests {
             engine,
             model: "small.en".into(),
             language: "en".into(),
+            live_captions: true,
         }
     }
     #[test]

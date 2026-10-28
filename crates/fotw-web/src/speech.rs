@@ -25,6 +25,13 @@ pub struct SpeechSettingsDoc {
     /// ISO language code, or empty/auto for model-supported detection.
     #[serde(default)]
     pub language: String,
+    /// Live captions in local meetings (#245). On unless saved off.
+    #[serde(default = "live_captions_default")]
+    pub live_captions: bool,
+}
+
+fn live_captions_default() -> bool {
+    true
 }
 impl SpeechSettingsDoc {
     /// Bound user input without changing its privacy policy.
@@ -73,6 +80,9 @@ pub struct SpeechSettingsResponse {
     pub model_path: Option<String>,
     /// Validation or storage failure; refused writes leave the old row intact.
     pub error: Option<String>,
+    /// Whether the live-caption model (#245) is installed.
+    #[serde(default)]
+    pub captions_installed: bool,
 }
 
 /// The daemon supplies model validation and persistence outside web code.

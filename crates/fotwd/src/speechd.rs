@@ -86,8 +86,19 @@ pub const PARAKEET: HelperModel = HelperModel {
     note: "Parakeet Unified 0.6B, English; the default on-device model, run by the speech helper",
 };
 
-/// Every model installed through the helper. Live captions (#245) add theirs.
-pub const HELPER_MODELS: &[HelperModel] = &[PARAKEET];
+/// Parakeet realtime EOU 120M, 320 ms: live captions in local mode (#245).
+/// Display only; the meeting's text still comes from the local engine.
+pub const CAPTIONS: HelperModel = HelperModel {
+    id: crate::captions::ENGINE,
+    repository: "FluidInference/parakeet-realtime-eou-120m-coreml",
+    revision: "40a23f4c0b333aa17ad8c0f2ea47ec2347f2f355",
+    bytes: 224_238_270,
+    license: "LicenseRef-NVIDIA-Open-Model-License",
+    note: "Parakeet realtime EOU 120M; live captions while people talk (display only)",
+};
+
+/// Every model installed through the helper.
+pub const HELPER_MODELS: &[HelperModel] = &[PARAKEET, CAPTIONS];
 
 /// A helper model by id.
 #[must_use]
@@ -604,6 +615,102 @@ mod start_tests {
             panic!("each leg loads its detector");
         };
         assert!(gated.message.contains("speech detector"), "{gated:?}");
+    }
+
+    /// A local Whisper meeting's legs, with `live_captions` as given.
+    async fn whisper_legs(
+        data_root: &Path,
+        live_captions: bool,
+        launch: Result<Launch, String>,
+    ) -> crate::session::LocalLegs {
+        let settings = SttSettings {
+            engine: SttEngine::Local,
+            model: data_root
+                .join("ggml-missing.bin")
+                .to_string_lossy()
+                .into_owned(),
+            live_captions,
+            ..SttSettings::default()
+        };
+        let detector = fixture_detector(data_root);
+        let prepared = local_transcription_with(
+            &settings,
+            data_root,
+            "fixture",
+            true,
+            true,
+            detector,
+            move || launch,
+        )
+        .prepare(&SessionControl::new())
+        .await
+        .expect("a Whisper meeting starts, model or not");
+        let Transcription::Local(legs) = prepared else {
+            panic!("expected local legs");
+        };
+        legs
+    }
+
+    fn install_caption_model(data_root: &Path) {
+        std::fs::create_dir_all(
+            models_root(data_root)
+                .join(CAPTIONS.id)
+                .join(CAPTIONS.revision),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_captions_join_a_local_meeting_only_when_on_and_installed() {
+        // #245: on by default, but nothing happens until the caption model is
+        // installed, and switching captions off keeps them off.
+        let root = tempfile::tempdir().unwrap();
+        let legs = whisper_legs(root.path(), true, Ok(fake_launch())).await;
+        assert!(
+            legs.captions.is_none(),
+            "no caption model installed: no captions"
+        );
+
+        install_caption_model(root.path());
+        let legs = whisper_legs(root.path(), true, Ok(fake_launch())).await;
+        let captions = legs.captions.expect("installed and on: captions");
+        assert_eq!(captions.model(), crate::captions::ENGINE);
+
+        let legs = whisper_legs(root.path(), false, Ok(fake_launch())).await;
+        assert!(legs.captions.is_none(), "switched off: no captions");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_captions_never_start_the_helper_at_start_and_need_one_in_the_build() {
+        let root = tempfile::tempdir().unwrap();
+        install_caption_model(root.path());
+        // A build without the helper still starts the meeting, without captions.
+        let legs = whisper_legs(root.path(), true, Launch::bundled_from(None)).await;
+        assert!(legs.captions.is_none());
+        // With one, preparing the meeting spawns nothing: the helper starts on
+        // the first caption stream, after capture has begun.
+        let before = pids_of_fake();
+        let legs = whisper_legs(root.path(), true, Ok(fake_launch())).await;
+        assert!(legs.captions.is_some());
+        assert_eq!(
+            pids_of_fake(),
+            before,
+            "no helper spawned to prepare captions"
+        );
+    }
+
+    /// Running fake helpers, by pid.
+    fn pids_of_fake() -> Vec<String> {
+        let out = std::process::Command::new("pgrep")
+            .args(["-f", "fotw-speechd-fake"])
+            .output()
+            .unwrap();
+        let mut pids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        pids.sort();
+        pids
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
