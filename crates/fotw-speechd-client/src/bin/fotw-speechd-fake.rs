@@ -134,12 +134,13 @@ impl Out {
     }
 }
 
-const ENGINES: [(&str, EngineKind, bool); 6] = [
+const ENGINES: [(&str, EngineKind, bool); 7] = [
     ("fake-batch", EngineKind::Batch, false),
     ("fake-stream", EngineKind::Streaming, true),
     ("fake-vad", EngineKind::Vad, false),
     ("fake-crash", EngineKind::Batch, false),
     ("fake-hang", EngineKind::Batch, false),
+    ("fake-stall", EngineKind::Batch, false),
     ("fake-exit-after-final", EngineKind::Batch, false),
 ];
 
@@ -382,6 +383,14 @@ impl Helper {
 
     fn finish(&mut self, id: u32) {
         let out = self.out.clone();
+        // A wedged engine: the stream never completes, the helper stays alive.
+        if self
+            .streams
+            .get(&id)
+            .is_some_and(|s| s.engine == "fake-stall")
+        {
+            return;
+        }
         let Some(stream) = self.streams.remove(&id) else {
             return;
         };

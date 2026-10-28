@@ -199,6 +199,7 @@ ordinary test suites use:
 | `fake-vad` | `speech_start` at the first sample with \|x\| ≥ 16384, `speech_end` at the next all-zero frame |
 | `fake-crash` | the process exits with status 70 on its first audio frame |
 | `fake-hang` | the process stops reading and answering on its first audio frame |
+| `fake-stall` | never answers `finish`, but keeps serving everything else |
 | `fake-exit-after-final` | on `finish`, `final` and `closed`, then the process exits with status 70 |
 
 `load` and `warmup` of a fake engine send one `progress` each.
@@ -240,7 +241,9 @@ Weights are never committed. They live under
   a 2 s deadline, so a hung helper is found within 3 s by default, even after
   `finish` when no audio flows. A queue to the helper that stays full for 2 s
   means the same. Either way the client kills it and handles it as a crash, so
-  a recording never blocks on transcription.
+  a recording never blocks on transcription. A stream with no result 120 s
+  after `finish` means a wedged engine in a helper that still answers, and is
+  handled the same way.
 - **Sending audio.** `send_audio` waits at most 2 s for room in the queue to
   the helper (then the helper is treated as hung). Call it from a task, never
   a real-time capture callback; there, `try_send_audio` queues one frame

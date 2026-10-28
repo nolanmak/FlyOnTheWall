@@ -21,6 +21,8 @@ dev_cert   := env_var_or_default("FOTW_DEV_CERT_DIR", env_var("HOME") / ".fotw-d
 dev_ident  := "FlyOnTheWall Dev"
 # Keep local builds off every core so an interactive machine stays usable.
 jobs       := env_var_or_default("CARGO_BUILD_JOBS", "3")
+# Where `just speechd-helper` builds the FluidAudio speech helper (#243).
+speechd_build := build_dir / "speechd-swift"
 
 default:
     @just --list
@@ -38,6 +40,47 @@ test:
     python3 -m unittest discover -s tools/speech-eval/tests
     CARGO_BUILD_JOBS={{jobs}} cargo test --locked -p fotw-stt --example local_whisper_smoke
     if [[ "$(uname -s)" == Darwin ]]; then env -u FOTW_FLUIDAUDIO_SOURCE swift run --package-path tools/speech-eval/parakeet -j {{jobs}} parakeet-protocol-check; fi
+    if [[ "$(uname -s)" == Darwin ]]; then just speechd-check; fi
+
+# Its Swift checks run first, then the Rust protocol tests against it in
+# --fake-engines mode, so the Swift and Rust ends are held to one contract.
+# macOS only; Command Line Tools suffice.
+# Check fotw-speechd (#243) without FluidAudio or models.
+speechd-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pkg=helpers/fotw-speechd
+    env -u FOTW_FLUIDAUDIO_SOURCE swift run --package-path "$pkg" -j {{jobs}} speechd-checks
+    env -u FOTW_FLUIDAUDIO_SOURCE swift build --package-path "$pkg" -j {{jobs}} --product fotw-speechd
+    bin="$(env -u FOTW_FLUIDAUDIO_SOURCE swift build --package-path "$pkg" --show-bin-path)/fotw-speechd"
+    FOTW_SPEECHD_BIN="$bin" CARGO_BUILD_JOBS={{jobs}} cargo test -p fotw-speechd-client --test protocol
+
+# Verifies the FluidAudio checkout against its pin first; downloads no model.
+# Build the speech helper with FluidAudio, release.
+speechd-helper:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [[ "$(uname -s)" == Darwin ]] || { echo "error: fotw-speechd is macOS-only" >&2; exit 1; }
+    src="${FOTW_FLUIDAUDIO_SOURCE:?set FOTW_FLUIDAUDIO_SOURCE to a FluidAudio 0.17.3 checkout (helpers/fotw-speechd/README.md)}"
+    python3 tools/speech-eval/parakeet/verify_runtime.py "$src"
+    FOTW_FLUIDAUDIO_SOURCE="$src" swift build --package-path helpers/fotw-speechd \
+        --scratch-path "{{speechd_build}}" -c release -j {{jobs}} --product fotw-speechd
+    echo "✓ built {{speechd_build}}/release/fotw-speechd"
+
+# Pinned Parakeet Unified and Silero VAD: startup and warmup gates, and
+# offline/loopback checks with the network denied after setup. Setup installs
+# Silero VAD from Hugging Face and imports Parakeet from PARAKEET_DIR (a
+# hash-checked copy) or downloads it. COREML_CACHE, if set, is deleted first so
+# the cold start includes Core ML's compile (~/Library/Caches/fotw-speechd).
+# The real-model suite (#243), separate from `ci`.
+speechd-real models_root corpus_dir:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just speechd-helper >&2
+    args=(--helper "{{speechd_build}}/release/fotw-speechd" --models-root "{{models_root}}" --corpus "{{corpus_dir}}")
+    if [[ -n "${PARAKEET_DIR:-}" ]]; then args+=(--parakeet-from "$PARAKEET_DIR"); fi
+    if [[ -n "${COREML_CACHE:-}" ]]; then args+=(--coreml-cache "$COREML_CACHE"); fi
+    CARGO_BUILD_JOBS={{jobs}} cargo run --release -p fotw-speechd-client --example speechd_real -- "${args[@]}"
 
 lint:
     cargo fmt --all --check

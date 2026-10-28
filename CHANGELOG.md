@@ -51,6 +51,12 @@ Windows, but neither captures anything.
   ([docs/SPEECHD_PROTOCOL.md](docs/SPEECHD_PROTOCOL.md)). It restarts a crashed
   helper at most 3 times in a row, 2 s apart, and fails open streams at once
   instead of waiting on it. Nothing uses it yet.
+- `fotw-speechd` (#243), the Swift helper itself
+  ([helpers/fotw-speechd](helpers/fotw-speechd/README.md)): Parakeet Unified
+  and Silero VAD through FluidAudio, models pinned to exact revisions with
+  per-file SHA-256 and installed only by an explicit setup action, and model-free
+  fake engines that the Rust protocol tests run against on macOS. Built only
+  with `FOTW_FLUIDAUDIO_SOURCE`; `just speechd-real` is its real-model suite.
 
 #### Library and keys
 
