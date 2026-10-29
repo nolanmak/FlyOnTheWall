@@ -101,12 +101,15 @@ speechd-real models_root corpus_dir:
 # channels) must find at least two speakers, and Parakeet's word timings must
 # match its text. Setup installs `diarizer` from Hugging Face and imports
 # Parakeet from PARAKEET_DIR or downloads it; OFFSET_S and DURATION_S pick the span.
+# Positional arguments, so a voice path with spaces stays one path.
+[positional-arguments]
 speechd-postpass-real models_root +voices:
     #!/usr/bin/env bash
     set -euo pipefail
     just speechd-helper >&2
-    args=(--helper "{{speechd_build}}/release/fotw-speechd" --models-root "{{models_root}}")
-    for voice in {{voices}}; do args+=(--voice "$voice"); done
+    args=(--helper "{{speechd_build}}/release/fotw-speechd" --models-root "$1")
+    shift
+    for voice in "$@"; do args+=(--voice "$voice"); done
     if [[ -n "${PARAKEET_DIR:-}" ]]; then args+=(--parakeet-from "$PARAKEET_DIR"); fi
     args+=(--offset-s "${OFFSET_S:-300}" --seconds "${DURATION_S:-180}")
     CARGO_BUILD_JOBS={{jobs}} cargo run --release -p fotw-speechd-client --example speechd_postpass_real -- "${args[@]}"
