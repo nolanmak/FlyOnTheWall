@@ -15,6 +15,8 @@ mod ownership;
 #[cfg(target_os = "macos")]
 mod process;
 #[cfg(target_os = "macos")]
+mod staging;
+#[cfg(target_os = "macos")]
 mod watch;
 #[cfg(target_os = "macos")]
 mod worker;
