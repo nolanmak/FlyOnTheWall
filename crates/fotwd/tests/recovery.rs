@@ -769,10 +769,11 @@ fn upgrading_an_existing_missing_policy_library_keeps_its_hosted_configuration()
     {
         let db = fotwd::open_library_with(&f.root, &f.store, &mut Scripted::new(), KDF_FOR_TESTS)
             .unwrap();
-        // Migration 9 adds only bootstrap rows. Removing those rows and
-        // restoring version 8 constructs the exact previous schema in this
-        // disposable encrypted fixture, without editing released migrations.
-        db.conn().execute_batch("DELETE FROM settings WHERE key='summarize'; DELETE FROM app_meta WHERE key='summary_destination_bootstrap'; PRAGMA user_version=8;").unwrap();
+        // Migration 9 adds only bootstrap rows and migration 10 only the
+        // empty cleanup tables. Removing both and restoring version 8
+        // constructs the exact previous schema in this disposable encrypted
+        // fixture, without editing released migrations.
+        db.conn().execute_batch("DELETE FROM settings WHERE key='summarize'; DELETE FROM app_meta WHERE key='summary_destination_bootstrap'; DROP TABLE post_pass_windows; DROP TABLE post_pass_jobs; PRAGMA user_version=8;").unwrap();
     }
     let db =
         fotwd::open_library_with(&f.root, &f.store, &mut Scripted::new(), KDF_FOR_TESTS).unwrap();
