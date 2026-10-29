@@ -1,0 +1,57 @@
+{
+ "schema": "ami-tuning-set-v1",
+ "purpose": "Held-out AMI meetings the cross-track bleed thresholds (crates/fotwd/src/post_pass/bleed.rs) were tuned on (#246). None of them is an acceptance meeting (ES2004c, IS1009c, TS3003c), and each comes from a different group of speakers. Build the replays with: python3 tools/speech-eval/ami_replay.py --audio-dir DIR --annotations ROOT --output OUT --meeting ES2005c:2 --meeting IS1003c:1 --meeting TS3006c:1",
+ "license": "CC-BY-4.0 (AMI Meeting Corpus, audio and manual annotations v1.6.2)",
+ "annotations": {
+  "url": "https://groups.inf.ed.ac.uk/ami/AMICorpusAnnotations/ami_public_manual_1.6.2.zip",
+  "sha256": "b56e5babb2496b8795deeeda7e71178d7fbc9963f94276cf2a3f4b56ebbc9f9d"
+ },
+ "meetings": [
+  {
+   "meeting": "ES2005c",
+   "mic_headset": 2,
+   "window_s": [120, 720],
+   "sources": {
+    "0": "daba08fb52bb5b23cff8014de14271a0cd59c0037295dac42cabf5b9f6ed9921",
+    "1": "18dd5538ae03b83e4c2ffed1f5ad22e0cbf1d2353aca050785bb0de208592196",
+    "2": "5458e94a3a0131681b193dc989b672de7c65a499f0b8c604d3aebdfe50307c0e",
+    "3": "31b8fda0bd234919c0985758137527e2a4f2d6804af9b536ded39ac569625503"
+   },
+   "cropped": {
+    "mic": "ca8047dd54e46f63d15bf635b15629d8d1b934a4c3230c12f28368b9161f9aa1",
+    "system": "dbe8d9238e7bd1d1614f3e572af440c5d1d965f885c13119a2c96b12f3324f5c"
+   }
+  },
+  {
+   "meeting": "IS1003c",
+   "mic_headset": 1,
+   "window_s": [120, 720],
+   "sources": {
+    "0": "3f1bbd1dfb01583ac8dd6f1b954932bedc53c3c1e96ae7d2ab53defd807ca7cc",
+    "1": "7938dd67320ab8e2b1b4b08bf260f04ce21dc06a8854af1bf557661069c04669",
+    "2": "4d4ccbd37f1fc47646f9b8533305286618c5499aa42ea5bc209e88fae1d64735",
+    "3": "b60e177eabd9c5a40e14d3928493297fba7017435db50dc6ec5ef44fcf6c0feb"
+   },
+   "cropped": {
+    "mic": "9e14e78854df27ed243ea75225095cb3c6b9bc566339623f88c32581d072f5e3",
+    "system": "d77288fdccd008797680da67c5ef74e24ed33eb93f2cae82ab8e7a8614714ad0"
+   }
+  },
+  {
+   "meeting": "TS3006c",
+   "mic_headset": 1,
+   "window_s": [120, 720],
+   "sources": {
+    "0": "d79e7a19f7874b796299118c5c379b0b598b1b6baf01a0b05cdcb29cf1049465",
+    "1": "2b37cca0cc412389924cb59541265c5028c4d1d005ca8284f3f4a8bf0cb87bc1",
+    "2": "b6736677bd3b0e74a6ebc60ca5e65974e76eeaf01c361990a6860fcded07dd54",
+    "3": "eca5f3ed94e62de16e05901002710432e2ae3f9a760b6c281f48367b98ec9fbb"
+   },
+   "cropped": {
+    "mic": "b349718057ca256078e5cf85f3ba1f3c4cc83c5b7ed8f5970f955bfb82312efa",
+    "system": "03464151d87183f5cab5311949f40ca45ecb1e48bb80fe0808728188e7661845"
+   }
+  }
+ ],
+ "source_url": "https://groups.inf.ed.ac.uk/ami/AMICorpusMirror/amicorpus/{meeting}/audio/{meeting}.Headset-{n}.wav"
+}

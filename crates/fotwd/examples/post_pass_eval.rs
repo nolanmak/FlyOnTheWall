@@ -14,7 +14,15 @@
 //! - The cleanup encodes both tracks to Opus exactly as promotion does, then
 //!   runs the production job over them (Silero, 30 s/2 s windows of Parakeet
 //!   with word timings, overlap merge, diarizer, turns) into an in-memory
-//!   library, and writes `clean.json`.
+//!   library, and writes `clean.json`. Archives already in `--out` (from
+//!   `--encode-only`) are reused and the WAVs are then not read, so the
+//!   measured memory is the cleanup's.
+//! - `--bleed off|system|both` and `--bleed-correlation`, `--bleed-gap-db`,
+//!   `--bleed-excess-db`, `--bleed-hang-ms`, `--bleed-context-ms`,
+//!   `--bleed-lag-ms` override the cross-track bleed suppression, for tuning
+//!   on held-out meetings (`tools/speech-eval/bleed-tuning-set.json`).
+//! - `--model-memory N` measures the wired memory each model adds, N rounds,
+//!   into `model-memory.json`, and runs nothing else.
 //!
 //! Both are `[{start_ms, end_ms, text, channel, speaker}]`, the hypothesis
 //! format `tools/speech-eval/meeting_score.py` scores. `report.json` holds the
@@ -56,18 +64,47 @@ mod imp {
                 .ok_or_else(|| format!("missing {name}"))
         };
         let data_root = PathBuf::from(flag("--data-root")?);
-        let mic = read_wav(Path::new(&flag("--mic")?))?;
-        let system = read_wav(Path::new(&flag("--system")?))?;
         let out = PathBuf::from(flag("--out")?);
         std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+        // With both archives already there and no live pass, the WAVs are
+        // not read at all, so the process holds no PCM the cleanup never
+        // uses and its memory is the cleanup's.
+        let archived = !args.iter().any(|a| a == "--live")
+            && ["mic.opus", "system.opus"]
+                .iter()
+                .all(|name| out.join(name).is_file());
+        let (mic, system) = if archived {
+            (Vec::new(), Vec::new())
+        } else {
+            (
+                read_wav(Path::new(&flag("--mic")?))?,
+                read_wav(Path::new(&flag("--system")?))?,
+            )
+        };
+        let samples = if archived {
+            let total = |name: &str| OpusTrack::open(&out.join(name)).map(|t| t.total() as usize);
+            total("mic.opus")?.max(total("system.opus")?)
+        } else {
+            mic.len().max(system.len())
+        };
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .map_err(|e| e.to_string())?;
         let mut report = serde_json::json!({
-            "audio_seconds": mic.len().max(system.len()) as f64 / 16_000.0,
+            "audio_seconds": samples as f64 / 16_000.0,
         });
+        if let Ok(rounds) = flag("--model-memory") {
+            let rounds = rounds.parse().map_err(|_| "bad --model-memory")?;
+            let memory = runtime.block_on(model_memory(&data_root, rounds))?;
+            write(&out.join("model-memory.json"), &memory)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&memory).map_err(|e| e.to_string())?
+            );
+            return Ok(());
+        }
         if args.iter().any(|a| a == "--live") {
             let started = Instant::now();
             let live = runtime.block_on(live(&data_root, &mic, &system))?;
@@ -201,7 +238,8 @@ mod imp {
                         }
                         None => fotwd::post_pass::speechd_engine::SPEAKER_THRESHOLD,
                     }
-                }),
+                })
+                .with_bleed(bleed_args()?),
             vad_off: std::env::args().any(|a| a == "--vad-off"),
             spans: Arc::new(Mutex::new(None)),
         };
@@ -335,6 +373,21 @@ mod imp {
         fn provenance(&self) -> serde_json::Value {
             self.inner.provenance()
         }
+        fn bleed(&self) -> Option<fotwd::post_pass::bleed::BleedParams> {
+            self.inner.bleed()
+        }
+        fn release_recognizer(&self) -> BoxFuture<'_, ()> {
+            self.inner.release_recognizer()
+        }
+        fn restore_recognizer(&self) -> BoxFuture<'_, ()> {
+            self.inner.restore_recognizer()
+        }
+        fn release(&self) -> BoxFuture<'_, ()> {
+            self.inner.release()
+        }
+        fn notes(&self) -> Vec<String> {
+            self.inner.notes()
+        }
     }
 
     struct Keep {
@@ -388,6 +441,129 @@ mod imp {
             )
         };
         (rc == 0).then_some((info.ri_resident_size, info.ri_phys_footprint))
+    }
+
+    /// System-wide wired memory (`vm_stat`), MiB. Core ML keeps model weights
+    /// wired outside both processes, so this is how their cost shows.
+    fn wired_mib() -> Result<f64, String> {
+        let out = std::process::Command::new("/usr/bin/vm_stat")
+            .output()
+            .map_err(|e| e.to_string())?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let page: f64 = text
+            .split("page size of ")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
+            .ok_or("vm_stat: no page size")?;
+        let pages: f64 = text
+            .lines()
+            .find(|l| l.starts_with("Pages wired down"))
+            .and_then(|l| l.split(':').nth(1))
+            .and_then(|s| s.trim().trim_end_matches('.').parse().ok())
+            .ok_or("vm_stat: no wired pages")?;
+        Ok(pages * page / f64::from(1u32 << 20))
+    }
+
+    /// `--model-memory N`: the wired memory each cleanup model adds, and
+    /// both at once, measured N times in a fresh helper: load and warm, let
+    /// it settle, read, unload, read. Medians, so another app's activity
+    /// during one round does not decide it.
+    async fn model_memory(data_root: &Path, rounds: usize) -> Result<serde_json::Value, String> {
+        use fotwd::post_pass::speechd_engine::DIARIZER_ENGINE;
+        use fotwd::speechd::PARAKEET;
+        let client = fotwd::speechd::helper(data_root).await?;
+        let settle = || tokio::time::sleep(std::time::Duration::from_secs(3));
+        let load = |engine: &'static str| {
+            let client = client.clone();
+            async move {
+                client.load(engine).await.map_err(|e| e.to_string())?;
+                client.warmup(engine).await.map_err(|e| e.to_string())?;
+                Ok::<_, String>(())
+            }
+        };
+        let unload = |engine: &'static str| {
+            let client = client.clone();
+            async move { client.unload(engine).await.map_err(|e| e.to_string()) }
+        };
+        let (mut asr, mut diarizer, mut both, mut left) = (vec![], vec![], vec![], vec![]);
+        for _ in 0..rounds {
+            settle().await;
+            let idle = wired_mib()?;
+            load(PARAKEET.id).await?;
+            settle().await;
+            asr.push(wired_mib()? - idle);
+            load(DIARIZER_ENGINE).await?;
+            settle().await;
+            both.push(wired_mib()? - idle);
+            unload(PARAKEET.id).await?;
+            settle().await;
+            diarizer.push(wired_mib()? - idle);
+            unload(DIARIZER_ENGINE).await?;
+            settle().await;
+            left.push(wired_mib()? - idle);
+        }
+        let median = |xs: &mut Vec<f64>| {
+            xs.sort_by(f64::total_cmp);
+            xs[xs.len() / 2].round()
+        };
+        Ok(serde_json::json!({
+            "rounds": rounds,
+            "wired_mib_median": {
+                "parakeet": median(&mut asr),
+                "diarizer": median(&mut diarizer),
+                "both": median(&mut both),
+                "after_unloading_both": median(&mut left),
+            },
+            "wired_mib_each_round": {"parakeet": asr, "diarizer": diarizer, "both": both, "after_unloading_both": left},
+        }))
+    }
+
+    /// `--bleed off|system|both` and `--bleed-<setting> <value>` over the
+    /// production settings, for tuning on held-out meetings.
+    fn bleed_args() -> Result<Option<fotwd::post_pass::bleed::BleedParams>, String> {
+        let args: Vec<String> = std::env::args().collect();
+        let value = |name: &str| {
+            args.iter()
+                .position(|a| a == name)
+                .and_then(|i| args.get(i + 1))
+                .cloned()
+        };
+        let mut params = fotwd::post_pass::bleed::BleedParams::default();
+        match value("--bleed").as_deref() {
+            None => {}
+            Some("off") => return Ok(None),
+            Some("system") => (params.system, params.mic) = (true, false),
+            Some("both") => (params.system, params.mic) = (true, true),
+            Some(other) => return Err(format!("bad --bleed {other}")),
+        }
+        let number = |name: &str| -> Result<Option<f32>, String> {
+            value(name)
+                .map(|v| v.parse::<f32>().map_err(|_| format!("bad {name}")))
+                .transpose()
+        };
+        if let Some(v) = number("--bleed-correlation")? {
+            params.min_correlation = v;
+        }
+        if let Some(v) = number("--bleed-gap-db")? {
+            params.min_gap_db = v;
+        }
+        if let Some(v) = number("--bleed-reference-db")? {
+            params.min_reference_db = v;
+        }
+        if let Some(v) = number("--bleed-hang-ms")? {
+            params.hang_ms = v as u32;
+        }
+        if let Some(v) = number("--bleed-context-ms")? {
+            params.context_ms = v as u32;
+        }
+        if let Some(v) = number("--bleed-lag-ms")? {
+            params.max_lag_ms = v as u32;
+        }
+        if let Some(v) = number("--bleed-excess-db")? {
+            params.max_excess_db = v;
+        }
+        Ok(Some(params))
     }
 
     fn read_wav(path: &Path) -> Result<Vec<i16>, String> {
