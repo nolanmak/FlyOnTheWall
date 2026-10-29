@@ -31,6 +31,12 @@
 //! `path` does not exist, creating it first: one crash, then a healthy helper.
 //! `--slow-health <ms>` answers every `health` that late, off the frame
 //! thread, like a helper starved of CPU on a heavily loaded Mac.
+//!
+//! `fake-diarizer` and `fake-words`, the post-meeting pass's fakes (#246),
+//! are in `fake/postpass.rs`.
+
+#[path = "fake/postpass.rs"]
+mod postpass;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, BufReader, BufWriter, Write};
@@ -41,7 +47,7 @@ use std::time::{Duration, Instant};
 use fotw_speechd_client::frame::{self, Frame, KIND_AUDIO, KIND_CONTROL, MAX_FRAME};
 use fotw_speechd_client::message::{
     Capabilities, CloseReason, EngineInfo, EngineKind, ErrorCode, FORMAT_S16LE, FinalText,
-    ModelInfo, PROTOCOL_VERSION, ProgressPhase, Reply, Request, VadKind,
+    ModelInfo, PROTOCOL_VERSION, ProgressPhase, Reply, Request, StreamOptions, VadKind,
 };
 
 const MAX_STREAMS: usize = 8;
@@ -244,6 +250,7 @@ fn capabilities(
         }),
         max_audio_ms: Some(600_000),
     }));
+    engines.extend(postpass::engines());
     let mut value = serde_json::to_value(Capabilities {
         max_frame_bytes: u32::try_from(MAX_FRAME).expect("1 MiB"),
         max_streams: u32::try_from(MAX_STREAMS).expect("small"),
@@ -266,6 +273,8 @@ struct Stream {
     engine: String,
     samples: u64,
     in_speech: bool,
+    /// `fake-diarizer` and `fake-words` (#246).
+    postpass: Option<postpass::State>,
     /// fake-captions: the utterance being spoken, where it began, and how
     /// much of it there is so far.
     utterance: u64,
@@ -352,7 +361,7 @@ impl Helper {
                     } else {
                         out.fail(id, ErrorCode::ModelMissing, "the model is not installed");
                     }
-                } else if ENGINES.iter().any(|e| e.0 == engine) {
+                } else if ENGINES.iter().any(|e| e.0 == engine) || postpass::is_engine(&engine) {
                     out.progress(id, ProgressPhase::Load);
                     self.loaded.insert(engine.clone());
                     let loaded = Reply::Loaded {
@@ -409,7 +418,7 @@ impl Helper {
                 stream,
                 engine,
                 (sample_rate, &format, channels),
-                options.language,
+                options,
             ),
             Request::Finish { stream } => self.finish(stream),
             Request::Cancel { stream } => {
@@ -499,9 +508,11 @@ impl Helper {
         stream: u32,
         engine: String,
         format: (u32, &str, u16),
-        language: Option<String>,
+        options: StreamOptions,
     ) {
-        let known = ENGINES.iter().any(|e| e.0 == engine) || self.pinned_engine(&engine).is_some();
+        let known = ENGINES.iter().any(|e| e.0 == engine)
+            || postpass::is_engine(&engine)
+            || self.pinned_engine(&engine).is_some();
         let out = &self.out;
         let refusal = if !known {
             Some((ErrorCode::UnknownEngine, "no such engine"))
@@ -539,13 +550,14 @@ impl Helper {
         self.streams.insert(
             stream,
             Stream {
+                postpass: postpass::State::new(&engine, &options),
                 engine,
                 samples: 0,
                 in_speech: false,
                 utterance: 1,
                 utterance_start: 0,
                 utterance_samples: 0,
-                language: language.unwrap_or_else(|| "auto".to_owned()),
+                language: options.language.unwrap_or_else(|| "auto".to_owned()),
             },
         );
         out.send(&Reply::StreamOpened { id, stream });
@@ -570,6 +582,24 @@ impl Helper {
                 }
                 Some(_) => {}
             }
+        }
+        if let Some(state) = stream.postpass.as_mut() {
+            match state.audio(id, pcm) {
+                postpass::Outcome::Ok(replies) => replies.iter().for_each(|r| out.send(r)),
+                postpass::Outcome::TooLong(message) => {
+                    self.streams.remove(&id);
+                    self.closed.insert(id);
+                    out.send(&Reply::Error {
+                        id: None,
+                        stream: Some(id),
+                        code: ErrorCode::TooLong,
+                        message: message.to_owned(),
+                        fatal: false,
+                        supported: Vec::new(),
+                    });
+                }
+            }
+            return;
         }
         let start = stream.samples;
         stream.samples += pcm.len() as u64;
@@ -689,6 +719,15 @@ impl Helper {
             return;
         };
         self.closed.insert(id);
+        if let Some(state) = stream.postpass.take() {
+            // At once, unlike fake-batch.
+            out.send(&Reply::Final(state.finish(id, &stream.engine)));
+            out.send(&Reply::Closed {
+                stream: id,
+                reason: CloseReason::Finished,
+            });
+            return;
+        }
         let held = self.dictation;
         self.end_dictation(&stream);
         if stream.engine == "fake-captions" {

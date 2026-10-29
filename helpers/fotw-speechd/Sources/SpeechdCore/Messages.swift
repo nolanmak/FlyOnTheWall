@@ -5,9 +5,12 @@ import Foundation
 public struct StreamOptions: Decodable, Sendable, Equatable {
     public var probabilities: Bool?
     public var language: String?
-    public init(probabilities: Bool? = nil, language: String? = nil) {
+    /// Batch recognizers: per-word `final` segments (#246).
+    public var timings: Bool?
+    public init(probabilities: Bool? = nil, language: String? = nil, timings: Bool? = nil) {
         self.probabilities = probabilities
         self.language = language
+        self.timings = timings
     }
 }
 

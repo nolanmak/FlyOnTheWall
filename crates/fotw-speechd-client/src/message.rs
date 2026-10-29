@@ -98,7 +98,18 @@ pub enum Request {
 }
 
 /// Per-stream engine options. Every field is optional.
+///
+/// Non-exhaustive, so a new option is not a breaking change for callers in
+/// other crates: build one from the default with the `with_*` methods.
+///
+/// ```
+/// use fotw_speechd_client::message::StreamOptions;
+/// let options = StreamOptions::default().with_timings(true).with_language("de");
+/// assert!(options.timings && !options.probabilities);
+/// assert_eq!(options.language.as_deref(), Some("de"));
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct StreamOptions {
     /// VAD engines: also report every chunk's speech probability.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -106,6 +117,34 @@ pub struct StreamOptions {
     /// BCP 47 language hint, for multilingual engines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// Batch recognizers (`parakeet-unified`): also report each word as a
+    /// `final` segment `{start_ms, end_ms, text}`, from the stream's first
+    /// sample. Off, the `final` is unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub timings: bool,
+}
+
+impl StreamOptions {
+    /// VAD engines: also report every chunk's speech probability.
+    #[must_use]
+    pub fn with_probabilities(mut self, probabilities: bool) -> Self {
+        self.probabilities = probabilities;
+        self
+    }
+
+    /// A BCP 47 language hint, for multilingual engines.
+    #[must_use]
+    pub fn with_language(mut self, language: impl Into<String>) -> Self {
+        self.language = Some(language.into());
+        self
+    }
+
+    /// Batch recognizers: per-word `final` segments.
+    #[must_use]
+    pub fn with_timings(mut self, timings: bool) -> Self {
+        self.timings = timings;
+        self
+    }
 }
 
 /// Helper → parent: responses (with `id`) and stream events (with `stream`).
@@ -483,6 +522,47 @@ mod tests {
         assert_eq!(json["type"], "open_stream");
         assert_eq!(json["options"], serde_json::json!({}));
         assert_eq!(serde_json::from_value::<Request>(json).unwrap(), open);
+    }
+
+    #[test]
+    fn post_pass_shapes_round_trip() {
+        // #246: word timings are asked for with `timings`, which is left off
+        // the wire when false, so the default request is unchanged.
+        let options = StreamOptions::default().with_timings(true);
+        assert_eq!(
+            serde_json::to_value(&options).unwrap(),
+            serde_json::json!({"timings": true})
+        );
+        assert_eq!(
+            serde_json::to_value(StreamOptions::default()).unwrap(),
+            serde_json::json!({})
+        );
+        // A final carries speaker segments (diarization) or word segments.
+        let json = serde_json::json!({
+            "type": "final", "stream": 2, "text": "", "start_ms": 0, "end_ms": 20550,
+            "model": "diarizer@df2625ac79a7ac6b65ad868fee6d80f320da4232",
+            "segments": [
+                {"start_ms": 2000, "end_ms": 5000, "speaker": "S1"},
+                {"start_ms": 6000, "end_ms": 6400, "text": "hello"},
+            ],
+        });
+        let reply: Reply = serde_json::from_value(json.clone()).unwrap();
+        let Reply::Final(ref f) = reply else {
+            panic!("{reply:?}")
+        };
+        assert_eq!(f.segments[0].speaker.as_deref(), Some("S1"));
+        assert_eq!(f.segments[1].text.as_deref(), Some("hello"));
+        let back: Reply = serde_json::from_value(serde_json::to_value(&reply).unwrap()).unwrap();
+        assert_eq!(back, reply);
+        // And the capabilities name the diarization kind.
+        let caps: Capabilities = serde_json::from_value(serde_json::json!({
+            "max_frame_bytes": 1_048_576, "max_streams": 8,
+            "engines": [{"id": "diarizer", "kind": "diarization", "partials": true,
+                         "sample_rates": [16000], "max_audio_ms": 14_400_000}],
+        }))
+        .unwrap();
+        assert_eq!(caps.engines[0].kind, EngineKind::Diarization);
+        assert_eq!(caps.engines[0].max_audio_ms, Some(14_400_000));
     }
 
     #[test]

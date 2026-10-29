@@ -140,11 +140,22 @@ Stream messages carry the stream id instead of a request id:
 
 | helper → parent | meaning |
 |---|---|
-| `partial {stream, text, start_ms, end_ms, utterance?}` | provisional text; display only, never persisted |
+| `partial {stream, text, start_ms, end_ms, utterance?}` | provisional text; display only, never persisted. A diarization stream sends it with empty `text` as a progress acknowledgement (see Engines) |
 | `final {stream, text, start_ms, end_ms, segments, model, utterance?}` | committed text. A streaming engine sends one per utterance; a batch engine one per `finish`. `segments` is `[{start_ms, end_ms, text?, speaker?}]`, which is also how diarization reports speakers |
 | `vad {stream, event, sample, probability}` | `event` is `speech_start`, `speech_end` or (with `options.probabilities`) `probability` |
 | `error {stream, code, message}` | terminal for that stream only |
 | `closed {stream, reason}` | terminal; `reason` is `finished` or `cancelled` |
+
+`open_stream.options` are all optional: `probabilities` (VAD: report every
+chunk's probability), `language` (a BCP 47 hint for multilingual engines) and
+`timings` (batch recognizers, #246: the `final` also carries one segment
+`{start_ms, end_ms, text}` per word, from the stream's first sample, in
+order). Without `timings` a batch `final` is unchanged and its `segments` are
+empty. `parakeet-unified` builds the words from FluidAudio's
+`transcribeWithTimings` token timings: a SentencePiece piece that starts with
+a space or `▁` starts a word, the others continue it, and a word runs from its
+first piece's start to its last piece's end. These are emission times, so a
+word's start can sit slightly after its true onset.
 
 `utterance` numbers a streaming engine's utterances from 1 within a stream. A
 later `partial` with the same `utterance` replaces the earlier one in place,
@@ -172,6 +183,7 @@ Error codes: `version_mismatch`, `protocol`, `bad_request`, `unknown_engine`,
 | `parakeet-eou-320ms` | streaming, pooled (#245) | `FluidInference/parakeet-realtime-eou-120m-coreml` | NVIDIA Open Model License |
 | `parakeet-eou-160ms` | streaming, pooled (#245, not the default) | same repository, its `160ms/` variant | NVIDIA Open Model License |
 | `nemotron-3.5` | streaming, one dictation at a time (Murmur #100) | `FluidInference/Nemotron-3.5-ASR-Streaming-Multilingual-0.6b-CoreML` | OpenMDW-1.1 |
+| `diarizer` | diarization | `FluidInference/speaker-diarization-coreml` (`pyannote_segmentation`, `wespeaker_v2`) | unconfirmed (#277): the card's scoped CC-BY-4.0 excludes these two files (`THIRD_PARTY_NOTICES.md`) |
 
 Each engine states its per-stream bound as `max_audio_ms` in the
 capabilities, and a stream past it fails with `too_long`.
@@ -204,13 +216,27 @@ capabilities, and a stream past it fails with `too_long`.
   stream starts from a reset state, and `warmup` runs one step of silence
   and resets.
 - A **diarization** stream (#246) takes a whole channel of a meeting, up to
-  `max_audio_ms` (4 hours for the planned `diarizer`). It processes audio as
-  it arrives in bounded windows, as Muesli's `diarizeRecordedAudio` does, and
-  keeps per-window speaker embeddings rather than the audio, so memory does
-  not grow with the meeting. On `finish` it sends one `final` with empty
-  `text` and `segments` `[{start_ms, end_ms, speaker}]` sorted by start,
-  covering the stream's speech; speaker labels (`"S1"`, `"S2"`, …) are stable
-  within that stream only. The 10-minute batch bound does not apply to it.
+  `max_audio_ms` (4 hours for `diarizer`). It processes audio as it arrives
+  in 10 s windows, as Muesli's `diarizeRecordedAudio` does: it holds at most
+  one window of audio, and its speaker tracker (per stream, reset when it
+  opens) keeps embeddings rather than audio, so memory does not grow with the
+  meeting. The 10-minute batch bound does not apply to it.
+  - After each window it sends `partial {stream, text: "", start_ms: 0,
+    end_ms: <ms processed so far>}`. This is progress, not text: the client
+    keeps its unacknowledged audio well under the 2-minute backlog by waiting
+    on these (`SpeechStream::await_progress`, at most
+    `DIARIZATION_MAX_UNACKED_MS` = 60 s ahead). So after `finish` at most that
+    much audio and one partial window are left to process, well inside the
+    client's 120 s deadline.
+  - On `finish` it processes the partial window, if any, and sends one
+    `final {text: "", start_ms: 0, end_ms: <total ms>, segments, model:
+    "<model>@<revision>"}`. `segments` are `[{start_ms, end_ms, speaker}]`,
+    each clipped to its window, sorted by start, with a segment that touches
+    or overlaps the same speaker's previous one merged into it. Speakers are
+    labelled `"S1"`, `"S2"`, … in order of first appearance, stable within
+    that stream only. Silence has no segments.
+  - More than 128 speakers fails the stream with `engine`, as Muesli does,
+    rather than merging unrelated voices.
 
 With `--fake-engines` the helper serves only model-free engines, which the
 ordinary test suites use:
@@ -226,6 +252,8 @@ ordinary test suites use:
 | `fake-exit-after-final` | on `finish`, `final` and `closed`, then the process exits with status 70 |
 | `fake-captions` | pooled like `parakeet-eou-320ms` (two streams). An utterance runs until an all-zero frame: a `partial {text: "utterance=<u> samples=<n>", utterance: u}` per frame within it, then `final {utterance: u}` with the same text, and the next utterance is `u + 1`. `finish` commits the last one |
 | `fake-dictation` | `nemotron-3.5` without a model, in 250 ms (4000-sample) steps: a `partial {text: "steps=<n> lang=<language or auto>", utterance: 1}` when a step completes; on `finish` the last partial step counts as one more, `final {utterance: 1}` with the same text. A frame holding a sample of −32768 fails the stream with `engine`. Like `nemotron-3.5` it has one recognizer, shared by its streams and reset when a stream ends; a second open stream is refused with `busy` |
+| `fake-diarizer` | kind `diarization`, 4 h bound, the real diarizer's windows and segment rules with a model-free speaker per 100 ms block (1600 samples): peak \|x\| < 328 is silence, 328 ≤ peak < 16384 one speaker, ≥ 16384 another. Its speaker tracker lives for the stream, like the real one's: a speaker keeps its label across windows. A `partial` per full 10 s window; on `finish`, at once, the `final` (`model: "fake-diarizer@fake"`). A trailing partial block is ignored |
+| `fake-words` | kind batch, 10-minute bound. On `finish`, at once, a `final` whose words come from 100 ms blocks: a block whose samples all equal one nonzero v is the word `w<v>`, a run of such blocks with the same v is one word spanning them, anything else is silence, and a trailing partial block is ignored. `text` is the words joined by spaces; `segments` are `[{start_ms, end_ms, text}]` per word with `options.timings`, and empty without, as for `parakeet-unified`; `model: "fake-words@fake"` |
 
 `load` and `warmup` of a fake engine send one `progress` each.
 
