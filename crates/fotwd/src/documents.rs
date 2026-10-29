@@ -154,6 +154,9 @@ fn prepare(db: &mut Db, id: &str) -> Result<Input, String> {
         .map(|n| n.body_md)
         .collect::<Vec<_>>()
         .join("\n");
+    if notes.chars().count() > 8000 {
+        return Err("These notes exceed the current document limit (8,000 characters). The original meeting and any saved draft are unchanged.".to_owned());
+    }
     let name_corrections = read(db, id)?
         .document
         .map(|d| d.name_corrections)
@@ -162,7 +165,7 @@ fn prepare(db: &mut Db, id: &str) -> Result<Input, String> {
         name_corrections,
         transcript,
         started_at_ms: meeting.started_at_ms,
-        notes: notes.chars().take(8000).collect(),
+        notes,
         meeting_title: meeting.title.clone(),
     })
 }
@@ -1229,5 +1232,64 @@ mod tests {
             // connection is not. Release it before its temporary root drops.
             writer.lock().unwrap().take();
         }
+    }
+    #[test]
+    fn document_preparation_preserves_all_notes_or_explicitly_refuses_them() {
+        let mut db = Db::open_in_memory(&fotw_store::DbKey::from_bytes([8; 32])).unwrap();
+        let id = meeting(&mut db);
+        let old = decode(&draft().to_string(), &input()).unwrap();
+        save(&mut db, &id, 0, &old).unwrap();
+        let previous = db.sharing_document(&id).unwrap();
+        for notes in ["a".repeat(8000), "é".repeat(7996) + "TAIL"] {
+            let revision = db.note_document(&id).unwrap().revision;
+            db.save_note_document(&id, revision, &notes, &[]).unwrap();
+            assert_eq!(prepare(&mut db, &id).unwrap().notes, notes);
+        }
+        let notes = "é".repeat(8000) + "IMPORTANT FINAL COMMITMENT";
+        let revision = db.note_document(&id).unwrap().revision;
+        db.save_note_document(&id, revision, &notes, &[]).unwrap();
+        let error = prepare(&mut db, &id)
+            .err()
+            .expect("over-limit notes must not be silently cut");
+        assert!(error.contains("8,000 characters"), "{error}");
+        assert_eq!(db.note_document(&id).unwrap().body_md, notes);
+        assert_eq!(db.sharing_document(&id).unwrap(), previous);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oversized_notes_refuse_generation_before_spawning_the_engine() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join(crate::testing::STUB_ENGINE_NAME);
+        let called = dir.path().join("called");
+        let quote = called.to_string_lossy().replace('\'', "'\\''");
+        std::fs::write(&binary, format!("#!/bin/sh\n: > '{quote}'\nexit 1\n")).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut db = Db::open_in_memory(&fotw_store::DbKey::from_bytes([8; 32])).unwrap();
+        let id = meeting(&mut db);
+        let old = decode(&draft().to_string(), &input()).unwrap();
+        save(&mut db, &id, 0, &old).unwrap();
+        let previous = db.sharing_document(&id).unwrap();
+        let notes = "a".repeat(8000) + "FINAL COMMITMENT";
+        db.save_note_document(&id, 0, &notes, &[]).unwrap();
+        db.put_setting("summarize", &json!({"policy":"claude_cli","acknowledged_egress":true,"binary":binary.to_string_lossy()}).to_string()).unwrap();
+        let store = Box::leak(Box::new(fotw_secrets::InMemoryKeyStore::new()));
+        let controller = Documents::new(db, store);
+        let result = controller
+            .run(
+                id.clone(),
+                DocumentRequest {
+                    action: DocumentAction::Generate,
+                    revision: 1,
+                    ..Default::default()
+                },
+            )
+            .await;
+        let error = result.expect_err("the controller must report over-limit notes");
+        assert!(error.contains("8,000 characters"), "{error}");
+        assert!(!called.exists(), "the owned engine must not be spawned");
+        let mut db = controller.db.lock().unwrap();
+        assert_eq!(db.sharing_document(&id).unwrap(), previous);
+        assert_eq!(db.note_document(&id).unwrap().body_md, notes);
     }
 }
