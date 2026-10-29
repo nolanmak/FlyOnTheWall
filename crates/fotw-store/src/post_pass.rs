@@ -17,6 +17,9 @@ use crate::repo::{insert_segments, insert_transcript};
 /// they use the live transcript: 15 minutes.
 pub const POST_PASS_WAIT_MS: i64 = 15 * 60 * 1_000;
 
+/// The detail of a job someone cancelled.
+pub const CANCELLED: &str = "Cancelled; the live transcript is kept.";
+
 /// Where a job is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PostPassState {
@@ -220,8 +223,11 @@ impl Db {
     /// the job done and drop its checkpoints, in one transaction. Returns the
     /// new transcript's id.
     ///
-    /// The live version is left exactly as it was. If someone has since made
-    /// another transcript primary by hand, the cleaned one does not take over.
+    /// The live version is left exactly as it was. The cleaned one is made
+    /// primary only if the live one still is (nobody switched by hand) and
+    /// the job finished within [`POST_PASS_WAIT_MS`] of being queued or
+    /// retried: after that, summaries and the GitHub push have used the live
+    /// version, so the cleaned one is stored for the person to switch to.
     ///
     /// # Errors
     ///
@@ -256,7 +262,16 @@ impl Db {
                 |r| r.get(0),
             )
             .optional()?;
-        let take_over = primary == live;
+        // Promote only while summaries and the push still wait for it. After
+        // the fallback they used the live version, so the cleaned one is
+        // stored and offered, not shown under them.
+        let created_at: i64 = tx.query_row(
+            "SELECT created_at_ms FROM post_pass_jobs WHERE meeting_id = ?1",
+            params![meeting_id],
+            |r| r.get(0),
+        )?;
+        let in_time = now_ms() - created_at <= POST_PASS_WAIT_MS;
+        let take_over = primary == live && in_time;
         let id = insert_transcript(&tx, meeting_id, provider, model, take_over)?;
         insert_segments(&tx, &id, segments)?;
         tx.execute(
@@ -271,6 +286,40 @@ impl Db {
         )?;
         tx.commit()?;
         Ok(id)
+    }
+
+    /// Queue a failed job again, from scratch. Returns whether it was failed.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failures.
+    pub fn post_pass_retry(&mut self, meeting_id: &str) -> Result<bool> {
+        let now = now_ms();
+        // A retry starts a new wait: it may still promote if it finishes
+        // within POST_PASS_WAIT_MS of being asked for.
+        let updated = self.conn().execute(
+            "UPDATE post_pass_jobs SET state = 'pending', detail = NULL, progress_permille = 0,
+                    created_at_ms = ?2, updated_at_ms = ?2
+              WHERE meeting_id = ?1 AND state = 'failed'",
+            params![meeting_id, now],
+        )?;
+        Ok(updated == 1)
+    }
+
+    /// Cancel a pending job: it fails with [`CANCELLED`] and the live version
+    /// stays. Returns whether one was pending.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failures.
+    pub fn post_pass_cancel(&mut self, meeting_id: &str) -> Result<bool> {
+        let pending = self
+            .post_pass_job(meeting_id)?
+            .is_some_and(|job| job.state == PostPassState::Pending);
+        if pending {
+            self.post_pass_fail(meeting_id, CANCELLED)?;
+        }
+        Ok(pending)
     }
 
     /// Mark a job failed and drop its checkpoints. The live version stays.
@@ -547,5 +596,59 @@ mod tests {
         assert!(shown < other, "{text}");
         assert!(text.contains("Live (shown above)"), "{text}");
         assert_ne!(cleaned_id, live);
+    }
+
+    #[test]
+    fn a_cleanup_finishing_after_the_fallback_is_stored_but_not_shown() {
+        // Summaries and the push already used the live version: switching
+        // what the meeting shows under them would make them disagree.
+        let (mut db, meeting, live) = db_with_meeting();
+        db.post_pass_queue(&meeting, "{}").unwrap();
+        db.conn()
+            .execute(
+                "UPDATE post_pass_jobs SET created_at_ms = ?1",
+                params![now_ms() - POST_PASS_WAIT_MS - 1_000],
+            )
+            .unwrap();
+        let cleaned = db
+            .post_pass_complete(&meeting, "p", "m", &[seg(0, "clean")], "{}", None)
+            .unwrap();
+        assert_eq!(
+            db.meetings().primary_transcript_id(&meeting).unwrap(),
+            Some(live)
+        );
+        let job = db.post_pass_job(&meeting).unwrap().unwrap();
+        assert_eq!(job.state, PostPassState::Done);
+        assert_eq!(job.cleaned_transcript_id, Some(cleaned));
+    }
+
+    #[test]
+    fn a_failed_job_can_be_retried_and_a_pending_one_cancelled() {
+        let (mut db, meeting, live) = db_with_meeting();
+        db.post_pass_queue(&meeting, "{}").unwrap();
+        db.post_pass_fail(&meeting, "helper crashed").unwrap();
+        assert!(db.post_pass_retry(&meeting).unwrap());
+        let job = db.post_pass_job(&meeting).unwrap().unwrap();
+        assert_eq!((job.state, job.detail), (PostPassState::Pending, None));
+        assert!(
+            !db.post_pass_retry(&meeting).unwrap(),
+            "only a failed job is retried"
+        );
+        db.post_pass_checkpoint(&meeting, "mic", 0, "[]", 10)
+            .unwrap();
+
+        assert!(db.post_pass_cancel(&meeting).unwrap());
+        let job = db.post_pass_job(&meeting).unwrap().unwrap();
+        assert_eq!(job.state, PostPassState::Failed);
+        assert_eq!(job.detail.as_deref(), Some(CANCELLED));
+        assert!(db.post_pass_windows(&meeting, "mic").unwrap().is_empty());
+        assert!(
+            !db.post_pass_cancel(&meeting).unwrap(),
+            "nothing left to cancel"
+        );
+        assert_eq!(
+            db.meetings().primary_transcript_id(&meeting).unwrap(),
+            Some(live)
+        );
     }
 }

@@ -68,7 +68,9 @@ pub use crate::models::{
     Meeting, NewMeeting, NewSegment, NewSummary, NoteAnchor, StoredSegment, Summary,
 };
 pub use crate::notes::{MAX_NOTE_BYTES, NoteDocument};
-pub use crate::post_pass::{POST_PASS_WAIT_MS, PostPassJob, PostPassState};
+pub use crate::post_pass::{
+    CANCELLED as POST_PASS_CANCELLED, POST_PASS_WAIT_MS, PostPassJob, PostPassState,
+};
 pub use crate::repo::MeetingRepo;
 pub use crate::search::{FTS_TABLES, SearchHit, SearchQuery, SearchSource, SearchWeights};
 
