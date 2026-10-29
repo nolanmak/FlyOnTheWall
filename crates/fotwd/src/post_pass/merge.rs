@@ -264,7 +264,7 @@ mod tests {
     fn windows_that_disagree_slightly_on_times_still_join_cleanly() {
         let windows = plan(600_000);
         let speech = straddling_speech(&windows);
-        let jitter = |k: usize| if k % 2 == 0 { 40 } else { -40 };
+        let jitter = |k: usize| if k.is_multiple_of(2) { 40 } else { -40 };
         let merged = merge_windows(&hear(&speech, &windows, str::to_owned, jitter));
         assert_eq!(texts(&merged), texts(&speech));
     }

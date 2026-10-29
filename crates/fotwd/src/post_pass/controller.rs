@@ -274,7 +274,7 @@ mod tests {
         assert_eq!(job.state, PostPassState::Done, "{:?}", job.detail);
         // Two windows of a 40 s track, both heard as speech.
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert_eq!(*done.lock().unwrap(), [id.clone()]);
+        assert_eq!(*done.lock().unwrap(), std::slice::from_ref(&id));
         controller.shutdown();
         worker.await.unwrap();
     }

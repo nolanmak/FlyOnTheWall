@@ -477,7 +477,7 @@ mod tests {
         );
         assert_eq!(
             db.post_pass_pending().unwrap(),
-            [meeting.clone()],
+            std::slice::from_ref(&meeting),
             "but it still resumes"
         );
         db.post_pass_fail(&meeting, "no model").unwrap();
