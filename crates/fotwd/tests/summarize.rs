@@ -731,3 +731,175 @@ async fn a_fresh_library_refuses_an_injected_hosted_engine_before_any_request() 
         assert!(db.meetings().current_summary(&id).unwrap().is_none());
     }
 }
+
+struct ChangeMeetingDuringReply {
+    mock: MockTransport,
+    writer: std::sync::Mutex<Db>,
+    meeting_id: String,
+    field: &'static str,
+}
+impl fotw_summarize::HttpTransport for ChangeMeetingDuringReply {
+    fn post<'a>(
+        &'a self,
+        request: fotw_summarize::HttpRequest,
+    ) -> fotw_summarize::transport::BoxFuture<
+        'a,
+        Result<fotw_summarize::HttpResponse, fotw_summarize::SummarizeError>,
+    > {
+        Box::pin(async move {
+            let response = self.mock.post(request).await?;
+            if self.mock.call_count() == 1 {
+                let db = self.writer.lock().unwrap();
+                let sql = match self.field {
+                    "notes" => "UPDATE notes SET body_md='Current user notes' WHERE meeting_id=?1",
+                    "transcript" => {
+                        "UPDATE segments SET text='Current edited transcript' WHERE meeting_id=?1"
+                    }
+                    _ => {
+                        "UPDATE meetings SET title='User renamed the meeting',lamport=lamport+1 WHERE id=?1"
+                    }
+                };
+                db.conn().execute(sql, [&self.meeting_id]).unwrap();
+            }
+            Ok(response)
+        })
+    }
+}
+fn seed_input_note(db: &Db, meeting_id: &str) {
+    db.conn().execute("INSERT INTO notes(id,meeting_id,body_md,created_at,updated_at,origin_device_id) VALUES('input-fence-note',?1,'Original user notes',0,0,'fixture')",[meeting_id]).unwrap();
+}
+#[tokio::test]
+async fn meeting_edits_during_prose_fence_extraction_and_preserve_old_results() {
+    for field in ["notes", "transcript", "title"] {
+        let dir = tmpdir(&format!("meeting-edit-{field}"));
+        let mut db = db_at(&dir);
+        let id = seeded_meeting(&mut db, &dir);
+        seed_input_note(&db, &id);
+        let old = db
+            .meetings()
+            .insert_summary(
+                &id,
+                fotw_store::NewSummary {
+                    transcript_id: None,
+                    provider: "fixture".into(),
+                    model: "fixture".into(),
+                    prompt_hash: "fixture".into(),
+                    body_md: "Previous valid summary".into(),
+                    coverage: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cost_micros: None,
+                    template_id: None,
+                    origin_device_id: "fixture".into(),
+                },
+            )
+            .unwrap();
+        let response = |text: &str| serde_json::json!({"content":[{"type":"text","text":text}],"usage":{"input_tokens":100,"output_tokens":10},"stop_reason":"end_turn"});
+        let transport=Arc::new(ChangeMeetingDuringReply {
+            mock:MockTransport::new().with_json(response("Numbers were above target.")).with_json(response(r#"{"action_items":[],"decisions":[],"open_questions":[],"follow_ups":[],"topics":[]}"#)),
+            writer:std::sync::Mutex::new(db_at(&dir)),meeting_id:id.clone(),field,
+        });
+        let result = summarize::summarize_meeting_with(
+            &mut db,
+            &anthropic(),
+            &id,
+            &general(),
+            Arc::clone(&transport),
+        )
+        .await;
+        assert!(result.is_err(), "{field}: stale content must be refused");
+        assert_eq!(
+            transport.mock.call_count(),
+            1,
+            "{field}: no extraction after an input edit"
+        );
+        assert_eq!(
+            db.meetings().current_summary(&id).unwrap().unwrap().id,
+            old.id
+        );
+        if field == "notes" {
+            assert_eq!(db.note_document(&id).unwrap().body_md, "Current user notes");
+        }
+        if field == "title" {
+            assert_eq!(
+                db.meetings().get(&id).unwrap().title,
+                "User renamed the meeting"
+            );
+        }
+    }
+}
+#[tokio::test]
+async fn meeting_edits_cancel_an_unresponsive_provider_without_waiting_for_its_deadline() {
+    let dir = tmpdir("waiting-meeting-edit");
+    let mut db = db_at(&dir);
+    let id = seeded_meeting(&mut db, &dir);
+    seed_input_note(&db, &id);
+    let writer = db_at(&dir);
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let transport = Arc::new(NeverReply {
+        entered: tokio::sync::Notify::new(),
+        dropped: Arc::clone(&dropped),
+    });
+    let engine = anthropic();
+    let template = general();
+    let work = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        summarize::summarize_meeting_with(&mut db, &engine, &id, &template, Arc::clone(&transport)),
+    );
+    let change = async {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            transport.entered.notified(),
+        )
+        .await
+        .unwrap();
+        writer
+            .conn()
+            .execute(
+                "UPDATE notes SET body_md='Current user notes' WHERE meeting_id=?1",
+                [&id],
+            )
+            .unwrap();
+    };
+    let (result, ()) = tokio::join!(work, change);
+    assert!(
+        result
+            .expect("content edits must not wait for the provider's deadline")
+            .is_err()
+    );
+    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(db.meetings().current_summary(&id).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_title_reply_after_a_meeting_edit_is_rejected_and_keeps_the_current_title() {
+    for field in ["notes", "transcript", "title"] {
+        let dir = tmpdir(&format!("title-edit-{field}"));
+        let mut db = db_at(&dir);
+        let id = seeded_meeting(&mut db, &dir);
+        seed_input_note(&db, &id);
+        let previous_title = db.meetings().get(&id).unwrap().title;
+        let response = serde_json::json!({"content":[{"type":"text","text":"Generated old title"}],"usage":{"input_tokens":100,"output_tokens":10},"stop_reason":"end_turn"});
+        let transport = Arc::new(ChangeMeetingDuringReply {
+            mock: MockTransport::new().with_json(response),
+            writer: std::sync::Mutex::new(db_at(&dir)),
+            meeting_id: id.clone(),
+            field,
+        });
+        let result =
+            summarize::title_meeting_with(&mut db, &anthropic(), &id, Arc::clone(&transport)).await;
+        assert!(
+            result.is_err(),
+            "{field}: a stale title must not be returned for publication"
+        );
+        assert_eq!(transport.mock.call_count(), 1);
+        assert_eq!(
+            db.meetings().get(&id).unwrap().title,
+            if field == "title" {
+                "User renamed the meeting"
+            } else {
+                &previous_title
+            }
+        );
+    }
+}

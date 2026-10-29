@@ -159,6 +159,7 @@ pub async fn summarize_meeting_with<T>(
 where
     T: fotw_summarize::transport::HttpTransport + 'static,
 {
+    let stamp = PolicyStamp::capture(db, engine, meeting_id)?;
     let Some(transcript_id) = crate::persist::primary_transcript_id(db, meeting_id) else {
         return Err(SummarizeRunError::NoTranscript(meeting_id.to_owned()));
     };
@@ -167,8 +168,6 @@ where
     if segments.is_empty() {
         return Err(SummarizeRunError::NoTranscript(meeting_id.to_owned()));
     }
-    let stamp = PolicyStamp::capture(db, engine)?;
-
     // The user's typed notes, if any. They are a *saliency signal*, not just
     // another input: the prompt contract treats each line as a pointer to
     // expand from the transcript, never as a claim to accept (§8.3).
@@ -449,19 +448,17 @@ pub async fn title_meeting_on(
     db: &mut Db,
     engine: &crate::engine::Engine,
     meeting_id: &str,
-    segments: &[TranscriptSegment],
 ) -> Result<String, SummarizeRunError> {
     let transport = Arc::new(AllowlistedTransport::new());
-    title_meeting_with(db, engine, meeting_id, segments, transport).await
+    title_meeting_with(db, engine, meeting_id, transport).await
 }
 
 /// [`title_meeting_on`] over an injected transport.
 ///
-/// Takes the segments the caller already loaded rather than re-reading them:
-/// the only caller is enrichment, which holds them for `fallback_title`
-/// anyway, and this call deliberately reads a *head* of them rather than the
-/// meeting. It reads the policy revision from the library, but never resolves
-/// the engine again or reads a credential.
+/// Captures policy/input generations before loading the stored transcript.
+/// It reads only a head into the title prompt, but does not trust an earlier
+/// caller-owned copy that could precede a user edit. It never resolves the
+/// engine again or reads a credential.
 ///
 /// One [`LlmAdapter::complete`](fotw_summarize::adapter::LlmAdapter::complete)
 /// against the cheap arm — naming a meeting is the lowest-difficulty task this
@@ -478,12 +475,13 @@ pub async fn title_meeting_with<T>(
     db: &mut Db,
     engine: &crate::engine::Engine,
     meeting_id: &str,
-    segments: &[TranscriptSegment],
     transport: Arc<T>,
 ) -> Result<String, SummarizeRunError>
 where
     T: fotw_summarize::transport::HttpTransport + 'static,
 {
+    let stamp = PolicyStamp::capture(db, engine, meeting_id)?;
+    let segments = stored_segments(db, meeting_id)?;
     if segments.is_empty() {
         return Err(SummarizeRunError::NoTranscript(meeting_id.to_owned()));
     }
@@ -491,7 +489,6 @@ where
         .extraction_model()
         .unwrap_or("claude-haiku-4-5");
     let built = engine_adapters(engine, &transport, model, model, TITLE_DEADLINE);
-    let stamp = PolicyStamp::capture(db, engine)?;
     let borrowed = Mutex::new(db);
     let check = || {
         let db = borrowed.lock().map_err(|_| changed())?;
@@ -499,7 +496,7 @@ where
     };
     let adapter = GuardedAdapter::new(built.prose.as_ref(), &check);
 
-    let document = TranscriptDocument::from_segments(segments);
+    let document = TranscriptDocument::from_segments(&segments);
     let request = title::title_request(&document, title::head_indices(&document), model);
     let response = adapter.complete(&request).await?;
     // SUM-10, and it means something specific here: the cap is 64 output
