@@ -213,6 +213,17 @@ pub async fn enrich_meeting_with(
     receipt.finished_at_ms = 0;
     stamp(db, meeting_id, &receipt, &mut report);
 
+    // Capture before reading any source content. A credential lookup can yield
+    // to another editor even when no hosted engine is eventually configured.
+    let fallback_version = db
+        .setting_version(crate::engine::SETTINGS_KEY)
+        .and_then(|version| version.with_meeting_inputs(db, meeting_id))
+        .map_err(|error| {
+            report.problems.push(format!("title inputs: {error}"));
+            error
+        })
+        .ok();
+
     // No transcript is a normal state — recorded with no provider — and an
     // empty one gets the same treatment.
     let segments = crate::summarize::stored_segments(db, meeting_id).unwrap_or_default();
@@ -265,15 +276,8 @@ pub async fn enrich_meeting_with(
                 // summary-derived title; a separate call is better, because it
                 // lands even when the templates are missing or Call B fails.
                 if replaceable {
-                    title_from_engine(
-                        db,
-                        &engine,
-                        meeting_id,
-                        &segments,
-                        &mut receipt,
-                        &mut report,
-                    )
-                    .await;
+                    title_from_engine(db, &engine, meeting_id, &mut receipt, &mut report, true)
+                        .await;
                 }
                 let outcome = summarize(db, &engine, meeting_id, &mut report).await;
                 if let Err(error) =
@@ -305,8 +309,17 @@ pub async fn enrich_meeting_with(
     // answered with something that is not a title.
     if report.title.is_none() {
         if replaceable {
-            if let Some(fallback) = fallback_title(&segments) {
-                mint(db, meeting_id, &fallback, &mut receipt, &mut report);
+            if let (Some(fallback), Some(version)) =
+                (fallback_title(&segments), fallback_version.as_ref())
+            {
+                mint(
+                    db,
+                    meeting_id,
+                    &fallback,
+                    version,
+                    &mut receipt,
+                    &mut report,
+                );
             }
         } else {
             report.title = Some(current);
@@ -333,18 +346,31 @@ async fn title_from_engine(
     db: &mut Db,
     engine: &Engine,
     meeting_id: &str,
-    segments: &[fotw_stt::TranscriptSegment],
     receipt: &mut EnrichReceipt,
     report: &mut EnrichReport,
+    only_if_replaceable: bool,
 ) {
-    let stamp = match crate::summary_guard::PolicyStamp::capture(db, engine) {
+    let stamp = match crate::summary_guard::PolicyStamp::capture(db, engine, meeting_id) {
         Ok(stamp) => stamp,
         Err(error) => {
             report.problems.push(format!("title: {error}"));
             return;
         }
     };
-    match title_meeting_on(db, engine, meeting_id, segments).await {
+    // Automatic enrichment must not treat a rename during credential
+    // resolution as the old placeholder. Explicit retitle keeps its intent.
+    if only_if_replaceable {
+        let Ok(current) = db.meetings().get(meeting_id).map(|m| m.title) else {
+            return;
+        };
+        if !current.trim().is_empty()
+            && !current.starts_with(FALLBACK_PREFIX)
+            && current != receipt.minted_title
+        {
+            return;
+        }
+    }
+    match title_meeting_on(db, engine, meeting_id).await {
         Ok(named) => match db
             .meetings()
             .set_title_if_setting(meeting_id, &named, stamp.version())
@@ -369,10 +395,14 @@ fn mint(
     db: &mut Db,
     meeting_id: &str,
     title: &str,
+    version: &fotw_store::SettingVersion,
     receipt: &mut EnrichReceipt,
     report: &mut EnrichReport,
 ) {
-    match db.meetings().set_title(meeting_id, title) {
+    match db
+        .meetings()
+        .set_title_if_setting(meeting_id, title, version)
+    {
         Ok(()) => {
             receipt.minted_title = title.to_owned();
             report.title = Some(title.to_owned());
@@ -798,15 +828,7 @@ pub async fn retitle_meetings(db: &mut Db, store: &dyn KeyStore, ids: &[String])
         // library, and the clocks in its stamp are the exporter's grace anchor.
         let mut receipt = read_receipts(db).remove(meeting_id).unwrap_or_default();
         let mut report = EnrichReport::default();
-        title_from_engine(
-            db,
-            &engine,
-            meeting_id,
-            &segments,
-            &mut receipt,
-            &mut report,
-        )
-        .await;
+        title_from_engine(db, &engine, meeting_id, &mut receipt, &mut report, false).await;
         if report.title.is_some() {
             stamp(db, meeting_id, &receipt, &mut report);
         }

@@ -1,4 +1,4 @@
-//! Fence model dispatch, awaited results and publication by settings revision.
+//! Fence dispatch, awaited results and publication by settings/input generations.
 use fotw_store::{Db, SettingVersion};
 use fotw_summarize::transport::BoxFuture;
 use fotw_summarize::{Capabilities, LlmAdapter, LlmRequest, LlmResponse, SummarizeError};
@@ -7,18 +7,26 @@ use crate::engine::{Engine, SETTINGS_KEY, SummarizeSettings};
 use fotw_web::SummaryPolicy;
 
 pub(crate) fn changed() -> SummarizeError {
-    SummarizeError::Transport("Summary settings changed or became unavailable; no result was saved. Retry with the selected destination.".into())
+    SummarizeError::Transport("The meeting content or summary settings changed or became unavailable. That result was not saved. Retry with the current version.".into())
 }
 
 pub(crate) struct PolicyStamp(SettingVersion);
 
 impl PolicyStamp {
-    pub(crate) fn capture(db: &Db, engine: &Engine) -> Result<Self, SummarizeError> {
+    pub(crate) fn capture(
+        db: &Db,
+        engine: &Engine,
+        meeting_id: &str,
+    ) -> Result<Self, SummarizeError> {
         let version = match engine.settings_version() {
             Some(version) => version.clone(),
             None => db.setting_version(SETTINGS_KEY).map_err(|_| changed())?,
         };
-        let stamp = Self(version);
+        let stamp = Self(
+            version
+                .with_meeting_inputs(db, meeting_id)
+                .map_err(|_| changed())?,
+        );
         stamp.check(db)?;
         let settings = SummarizeSettings::from_snapshot(db, stamp.0.value());
         let permitted = match settings.policy {

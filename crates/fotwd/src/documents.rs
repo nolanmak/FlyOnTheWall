@@ -447,8 +447,8 @@ pub async fn prepare_automatic(
     if db.meetings().get(id).map_err(|_| FAILED.to_owned())?.state != "ready" {
         return Ok(());
     }
+    let stamp = PolicyStamp::capture(db, engine, id).map_err(|_| FAILED.to_owned())?;
     let input = prepare(db, id)?;
-    let stamp = PolicyStamp::capture(db, engine).map_err(|_| FAILED.to_owned())?;
     let doc = {
         let borrowed = Mutex::new(&mut *db);
         let check = || {
@@ -598,14 +598,14 @@ impl DocumentControl for Documents {
                         if state.revision != prefs_load.revision {
                             return Err(STALE.to_owned());
                         }
-                        let input = prepare(&mut db, &id_load)?;
                         let engine =
                             crate::engine::resolve_engine(store, &db).ok_or_else(|| {
                                 "Choose a summary engine in Settings before creating a document."
                                     .to_owned()
                             })?;
-                        let stamp =
-                            PolicyStamp::capture(&db, &engine).map_err(|_| FAILED.to_owned())?;
+                        let stamp = PolicyStamp::capture(&db, &engine, &id_load)
+                            .map_err(|_| FAILED.to_owned())?;
+                        let input = prepare(&mut db, &id_load)?;
                         Ok((state, Some((input, engine, stamp))))
                     }
                 }
@@ -1089,5 +1089,145 @@ mod tests {
             doc.excerpts.iter().map(|e| e.index).collect::<Vec<_>>(),
             vec![0, 2, 3]
         );
+    }
+    struct EditingStore {
+        inner: fotw_secrets::InMemoryKeyStore,
+        writer: std::sync::Arc<Mutex<Option<Db>>>,
+        meeting: String,
+        edit_on_resolution: bool,
+    }
+    impl fotw_secrets::KeyStore for EditingStore {
+        fn set(
+            &self,
+            key: fotw_secrets::SecretKey,
+            value: &fotw_secrets::SecretString,
+        ) -> Result<(), fotw_secrets::SecretsError> {
+            self.inner.set(key, value)
+        }
+        fn get(
+            &self,
+            key: fotw_secrets::SecretKey,
+        ) -> Result<fotw_secrets::SecretString, fotw_secrets::SecretsError> {
+            if self.edit_on_resolution {
+                self.writer.lock().unwrap().as_ref().unwrap().conn().execute("UPDATE notes SET body_md='notes-after-resolution-fixture' WHERE meeting_id=?1",[&self.meeting]).unwrap();
+            }
+            self.inner.get(key)
+        }
+        fn delete(&self, key: fotw_secrets::SecretKey) -> Result<(), fotw_secrets::SecretsError> {
+            self.inner.delete(key)
+        }
+        fn contains(
+            &self,
+            key: fotw_secrets::SecretKey,
+        ) -> Result<bool, fotw_secrets::SecretsError> {
+            self.inner.contains(key)
+        }
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn document_input_edits_during_resolution_or_inference_use_current_data_or_preserve_the_draft()
+     {
+        use std::os::unix::fs::PermissionsExt;
+        for at_resolution in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("fixture.sqlite3");
+            let key = fotw_store::DbKey::from_bytes([5; 32]);
+            let mut db = Db::open(&path, &key).unwrap();
+            let id = meeting(&mut db);
+            db.conn().execute("INSERT INTO notes(id,meeting_id,body_md,created_at,updated_at,origin_device_id) VALUES('edit-note',?1,'notes-before-resolution-fixture',0,0,'fixture')",[&id]).unwrap();
+            let answer = json!({"title":"Demo recap","purpose":"Review a demo","audience":"Team","sections":[{"heading":"Discussion","body":"A demo meeting.","kind":"meeting","evidence":[0]}],"end_index":0,"omit_ranges":[],"review_notes":[]});
+            let old = decode(&answer.to_string(), &prepare(&mut db, &id).unwrap()).unwrap();
+            save(&mut db, &id, 0, &old).unwrap();
+            let previous = db.sharing_document(&id).unwrap();
+            let binary = dir.path().join(crate::testing::STUB_ENGINE_NAME);
+            let captured = dir.path().join("captured");
+            let entered = dir.path().join("entered");
+            let release = dir.path().join("release");
+            let quote =
+                |p: &std::path::Path| format!("'{}'", p.to_string_lossy().replace('\'', "'\\''"));
+            let envelope = json!({"is_error":false,"result":answer.to_string()})
+                .to_string()
+                .replace('\'', "'\\''");
+            let barrier = if at_resolution {
+                String::new()
+            } else {
+                format!(
+                    ": > {}\nwhile [ ! -e {} ]; do /bin/sleep 0.01; done\n",
+                    quote(&entered),
+                    quote(&release)
+                )
+            };
+            std::fs::write(
+                &binary,
+                format!(
+                    "#!/bin/sh\ncat > {}\n{barrier}printf '%s\\n' '{envelope}'\n",
+                    quote(&captured)
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // Model an explicitly configured legacy CLI library: looking for
+            // its missing mock API key exercises the credential-lookup gap.
+            db.put_setting("summarize",&json!({"cli_enabled":true,"acknowledged_egress":true,"binary":binary.to_string_lossy()}).to_string()).unwrap();
+            let writer = std::sync::Arc::new(Mutex::new(Some(Db::open(&path, &key).unwrap())));
+            let store = Box::leak(Box::new(EditingStore {
+                inner: fotw_secrets::InMemoryKeyStore::new(),
+                writer: writer.clone(),
+                meeting: id.clone(),
+                edit_on_resolution: at_resolution,
+            }));
+            let controller = Documents::new(db, store);
+            let request = DocumentRequest {
+                action: DocumentAction::Generate,
+                revision: 1,
+                ..Default::default()
+            };
+            if at_resolution {
+                let result = controller.run(id.clone(), request).await.unwrap();
+                assert_eq!(result.revision, 2);
+                let request = std::fs::read_to_string(&captured).unwrap();
+                assert!(request.contains("notes-after-resolution-fixture"));
+                assert!(!request.contains("notes-before-resolution-fixture"));
+            } else {
+                let change = async {
+                    let until = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+                    while !entered.exists() {
+                        assert!(
+                            tokio::time::Instant::now() < until,
+                            "owned document CLI did not start"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    }
+                    writer.lock().unwrap().as_ref().unwrap().conn().execute("UPDATE notes SET body_md='notes-after-resolution-fixture' WHERE meeting_id=?1",[&id]).unwrap();
+                    std::fs::write(&release, "").unwrap();
+                };
+                let (result, ()) = tokio::join!(controller.run(id.clone(), request), change);
+                assert!(result.is_err());
+                assert_eq!(
+                    writer
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .sharing_document(&id)
+                        .unwrap(),
+                    previous
+                );
+            }
+            assert_eq!(
+                writer
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .note_document(&id)
+                    .unwrap()
+                    .body_md,
+                "notes-after-resolution-fixture"
+            );
+            // The application keystore is process-lived; the owned test DB
+            // connection is not. Release it before its temporary root drops.
+            writer.lock().unwrap().take();
+        }
     }
 }

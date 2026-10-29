@@ -50,7 +50,7 @@ impl Db {
             .conn_mut()
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if let Some(version) = version {
-            version.ensure_current(&tx)?;
+            version.ensure_for_meeting(&tx, meeting_id)?;
         }
         let current: i64 = tx.query_row(
             "SELECT COALESCE(MAX(version),0) FROM meeting_documents WHERE meeting_id=?1",
