@@ -261,7 +261,7 @@ fn estimate_times(text: &str, pcm: &[i16]) -> Vec<TimedWord> {
         .enumerate()
         .map(|(i, w)| {
             let start = from + step * i as u64;
-            TimedWord::new(*w, start, start + step)
+            TimedWord::estimated(*w, start, start + step)
         })
         .collect()
 }
