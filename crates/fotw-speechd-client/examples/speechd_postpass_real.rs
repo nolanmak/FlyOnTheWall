@@ -266,11 +266,19 @@ async fn main() {
     let clip_ms = (clip.len() * 1000 / RATE) as u64;
     let plain = transcribe(&client, clip, false).await;
     let timed = transcribe(&client, clip, true).await;
-    let words: Vec<&str> = timed
+    // Every timed segment must carry exactly one word, and together they must
+    // be the text's words, in order: no segment without text, none holding
+    // several words.
+    let words: Option<Vec<&str>> = timed
         .segments
         .iter()
-        .filter_map(|s| s.text.as_deref())
+        .map(|s| {
+            s.text
+                .as_deref()
+                .filter(|t| !t.is_empty() && !t.contains(char::is_whitespace))
+        })
         .collect();
+    let text_words: Vec<&str> = timed.text.split_whitespace().collect();
     gates.push((
         "plain final unchanged: no segments".into(),
         plain.segments.is_empty(),
@@ -278,10 +286,12 @@ async fn main() {
     ));
     gates.push((
         "timed text equals the plain text, one segment per word".into(),
-        !words.is_empty()
-            && timed.text == plain.text
-            && words.join(" ") == timed.text.split_whitespace().collect::<Vec<_>>().join(" "),
-        format!("{} words", words.len()),
+        !text_words.is_empty() && timed.text == plain.text && words.as_ref() == Some(&text_words),
+        format!(
+            "{} segments for {} words",
+            timed.segments.len(),
+            text_words.len()
+        ),
     ));
     gates.push((
         "word times ordered and inside the clip".into(),
