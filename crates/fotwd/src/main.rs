@@ -41,6 +41,13 @@ use fotwd::secrets;
 use fotwd::session::{self, Transcription};
 
 fn main() -> ExitCode {
+    #[cfg(target_os = "macos")]
+    if let Some(result) = fotwd::local_summary::run_worker_if_requested() {
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let terminal = std::io::IsTerminal::is_terminal(&std::io::stdin());
     if fotwd::native_launch::should_launch(
@@ -91,6 +98,72 @@ fn main() -> ExitCode {
 
 async fn run_cli(args: Vec<String>) -> ExitCode {
     match args.first().map(String::as_str) {
+        #[cfg(all(target_os = "macos", feature = "test-guards"))]
+        Some("--test-local-summary-parent") => {
+            // Owned integration fixture only: never open a meeting library or
+            // resolve a real summary provider. The fake native has its own
+            // bounded lifetime even when this parent is deliberately killed.
+            let result = async {
+                let config = args.get(1).ok_or("fixture configuration missing")?;
+                let ready = args.get(2).ok_or("fixture readiness path missing")?;
+                let config: fotwd::local_summary::RuntimeConfig = serde_json::from_slice(
+                    &std::fs::read(config).map_err(|_| "fixture read failed")?,
+                )
+                .map_err(|_| "fixture configuration invalid")?;
+                let adapter = fotwd::local_summary::LocalAdapter::launch(config).await?;
+                std::fs::write(ready, "ready").map_err(|_| "fixture readiness failed")?;
+                if args.get(3).is_some_and(|value| value == "--crash-owner") {
+                    use fotw_summarize::LlmAdapter;
+                    let crash = PathBuf::from(args.get(4).ok_or("fixture crash gate missing")?);
+                    let followup =
+                        PathBuf::from(args.get(5).ok_or("fixture followup gate missing")?);
+                    let until = tokio::time::Instant::now() + Duration::from_secs(15);
+                    while !crash.exists() {
+                        if tokio::time::Instant::now() >= until {
+                            return Err("fixture crash gate timed out".into());
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    adapter.crash_owner_for_testing().await?;
+                    // The driver observes native exit before permitting any
+                    // subsequent call. A call cannot be its cleanup trigger.
+                    while !followup.exists() {
+                        if tokio::time::Instant::now() >= until {
+                            return Err("fixture followup gate timed out".into());
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    let request = fotw_summarize::LlmRequest {
+                        model: adapter.model_id().into(),
+                        system: "synthetic".into(),
+                        document: None,
+                        user_notes: None,
+                        instruction: "synthetic".into(),
+                        citations: false,
+                        output_format: None,
+                        effort: None,
+                        max_output_tokens: 128,
+                    };
+                    match adapter.complete(&request).await {
+                        Err(fotw_summarize::SummarizeError::Transport(message))
+                            if message.contains("local runtime stopped")
+                                || message.contains("local runtime exited") => {}
+                        _ => return Err("fixture call was not fenced after owner exit".into()),
+                    }
+                    return adapter.shutdown().await;
+                }
+                std::future::pending::<()>().await;
+                adapter.shutdown().await
+            }
+            .await;
+            match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("local summary fixture: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some("shell") => {
             eprintln!("fotwd: the native shell requires macOS");
             ExitCode::FAILURE

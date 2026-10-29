@@ -129,6 +129,19 @@ shapes, including omitted nullable fields. Unknown schema dialects are refused
 before IPC. Evidence validation and model-quality qualification remain separate
 gates; a syntactically valid extraction can still contain unsupported claims.
 
+The app and smoke binary dispatch private worker modes before normal startup.
+Other binaries embedding `LocalAdapter` must call
+`local_summary::run_worker_if_requested` at entry and return its worker result
+before starting app services. A guardian observes app exit, and the app observes
+guardian/native exit. Native execution waits until its original PID is registered
+for kernel exit events. All workers inherit the same network sandbox. Retain and
+await `shutdown` to confirm native exit and guardian reaping; requesting Stop is
+separate from confirming resource release.
+
+The app-wide lease/queue, capture priority, idle unload and crash-staging recovery
+remain acceptance work in #237. Forced app exit can leave public runtime staging
+copies in its private temporary directory; no meeting text is written there.
+
 For a split GGUF, set `model` to its first shard and `model_shards` to the
 remaining pinned artifacts. Each shard keeps its verified read-only descriptor
 and original filename in a private binding directory; cache pathname changes

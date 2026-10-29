@@ -71,6 +71,13 @@ impl LocalAdapter {
         self.process.shutdown().await
     }
 
+    /// Fault injection for isolated process fixtures, excluded from shipped builds.
+    #[cfg(feature = "test-guards")]
+    #[doc(hidden)]
+    pub async fn crash_owner_for_testing(&self) -> Result<(), String> {
+        self.process.crash_owner_for_testing().await
+    }
+
     async fn generate(&self, request: &LlmRequest) -> Result<LlmResponse, SummarizeError> {
         request.validate(&self.capabilities())?;
         // Only the application's frozen extraction vocabulary is supported.
