@@ -643,9 +643,15 @@ fn confirmed_cloud_sources_need_no_local_plan_or_model_to_finalize_projection() 
         );
     }
 }
-struct SlowFactory;
-struct SlowModel;
-impl RecognizerFactory for SlowFactory {
+struct ProgressClockFactory {
+    clock: Arc<std::sync::atomic::AtomicU64>,
+    gate: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+}
+struct ProgressClockModel {
+    clock: Arc<std::sync::atomic::AtomicU64>,
+    gate: Option<Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>>,
+}
+impl RecognizerFactory for ProgressClockFactory {
     fn model(&self) -> &str {
         "fixture-local"
     }
@@ -653,12 +659,25 @@ impl RecognizerFactory for SlowFactory {
         Some("en")
     }
     fn create(&self) -> Result<Box<dyn Recognizer>, SttError> {
-        Ok(Box::new(SlowModel))
+        Ok(Box::new(ProgressClockModel {
+            clock: self.clock.clone(),
+            gate: Some(self.gate.clone()),
+        }))
     }
 }
-impl Recognizer for SlowModel {
+impl Recognizer for ProgressClockModel {
     fn transcribe(&mut self, pcm: &[f32]) -> Result<Vec<Recognized>, SttError> {
-        std::thread::sleep(Duration::from_millis(100));
+        // Wait until the controller enters Transcribing so the simulated job
+        // cannot finish before its progress deadline has actually started.
+        if let Some(gate) = self.gate.take() {
+            gate.lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+        }
+        // Advance only simulated inference time. Host scheduling and fsync
+        // latency must not consume this fixture's artificial 500 ms budget.
+        self.clock.fetch_add(100, Ordering::AcqRel);
         Model.transcribe(pcm)
     }
 }
@@ -668,23 +687,41 @@ fn healthy_long_recovery_outlives_one_stall_budget_while_durable_progress_contin
         .map(|n| if (n / 3200) % 2 == 0 { 1000 } else { 8000 })
         .collect();
     let f = fixture_audio(pcm, "fixture-local", "fixture-revision");
+    let clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (release, gate) = std::sync::mpsc::channel();
+    let factory = Arc::new(ProgressClockFactory {
+        clock: clock.clone(),
+        gate: Arc::new(std::sync::Mutex::new(gate)),
+    });
+    let observed_clock = clock.clone();
     let c = SavedSpeechRecovery::with_parts(
         Db::open(&f.database, &f.key).unwrap(),
         f.root.path().to_owned(),
-        Arc::new(|_, _| Ok(Arc::new(SlowFactory))),
+        Arc::new(move |_, _| Ok(factory.clone())),
         Duration::from_secs(5),
         Duration::from_millis(500),
-    );
-    let began = Instant::now();
+    )
+    .with_clock(Arc::new(move || {
+        Duration::from_millis(observed_clock.load(Ordering::Acquire))
+    }));
     c.retry(&f.meeting).unwrap();
+    let until = Instant::now() + Duration::from_secs(10);
+    while c.read(&f.meeting).unwrap().phase != RecoveryPhase::Transcribing {
+        assert!(Instant::now() < until, "fixture did not enter Transcribing");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    release.send(()).unwrap();
     let status = finished(&c, &f.meeting);
-    assert!(began.elapsed() > Duration::from_millis(500));
     assert_eq!(
         status.phase,
         RecoveryPhase::Complete,
         "healthy long recordings must not expire on a total-time cap: {status:?}"
     );
     assert_eq!(status.sources[0].pending_audio_ms, 0);
+    assert!(
+        clock.load(Ordering::Acquire) > 500,
+        "the entire job must outlive one progress deadline in simulated time"
+    );
 }
 
 fn startup_finished(pass: &fotwd::speech_recovery::StartupRecovery) {
