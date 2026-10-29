@@ -155,7 +155,12 @@ empty. `parakeet-unified` builds the words from FluidAudio's
 `transcribeWithTimings` token timings: a SentencePiece piece that starts with
 a space or `▁` starts a word, the others continue it, and a word runs from its
 first piece's start to its last piece's end. These are emission times, so a
-word's start can sit slightly after its true onset.
+word's start can sit slightly after its true onset. `speaker_threshold`
+(diarization, #246) is the cosine distance under which a window's voice joins
+a speaker the stream already knows; a smaller value separates similar voices
+more readily. Absent, `diarizer` uses FluidAudio's default (0.84, 1.2 × its
+0.7 clustering threshold); outside (0, 2) the stream is refused with
+`bad_request`. The fakes ignore it.
 
 `utterance` numbers a streaming engine's utterances from 1 within a stream. A
 later `partial` with the same `utterance` replaces the earlier one in place,

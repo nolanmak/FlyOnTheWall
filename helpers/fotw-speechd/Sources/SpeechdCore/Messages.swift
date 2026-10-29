@@ -7,10 +7,15 @@ public struct StreamOptions: Decodable, Sendable, Equatable {
     public var language: String?
     /// Batch recognizers: per-word `final` segments (#246).
     public var timings: Bool?
-    public init(probabilities: Bool? = nil, language: String? = nil, timings: Bool? = nil) {
+    /// Diarization: the cosine distance under which a window's voice joins
+    /// a known speaker of the stream (#246). Absent, the engine's default.
+    public var speakerThreshold: Float?
+    public init(probabilities: Bool? = nil, language: String? = nil, timings: Bool? = nil,
+                speakerThreshold: Float? = nil) {
         self.probabilities = probabilities
         self.language = language
         self.timings = timings
+        self.speakerThreshold = speakerThreshold
     }
 }
 

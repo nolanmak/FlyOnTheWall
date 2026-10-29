@@ -770,7 +770,8 @@ fn upgrading_an_existing_missing_policy_library_keeps_its_hosted_configuration()
         let db = fotwd::open_library_with(&f.root, &f.store, &mut Scripted::new(), KDF_FOR_TESTS)
             .unwrap();
         // Recreate the released v8 shape in this owned encrypted fixture:
-        // v9 adds bootstrap rows; v10 adds derived input-generation triggers.
+        // v9 adds bootstrap rows; v10 adds derived input-generation triggers;
+        // v11 adds the empty post-meeting cleanup tables.
         let triggers = {
             let mut query=db.conn().prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND name GLOB 'summary_input_*'").unwrap();
             query
@@ -790,7 +791,7 @@ fn upgrading_an_existing_missing_policy_library_keeps_its_hosted_configuration()
                 [],
             )
             .unwrap();
-        db.conn().execute_batch("DELETE FROM settings WHERE key='summarize'; DELETE FROM app_meta WHERE key='summary_destination_bootstrap'; PRAGMA user_version=8;").unwrap();
+        db.conn().execute_batch("DELETE FROM settings WHERE key='summarize'; DELETE FROM app_meta WHERE key='summary_destination_bootstrap'; DROP TABLE post_pass_windows; DROP TABLE post_pass_jobs; PRAGMA user_version=8;").unwrap();
     }
     let db =
         fotwd::open_library_with(&f.root, &f.store, &mut Scripted::new(), KDF_FOR_TESTS).unwrap();

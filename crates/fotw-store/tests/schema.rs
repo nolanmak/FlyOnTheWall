@@ -44,6 +44,8 @@ const EXPECTED_TABLES: &[&str] = &[
     "note_anchors",
     "notes",
     "people",
+    "post_pass_jobs",
+    "post_pass_windows",
     "recordings",
     "segments",
     "session_note_links",

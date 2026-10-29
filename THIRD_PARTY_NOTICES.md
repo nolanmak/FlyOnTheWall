@@ -373,7 +373,14 @@ local model (`crates/fotw-stt/src/vad.rs`, from
 `native/MuesliNative/Sources/MuesliNativeApp/TranscriptionRuntime.swift`) and
 the transcript artifact cleanup (`crates/fotw-stt/src/cleanup.rs`, from
 `TranscriptionEngineArtifactsFilter.swift` and
-`native/MuesliNative/Sources/MuesliCore/InsightsWordAnalyzer.swift`). Each
+`native/MuesliNative/Sources/MuesliCore/InsightsWordAnalyzer.swift`). The
+post-meeting cleanup in fotwd (#246) is translated from it too: the
+boundary-only window merge (`crates/fotwd/src/post_pass/merge.rs`, from
+`MeetingRecordingTranscriber.swift`'s `removingOverlap`), the bounded window
+reader (`crates/fotwd/src/post_pass/windows.rs`, from its
+`RecordingAudioWindowReader`) and the turn builder
+(`crates/fotwd/src/post_pass/turns.rs`, from `MicTurnNormalizer.swift`,
+`SystemTurnNormalizer.swift` and `TranscriptReconciler.swift`). Each
 ported file names its source in its header. Muesli is licensed as follows:
 
 ````text

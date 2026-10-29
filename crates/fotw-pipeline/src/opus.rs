@@ -831,3 +831,171 @@ pub fn decode_ogg_opus<R: Read + Seek>(rdr: R, out_rate: u32) -> Result<DecodedO
         truncated,
     })
 }
+
+/// An Ogg Opus track decoded a packet at a time, so reading an hour of it
+/// holds one bounded window rather than the whole recording (#246).
+///
+/// It yields exactly the samples [`decode_ogg_opus`] returns for the same
+/// file: the pre-skip is dropped from the front and the end is trimmed to the
+/// final granule position, which [`OpusStreamReader::open`] finds by reading
+/// the pages once before decoding. A torn final page ends the stream where
+/// the whole-file decoder stops.
+pub struct OpusStreamReader<R: Read + Seek> {
+    reader: PacketReader<R>,
+    dec: DecoderHandle,
+    frame: Vec<f32>,
+    max_frame: usize,
+    skip: usize,
+    limit: Option<u64>,
+    produced: u64,
+    pending: std::collections::VecDeque<f32>,
+    ended: bool,
+}
+
+impl OpusStreamReader<File> {
+    /// Open a track at `path`, decoding to `out_rate`.
+    ///
+    /// # Errors
+    ///
+    /// As [`decode_ogg_opus_file`].
+    pub fn open(path: impl AsRef<Path>, out_rate: u32) -> Result<Self, OpusError> {
+        let path = path.as_ref();
+        let last_granule = final_granule(File::open(path)?)?;
+        Self::new(File::open(path)?, out_rate, last_granule)
+    }
+}
+
+/// The last granule position before the stream ends or tears.
+fn final_granule<R: Read + Seek>(rdr: R) -> Result<u64, OpusError> {
+    let mut reader = PacketReader::new(rdr);
+    let mut last = 0u64;
+    loop {
+        match reader.read_packet() {
+            Ok(Some(p)) => {
+                if p.absgp_page() != u64::MAX {
+                    last = last.max(p.absgp_page());
+                }
+            }
+            Ok(None) | Err(_) => return Ok(last),
+        }
+    }
+}
+
+impl<R: Read + Seek> OpusStreamReader<R> {
+    fn new(rdr: R, out_rate: u32, last_granule: u64) -> Result<Self, OpusError> {
+        if !SUPPORTED_RATES.contains(&out_rate) {
+            return Err(OpusError::UnsupportedRate(out_rate));
+        }
+        let mut reader = PacketReader::new(rdr);
+        let head = reader
+            .read_packet()
+            .map_err(|e| OpusError::Container(e.to_string()))?
+            .ok_or_else(|| OpusError::Container("empty stream".into()))?;
+        if head.data.len() < 19 || &head.data[..8] != b"OpusHead" {
+            return Err(OpusError::Container("first packet is not OpusHead".into()));
+        }
+        let channels = u16::from(head.data[9]);
+        let pre_skip = u16::from_le_bytes([head.data[10], head.data[11]]);
+        if channels != 1 {
+            return Err(OpusError::UnsupportedChannels(channels));
+        }
+        let tags = reader
+            .read_packet()
+            .map_err(|e| OpusError::Container(e.to_string()))?
+            .ok_or_else(|| OpusError::Container("stream ended before OpusTags".into()))?;
+        if tags.data.len() < 8 || &tags.data[..8] != b"OpusTags" {
+            return Err(OpusError::Container("second packet is not OpusTags".into()));
+        }
+        let mut err: c_int = 0;
+        // SAFETY: as in `decode_ogg_opus`.
+        let raw = unsafe { sys::opus_decoder_create(out_rate as sys::opus_int32, 1, &mut err) };
+        check("opus_decoder_create", err)?;
+        if raw.is_null() {
+            return Err(OpusError::Codec {
+                op: "opus_decoder_create",
+                code: sys::OPUS_ALLOC_FAIL,
+                msg: "returned null".into(),
+            });
+        }
+        let max_frame = out_rate as usize / 1_000 * MAX_FRAME_MS;
+        let rate = u64::from(out_rate);
+        // The same trim `decode_ogg_opus` applies, decided before decoding.
+        let limit = (last_granule >= u64::from(pre_skip))
+            .then(|| (last_granule - u64::from(pre_skip)) * rate / GRANULE_RATE);
+        Ok(Self {
+            reader,
+            dec: DecoderHandle(raw),
+            frame: vec![0f32; max_frame],
+            max_frame,
+            skip: usize::from(pre_skip) * out_rate as usize / GRANULE_RATE as usize,
+            limit,
+            produced: 0,
+            pending: std::collections::VecDeque::new(),
+            ended: false,
+        })
+    }
+
+    /// Samples the track holds once trimmed, when its end is known.
+    #[must_use]
+    pub fn total_samples(&self) -> Option<u64> {
+        self.limit
+    }
+
+    /// Append up to `max` more samples to `out`; returns how many. `0` means
+    /// the track has ended.
+    ///
+    /// # Errors
+    ///
+    /// When libopus refuses a packet.
+    pub fn read_into(&mut self, out: &mut Vec<f32>, max: usize) -> Result<usize, OpusError> {
+        let mut n = 0;
+        while n < max {
+            if self.limit.is_some_and(|limit| self.produced >= limit) {
+                break;
+            }
+            if let Some(sample) = self.pending.pop_front() {
+                out.push(sample);
+                n += 1;
+                self.produced += 1;
+                continue;
+            }
+            if self.ended || !self.decode_packet()? {
+                self.ended = true;
+                break;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Decode one packet into `pending`; false at the end of the stream.
+    fn decode_packet(&mut self) -> Result<bool, OpusError> {
+        let packet = match self.reader.read_packet() {
+            Ok(Some(p)) => p,
+            // A torn final page ends the track, as in `decode_ogg_opus`.
+            Ok(None) | Err(_) => return Ok(false),
+        };
+        // SAFETY: as in `decode_ogg_opus`.
+        let n = unsafe {
+            sys::opus_decode_float(
+                self.dec.0,
+                packet.data.as_ptr(),
+                packet.data.len() as sys::opus_int32,
+                self.frame.as_mut_ptr(),
+                self.max_frame as c_int,
+                0,
+            )
+        };
+        if n < 0 {
+            return Err(OpusError::Codec {
+                op: "opus_decode_float",
+                code: n,
+                msg: strerror(n),
+            });
+        }
+        let decoded = &self.frame[..n as usize];
+        let skipped = self.skip.min(decoded.len());
+        self.skip -= skipped;
+        self.pending.extend(&decoded[skipped..]);
+        Ok(true)
+    }
+}

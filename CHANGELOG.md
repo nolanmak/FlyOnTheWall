@@ -96,6 +96,21 @@ Windows, but neither captures anything.
   560 ms variant for partials and its 1120 ms variant for the final, and the
   model-free `fake-dictation` engine for tests. `speechd_dictation` replays
   the corpus through it in real time.
+- Post-meeting transcript cleanup (#246). After Stop, a meeting no cloud
+  provider transcribed is transcribed again from its saved audio: Silero VAD,
+  Parakeet Unified in 30 s windows with 2 s of overlap and word timings, a
+  boundary-only window merge, and speaker labels for the system track from the
+  `diarizer` (license unconfirmed, #277). The result is a new transcript
+  version shown in place of the live one, which is kept; summaries and the
+  GitHub push wait for it up to 15 minutes. A failed cleanup retries after
+  30 s, 2 min and 10 min. Measured on AMI it is not yet better than live on
+  every meeting (TS3003c: 17.3% against 11.8% WER); see
+  [docs/POST_MEETING_CLEANUP.md](docs/POST_MEETING_CLEANUP.md).
+- **Library schema 11** adds the cleanup's job and checkpoint tables. A build
+  from before it refuses to open the upgraded library; to go back, restore
+  the encrypted `backups/pre-migration-10-*.db` taken automatically before the
+  upgrade (meetings recorded since are not in it) or import a library archive
+  made before upgrading.
 
 #### Library and keys
 
