@@ -71,14 +71,7 @@ impl HelperEngine {
                 fotw_stt::speechd::install_hint(PARAKEET.id)
             ));
         }
-        let vad = crate::stt::verify_vad_model(data_root)?;
-        let detector = tokio::task::spawn_blocking(move || {
-            fotw_stt::whisper::SileroDetector::load(&vad)
-                .map(|d| Box::new(d) as Box<dyn SpeechDetector>)
-                .map_err(|e| e.message)
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+        let detector = load_detector(data_root).await?;
         let client = crate::speechd::helper(data_root).await?;
         client
             .load(PARAKEET.id)
@@ -103,6 +96,13 @@ impl HelperEngine {
             request_timings: true,
             estimated: Default::default(),
         })
+    }
+
+    /// The speech helper and its models are macOS-only; elsewhere the
+    /// cleanup is refused before anything starts.
+    #[cfg(not(target_os = "macos"))]
+    fn unsupported() -> String {
+        "The transcript cleanup runs only on macOS.".into()
     }
 
     /// Diarize with this speaker threshold instead (evaluation).
@@ -221,6 +221,24 @@ impl PassEngine for HelperEngine {
             )],
         }
     }
+}
+
+/// The pinned Silero detector live local transcription uses.
+#[cfg(target_os = "macos")]
+async fn load_detector(data_root: &Path) -> Result<Box<dyn SpeechDetector>, String> {
+    let vad = crate::stt::verify_vad_model(data_root)?;
+    tokio::task::spawn_blocking(move || {
+        fotw_stt::whisper::SileroDetector::load(&vad)
+            .map(|d| Box::new(d) as Box<dyn SpeechDetector>)
+            .map_err(|e| e.message)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn load_detector(_data_root: &Path) -> Result<Box<dyn SpeechDetector>, String> {
+    Err(HelperEngine::unsupported())
 }
 
 /// `text`'s words spread evenly over the audible part of `pcm` (the job has
