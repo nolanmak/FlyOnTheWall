@@ -538,6 +538,40 @@ mod tests {
         let _ = done;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cleanup_waits_while_the_recorder_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = library(dir.path());
+        let id = meeting(dir.path(), &open);
+        let engine = Arc::new(FakeEngine::default());
+        let started = Arc::clone(&engine.started);
+        let factory: EngineFactory = Arc::new(move || {
+            let engine = Arc::clone(&engine) as Arc<dyn PassEngine>;
+            Box::pin(async move { Ok(engine) })
+        });
+        let (controller, _) = controller(dir.path(), &open, factory);
+        // A stand-in for the recorder: capturing until told otherwise.
+        let recording = Arc::new(AtomicBool::new(true));
+        let busy = Arc::clone(&recording);
+        controller.set_busy(Box::new(move || busy.load(Ordering::SeqCst)));
+        let worker = controller.start();
+        controller.after_stop(&id);
+        assert!(!controller.wait(&id, Duration::from_millis(1_500)).await);
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            0,
+            "no window while recording"
+        );
+        recording.store(false, Ordering::SeqCst);
+        assert!(controller.wait(&id, Duration::from_secs(30)).await);
+        assert_eq!(
+            open().unwrap().post_pass_job(&id).unwrap().unwrap().state,
+            PostPassState::Done
+        );
+        controller.shutdown();
+        worker.await.unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_waiting_tail_opens_the_library_rarely() {
         let dir = tempfile::tempdir().unwrap();

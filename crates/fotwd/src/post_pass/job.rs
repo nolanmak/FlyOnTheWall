@@ -340,6 +340,7 @@ enum Diarized {
 /// The system channel's speakers. A diarizer that is missing or fails
 /// leaves the cleaned version without remote labels rather than failing it
 /// (Muesli's `RecordedTranscriptDiarization.apply`).
+#[allow(clippy::too_many_arguments)] // the run's own inputs, passed through
 async fn diarize(
     db: &Mutex<Db>,
     meeting_id: &str,
