@@ -6,6 +6,8 @@
 
 #[cfg(target_os = "macos")]
 mod adapter;
+#[cfg(target_os = "macos")]
+mod extraction_schema;
 #[cfg(any(target_os = "macos", test))]
 mod ipc;
 #[cfg(target_os = "macos")]

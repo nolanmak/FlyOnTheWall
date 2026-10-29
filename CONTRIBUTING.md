@@ -113,6 +113,22 @@ answer, and confirms owned-process exit. It tests real inference, not model
 quality or hardware-tier qualification. Context and deadlines are explicit
 configuration values; larger Macs are not limited to a small-model tier.
 
+Add `--extraction` to exercise the application's extraction schema with a
+synthetic no-action meeting:
+
+```sh
+cargo run -p fotwd --example local_summary_smoke -- /path/to/config.json --extraction
+```
+
+The owned adapter includes field definitions in the rendered prompt and sends
+the pinned runtime's native `json_schema` sampling constraint
+([protocol reference](https://github.com/ggml-org/llama.cpp/blob/8ca4060b7e30e76baaa5670ee1ec1b760b7f8552/tools/server/README.md)).
+Only the built-in extraction shape is supported. The client independently
+rejects missing/unknown fields, wrong types and invalid enums/source-index
+shapes, including omitted nullable fields. Unknown schema dialects are refused
+before IPC. Evidence validation and model-quality qualification remain separate
+gates; a syntactically valid extraction can still contain unsupported claims.
+
 For a split GGUF, set `model` to its first shard and `model_shards` to the
 remaining pinned artifacts. Each shard keeps its verified read-only descriptor
 and original filename in a private binding directory; cache pathname changes
