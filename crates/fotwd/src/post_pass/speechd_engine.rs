@@ -49,6 +49,11 @@ pub struct HelperEngine {
     detector: Arc<Mutex<Box<dyn SpeechDetector>>>,
     diarizer: bool,
     speaker_threshold: Option<f32>,
+    /// Ask Parakeet for word timings (always, outside tests).
+    request_timings: bool,
+    /// Windows whose word times were estimated, because the helper returned
+    /// text without them.
+    estimated: std::sync::atomic::AtomicUsize,
 }
 
 impl HelperEngine {
@@ -95,6 +100,8 @@ impl HelperEngine {
             detector: Arc::new(Mutex::new(detector)),
             diarizer,
             speaker_threshold: SPEAKER_THRESHOLD,
+            request_timings: true,
+            estimated: Default::default(),
         })
     }
 
@@ -140,7 +147,7 @@ impl PassEngine for HelperEngine {
         Box::pin(async move {
             let config = StreamConfig {
                 options: StreamOptions {
-                    timings: true,
+                    timings: self.request_timings,
                     ..StreamOptions::default()
                 },
                 ..StreamConfig::new(self.asr, RATE)
@@ -157,9 +164,12 @@ impl PassEngine for HelperEngine {
                 match event {
                     StreamEvent::Final(result) => {
                         if result.segments.is_empty() && !result.text.trim().is_empty() {
-                            return Err(
-                                "the speech helper returned no word timings; update it".into()
-                            );
+                            // A helper without word timings: keep its words,
+                            // with times spread over the window's speech.
+                            self.estimated
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            words = Some(estimate_times(&result.text, pcm));
+                            continue;
                         }
                         words = Some(
                             result
@@ -207,6 +217,40 @@ impl PassEngine for HelperEngine {
     fn provenance(&self) -> serde_json::Value {
         provenance()
     }
+
+    fn notes(&self) -> Vec<String> {
+        match self.estimated.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => Vec::new(),
+            n => vec![format!(
+                "the speech helper reported no word times for {n} window(s); their times were estimated"
+            )],
+        }
+    }
+}
+
+/// `text`'s words spread evenly over the audible part of `pcm` (the job has
+/// silenced everything outside speech), for a helper without word timings.
+fn estimate_times(text: &str, pcm: &[i16]) -> Vec<TimedWord> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let first = pcm.iter().position(|&x| x != 0).unwrap_or(0) as u64;
+    let last = pcm
+        .iter()
+        .rposition(|&x| x != 0)
+        .map_or(pcm.len(), |i| i + 1) as u64;
+    let (from, to) = (
+        first * 1_000 / u64::from(RATE),
+        last * 1_000 / u64::from(RATE),
+    );
+    let n = words.len().max(1) as u64;
+    let step = to.saturating_sub(from) / n;
+    words
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            let start = from + step * i as u64;
+            TimedWord::new(*w, start, start + step)
+        })
+        .collect()
 }
 
 /// One channel streamed to the helper's diarizer, paced by its per-window
@@ -297,6 +341,8 @@ mod tests {
             detector: Arc::new(Mutex::new(Box::new(Silent))),
             diarizer: true,
             speaker_threshold: None,
+            request_timings: true,
+            estimated: Default::default(),
         }
     }
 
@@ -316,6 +362,24 @@ mod tests {
             ]
         );
         assert!(engine.speech(&pcm).await.unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_helper_that_returns_text_without_word_times_still_yields_the_words() {
+        let mut engine = engine().await;
+        // Not asking for timings stands in for a helper that cannot give them.
+        engine.request_timings = false;
+        let mut pcm = vec![0i16; 480_000];
+        pcm[16_000..20_800].iter_mut().for_each(|x| *x = 1_200);
+        pcm[32_000..36_800].iter_mut().for_each(|x| *x = 700);
+        let words = engine.transcribe(&pcm).await.unwrap();
+        let texts: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(texts, ["w1200", "w700"]);
+        assert!(
+            words.iter().all(|w| (1_000..=2_300).contains(&w.start_ms)),
+            "{words:?}"
+        );
+        assert_eq!(engine.notes().len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -103,6 +103,31 @@ fn ends_sentence(word: &str) -> bool {
         .ends_with(['.', '?', '!'])
 }
 
+/// Same-speaker spans this close are one turn of speech. The diarizer works
+/// in 10 s windows and its segments often stop ~60 ms short of a window's
+/// edge, which would otherwise split a turn there.
+pub const SPAN_GAP_MS: u64 = 250;
+
+/// `spans` sorted, with each speaker's spans that touch, overlap or sit
+/// within [`SPAN_GAP_MS`] of each other joined.
+#[must_use]
+pub fn join_spans(mut spans: Vec<SpeakerSpan>) -> Vec<SpeakerSpan> {
+    spans.sort_by_key(|s| (s.start_ms, s.end_ms));
+    let mut out: Vec<SpeakerSpan> = Vec::new();
+    for span in spans {
+        // The latest span of the same speaker, if nothing else started since.
+        if let Some(last) = out.last_mut()
+            && last.speaker == span.speaker
+            && span.start_ms <= last.end_ms + SPAN_GAP_MS
+        {
+            last.end_ms = last.end_ms.max(span.end_ms);
+            continue;
+        }
+        out.push(span);
+    }
+    out
+}
+
 /// The speaker of the system word `[start, end)`: the span overlapping it
 /// most, else the nearest within [`NEAREST_SPEAKER_MS`].
 #[must_use]
@@ -318,6 +343,31 @@ mod tests {
         let turns = build_turns(&mic, &system, None);
         let shown: Vec<String> = turns.iter().map(Turn::text).collect();
         assert_eq!(shown, ["so what", "yes", "now"]);
+    }
+
+    #[test]
+    fn spans_split_just_short_of_a_window_edge_join_but_other_speakers_do_not() {
+        let joined = join_spans(vec![
+            span("S1", 2_936, 9_939),
+            span("S1", 10_000, 19_939),
+            span("S1", 20_000, 23_476),
+            span("S2", 23_600, 25_000),
+            span("S1", 25_100, 26_000),
+            span("S2", 27_000, 28_000),
+        ]);
+        let shown: Vec<(&str, u64, u64)> = joined
+            .iter()
+            .map(|s| (s.speaker.as_str(), s.start_ms, s.end_ms))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("S1", 2_936, 23_476),
+                ("S2", 23_600, 25_000),
+                ("S1", 25_100, 26_000),
+                ("S2", 27_000, 28_000),
+            ]
+        );
     }
 
     #[test]

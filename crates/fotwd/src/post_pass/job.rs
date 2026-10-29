@@ -238,7 +238,7 @@ pub async fn run(
         heard.push((channel, windows));
     }
 
-    let mut notes = Vec::new();
+    let mut notes = engine.notes();
     let speakers = if heard.iter().any(|(c, _)| *c == Channel::System) {
         match diarize(
             db,
@@ -251,7 +251,7 @@ pub async fn run(
         )
         .await?
         {
-            Diarized::Spans(spans) => Some(spans),
+            Diarized::Spans(spans) => Some(super::turns::join_spans(spans)),
             Diarized::Unavailable(why) => {
                 notes.push(why);
                 None

@@ -20,6 +20,12 @@ pub trait PassEngine: Send + Sync {
 
     /// Engines and revisions, recorded with the cleaned version.
     fn provenance(&self) -> serde_json::Value;
+
+    /// What the engine had to approximate during the run (for the job's
+    /// detail), such as word times a helper could not report.
+    fn notes(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// One channel's diarization: the whole channel in order, then its speakers.
