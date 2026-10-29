@@ -41,9 +41,9 @@ pub trait PassEngine: Send + Sync {
         Box::pin(async {})
     }
 
-    /// Load the recognizer again after
-    /// [`release_recognizer`](Self::release_recognizer): a recording started
-    /// meanwhile and its live transcription uses the same model.
+    /// A recording started and its live transcription uses the same model:
+    /// load the recognizer again if it was released, and leave it loaded
+    /// from now on, even through [`release`](Self::release).
     fn restore_recognizer(&self) -> BoxFuture<'_, ()> {
         Box::pin(async {})
     }

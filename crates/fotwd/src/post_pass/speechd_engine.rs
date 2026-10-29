@@ -148,14 +148,18 @@ impl HelperEngine {
         self
     }
 
-    /// Unload `engine` if this engine loaded it (`owned`), and forget it.
+    /// Unload `engine` if this engine loaded it (`owned`). A refused unload
+    /// (a stream still open) keeps it owned, so the job's final release
+    /// tries again.
     async fn unload(&self, engine: &str, owned: &AtomicBool) {
-        if owned.swap(false, Ordering::SeqCst)
-            && let Err(e) = self.client.unload(engine).await
-        {
-            // A refused unload (a stream still open) leaves it loaded; the
-            // next cleanup or the helper's exit releases it.
-            crate::journal::record(&format!("cleanup  : {engine} stayed loaded: {e}"));
+        if !owned.load(Ordering::SeqCst) {
+            return;
+        }
+        match self.client.unload(engine).await {
+            Ok(()) => owned.store(false, Ordering::SeqCst),
+            Err(e) => {
+                crate::journal::record(&format!("cleanup  : {engine} stayed loaded: {e}"));
+            }
         }
     }
 
@@ -272,8 +276,9 @@ impl PassEngine for HelperEngine {
 
     fn restore_recognizer(&self) -> BoxFuture<'_, ()> {
         // For the recording that started: loaded for it, so not this
-        // engine's to unload.
+        // engine's to unload any more.
         Box::pin(async move {
+            self.owns_asr.store(false, Ordering::SeqCst);
             if let Err(e) = load(&self.client, self.asr).await {
                 crate::journal::record(&format!("cleanup  : Parakeet did not {e}"));
             }

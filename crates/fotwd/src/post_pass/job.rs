@@ -191,6 +191,10 @@ pub async fn run(
     pause: &(dyn Fn() -> bool + Sync),
 ) -> Result<Outcome, String> {
     let outcome = run_job(db, meeting_id, engine, open, stop, pause).await;
+    // A recording running now may be using Parakeet: it is left to it.
+    if pause() {
+        engine.restore_recognizer().await;
+    }
     engine.release().await;
     outcome
 }
@@ -838,6 +842,30 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, Outcome::Stopped);
         assert!(engine.released.load(Ordering::SeqCst), "models left loaded");
+    }
+
+    #[tokio::test]
+    async fn a_job_stopped_while_a_recording_runs_leaves_parakeet_to_it() {
+        let (mic, system) = meeting();
+        let (db, meeting_id) = library();
+        let engine = FakeEngine::default();
+        queue(&db, &meeting_id, &engine);
+        let outcome = run(
+            &db,
+            &meeting_id,
+            &engine,
+            &opener(mic, system),
+            &AtomicBool::new(true),
+            &|| true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, Outcome::Stopped);
+        assert_eq!(
+            engine.restored.load(Ordering::SeqCst),
+            1,
+            "the recording's model was not handed over before the release"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
