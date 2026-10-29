@@ -24,7 +24,8 @@ function rig() {
     settings: () => ctx.FOTWCleanup.settings(body, api),
     all, reloads: () => reloads,
     status: () => all().find(n => n.role === 'status'),
-    button: () => all().find(n => n.tagName === 'button'),
+    button: () => all().find(n => n.tagName === 'button' && /transcript$/.test(n.textContent)),
+    labelled: label => all().find(n => n.tagName === 'button' && n.textContent === label),
   };
 }
 const flush = () => new Promise(resolve => setImmediate(resolve));
@@ -97,4 +98,52 @@ test('the setting loads and saves the chosen mode', async () => {
   await select.listeners.change();
   assert.equal(select.value, 'on');
   assert.match(w.status().textContent, /^Saved/);
+});
+
+test('a running cleanup can be cancelled, keeping the live transcript', async () => {
+  const w = rig();
+  w.respond(() => state('pending', { percent: 20, showing: 'live' }));
+  w.mount('m');
+  await flush();
+  const cancel = w.labelled('Cancel cleanup');
+  assert.equal(cancel.hidden, false);
+  assert.equal(w.labelled('Retry cleanup').hidden, true);
+  w.respond((url, options) => {
+    assert.equal(url, '/api/meetings/m/cleanup/cancel');
+    assert.equal(options.method, 'POST');
+    assert.equal(options.body, '{}');
+    return state('failed', { showing: 'live', detail: 'Cancelled; the live transcript is kept.' });
+  });
+  await cancel.click();
+  await flush();
+  assert.equal(w.status().textContent, 'Transcript cleanup cancelled. Showing the live transcript.');
+  assert.equal(w.labelled('Cancel cleanup').hidden, true);
+  assert.equal(w.labelled('Retry cleanup').hidden, false);
+});
+
+test('a failed cleanup offers retry, which polls again', async () => {
+  const w = rig();
+  w.respond(() => state('failed', { showing: 'live', detail: 'the speech helper crashed' }));
+  w.mount('m');
+  await flush();
+  assert.equal(w.labelled('Cancel cleanup').hidden, true);
+  w.respond((url) => {
+    assert.equal(url, '/api/meetings/m/cleanup/retry');
+    return state('pending', { percent: 0, showing: 'live' });
+  });
+  const before = w.timers.length;
+  await w.labelled('Retry cleanup').click();
+  await flush();
+  assert.equal(w.status().textContent, 'Cleaning up transcript… 0%');
+  assert.equal(w.timers.length, before + 1, 'polls again');
+  assert.equal(w.labelled('Retry cleanup').hidden, true);
+});
+
+test('a cleaned version that arrived after the summary is offered, not shown', async () => {
+  const w = rig();
+  w.respond(() => state('done', { showing: 'live' }));
+  w.mount('m');
+  await flush();
+  assert.equal(w.status().textContent, 'Cleaned transcript available. Showing the live transcript.');
+  assert.equal(w.button().textContent, 'Show cleaned transcript');
 });

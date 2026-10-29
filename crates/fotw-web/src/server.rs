@@ -202,6 +202,14 @@ fn routes(state: AppState) -> Router {
             post(crate::cleanup::show),
         )
         .route(
+            "/api/meetings/{id}/cleanup/retry",
+            post(crate::cleanup::retry),
+        )
+        .route(
+            "/api/meetings/{id}/cleanup/cancel",
+            post(crate::cleanup::cancel),
+        )
+        .route(
             "/api/settings/cleanup",
             get(crate::cleanup::get_settings).post(crate::cleanup::post_settings),
         )

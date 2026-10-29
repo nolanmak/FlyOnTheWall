@@ -1,5 +1,5 @@
 //! The dashboard's view of the cleanup: progress, "Show live transcript",
-//! and the setting.
+//! Retry and Cancel, and the setting.
 
 use std::sync::Mutex;
 
@@ -11,9 +11,27 @@ use fotw_web::cleanup::{
 
 use super::{CleanupMode, CleanupSettings};
 
+/// What the dashboard can ask of the cleanup worker.
+pub trait JobActions: Send + Sync {
+    /// Queue a failed job again; whether it was failed.
+    fn retry(&self, meeting: &str) -> bool;
+    /// Cancel a pending job; whether one was pending.
+    fn cancel(&self, meeting: &str) -> bool;
+}
+
+impl JobActions for super::controller::Controller {
+    fn retry(&self, meeting: &str) -> bool {
+        super::controller::Controller::retry(self, meeting)
+    }
+    fn cancel(&self, meeting: &str) -> bool {
+        super::controller::Controller::cancel(self, meeting)
+    }
+}
+
 /// [`CleanupControl`] over the daemon's library.
 pub struct DashboardCleanup {
     db: Mutex<Db>,
+    actions: std::sync::Arc<dyn JobActions>,
 }
 
 impl std::fmt::Debug for DashboardCleanup {
@@ -25,8 +43,11 @@ impl std::fmt::Debug for DashboardCleanup {
 impl DashboardCleanup {
     /// Over its own library connection.
     #[must_use]
-    pub fn new(db: Db) -> Self {
-        Self { db: Mutex::new(db) }
+    pub fn new(db: Db, actions: std::sync::Arc<dyn JobActions>) -> Self {
+        Self {
+            db: Mutex::new(db),
+            actions,
+        }
     }
 
     fn db(&self) -> std::sync::MutexGuard<'_, Db> {
@@ -90,6 +111,22 @@ impl CleanupControl for DashboardCleanup {
         }
     }
 
+    fn retry(&self, meeting: &str) -> Option<CleanupStatus> {
+        // The worker owns the job: it reopens the library itself, so this
+        // connection's lock is not held across it.
+        if !self.actions.retry(meeting) {
+            return None;
+        }
+        read_status(&mut self.db(), meeting)
+    }
+
+    fn cancel(&self, meeting: &str) -> Option<CleanupStatus> {
+        if !self.actions.cancel(meeting) {
+            return None;
+        }
+        read_status(&mut self.db(), meeting)
+    }
+
     fn set_settings(&self, doc: CleanupSettingsDoc) -> Result<(), String> {
         CleanupSettings {
             mode: match doc.mode {
@@ -108,6 +145,69 @@ mod tests {
 
     use super::*;
 
+    struct NoActions;
+    impl JobActions for NoActions {
+        fn retry(&self, _: &str) -> bool {
+            false
+        }
+        fn cancel(&self, _: &str) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn the_meeting_view_can_cancel_a_pending_cleanup_and_retry_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        let key = [0x54; 32];
+        let open: super::super::controller::OpenLibrary = {
+            let path = path.clone();
+            std::sync::Arc::new(move || {
+                Db::open(&path, &DbKey::from_bytes(key)).map_err(|e| e.to_string())
+            })
+        };
+        let mut db = open().unwrap();
+        let meeting = db
+            .meetings()
+            .create(NewMeeting::new("dev-1", "UTC"))
+            .unwrap();
+        let live = db
+            .meetings()
+            .create_transcript(&meeting, "fotw-speechd", "parakeet-unified", true)
+            .unwrap();
+        db.post_pass_queue(&meeting, "{}").unwrap();
+        // A worker that never runs anything: only the actions are under test.
+        let controller = super::super::controller::Controller::new(
+            dir.path(),
+            open.clone(),
+            std::sync::Arc::new(|| Box::pin(std::future::pending())),
+            serde_json::json!({}),
+            Box::new(|_| {}),
+        );
+        let control = DashboardCleanup::new(open().unwrap(), controller);
+
+        let cancelled = control.cancel(&meeting).expect("a pending cleanup");
+        assert_eq!(cancelled.phase, CleanupPhase::Failed);
+        assert_eq!(cancelled.showing, Some(TranscriptVersion::Live));
+        assert_eq!(
+            cancelled.detail.as_deref(),
+            Some(fotw_store::POST_PASS_CANCELLED)
+        );
+        assert!(control.cancel(&meeting).is_none(), "nothing left to cancel");
+
+        let retried = control.retry(&meeting).expect("a failed cleanup");
+        assert_eq!(retried.phase, CleanupPhase::Pending);
+        assert!(control.retry(&meeting).is_none(), "already pending");
+        assert_eq!(
+            open()
+                .unwrap()
+                .meetings()
+                .primary_transcript_id(&meeting)
+                .unwrap(),
+            Some(live)
+        );
+    }
+
     #[test]
     fn show_live_transcript_switches_back_and_forth_between_the_two_versions() {
         let mut db = Db::open_in_memory(&DbKey::from_bytes([0x52; 32])).unwrap();
@@ -122,7 +222,7 @@ mod tests {
         db.meetings()
             .append_segments(&live, &[NewSegment::new(0, 0, 900, "live words")])
             .unwrap();
-        let control = DashboardCleanup::new(db);
+        let control = DashboardCleanup::new(db, std::sync::Arc::new(NoActions));
         assert_eq!(control.status(&meeting).unwrap().phase, CleanupPhase::None);
         assert!(control.status("no-such-meeting").is_none());
 
@@ -185,8 +285,10 @@ mod tests {
 
     #[test]
     fn the_setting_round_trips() {
-        let control =
-            DashboardCleanup::new(Db::open_in_memory(&DbKey::from_bytes([0x53; 32])).unwrap());
+        let control = DashboardCleanup::new(
+            Db::open_in_memory(&DbKey::from_bytes([0x53; 32])).unwrap(),
+            std::sync::Arc::new(NoActions),
+        );
         assert_eq!(control.settings().mode, WebMode::Auto);
         control
             .set_settings(CleanupSettingsDoc { mode: WebMode::On })

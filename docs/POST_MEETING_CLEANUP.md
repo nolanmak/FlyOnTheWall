@@ -77,7 +77,9 @@ The cleaned transcript is a new row in `transcripts`; the live one is not
 touched. `post_pass_jobs` names both (`live_transcript_id`,
 `cleaned_transcript_id`). **Show live transcript** in the meeting view makes
 the live version primary again, and **Show cleaned transcript** switches back
-(`POST /api/meetings/{id}/cleanup/show`). If someone switched versions while a
+(`POST /api/meetings/{id}/cleanup/show`). `POST …/cleanup/cancel` and
+`POST …/cleanup/retry` (empty JSON bodies) back **Cancel cleanup** and
+**Retry cleanup**. If someone switched versions while a
 cleanup ran, its result does not take over.
 
 Exports follow the shown version and add the other: Markdown and plain text

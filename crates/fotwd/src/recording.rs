@@ -729,6 +729,16 @@ impl DaemonRecorder {
         self
     }
 
+    /// Whether a recording holds the recorder: from Start until its native
+    /// work is released. The post-meeting cleanup waits while it does.
+    #[must_use]
+    pub fn is_busy(&self) -> bool {
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
     /// Bind the post-meeting cleanup worker (#246). Sessions stopped from
     /// now on queue their meeting and wait for it before summarizing.
     pub fn set_post_pass(&self, controller: Arc<crate::post_pass::controller::Controller>) {
@@ -1251,6 +1261,7 @@ mod capture_retry_tests {
             Duration::from_secs(60),
             Duration::from_secs(1),
         );
+        assert!(!recorder.is_busy(), "no recording yet");
         let monitor = crate::capture_health::CaptureMonitor::default();
         let source_status = |state| RecoveryStatus {
             state,
@@ -1271,6 +1282,7 @@ mod capture_retry_tests {
             stopped_at_ms: None,
             errors: SttErrors::new(),
         });
+        assert!(recorder.is_busy(), "a recording holds the recorder");
         assert_eq!(
             recorder.status().capture_health.unwrap().system.state,
             CaptureDelivery::Healthy

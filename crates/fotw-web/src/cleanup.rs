@@ -78,6 +78,44 @@ pub trait CleanupControl: std::fmt::Debug + Send + Sync {
     fn settings(&self) -> CleanupSettingsDoc;
     /// Change the setting; applies to meetings stopped from now on.
     fn set_settings(&self, doc: CleanupSettingsDoc) -> Result<(), String>;
+    /// Queue a failed cleanup again; `None` when it has not failed.
+    fn retry(&self, meeting: &str) -> Option<CleanupStatus>;
+    /// Stop a pending cleanup, keeping the live transcript; `None` when
+    /// nothing is pending.
+    fn cancel(&self, meeting: &str) -> Option<CleanupStatus>;
+}
+
+/// An empty JSON object, the body of the retry and cancel actions.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Action {}
+
+pub(crate) async fn retry(
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Result<axum::Json<Action>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    let (Some(control), Ok(_)) = (state.cleanup(), body) else {
+        return crate::ingress::not_found();
+    };
+    match tokio::task::spawn_blocking(move || control.retry(&id)).await {
+        Ok(Some(status)) => crate::api::json(&state, &status),
+        _ => crate::ingress::not_found(),
+    }
+}
+
+pub(crate) async fn cancel(
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Result<axum::Json<Action>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    let (Some(control), Ok(_)) = (state.cleanup(), body) else {
+        return crate::ingress::not_found();
+    };
+    match tokio::task::spawn_blocking(move || control.cancel(&id)).await {
+        Ok(Some(status)) => crate::api::json(&state, &status),
+        _ => crate::ingress::not_found(),
+    }
 }
 
 pub(crate) async fn status(

@@ -652,10 +652,17 @@ async fn serve_until_stopped(
             }),
         );
         recorder.set_post_pass(Arc::clone(&controller));
+        // A recording owns the machine and the helper: cleanup waits between
+        // windows until the recorder's slot is free again.
+        let busy_recorder = Arc::clone(&recorder);
+        controller.set_busy(Box::new(move || busy_recorder.is_busy()));
         if let Ok(db) = crate::open_library(&root) {
             server
                 .state()
-                .set_cleanup(Arc::new(crate::post_pass::web::DashboardCleanup::new(db)));
+                .set_cleanup(Arc::new(crate::post_pass::web::DashboardCleanup::new(
+                    db,
+                    Arc::clone(&controller) as Arc<dyn crate::post_pass::web::JobActions>,
+                )));
         }
         controller
     };

@@ -10,6 +10,10 @@ globalThis.FOTWCleanup = {
     const note = root.appendChild(make('p', '')); note.className = 'meta'; note.hidden = true;
     const toggle = root.appendChild(make('button', 'Show live transcript'));
     toggle.type = 'button'; toggle.hidden = true;
+    const cancel = root.appendChild(make('button', 'Cancel cleanup'));
+    cancel.type = 'button'; cancel.hidden = true;
+    const retry = root.appendChild(make('button', 'Retry cleanup'));
+    retry.type = 'button'; retry.hidden = true;
     parent.appendChild(root);
     const base = '/api/meetings/' + encodeURIComponent(id) + '/cleanup';
     let request = 0, timer = false, wasPending = false, showing = null;
@@ -24,6 +28,8 @@ globalThis.FOTWCleanup = {
       root.hidden = state.phase === 'none';
       toggle.hidden = state.phase !== 'done' || !state.showing;
       toggle.textContent = state.showing === 'live' ? 'Show cleaned transcript' : 'Show live transcript';
+      cancel.hidden = state.phase !== 'pending';
+      retry.hidden = state.phase !== 'failed';
       note.hidden = !state.detail;
       note.textContent = state.detail || '';
       if (state.phase === 'pending') {
@@ -32,13 +38,29 @@ globalThis.FOTWCleanup = {
         poll();
       } else if (state.phase === 'done') {
         message.textContent = state.showing === 'live'
-          ? 'Showing the live transcript. A cleaned version is available.'
+          ? 'Cleaned transcript available. Showing the live transcript.'
           : 'Cleaned transcript: re-transcribed on this Mac after the meeting.';
         // The cleaned version became primary while this view was open.
         if (wasPending) { wasPending = false; reload(); }
       } else if (state.phase === 'failed') {
-        message.textContent = 'Transcript cleanup did not finish. Showing the live transcript.';
+        message.textContent = /^Cancelled/.test(state.detail || '')
+          ? 'Transcript cleanup cancelled. Showing the live transcript.'
+          : 'Transcript cleanup did not finish. Showing the live transcript.';
         wasPending = false;
+      }
+    }
+    const post = (path, body) => api(base + path, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
+    async function act(path) {
+      if (root.isConnected === false) return;
+      const seq = ++request;
+      cancel.disabled = retry.disabled = true;
+      try {
+        const state = await post(path, '{}');
+        if (current(seq)) render(state);
+      } catch (error) {
+        if (current(seq)) await load();
+      } finally {
+        cancel.disabled = retry.disabled = false;
       }
     }
     async function load(version) {
@@ -46,7 +68,7 @@ globalThis.FOTWCleanup = {
       const seq = ++request;
       try {
         const state = version
-          ? await api(base + '/show', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ version }) })
+          ? await post('/show', JSON.stringify({ version }))
           : await api(base);
         if (!current(seq)) return;
         render(state);
@@ -56,6 +78,8 @@ globalThis.FOTWCleanup = {
       }
     }
     toggle.addEventListener('click', () => load(showing === 'live' ? 'cleaned' : 'live'));
+    cancel.addEventListener('click', () => act('/cancel'));
+    retry.addEventListener('click', () => act('/retry'));
     load();
     return root;
   },
