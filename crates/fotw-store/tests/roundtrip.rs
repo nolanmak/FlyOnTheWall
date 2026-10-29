@@ -140,8 +140,13 @@ fn snapshot(db: &Db) -> BTreeMap<String, Vec<String>> {
             .collect::<Vec<_>>()
             .join(", ");
         let conn = db.conn();
+        let derived_filter = if table == "app_meta" {
+            " WHERE key NOT GLOB 'summary_input_epoch:*'"
+        } else {
+            ""
+        };
         let mut stmt = conn
-            .prepare(&format!("SELECT {select} FROM \"{table}\""))
+            .prepare(&format!("SELECT {select} FROM \"{table}\"{derived_filter}"))
             .unwrap();
         let rows = stmt
             .query_map([], |r| {
@@ -1416,4 +1421,62 @@ fn human_history_does_not_claim_unconfirmed_audio_or_render_metadata_as_markup()
         "{plain}"
     );
     assert!(!plain.contains("\n## injected"), "{plain}");
+}
+
+#[test]
+fn derived_input_generations_are_rebuilt_and_never_transferred_in_archives() {
+    let (f, source) = fixture();
+    let version = source
+        .setting_version("summarize")
+        .unwrap()
+        .with_meeting_inputs(&source, "mtg-1")
+        .unwrap();
+    let old_epoch: String = source
+        .conn()
+        .query_row(
+            "SELECT value FROM app_meta WHERE key='summary_input_epoch:mtg-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    source
+        .export_library(&f.archive, &ArchiveOptions::default(), &mut |_| {})
+        .unwrap();
+    let path = f.archive.join("library.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !text.contains("summary_input_epoch:"),
+        "local concurrency observations are not portable user data"
+    );
+    let mut manifest: serde_json::Value = serde_json::from_str(&text).unwrap();
+    for (key, value) in [
+        ("summary_input_epoch:mtg-1", old_epoch.as_str()),
+        ("summary_input_epoch:absent", "forged-local-observation"),
+    ] {
+        manifest["app_meta"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"key":key,"value":value,"updated_at":0}));
+    }
+    std::fs::write(path, serde_json::to_string(&manifest).unwrap()).unwrap();
+    let mut dest = open_at(&f.fresh.join("db.sqlite3"));
+    let report = dest.import_library(&f.archive).unwrap();
+    assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+    assert_same_library(&source, &dest);
+    assert!(
+        !version.is_current(&dest).unwrap(),
+        "a source library's live work does not own restored content"
+    );
+    let count: i64 = dest
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM app_meta WHERE key='summary_input_epoch:absent'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "ignore local generation metadata supplied by an archive"
+    );
 }

@@ -6,7 +6,7 @@ speaker labels for the other participants. The result is a **new transcript
 version** shown in place of the live one. The live version is kept.
 
 Code: `crates/fotwd/src/post_pass/` (the job), `crates/fotw-store/src/post_pass.rs`
-and `schema/0010_post_pass.sql` (jobs and checkpoints),
+and `schema/0011_post_pass.sql` (jobs and checkpoints),
 `crates/fotw-web/src/cleanup.rs` and `ui/cleanup.js` (the meeting view and the
 setting). Engines: `docs/SPEECHD_PROTOCOL.md`.
 

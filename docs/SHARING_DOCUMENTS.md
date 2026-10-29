@@ -16,6 +16,12 @@ adds one model call per eligible meeting, with one repair attempt for invalid ou
 Both calls share a five-minute deadline. Failed
 automatic attempts can be retried manually; there is no separate retry queue.
 
+Generation currently accepts transcripts up to 200 KB / 4,000 segments and manual
+notes up to 8,000 characters. Larger inputs return an explicit error before a model
+call; they are never silently shortened. The original meeting and any saved draft
+remain unchanged. Longer inputs need the full-coverage work tracked in
+[#235](https://github.com/nolanmak/FlyOnTheWall/issues/235).
+
 ## Create and download
 
 **Create & download .md** generates the draft, saves it in the meeting, and starts

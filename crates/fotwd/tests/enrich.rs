@@ -1265,3 +1265,54 @@ async fn a_legacy_title_cut_short_at_the_budget_is_adopted_too() {
         minted
     );
 }
+
+struct RenameWhileResolving {
+    writer: std::sync::Mutex<Db>,
+    meeting: String,
+    inner: InMemoryKeyStore,
+}
+impl KeyStore for RenameWhileResolving {
+    fn set(&self, key: SecretKey, value: &SecretString) -> Result<(), SecretsError> {
+        self.inner.set(key, value)
+    }
+    fn get(&self, key: SecretKey) -> Result<SecretString, SecretsError> {
+        self.writer
+            .lock()
+            .unwrap()
+            .meetings()
+            .set_title(&self.meeting, "User title chosen while credentials resolve")
+            .unwrap();
+        self.inner.get(key)
+    }
+    fn delete(&self, key: SecretKey) -> Result<(), SecretsError> {
+        self.inner.delete(key)
+    }
+    fn contains(&self, key: SecretKey) -> Result<bool, SecretsError> {
+        self.inner.contains(key)
+    }
+}
+#[tokio::test]
+async fn a_local_fallback_cannot_undo_a_rename_during_credential_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.sqlite3");
+    let key = DbKey::from_bytes([9; 32]);
+    let mut db = Db::open(&path, &key).unwrap();
+    let meeting = meeting_with_transcript(&mut db);
+    db.put_setting(
+        "summarize",
+        r#"{"policy":"anthropic","acknowledged_egress":true}"#,
+    )
+    .unwrap();
+    let store = RenameWhileResolving {
+        writer: std::sync::Mutex::new(Db::open(&path, &key).unwrap()),
+        meeting: meeting.clone(),
+        inner: InMemoryKeyStore::new(),
+    };
+    let report = enrich_meeting_with(&mut db, &store, &meeting).await;
+    assert_eq!(
+        db.meetings().get(&meeting).unwrap().title,
+        "User title chosen while credentials resolve"
+    );
+    assert!(report.summary_version.is_none());
+    assert!(report.problems.iter().any(|p| p.contains("changed")));
+}

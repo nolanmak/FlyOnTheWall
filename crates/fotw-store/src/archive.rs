@@ -357,7 +357,7 @@ impl Db {
             includes_audio: opts.include_audio,
             meetings: ids,
             devices: self.fetch_all("ORDER BY id")?,
-            app_meta: self.fetch_all("ORDER BY key")?,
+            app_meta: self.fetch_all("WHERE key NOT GLOB 'summary_input_epoch:*' ORDER BY key")?,
             settings: self.fetch_all("ORDER BY key")?,
             session_notes: self.fetch_all("ORDER BY session_id")?,
             session_note_links: self.fetch_all("ORDER BY session_id")?,
@@ -414,7 +414,7 @@ impl Db {
         let manifest_path = src.join("library.json");
         let text = std::fs::read_to_string(&manifest_path)
             .map_err(|e| StoreError::io("reading the archive manifest", &manifest_path, e))?;
-        let manifest: LibraryManifest = serde_json::from_str(&text).map_err(|e| {
+        let mut manifest: LibraryManifest = serde_json::from_str(&text).map_err(|e| {
             StoreError::InvalidArgument(format!(
                 "{} is not a library@1 manifest: {e}",
                 manifest_path.display()
@@ -435,6 +435,14 @@ impl Db {
                 manifest.schema_version
             )));
         }
+
+        // Concurrency generations belong to this live library only. Treat
+        // even a supplied archive row as derived state, never an old owner's
+        // authority over newly imported content. Source inserts rebuild it.
+        manifest.app_meta.retain(|row| {
+            !row.key
+                .starts_with(crate::setting_version::MEETING_INPUT_PREFIX)
+        });
 
         // Read and parse every meeting document before opening the write
         // transaction, so a corrupt file fails before anything is touched.
