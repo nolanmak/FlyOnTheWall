@@ -73,6 +73,17 @@ impl LocalAdapter {
 
     async fn generate(&self, request: &LlmRequest) -> Result<LlmResponse, SummarizeError> {
         request.validate(&self.capabilities())?;
+        // Only the application's frozen extraction vocabulary is supported.
+        // Do not silently drop constraints from arbitrary JSON Schema dialects.
+        if request
+            .output_format
+            .as_ref()
+            .is_some_and(|schema| !super::extraction_schema::supports(schema))
+        {
+            return Err(SummarizeError::UnsupportedCapability {
+                capability: "local_extraction_schema",
+            });
+        }
         if request.model != self.config.model_id
             || request.max_output_tokens == 0
             || request.max_output_tokens > self.config.output_tokens
@@ -105,11 +116,19 @@ impl LocalAdapter {
             let tokens = tokenized["tokens"].as_array().filter(|v| !v.is_empty() && v.iter().all(|x| x.as_u64().is_some()))
                 .ok_or_else(|| SummarizeError::Decode("local tokenizer returned invalid tokens".into()))?;
             check_context(tokens.len(),request.max_output_tokens,self.config.context_tokens)?;
+            let mut completion = json!({"prompt":tokens,"n_predict":request.max_output_tokens,"stream":false,
+                    "temperature":0,"seed":42,"cache_prompt":false,"id_slot":0});
+            if let Some(schema) = &request.output_format {
+                completion["json_schema"] = schema.clone();
+            }
             let response = ipc::request(&self.process.socket,pid,Endpoint::Completion,
-                Some(json!({"prompt":tokens,"n_predict":request.max_output_tokens,"stream":false,
-                    "temperature":0,"seed":42,"cache_prompt":false,"id_slot":0})),
+                Some(completion),
                 Duration::from_secs(self.config.call_timeout_seconds)).await.map_err(SummarizeError::Transport)?;
-            decode(&response,tokens.len())
+            let decoded = decode(&response,tokens.len())?;
+            if let Some(schema) = &request.output_format {
+                super::extraction_schema::validate(&decoded.text(), schema)?;
+            }
+            Ok(decoded)
         }).await.map_err(|_| SummarizeError::Transport("local generation deadline exceeded".into()))?;
         // A clean native response ends ownership of this call. Any failure
         // conservatively stops the process; no hidden generation survives it.
@@ -125,6 +144,7 @@ impl LlmAdapter for LocalAdapter {
         let mut capabilities = Capabilities::local_default();
         capabilities.usable_context_tokens = self.config.context_tokens;
         capabilities.max_output_tokens = self.config.output_tokens;
+        capabilities.strict_json_schema = true;
         capabilities
     }
     fn model_id(&self) -> &str {
@@ -139,6 +159,14 @@ impl LlmAdapter for LocalAdapter {
 }
 
 fn messages(request: &LlmRequest) -> Result<Value, SummarizeError> {
+    let mut system = request.system.clone();
+    if let Some(schema) = &request.output_format {
+        // Native json_schema constrains sampling; supply the field meanings
+        // in the rendered prompt too. This is our supported application schema,
+        // kept outside the transcript and notes' untrusted-data blocks.
+        system.push_str("\n\nReturn only JSON matching this application output schema:\n");
+        system.push_str(&schema.to_string());
+    }
     let mut content = String::new();
     if let Some(payload) = &request.document {
         content.push_str("<transcript>\n");
@@ -158,7 +186,7 @@ fn messages(request: &LlmRequest) -> Result<Value, SummarizeError> {
         content.push_str("\n</user_notes>\n");
     }
     content.push_str(&request.instruction);
-    Ok(json!([{"role":"system","content":request.system},{"role":"user","content":content}]))
+    Ok(json!([{"role":"system","content":system},{"role":"user","content":content}]))
 }
 
 fn check_context(input: usize, output: usize, context: usize) -> Result<(), SummarizeError> {
@@ -229,6 +257,214 @@ fn decode(response: &Value, input: usize) -> Result<LlmResponse, SummarizeError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fotw_summarize::EXTRACTION_SCHEMA;
+
+    fn empty_extraction() -> Value {
+        json!({"action_items":[],"decisions":[],"open_questions":[],"follow_ups":[],"topics":[]})
+    }
+
+    async fn protocol_adapter(content: &str) -> (Arc<LocalAdapter>, std::path::PathBuf) {
+        let (process, listening, received) = process::protocol_fixture(content);
+        let config = RuntimeConfig {
+            model_id: "fixture".into(),
+            runtime_files: vec![],
+            executable: "llama-server".into(),
+            model: process::Artifact {
+                path: "/unused".into(),
+                sha256: "0".repeat(64),
+            },
+            model_shards: vec![],
+            context_tokens: 8192,
+            output_tokens: 512,
+            threads: 1,
+            load_timeout_seconds: 1,
+            call_timeout_seconds: 5,
+        };
+        let adapter = Arc::new(LocalAdapter {
+            process,
+            config,
+            queue: Semaphore::new(5),
+            serial: Semaphore::new(1),
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !listening.exists() {
+            adapter
+                .process
+                .pid()
+                .expect("owned fixture exited before readiness");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "owned fixture did not listen"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (adapter, received)
+    }
+
+    fn extraction_request() -> LlmRequest {
+        LlmRequest {
+            model: "fixture".into(),
+            system: "synthetic".into(),
+            document: None,
+            user_notes: None,
+            instruction: "Extract this synthetic meeting.".into(),
+            citations: false,
+            output_format: Some(EXTRACTION_SCHEMA.clone()),
+            effort: None,
+            max_output_tokens: 128,
+        }
+    }
+
+    #[tokio::test]
+    async fn extraction_schema_reaches_the_owned_native_completion_endpoint() {
+        let answer = empty_extraction().to_string();
+        let (adapter, received) = protocol_adapter(&answer).await;
+        let result = adapter.complete(&extraction_request()).await;
+        adapter.shutdown().await.unwrap();
+        assert_eq!(result.unwrap().text(), answer);
+        let native: Value = serde_json::from_slice(&std::fs::read(&received).unwrap()).unwrap();
+        assert_eq!(native["json_schema"], *EXTRACTION_SCHEMA);
+        assert_eq!(native["prompt"], json!([1, 2, 3]));
+        for unsupported in [
+            "output_format",
+            "response_format",
+            "citations",
+            "tools",
+            "effort",
+            "messages",
+        ] {
+            assert!(native.get(unsupported).is_none(), "{unsupported}");
+        }
+        assert!(adapter.capabilities().strict_json_schema);
+        assert!(!adapter.capabilities().native_citations);
+        let template: Value = serde_json::from_slice(
+            &std::fs::read(received.with_file_name("apply-template.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            template["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains(&EXTRACTION_SCHEMA.to_string()),
+            "the model must see field definitions, not just a sampling constraint"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_prose_does_not_request_json_grammar() {
+        let (adapter, received) = protocol_adapter("Ordinary synthetic prose.").await;
+        let mut request = extraction_request();
+        request.output_format = None;
+        let result = adapter.complete(&request).await;
+        adapter.shutdown().await.unwrap();
+        assert_eq!(result.unwrap().text(), "Ordinary synthetic prose.");
+        let native: Value = serde_json::from_slice(&std::fs::read(&received).unwrap()).unwrap();
+        assert!(native.get("json_schema").is_none());
+        let template: Value = serde_json::from_slice(
+            &std::fs::read(received.with_file_name("apply-template.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(template["messages"][0]["content"], request.system);
+    }
+
+    #[tokio::test]
+    async fn unsupported_schemas_are_refused_before_any_owned_runtime_request() {
+        let (adapter, received) = protocol_adapter("not used").await;
+        let mut request = extraction_request();
+        request.output_format = Some(json!({"type":"string","pattern":"unimplemented"}));
+        let result = adapter.complete(&request).await;
+        adapter.shutdown().await.unwrap();
+        assert!(result.is_err());
+        assert!(!received.exists());
+        assert!(!received.with_file_name("requests.log").exists());
+    }
+
+    #[tokio::test]
+    async fn a_complete_native_reply_cannot_bypass_independent_extraction_validation() {
+        let valid = json!({
+            "action_items":[{
+                "text":"Send the fixture draft","owner":null,"due":null,"due_raw":null,
+                "confidence":"explicit","evidence_segment_ids":[0],
+                "evidence_quote":"Send the fixture draft"
+            }],"decisions":[],"open_questions":[],"follow_ups":[],"topics":[]
+        });
+        let (adapter, _) = protocol_adapter(&valid.to_string()).await;
+        let result = adapter.complete(&extraction_request()).await;
+        adapter.shutdown().await.unwrap();
+        assert!(result.is_ok(), "nullable uncertainty must remain supported");
+
+        let mut all_kinds = valid.clone();
+        all_kinds["action_items"][0]["owner"] = json!("Fixture speaker");
+        all_kinds["action_items"][0]["due"] = json!("2026-01-02");
+        all_kinds["action_items"][0]["due_raw"] = json!("Friday");
+        all_kinds["decisions"] = json!([{
+            "text":"Keep the fixture date","alternatives_considered":["Move it"],
+            "confidence":"implied","evidence_segment_ids":[0],"evidence_quote":"Keep the fixture date"
+        }]);
+        all_kinds["open_questions"] = json!([{
+            "text":"Which fixture?","raised_by":"Fixture speaker","confidence":"explicit",
+            "evidence_segment_ids":[0],"evidence_quote":"Which fixture?"
+        }]);
+        all_kinds["follow_ups"] = json!([{
+            "text":"Revisit the fixture","blocked_on":null,"confidence":"explicit",
+            "evidence_segment_ids":[0],"evidence_quote":"Revisit the fixture"
+        }]);
+        all_kinds["topics"] = json!([{"label":"Fixture","start_segment_id":0}]);
+        let (adapter, _) = protocol_adapter(&all_kinds.to_string()).await;
+        let result = adapter.complete(&extraction_request()).await;
+        adapter.shutdown().await.unwrap();
+        assert!(
+            result.is_ok(),
+            "every extraction collection must remain usable"
+        );
+
+        let mut faults = Vec::new();
+        let mut extra = valid.clone();
+        extra["unexpected"] = json!(true);
+        faults.push(("unknown root key", extra.to_string()));
+        let mut missing = valid.clone();
+        missing["action_items"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("due");
+        faults.push(("absent nullable key", missing.to_string()));
+        for (field, value) in [
+            ("confidence", json!("invented")),
+            ("evidence_segment_ids", json!([])),
+            ("evidence_segment_ids", json!([-1])),
+            ("owner", json!(false)),
+            ("unexpected", json!(true)),
+        ] {
+            let mut bad = valid.clone();
+            bad["action_items"][0][field] = value;
+            faults.push((field, bad.to_string()));
+        }
+        let mut bad_topic = valid.clone();
+        bad_topic["topics"] = json!([{"label":"fixture","start_segment_id":0.5}]);
+        faults.push(("noninteger source id", bad_topic.to_string()));
+        let mut bad_array = valid.clone();
+        bad_array["decisions"] = json!("not a list");
+        faults.push(("nonarray collection", bad_array.to_string()));
+        faults.push(("nonobject root", "null".into()));
+        faults.push((
+            "text wrapped around JSON",
+            format!("Here is the result: {valid}"),
+        ));
+        for (label, answer) in faults {
+            let (adapter, received) = protocol_adapter(&answer).await;
+            let result = adapter.complete(&extraction_request()).await;
+            adapter.shutdown().await.unwrap();
+            assert!(
+                received.exists(),
+                "{label}: must reach the actual native endpoint"
+            );
+            assert!(
+                matches!(result, Err(SummarizeError::SchemaViolation(_))),
+                "{label}: a native success flag is insufficient: {result:?}"
+            );
+        }
+    }
+
     #[test]
     fn output_and_template_headroom_must_fit_without_overflow() {
         assert!(check_context(100, 100, 208).is_ok());

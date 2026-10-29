@@ -524,6 +524,73 @@ while c.recv(8192):pass
 }
 
 #[cfg(test)]
+pub(super) fn protocol_fixture(content: &str) -> (Process, PathBuf, PathBuf) {
+    let root = tempfile::Builder::new()
+        .prefix("fotw-summary-protocol-")
+        .tempdir_in("/private/tmp")
+        .unwrap();
+    let socket = root.path().join("owned.sock");
+    let listening = root.path().join("listening");
+    let received = root.path().join("completion.json");
+    std::fs::write(
+        root.path().join("answer.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "content":content,"tokens_predicted":5,"tokens_evaluated":3,
+            "truncated":false,"stop_type":"eos"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let code = r#"import socket,pathlib,json
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+s.bind('owned.sock');s.listen(1)
+pathlib.Path('listening').write_text('ready')
+for _ in range(3):
+ c,_=s.accept()
+ data=b''
+ while b'\r\n\r\n' not in data:
+  part=c.recv(4096)
+  if not part: raise RuntimeError('incomplete fixture headers')
+  data+=part
+ head,body=data.split(b'\r\n\r\n',1)
+ headers=dict(line.lower().split(b': ',1) for line in head.split(b'\r\n')[1:])
+ length=int(headers[b'content-length'])
+ while len(body)<length:
+  part=c.recv(4096)
+  if not part: raise RuntimeError('incomplete fixture body')
+  body+=part
+ path=head.split(b' ')[1]
+ with open('requests.log','ab') as log: log.write(path+b'\n')
+ pathlib.Path(path.decode().lstrip('/')+'.json').write_bytes(body)
+ if path==b'/apply-template': answer=json.dumps({'prompt':'synthetic'}).encode()
+ elif path==b'/tokenize': answer=json.dumps({'tokens':[1,2,3]}).encode()
+ elif path==b'/completion':
+  pathlib.Path('completion.json').write_bytes(body)
+  answer=pathlib.Path('answer.json').read_bytes()
+ else: raise RuntimeError('unexpected fixture endpoint')
+ c.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: '+str(len(answer)).encode()+b'\r\n\r\n'+answer)
+ c.close()
+"#;
+    let child = sandboxed_command(Path::new("/usr/bin/python3"), root.path(), &socket)
+        .args(["-I", "-S", "-c", code])
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    (
+        Process {
+            child: Mutex::new(child),
+            pid,
+            stopped: AtomicBool::new(false),
+            _root: root,
+            _models: None,
+            socket,
+        },
+        listening,
+        received,
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
