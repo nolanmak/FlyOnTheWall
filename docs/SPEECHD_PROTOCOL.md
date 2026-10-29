@@ -183,7 +183,7 @@ Error codes: `version_mismatch`, `protocol`, `bad_request`, `unknown_engine`,
 | `parakeet-eou-320ms` | streaming, pooled (#245) | `FluidInference/parakeet-realtime-eou-120m-coreml` | NVIDIA Open Model License |
 | `parakeet-eou-160ms` | streaming, pooled (#245, not the default) | same repository, its `160ms/` variant | NVIDIA Open Model License |
 | `nemotron-3.5` | streaming, one dictation at a time (Murmur #100) | `FluidInference/Nemotron-3.5-ASR-Streaming-Multilingual-0.6b-CoreML` | OpenMDW-1.1 |
-| `diarizer` | diarization | `FluidInference/speaker-diarization-coreml` (`pyannote_segmentation`, `wespeaker_v2`) | unconfirmed: the card's scoped CC-BY-4.0 excludes these two files (`THIRD_PARTY_NOTICES.md`) |
+| `diarizer` | diarization | `FluidInference/speaker-diarization-coreml` (`pyannote_segmentation`, `wespeaker_v2`) | unconfirmed (#277): the card's scoped CC-BY-4.0 excludes these two files (`THIRD_PARTY_NOTICES.md`) |
 
 Each engine states its per-stream bound as `max_audio_ms` in the
 capabilities, and a stream past it fails with `too_long`.
@@ -252,8 +252,8 @@ ordinary test suites use:
 | `fake-exit-after-final` | on `finish`, `final` and `closed`, then the process exits with status 70 |
 | `fake-captions` | pooled like `parakeet-eou-320ms` (two streams). An utterance runs until an all-zero frame: a `partial {text: "utterance=<u> samples=<n>", utterance: u}` per frame within it, then `final {utterance: u}` with the same text, and the next utterance is `u + 1`. `finish` commits the last one |
 | `fake-dictation` | `nemotron-3.5` without a model, in 250 ms (4000-sample) steps: a `partial {text: "steps=<n> lang=<language or auto>", utterance: 1}` when a step completes; on `finish` the last partial step counts as one more, `final {utterance: 1}` with the same text. A frame holding a sample of −32768 fails the stream with `engine`. Like `nemotron-3.5` it has one recognizer, shared by its streams and reset when a stream ends; a second open stream is refused with `busy` |
-| `fake-diarizer` | kind `diarization`, 4 h bound, the real diarizer's windows and segment rules with a model-free speaker per 100 ms block (1600 samples): peak \|x\| < 328 is silence, 328 ≤ peak < 16384 one speaker, ≥ 16384 another. A `partial` per full 10 s window; on `finish`, at once, the `final` (`model: "fake-diarizer@fake"`). A trailing partial block is ignored |
-| `fake-words` | kind batch, 10-minute bound. On `finish`, at once, a `final` whose words come from 100 ms blocks: a block whose samples all equal one nonzero v is the word `w<v>`, a run of such blocks with the same v is one word spanning them, anything else is silence, and a trailing partial block is ignored. `text` is the words joined by spaces; `segments` are always `[{start_ms, end_ms, text}]` per word; `model: "fake-words@fake"` |
+| `fake-diarizer` | kind `diarization`, 4 h bound, the real diarizer's windows and segment rules with a model-free speaker per 100 ms block (1600 samples): peak \|x\| < 328 is silence, 328 ≤ peak < 16384 one speaker, ≥ 16384 another. Its speaker tracker lives for the stream, like the real one's: a speaker keeps its label across windows. A `partial` per full 10 s window; on `finish`, at once, the `final` (`model: "fake-diarizer@fake"`). A trailing partial block is ignored |
+| `fake-words` | kind batch, 10-minute bound. On `finish`, at once, a `final` whose words come from 100 ms blocks: a block whose samples all equal one nonzero v is the word `w<v>`, a run of such blocks with the same v is one word spanning them, anything else is silence, and a trailing partial block is ignored. `text` is the words joined by spaces; `segments` are `[{start_ms, end_ms, text}]` per word with `options.timings`, and empty without, as for `parakeet-unified`; `model: "fake-words@fake"` |
 
 `load` and `warmup` of a fake engine send one `progress` each.
 

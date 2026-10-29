@@ -71,11 +71,11 @@ public actor DiarizerEngine: SpeechEngine {
     public func isLoaded() async -> Bool { await lifecycle.current != nil }
 
     public func makeSession(options: StreamOptions) async throws -> any EngineSession {
-        let state = StreamSpeakers(try await initialSpeakers())
-        return WindowedDiarizationSession(model: "\(model.id)@\(model.revision)") { [self] window, start in
-            let (result, speakers) = try await self.diarize(window, startSample: start, speakers: state.speakers)
-            state.speakers = speakers
-            return result
+        // The stream's own speaker tracker, carried from window to window by
+        // the session, as Muesli's job keeps its SpeakerManager.
+        return WindowedDiarizationSession(model: "\(model.id)@\(model.revision)",
+                                          initial: try await initialSpeakers()) { [self] window, start, speakers in
+            try await self.diarize(window, startSample: start, speakers: speakers)
         }
     }
 
@@ -119,11 +119,4 @@ public actor DiarizerEngine: SpeechEngine {
     private static func ms(_ seconds: Float) -> UInt64 {
         UInt64(max(0, (Double(seconds) * 1000).rounded()))
     }
-}
-
-/// One stream's speaker tracker, carried from window to window. Used only from
-/// that stream's task, one window at a time.
-final class StreamSpeakers: @unchecked Sendable {
-    var speakers: SpeakerManager
-    init(_ speakers: SpeakerManager) { self.speakers = speakers }
 }

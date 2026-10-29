@@ -121,6 +121,23 @@ func sentencePiecesMergeIntoTimedWords() throws {
     try expect(WordTimings.words([]).isEmpty, "no pieces, no words")
 }
 
+actor StateLog {
+    var seen: [Int] = []
+    func record(_ state: Int) { seen.append(state) }
+}
+
+func aSessionCarriesItsSpeakerStateFromWindowToWindow() async throws {
+    let log = StateLog()
+    let session = WindowedDiarizationSession(model: "m", initial: 0) { _, _, state in
+        await log.record(state)
+        return (WindowResult(spans: [], speakerCount: 1), state + 1)
+    }
+    _ = try await session.append([Float](repeating: 0, count: WindowedDiarizationSession.windowSamples * 3 + 5))
+    _ = try await session.finish()
+    let seen = await log.seen
+    try expect(seen == [0, 1, 2, 3], "each window sees the previous window's state: \(seen)")
+}
+
 let diarizationCases: [(String, @Sendable () async throws -> Void)] = [
     ("diarization segments are sorted, merged and relabelled by first appearance",
      finalSegmentsAreSortedMergedAndRelabelledByFirstAppearance),
@@ -131,4 +148,6 @@ let diarizationCases: [(String, @Sendable () async throws -> Void)] = [
      aSessionPastTheSpeakerCapFailsWithAnEngineError),
     ("a diarization session past max_audio_ms fails too_long", aSessionPastItsBoundFailsTooLong),
     ("SentencePiece pieces merge into timed words", sentencePiecesMergeIntoTimedWords),
+    ("a diarization session carries its speaker state from window to window",
+     aSessionCarriesItsSpeakerStateFromWindowToWindow),
 ]

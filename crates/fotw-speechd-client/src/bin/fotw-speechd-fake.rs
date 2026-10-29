@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 use fotw_speechd_client::frame::{self, Frame, KIND_AUDIO, KIND_CONTROL, MAX_FRAME};
 use fotw_speechd_client::message::{
     Capabilities, CloseReason, EngineInfo, EngineKind, ErrorCode, FORMAT_S16LE, FinalText,
-    ModelInfo, PROTOCOL_VERSION, ProgressPhase, Reply, Request, VadKind,
+    ModelInfo, PROTOCOL_VERSION, ProgressPhase, Reply, Request, StreamOptions, VadKind,
 };
 
 const MAX_STREAMS: usize = 8;
@@ -418,7 +418,7 @@ impl Helper {
                 stream,
                 engine,
                 (sample_rate, &format, channels),
-                options.language,
+                options,
             ),
             Request::Finish { stream } => self.finish(stream),
             Request::Cancel { stream } => {
@@ -508,7 +508,7 @@ impl Helper {
         stream: u32,
         engine: String,
         format: (u32, &str, u16),
-        language: Option<String>,
+        options: StreamOptions,
     ) {
         let known = ENGINES.iter().any(|e| e.0 == engine)
             || postpass::is_engine(&engine)
@@ -550,14 +550,14 @@ impl Helper {
         self.streams.insert(
             stream,
             Stream {
-                postpass: postpass::State::new(&engine),
+                postpass: postpass::State::new(&engine, &options),
                 engine,
                 samples: 0,
                 in_speech: false,
                 utterance: 1,
                 utterance_start: 0,
                 utterance_samples: 0,
-                language: language.unwrap_or_else(|| "auto".to_owned()),
+                language: options.language.unwrap_or_else(|| "auto".to_owned()),
             },
         );
         out.send(&Reply::StreamOpened { id, stream });
