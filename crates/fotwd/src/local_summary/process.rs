@@ -10,11 +10,15 @@ use std::{
     },
     time::Duration,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 
 use super::{
     ipc::{self, Endpoint},
+    ownership::OwnerLease,
     package::{BoundModel, bind_models_with_cancellation},
+    watch::ExitWatch,
+    worker,
 };
 
 /// A regular artifact from an authenticated catalog. Digests bind bytes, not
@@ -30,6 +34,10 @@ pub struct Artifact {
 /// Explicit runtime configuration; there is no model-size or RAM-tier ceiling.
 #[derive(Clone, serde::Deserialize)]
 pub struct RuntimeConfig {
+    /// Stable private directory shared by all summary models and app instances
+    /// for this app owner. Must exist, belong to this user and have mode 0700.
+    /// Never use a per-model or per-request directory.
+    pub ownership_directory: PathBuf,
     /// Catalog model identity used in provenance, never a provider model name.
     pub model_id: String,
     /// Main llama-server executable and all adjacent runtime dylibs. These are
@@ -87,19 +95,90 @@ impl Drop for CancelOnDrop {
 }
 
 pub(super) struct Process {
-    child: Mutex<Child>,
+    child: Arc<Mutex<Child>>,
     pid: u32,
-    stopped: AtomicBool,
+    group_pid: u32,
+    supervision: Option<Supervision>,
+    stopped: Arc<AtomicBool>,
+    monitor: Option<Monitor>,
     // Kept alive until the owner is dropped, including after cancellation.
     _root: tempfile::TempDir,
     pub(super) socket: PathBuf,
     _models: Option<BoundModel>,
+    lease: Option<Arc<OwnerLease>>,
+}
+
+struct Supervision {
+    guardian: Arc<ExitWatch>,
+    native: Arc<ExitWatch>,
+}
+
+struct Monitor(tokio::task::JoinHandle<()>);
+impl Drop for Monitor {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn stop_owned(child: &Mutex<Child>, group: u32, stopped: &AtomicBool) {
+    if stopped.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // An unreaped owned leader binds this group number until the signal.
+    if let Ok(mut child) = child.lock()
+        && child.id().is_some()
+    {
+        unsafe {
+            libc::kill(-(group as i32), libc::SIGKILL);
+        }
+        let _ = child.start_kill();
+    }
 }
 
 impl Process {
+    fn monitor_exits(&mut self) {
+        let Some(watches) = &self.supervision else {
+            return;
+        };
+        let guardian = watches.guardian.clone();
+        let native = watches.native.clone();
+        let child = self.child.clone();
+        let stopped = self.stopped.clone();
+        let group = self.group_pid;
+        self.monitor = Some(Monitor(tokio::spawn(async move {
+            loop {
+                if stopped.load(Ordering::Acquire) {
+                    return;
+                }
+                if !matches!(
+                    (guardian.wait(Duration::ZERO), native.wait(Duration::ZERO)),
+                    (Ok(false), Ok(false))
+                ) {
+                    stop_owned(&child, group, &stopped);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })));
+    }
+
     pub(super) fn pid(&self) -> Result<u32, String> {
         if self.stopped.load(Ordering::Acquire) {
             return Err("local runtime stopped; reload required".into());
+        }
+        if let Some(watches) = &self.supervision {
+            match (
+                watches.guardian.wait(Duration::ZERO),
+                watches.native.wait(Duration::ZERO),
+            ) {
+                (Ok(false), Ok(false)) => return Ok(self.pid),
+                _ => {
+                    // Neither watcher reaps the guardian. Its unreaped PID
+                    // still binds this group's identity while we stop it.
+                    self.stop();
+                    return Err("local runtime exited or ownership observation failed".into());
+                }
+            }
         }
         let mut child = self
             .child
@@ -112,18 +191,7 @@ impl Process {
     }
 
     pub(super) fn stop(&self) {
-        self.stopped.store(true, Ordering::Release);
-        // The process group was created by us at spawn; this never targets an
-        // arbitrary user daemon. Descendants inherit the same network sandbox.
-        // Retain the unreaped leader until wait(), preventing PID reuse.
-        if let Ok(mut child) = self.child.lock()
-            && child.id().is_some()
-        {
-            unsafe {
-                libc::kill(-(self.pid as i32), libc::SIGKILL);
-            }
-            let _ = child.start_kill();
-        }
+        stop_owned(&self.child, self.group_pid, &self.stopped);
     }
 
     pub(super) async fn shutdown(&self) -> Result<(), String> {
@@ -131,6 +199,19 @@ impl Process {
         // No await with a std mutex guard: try_wait also reaps the owned leader.
         let until = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
+            let native_exited = match &self.supervision {
+                Some(watches) => watches.native.wait(Duration::ZERO)?,
+                None => true,
+            };
+            // Reap the guardian only after the original native/wrapper exit
+            // event. A guardian exit alone does not prove model release.
+            if !native_exited {
+                if tokio::time::Instant::now() >= until {
+                    return Err("local native exit not confirmed".into());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
             let exited = self
                 .child
                 .lock()
@@ -139,6 +220,9 @@ impl Process {
                 .map_err(|_| "local runtime wait failed")?
                 .is_some();
             if exited {
+                if let Some(lease) = &self.lease {
+                    lease.release()?;
+                }
                 return Ok(());
             }
             if tokio::time::Instant::now() >= until {
@@ -146,6 +230,26 @@ impl Process {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    #[cfg(feature = "test-guards")]
+    pub(super) async fn crash_owner_for_testing(&self) -> Result<(), String> {
+        let watches = self.supervision.as_ref().ok_or("fixture has no guardian")?;
+        self.child
+            .lock()
+            .map_err(|_| "fixture owner unavailable")?
+            .start_kill()
+            .map_err(|_| "fixture owner could not be stopped")?;
+        // Observe without reaping: the app must retain the group identity
+        // while its normal failure handling stops the native child.
+        let until = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !watches.guardian.wait(Duration::ZERO)? {
+            if tokio::time::Instant::now() >= until {
+                return Err("fixture owner exit was not observed".into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
     }
 }
 
@@ -349,10 +453,16 @@ pub(super) async fn launch(
         armed: true,
     };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(config.load_timeout_seconds);
+    let lease = Arc::new(OwnerLease::acquire(&config.ownership_directory)?);
     let copy = config.clone();
     let control = cancellation.clone();
-    let mut verification = tokio::task::spawn_blocking(move || prepare(&copy, &control));
-    let (root, model) = match tokio::time::timeout_at(deadline, &mut verification).await {
+    // The blocking verifier retains admission even if its async caller is
+    // dropped. Cancellation must finish actual file work before another load.
+    let mut verification = tokio::task::spawn_blocking(move || {
+        let (root, model) = prepare(&copy, &control)?;
+        Ok::<_, String>((root, model, lease))
+    });
+    let (root, model, lease) = match tokio::time::timeout_at(deadline, &mut verification).await {
         Ok(result) => result.map_err(|_| "local artifact verification failed")??,
         Err(_) => {
             cancellation.cancel();
@@ -367,43 +477,123 @@ pub(super) async fn launch(
         return Err("local model load timed out".into());
     }
     let socket = root.path().join("server.sock");
-    let mut command =
-        sandboxed_command(&root.path().join(&config.executable), root.path(), &socket);
+    let worker_binary = std::env::current_exe().map_err(|_| "local worker binary unavailable")?;
+    let spec = worker::Spec {
+        version: 1,
+        parent_pid: std::process::id(),
+        worker: worker_binary.clone(),
+        executable: root.path().join(&config.executable),
+        directory: root.path().into(),
+        arguments: vec![
+            "--offline".into(),
+            "--no-webui".into(),
+            "--no-agent".into(),
+            "--log-disable".into(),
+            "--no-context-shift".into(),
+            "--jinja".into(),
+            "--host".into(),
+            socket.to_string_lossy().into_owned(),
+            "--model".into(),
+            model.first_path.to_string_lossy().into_owned(),
+            "--alias".into(),
+            config.model_id.clone(),
+            "--ctx-size".into(),
+            config.context_tokens.to_string(),
+            "--threads".into(),
+            config.threads.to_string(),
+            "--parallel".into(),
+            "1".into(),
+            "--cache-ram".into(),
+            "0".into(),
+            "--no-warmup".into(),
+        ],
+    };
+    let spec_path = root.path().join("worker.json");
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&spec_path)
+        .map_err(|_| "local worker configuration unavailable")?
+        .write_all(&serde_json::to_vec(&spec).map_err(|_| "local worker configuration invalid")?)
+        .map_err(|_| "local worker configuration unavailable")?;
+    let mut command = sandboxed_command(&worker_binary, root.path(), &socket);
     command
-        .args([
-            "--offline",
-            "--no-webui",
-            "--no-agent",
-            "--log-disable",
-            "--no-context-shift",
-            "--jinja",
-        ])
-        .arg("--host")
-        .arg(&socket)
-        .arg("--model")
-        .arg(&model.first_path)
-        .arg("--alias")
-        .arg(&config.model_id)
-        .arg("--ctx-size")
-        .arg(config.context_tokens.to_string())
-        .arg("--threads")
-        .arg(config.threads.to_string())
-        .args(["--parallel", "1", "--cache-ram", "0", "--no-warmup"]);
+        .arg(worker::GUARDIAN)
+        .arg(&spec_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    inherit_file(&mut command, lease.file());
     for file in &model.files {
-        inherit_model(&mut command, file);
+        inherit_file(&mut command, file);
     }
-    let child = command
-        .spawn()
-        .map_err(|_| "network-isolated local runtime launch failed")?;
-    let pid = child.id().ok_or("local runtime has no owned PID")?;
-    let process = Process {
-        child: Mutex::new(child),
+    lease.retain_for_native();
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            // A failed spawn has no surviving native holder. Do not leave
+            // admission pinned by an unrelated fork's pre-exec descriptor.
+            lease.release()?;
+            return Err("network-isolated local runtime launch failed".into());
+        }
+    };
+    let group_pid = child.id().ok_or("local runtime has no owned PID")?;
+    let mut spawned = Spawned {
+        child: Some(child),
+        group: group_pid,
+    };
+    let guardian_watch = ExitWatch::new(group_pid)?;
+    let stdout = spawned
+        .child
+        .as_mut()
+        .and_then(|c| c.stdout.take())
+        .ok_or("local worker handshake missing")?;
+    let mut go = spawned
+        .child
+        .as_mut()
+        .and_then(|c| c.stdin.take())
+        .ok_or("local worker control missing")?;
+    let pid = ready_pid(stdout, deadline, cancellation).await?;
+    if pid == 0 || pid > i32::MAX as u32 || pid == group_pid || pid == std::process::id() {
+        return Err("local native worker identity invalid".into());
+    }
+    if guardian_watch.wait(Duration::ZERO)? {
+        return Err("local guardian exited before native observation".into());
+    }
+    let native_watch = ExitWatch::new(pid)?;
+    if guardian_watch.wait(Duration::ZERO)? {
+        return Err("local guardian exited during native observation".into());
+    }
+    let mut process = Process {
+        child: Arc::new(Mutex::new(
+            spawned
+                .child
+                .take()
+                .ok_or("local worker ownership missing")?,
+        )),
         pid,
-        stopped: AtomicBool::new(false),
+        group_pid,
+        supervision: Some(Supervision {
+            guardian: Arc::new(guardian_watch),
+            native: Arc::new(native_watch),
+        }),
+        stopped: Arc::new(AtomicBool::new(false)),
+        monitor: None,
         socket,
         _root: root,
         _models: Some(model),
+        lease: Some(lease),
     };
+    process.monitor_exits();
+    if let Err(error) = cancellation.check() {
+        return finish_failed_load(process, error).await;
+    }
+    match tokio::time::timeout_at(deadline, go.write_all(b"G")).await {
+        Ok(Ok(())) => {}
+        _ => return finish_failed_load(process, "local native exec handshake failed".into()).await,
+    }
+    drop(go);
     loop {
         if let Err(error) = cancellation.check() {
             return finish_failed_load(process, error).await;
@@ -434,6 +624,64 @@ pub(super) async fn launch(
             return finish_failed_load(process, "local model load timed out".into()).await;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Until the PID handshake finishes, native exec is forbidden by the wrapper.
+/// This guard still stops every owned helper if startup is cancelled or fails.
+struct Spawned {
+    child: Option<Child>,
+    group: u32,
+}
+impl Drop for Spawned {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            unsafe {
+                libc::kill(-(self.group as i32), libc::SIGKILL);
+            }
+            let _ = child.start_kill();
+        }
+    }
+}
+
+async fn ready_pid(
+    mut stdout: tokio::process::ChildStdout,
+    deadline: tokio::time::Instant,
+    cancellation: &LoadCancellation,
+) -> Result<u32, String> {
+    let read = async {
+        let mut line = Vec::new();
+        for _ in 0..128 {
+            let byte = stdout
+                .read_u8()
+                .await
+                .map_err(|_| "local worker handshake failed")?;
+            line.push(byte);
+            if byte == b'\n' {
+                let line =
+                    std::str::from_utf8(&line).map_err(|_| "local worker protocol invalid")?;
+                return line
+                    .strip_prefix(worker::READY)
+                    .and_then(|s| s.strip_suffix('\n'))
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .ok_or("local worker protocol invalid");
+            }
+        }
+        Err("local worker handshake exceeded its limit")
+    };
+    tokio::pin!(read);
+    let mut tick = tokio::time::interval(Duration::from_millis(10));
+    loop {
+        tokio::select! {
+            biased;
+            _ = tick.tick() => {
+                cancellation.check()?;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err("local model load timed out".into());
+                }
+            }
+            result = &mut read => return result.map_err(Into::into),
+        }
     }
 }
 
@@ -469,11 +717,12 @@ fn sandboxed_command(executable: &Path, root: &Path, socket: &Path) -> Command {
     command
 }
 
-fn inherit_model(command: &mut Command, model: &File) {
-    let fd = model.as_raw_fd();
+fn inherit_file(command: &mut Command, file: &File) {
+    let fd = file.as_raw_fd();
     // Keep the verified inode through exec: a cache pathname replaced after
     // verification must not change the model actually opened by llama.cpp.
-    // Only this read-only model descriptor loses CLOEXEC, in the child only.
+    // Only explicitly owned model/lease descriptors lose CLOEXEC, in this
+    // child only. The guardian and native execs retain the lease until exit.
     unsafe {
         command.pre_exec(move || {
             if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
@@ -511,11 +760,15 @@ while c.recv(8192):pass
     let pid = child.id().unwrap();
     (
         Process {
-            child: Mutex::new(child),
+            child: Arc::new(Mutex::new(child)),
             pid,
-            stopped: AtomicBool::new(false),
+            group_pid: pid,
+            supervision: None,
+            stopped: Arc::new(AtomicBool::new(false)),
+            monitor: None,
             _root: root,
             _models: None,
+            lease: None,
             socket,
         },
         listening,
@@ -578,11 +831,15 @@ for _ in range(3):
     let pid = child.id().unwrap();
     (
         Process {
-            child: Mutex::new(child),
+            child: Arc::new(Mutex::new(child)),
             pid,
-            stopped: AtomicBool::new(false),
+            group_pid: pid,
+            supervision: None,
+            stopped: Arc::new(AtomicBool::new(false)),
+            monitor: None,
             _root: root,
             _models: None,
+            lease: None,
             socket,
         },
         listening,
@@ -593,6 +850,50 @@ for _ in range(3):
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn another_owner_is_refused_before_artifact_verification() {
+        let owner = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(owner.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let missing = Artifact {
+            path: owner.path().join("missing.gguf"),
+            sha256: "0".repeat(64),
+        };
+        let config = RuntimeConfig {
+            ownership_directory: owner.path().into(),
+            model_id: "another model".into(),
+            runtime_files: vec![Artifact {
+                path: owner.path().join("llama-server"),
+                sha256: "0".repeat(64),
+            }],
+            executable: "llama-server".into(),
+            model: missing,
+            model_shards: vec![],
+            context_tokens: 8192,
+            output_tokens: 512,
+            threads: 1,
+            load_timeout_seconds: 1,
+            call_timeout_seconds: 1,
+        };
+        let lease = OwnerLease::acquire(owner.path()).unwrap();
+        let error = launch(&config, &LoadCancellation::default())
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains("busy"), "{error}");
+        lease.release().unwrap();
+        let error = launch(&config, &LoadCancellation::default())
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains("artifact unavailable"), "{error}");
+        // A failed verifier releases its own admission, never a permanent lock.
+        OwnerLease::acquire(owner.path())
+            .unwrap()
+            .release()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn cancelled_load_never_opens_missing_artifacts_or_spawns_a_child() {
@@ -606,6 +907,7 @@ mod tests {
             sha256: "0".repeat(64),
         };
         let config = RuntimeConfig {
+            ownership_directory: root.path().into(),
             model_id: "cancelled fixture".into(),
             runtime_files: vec![runtime],
             executable: "llama-server".into(),
@@ -681,7 +983,7 @@ mod tests {
             root.path(),
             &root.path().join("owned.sock"),
         );
-        inherit_model(&mut command, &model);
+        inherit_file(&mut command, &model);
         let output = command
             .args([
                 "-I",
@@ -800,11 +1102,15 @@ print(json.dumps(results))
             .unwrap();
         let pid = child.id().unwrap();
         let process = Process {
-            child: Mutex::new(child),
+            child: Arc::new(Mutex::new(child)),
             pid,
-            stopped: AtomicBool::new(false),
+            group_pid: pid,
+            supervision: None,
+            stopped: Arc::new(AtomicBool::new(false)),
+            monitor: None,
             _root: root,
             _models: None,
+            lease: None,
             socket,
         };
         assert_eq!(process.pid().unwrap(), pid);

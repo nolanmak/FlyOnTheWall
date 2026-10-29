@@ -100,7 +100,17 @@ qualification are completed in #234.
 For a development smoke test, supply a JSON `RuntimeConfig` (see
 `crates/fotwd/src/local_summary/process.rs`) containing trusted SHA-256 digests
 for the installed GGUF, `llama-server` and every required adjacent dylib. Use
-regular files rather than symlinks. The caller authenticates this manifest;
+regular files rather than symlinks. Set `ownership_directory` to an existing,
+absolute, user-owned mode-0700 directory shared by every app instance and summary
+model for this development owner. Keep it separate from per-model caches and
+per-load staging. Loading acquires its persistent mode-0600 `runtime.lock` before
+verification; another owner receives Busy without starting native work. Never
+unlink or replace that lock file to clear Busy. An inherited descriptor retains
+admission through app/guardian/native exec and crash cleanup. Only confirmed
+native exit plus guardian reaping permits explicit release; unconfirmed shutdown
+retains admission until the remaining holders exit.
+
+The caller authenticates this manifest;
 matching a caller-provided hash alone does not establish publisher trust.
 
 ```sh
@@ -128,6 +138,19 @@ rejects missing/unknown fields, wrong types and invalid enums/source-index
 shapes, including omitted nullable fields. Unknown schema dialects are refused
 before IPC. Evidence validation and model-quality qualification remain separate
 gates; a syntactically valid extraction can still contain unsupported claims.
+
+The app and smoke binary dispatch private worker modes before normal startup.
+Other binaries embedding `LocalAdapter` must call
+`local_summary::run_worker_if_requested` at entry and return its worker result
+before starting app services. A guardian observes app exit, and the app observes
+guardian/native exit. Native execution waits until its original PID is registered
+for kernel exit events. All workers inherit the same network sandbox. Retain and
+await `shutdown` to confirm native exit and guardian reaping; requesting Stop is
+separate from confirming resource release.
+
+The app-wide queue, capture priority, idle unload and crash-staging recovery
+remain acceptance work in #237. Forced app exit can leave public runtime staging
+copies in its private temporary directory; no meeting text is written there.
 
 For a split GGUF, set `model` to its first shard and `model_shards` to the
 remaining pinned artifacts. Each shard keeps its verified read-only descriptor

@@ -71,6 +71,13 @@ impl LocalAdapter {
         self.process.shutdown().await
     }
 
+    /// Fault injection for isolated process fixtures, excluded from shipped builds.
+    #[cfg(feature = "test-guards")]
+    #[doc(hidden)]
+    pub async fn crash_owner_for_testing(&self) -> Result<(), String> {
+        self.process.crash_owner_for_testing().await
+    }
+
     async fn generate(&self, request: &LlmRequest) -> Result<LlmResponse, SummarizeError> {
         request.validate(&self.capabilities())?;
         // Only the application's frozen extraction vocabulary is supported.
@@ -266,6 +273,7 @@ mod tests {
     async fn protocol_adapter(content: &str) -> (Arc<LocalAdapter>, std::path::PathBuf) {
         let (process, listening, received) = process::protocol_fixture(content);
         let config = RuntimeConfig {
+            ownership_directory: "/unused".into(),
             model_id: "fixture".into(),
             runtime_files: vec![],
             executable: "llama-server".into(),
@@ -498,6 +506,7 @@ mod tests {
         // fixture boot under CI load must not consume the cancellation budget.
         let (process, listening, marker) = process::stalled_fixture(Duration::from_secs(3));
         let config = RuntimeConfig {
+            ownership_directory: "/unused".into(),
             model_id: "fixture".into(),
             runtime_files: vec![],
             executable: "llama-server".into(),

@@ -11,11 +11,19 @@ mod extraction_schema;
 #[cfg(any(target_os = "macos", test))]
 mod ipc;
 #[cfg(target_os = "macos")]
+mod ownership;
+#[cfg(target_os = "macos")]
 mod process;
+#[cfg(target_os = "macos")]
+mod watch;
+#[cfg(target_os = "macos")]
+mod worker;
 #[cfg(target_os = "macos")]
 pub use adapter::LocalAdapter;
 #[cfg(target_os = "macos")]
 pub use process::{Artifact, LoadCancellation, RuntimeConfig};
+#[cfg(target_os = "macos")]
+pub use worker::run_worker_if_requested;
 
 pub mod probe;
 

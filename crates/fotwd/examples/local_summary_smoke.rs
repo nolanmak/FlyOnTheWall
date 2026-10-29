@@ -1,8 +1,18 @@
 //! Explicit development smoke: owned artifacts + synthetic input, no library,
 //! microphone, keychain, hosted engine or implicit model download.
 #[cfg(target_os = "macos")]
-#[tokio::main]
-async fn main() -> Result<(), String> {
+fn main() -> Result<(), String> {
+    if let Some(result) = fotwd::local_summary::run_worker_if_requested() {
+        return result;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "local smoke runtime unavailable")?
+        .block_on(smoke())
+}
+#[cfg(target_os = "macos")]
+async fn smoke() -> Result<(), String> {
     use fotw_summarize::{LlmAdapter, LlmRequest};
     use fotwd::local_summary::{LocalAdapter, RuntimeConfig};
     let mut args = std::env::args_os().skip(1);
