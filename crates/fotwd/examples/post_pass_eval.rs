@@ -66,6 +66,25 @@ mod imp {
         let data_root = PathBuf::from(flag("--data-root")?);
         let out = PathBuf::from(flag("--out")?);
         std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        // Needs no audio.
+        if let Ok(rounds) = flag("--model-memory") {
+            let rounds: usize = rounds.parse().map_err(|_| "bad --model-memory")?;
+            if rounds == 0 {
+                return Err("--model-memory needs at least one round".into());
+            }
+            let memory = runtime.block_on(model_memory(&data_root, rounds))?;
+            write(&out.join("model-memory.json"), &memory)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&memory).map_err(|e| e.to_string())?
+            );
+            return Ok(());
+        }
         // With both archives already there and no live pass, the WAVs are
         // not read at all, so the process holds no PCM the cleanup never
         // uses and its memory is the cleanup's.
@@ -87,24 +106,9 @@ mod imp {
         } else {
             mic.len().max(system.len())
         };
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?;
         let mut report = serde_json::json!({
             "audio_seconds": samples as f64 / 16_000.0,
         });
-        if let Ok(rounds) = flag("--model-memory") {
-            let rounds = rounds.parse().map_err(|_| "bad --model-memory")?;
-            let memory = runtime.block_on(model_memory(&data_root, rounds))?;
-            write(&out.join("model-memory.json"), &memory)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&memory).map_err(|e| e.to_string())?
-            );
-            return Ok(());
-        }
         if args.iter().any(|a| a == "--live") {
             let started = Instant::now();
             let live = runtime.block_on(live(&data_root, &mic, &system))?;
@@ -503,17 +507,19 @@ mod imp {
             settle().await;
             left.push(wired_mib()? - idle);
         }
-        let median = |xs: &mut Vec<f64>| {
-            xs.sort_by(f64::total_cmp);
-            xs[xs.len() / 2].round()
+        // Sorted copies, so the per-round arrays stay in round order.
+        let median = |xs: &[f64]| {
+            let mut sorted = xs.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[sorted.len() / 2].round()
         };
         Ok(serde_json::json!({
             "rounds": rounds,
             "wired_mib_median": {
-                "parakeet": median(&mut asr),
-                "diarizer": median(&mut diarizer),
-                "both": median(&mut both),
-                "after_unloading_both": median(&mut left),
+                "parakeet": median(&asr),
+                "diarizer": median(&diarizer),
+                "both": median(&both),
+                "after_unloading_both": median(&left),
             },
             "wired_mib_each_round": {"parakeet": asr, "diarizer": diarizer, "both": both, "after_unloading_both": left},
         }))

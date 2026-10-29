@@ -176,7 +176,7 @@ Ordinary suite (offline, fakes):
   the diarizer hears the remote person but not the mic speaker's copy;
   Parakeet is released before the diarizer starts and everything after the
   job (also a stopped one); a recording that starts at the release gets
-  Parakeet back.
+  Parakeet back, and one still running when the job ends keeps it.
 - `post_pass::bleed` — an attenuated, delayed copy of the other track is
   silenced (over 90% of it); a different person's quiet speech under the
   mic speaker, and a different person talking over the copy (where louder
