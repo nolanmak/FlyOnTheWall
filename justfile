@@ -48,6 +48,11 @@ test:
     if [[ "$(uname -s)" == Darwin ]]; then env -u FOTW_FLUIDAUDIO_SOURCE swift run --package-path tools/speech-eval/parakeet -j {{jobs}} parakeet-protocol-check; fi
     if [[ "$(uname -s)" == Darwin ]]; then just speechd-check; fi
 
+# The §9.4 search budget (#262). Wall-clock, so not part of `just test`:
+# run it in the release profile on an idle machine.
+bench-search:
+    CARGO_BUILD_JOBS={{jobs}} cargo test --release -p fotw-store --test search -- --ignored --exact bench_two_term_query_over_the_acceptance_corpus_stays_under_the_budget --nocapture
+
 # Its Swift checks run first, then the Rust protocol tests against it in
 # --fake-engines mode, so the Swift and Rust ends are held to one contract.
 # macOS only; Command Line Tools suffice.

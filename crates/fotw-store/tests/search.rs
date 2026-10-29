@@ -873,14 +873,49 @@ const PERF_SEGMENTS: i64 = 120;
 /// §9.4's p95 budget for a two-term query.
 const PERF_BUDGET_MS: u128 = 100;
 
+/// The §9.4 acceptance corpus is well-formed and every query shape the
+/// benchmark below times actually finds something. This is the behavioral
+/// half of the old timed test: it runs everywhere, on any machine load.
+#[test]
+fn two_term_queries_over_the_acceptance_corpus_return_hits() {
+    let mut db = db();
+    let corpus_terms = build_perf_corpus(&mut db);
+    let meetings: i64 = db
+        .conn()
+        .query_row("SELECT count(*) FROM meetings", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(meetings, PERF_MEETINGS);
+    assert!(!corpus_terms.is_empty(), "the corpus produced no queries");
+    let total_hits: usize = corpus_terms
+        .iter()
+        .map(|pair| {
+            db.search(&SearchQuery::new(pair.clone()).limit(50))
+                .unwrap()
+                .len()
+        })
+        .sum();
+    assert!(
+        total_hits > 0,
+        "the acceptance corpus returned no hits at all"
+    );
+}
+
 /// §9.4: under 100 ms p95 for a two-term query over 1,250 meetings.
 ///
+/// A wall-clock budget, so a benchmark rather than a test (#262): on a loaded
+/// CI runner or laptop the p95 measures the scheduler, not the query, and a
+/// dev-profile run compiles the vendored SQLCipher at `-O0`. Run it on purpose,
+/// on an idle machine, in the release profile the app ships with:
+///
+/// ```text
+/// just bench-search
+/// ```
+///
 /// The corpus is generated rather than fixed so the numbers move with the
-/// schema. Note that this runs in a `cargo test` (dev) profile, which compiles
-/// the vendored SQLCipher with `-O0`; the shipped build is `-O3` with LTO, so
-/// this is a pessimistic measurement, not an optimistic one.
+/// schema.
 #[test]
-fn a_two_term_query_over_the_acceptance_corpus_stays_under_the_budget() {
+#[ignore = "benchmark: wall-clock budget; run `just bench-search` on an idle machine"]
+fn bench_two_term_query_over_the_acceptance_corpus_stays_under_the_budget() {
     let mut db = db();
     let built = Instant::now();
     let corpus_terms = build_perf_corpus(&mut db);
