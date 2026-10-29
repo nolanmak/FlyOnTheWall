@@ -504,7 +504,7 @@ file against SHA-256 hashes. Their licenses:
 | Silero VAD | https://huggingface.co/FluidInference/silero-vad-coreml | MIT |
 | Parakeet realtime EOU 120M | https://huggingface.co/FluidInference/parakeet-realtime-eou-120m-coreml | NVIDIA Open Model License |
 | Nemotron 3.5 ASR Streaming 0.6B | https://huggingface.co/FluidInference/Nemotron-3.5-ASR-Streaming-Multilingual-0.6b-CoreML | OpenMDW-1.1 |
-| Speaker diarizer (`pyannote_segmentation`, `wespeaker_v2`) | https://huggingface.co/FluidInference/speaker-diarization-coreml/tree/df2625ac79a7ac6b65ad868fee6d80f320da4232 | Unconfirmed; see below |
+| Speaker diarizer (`pyannote_segmentation`, `wespeaker_v2`) | https://huggingface.co/FluidInference/speaker-diarization-coreml/tree/df2625ac79a7ac6b65ad868fee6d80f320da4232 | Unconfirmed (#277); see below |
 
 The speaker diarizer (#246) is the pair of Core ML models FluidAudio 0.17.3's
 `DiarizerManager` loads, at the revision FluidAudio pins. The model card at
@@ -521,7 +521,8 @@ name their upstream. Its citations name pyannote's powerset segmentation
 under the MIT license) and WeSpeaker (Wang et al., 2023; its VoxCeleb ResNet34
 embedding is published as `pyannote/wespeaker-voxceleb-resnet34-LM` under
 CC BY 4.0), but it does not say these files were converted from them. Until
-that is confirmed the license is shown as unconfirmed. Attribution as the card
+that is confirmed (#277, diarizer license confirmation) the license is shown as
+"license unconfirmed (see #277)"; the model stays installable. Attribution as the card
 asks: pyannote, WeSpeaker, BUT Speech@FIT and Fluid Inference; the files are
 Fluid Inference's Core ML conversions.
 

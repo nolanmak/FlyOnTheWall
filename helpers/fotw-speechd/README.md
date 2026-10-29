@@ -84,7 +84,7 @@ check leaves the previous selection as it was. Loading reads local files only.
 | `parakeet-eou-320ms` (live captions, #245) | NVIDIA Open Model License |
 | `parakeet-eou-160ms` (live captions, faster variant, not the default) | NVIDIA Open Model License |
 | `nemotron-3.5` (560 ms + 1120 ms variants; streaming dictation, Murmur #100) | OpenMDW-1.1 |
-| `diarizer` (#246) | Unconfirmed: the model card scopes CC-BY-4.0 to other files and lists these two as legacy exclusions (see `THIRD_PARTY_NOTICES.md`) |
+| `diarizer` (#246) | Unconfirmed (#277): the model card scopes CC-BY-4.0 to other files and lists these two as legacy exclusions (see `THIRD_PARTY_NOTICES.md`) |
 
 ## Real-model suite
 

@@ -25,7 +25,8 @@
 //   the Community-1 artifacts only. It lists pyannote_segmentation.mlmodelc
 //   and wespeaker_v2.mlmodelc as "legacy exclusions" whose "original source
 //   and licensing must be evaluated separately"; the card names no upstream
-//   for them. So the license is recorded as unconfirmed, not as CC-BY-4.0.
+//   for them. So the license is recorded as unconfirmed, not as CC-BY-4.0,
+//   until #277 (diarizer license confirmation) settles it.
 // Weights are downloaded on demand by an explicit install and never committed.
 
 public struct PinnedFile: Sendable, Equatable {
@@ -154,7 +155,7 @@ public enum PinnedModels {
             PinnedFile(path: "560ms/metadata.json", size: 3003, sha256: "5a09e646e9cc1b204f6c25b414a819c51b006587a425f66f3220cf1ef0645113"),
             PinnedFile(path: "560ms/tokenizer.json", size: 284969, sha256: "fb70c8fcb6472cda2bdb799b156a8941e72762344a7c636d3b1275f1d53c4a6b"),
         ]),
-        PinnedModel(id: "diarizer", repository: "FluidInference/speaker-diarization-coreml", revision: "df2625ac79a7ac6b65ad868fee6d80f320da4232", license: "Unconfirmed (card: scoped-cc-by-4.0, these legacy files excluded)", remoteDirectory: "", files: [
+        PinnedModel(id: "diarizer", repository: "FluidInference/speaker-diarization-coreml", revision: "df2625ac79a7ac6b65ad868fee6d80f320da4232", license: "license unconfirmed (see #277)", remoteDirectory: "", files: [
             PinnedFile(path: "pyannote_segmentation.mlmodelc/analytics/coremldata.bin", size: 243, sha256: "b379db0541b35344a34bb7540783ae704c11599bbed5aa8bbbda11c20ad215ee"),
             PinnedFile(path: "pyannote_segmentation.mlmodelc/coremldata.bin", size: 316, sha256: "4a450ea1b053b9eb7eef0cab6971018076600840c7e246d064e7c5387f456c98"),
             PinnedFile(path: "pyannote_segmentation.mlmodelc/metadata.json", size: 1763, sha256: "44e1fa36d6abafacf688beccad99f7569394248d8bb41545829997c67668c08c"),

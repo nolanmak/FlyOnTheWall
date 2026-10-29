@@ -102,18 +102,39 @@ pub const CAPTIONS: HelperModel = HelperModel {
 /// 0.17.3 itself pins. The model card at that revision scopes its
 /// CC-BY-4.0 to other files of the repository and names these two as legacy
 /// exclusions whose licensing is to be evaluated separately, so the license
-/// is shown as unconfirmed (THIRD_PARTY_NOTICES.md, "Speech models").
+/// is shown as unconfirmed until #277 confirms it (THIRD_PARTY_NOTICES.md,
+/// "Speech models"). It stays installable meanwhile.
 pub const DIARIZER: HelperModel = HelperModel {
     id: "diarizer",
     repository: "FluidInference/speaker-diarization-coreml",
     revision: "df2625ac79a7ac6b65ad868fee6d80f320da4232",
     bytes: 13_720_676,
-    license: "Unconfirmed (card: scoped-cc-by-4.0, these legacy files excluded)",
+    license: "license unconfirmed (see #277)",
     note: "Speaker diarization (pyannote segmentation and WeSpeaker embeddings) for the post-meeting cleanup, run by the speech helper",
 };
 
 /// Every model installed through the helper.
 pub const HELPER_MODELS: &[HelperModel] = &[PARAKEET, CAPTIONS, DIARIZER];
+
+/// How `fotwd stt models list` shows a helper model.
+#[must_use]
+pub fn helper_model_listing(model: &HelperModel, installed: bool) -> String {
+    format!(
+        "{}: {} bytes; {}\n  {}@{}; every file size- and SHA-256-pinned\n  License: {} — {}\n  {}",
+        model.id,
+        model.bytes,
+        model.note,
+        model.repository,
+        model.revision,
+        model.license,
+        model.license_url(),
+        if installed {
+            "installed"
+        } else {
+            "not installed"
+        }
+    )
+}
 
 /// A helper model by id.
 #[must_use]
@@ -488,10 +509,13 @@ mod tests {
                 13_720_676
             )
         );
+        // Installable, with its license shown as unconfirmed until #277
+        // settles it, in the CLI listing as on the dashboard.
+        assert_eq!(model.license, "license unconfirmed (see #277)");
+        let listing = helper_model_listing(model, false);
         assert!(
-            model.license.contains("scoped-cc-by-4.0"),
-            "{}",
-            model.license
+            listing.contains("License: license unconfirmed (see #277)"),
+            "{listing}"
         );
         assert!(model.license_url().contains(model.revision));
     }

@@ -1818,19 +1818,11 @@ async fn model_setup_command(default_data_root: &std::path::Path, args: &[String
         println!("Speech helper models (fotw-speechd):");
         for model in fotwd::speechd::HELPER_MODELS {
             println!(
-                "{}: {} bytes; {}\n  {}@{}; every file size- and SHA-256-pinned\n  License: {} — {}\n  {}",
-                model.id,
-                model.bytes,
-                model.note,
-                model.repository,
-                model.revision,
-                model.license,
-                model.license_url(),
-                if fotwd::speechd::present_model(default_data_root, model) {
-                    "installed"
-                } else {
-                    "not installed"
-                }
+                "{}",
+                fotwd::speechd::helper_model_listing(
+                    model,
+                    fotwd::speechd::present_model(default_data_root, model)
+                )
             );
         }
         println!();
