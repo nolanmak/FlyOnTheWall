@@ -157,6 +157,12 @@ preserved. A crash before the receipt is published can leave a private directory
 and tiny ownership metadata; older unrecorded staging is not removed automatically.
 No meeting text is written to these files.
 
+This recovery guarantee covers app/process crashes. Power-loss persistence is
+not certified by these tests: filesystem sync alone is not evidence that the
+drive's volatile cache survived a power cut. Lost metadata can leave public
+staging behind; damaged or inconsistent ownership proof refuses admission.
+Power-loss flushing and physical fault testing remain separate validation work.
+
 The app-wide queue, capture priority and idle unload remain acceptance work in #237.
 
 For a split GGUF, set `model` to its first shard and `model_shards` to the

@@ -22,7 +22,7 @@ struct Record {
     nonce: String,
 }
 
-/// Record ownership before copying runtime bytes. A crash before publication
+/// Record ownership before copying runtime bytes. An app/process crash before publication
 /// can leave only a private directory and tiny ownership metadata, never a
 /// large unrecorded package.
 pub(super) fn begin(owner: &Path, directory: &Path) -> Result<(), String> {
