@@ -6,10 +6,14 @@
 //!   window and labels 100 ms blocks by loudness.
 //! - `fake-words`: a batch recognizer whose words are runs of constant
 //!   100 ms blocks, so windowed transcription is testable without a model.
+//!   Like `parakeet-unified`, it sends the words' segments only with
+//!   `options.timings`.
 //!
 //! Both answer at once on `finish`.
 
-use fotw_speechd_client::message::{EngineInfo, EngineKind, FinalText, Reply, Segment};
+use fotw_speechd_client::message::{
+    EngineInfo, EngineKind, FinalText, Reply, Segment, StreamOptions,
+};
 
 /// 100 ms at 16 kHz.
 const BLOCK: usize = 1_600;
@@ -130,8 +134,17 @@ fn constant(block: &[i16]) -> Option<i16> {
 }
 
 pub enum State {
-    Diarizer { samples: u64, blocks: Blocks<Voice> },
-    Words { samples: u64, blocks: Blocks<i16> },
+    Diarizer {
+        samples: u64,
+        blocks: Blocks<Voice>,
+    },
+    Words {
+        samples: u64,
+        blocks: Blocks<i16>,
+        /// `options.timings`: send the words' segments, as parakeet-unified
+        /// does.
+        timings: bool,
+    },
 }
 
 /// What one audio frame did to a stream.
@@ -143,7 +156,7 @@ pub enum Outcome {
 }
 
 impl State {
-    pub fn new(engine: &str) -> Option<Self> {
+    pub fn new(engine: &str, options: &StreamOptions) -> Option<Self> {
         match engine {
             DIARIZER => Some(Self::Diarizer {
                 samples: 0,
@@ -152,6 +165,7 @@ impl State {
             WORDS => Some(Self::Words {
                 samples: 0,
                 blocks: Blocks::new(),
+                timings: options.timings,
             }),
             _ => None,
         }
@@ -179,7 +193,9 @@ impl State {
                     .collect();
                 Outcome::Ok(acks)
             }
-            Self::Words { samples, blocks } => {
+            Self::Words {
+                samples, blocks, ..
+            } => {
                 *samples += pcm.len() as u64;
                 if *samples > WORDS_MAX_SAMPLES {
                     return Outcome::TooLong("a batch stream holds at most 10 minutes");
@@ -194,7 +210,9 @@ impl State {
         let ms = |block: u64| block * 100;
         let (samples, text, segments) = match self {
             Self::Diarizer { samples, blocks } => {
-                // Labels in order of first appearance.
+                // The stream's speaker tracker: a label per voice, numbered in
+                // order of first appearance over the whole stream, never per
+                // window (the real engine's tracker lives for the stream).
                 let mut seen: Vec<Voice> = Vec::new();
                 let segments = blocks
                     .runs
@@ -214,8 +232,12 @@ impl State {
                     .collect();
                 (samples, String::new(), segments)
             }
-            Self::Words { samples, blocks } => {
-                let segments: Vec<Segment> = blocks
+            Self::Words {
+                samples,
+                blocks,
+                timings,
+            } => {
+                let words: Vec<Segment> = blocks
                     .runs
                     .iter()
                     .map(|run| Segment {
@@ -225,12 +247,12 @@ impl State {
                         speaker: None,
                     })
                     .collect();
-                let text = segments
+                let text = words
                     .iter()
                     .filter_map(|s| s.text.as_deref())
                     .collect::<Vec<_>>()
                     .join(" ");
-                (samples, text, segments)
+                (samples, text, if timings { words } else { Vec::new() })
             }
         };
         FinalText {

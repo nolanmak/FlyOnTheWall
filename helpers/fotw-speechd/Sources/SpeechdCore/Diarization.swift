@@ -117,6 +117,21 @@ public final class WindowedDiarizationSession: EngineSession, @unchecked Sendabl
         window.reserveCapacity(Self.windowSamples)
     }
 
+    /// A session whose model keeps per-stream state, as a diarizer's speaker
+    /// tracker: each window sees the state the previous one returned.
+    public convenience init<State: Sendable>(
+        model: String, maxAudioMs: UInt64 = WindowedDiarizationSession.maxAudioMs, initial: State,
+        diarize: @escaping @Sendable (_ window: [Float], _ startSample: Int, _ state: State) async throws
+            -> (WindowResult, State)
+    ) {
+        let carried = Carried(initial)
+        self.init(model: model, maxAudioMs: maxAudioMs) { window, start in
+            let (result, next) = try await diarize(window, start, carried.state)
+            carried.state = next
+            return result
+        }
+    }
+
     public func append(_ samples: [Float]) async throws -> [EngineEvent] {
         guard processed + window.count + samples.count <= maxSamples else {
             throw SpeechdError("too_long", "a diarization stream holds at most \(maxSamples / Int(Wire.sampleRate) / 3600) hours")
@@ -152,6 +167,13 @@ public final class WindowedDiarizationSession: EngineSession, @unchecked Sendabl
                                              endMs: milliseconds(samples: processed))
         window.removeAll(keepingCapacity: true)
     }
+}
+
+/// A stream's model state between windows. Used only from that stream's
+/// task, one window at a time.
+private final class Carried<State: Sendable>: @unchecked Sendable {
+    var state: State
+    init(_ state: State) { self.state = state }
 }
 
 /// One recognizer token with its time, as FluidAudio's `TokenTiming` gives it.

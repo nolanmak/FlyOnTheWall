@@ -146,10 +146,7 @@ impl PassEngine for HelperEngine {
     fn transcribe<'a>(&'a self, pcm: &'a [i16]) -> BoxFuture<'a, Result<Vec<TimedWord>, String>> {
         Box::pin(async move {
             let config = StreamConfig {
-                options: StreamOptions {
-                    timings: self.request_timings,
-                    ..StreamOptions::default()
-                },
+                options: StreamOptions::default().with_timings(self.request_timings),
                 ..StreamConfig::new(self.asr, RATE)
             };
             let mut stream = self
@@ -198,10 +195,8 @@ impl PassEngine for HelperEngine {
             let stream = self
                 .client
                 .open_stream(StreamConfig {
-                    options: StreamOptions {
-                        speaker_threshold: self.speaker_threshold,
-                        ..StreamOptions::default()
-                    },
+                    options: StreamOptions::default()
+                        .with_speaker_threshold(self.speaker_threshold),
                     ..StreamConfig::new(self.diarizer_engine, RATE)
                 })
                 .await

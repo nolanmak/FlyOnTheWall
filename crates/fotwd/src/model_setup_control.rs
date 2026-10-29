@@ -339,7 +339,8 @@ mod tests {
             (diarizer.name.as_str(), diarizer.present),
             ("diarizer", false)
         );
-        assert!(diarizer.license.contains("scoped-cc-by-4.0"));
+        // Installable, but its license is not confirmed yet (#277).
+        assert_eq!(diarizer.license, "license unconfirmed (see #277)");
         assert!(s.models[3..].iter().all(|m| m.license == "MIT"
             && m.revision.len() == 40
             && m.sha256.len() == 64

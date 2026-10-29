@@ -6,6 +6,8 @@
 //   model-free window diarizer that labels 100 ms blocks by loudness.
 // - `fake-words` is a batch recognizer whose words are runs of constant
 //   100 ms blocks, so windowed transcription is testable without a model.
+//   Like parakeet-unified, it sends the words' segments only with
+//   `options.timings`.
 //
 // Both answer at once on `finish`.
 import Foundation
@@ -39,11 +41,14 @@ public actor PostPassFakeEngine: SpeechEngine {
     public func makeSession(options: StreamOptions) async throws -> any EngineSession {
         guard loaded else { throw SpeechdError.notLoaded(descriptor.id) }
         if descriptor.id == "fake-diarizer" {
-            return WindowedDiarizationSession(model: "fake-diarizer@fake") { window, start in
-                FakeBlocks.diarize(window, startSample: start)
+            // A per-stream speaker tracker, carried by the session as the real
+            // engine's is: a reset per window would relabel speakers.
+            return WindowedDiarizationSession(model: "fake-diarizer@fake", initial: FakeSpeakers()) {
+                window, start, speakers in
+                FakeBlocks.diarize(window, startSample: start, speakers: speakers)
             }
         }
-        return FakeWordsSession()
+        return FakeWordsSession(timings: options.timings ?? false)
     }
 }
 
@@ -79,14 +84,34 @@ enum FakeBlocks {
         return runs
     }
 
-    /// `fake-diarizer`'s model: one window's blocks labelled "low" or "high".
-    static func diarize(_ window: [Float], startSample: Int) -> WindowResult {
+    /// `fake-diarizer`'s model: one window's blocks classed "low" or "high",
+    /// like an embedding, then matched against the stream's tracker, which
+    /// numbers a class it has not heard before next, as FluidAudio's
+    /// SpeakerManager numbers new speakers.
+    static func diarize(_ window: [Float], startSample: Int,
+                        speakers: FakeSpeakers) -> (WindowResult, FakeSpeakers) {
         let runs = runs(window[...], firstBlock: startSample / block) { block -> String? in
             let peak = int16(max(block.max() ?? 0, -(block.min() ?? 0)))
             return peak >= loud ? "high" : peak >= quiet ? "low" : nil
         }
-        let spans = runs.map { SpeakerSpan(startMs: UInt64($0.1) * 100, endMs: UInt64($0.2 + 1) * 100, speaker: $0.0) }
-        return WindowResult(spans: spans, speakerCount: Set(runs.map(\.0)).count)
+        var speakers = speakers
+        let spans = runs.map { run in
+            SpeakerSpan(startMs: UInt64(run.1) * 100, endMs: UInt64(run.2 + 1) * 100,
+                        speaker: speakers.id(for: run.0))
+        }
+        return (WindowResult(spans: spans, speakerCount: speakers.ids.count), speakers)
+    }
+}
+
+/// `fake-diarizer`'s speaker tracker: a speaker id per class heard so far.
+struct FakeSpeakers: Sendable {
+    var ids: [String: String] = [:]
+
+    mutating func id(for voice: String) -> String {
+        if let id = ids[voice] { return id }
+        let id = String(ids.count + 1)
+        ids[voice] = id
+        return id
     }
 }
 
@@ -94,10 +119,16 @@ enum FakeBlocks {
 /// word `w<v>`, and a run of such blocks with the same v is one word.
 final class FakeWordsSession: EngineSession, @unchecked Sendable {
     // @unchecked: confined to its stream's task.
+    /// `options.timings`: send the words' segments, as parakeet-unified does.
+    private let timings: Bool
     private var pending: [Float] = []
     private var blocks = 0
     private var samples = 0
     private var runs: [(Int, Int, Int)] = []
+
+    init(timings: Bool) {
+        self.timings = timings
+    }
 
     func append(_ chunk: [Float]) async throws -> [EngineEvent] {
         samples += chunk.count
@@ -125,7 +156,8 @@ final class FakeWordsSession: EngineSession, @unchecked Sendable {
     func finish() async throws -> [EngineEvent] {
         let words = runs.map { TimedSegment(startMs: UInt64($0.1) * 100, endMs: UInt64($0.2 + 1) * 100, text: "w\($0.0)") }
         return [.final(text: words.compactMap(\.text).joined(separator: " "), startMs: 0,
-                       endMs: milliseconds(samples: samples), segments: words, model: "fake-words@fake",
+                       endMs: milliseconds(samples: samples), segments: timings ? words : [],
+                       model: "fake-words@fake",
                        utterance: nil)]
     }
 }

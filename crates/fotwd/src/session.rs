@@ -1843,12 +1843,60 @@ pub async fn run_with_stop(
 /// Whatever [`run`] fails with.
 pub async fn run_with_control(
     root: &Path,
+    system: Box<dyn AudioTap>,
+    mic: Option<Box<dyn AudioTap>>,
+    transcription: Transcription,
+    duration: Duration,
+    control: SessionControl,
+) -> Result<SessionOutcome, String> {
+    run_unsupervised(
+        root,
+        system,
+        mic,
+        transcription,
+        duration,
+        control,
+        Arc::new(fotw_audio::clock::HostClock),
+    )
+    .await
+}
+
+/// [`run_with_control`], with audio processing timed on `clock` rather than
+/// the host clock.
+///
+/// The capture-host clock that processing deadlines, reference freshness and
+/// owner waits are measured on. Production uses [`run_with_control`]; a test
+/// whose taps stamp a generated timeline passes a clock that follows that
+/// timeline, so a descheduled pump is not mistaken for late audio (#262).
+/// [`run_supervised`] already takes its clock the same way.
+///
+/// # Errors
+///
+/// Whatever [`run`] fails with.
+#[cfg(feature = "experimental-aec")]
+pub async fn run_with_control_on_clock(
+    root: &Path,
+    system: Box<dyn AudioTap>,
+    mic: Option<Box<dyn AudioTap>>,
+    transcription: Transcription,
+    duration: Duration,
+    control: SessionControl,
+    clock: Arc<dyn Clock>,
+) -> Result<SessionOutcome, String> {
+    run_unsupervised(root, system, mic, transcription, duration, control, clock).await
+}
+
+async fn run_unsupervised(
+    root: &Path,
     mut system: Box<dyn AudioTap>,
     mut mic: Option<Box<dyn AudioTap>>,
     transcription: Transcription,
     duration: Duration,
     control: SessionControl,
+    clock: Arc<dyn Clock>,
 ) -> Result<SessionOutcome, String> {
+    #[cfg(not(feature = "experimental-aec"))]
+    let _ = clock;
     #[cfg(feature = "experimental-aec")]
     let processing = control.take_processing()?;
     #[cfg(feature = "experimental-aec")]
@@ -1939,7 +1987,7 @@ pub async fn run_with_control(
         timing: PumpTiming {
             mic_anchor: anchors.mic_ms.checked_mul(16),
             #[cfg(feature = "experimental-aec")]
-            clock: Arc::new(fotw_audio::clock::HostClock),
+            clock,
         },
         #[cfg(feature = "experimental-aec")]
         processing,

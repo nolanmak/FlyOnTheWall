@@ -4,7 +4,9 @@
 
 use std::time::Duration;
 
-use fotw_speechd_client::message::{CloseReason, EngineKind, ErrorCode, FinalText, Segment};
+use fotw_speechd_client::message::{
+    CloseReason, EngineKind, ErrorCode, FinalText, Segment, StreamOptions,
+};
 use fotw_speechd_client::{
     ClientError, DIARIZATION_MAX_UNACKED_MS, SpeechStream, SpeechdClient, StreamEvent,
 };
@@ -192,9 +194,16 @@ async fn fake_diarizer_refuses_audio_past_four_hours_with_too_long() {
     }
 }
 
-/// Batch-finish a `fake-words` stream on `pcm`.
+/// Batch-finish a `fake-words` stream on `pcm`, asking for word timings.
 async fn words_of(client: &SpeechdClient, pcm: &[i16]) -> FinalText {
-    let mut s = client.open_stream(stream("fake-words")).await.unwrap();
+    words_with(client, pcm, true).await
+}
+
+/// Batch-finish a `fake-words` stream on `pcm`.
+async fn words_with(client: &SpeechdClient, pcm: &[i16], timings: bool) -> FinalText {
+    let mut config = stream("fake-words");
+    config.options = StreamOptions::default().with_timings(timings);
+    let mut s = client.open_stream(config).await.unwrap();
     s.send_audio(pcm).await.unwrap();
     s.finish().await.unwrap();
     let mut events = rest(&mut s).await;
@@ -260,4 +269,57 @@ async fn fake_words_cuts_a_word_at_a_window_edge_and_the_next_overlapping_window
         vec![word(100, 500, "w900"), word(600, 700, "w300")]
     );
     assert_eq!(second.text, "w900 w300");
+}
+
+#[tokio::test]
+async fn fake_words_reports_word_segments_only_when_asked_for_timings() {
+    // Like parakeet-unified: the text either way, the words' times only with
+    // `options.timings`, so a daemon that forgets to ask gets no segments.
+    let client = started("fake-words").await;
+    let pcm = blocks(&[0, 400, 400, 0, 900]);
+    let plain = words_with(&client, &pcm, false).await;
+    let timed = words_with(&client, &pcm, true).await;
+    assert_eq!(plain.text, "w400 w900");
+    assert_eq!(plain.segments, vec![], "no timings asked for, none sent");
+    assert_eq!(timed.text, plain.text);
+    assert_eq!(
+        timed.segments,
+        vec![word(100, 300, "w400"), word(400, 500, "w900")]
+    );
+}
+
+#[tokio::test]
+async fn fake_diarizer_keeps_a_speakers_label_across_windows() {
+    // A (loud) across the 10 s edge, then B (quiet), then, in the third
+    // window, B first and A again. The speaker tracker lives for the stream,
+    // as the real engine's does: one reset per window would hand B the label
+    // A had (each window would start again at its first voice).
+    let client = started("fake-diarizer").await;
+    let mut pcm = blocks(&[0; 20]);
+    pcm.extend((20..130).flat_map(|_| block_peaking_at(20_000)));
+    pcm.extend(blocks(&[0; 10]));
+    pcm.extend((140..180).flat_map(|_| block_peaking_at(1_000)));
+    pcm.extend(blocks(&[0; 20]));
+    pcm.extend((200..220).flat_map(|_| block_peaking_at(1_000)));
+    pcm.extend(blocks(&[0; 30]));
+    pcm.extend((250..280).flat_map(|_| block_peaking_at(20_000)));
+    pcm.extend(blocks(&[0; 20]));
+    assert_eq!(pcm.len(), 300 * BLOCK);
+
+    let mut s = client.open_stream(stream("fake-diarizer")).await.unwrap();
+    s.send_audio(&pcm).await.unwrap();
+    s.finish().await.unwrap();
+    let events = rest(&mut s).await;
+    let Some(StreamEvent::Final(f)) = events.iter().rev().nth(1) else {
+        panic!("expected a final before close: {events:?}")
+    };
+    assert_eq!(
+        f.segments,
+        vec![
+            speaker(2_000, 13_000, "S1"),
+            speaker(14_000, 18_000, "S2"),
+            speaker(20_000, 22_000, "S2"),
+            speaker(25_000, 28_000, "S1"),
+        ]
+    );
 }
