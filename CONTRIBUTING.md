@@ -148,9 +148,22 @@ for kernel exit events. All workers inherit the same network sandbox. Retain and
 await `shutdown` to confirm native exit and guardian reaping; requesting Stop is
 separate from confirming resource release.
 
-The app-wide queue, capture priority, idle unload and crash-staging recovery
-remain acceptance work in #237. Forced app exit can leave public runtime staging
-copies in its private temporary directory; no meeting text is written there.
+New loads durably record metadata-only staging ownership before copying runtime
+bytes. After the previous lease holders release admission, the next load can
+remove that staging only when the receipt's owner/directory identity and random
+marker agree. Damaged or mismatched proof refuses admission; recovery never scans
+for directory prefixes or signals recorded PIDs. Model-cache symlink targets are
+preserved. A crash before the receipt is published can leave a private directory
+and tiny ownership metadata; older unrecorded staging is not removed automatically.
+No meeting text is written to these files.
+
+This recovery guarantee covers app/process crashes. Power-loss persistence is
+not certified by these tests: filesystem sync alone is not evidence that the
+drive's volatile cache survived a power cut. Lost metadata can leave public
+staging behind; damaged or inconsistent ownership proof refuses admission.
+Power-loss flushing and physical fault testing remain separate validation work.
+
+The app-wide queue, capture priority and idle unload remain acceptance work in #237.
 
 For a split GGUF, set `model` to its first shard and `model_shards` to the
 remaining pinned artifacts. Each shard keeps its verified read-only descriptor

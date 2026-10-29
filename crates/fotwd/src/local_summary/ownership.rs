@@ -50,7 +50,9 @@ impl OwnerLease {
             }
             .into());
         }
-        Ok(Self(file, AtomicBool::new(false)))
+        let lease = Self(file, AtomicBool::new(false));
+        super::staging::recover(directory)?;
+        Ok(lease)
     }
 
     pub(super) fn file(&self) -> &File {

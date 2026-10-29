@@ -406,6 +406,7 @@ fn prepare(
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
         .map_err(|_| "private runtime permissions failed")?;
+    super::staging::begin(&config.ownership_directory, root.path())?;
     let mut names = std::collections::HashSet::new();
     for artifact in &config.runtime_files {
         let name = artifact

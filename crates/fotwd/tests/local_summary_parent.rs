@@ -226,7 +226,7 @@ while True:
             );
         }
         let observed: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(native_ready).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(&native_ready).unwrap()).unwrap();
         let pid = observed["pid"].as_u64().unwrap().try_into().unwrap();
         let guardian_pid = observed["guardian"].as_u64().unwrap().try_into().unwrap();
         // Admission must be shared by every app instance, not just requests
@@ -259,6 +259,50 @@ while True:
         let guardian_finally = guardian.wait(Duration::from_secs(15));
         assert!(finally, "bounded fake native did not finish");
         assert!(guardian_finally, "owned guardian did not finish");
+        let mut recovered_staging = true;
+        if mode == "ready" {
+            // A later app instance must reclaim only the proven staging of
+            // this now-exited owner before starting another native model.
+            let recovered_ready = root.join("recovered-ready");
+            let child = Command::new(env!("CARGO_BIN_EXE_fotwd"))
+                .arg("--test-local-summary-parent")
+                .arg(&config)
+                .arg(&recovered_ready)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+            let mut replacement = Parent(Some(child));
+            let until = Instant::now() + Duration::from_secs(15);
+            while !recovered_ready.exists() {
+                assert!(
+                    replacement
+                        .0
+                        .as_mut()
+                        .unwrap()
+                        .try_wait()
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    Instant::now() < until,
+                    "replacement owner did not become ready"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            recovered_staging = !Path::new(observed["directory"].as_str().unwrap()).exists();
+            let next: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&native_ready).unwrap()).unwrap();
+            let mut next_native = ExitWatch::new(next["pid"].as_u64().unwrap().try_into().unwrap());
+            let mut next_guardian =
+                ExitWatch::new(next["guardian"].as_u64().unwrap().try_into().unwrap());
+            let next_pid = replacement.0.as_ref().unwrap().id();
+            replacement.stop();
+            assert!(next_native.wait(Duration::from_secs(15)));
+            assert!(next_guardian.wait(Duration::from_secs(15)));
+            cleanup_fixture_staging(&next, next_pid);
+        }
         if mode == "guardian_crash" {
             // No completion/health call was allowed to trigger cleanup before
             // this observation. Now verify that a later call is refused and
@@ -281,26 +325,11 @@ while True:
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
-        // SIGKILL bypassed the app's TempDir destructor. Remove only this
-        // fixture's proven runtime staging, after both original processes exit.
-        let directory = Path::new(observed["directory"].as_str().unwrap());
-        assert_eq!(directory.parent(), Some(Path::new("/private/tmp")));
+        cleanup_fixture_staging(&observed, app_pid);
         assert!(
-            directory
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .starts_with("fotw-summary-")
+            recovered_staging,
+            "a restarted app left its proven exited runtime staging behind"
         );
-        if directory.exists() {
-            assert!(std::fs::symlink_metadata(directory).unwrap().is_dir());
-            let spec: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(directory.join("worker.json")).unwrap())
-                    .unwrap();
-            assert_eq!(spec["parent_pid"].as_u64(), Some(u64::from(app_pid)));
-            std::fs::remove_dir_all(directory).unwrap();
-        }
         assert!(
             !available_while_running,
             "a second app owner could acquire admission while a model was running"
@@ -316,5 +345,25 @@ while True:
             "{mode}: an owner died but its owned native model remained running"
         );
         assert!(guardian_promptly, "the owned guardian outlived its app");
+    }
+}
+
+fn cleanup_fixture_staging(observed: &serde_json::Value, app_pid: u32) {
+    let directory = Path::new(observed["directory"].as_str().unwrap());
+    assert_eq!(directory.parent(), Some(Path::new("/private/tmp")));
+    assert!(
+        directory
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("fotw-summary-")
+    );
+    if directory.exists() {
+        assert!(std::fs::symlink_metadata(directory).unwrap().is_dir());
+        let spec: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join("worker.json")).unwrap()).unwrap();
+        assert_eq!(spec["parent_pid"].as_u64(), Some(u64::from(app_pid)));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
