@@ -275,6 +275,36 @@ row_type!(
 );
 
 row_type!(
+    /// A post-meeting cleanup job (#246): its plan, progress, which transcript
+    /// was live and which one it produced, and the engines' provenance.
+    PostPassJobRow, "post_pass_jobs",
+    pk = ["meeting_id"], exclusive = [], {
+        meeting_id: String,
+        state: String,
+        created_at_ms: i64,
+        updated_at_ms: i64,
+        plan_json: String,
+        progress_permille: i64,
+        live_transcript_id: Option<String>,
+        cleaned_transcript_id: Option<String>,
+        provenance_json: Option<String>,
+        detail: Option<String>,
+    }
+);
+
+row_type!(
+    /// One checkpointed window of a pending cleanup job (#246).
+    PostPassWindowRow, "post_pass_windows",
+    pk = ["id"], exclusive = [], {
+        id: String,
+        meeting_id: String,
+        channel: String,
+        idx: i64,
+        words_json: String,
+    }
+);
+
+row_type!(
     /// A row of `folders`.
     FolderRow, "folders",
     pk = ["id"], exclusive = [], {
@@ -623,6 +653,12 @@ pub struct MeetingDoc {
     /// Original interval receipts for idempotent recovery after import.
     #[serde(default)]
     pub speech_receipts: Vec<SpeechReceiptRow>,
+    /// The post-meeting cleanup job. Absent in older archives.
+    #[serde(default)]
+    pub post_pass_jobs: Vec<PostPassJobRow>,
+    /// A pending cleanup's checkpoints. Absent in older archives.
+    #[serde(default)]
+    pub post_pass_windows: Vec<PostPassWindowRow>,
     /// The note document, if there is one.
     pub notes: Vec<NoteRow>,
     /// Its anchors.
@@ -683,6 +719,8 @@ impl Db {
             segments: self.fetch_by_meeting("ORDER BY transcript_id, idx", meeting_id)?,
             speech_epochs: self.fetch_by_meeting("ORDER BY session_id,source,epoch", meeting_id)?,
             speech_receipts: self.fetch_by_meeting("ORDER BY epoch_id,from_sample", meeting_id)?,
+            post_pass_jobs: self.fetch_by_meeting("ORDER BY meeting_id", meeting_id)?,
+            post_pass_windows: self.fetch_by_meeting("ORDER BY channel, idx", meeting_id)?,
             notes: self.fetch_by_meeting("ORDER BY id", meeting_id)?,
             note_anchors: self.fetch_by_meeting("ORDER BY note_id, block_idx", meeting_id)?,
             summaries: self.fetch_by_meeting("ORDER BY version", meeting_id)?,
@@ -806,6 +844,8 @@ impl_table_row!(
     SegmentRow,
     SpeechEpochRow,
     SpeechReceiptRow,
+    PostPassJobRow,
+    PostPassWindowRow,
     NoteRow,
     NoteAnchorRow,
     SummaryRow,
@@ -896,16 +936,110 @@ impl MeetingDoc {
     }
 
     fn primary_segments(&self) -> Vec<&SegmentRow> {
-        let primary = self.primary_transcript();
+        self.primary_transcript()
+            .map(|p| self.segments_of(&p.id))
+            .unwrap_or_default()
+    }
+
+    fn segments_of(&self, transcript_id: &str) -> Vec<&SegmentRow> {
         let mut rows: Vec<_> = self
             .segments
             .iter()
-            .filter(|s| {
-                primary.is_some_and(|p| s.transcript_id == p.id) && !s.text.trim().is_empty()
-            })
+            .filter(|s| s.transcript_id == transcript_id && !s.text.trim().is_empty())
             .collect();
         rows.sort_by_key(|s| (s.start_ms, s.idx));
         rows
+    }
+
+    /// A finished post-meeting cleanup (#246) and the version it is not
+    /// showing: `(job, other transcript, whether the cleaned one is shown)`.
+    fn cleanup_versions(&self) -> Option<(&PostPassJobRow, &TranscriptRow, bool)> {
+        let job = self.post_pass_jobs.iter().find(|j| j.state == "done")?;
+        let cleaned = job.cleaned_transcript_id.as_deref()?;
+        let live = job.live_transcript_id.as_deref()?;
+        let primary = self.primary_transcript()?;
+        let cleaned_shown = primary.id == cleaned;
+        if !cleaned_shown && primary.id != live {
+            return None;
+        }
+        let other = if cleaned_shown { live } else { cleaned };
+        let other = self.transcripts.iter().find(|t| t.id == other)?;
+        Some((job, other, cleaned_shown))
+    }
+
+    /// Both transcript versions and where each came from.
+    fn versions_text(&self, markdown: bool) -> String {
+        let Some((job, other, cleaned_shown)) = self.cleanup_versions() else {
+            return String::new();
+        };
+        let field = |value: &str| export_metadata(value, markdown);
+        let provenance: serde_json::Value = job
+            .provenance_json
+            .as_deref()
+            .and_then(|p| serde_json::from_str(p).ok())
+            .unwrap_or_default();
+        let engines = ["asr", "vad", "diarizer"]
+            .iter()
+            .filter_map(|k| provenance["engines"][k].as_str())
+            .map(field)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let labels = if provenance["speaker_labels"] == true {
+            "with speaker labels"
+        } else {
+            "without speaker labels"
+        };
+        let live = if cleaned_shown {
+            other
+        } else {
+            self.primary_transcript().unwrap_or(other)
+        };
+        let mut out = String::from(if markdown {
+            "## Transcript versions\n\n"
+        } else {
+            "Transcript versions\n\n"
+        });
+        out.push_str(&format!(
+            "- Cleaned{}: re-transcribed on this Mac after the meeting from the saved audio ({engines}), in {} s windows with {} s overlap, {labels}.\n",
+            if cleaned_shown { " (shown above)" } else { "" },
+            provenance["window_ms"].as_u64().unwrap_or(0) / 1000,
+            provenance["overlap_ms"].as_u64().unwrap_or(0) / 1000,
+        ));
+        out.push_str(&format!(
+            "- Live{}: transcribed during the meeting by {} / {}.\n",
+            if cleaned_shown { "" } else { " (shown above)" },
+            field(&live.provider),
+            field(&live.model),
+        ));
+        if let Some(detail) = job.detail.as_deref().filter(|d| !d.is_empty()) {
+            out.push_str(&format!("- Note: {}.\n", field(detail)));
+        }
+        out.push('\n');
+        out
+    }
+
+    /// The version not shown, under its own heading.
+    fn other_version_text(&self, markdown: bool) -> String {
+        let Some((_, other, cleaned_shown)) = self.cleanup_versions() else {
+            return String::new();
+        };
+        let lines = self.lines_of(
+            &self.segments_of(&other.id),
+            if markdown { "- " } else { "" },
+        );
+        if lines.is_empty() {
+            return String::new();
+        }
+        let title = if cleaned_shown {
+            "Live transcript"
+        } else {
+            "Cleaned transcript"
+        };
+        if markdown {
+            format!("\n## {title}\n\n{lines}")
+        } else {
+            format!("\n{title}\n\n{lines}")
+        }
     }
 
     /// The summary the UI shows, if there is one.
@@ -1047,9 +1181,11 @@ impl MeetingDoc {
         }
 
         out.push_str(&self.speech_history_text(true));
+        out.push_str(&self.versions_text(true));
         if !self.segments.is_empty() {
             out.push_str("## Transcript\n\n");
             out.push_str(&self.transcript_lines("- "));
+            out.push_str(&self.other_version_text(true));
             out.push('\n');
         }
         out
@@ -1070,7 +1206,9 @@ impl MeetingDoc {
             iso_date(m.started_at_ms)
         ));
         out.push_str(&self.speech_history_text(false));
+        out.push_str(&self.versions_text(false));
         out.push_str(&self.transcript_lines(""));
+        out.push_str(&self.other_version_text(false));
         out
     }
 
@@ -1177,7 +1315,11 @@ impl MeetingDoc {
     /// single wall of text with the timestamps buried mid-sentence. List items
     /// are the only form that survives every renderer.
     fn transcript_lines(&self, prefix: &str) -> String {
-        let rows = self.primary_segments();
+        self.lines_of(&self.primary_segments(), prefix)
+    }
+
+    fn lines_of(&self, rows: &[&SegmentRow], prefix: &str) -> String {
+        let rows = rows.to_vec();
         let Some(origin) = rows.first().map(|s| s.start_ms) else {
             return String::new();
         };

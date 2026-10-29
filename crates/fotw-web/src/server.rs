@@ -196,6 +196,23 @@ fn routes(state: AppState) -> Router {
             "/api/meetings/{id}/speech-recovery/cancel",
             post(crate::speech_recovery::cancel),
         )
+        .route("/api/meetings/{id}/cleanup", get(crate::cleanup::status))
+        .route(
+            "/api/meetings/{id}/cleanup/show",
+            post(crate::cleanup::show),
+        )
+        .route(
+            "/api/meetings/{id}/cleanup/retry",
+            post(crate::cleanup::retry),
+        )
+        .route(
+            "/api/meetings/{id}/cleanup/cancel",
+            post(crate::cleanup::cancel),
+        )
+        .route(
+            "/api/settings/cleanup",
+            get(crate::cleanup::get_settings).post(crate::cleanup::post_settings),
+        )
         .route(
             "/api/meetings/{id}/notes",
             get(crate::notes::load).post(crate::notes::save),
