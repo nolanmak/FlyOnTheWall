@@ -149,3 +149,71 @@ Ordinary suite (offline, fakes):
   the live/cleaned switch, the setting.
 
 Real models: `crates/fotwd/examples/post_pass_eval.rs` (acceptance below).
+
+## Acceptance (measured 2026-10-28, M3 MacBook Air 24 GB)
+
+Real models: Parakeet Unified `d32e972`, Silero v5.1.2 (ggml), diarizer
+`speaker-diarization-coreml@df2625a` (FluidAudio 0.17.3's pin; license
+unconfirmed, see #277), helper built from FluidAudio 0.17.3. Fixtures:
+`tools/speech-eval/ami_replay.py` (#267): AMI ES2004c, IS1009c and TS3003c,
+120–720 s. The mic track is the #118 mic headset; the system track is the
+sum of the other three headsets ÷ 2. The reference is **every speaker's
+words in time order** (the corrected #118 method). Runner:
+`crates/fotwd/examples/post_pass_eval.rs`; scorer: `meeting_score.py`.
+
+**WER, all-speaker reference** (gate: cleaned ≤ live and ≤ 15%):
+
+| meeting | live | cleaned | gate |
+|---|---|---|---|
+| ES2004c | 30.6% | 16.1% | fails ≤ 15% |
+| IS1009c | 93.3% | 19.8% | fails ≤ 15% |
+| TS3003c | 11.8% | 17.3% | fails both |
+
+Per channel the cleaned version is close to the models' limit (ES2004c mic
+7.7%, system 16.0%). What remains is mostly AMI headset crosstalk: each
+headset also picks up the others, so the summed system track carries the mic
+speaker's voice too, and windowed Parakeet, hearing 30 s at a time,
+transcribes that quiet crosstalk where the live path did not (TS3003c's
+69 system-channel insertions). Turn ordering across overlapping speech costs
+the rest. A real call's system audio carries only the remote side.
+
+**#241's fixture** (AMI ES2004c Headset-2, 120–720 s, which local Whisper
+emptied): 663 reference words, WER 7.5%, deletions 3.8%
+(`crates/fotwd/tests/post_pass_real.rs`).
+
+**DER** of the diarizer's spans, pyannote-style with overlap scored, gate
+≤ 25% at ±0.25 s per reference boundary (pyannote `collar=0.5`):
+
+| meeting | system speakers only (as specified) | every voice in the system track | same, ±0.125 s (pyannote `collar=0.25`) |
+|---|---|---|---|
+| ES2004c | 60.9% | 19.5% | 22.8% |
+| IS1009c | 132.4% | 10.2% | 13.6% |
+| TS3003c | 87.2% | 14.5% | 15.5% |
+
+Against the system speakers alone the gate fails, and the reason is the
+replay rather than the diarizer: on ES2004c 147 of 153 s of false alarm fall
+inside the mic speaker's own turns, i.e. their crosstalk summed into the
+system track, which the diarizer correctly hears as a voice. Counting every
+voice present in the system track, the gate passes on all three.
+
+The speaker threshold (0.6) was chosen by sweeping 0.84 (FluidAudio's
+default), 0.7, 0.6, 0.5 and 0.4 on these same three meetings, so it is tuned
+on the acceptance set:
+
+| threshold | ES2004c | IS1009c | TS3003c (every-voice DER) |
+|---|---|---|---|
+| 0.84 | 38.0% | 27.9% | 33.0% |
+| 0.7 | 25.1% | 10.0% | 14.5% |
+| 0.6 | 19.5% | 10.2% | 14.5% |
+| 0.5 | 20.8% | 12.4% | 15.0% |
+| 0.4 | 22.1% | 13.9% | 15.5% |
+
+**Speed and memory**, a 60:00 two-track replay (ES2004c whole, then
+IS1009c), Opus archives pre-encoded so only the cleanup is timed, AC power,
+quiet machine (load 6.5; Murmur's idle helper the only other speech
+process): **107.1 s, RTF 0.030** (gate ≤ 6 min). Peak RSS: daemon side
+157 MB + helper 121 MB = 278 MB (gate ≤ 1.5 GiB). Peak physical footprint:
+375 MB + 207 MB. Core ML keeps model weights in wired memory outside both
+processes: system-wide wired memory rose by 1,464 MiB during the run
+(3,390 → 4,854 MiB, `vm_stat`), an upper bound on what the models pinned.
+The 10-minute meetings each cleaned in 12–14 s (RTF 0.02).
