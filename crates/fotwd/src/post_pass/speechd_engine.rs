@@ -23,8 +23,10 @@ use crate::speechd::{DIARIZER, PARAKEET};
 pub const DIARIZER_ENGINE: &str = "diarizer";
 /// The diarizer's speaker threshold for meetings. FluidAudio's default
 /// (0.84) merged two of three remote speakers on AMI ES2004c; swept over
-/// 0.84/0.7/0.6/0.5/0.4 on the three AMI meetings, 0.6 had the lowest or
-/// equal-lowest DER on each (docs/POST_MEETING_CLEANUP.md).
+/// 0.84/0.7/0.6/0.5/0.4 on the three AMI meetings, 0.6 had the lowest DER on
+/// ES2004c and the lowest total; on IS1009c 0.7 was 0.2 points lower, on
+/// TS3003c they tied. Chosen on the acceptance meetings themselves, so the
+/// numbers are not held-out (docs/POST_MEETING_CLEANUP.md).
 pub const SPEAKER_THRESHOLD: Option<f32> = Some(0.6);
 /// PCM per audio frame to the helper: 5 s, well under its 1 MiB frame.
 const FRAME: usize = 16_000 * 5;
