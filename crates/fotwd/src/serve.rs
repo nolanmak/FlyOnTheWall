@@ -622,6 +622,52 @@ async fn serve_until_stopped(
             .set_capture(Arc::new(crate::capture_settings::SettingsControl::new(db)));
     }
 
+    // The post-meeting cleanup (#246): one worker, resuming whatever a
+    // previous daemon left, which the recording tail waits on before it
+    // summarizes. Its own library connections, like every control here.
+    let cleanup = {
+        let data_root = root.parent().unwrap_or(&root).to_owned();
+        let library = root.clone();
+        let open: crate::post_pass::controller::OpenLibrary =
+            Arc::new(move || crate::open_library(&library));
+        let engine_root = data_root.clone();
+        let factory: crate::post_pass::controller::EngineFactory = Arc::new(move || {
+            let data_root = engine_root.clone();
+            Box::pin(async move {
+                crate::post_pass::speechd_engine::HelperEngine::prepare(&data_root)
+                    .await
+                    .map(|engine| Arc::new(engine) as Arc<dyn crate::post_pass::engine::PassEngine>)
+            })
+        });
+        let hub_for_cleanup = Arc::clone(&hub_slot);
+        let controller = crate::post_pass::controller::Controller::new(
+            &data_root,
+            open,
+            factory,
+            crate::post_pass::speechd_engine::provenance(),
+            Box::new(move |meeting| {
+                if let Some(hub) = hub_for_cleanup.get() {
+                    hub.announce_meeting_ready(meeting, fotw_web::MeetingReadyReason::Cleaned);
+                }
+            }),
+        );
+        recorder.set_post_pass(Arc::clone(&controller));
+        // A recording owns the machine and the helper: cleanup waits between
+        // windows until the recorder's slot is free again.
+        let busy_recorder = Arc::clone(&recorder);
+        controller.set_busy(Box::new(move || busy_recorder.is_busy()));
+        if let Ok(db) = crate::open_library(&root) {
+            server
+                .state()
+                .set_cleanup(Arc::new(crate::post_pass::web::DashboardCleanup::new(
+                    db,
+                    Arc::clone(&controller) as Arc<dyn crate::post_pass::web::JobActions>,
+                )));
+        }
+        controller
+    };
+    let _cleanup_worker = cleanup.start();
+
     let addr = server.addr();
     let state = server.state().clone();
 

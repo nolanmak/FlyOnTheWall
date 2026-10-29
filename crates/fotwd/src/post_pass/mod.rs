@@ -34,6 +34,7 @@ pub mod job;
 pub mod merge;
 pub mod speechd_engine;
 pub mod turns;
+pub mod web;
 pub mod windows;
 
 use std::path::{Path, PathBuf};

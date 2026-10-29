@@ -451,6 +451,12 @@ function renderDetail(detail) {
   if (typeof FOTWSpeechRecovery !== "undefined") {
     FOTWSpeechRecovery.mount(detail.meeting.id, el.detail, api, () => openMeeting(detail.meeting.id));
   }
+  if (typeof FOTWCleanup !== "undefined") {
+    FOTWCleanup.mount(detail.meeting.id, el.detail, api, () => openMeeting(detail.meeting.id));
+  }
+  if (typeof FOTWCleanup !== "undefined") {
+    FOTWCleanup.mount(detail.meeting.id, el.detail, api, () => openMeeting(detail.meeting.id));
+  }
 
   // Notes first, and above the summary, because they are the user's own words
   // and the summary is a derived artifact. Search has always indexed notes, so
@@ -2317,6 +2323,8 @@ async function main() {
   await loadCapture();
   await loadSpeech();
   const modelSetup = document.getElementById("model-setup-mount");
+  if (modelSetup && typeof FOTWCleanup !== "undefined") FOTWCleanup.settings(modelSetup.parentNode, api);
+  if (modelSetup && typeof FOTWCleanup !== "undefined") FOTWCleanup.settings(modelSetup.parentNode, api);
   if (modelSetup && typeof FOTWModels !== "undefined") FOTWModels.mount(modelSetup, api);
   await loadMeetings();
   await loadNoteDraftControl();
