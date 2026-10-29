@@ -15,8 +15,9 @@
 //! 1. **Setup**, the only phase that may download: installs `diarizer` and
 //!    `parakeet-unified` (imported with `--…-from` if given) when missing.
 //! 2. Runs one diarization stream over the mix, paced by its window
-//!    acknowledgements, and requires at least two speakers in a final whose
-//!    segments are sorted and inside the audio.
+//!    acknowledgements, and requires two to four speakers, a label that
+//!    returns after another speaker's turn, and segments sorted and inside
+//!    the audio.
 //! 3. Transcribes the first 30 s with and without `options.timings`: the text
 //!    must be the same, the plain final must have no segments, and the timed
 //!    one must have one segment per word, in order, inside the clip.
@@ -148,10 +149,7 @@ async fn final_of(stream: &mut fotw_speechd_client::SpeechStream) -> FinalText {
 
 async fn transcribe(client: &SpeechdClient, pcm: &[i16], timings: bool) -> FinalText {
     let mut config = StreamConfig::new(PARAKEET, 16_000);
-    config.options = StreamOptions {
-        timings,
-        ..StreamOptions::default()
-    };
+    config.options = StreamOptions::default().with_timings(timings);
     let mut stream = client.open_stream(config).await.expect("open");
     stream.send_audio(pcm).await.expect("audio");
     stream.finish().await.expect("finish");
@@ -230,10 +228,26 @@ async fn main() {
         .segments
         .iter()
         .all(|s| s.start_ms < s.end_ms && s.end_ms <= audio_ms);
+    // A label that comes back after another speaker's turn: the stream's
+    // speaker tracker carried it across windows rather than starting over.
+    let labels: Vec<&str> = diarized
+        .segments
+        .iter()
+        .filter_map(|s| s.speaker.as_deref())
+        .collect();
+    let reused = labels
+        .iter()
+        .enumerate()
+        .any(|(i, label)| labels[..i].contains(label) && labels[i - 1] != *label);
     gates.push((
-        "diarizer finds ≥ 2 speakers in a two-voice mix".into(),
-        speakers.len() >= 2,
+        "diarizer finds 2 to 4 speakers in a two-voice mix".into(),
+        (2..=4).contains(&speakers.len()),
         format!("{speakers:?}"),
+    ));
+    gates.push((
+        "a speaker's label returns after another's turn".into(),
+        reused,
+        format!("{labels:?}"),
     ));
     gates.push((
         "diarizer segments sorted and inside the audio".into(),

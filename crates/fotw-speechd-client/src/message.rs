@@ -98,7 +98,18 @@ pub enum Request {
 }
 
 /// Per-stream engine options. Every field is optional.
+///
+/// Non-exhaustive, so a new option is not a breaking change for callers in
+/// other crates: build one from the default with the `with_*` methods.
+///
+/// ```
+/// use fotw_speechd_client::message::StreamOptions;
+/// let options = StreamOptions::default().with_timings(true).with_language("de");
+/// assert!(options.timings && !options.probabilities);
+/// assert_eq!(options.language.as_deref(), Some("de"));
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct StreamOptions {
     /// VAD engines: also report every chunk's speech probability.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -111,6 +122,29 @@ pub struct StreamOptions {
     /// sample. Off, the `final` is unchanged.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub timings: bool,
+}
+
+impl StreamOptions {
+    /// VAD engines: also report every chunk's speech probability.
+    #[must_use]
+    pub fn with_probabilities(mut self, probabilities: bool) -> Self {
+        self.probabilities = probabilities;
+        self
+    }
+
+    /// A BCP 47 language hint, for multilingual engines.
+    #[must_use]
+    pub fn with_language(mut self, language: impl Into<String>) -> Self {
+        self.language = Some(language.into());
+        self
+    }
+
+    /// Batch recognizers: per-word `final` segments.
+    #[must_use]
+    pub fn with_timings(mut self, timings: bool) -> Self {
+        self.timings = timings;
+        self
+    }
 }
 
 /// Helper → parent: responses (with `id`) and stream events (with `stream`).
@@ -494,10 +528,7 @@ mod tests {
     fn post_pass_shapes_round_trip() {
         // #246: word timings are asked for with `timings`, which is left off
         // the wire when false, so the default request is unchanged.
-        let options = StreamOptions {
-            timings: true,
-            ..StreamOptions::default()
-        };
+        let options = StreamOptions::default().with_timings(true);
         assert_eq!(
             serde_json::to_value(&options).unwrap(),
             serde_json::json!({"timings": true})
