@@ -4,8 +4,10 @@
 //! Ported from Muesli (https://github.com/Muesli-HQ/muesli, MIT, © 2026 Pranav
 //! Hari) at commit 97e455794112126a896cae17f5c829e8ffa820c8:
 //! native/MuesliNative/Sources/MuesliNativeApp/MicTurnNormalizer.swift (the
-//! merge rule: join across a gap of at most 0.35 s, or 1.5 s when either side
-//! is a short fragment under 8 visible characters),
+//! merge rule: join across a gap of at most 0.35 s, or 1.5 s when a side is
+//! a short fragment under 8 visible characters; Muesli joins segments, and
+//! here, joining words, only the running turn is judged, since a single next
+//! word is always short),
 //! SystemTurnNormalizer.swift (sentence units as the place to break a long
 //! turn) and TranscriptReconciler.swift (preserve first: every mic turn is
 //! kept; the system channel is the remote speakers' source of truth; speaker
@@ -171,8 +173,10 @@ fn channel_turns(
             let interrupted = other.get(from).is_some_and(|&t| t < word.start_ms);
             let gap = word.start_ms.saturating_sub(turn.end_ms);
             let last = &turn.words.last().expect("a turn has a word").0;
-            let short =
-                visible(&turn.text()) < SHORT_VISIBLE || visible(&word.text) < SHORT_VISIBLE;
+            // Muesli judges the running turn: a fragment so far may reach
+            // across a longer pause. A single next word is always short, so
+            // judging it would make the rule 1.5 s for every turn.
+            let short = visible(&turn.text()) < SHORT_VISIBLE;
             let joins = gap <= MERGE_GAP_MS || (gap <= SHORT_GAP_MS && short);
             let long = turn.end_ms - turn.start_ms >= LONG_TURN_MS && ends_sentence(&last.text);
             if turn.speaker == speaker && joins && !long && !interrupted {
@@ -311,6 +315,21 @@ mod tests {
             w("agreed", 2_850, 3_200),
         ];
         assert_eq!(build_turns(&mic, &[], None).len(), 2);
+    }
+
+    #[test]
+    fn a_short_next_word_does_not_stretch_the_gap_rule() {
+        // Muesli's 1.5 s exception is for a running turn that is still a
+        // fragment. A single next word is always short, so judging it would
+        // make the rule 1.5 s for everyone.
+        let mic = [
+            w("absolutely", 0, 600),
+            w("wonderful", 650, 1_100),
+            w("ok", 2_000, 2_200),
+        ];
+        let turns = build_turns(&mic, &[], None);
+        let shown: Vec<String> = turns.iter().map(Turn::text).collect();
+        assert_eq!(shown, ["absolutely wonderful", "ok"]);
     }
 
     #[test]

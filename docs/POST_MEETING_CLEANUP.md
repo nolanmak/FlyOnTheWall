@@ -6,7 +6,7 @@ speaker labels for the other participants. The result is a **new transcript
 version** shown in place of the live one. The live version is kept.
 
 Code: `crates/fotwd/src/post_pass/` (the job), `crates/fotw-store/src/post_pass.rs`
-and `schema/0010_post_pass.sql` (jobs and checkpoints),
+and `schema/0011_post_pass.sql` (jobs and checkpoints),
 `crates/fotw-web/src/cleanup.rs` and `ui/cleanup.js` (the meeting view and the
 setting). Engines: `docs/SPEECHD_PROTOCOL.md`.
 
@@ -48,7 +48,7 @@ Then:
    after 20 s. Every word is kept. The live transcript's cross-channel echo
    pass then runs on the result.
 8. **Store** the turns as a new transcript (`provider` `fotw-speechd`, model
-   `parakeet-unified+diarizer`), make it primary, mark the job done with its
+   `parakeet-unified+diarizer`), make it primary (if it finished within the 15-minute wait), mark the job done with its
    provenance and delete the checkpoints: one transaction.
 
 If the diarizer is not installed or fails, the cleaned version is stored
@@ -63,7 +63,7 @@ version stays.
 
 | setting | runs for |
 |---|---|
-| Automatic (default) | meetings no cloud provider transcribed: no transcript and no speech epoch of the meeting names Deepgram, so a fallback meeting that used Deepgram for any stretch is not cleaned |
+| Automatic (default) | meetings no cloud provider transcribed (on AMI the cleaned version is not better than live on every meeting: TS3003c 17.3% against 11.8% WER; see Acceptance): no transcript and no speech epoch of the meeting names Deepgram, so a fallback meeting that used Deepgram for any stretch is not cleaned |
 | Always | every meeting, Deepgram ones included |
 | Off | nothing |
 
@@ -107,8 +107,28 @@ no result and is transcribed once on resume. Diarization is not checkpointed
 diarization restarts that channel; it is the short phase. A job whose engines'
 pinned revisions changed between runs fails rather than mixing models.
 
-Engine failures are retried up to three times per daemon run, then the job
-is marked failed.
+Failures back off and can be retried (below).
+
+## Upgrading and going back
+
+The cleanup's tables are library schema 11. A build from before it refuses
+to open an upgraded library (forward-only migrations, docs/UPGRADE_CHECKPOINT.md).
+To go back, restore the encrypted `backups/pre-migration-10-*.db` the upgrade
+took automatically (meetings recorded since are not in it), or import a library
+archive made before upgrading.
+
+## Failures, retry and cancel
+
+A failure (the engine will not start, the helper crashes, a track cannot be
+read) is retried after 30 s, 2 min and 10 min; after the fourth the job is
+marked failed and the meeting shows **Retry cleanup**. A job waits between
+windows while a recording is running. **Cancel** stops a job before its next
+window and keeps the live transcript; turning the setting off does not cancel
+jobs already queued.
+
+A cleanup that finishes after the 15-minute fallback is stored but not made
+primary, since the summary and the GitHub push were made from the live
+version; the meeting says a cleaned version is available.
 
 ## Recovery of interrupted recordings is a separate thing
 
@@ -208,7 +228,8 @@ on the acceptance set:
 | 0.5 | 20.8% | 12.4% | 15.0% |
 | 0.4 | 22.1% | 13.9% | 15.5% |
 
-**Speed and memory**, a 60:00 two-track replay (ES2004c whole, then
+**Speed and memory** (gates: ≤ 6 min, peak memory ≤ 1.5 GiB). One run, not
+p50/p95 over 20 trials as the epic's measurement rule asks; a 60:00 two-track replay (ES2004c whole, then
 IS1009c), Opus archives pre-encoded so only the cleanup is timed, AC power,
 quiet machine (load 6.5; Murmur's idle helper the only other speech
 process): **107.1 s, RTF 0.030** (gate ≤ 6 min). Peak RSS: daemon side
@@ -216,4 +237,7 @@ process): **107.1 s, RTF 0.030** (gate ≤ 6 min). Peak RSS: daemon side
 375 MB + 207 MB. Core ML keeps model weights in wired memory outside both
 processes: system-wide wired memory rose by 1,464 MiB during the run
 (3,390 → 4,854 MiB, `vm_stat`), an upper bound on what the models pinned.
+Counting that, the cleanup's memory is about 1.7 GiB, **over the 1.5 GiB
+gate**: the RSS figure alone passes, the whole cost does not, so the memory
+gate is not met as stated.
 The 10-minute meetings each cleaned in 12–14 s (RTF 0.02).

@@ -769,10 +769,28 @@ fn upgrading_an_existing_missing_policy_library_keeps_its_hosted_configuration()
     {
         let db = fotwd::open_library_with(&f.root, &f.store, &mut Scripted::new(), KDF_FOR_TESTS)
             .unwrap();
-        // Migration 9 adds only bootstrap rows and migration 10 only the
-        // empty cleanup tables. Removing both and restoring version 8
-        // constructs the exact previous schema in this disposable encrypted
-        // fixture, without editing released migrations.
+        // Recreate the released v8 shape in this owned encrypted fixture:
+        // v9 adds bootstrap rows; v10 adds derived input-generation triggers;
+        // v11 adds the empty post-meeting cleanup tables.
+        let triggers = {
+            let mut query=db.conn().prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND name GLOB 'summary_input_*'").unwrap();
+            query
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        for name in triggers {
+            db.conn()
+                .execute_batch(&format!("DROP TRIGGER \"{}\"", name.replace('"', "\"\"")))
+                .unwrap();
+        }
+        db.conn()
+            .execute(
+                "DELETE FROM app_meta WHERE key GLOB 'summary_input_epoch:*'",
+                [],
+            )
+            .unwrap();
         db.conn().execute_batch("DELETE FROM settings WHERE key='summarize'; DELETE FROM app_meta WHERE key='summary_destination_bootstrap'; DROP TABLE post_pass_windows; DROP TABLE post_pass_jobs; PRAGMA user_version=8;").unwrap();
     }
     let db =

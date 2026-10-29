@@ -58,7 +58,7 @@ impl MeetingRepo<'_> {
             .db
             .conn_mut()
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        version.ensure_current(&tx)?;
+        version.ensure_for_meeting(&tx, meeting_id)?;
         let count = tx.execute(
             "UPDATE meetings SET title=?2,updated_at=?3,lamport=lamport+1 WHERE id=?1",
             params![meeting_id, title, now_ms()],
@@ -572,7 +572,7 @@ impl MeetingRepo<'_> {
 
         let tx = self.db.conn_mut().transaction()?;
         if let Some(version) = version {
-            version.ensure_current(&tx)?;
+            version.ensure_for_meeting(&tx, meeting_id)?;
         }
 
         // Guard explicitly: a summary for a nonexistent meeting would

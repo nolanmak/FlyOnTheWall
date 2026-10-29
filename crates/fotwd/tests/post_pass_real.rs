@@ -115,11 +115,16 @@ async fn issue_241_the_long_mic_track_whisper_dropped_is_transcribed_whole() {
             Channel::System => None,
         })
     };
-    let Outcome::Done(transcript) =
-        job::run(&db, &meeting, &engine, &open, &AtomicBool::new(false))
-            .await
-            .unwrap()
-    else {
+    let Outcome::Done(transcript) = job::run(
+        &db,
+        &meeting,
+        &engine,
+        &open,
+        &AtomicBool::new(false),
+        &|| false,
+    )
+    .await
+    .unwrap() else {
         panic!("the cleanup stopped");
     };
     let mut db = db.into_inner().unwrap();

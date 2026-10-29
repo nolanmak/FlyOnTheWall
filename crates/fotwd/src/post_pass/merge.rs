@@ -22,6 +22,10 @@
 //! 3. Where the two windows heard the stretch differently, the cut falls at the
 //!    middle of the overlap: earlier words before it, later words after it.
 //!
+//! Windows whose word times were estimated (a helper that reported none)
+//! skip steps 1 and 2's time tests: their boundary is joined by text alone,
+//! Muesli's original rule, or else cut at the middle.
+//!
 //! The merge is a pure function of every window's words, so a job resumed
 //! from checkpoints produces exactly what an uninterrupted one does.
 
@@ -39,6 +43,9 @@ pub struct TimedWord {
     /// End.
     #[serde(rename = "e")]
     pub end_ms: u64,
+    /// The times were estimated, not reported by the engine.
+    #[serde(rename = "x", default, skip_serializing_if = "std::ops::Not::not")]
+    pub estimated: bool,
 }
 
 impl TimedWord {
@@ -49,6 +56,17 @@ impl TimedWord {
             text: text.into(),
             start_ms,
             end_ms: end_ms.max(start_ms),
+            estimated: false,
+        }
+    }
+
+    /// A word whose times were spread over its window by estimate, not
+    /// reported by the engine.
+    #[must_use]
+    pub fn estimated(text: impl Into<String>, start_ms: u64, end_ms: u64) -> Self {
+        Self {
+            estimated: true,
+            ..Self::new(text, start_ms, end_ms)
         }
     }
 
@@ -80,6 +98,10 @@ pub const MATCH_TOLERANCE_MS: u64 = 600;
 /// `windows` must be in order; consecutive windows may overlap.
 #[must_use]
 pub fn merge_windows(windows: &[WindowWords]) -> Vec<TimedWord> {
+    let estimated: Vec<bool> = windows
+        .iter()
+        .map(|w| w.words.iter().any(|word| word.estimated))
+        .collect();
     let mut out: Vec<TimedWord> = Vec::new();
     for (k, window) in windows.iter().enumerate() {
         let mut words: Vec<TimedWord> = window
@@ -92,6 +114,8 @@ pub fn merge_windows(windows: &[WindowWords]) -> Vec<TimedWord> {
         if windows
             .get(k + 1)
             .is_some_and(|next| next.start_ms < window.end_ms)
+            && !estimated[k]
+            && !estimated[k + 1]
         {
             words.retain(|w| w.end_ms + EDGE_GUARD_MS < window.end_ms);
         }
@@ -104,6 +128,37 @@ pub fn merge_windows(windows: &[WindowWords]) -> Vec<TimedWord> {
             continue;
         }
         let (overlap_start, overlap_end) = (window.start_ms, prev.end_ms);
+        if estimated[k] || estimated[k - 1] {
+            // Estimated times are only roughly where the words were: the
+            // same word can sit seconds apart in the two windows. Join as
+            // Muesli does, by the run of words that ends the earlier window
+            // and starts this one, by text alone; else cut at the middle.
+            let tail_from = out.len().saturating_sub(MAX_MATCH_WORDS);
+            let tail: Vec<String> = out[tail_from..].iter().map(|w| key(&w.text)).collect();
+            let head: Vec<String> = words
+                .iter()
+                .take(MAX_MATCH_WORDS)
+                .map(|w| key(&w.text))
+                .collect();
+            let limit = tail.len().min(head.len());
+            if let Some(n) = (1..=limit)
+                .rev()
+                .find(|&n| tail[tail.len() - n..] == head[..n])
+            {
+                words.drain(..n);
+            } else {
+                let cut = overlap_start + (overlap_end - overlap_start) / 2;
+                while out
+                    .last()
+                    .is_some_and(|w| w.end_ms > overlap_start && w.mid() >= cut)
+                {
+                    out.pop();
+                }
+                words.retain(|w| w.start_ms >= overlap_end || w.mid() >= cut);
+            }
+            out.extend(words);
+            continue;
+        }
         // Words cut off by this window's start, which the earlier one kept.
         words.retain(|w| {
             w.start_ms > overlap_start + EDGE_GUARD_MS
@@ -278,6 +333,52 @@ mod tests {
         let windows = plan(60_000);
         let merged = merge_windows(&hear(&speech, &windows, str::to_owned, |_| 0));
         assert_eq!(merged.len(), speech.len());
+    }
+
+    #[test]
+    fn a_word_straddling_every_edge_is_kept_once_when_times_are_estimated() {
+        let windows = plan(600_000);
+        let speech = straddling_speech(&windows);
+        let heard: Vec<WindowWords> = hear(&speech, &windows, str::to_owned, |_| 0)
+            .into_iter()
+            .map(|mut w| {
+                w.words.iter_mut().for_each(|word| word.estimated = true);
+                w
+            })
+            .collect();
+        assert_eq!(texts(&merge_windows(&heard)), texts(&speech));
+    }
+
+    #[test]
+    fn windows_with_estimated_times_join_by_text_without_losing_the_shared_words() {
+        // A helper without word timings: each window spreads its words over
+        // its own audio, so the same word gets different times in the two
+        // windows, and the earlier window's last word "ends" at its edge.
+        let est = |t: &str, s: u64, e: u64| TimedWord::estimated(t, s, e);
+        let windows = [
+            WindowWords {
+                start_ms: 0,
+                end_ms: 30_000,
+                words: vec![
+                    est("so", 20_000, 24_000),
+                    est("we", 24_000, 29_000),
+                    est("ship", 29_500, 30_000),
+                ],
+            },
+            WindowWords {
+                start_ms: 28_000,
+                end_ms: 58_000,
+                words: vec![
+                    est("we", 28_000, 28_500),
+                    est("ship", 28_500, 29_000),
+                    est("today", 30_000, 31_000),
+                ],
+            },
+        ];
+        assert_eq!(
+            texts(&merge_windows(&windows)),
+            ["so", "we", "ship", "today"]
+        );
     }
 
     #[test]

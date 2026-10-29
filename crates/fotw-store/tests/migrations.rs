@@ -26,8 +26,8 @@ fn a_fresh_database_lands_on_the_latest_version() {
     let db = Db::open(&path, &test_key()).unwrap();
     assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
     assert_eq!(
-        LATEST_SCHEMA_VERSION, 10,
-        "0001 initial schema, 0002 fts5 search indexes, 0003 enrich report, 0004 sharing documents, 0005 session notes, 0006 note handoff aliases, 0007 durable speech receipts, 0008 capture clock state, 0009 summary destination defaults, 0010 post-meeting cleanup jobs"
+        LATEST_SCHEMA_VERSION, 11,
+        "0001 initial schema, 0002 fts5 search indexes, 0003 enrich report, 0004 sharing documents, 0005 session notes, 0006 note handoff aliases, 0007 durable speech receipts, 0008 capture clock state, 0009 summary destination defaults, 0010 summary input generations, 0011 post-meeting cleanup jobs"
     );
 }
 
@@ -356,6 +356,19 @@ fn v6_notes_and_capture_alias_survive_the_speech_receipt_migration() {
     let doc = db.export_meeting("saved-meeting").unwrap();
     assert_eq!(doc.meeting.title, "owned title");
     assert!(doc.speech_epochs.is_empty() && doc.speech_receipts.is_empty());
+    let observation = db
+        .setting_version("summarize")
+        .unwrap()
+        .with_meeting_inputs(&db, "saved-meeting")
+        .unwrap();
+    assert!(observation.is_current(&db).unwrap());
+    db.conn()
+        .execute(
+            "UPDATE notes SET body_md='new owned notes' WHERE meeting_id='saved-meeting'",
+            [],
+        )
+        .unwrap();
+    assert!(!observation.is_current(&db).unwrap());
 }
 
 #[test]

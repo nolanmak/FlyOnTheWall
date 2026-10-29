@@ -215,6 +215,8 @@ fotwd engine local                             # local-only policy; model setup 
 
 Run a hosted engine command without the acknowledgement flag first to see its disclosure without enabling it. Add `--binary /full/path/to/claude` if the daemon cannot find the CLI. `fotwd engine` reports the selected destination; the dashboard's **Summaries** panel selects the same policy. New libraries start with summaries **Off**; storing an API key does not enable them. Existing libraries without an explicit policy keep their previous API-key/CLI precedence until you choose a destination. Malformed settings fail closed until explicitly resaved.
 
+Editing a meeting’s transcript, notes or title while generation is running prevents the older response from being saved. Retry generation to use the updated meeting.
+
 Changing destination fences queued jobs and future calls from an active job, cancels waiting for a response, and prevents old results from being published. A request already dispatched to a hosted service cannot be recalled. Off and Local-only do not inspect hosted keys. Local-only does not silently provision a model or fall back to cloud; it is a privacy gate pending the runtime/setup work, not a working local summary engine yet. For fully private meeting processing, transcription and export destinations must also be configured appropriately.
 
 ## Your Recovery Key
