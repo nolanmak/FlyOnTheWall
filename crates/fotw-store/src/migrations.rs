@@ -14,7 +14,7 @@ use crate::key::DbKey;
 ///
 /// Bump this in the same commit that appends to [`migration_set`]; the two
 /// drifting apart is what [`crate::Db::open`]'s refusal is guarding against.
-pub const LATEST_SCHEMA_VERSION: usize = 9;
+pub const LATEST_SCHEMA_VERSION: usize = 10;
 
 /// Every migration, oldest first. Append only — a released migration is
 /// immutable, because editing one changes the schema of databases that already
@@ -61,6 +61,8 @@ fn migration_set(new_library: bool) -> Migrations<'static> {
             },
         )
         .comment("explicit summary destination defaults for new libraries"),
+        M::up(include_str!("schema/0010_post_pass.sql"))
+            .comment("post-meeting cleanup pass jobs and checkpoints"),
     ])
 }
 

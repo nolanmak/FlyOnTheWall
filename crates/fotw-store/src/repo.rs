@@ -13,6 +13,7 @@ use crate::ids::{new_id, now_ms};
 use crate::models::{
     Meeting, NewMeeting, NewSegment, NewSummary, NoteAnchor, StoredSegment, Summary,
 };
+use crate::post_pass::HOLDS_ENRICHMENT;
 
 /// What "still awaiting enrichment" means, as a `WHERE` clause over `meetings
 /// m` — the one definition [`MeetingRepo::needing_summary`] and
@@ -269,6 +270,7 @@ impl MeetingRepo<'_> {
         let mut stmt = conn.prepare(&format!(
             "SELECT m.id FROM meetings m
               WHERE {AWAITING_ENRICHMENT}
+                AND NOT {HOLDS_ENRICHMENT}
               ORDER BY m.started_at_ms ASC, m.id ASC
               LIMIT ?1"
         ))?;
@@ -295,7 +297,10 @@ impl MeetingRepo<'_> {
     pub fn count_needing_summary(&self) -> Result<i64> {
         let conn = self.db.conn();
         Ok(conn.query_row(
-            &format!("SELECT COUNT(*) FROM meetings m WHERE {AWAITING_ENRICHMENT}"),
+            &format!(
+                "SELECT COUNT(*) FROM meetings m WHERE {AWAITING_ENRICHMENT}
+                AND NOT {HOLDS_ENRICHMENT}"
+            ),
             [],
             |r| r.get(0),
         )?)

@@ -71,10 +71,17 @@ public actor DiarizerEngine: SpeechEngine {
     public func isLoaded() async -> Bool { await lifecycle.current != nil }
 
     public func makeSession(options: StreamOptions) async throws -> any EngineSession {
+        var speakers = try await initialSpeakers()
+        if let threshold = options.speakerThreshold {
+            guard threshold.isFinite, threshold > 0, threshold < 2 else {
+                throw SpeechdError("bad_request", "speaker_threshold is a cosine distance in (0, 2)")
+            }
+            speakers.speakerThreshold = threshold
+        }
         // The stream's own speaker tracker, carried from window to window by
         // the session, as Muesli's job keeps its SpeakerManager.
         return WindowedDiarizationSession(model: "\(model.id)@\(model.revision)",
-                                          initial: try await initialSpeakers()) { [self] window, start, speakers in
+                                          initial: speakers) { [self] window, start, speakers in
             try await self.diarize(window, startSample: start, speakers: speakers)
         }
     }

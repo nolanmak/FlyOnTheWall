@@ -53,6 +53,8 @@ const ALL_TABLES: &[&str] = &[
     "note_anchors",
     "notes",
     "people",
+    "post_pass_jobs",
+    "post_pass_windows",
     "recordings",
     "segments",
     "session_note_links",
@@ -359,6 +361,12 @@ INSERT INTO speech_epochs(id,meeting_id,transcript_id,session_id,source,epoch,fr
 VALUES ('fixture-epoch','mtg-1','tr-1','saved-fixture','system',0,0,'fixture-provider','fixture-model','fixture-checksum','{"diarization":"none"}',NULL);
 INSERT INTO speech_receipts(id,meeting_id,transcript_id,epoch_id,from_sample,through_sample,payload_json)
 VALUES ('fixture-receipt','mtg-1','tr-1','fixture-epoch',0,16000,'{"epoch":0,"from_sample":0,"through_sample":16000,"segments":[]}');
+
+-- A cleanup job mid-way: its live version, a checkpoint and no result yet.
+INSERT INTO post_pass_jobs(meeting_id,state,created_at_ms,updated_at_ms,plan_json,progress_permille,live_transcript_id,cleaned_transcript_id,provenance_json,detail)
+VALUES ('mtg-1','pending',1000,2000,'{"version":1}',420,'tr-1',NULL,NULL,NULL);
+INSERT INTO post_pass_windows(id,meeting_id,channel,idx,words_json)
+VALUES ('fixture-window','mtg-1','system',3,'[{"t":"café","s":84000,"e":84300}]');
 
 INSERT INTO session_note_links(session_id,meeting_id,started_at_ms,elapsed_ms)
 VALUES ('saved-fixture','mtg-1',1000,500);
@@ -1160,6 +1168,8 @@ fn every_column_of_every_table_appears_in_the_archive() {
         ("segments", &meeting, "segments"),
         ("speech_epochs", &meeting, "speech_epochs"),
         ("speech_receipts", &meeting, "speech_receipts"),
+        ("post_pass_jobs", &meeting, "post_pass_jobs"),
+        ("post_pass_windows", &meeting, "post_pass_windows"),
         ("notes", &meeting, "notes"),
         ("note_anchors", &meeting, "note_anchors"),
         ("summaries", &meeting, "summaries"),

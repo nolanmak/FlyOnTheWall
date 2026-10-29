@@ -45,6 +45,7 @@ mod media;
 mod migrations;
 mod models;
 mod notes;
+mod post_pass;
 mod repo;
 mod search;
 mod session_notes;
@@ -67,6 +68,7 @@ pub use crate::models::{
     Meeting, NewMeeting, NewSegment, NewSummary, NoteAnchor, StoredSegment, Summary,
 };
 pub use crate::notes::{MAX_NOTE_BYTES, NoteDocument};
+pub use crate::post_pass::{POST_PASS_WAIT_MS, PostPassJob, PostPassState};
 pub use crate::repo::MeetingRepo;
 pub use crate::search::{FTS_TABLES, SearchHit, SearchQuery, SearchSource, SearchWeights};
 
