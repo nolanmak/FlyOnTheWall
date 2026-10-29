@@ -90,7 +90,7 @@ fotw-speechd-client = { path = "../fotw-speechd-client", features = ["testing"] 
 # (`just bundle release`) and `cargo build --workspace` (`just build`) all
 # resolve it OFF; `cargo test` and `cargo clippy --all-targets` resolve it ON.
 fotwd = { path = ".", features = ["test-guards"] }
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync", "test-util"] }
 # The recovery round trip creates several throwaway libraries per test and has
 # to leave nothing behind when one fails mid-way -- the older
 # `std::env::temp_dir()` pattern in this crate's other tests cleans up only on

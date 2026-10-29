@@ -119,7 +119,24 @@ fn lock(db: &Mutex<Db>) -> std::sync::MutexGuard<'_, Db> {
     db.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// How often a paused job looks again whether it may continue.
+pub const PAUSE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Wait while `pause()` says so, between windows: a recording owns the
+/// machine and the speech helper. Returns false if `stop` was set meanwhile.
+async fn yield_while(pause: &(dyn Fn() -> bool + Sync), stop: &AtomicBool) -> bool {
+    while pause() {
+        if stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        tokio::time::sleep(PAUSE_POLL).await;
+    }
+    !stop.load(Ordering::SeqCst)
+}
+
 /// Run `meeting_id`'s pending job to completion, or until `stop` is set.
+/// Between windows it waits while `pause()` is true (a recording is
+/// running); its checkpoints make the wait free.
 ///
 /// # Errors
 ///
@@ -132,6 +149,7 @@ pub async fn run(
     engine: &dyn PassEngine,
     open: &OpenTrack<'_>,
     stop: &AtomicBool,
+    pause: &(dyn Fn() -> bool + Sync),
 ) -> Result<Outcome, String> {
     let job = lock(db)
         .post_pass_job(meeting_id)
@@ -197,7 +215,7 @@ pub async fn run(
             if saved.contains_key(&window.index) {
                 continue;
             }
-            if stop.load(Ordering::SeqCst) {
+            if !yield_while(pause, stop).await {
                 return Ok(Outcome::Stopped);
             }
             let speech = engine.speech(&window.pcm).await?;
@@ -246,6 +264,7 @@ pub async fn run(
             engine,
             open,
             stop,
+            pause,
             &mut progress,
             diarize_units,
         )
@@ -327,6 +346,7 @@ async fn diarize(
     engine: &dyn PassEngine,
     open: &OpenTrack<'_>,
     stop: &AtomicBool,
+    pause: &(dyn Fn() -> bool + Sync),
     progress: &mut Progress,
     units: u64,
 ) -> Result<Diarized, String> {
@@ -344,7 +364,7 @@ async fn diarize(
     let mut sent = 0u64;
     let mut pcm = Vec::with_capacity(DIARIZE_CHUNK);
     loop {
-        if stop.load(Ordering::SeqCst) {
+        if !yield_while(pause, stop).await {
             return Ok(Diarized::Stopped);
         }
         pcm.clear();
@@ -513,6 +533,7 @@ mod tests {
             &engine,
             &opener(mic.clone(), system.clone()),
             &AtomicBool::new(false),
+            &|| false,
         )
         .await
         .unwrap();
@@ -561,6 +582,7 @@ mod tests {
             &whole,
             &open,
             &AtomicBool::new(false),
+            &|| false,
         )
         .await
         .unwrap();
@@ -575,7 +597,14 @@ mod tests {
         queue(&db, &meeting_id, &first);
         let killed = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            run(&db, &meeting_id, &first, &open, &AtomicBool::new(false)),
+            run(
+                &db,
+                &meeting_id,
+                &first,
+                &open,
+                &AtomicBool::new(false),
+                &|| false,
+            ),
         )
         .await;
         assert!(killed.is_err(), "the run was cut off");
@@ -588,9 +617,16 @@ mod tests {
         );
 
         let second = FakeEngine::default();
-        run(&db, &meeting_id, &second, &open, &AtomicBool::new(false))
-            .await
-            .unwrap();
+        run(
+            &db,
+            &meeting_id,
+            &second,
+            &open,
+            &AtomicBool::new(false),
+            &|| false,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             first.transcribed.load(Ordering::SeqCst) + second.transcribed.load(Ordering::SeqCst),
             windows,
@@ -614,6 +650,7 @@ mod tests {
             &engine,
             &opener(mic, system),
             &AtomicBool::new(false),
+            &|| false,
         )
         .await
         .unwrap();
@@ -635,9 +672,16 @@ mod tests {
         queue(&db, &meeting_id, &engine);
         let stop = AtomicBool::new(true);
         assert_eq!(
-            run(&db, &meeting_id, &engine, &opener(mic, system), &stop)
-                .await
-                .unwrap(),
+            run(
+                &db,
+                &meeting_id,
+                &engine,
+                &opener(mic, system),
+                &stop,
+                &|| false
+            )
+            .await
+            .unwrap(),
             Outcome::Stopped
         );
         let live = lock(&db)
@@ -653,6 +697,31 @@ mod tests {
             live
         );
         let _ = Arc::new(AtomicUsize::new(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_waits_between_windows_while_a_recording_runs() {
+        let (mic, system) = meeting();
+        let (db, meeting_id) = library();
+        let engine = FakeEngine::default();
+        queue(&db, &meeting_id, &engine);
+        let recording = Arc::new(AtomicBool::new(true));
+        let busy = Arc::clone(&recording);
+        let pause = move || busy.load(Ordering::SeqCst);
+        let open = opener(mic, system);
+        let stop = AtomicBool::new(false);
+        let run = run(&db, &meeting_id, &engine, &open, &stop, &pause);
+        tokio::pin!(run);
+        // While the recording runs, no window reaches the engine.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1_500), &mut run)
+                .await
+                .is_err()
+        );
+        assert_eq!(engine.started.load(Ordering::SeqCst), 0);
+        recording.store(false, Ordering::SeqCst);
+        assert!(matches!(run.await.unwrap(), Outcome::Done(_)));
+        assert!(engine.transcribed.load(Ordering::SeqCst) > 0);
     }
 
     #[test]

@@ -232,7 +232,15 @@ mod imp {
             Ok(Some(Box::new(OpusTrack::open(path)?) as Box<dyn PcmSource>))
         };
         let started = Instant::now();
-        let outcome = job::run(&db, &meeting, &engine, &open, &AtomicBool::new(false)).await?;
+        let outcome = job::run(
+            &db,
+            &meeting,
+            &engine,
+            &open,
+            &AtomicBool::new(false),
+            &|| false,
+        )
+        .await?;
         let wall = started.elapsed().as_secs_f64();
         sampling.store(false, Ordering::SeqCst);
         let _ = sampler.join();
