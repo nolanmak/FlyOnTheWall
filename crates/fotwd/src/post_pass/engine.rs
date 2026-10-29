@@ -21,10 +21,37 @@ pub trait PassEngine: Send + Sync {
     /// Engines and revisions, recorded with the cleaned version.
     fn provenance(&self) -> serde_json::Value;
 
+    /// Cross-track bleed suppression to run before the engines hear a
+    /// track ([`super::bleed`]); `None` reads the tracks as saved.
+    fn bleed(&self) -> Option<super::bleed::BleedParams> {
+        None
+    }
+
     /// What the engine had to approximate during the run (for the job's
     /// detail), such as word times a helper could not report.
     fn notes(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Transcription is over: release the recognizer's model, if this job
+    /// loaded it, so it is never in memory together with the diarizer's.
+    /// Nothing is transcribed after this unless
+    /// [`restore_recognizer`](Self::restore_recognizer) is called.
+    fn release_recognizer(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
+
+    /// A recording started and its live transcription uses the same model:
+    /// load the recognizer again if it was released, and leave it loaded
+    /// from now on, even through [`release`](Self::release).
+    fn restore_recognizer(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
+
+    /// The job is over, however it ended: release every model this engine
+    /// loaded for it.
+    fn release(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
     }
 }
 
@@ -45,7 +72,7 @@ pub(crate) mod fake {
     //! equal blocks are one word, and a block's loudness picks its speaker.
 
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
 
@@ -63,6 +90,19 @@ pub(crate) mod fake {
         pub hang_on: Option<usize>,
         /// Report no diarizer.
         pub no_diarizer: bool,
+        /// Cross-track bleed suppression the job should run.
+        pub bleed: Option<super::super::bleed::BleedParams>,
+        /// The recognizer's model was released.
+        pub recognizer_released: Arc<AtomicBool>,
+        /// Times it was loaded again after a release.
+        pub restored: Arc<AtomicUsize>,
+        /// A diarization started while the recognizer was still loaded.
+        pub diarized_beside_recognizer: Arc<AtomicBool>,
+        /// Everything was released at the end of the job.
+        pub released: Arc<AtomicBool>,
+        /// Nonzero samples the recognizer and the diarizer were given.
+        pub heard: Arc<AtomicUsize>,
+        pub diarizer_heard: Arc<AtomicUsize>,
     }
 
     pub(crate) fn words(pcm: &[i16]) -> Vec<TimedWord> {
@@ -110,7 +150,13 @@ pub(crate) mod fake {
                 if self.hang_on == Some(call) {
                     std::future::pending::<()>().await;
                 }
+                assert!(
+                    !self.recognizer_released.load(Ordering::SeqCst),
+                    "transcribed after the recognizer was released"
+                );
                 tokio::task::yield_now().await;
+                self.heard
+                    .fetch_add(pcm.iter().filter(|&&x| x != 0).count(), Ordering::SeqCst);
                 self.transcribed.fetch_add(1, Ordering::SeqCst);
                 Ok(words(pcm))
             })
@@ -118,9 +164,40 @@ pub(crate) mod fake {
 
         fn diarize(&self) -> BoxFuture<'_, Result<Option<Box<dyn Diarization>>, String>> {
             let none = self.no_diarizer;
+            if !none && !self.recognizer_released.load(Ordering::SeqCst) {
+                self.diarized_beside_recognizer
+                    .store(true, Ordering::SeqCst);
+            }
+            let heard = Arc::clone(&self.diarizer_heard);
             Box::pin(async move {
-                Ok((!none).then(|| Box::new(FakeDiarization::default()) as Box<dyn Diarization>))
+                Ok((!none).then(|| {
+                    Box::new(FakeDiarization {
+                        heard,
+                        ..FakeDiarization::default()
+                    }) as Box<dyn Diarization>
+                }))
             })
+        }
+
+        fn bleed(&self) -> Option<super::super::bleed::BleedParams> {
+            self.bleed
+        }
+
+        fn release_recognizer(&self) -> BoxFuture<'_, ()> {
+            self.recognizer_released.store(true, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+
+        fn restore_recognizer(&self) -> BoxFuture<'_, ()> {
+            self.recognizer_released.store(false, Ordering::SeqCst);
+            self.restored.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+
+        fn release(&self) -> BoxFuture<'_, ()> {
+            self.recognizer_released.store(true, Ordering::SeqCst);
+            self.released.store(true, Ordering::SeqCst);
+            Box::pin(async {})
         }
 
         fn provenance(&self) -> serde_json::Value {
@@ -132,6 +209,7 @@ pub(crate) mod fake {
     /// or above it another; labelled by first appearance.
     #[derive(Default)]
     pub(crate) struct FakeDiarization {
+        heard: Arc<AtomicUsize>,
         pending: Vec<i16>,
         block: u64,
         classes: Vec<bool>,
@@ -168,6 +246,8 @@ pub(crate) mod fake {
     impl Diarization for FakeDiarization {
         fn push<'a>(&'a mut self, pcm: &'a [i16]) -> BoxFuture<'a, Result<(), String>> {
             Box::pin(async move {
+                self.heard
+                    .fetch_add(pcm.iter().filter(|&&x| x != 0).count(), Ordering::SeqCst);
                 self.pending.extend_from_slice(pcm);
                 self.take_blocks(false);
                 Ok(())

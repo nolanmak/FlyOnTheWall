@@ -4,6 +4,7 @@
 //! shared speech helper (#243, docs/SPEECHD_PROTOCOL.md).
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use fotw_speechd_client::message::StreamOptions;
@@ -13,6 +14,7 @@ use fotw_speechd_client::{
 use fotw_stt::vad::{GateConfig, SpeechDetector, speech_regions};
 use futures_util::future::BoxFuture;
 
+use super::bleed::BleedParams;
 use super::engine::{Diarization, PassEngine};
 use super::merge::TimedWord;
 use super::turns::SpeakerSpan;
@@ -43,14 +45,28 @@ pub fn provenance() -> serde_json::Value {
     })
 }
 
+/// The plan new cleanup jobs get in this build: [`provenance`] and the
+/// cross-track bleed suppression [`HelperEngine`] runs.
+#[must_use]
+pub fn plan() -> super::job::Plan {
+    super::job::Plan::new(provenance(), Some(BleedParams::default()))
+}
+
 /// Parakeet and the diarizer in the helper, Silero beside them.
 pub struct HelperEngine {
     client: SpeechdClient,
     asr: &'static str,
     diarizer_engine: &'static str,
     detector: Arc<Mutex<Box<dyn SpeechDetector>>>,
+    /// The diarizer is installed; it is loaded only once Parakeet is done.
     diarizer: bool,
+    /// This engine loaded Parakeet (a recording had not), so it unloads it.
+    owns_asr: AtomicBool,
+    /// This engine loaded the diarizer, so it unloads it.
+    owns_diarizer: AtomicBool,
     speaker_threshold: Option<f32>,
+    /// Cross-track bleed suppression before the engines hear a track.
+    bleed: Option<BleedParams>,
     /// Ask Parakeet for word timings (always, outside tests).
     request_timings: bool,
     /// Windows whose word times were estimated, because the helper returned
@@ -59,8 +75,10 @@ pub struct HelperEngine {
 }
 
 impl HelperEngine {
-    /// Load and warm Parakeet and, when it is installed, the diarizer, in
-    /// the daemon's shared helper; load the speech detector.
+    /// Load and warm Parakeet in the daemon's shared helper and load the
+    /// speech detector. The diarizer, when installed, is loaded only after
+    /// Parakeet is released ([`PassEngine::diarize`]), so the two models are
+    /// never in memory together.
     ///
     /// # Errors
     ///
@@ -75,26 +93,34 @@ impl HelperEngine {
         }
         let detector = load_detector(data_root).await?;
         let client = crate::speechd::helper(data_root).await?;
-        client
-            .load(PARAKEET.id)
-            .await
-            .map_err(|e| format!("Parakeet did not load: {e}"))?;
-        client
-            .warmup(PARAKEET.id)
-            .await
-            .map_err(|e| format!("Parakeet did not warm up: {e}"))?;
         // Speaker labels are an addition: without the diarizer the cleaned
         // version is stored unlabelled and says so.
-        let diarizer = crate::speechd::present_model(data_root, &DIARIZER)
-            && client.load(DIARIZER_ENGINE).await.is_ok()
-            && client.warmup(DIARIZER_ENGINE).await.is_ok();
+        let diarizer = crate::speechd::present_model(data_root, &DIARIZER);
+        Self::start(client, PARAKEET.id, DIARIZER_ENGINE, detector, diarizer).await
+    }
+
+    /// [`prepare`](Self::prepare) with the helper, engines and detector
+    /// given: load and warm `asr`, noting whether this engine loaded it.
+    async fn start(
+        client: SpeechdClient,
+        asr: &'static str,
+        diarizer_engine: &'static str,
+        detector: Box<dyn SpeechDetector>,
+        diarizer: bool,
+    ) -> Result<Self, String> {
+        let owns_asr = load(&client, asr)
+            .await
+            .map_err(|e| format!("Parakeet did not {e}"))?;
         Ok(Self {
             client,
-            asr: PARAKEET.id,
-            diarizer_engine: DIARIZER_ENGINE,
+            asr,
+            diarizer_engine,
             detector: Arc::new(Mutex::new(detector)),
             diarizer,
+            owns_asr: AtomicBool::new(owns_asr),
+            owns_diarizer: AtomicBool::new(false),
             speaker_threshold: SPEAKER_THRESHOLD,
+            bleed: Some(BleedParams::default()),
             request_timings: true,
             estimated: Default::default(),
         })
@@ -112,6 +138,29 @@ impl HelperEngine {
     pub fn with_speaker_threshold(mut self, threshold: Option<f32>) -> Self {
         self.speaker_threshold = threshold;
         self
+    }
+
+    /// Suppress cross-track bleed with these settings instead, or not at
+    /// all (evaluation).
+    #[must_use]
+    pub fn with_bleed(mut self, bleed: Option<BleedParams>) -> Self {
+        self.bleed = bleed;
+        self
+    }
+
+    /// Unload `engine` if this engine loaded it (`owned`). A refused unload
+    /// (a stream still open) keeps it owned, so the job's final release
+    /// tries again.
+    async fn unload(&self, engine: &str, owned: &AtomicBool) {
+        if !owned.load(Ordering::SeqCst) {
+            return;
+        }
+        match self.client.unload(engine).await {
+            Ok(()) => owned.store(false, Ordering::SeqCst),
+            Err(e) => {
+                crate::journal::record(&format!("cleanup  : {engine} stayed loaded: {e}"));
+            }
+        }
     }
 
     async fn send(stream: &SpeechStream, pcm: &[i16]) -> Result<(), String> {
@@ -194,6 +243,12 @@ impl PassEngine for HelperEngine {
             if !self.diarizer {
                 return Ok(None);
             }
+            if load(&self.client, self.diarizer_engine)
+                .await
+                .map_err(|e| format!("the diarizer did not {e}"))?
+            {
+                self.owns_diarizer.store(true, Ordering::SeqCst);
+            }
             let stream = self
                 .client
                 .open_stream(StreamConfig {
@@ -215,6 +270,32 @@ impl PassEngine for HelperEngine {
         provenance()
     }
 
+    fn release_recognizer(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async move { self.unload(self.asr, &self.owns_asr).await })
+    }
+
+    fn restore_recognizer(&self) -> BoxFuture<'_, ()> {
+        // For the recording that started: loaded for it, so not this
+        // engine's to unload any more.
+        Box::pin(async move {
+            self.owns_asr.store(false, Ordering::SeqCst);
+            if let Err(e) = load(&self.client, self.asr).await {
+                crate::journal::record(&format!("cleanup  : Parakeet did not {e}"));
+            }
+        })
+    }
+
+    fn release(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            self.unload(self.diarizer_engine, &self.owns_diarizer).await;
+            self.unload(self.asr, &self.owns_asr).await;
+        })
+    }
+
+    fn bleed(&self) -> Option<BleedParams> {
+        self.bleed
+    }
+
     fn notes(&self) -> Vec<String> {
         match self.estimated.load(std::sync::atomic::Ordering::SeqCst) {
             0 => Vec::new(),
@@ -223,6 +304,30 @@ impl PassEngine for HelperEngine {
             )],
         }
     }
+}
+
+/// Load and warm `engine` in the shared helper unless it is loaded already.
+/// Returns whether this call loaded it. The error reads after "did not".
+async fn load(client: &SpeechdClient, engine: &str) -> Result<bool, String> {
+    let held = client
+        .health()
+        .await
+        .map_err(|e| format!("load: {e}"))?
+        .loaded
+        .iter()
+        .any(|e| e == engine);
+    if held {
+        return Ok(false);
+    }
+    client
+        .load(engine)
+        .await
+        .map_err(|e| format!("load: {e}"))?;
+    client
+        .warmup(engine)
+        .await
+        .map_err(|e| format!("warm up: {e}"))?;
+    Ok(true)
 }
 
 /// The pinned Silero detector live local transcription uses.
@@ -341,24 +446,77 @@ mod tests {
         }
     }
 
-    async fn engine() -> HelperEngine {
+    async fn client() -> SpeechdClient {
         let root = tempfile::tempdir().unwrap();
-        let client = crate::speechd::helper_with(&fake_launch(), root.path())
+        crate::speechd::helper_with(&fake_launch(), root.path())
             .await
-            .unwrap();
-        for id in ["fake-words", "fake-diarizer"] {
-            client.load(id).await.unwrap();
-        }
-        HelperEngine {
+            .unwrap()
+    }
+
+    async fn start(client: SpeechdClient) -> HelperEngine {
+        HelperEngine::start(
             client,
-            asr: "fake-words",
-            diarizer_engine: "fake-diarizer",
-            detector: Arc::new(Mutex::new(Box::new(Silent))),
-            diarizer: true,
-            speaker_threshold: None,
-            request_timings: true,
-            estimated: Default::default(),
-        }
+            "fake-words",
+            "fake-diarizer",
+            Box::new(Silent),
+            true,
+        )
+        .await
+        .unwrap()
+        .with_speaker_threshold(None)
+        .with_bleed(None)
+    }
+
+    async fn engine() -> HelperEngine {
+        start(client().await).await
+    }
+
+    async fn loaded(client: &SpeechdClient) -> Vec<String> {
+        let mut loaded = client.health().await.unwrap().loaded;
+        loaded.sort();
+        loaded
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parakeet_is_unloaded_before_the_diarizer_loads_and_nothing_stays_loaded() {
+        let engine = engine().await;
+        assert_eq!(loaded(&engine.client).await, ["fake-words"]);
+        engine.release_recognizer().await;
+        assert!(loaded(&engine.client).await.is_empty());
+        let session = engine.diarize().await.unwrap().expect("a diarizer");
+        assert_eq!(loaded(&engine.client).await, ["fake-diarizer"]);
+        session.finish().await.unwrap();
+        engine.release().await;
+        assert!(
+            loaded(&engine.client).await.is_empty(),
+            "models left loaded"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_model_the_live_transcription_loaded_is_left_loaded() {
+        // A recording loaded Parakeet in the shared helper before the
+        // cleanup started; the cleanup does not take it away.
+        let client = client().await;
+        client.load("fake-words").await.unwrap();
+        let engine = start(client).await;
+        engine.release_recognizer().await;
+        assert_eq!(loaded(&engine.client).await, ["fake-words"]);
+        let session = engine.diarize().await.unwrap().expect("a diarizer");
+        session.finish().await.unwrap();
+        engine.release().await;
+        assert_eq!(loaded(&engine.client).await, ["fake-words"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_released_recognizer_can_be_restored_for_a_recording() {
+        let engine = engine().await;
+        engine.release_recognizer().await;
+        engine.restore_recognizer().await;
+        assert_eq!(loaded(&engine.client).await, ["fake-words"]);
+        // Restored for the recording, so the cleanup no longer owns it.
+        engine.release().await;
+        assert_eq!(loaded(&engine.client).await, ["fake-words"]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

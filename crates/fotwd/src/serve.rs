@@ -644,7 +644,7 @@ async fn serve_until_stopped(
             &data_root,
             open,
             factory,
-            crate::post_pass::speechd_engine::provenance(),
+            crate::post_pass::speechd_engine::plan(),
             Box::new(move |meeting| {
                 if let Some(hub) = hub_for_cleanup.get() {
                     hub.announce_meeting_ready(meeting, fotw_web::MeetingReadyReason::Cleaned);

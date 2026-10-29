@@ -181,7 +181,7 @@ mod tests {
             dir.path(),
             open.clone(),
             std::sync::Arc::new(|| Box::pin(std::future::pending())),
-            serde_json::json!({}),
+            super::super::job::Plan::new(serde_json::json!({}), None),
             Box::new(|_| {}),
         );
         let control = DashboardCleanup::new(open().unwrap(), controller);
