@@ -273,6 +273,7 @@ mod tests {
     async fn protocol_adapter(content: &str) -> (Arc<LocalAdapter>, std::path::PathBuf) {
         let (process, listening, received) = process::protocol_fixture(content);
         let config = RuntimeConfig {
+            ownership_directory: "/unused".into(),
             model_id: "fixture".into(),
             runtime_files: vec![],
             executable: "llama-server".into(),
@@ -505,6 +506,7 @@ mod tests {
         // fixture boot under CI load must not consume the cancellation budget.
         let (process, listening, marker) = process::stalled_fixture(Duration::from_secs(3));
         let config = RuntimeConfig {
+            ownership_directory: "/unused".into(),
             model_id: "fixture".into(),
             runtime_files: vec![],
             executable: "llama-server".into(),
