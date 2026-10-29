@@ -77,9 +77,16 @@ mod imp {
         if !args.iter().any(|a| a == "--no-clean") {
             // Archive both tracks as promotion does, then free the PCM: the
             // job reads only the Opus files, so its memory is measured alone.
-            encode(&mic, &out.join("mic.opus"))?;
-            encode(&system, &out.join("system.opus"))?;
+            // An archive already there (a previous `--encode-only`) is reused.
+            for (pcm, name) in [(&mic, "mic.opus"), (&system, "system.opus")] {
+                if !out.join(name).is_file() {
+                    encode(pcm, &out.join(name))?;
+                }
+            }
             drop((mic, system));
+            if args.iter().any(|a| a == "--encode-only") {
+                return Ok(());
+            }
             let clean = runtime.block_on(clean(&data_root, &out, &mut report))?;
             write(&out.join("clean.json"), &clean)?;
         }
@@ -155,8 +162,11 @@ mod imp {
     fn encode(pcm: &[i16], path: &Path) -> Result<(), String> {
         let mut w =
             fotw_pipeline::opus::OpusOggWriter::create(path, 16_000).map_err(|e| e.to_string())?;
-        let floats: Vec<f32> = pcm.iter().map(|&x| f32::from(x) / 32768.0).collect();
-        w.push_f32(&floats).map_err(|e| e.to_string())?;
+        // In pieces, as the recording pump writes it.
+        for piece in pcm.chunks(16_000) {
+            let floats: Vec<f32> = piece.iter().map(|&x| f32::from(x) / 32768.0).collect();
+            w.push_f32(&floats).map_err(|e| e.to_string())?;
+        }
         w.finish().map_err(|e| e.to_string())?;
         Ok(())
     }
