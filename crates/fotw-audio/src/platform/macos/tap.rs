@@ -15,7 +15,11 @@
 //!    `kAudioAggregateDeviceMainSubDeviceKey`, no sub-device list: verified
 //!    unnecessary, and omitting them removes drift compensation, the
 //!    default-output lookup and default-device-change tracking from the
-//!    critical path.
+//!    critical path. **No tap auto-start** either: it makes IO wait for a
+//!    tapped process to *begin* playing, which a call already running on a
+//!    Bluetooth HFP headset never does (see [`aggregate_description`]).
+//!    The IOProc format is then read from the aggregate's input stream, not
+//!    assumed from the tap's ASBD (see [`io_format`]).
 //! 5. `AudioDeviceCreateIOProcIDWithBlock` on a **dedicated serial dispatch
 //!    queue**. Passing `None` silently fails to register the block on
 //!    macOS 26 — always pass `Some`.
@@ -169,42 +173,17 @@ impl SystemTap {
             let asbd = assets.system_tap().asbd().map_err(|e| {
                 TapError::platform(format!("kAudioTapPropertyFormat failed: {e:?}"))
             })?;
-            let format = asbd_to_format(&asbd)?;
+            let tap_format = asbd_to_format(&asbd)?;
 
             // --- 4. Tap-only private aggregate device ------------------------
-            let sub_tap = cf::DictionaryOf::with_keys_values(
-                &[sub_tap_keys::uid(), sub_tap_keys::drift_compensation()],
-                &[
-                    tap_uid.as_type_ref(),
-                    cf::Boolean::value_true().as_type_ref(),
-                ],
-            );
-            let tap_list = cf::ArrayOf::from_slice(&[sub_tap.as_ref()]);
             let agg_uid = cf::Uuid::new().to_cf_string();
-
-            let dict = cf::DictionaryOf::with_keys_values(
-                &[
-                    agg::uid(),
-                    agg::name(),
-                    agg::is_private(),
-                    agg::is_stacked(),
-                    agg::tap_auto_start(),
-                    agg::tap_list(),
-                ],
-                &[
-                    agg_uid.as_type_ref(),
-                    cf::str!(c"FlyOnTheWall").as_type_ref(),
-                    cf::Boolean::value_true().as_type_ref(),
-                    cf::Boolean::value_false().as_type_ref(),
-                    cf::Boolean::value_true().as_type_ref(),
-                    tap_list.as_type_ref(),
-                ],
-            );
+            let dict = aggregate_description(&agg_uid, &tap_uid);
 
             let device = AggregateDevice::with_desc(&dict).map_err(|e| {
                 TapError::platform(format!("AudioHardwareCreateAggregateDevice failed: {e:?}"))
             })?;
 
+            let format = io_format(tap_format, device.input_asbd());
             assets.set_system_device(device);
 
             // --- 5. IOProc on a dedicated serial queue -----------------------
@@ -260,7 +239,20 @@ fn on_io(
         return;
     };
 
+    // Never reinterpret a buffer whose layout disagrees with the format we
+    // reported: a route flip to mono read as stereo halves every frame count.
+    // The typed error is a callback fault, so the supervisor rebuilds and
+    // re-reads the format instead of recording garbage.
     let buf = &input.buffers[0];
+    let channels_u64 = u64::from(channels);
+    if input.number_buffers != 1
+        || channels == 0
+        || buf.number_channels != channels
+        || !u64::from(buf.data_bytes_size).is_multiple_of(channels_u64 * 4)
+    {
+        sink.on_error(TapError::StreamFormatChanged);
+        return;
+    }
     if buf.data.is_null() || buf.data_bytes_size == 0 {
         return;
     }
@@ -280,6 +272,67 @@ fn on_io(
     flags.set(FrameFlags::SILENT, pcm.iter().all(|s| *s == 0.0));
 
     sink.on_input(pcm, input_time, before, frames, flags);
+}
+
+/// The composition of our tap-only private aggregate device.
+fn aggregate_description(
+    agg_uid: &cf::String,
+    tap_uid: &cf::String,
+) -> arc::R<cf::DictionaryOf<cf::String, cf::Type>> {
+    let sub_tap = cf::DictionaryOf::with_keys_values(
+        &[sub_tap_keys::uid(), sub_tap_keys::drift_compensation()],
+        &[
+            tap_uid.as_type_ref(),
+            cf::Boolean::value_true().as_type_ref(),
+        ],
+    );
+    let tap_list = cf::ArrayOf::from_slice(&[sub_tap.as_ref()]);
+    cf::DictionaryOf::with_keys_values(
+        &[
+            agg::uid(),
+            agg::name(),
+            agg::is_private(),
+            agg::is_stacked(),
+            agg::tap_auto_start(),
+            agg::tap_list(),
+        ],
+        &[
+            agg_uid.as_type_ref(),
+            cf::str!(c"FlyOnTheWall").as_type_ref(),
+            cf::Boolean::value_true().as_type_ref(),
+            cf::Boolean::value_false().as_type_ref(),
+            // Never auto-start. With it, AudioDeviceStart defers IO until a
+            // tapped process *begins* receiving audio. Audio that was already
+            // flowing when we started — a call on a Bluetooth headset in HFP —
+            // never produces that edge, so the IOProc never runs (zero
+            // buffers, every rebuild identical), and on macOS 26.3 coreaudiod
+            // parks other processes' input starts in BlockStartOnTapStart
+            // behind the unstarted tap (#268). Nothing playing at all has the
+            // same no-buffer signature (#270). Chromium's CATap loopback uses
+            // this same tap-only, no-auto-start composition.
+            cf::Boolean::value_false().as_type_ref(),
+            tap_list.as_type_ref(),
+        ],
+    )
+}
+
+/// The format every IOProc buffer is delivered in.
+///
+/// The aggregate's input stream format is what Core Audio hands the IOProc.
+/// The tap's own ASBD is an estimate of the mixdown and can disagree with it:
+/// on a Bluetooth headset in HFP the tap still reports 48 kHz while the route
+/// runs at 16 kHz, and labelling 16 kHz buffers as 48 kHz plays the call back
+/// at 3x speed. The tap's format is the fallback only when the aggregate
+/// cannot describe its stream.
+fn io_format<E>(
+    tap: StreamFormat,
+    aggregate: Result<cat::AudioStreamBasicDesc, E>,
+) -> StreamFormat {
+    aggregate
+        .ok()
+        .filter(|asbd| asbd.sample_rate.is_finite() && asbd.sample_rate.fract() == 0.0)
+        .and_then(|asbd| asbd_to_format(&asbd).ok())
+        .unwrap_or(tap)
 }
 
 fn asbd_to_format(asbd: &cat::AudioStreamBasicDesc) -> Result<StreamFormat, TapError> {
@@ -398,5 +451,111 @@ mod exclusion_tests {
             let ids: Vec<_> = desc.bundle_ids().iter().map(|id| id.to_string()).collect();
             assert_eq!(ids, ["com.brave.Browser.helper", "com.spotify.client"]);
         }
+    }
+}
+
+#[cfg(test)]
+mod bluetooth_route_tests {
+    //! A Bluetooth headset used as both mic and speaker runs in HFP: the
+    //! output device is 16 kHz mono while the global tap still describes a
+    //! 48 kHz stereo mixdown. None of these tests open a device or create a
+    //! tap; they check only the descriptions and arithmetic we hand Core Audio.
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn flag(dict: &cf::DictionaryOf<cf::String, cf::Type>, key: &cf::String) -> Option<bool> {
+        dict.get(key)
+            .map(|v| v.equal(cf::Boolean::value_true().as_type_ref()))
+    }
+
+    #[test]
+    fn aggregate_starts_without_waiting_for_a_tapped_process_to_begin_rendering() {
+        // With tap auto-start, AudioDeviceStart defers IO until a tapped
+        // process *begins* receiving audio. A call that was already playing
+        // through an HFP headset never produces that edge, so the IOProc never
+        // runs, and coreaudiod parks other processes' input starts behind it.
+        let dict = aggregate_description(cf::str!(c"agg-fixture"), cf::str!(c"tap-fixture"));
+        assert_eq!(flag(&dict, agg::tap_auto_start()), Some(false));
+        assert_eq!(flag(&dict, agg::is_private()), Some(true));
+        assert_eq!(flag(&dict, agg::is_stacked()), Some(false));
+        assert!(dict.get(agg::tap_list()).is_some());
+        // No physical sub-device: the headset is never opened as a clock.
+        assert!(dict.get(agg::sub_device_list()).is_none());
+        assert!(dict.get(agg::main_sub_device()).is_none());
+    }
+
+    #[test]
+    fn io_format_is_what_the_aggregate_delivers_not_the_tap_estimate() {
+        let tap = StreamFormat::new(48_000, 2, SampleFormat::F32);
+        let hfp = cat::AudioStreamBasicDesc::common_f32(16_000.0, 2, true);
+        assert_eq!(
+            io_format::<()>(tap, Ok(hfp)),
+            StreamFormat::new(16_000, 2, SampleFormat::F32),
+            "reading 16 kHz buffers as 48 kHz plays the call back at 3x speed"
+        );
+    }
+
+    #[test]
+    fn io_format_falls_back_to_the_tap_when_the_aggregate_cannot_say() {
+        let tap = StreamFormat::new(48_000, 2, SampleFormat::F32);
+        assert_eq!(io_format(tap, Err("unreadable")), tap);
+        let uninitialised = cat::AudioStreamBasicDesc::common_f32(0.0, 0, true);
+        assert_eq!(io_format::<()>(tap, Ok(uninitialised)), tap);
+    }
+
+    struct Counting {
+        samples: Arc<AtomicUsize>,
+        errors: Arc<AtomicUsize>,
+    }
+    impl FrameSink for Counting {
+        fn on_frames(&mut self, pcm: &[f32], _: crate::frames::CaptureTimestamp, _: FrameFlags) {
+            self.samples.fetch_add(pcm.len(), Ordering::AcqRel);
+        }
+        fn on_error(&mut self, error: TapError) {
+            assert!(matches!(error, TapError::StreamFormatChanged));
+            self.errors.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[test]
+    fn a_buffer_whose_layout_disagrees_with_the_format_is_a_fault_not_audio() {
+        let samples = Arc::new(AtomicUsize::new(0));
+        let errors = Arc::new(AtomicUsize::new(0));
+        let state = IoState {
+            sink: Mutex::new(Some(CaptureSink::new(Box::new(Counting {
+                samples: samples.clone(),
+                errors: errors.clone(),
+            })))),
+            device_frames: AtomicU64::new(0),
+        };
+        let mut pcm = [0.25_f32, -0.25, 0.5, -0.5];
+        let buffer = |channels: u32, pcm: &mut [f32; 4]| cat::AudioBufList {
+            number_buffers: 1,
+            buffers: [cat::AudioBuf {
+                number_channels: channels,
+                data_bytes_size: 16,
+                data: pcm.as_mut_ptr().cast(),
+            }],
+        };
+        on_io(
+            &state,
+            &buffer(2, &mut pcm),
+            2,
+            &cat::AudioTimeStamp::invalid(),
+        );
+        assert_eq!(samples.load(Ordering::Acquire), 4);
+        assert_eq!(state.device_frames.load(Ordering::Acquire), 2);
+
+        // The route flipped to mono under a stereo format: halving the frame
+        // count would silently double the speed of everything after it.
+        on_io(
+            &state,
+            &buffer(1, &mut pcm),
+            2,
+            &cat::AudioTimeStamp::invalid(),
+        );
+        assert_eq!(samples.load(Ordering::Acquire), 4, "no samples appended");
+        assert_eq!(state.device_frames.load(Ordering::Acquire), 2);
+        assert_eq!(errors.load(Ordering::Acquire), 1);
     }
 }
