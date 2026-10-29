@@ -11,6 +11,8 @@ mod extraction_schema;
 #[cfg(any(target_os = "macos", test))]
 mod ipc;
 #[cfg(target_os = "macos")]
+mod ownership;
+#[cfg(target_os = "macos")]
 mod process;
 #[cfg(target_os = "macos")]
 mod watch;

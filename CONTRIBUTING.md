@@ -100,7 +100,17 @@ qualification are completed in #234.
 For a development smoke test, supply a JSON `RuntimeConfig` (see
 `crates/fotwd/src/local_summary/process.rs`) containing trusted SHA-256 digests
 for the installed GGUF, `llama-server` and every required adjacent dylib. Use
-regular files rather than symlinks. The caller authenticates this manifest;
+regular files rather than symlinks. Set `ownership_directory` to an existing,
+absolute, user-owned mode-0700 directory shared by every app instance and summary
+model for this development owner. Keep it separate from per-model caches and
+per-load staging. Loading acquires its persistent mode-0600 `runtime.lock` before
+verification; another owner receives Busy without starting native work. Never
+unlink or replace that lock file to clear Busy. An inherited descriptor retains
+admission through app/guardian/native exec and crash cleanup. Only confirmed
+native exit plus guardian reaping permits explicit release; unconfirmed shutdown
+retains admission until the remaining holders exit.
+
+The caller authenticates this manifest;
 matching a caller-provided hash alone does not establish publisher trust.
 
 ```sh
@@ -138,7 +148,7 @@ for kernel exit events. All workers inherit the same network sandbox. Retain and
 await `shutdown` to confirm native exit and guardian reaping; requesting Stop is
 separate from confirming resource release.
 
-The app-wide lease/queue, capture priority, idle unload and crash-staging recovery
+The app-wide queue, capture priority, idle unload and crash-staging recovery
 remain acceptance work in #237. Forced app exit can leave public runtime staging
 copies in its private temporary directory; no meeting text is written there.
 

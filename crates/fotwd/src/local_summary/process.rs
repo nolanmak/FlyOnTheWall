@@ -15,6 +15,7 @@ use tokio::process::{Child, Command};
 
 use super::{
     ipc::{self, Endpoint},
+    ownership::OwnerLease,
     package::{BoundModel, bind_models_with_cancellation},
     watch::ExitWatch,
     worker,
@@ -33,6 +34,10 @@ pub struct Artifact {
 /// Explicit runtime configuration; there is no model-size or RAM-tier ceiling.
 #[derive(Clone, serde::Deserialize)]
 pub struct RuntimeConfig {
+    /// Stable private directory shared by all summary models and app instances
+    /// for this app owner. Must exist, belong to this user and have mode 0700.
+    /// Never use a per-model or per-request directory.
+    pub ownership_directory: PathBuf,
     /// Catalog model identity used in provenance, never a provider model name.
     pub model_id: String,
     /// Main llama-server executable and all adjacent runtime dylibs. These are
@@ -100,6 +105,7 @@ pub(super) struct Process {
     _root: tempfile::TempDir,
     pub(super) socket: PathBuf,
     _models: Option<BoundModel>,
+    lease: Option<Arc<OwnerLease>>,
 }
 
 struct Supervision {
@@ -214,6 +220,9 @@ impl Process {
                 .map_err(|_| "local runtime wait failed")?
                 .is_some();
             if exited {
+                if let Some(lease) = &self.lease {
+                    lease.release()?;
+                }
                 return Ok(());
             }
             if tokio::time::Instant::now() >= until {
@@ -444,10 +453,16 @@ pub(super) async fn launch(
         armed: true,
     };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(config.load_timeout_seconds);
+    let lease = Arc::new(OwnerLease::acquire(&config.ownership_directory)?);
     let copy = config.clone();
     let control = cancellation.clone();
-    let mut verification = tokio::task::spawn_blocking(move || prepare(&copy, &control));
-    let (root, model) = match tokio::time::timeout_at(deadline, &mut verification).await {
+    // The blocking verifier retains admission even if its async caller is
+    // dropped. Cancellation must finish actual file work before another load.
+    let mut verification = tokio::task::spawn_blocking(move || {
+        let (root, model) = prepare(&copy, &control)?;
+        Ok::<_, String>((root, model, lease))
+    });
+    let (root, model, lease) = match tokio::time::timeout_at(deadline, &mut verification).await {
         Ok(result) => result.map_err(|_| "local artifact verification failed")??,
         Err(_) => {
             cancellation.cancel();
@@ -509,12 +524,20 @@ pub(super) async fn launch(
         .arg(&spec_path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());
+    inherit_file(&mut command, lease.file());
     for file in &model.files {
-        inherit_model(&mut command, file);
+        inherit_file(&mut command, file);
     }
-    let child = command
-        .spawn()
-        .map_err(|_| "network-isolated local runtime launch failed")?;
+    lease.retain_for_native();
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            // A failed spawn has no surviving native holder. Do not leave
+            // admission pinned by an unrelated fork's pre-exec descriptor.
+            lease.release()?;
+            return Err("network-isolated local runtime launch failed".into());
+        }
+    };
     let group_pid = child.id().ok_or("local runtime has no owned PID")?;
     let mut spawned = Spawned {
         child: Some(child),
@@ -560,6 +583,7 @@ pub(super) async fn launch(
         socket,
         _root: root,
         _models: Some(model),
+        lease: Some(lease),
     };
     process.monitor_exits();
     if let Err(error) = cancellation.check() {
@@ -693,11 +717,12 @@ fn sandboxed_command(executable: &Path, root: &Path, socket: &Path) -> Command {
     command
 }
 
-fn inherit_model(command: &mut Command, model: &File) {
-    let fd = model.as_raw_fd();
+fn inherit_file(command: &mut Command, file: &File) {
+    let fd = file.as_raw_fd();
     // Keep the verified inode through exec: a cache pathname replaced after
     // verification must not change the model actually opened by llama.cpp.
-    // Only this read-only model descriptor loses CLOEXEC, in the child only.
+    // Only explicitly owned model/lease descriptors lose CLOEXEC, in this
+    // child only. The guardian and native execs retain the lease until exit.
     unsafe {
         command.pre_exec(move || {
             if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
@@ -743,6 +768,7 @@ while c.recv(8192):pass
             monitor: None,
             _root: root,
             _models: None,
+            lease: None,
             socket,
         },
         listening,
@@ -813,6 +839,7 @@ for _ in range(3):
             monitor: None,
             _root: root,
             _models: None,
+            lease: None,
             socket,
         },
         listening,
@@ -823,6 +850,50 @@ for _ in range(3):
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn another_owner_is_refused_before_artifact_verification() {
+        let owner = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(owner.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let missing = Artifact {
+            path: owner.path().join("missing.gguf"),
+            sha256: "0".repeat(64),
+        };
+        let config = RuntimeConfig {
+            ownership_directory: owner.path().into(),
+            model_id: "another model".into(),
+            runtime_files: vec![Artifact {
+                path: owner.path().join("llama-server"),
+                sha256: "0".repeat(64),
+            }],
+            executable: "llama-server".into(),
+            model: missing,
+            model_shards: vec![],
+            context_tokens: 8192,
+            output_tokens: 512,
+            threads: 1,
+            load_timeout_seconds: 1,
+            call_timeout_seconds: 1,
+        };
+        let lease = OwnerLease::acquire(owner.path()).unwrap();
+        let error = launch(&config, &LoadCancellation::default())
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains("busy"), "{error}");
+        lease.release().unwrap();
+        let error = launch(&config, &LoadCancellation::default())
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains("artifact unavailable"), "{error}");
+        // A failed verifier releases its own admission, never a permanent lock.
+        OwnerLease::acquire(owner.path())
+            .unwrap()
+            .release()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn cancelled_load_never_opens_missing_artifacts_or_spawns_a_child() {
@@ -836,6 +907,7 @@ mod tests {
             sha256: "0".repeat(64),
         };
         let config = RuntimeConfig {
+            ownership_directory: root.path().into(),
             model_id: "cancelled fixture".into(),
             runtime_files: vec![runtime],
             executable: "llama-server".into(),
@@ -911,7 +983,7 @@ mod tests {
             root.path(),
             &root.path().join("owned.sock"),
         );
-        inherit_model(&mut command, &model);
+        inherit_file(&mut command, &model);
         let output = command
             .args([
                 "-I",
@@ -1038,6 +1110,7 @@ print(json.dumps(results))
             monitor: None,
             _root: root,
             _models: None,
+            lease: None,
             socket,
         };
         assert_eq!(process.pid().unwrap(), pid);

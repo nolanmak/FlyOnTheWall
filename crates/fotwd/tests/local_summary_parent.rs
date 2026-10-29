@@ -120,7 +120,7 @@ fn killing_the_app_parent_does_not_leave_its_native_model_running() {
         // it never signals a potentially recycled orphan PID.
         let code = format!(
             r#"#!/usr/bin/python3 -IS
-import socket,sys,pathlib,threading,os,time,errno,json
+import socket,sys,pathlib,threading,os,time,errno,json,fcntl
 assert pathlib.Path(sys.argv[sys.argv.index('--model')+1]).read_bytes()==b'synthetic fixture weights'
 assert pathlib.Path(sys.argv[sys.argv.index('--model')+1]).with_name('fixture-00002-of-00002.gguf').read_bytes()==b'synthetic second shard'
 probe=None
@@ -131,6 +131,17 @@ except PermissionError as error:denied=error.errno
 finally:
  if probe is not None:probe.close()
 assert denied in (errno.EPERM,errno.EACCES)
+# A lease descriptor must survive guardian -> wrapper -> native exec. A path
+# lock held only by the app would not protect admission after an app crash.
+lease_stat=os.stat({lease_path})
+inherited=[]
+for fd in range(3,256):
+ try:
+  info=os.fstat(fd)
+  if (info.st_dev,info.st_ino)==(lease_stat.st_dev,lease_stat.st_ino):inherited.append(fd)
+ except OSError:pass
+assert len(inherited)==1
+assert not (fcntl.fcntl(inherited[0],fcntl.F_GETFD)&fcntl.FD_CLOEXEC)
 timer=threading.Timer(10,lambda:os._exit(0));timer.daemon=True;timer.start()
 s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
 s.bind(sys.argv[sys.argv.index('--host')+1]);s.listen(2)
@@ -152,6 +163,7 @@ while True:
  c.close()
 "#,
             ready = serde_json::to_string(&native_ready).unwrap(),
+            lease_path = serde_json::to_string(&root.join("summary-owner/runtime.lock")).unwrap(),
             health_delay = if during_load { 2 } else { 0 },
         );
         std::fs::write(&executable, code).unwrap();
@@ -159,11 +171,15 @@ while True:
         std::fs::write(&model, b"synthetic fixture weights").unwrap();
         let second = root.join("fixture-00002-of-00002.gguf");
         std::fs::write(&second, b"synthetic second shard").unwrap();
+        let owner = root.join("summary-owner");
+        std::fs::create_dir(&owner).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&owner, std::fs::Permissions::from_mode(0o700)).unwrap();
         let config = root.join("config.json");
         std::fs::write(
             &config,
             serde_json::to_vec(&json!({
-                "model_id":"fixture","runtime_files":[artifact(&executable)],
+                "ownership_directory":owner,"model_id":"fixture","runtime_files":[artifact(&executable)],
                 "executable":"llama-server","model":artifact(&model),"model_shards":[artifact(&second)],
                 "context_tokens":4096,"output_tokens":256,"threads":1,
                 "load_timeout_seconds":10,"call_timeout_seconds":5
@@ -213,6 +229,22 @@ while True:
             serde_json::from_slice(&std::fs::read(native_ready).unwrap()).unwrap();
         let pid = observed["pid"].as_u64().unwrap().try_into().unwrap();
         let guardian_pid = observed["guardian"].as_u64().unwrap().try_into().unwrap();
+        // Admission must be shared by every app instance, not just requests
+        // through one adapter. Never keep the probe's lock when it succeeds.
+        use std::os::unix::fs::OpenOptionsExt;
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(owner.join("runtime.lock"))
+            .unwrap();
+        let available_while_running =
+            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        if available_while_running {
+            assert_eq!(unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_UN) }, 0);
+        }
         let mut native = ExitWatch::new(pid);
         let mut guardian = ExitWatch::new(guardian_pid);
         if mode == "guardian_crash" {
@@ -269,6 +301,16 @@ while True:
             assert_eq!(spec["parent_pid"].as_u64(), Some(u64::from(app_pid)));
             std::fs::remove_dir_all(directory).unwrap();
         }
+        assert!(
+            !available_while_running,
+            "a second app owner could acquire admission while a model was running"
+        );
+        assert_eq!(
+            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "admission remained stuck after confirmed native and owner exit"
+        );
+        assert_eq!(unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_UN) }, 0);
         assert!(
             promptly,
             "{mode}: an owner died but its owned native model remained running"
