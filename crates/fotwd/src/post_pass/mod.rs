@@ -28,6 +28,7 @@
 //! version. A recovered meeting is eligible for cleanup afterwards like any
 //! other, which is how saved Parakeet audio gets its Parakeet transcript.
 
+pub mod bleed;
 pub mod controller;
 pub mod engine;
 pub mod job;

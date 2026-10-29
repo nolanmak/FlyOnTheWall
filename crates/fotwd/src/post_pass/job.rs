@@ -22,6 +22,7 @@ use fotw_store::Db;
 use fotw_stt::{Source, TranscriptSegment, Word};
 use serde::{Deserialize, Serialize};
 
+use super::bleed::{BleedFilter, BleedParams};
 use super::engine::PassEngine;
 use super::merge::{TimedWord, WindowWords, merge_windows};
 use super::turns::{Channel, SpeakerSpan, Turn, build_turns};
@@ -37,7 +38,7 @@ const DIARIZE_CHUNK: usize = 16_000 * 10;
 
 /// What a job reads and how. Stored with the job; a resumed job refuses
 /// checkpoints made under a different plan.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
     /// Format of this record.
     pub version: u32,
@@ -47,17 +48,28 @@ pub struct Plan {
     pub overlap_ms: u64,
     /// The engines, as [`PassEngine::provenance`] names them.
     pub engines: serde_json::Value,
+    /// Cross-track bleed suppression, when on ([`super::bleed`]).
+    #[serde(default)]
+    pub bleed: Option<BleedParams>,
 }
 
 impl Plan {
     /// The plan this build runs with `engine`.
     #[must_use]
     pub fn current(engine: &dyn PassEngine) -> Self {
+        Self::new(engine.provenance(), engine.bleed())
+    }
+
+    /// This build's plan for `engines` (as [`PassEngine::provenance`] names
+    /// them) with `bleed` suppression.
+    #[must_use]
+    pub fn new(engines: serde_json::Value, bleed: Option<BleedParams>) -> Self {
         Self {
-            version: 1,
+            version: 2,
             window_ms: super::windows::WINDOW_MS,
             overlap_ms: super::windows::OVERLAP_MS,
-            engines: engine.provenance(),
+            engines,
+            bleed,
         }
     }
 }
@@ -73,6 +85,30 @@ pub enum Outcome {
     Done(String),
     /// Stopped on request; checkpoints kept for the next start.
     Stopped,
+}
+
+/// `channel`'s saved track as the job reads it: with every stretch that is
+/// only a copy of the other channel silenced, when the plan says so for this
+/// channel and the other channel was saved too.
+fn open_track(
+    open: &OpenTrack<'_>,
+    plan: &Plan,
+    channel: Channel,
+) -> Result<Option<Box<dyn PcmSource>>, String> {
+    let Some(track) = open(channel)? else {
+        return Ok(None);
+    };
+    let Some(params) = plan.bleed.filter(|p| p.applies_to(channel)) else {
+        return Ok(Some(track));
+    };
+    let other = match channel {
+        Channel::Mic => Channel::System,
+        Channel::System => Channel::Mic,
+    };
+    Ok(Some(match open(other)? {
+        Some(reference) => Box::new(BleedFilter::new(track, reference, params)),
+        None => track,
+    }))
 }
 
 fn channel_name(channel: Channel) -> &'static str {
@@ -143,7 +179,23 @@ async fn yield_while(pause: &(dyn Fn() -> bool + Sync), stop: &AtomicBool) -> bo
 /// A track that cannot be read, an engine failure, or a plan that no longer
 /// matches the engines. The caller marks the job failed; the live version
 /// stays primary.
+///
+/// However it ends, the engine's models are released afterwards
+/// ([`PassEngine::release`]).
 pub async fn run(
+    db: &Mutex<Db>,
+    meeting_id: &str,
+    engine: &dyn PassEngine,
+    open: &OpenTrack<'_>,
+    stop: &AtomicBool,
+    pause: &(dyn Fn() -> bool + Sync),
+) -> Result<Outcome, String> {
+    let outcome = run_job(db, meeting_id, engine, open, stop, pause).await;
+    engine.release().await;
+    outcome
+}
+
+async fn run_job(
     db: &Mutex<Db>,
     meeting_id: &str,
     engine: &dyn PassEngine,
@@ -165,7 +217,7 @@ pub async fn run(
 
     let mut tracks = Vec::new();
     for channel in [Channel::Mic, Channel::System] {
-        if let Some(track) = open(channel)? {
+        if let Some(track) = open_track(open, &plan, channel)? {
             tracks.push((channel, track));
         }
     }
@@ -258,11 +310,22 @@ pub async fn run(
 
     let mut notes = engine.notes();
     let speakers = if heard.iter().any(|(c, _)| *c == Channel::System) {
+        // Parakeet's part is done: release it before the diarizer loads, so
+        // the two models are never in memory together. Not while a recording
+        // runs (its live transcription may use the same model), and if one
+        // started meanwhile, it gets the model back.
+        if !yield_while(pause, stop).await {
+            return Ok(Outcome::Stopped);
+        }
+        engine.release_recognizer().await;
+        if pause() {
+            engine.restore_recognizer().await;
+        }
         match diarize(
             db,
             meeting_id,
             engine,
-            open,
+            &|c| open_track(open, &plan, c),
             stop,
             pause,
             &mut progress,
@@ -313,6 +376,7 @@ pub async fn run(
         "window_ms": plan.window_ms,
         "overlap_ms": plan.overlap_ms,
         "speech_pad_ms": SPEECH_PAD_MS,
+        "bleed": plan.bleed,
         "speaker_labels": speakers.is_some(),
         "echo_segments_dropped": echoes,
         "live_transcript_id": job.live_transcript_id,
@@ -352,10 +416,16 @@ async fn diarize(
     units: u64,
 ) -> Result<Diarized, String> {
     let unavailable = |e: String| Diarized::Unavailable(format!("speaker labels unavailable: {e}"));
-    let Some(mut session) = engine.diarize().await? else {
-        return Ok(Diarized::Unavailable(
-            "speaker labels unavailable: no diarizer installed".into(),
-        ));
+    // The diarizer loads here, after Parakeet's release; one that will not
+    // load or start is treated like one that fails mid-channel.
+    let mut session = match engine.diarize().await {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return Ok(Diarized::Unavailable(
+                "speaker labels unavailable: no diarizer installed".into(),
+            ));
+        }
+        Err(e) => return Ok(unavailable(e)),
     };
     let Some(mut track) = open(Channel::System)? else {
         return Ok(Diarized::Spans(Vec::new()));
@@ -723,6 +793,122 @@ mod tests {
         recording.store(false, Ordering::SeqCst);
         assert!(matches!(run.await.unwrap(), Outcome::Done(_)));
         assert!(engine.transcribed.load(Ordering::SeqCst) > 0);
+    }
+
+    #[tokio::test]
+    async fn the_recognizer_is_released_before_the_diarizer_starts_and_everything_after() {
+        let (mic, system) = meeting();
+        let (db, meeting_id) = library();
+        let engine = FakeEngine::default();
+        queue(&db, &meeting_id, &engine);
+        let outcome = run(
+            &db,
+            &meeting_id,
+            &engine,
+            &opener(mic, system),
+            &AtomicBool::new(false),
+            &|| false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, Outcome::Done(_)));
+        assert!(
+            !engine.diarized_beside_recognizer.load(Ordering::SeqCst),
+            "Parakeet and the diarizer were loaded at the same time"
+        );
+        assert!(engine.released.load(Ordering::SeqCst), "models left loaded");
+        assert_eq!(engine.restored.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_stopped_job_releases_its_models_too() {
+        let (mic, system) = meeting();
+        let (db, meeting_id) = library();
+        let engine = FakeEngine::default();
+        queue(&db, &meeting_id, &engine);
+        let outcome = run(
+            &db,
+            &meeting_id,
+            &engine,
+            &opener(mic, system),
+            &AtomicBool::new(true),
+            &|| false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, Outcome::Stopped);
+        assert!(engine.released.load(Ordering::SeqCst), "models left loaded");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recording_that_starts_while_the_recognizer_is_released_gets_it_back() {
+        let (mic, system) = meeting();
+        let (db, meeting_id) = library();
+        let engine = FakeEngine::default();
+        queue(&db, &meeting_id, &engine);
+        // A recording starts just as the cleanup releases Parakeet, and ends
+        // a moment later.
+        let released = Arc::clone(&engine.recognizer_released);
+        let seen = AtomicUsize::new(0);
+        let pause =
+            move || released.load(Ordering::SeqCst) && seen.fetch_add(1, Ordering::SeqCst) == 0;
+        let outcome = run(
+            &db,
+            &meeting_id,
+            &engine,
+            &opener(mic, system),
+            &AtomicBool::new(false),
+            &pause,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, Outcome::Done(_)));
+        assert_eq!(
+            engine.restored.load(Ordering::SeqCst),
+            1,
+            "the live recording's model was left unloaded"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_diarizer_hears_the_remote_person_but_not_the_mic_speakers_copy() {
+        use super::super::bleed::tests::{copy, mix, talker};
+        // 60 s: the person at the mic talks for the first 30 s and the
+        // system track carries them 26 dB down and 3 ms late; then a remote
+        // person talks alone for 30 s.
+        let mut mic = talker(1, 30.0, 12_000.0);
+        mic.resize(16_000 * 60, 0);
+        let mut remote = vec![0i16; 16_000 * 30];
+        remote.extend(talker(2, 30.0, 6_000.0));
+        let system = mix(&copy(&mic, 0.05, 48), &remote);
+        let audible = |pcm: &[i16]| pcm.iter().filter(|&&x| x != 0).count();
+
+        let (db, meeting_id) = library();
+        let engine = FakeEngine {
+            bleed: Some(BleedParams::default()),
+            ..FakeEngine::default()
+        };
+        queue(&db, &meeting_id, &engine);
+        run(
+            &db,
+            &meeting_id,
+            &engine,
+            &opener(mic, system.clone()),
+            &AtomicBool::new(false),
+            &|| false,
+        )
+        .await
+        .unwrap();
+        let diarized = engine.diarizer_heard.load(Ordering::SeqCst);
+        assert!(
+            diarized >= audible(&remote) * 99 / 100,
+            "the remote person was cut: {diarized} of {} samples",
+            audible(&remote)
+        );
+        assert!(
+            diarized <= audible(&remote) + audible(&system[..16_000 * 30]) / 10,
+            "the copy reached the diarizer: {diarized} samples"
+        );
     }
 
     #[test]

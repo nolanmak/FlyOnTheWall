@@ -56,9 +56,8 @@ pub struct Controller {
     data_root: PathBuf,
     open: OpenLibrary,
     factory: EngineFactory,
-    /// The engines' provenance, for new jobs' plans, known without starting
-    /// the helper.
-    provenance: serde_json::Value,
+    /// New jobs' plan, known without starting the helper.
+    plan: Plan,
     wake: tokio::sync::Notify,
     /// Fired whenever a job stops being pending.
     settled: tokio::sync::Notify,
@@ -77,14 +76,14 @@ impl Controller {
         data_root: &Path,
         open: OpenLibrary,
         factory: EngineFactory,
-        provenance: serde_json::Value,
+        plan: Plan,
         on_done: Box<dyn Fn(&str) + Send + Sync>,
     ) -> Arc<Self> {
         Arc::new(Self {
             data_root: data_root.to_owned(),
             open,
             factory,
-            provenance,
+            plan,
             wake: tokio::sync::Notify::new(),
             settled: tokio::sync::Notify::new(),
             stop: AtomicBool::new(false),
@@ -108,12 +107,7 @@ impl Controller {
     /// The plan new jobs get.
     #[must_use]
     pub fn plan(&self) -> Plan {
-        Plan {
-            version: 1,
-            window_ms: super::windows::WINDOW_MS,
-            overlap_ms: super::windows::OVERLAP_MS,
-            engines: self.provenance.clone(),
-        }
+        self.plan.clone()
     }
 
     fn attempts(&self) -> std::sync::MutexGuard<'_, HashMap<String, Attempts>> {
@@ -366,7 +360,7 @@ mod tests {
         let open = library(dir.path());
         let id = meeting(dir.path(), &open);
         let engine = Arc::new(FakeEngine::default());
-        let provenance = engine.provenance();
+        let plan = Plan::current(engine.as_ref());
         let calls = Arc::clone(&engine.transcribed);
         let done = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&done);
@@ -378,7 +372,7 @@ mod tests {
             dir.path(),
             open.clone(),
             factory,
-            provenance,
+            plan,
             Box::new(move |m| seen.lock().unwrap().push(m.to_owned())),
         );
         let worker = controller.start();
@@ -404,7 +398,7 @@ mod tests {
             dir,
             open.clone(),
             factory,
-            FakeEngine::default().provenance(),
+            Plan::current(&FakeEngine::default()),
             Box::new(move |m| seen.lock().unwrap().push(m.to_owned())),
         );
         (c, done)
