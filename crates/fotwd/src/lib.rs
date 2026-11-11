@@ -7,6 +7,7 @@
 #![warn(missing_docs)]
 
 pub mod audit;
+pub mod calendar;
 pub mod captions;
 pub mod consent;
 pub mod detect;

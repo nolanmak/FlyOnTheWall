@@ -887,6 +887,43 @@ fn keychain_transcription() -> Transcription {
     }
 }
 
+/// The calendar event this session was, if the calendar can say (#295).
+///
+/// Never fails the save: a calendar that is off, slow or broken costs the
+/// meeting its calendar name and nothing else. The log line never names the
+/// event.
+fn calendar_link(outcome: &SessionOutcome) -> Option<crate::calendar::CalendarLink> {
+    let started = i64::try_from(outcome.started_at_ms)
+        .ok()
+        .filter(|&s| s > 0)?;
+    let ended = outcome
+        .capture_ended_at_ms
+        .and_then(|e| i64::try_from(e).ok())
+        .unwrap_or_else(fotw_store::now_ms);
+    // Only the signed `.app` holds the calendar grant. A bare binary run from
+    // a terminal could inherit the terminal's grant and name a test meeting
+    // after a real event.
+    if !DaemonRecorder::launched_as_app() {
+        return None;
+    }
+    match crate::calendar::lookup_match(
+        crate::calendar::system(),
+        started,
+        ended,
+        crate::calendar::LOOKUP_TIMEOUT,
+    ) {
+        Ok(Some(link)) => {
+            journal::record("calendar : named the meeting after its calendar event");
+            Some(link)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            journal::record(&format!("calendar : {e}; using the usual title"));
+            None
+        }
+    }
+}
+
 /// The persist-then-promote tail, headless.
 ///
 /// Persist happens AFTER the WAL is finalized, never instead of it: the
@@ -921,13 +958,17 @@ fn persist_and_promote(root: &Path, outcome: &SessionOutcome, ready: &ReadyTap) 
     // and rendering true local time is a dependency decision. Read
     // `dated_fallback_title`'s doc before reaching for a conversion here (#89).
     let title = crate::enrich::dated_fallback_title(fotw_store::now_ms());
+    let link = calendar_link(outcome);
+    let persist = |db: &mut fotw_store::Db| {
+        crate::persist::persist_session_linked(db, outcome, &title, link.as_ref())
+    };
 
     match crate::open_library(root) {
         Err(e) => {
             diag!("  ! could not open the library: {e}");
             None
         }
-        Ok(mut db) => match crate::persist::persist_session(&mut db, outcome, &title) {
+        Ok(mut db) => match persist(&mut db) {
             Err(e) => {
                 diag!("  ! could not add to the library: {e}");
                 None
