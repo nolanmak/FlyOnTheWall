@@ -271,12 +271,14 @@ pub fn lookup_match(
         }
     };
     // A title that cleans to nothing is no name at all, so it is not offered
-    // to the matcher; an emptier rival must not win because of it.
+    // to the matcher; an emptier rival must not win because of it. Nor is one
+    // that starts like the placeholder: enrichment reads that prefix as
+    // replaceable, so it would be silently overwritten later.
     let usable: Vec<ScheduledEvent> = events
         .into_iter()
         .filter_map(|mut e| {
             e.title = clean_event_title(&e.title)?;
-            Some(e)
+            (!e.title.starts_with(crate::enrich::FALLBACK_PREFIX)).then_some(e)
         })
         .collect();
     Ok(

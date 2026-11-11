@@ -16,6 +16,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use block2::RcBlock;
+use objc2::rc::autoreleasepool;
 use objc2::runtime::Bool;
 use objc2_event_kit::{
     EKAuthorizationStatus, EKEntityType, EKEvent, EKEventStatus, EKEventStore, EKParticipantStatus,
@@ -75,13 +76,17 @@ pub fn request_access(timeout: Duration) -> Access {
         return access();
     }
     let (tx, rx) = mpsc::sync_channel(1);
-    let block = RcBlock::new(move |granted: Bool, _error: *mut NSError| {
-        let _ = tx.try_send(granted.as_bool());
+    // A pool, because this runs on a plain Rust thread: Cocoa objects
+    // autoreleased here would otherwise never be freed.
+    autoreleasepool(|_| {
+        let block = RcBlock::new(move |granted: Bool, _error: *mut NSError| {
+            let _ = tx.try_send(granted.as_bool());
+        });
+        // SAFETY: `block` outlives the call — EventKit copies it — and the store is
+        // kept alive until the answer arrives or we stop waiting.
+        let store = unsafe { EKEventStore::new() };
+        unsafe { store.requestFullAccessToEventsWithCompletion(RcBlock::as_ptr(&block)) };
     });
-    // SAFETY: `block` outlives the call — EventKit copies it — and the store is
-    // kept alive until the answer arrives or we stop waiting.
-    let store = unsafe { EKEventStore::new() };
-    unsafe { store.requestFullAccessToEventsWithCompletion(RcBlock::as_ptr(&block)) };
     match rx.recv_timeout(timeout) {
         Ok(true) => Access::Granted,
         Ok(false) => Access::Refused,
@@ -107,16 +112,20 @@ impl CalendarLookup for EventKitCalendar {
         // SAFETY: plain EventKit reads on objects this function owns. The
         // predicate comes from the same store it is evaluated by, which is the
         // one precondition `eventsMatchingPredicate` documents.
-        let events = unsafe {
-            let store = EKEventStore::new();
-            let predicate = store.predicateForEventsWithStartDate_endDate_calendars(
-                &NSDate::dateWithTimeIntervalSince1970(start),
-                &NSDate::dateWithTimeIntervalSince1970(end),
-                None,
-            );
-            store.eventsMatchingPredicate(&predicate)
-        };
-        Ok(events.iter().map(|e| from_raw(&raw(&e))).collect())
+        // Inside a pool: lookups run on a plain Rust thread, where Cocoa's
+        // autoreleased objects would otherwise never be freed.
+        Ok(autoreleasepool(|_| {
+            let events = unsafe {
+                let store = EKEventStore::new();
+                let predicate = store.predicateForEventsWithStartDate_endDate_calendars(
+                    &NSDate::dateWithTimeIntervalSince1970(start),
+                    &NSDate::dateWithTimeIntervalSince1970(end),
+                    None,
+                );
+                store.eventsMatchingPredicate(&predicate)
+            };
+            events.iter().map(|e| from_raw(&raw(&e))).collect()
+        }))
     }
 }
 

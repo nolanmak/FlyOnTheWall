@@ -329,3 +329,23 @@ fn the_legacy_sweep_never_adopts_a_calendar_title() {
     let found = fotwd::enrich::adopt_legacy_titles(&mut db);
     assert!(!found.adopted.contains(&id));
 }
+
+#[test]
+fn an_event_named_like_the_placeholder_is_not_used() {
+    // Enrichment treats an `Untitled recording` prefix as replaceable, so a
+    // calendar title wearing it would be silently overwritten. Better to fall
+    // back to the usual naming from the start.
+    let calendar: Arc<dyn CalendarLookup> = Arc::new(Fixed::new(
+        "test",
+        vec![event(
+            "evt-1",
+            "Untitled recording — notes",
+            T10,
+            T10 + 30 * MIN,
+        )],
+    ));
+    assert_eq!(
+        lookup_match(calendar, T10, T10 + 30 * MIN, Duration::from_secs(2)).unwrap(),
+        None
+    );
+}
