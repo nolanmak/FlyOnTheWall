@@ -30,6 +30,18 @@ deny = [{ name = "cacao" }]
 # without failing the licenses/bans/sources gate on unrelated PRs.
 [advisories]
 yanked = "deny"
+ignore = [
+  # SQLite < 3.54.0 can return uninitialised page-cache memory when it opens a
+  # database together with a `-wal` file of a different page size. No release
+  # fixes our build: rusqlite's `bundled-sqlcipher` still bundles SQLite
+  # 3.53.4 in libsqlite3-sys 0.39. Exposure needs a less trusted party to have
+  # written the database pair, and fotwd only ever opens its own SQLCipher
+  # library and its pre-migration backups under its own data folder (Db::open,
+  # recovery::recover, migrations backups). A crafted file would also have to
+  # be encrypted under the library key. Remove this once sqlcipher-src ships
+  # SQLite >= 3.54.0.
+  { id = "RUSTSEC-2026-0459", reason = "SQLCipher build has no fix yet; fotwd opens only its own encrypted library" },
+]
 
 [sources]
 unknown-registry = "deny"
