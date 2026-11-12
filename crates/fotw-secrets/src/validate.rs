@@ -275,6 +275,16 @@ pub fn request_for(provider: Provider) -> ValidationRequest {
             },
             extra_headers: vec![("anthropic-version", "2023-06-01")],
         },
+        // Lists one auth config: read-only, and touches no connected account.
+        Provider::Composio => ValidationRequest {
+            method: "GET",
+            url: "https://backend.composio.dev/api/v3.1/auth_configs?limit=1".to_owned(),
+            auth: AuthScheme {
+                header: "x-api-key",
+                prefix: "",
+            },
+            extra_headers: Vec::new(),
+        },
     }
 }
 
@@ -455,6 +465,11 @@ mod tests {
                 Provider::Anthropic,
                 "api.anthropic.com",
                 "https://api.anthropic.com/v1/models",
+            ),
+            (
+                Provider::Composio,
+                "backend.composio.dev",
+                "https://backend.composio.dev/api/v3.1/auth_configs?limit=1",
             ),
         ];
 

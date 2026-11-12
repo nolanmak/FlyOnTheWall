@@ -16,7 +16,9 @@
 //! # What is read, and what is kept
 //!
 //! A lookup reads the title, times, all-day flag, status and the user's own
-//! response for events near the recording. Only the chosen event's title and
+//! response for events near the recording, from Apple Calendar and, when the
+//! user connected one, Google accounts through Composio (see [`composio`] for
+//! what that sends off the machine). Only the chosen event's title and
 //! identifier are stored. Attendees, notes, location and links are never read.
 //! The title then behaves like any other meeting title.
 //!
@@ -30,6 +32,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
+pub mod composio;
 #[cfg(target_os = "macos")]
 pub mod eventkit;
 
@@ -74,6 +77,9 @@ pub struct ScheduledEvent {
     pub canceled: bool,
     /// The user's own response.
     pub participation: Participation,
+    /// Which calendar store it came from, saved as `meetings.calendar_source`.
+    /// Empty means "whichever lookup returned it".
+    pub source: &'static str,
 }
 
 impl ScheduledEvent {
@@ -167,6 +173,53 @@ impl CalendarLookup for Fixed {
             .filter(|e| e.start_ms <= end_ms && start_ms <= e.end_ms)
             .cloned()
             .collect())
+    }
+}
+
+/// Several calendars read as one: Apple Calendar and any Google accounts
+/// connected through Composio.
+///
+/// A store that fails is skipped so the others still name the recording; only
+/// when every store fails is the lookup an error.
+pub struct Many {
+    stores: Vec<Arc<dyn CalendarLookup>>,
+}
+
+impl Many {
+    /// All of `stores`, in order.
+    #[must_use]
+    pub fn new(stores: Vec<Arc<dyn CalendarLookup>>) -> Self {
+        Self { stores }
+    }
+}
+
+impl CalendarLookup for Many {
+    fn source(&self) -> &'static str {
+        "many"
+    }
+
+    fn events_overlapping(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<ScheduledEvent>, String> {
+        let mut events = Vec::new();
+        let mut failures = Vec::new();
+        for store in &self.stores {
+            match store.events_overlapping(start_ms, end_ms) {
+                Ok(found) => events.extend(found.into_iter().map(|mut e| {
+                    if e.source.is_empty() {
+                        e.source = store.source();
+                    }
+                    e
+                })),
+                Err(e) => failures.push(format!("{}: {e}", store.source())),
+            }
+        }
+        if !self.stores.is_empty() && failures.len() == self.stores.len() {
+            return Err(failures.join("; "));
+        }
+        Ok(events)
     }
 }
 
@@ -285,9 +338,37 @@ pub fn lookup_match(
         match_event(&usable, start_ms, end_ms).map(|e| CalendarLink {
             title: e.title.clone(),
             uid: e.uid.clone(),
-            source: source.to_owned(),
+            source: if e.source.is_empty() {
+                source
+            } else {
+                e.source
+            }
+            .to_owned(),
         }),
     )
+}
+
+/// The longest a save waits when a Google account is connected through
+/// Composio: a network round trip per account, not a local read.
+pub const NETWORK_LOOKUP_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Every calendar a recording in the library at `root` may be named from, and
+/// how long a save should wait for them.
+///
+/// Apple Calendar always; Composio as well when the user connected a Google
+/// account there.
+#[must_use]
+pub fn for_library_root(root: &std::path::Path) -> (Arc<dyn CalendarLookup>, Duration) {
+    let google = crate::open_library(root)
+        .ok()
+        .and_then(|db| composio::for_library(&db));
+    match google {
+        Some(google) => (
+            Arc::new(Many::new(vec![system(), Arc::new(google)])),
+            NETWORK_LOOKUP_TIMEOUT,
+        ),
+        None => (system(), LOOKUP_TIMEOUT),
+    }
 }
 
 /// The calendar this machine can read right now.

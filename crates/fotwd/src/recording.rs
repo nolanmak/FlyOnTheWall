@@ -892,7 +892,7 @@ fn keychain_transcription() -> Transcription {
 /// Never fails the save: a calendar that is off, slow or broken costs the
 /// meeting its calendar name and nothing else. The log line never names the
 /// event.
-fn calendar_link(outcome: &SessionOutcome) -> Option<crate::calendar::CalendarLink> {
+fn calendar_link(root: &Path, outcome: &SessionOutcome) -> Option<crate::calendar::CalendarLink> {
     let started = i64::try_from(outcome.started_at_ms)
         .ok()
         .filter(|&s| s > 0)?;
@@ -906,12 +906,8 @@ fn calendar_link(outcome: &SessionOutcome) -> Option<crate::calendar::CalendarLi
     if !DaemonRecorder::launched_as_app() {
         return None;
     }
-    match crate::calendar::lookup_match(
-        crate::calendar::system(),
-        started,
-        ended,
-        crate::calendar::LOOKUP_TIMEOUT,
-    ) {
+    let (calendar, deadline) = crate::calendar::for_library_root(root);
+    match crate::calendar::lookup_match(calendar, started, ended, deadline) {
         Ok(Some(link)) => {
             journal::record("calendar : named the meeting after its calendar event");
             Some(link)
@@ -958,7 +954,7 @@ fn persist_and_promote(root: &Path, outcome: &SessionOutcome, ready: &ReadyTap) 
     // and rendering true local time is a dependency decision. Read
     // `dated_fallback_title`'s doc before reaching for a conversion here (#89).
     let title = crate::enrich::dated_fallback_title(fotw_store::now_ms());
-    let link = calendar_link(outcome);
+    let link = calendar_link(root, outcome);
     let persist = |db: &mut fotw_store::Db| {
         crate::persist::persist_session_linked(db, outcome, &title, link.as_ref())
     };

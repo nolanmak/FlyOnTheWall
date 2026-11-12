@@ -118,6 +118,7 @@ pub use crate::tokens::{HANDOFF_TTL, TokenTable, WS_TICKET_TTL};
 #[cfg(feature = "store")]
 pub use crate::store_source::StoreSource;
 
+pub mod calendar;
 pub mod capture;
 /// The post-meeting cleanup's status, version switch and setting (#246).
 pub mod cleanup;

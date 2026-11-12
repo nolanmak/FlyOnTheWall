@@ -44,11 +44,11 @@ not make transcription context-aware; the following flow is needed:
    respect unsaved edits and document revisions. Propagate saved changes through
    the existing GitHub sync and provide an updated download.
 
-Composio supports Google Calendar and Gmail OAuth, including custom scopes. It is
-an optional integration provider; a direct provider connection fits the app's
-existing preference for avoiding a hosted integration relay. Choose the account
-provider and connection approach before implementing OAuth and token storage.
-No calendar/email account was connected as part of this change.
+Google Calendar can now be connected through Composio from Settings › Calendars
+(opt-in, `crates/fotwd/src/calendar/composio.rs`). It is used only to name
+recordings: titles, times, status and the user's own response. Attendees,
+descriptions and email are not read yet; the flow above still applies before
+they are.
 
 Primary references:
 - https://docs.composio.dev/toolkits/googlecalendar

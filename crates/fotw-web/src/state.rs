@@ -39,6 +39,7 @@ struct Inner {
     health: OnceLock<Arc<dyn DaemonHealth>>,
     model_setup: OnceLock<Arc<dyn crate::model_setup::ModelSetupControl>>,
     speech: OnceLock<Arc<dyn crate::speech::SpeechControl>>,
+    calendar: OnceLock<Arc<dyn crate::calendar::CalendarControl>>,
     capture: OnceLock<Arc<dyn crate::capture::CaptureControl>>,
     speech_recovery: OnceLock<Arc<dyn crate::speech_recovery::SpeechRecoveryControl>>,
     documents: OnceLock<Arc<dyn crate::documents::DocumentControl>>,
@@ -117,6 +118,16 @@ impl AppState {
     /// Attach transcription settings before serving requests.
     pub fn set_speech(&self, control: Arc<dyn crate::speech::SpeechControl>) {
         let _ = self.inner.speech.set(control);
+    }
+
+    /// Attach calendar settings before serving requests.
+    pub fn set_calendar(&self, control: Arc<dyn crate::calendar::CalendarControl>) {
+        let _ = self.inner.calendar.set(control);
+    }
+
+    /// Calendar settings are absent on read-only servers.
+    pub fn calendar(&self) -> Option<Arc<dyn crate::calendar::CalendarControl>> {
+        self.inner.calendar.get().cloned()
     }
 
     /// Transcription settings are absent on read-only servers.
@@ -206,6 +217,7 @@ impl AppState {
                 documents: OnceLock::new(),
                 model_setup: OnceLock::new(),
                 speech: OnceLock::new(),
+                calendar: OnceLock::new(),
                 capture: OnceLock::new(),
                 speech_recovery: OnceLock::new(),
                 cleanup: OnceLock::new(),

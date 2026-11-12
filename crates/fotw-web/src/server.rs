@@ -253,6 +253,10 @@ fn routes(state: AppState) -> Router {
             get(crate::capture::get).post(crate::capture::post),
         )
         .route(
+            "/api/settings/calendar",
+            get(crate::calendar::get).post(crate::calendar::post),
+        )
+        .route(
             "/api/settings/speech",
             get(crate::speech::get).post(crate::speech::post),
         )

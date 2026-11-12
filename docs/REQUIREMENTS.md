@@ -58,6 +58,7 @@ FlyOnTheWall is a macOS menu-bar app that records both sides of a meeting — th
 ### Non-goals (v1)
 
 - **Any backend.** No accounts, no sync server, no hosted anything. This is the constraint that kills half the feature-request list, and that is the point.
+  - **One opt-in exception: Google Calendar through Composio** (`crates/fotwd/src/calendar/composio.rs`). Off until the user pastes a Composio key and ticks a disclosure in Settings. Composio sees the recording's time window and returns event titles and times; audio, transcripts and summaries never go to it. Apple Calendar (EventKit, which also covers Google accounts added in macOS Internet Accounts) stays the local default.
 - **Windows and Linux shipping code.** The platform seam is built on day one and stubs compile in CI; the implementations are M4+.
 - **Mac App Store.** Sandbox compatibility for Core Audio taps is undocumented and reported fragile; every shipping implementation runs non-sandboxed. Developer ID + notarized DMG only.
 - **Multi-tenancy:** workspaces, shared folders, SSO, admin controls, seat billing, share links, a web viewer.

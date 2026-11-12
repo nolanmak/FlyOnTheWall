@@ -29,6 +29,7 @@ fn event(uid: &str, title: &str, start: i64, end: i64) -> ScheduledEvent {
         all_day: false,
         canceled: false,
         participation: Participation::Accepted,
+        source: "",
     }
 }
 
