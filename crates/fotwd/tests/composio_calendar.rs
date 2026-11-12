@@ -360,7 +360,7 @@ fn the_lookup_reads_every_active_account_and_skips_the_rest() {
     );
     let events = lookup.events_overlapping(T, T + 30 * MIN).unwrap();
     assert_eq!(events.len(), 2);
-    let asked: Vec<String> = http
+    let mut asked: Vec<String> = http
         .requests()
         .iter()
         .map(|r| {
@@ -370,6 +370,7 @@ fn the_lookup_reads_every_active_account_and_skips_the_rest() {
                 .to_owned()
         })
         .collect();
+    asked.sort();
     assert_eq!(asked, ["ca_1", "ca_3"]);
 }
 
@@ -774,4 +775,84 @@ fn disconnect_revokes_the_google_grant() {
         "{}",
         http.requests()[0].url
     );
+}
+
+#[test]
+fn a_new_key_forgets_the_auth_config_but_keeps_accounts() {
+    let mut db = db();
+    ComposioSettings {
+        user_id: "u".into(),
+        auth_config_id: Some("ac_old_project".into()),
+        acknowledged_egress: true,
+        accounts: vec![account("ca_1", AccountState::Active)],
+    }
+    .write(&mut db)
+    .unwrap();
+    let store: &'static InMemoryKeyStore = Box::leak(Box::new(InMemoryKeyStore::new()));
+    store
+        .set(
+            SecretKey::ApiKey(Provider::Composio),
+            &fotw_secrets::SecretString::new("old"),
+        )
+        .unwrap();
+    let http = FakeComposio::replying(vec![
+        (200, json!({"items": []})),
+        (200, json!({"items": []})),
+    ]);
+    let c = composio::CalendarSettingsControl::new(db, store, http);
+    // Same key again: nothing to forget.
+    c.act(CalendarAction::SaveKey { key: "old".into() })
+        .unwrap();
+    let kept: ComposioSettings =
+        serde_json::from_str(&c.stored_setting_for_tests().unwrap()).unwrap();
+    assert_eq!(kept.auth_config_id.as_deref(), Some("ac_old_project"));
+    // A different key: the config may belong to another project.
+    c.act(CalendarAction::SaveKey { key: "new".into() })
+        .unwrap();
+    let after: ComposioSettings =
+        serde_json::from_str(&c.stored_setting_for_tests().unwrap()).unwrap();
+    assert_eq!(after.auth_config_id, None);
+    assert_eq!(
+        after.accounts.len(),
+        1,
+        "accounts are kept across a key change"
+    );
+}
+
+/// The first account never answers; the second does at once.
+struct StallFirst;
+impl ComposioHttp for StallFirst {
+    fn send(&self, _key: &str, request: &Request) -> Result<(u16, Value), String> {
+        let body = request.body.as_ref().unwrap();
+        if body["connected_account_id"] == "ca_slow" {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+        Ok((
+            200,
+            json!({"successful": true, "data": {"items": [
+                google_event("e2", "Planning", "2026-11-12T18:00:00Z", "2026-11-12T18:30:00Z")
+            ]}}),
+        ))
+    }
+}
+
+#[test]
+fn a_stalled_account_does_not_block_the_next_one() {
+    let lookup = ComposioCalendar::new(
+        Arc::new(StallFirst),
+        Arc::new(|| Ok(Some("k".to_owned()))),
+        vec![
+            account("ca_slow", AccountState::Active),
+            account("ca_fast", AccountState::Active),
+        ],
+    )
+    .with_deadline(std::time::Duration::from_millis(300));
+    let began = std::time::Instant::now();
+    let events = lookup.events_overlapping(T, T + MIN).unwrap();
+    assert!(
+        began.elapsed() < std::time::Duration::from_secs(2),
+        "{:?}",
+        began.elapsed()
+    );
+    assert_eq!(events.len(), 1);
 }

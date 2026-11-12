@@ -620,7 +620,12 @@ pub struct ComposioCalendar {
     http: Arc<dyn ComposioHttp>,
     key: KeySource,
     accounts: Vec<Account>,
+    deadline: Duration,
 }
+
+/// How long the Google accounts get, together, to answer one lookup: inside
+/// [`super::MANY_DEADLINE`].
+pub const ACCOUNTS_DEADLINE: Duration = Duration::from_secs(5);
 
 impl ComposioCalendar {
     /// Read `accounts` through `http`, with the key from `key`.
@@ -630,7 +635,15 @@ impl ComposioCalendar {
             http,
             key,
             accounts,
+            deadline: ACCOUNTS_DEADLINE,
         }
+    }
+
+    /// The same store with a different shared deadline for its accounts.
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
+        self
     }
 }
 
@@ -657,16 +670,41 @@ impl CalendarLookup for ComposioCalendar {
         let Some(key) = (self.key)()? else {
             return Ok(Vec::new());
         };
-        let mut events = Vec::new();
-        let mut failures = 0;
+        // Side by side, under one deadline: an account that stalls must not
+        // keep the next one from being read.
+        let until = std::time::Instant::now() + self.deadline;
+        let (tx, rx) = std::sync::mpsc::channel();
         for account in &active {
-            match list_events(self.http.as_ref(), &key, &account.id, start_ms, end_ms) {
-                Ok(found) => events.extend(found),
-                Err(_) => failures += 1,
+            let (http, key, id, tx) = (
+                Arc::clone(&self.http),
+                key.clone(),
+                account.id.clone(),
+                tx.clone(),
+            );
+            let _ = std::thread::Builder::new()
+                .name("fotw-composio-account".into())
+                .spawn(move || {
+                    let _ = tx.send(list_events(http.as_ref(), &key, &id, start_ms, end_ms));
+                });
+        }
+        drop(tx);
+        let (mut events, mut read) = (Vec::new(), 0);
+        for _ in 0..active.len() {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(Ok(found)) => {
+                    read += 1;
+                    events.extend(found);
+                }
+                Ok(Err(_)) => {}
+                Err(_) => break,
             }
         }
-        if failures == active.len() {
-            return Err(format!("{failures} Google account(s) could not be read"));
+        if read == 0 {
+            return Err(format!(
+                "none of {} Google account(s) could be read",
+                active.len()
+            ));
         }
         Ok(events)
     }
@@ -791,12 +829,23 @@ impl CalendarControl for CalendarSettingsControl {
                     &key,
                     &Request::get("/auth_configs?limit=1"),
                 )?;
+                let replaced = read_key(self.store)?.is_some_and(|old| old != key);
                 self.store
                     .set(
                         SecretKey::ApiKey(Provider::Composio),
                         &SecretString::from_pasted(key),
                     )
                     .map_err(|e| e.to_string())?;
+                // A different key may belong to another Composio project,
+                // where the saved auth config does not exist. It is looked
+                // up again on the next connect; accounts are kept, because a
+                // rotation within one project leaves them valid.
+                if replaced {
+                    let mut settings = ComposioSettings::try_read(&self.lock())?;
+                    if settings.auth_config_id.take().is_some() {
+                        settings.write(&mut self.lock())?;
+                    }
+                }
                 Ok(None)
             }
             CalendarAction::ForgetKey => {
