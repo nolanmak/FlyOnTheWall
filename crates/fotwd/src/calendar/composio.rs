@@ -126,6 +126,8 @@ impl ComposioHttp for ReqwestHttp {
                 reqwest::blocking::Client::builder()
                     .timeout(REQUEST_TIMEOUT)
                     .no_proxy()
+                    // A redirect could carry the key to another host.
+                    .redirect(reqwest::redirect::Policy::none())
                     .build()
                     .map_err(|e| e.to_string())
             })
@@ -499,7 +501,11 @@ pub fn account_state(
 pub fn delete_account(http: &dyn ComposioHttp, key: &str, account_id: &str) -> Result<(), String> {
     let (status, body) = http.send(
         key,
-        &Request::delete(&format!("/connected_accounts/{account_id}")),
+        // Revoke the Google grant too: disconnecting should leave Composio
+        // with no access to the calendar.
+        &Request::delete(&format!(
+            "/connected_accounts/{account_id}?revoke_on_delete=true"
+        )),
     )?;
     match status {
         200..=299 | 404 => Ok(()),
@@ -566,11 +572,23 @@ impl ComposioSettings {
     /// The stored state, or the default when there is none or it is unreadable.
     #[must_use]
     pub fn read(db: &Db) -> Self {
-        db.get_setting(SETTINGS_KEY)
-            .ok()
-            .flatten()
-            .and_then(|json| serde_json::from_str(&json).ok())
-            .unwrap_or_default()
+        Self::try_read(db).unwrap_or_default()
+    }
+
+    /// The stored state; the default only when nothing is stored yet.
+    ///
+    /// # Errors
+    /// The row exists but cannot be read. Callers that write must stop here
+    /// rather than overwrite the user's connected accounts with nothing.
+    pub fn try_read(db: &Db) -> Result<Self, String> {
+        match db.get_setting(SETTINGS_KEY) {
+            Ok(None) => Ok(Self::default()),
+            Ok(Some(json)) => serde_json::from_str(&json).map_err(|_| {
+                "The saved Google Calendar connection could not be read. Nothing was changed."
+                    .to_owned()
+            }),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     /// Store this state.
@@ -691,6 +709,9 @@ pub struct CalendarSettingsControl {
     db: Mutex<Db>,
     store: &'static dyn KeyStore,
     http: Arc<dyn ComposioHttp>,
+    /// Held across each action's read, network calls and write, so two
+    /// overlapping actions cannot drop each other's accounts.
+    acting: Mutex<()>,
 }
 
 impl std::fmt::Debug for CalendarSettingsControl {
@@ -707,7 +728,15 @@ impl CalendarSettingsControl {
             db: Mutex::new(db),
             store,
             http,
+            acting: Mutex::new(()),
         }
+    }
+
+    /// The raw stored row. For tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn stored_setting_for_tests(&self) -> Option<String> {
+        self.lock().get_setting(SETTINGS_KEY).ok().flatten()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Db> {
@@ -749,6 +778,10 @@ impl CalendarControl for CalendarSettingsControl {
     }
 
     fn act(&self, action: CalendarAction) -> Result<Option<String>, String> {
+        let _acting = self
+            .acting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match action {
             CalendarAction::SaveKey { key } => {
                 let key = key.trim().to_owned();
@@ -774,7 +807,7 @@ impl CalendarControl for CalendarSettingsControl {
             }
             CalendarAction::Connect { acknowledge_egress } => {
                 let key = self.key()?;
-                let mut settings = ComposioSettings::read(&self.lock());
+                let mut settings = ComposioSettings::try_read(&self.lock())?;
                 if !acknowledge_egress && !settings.acknowledged_egress {
                     return Err("Tick the box to confirm event titles and times may pass \
                                 through Composio."
@@ -801,23 +834,28 @@ impl CalendarControl for CalendarSettingsControl {
             }
             CalendarAction::Refresh => {
                 let key = self.key()?;
-                let mut settings = ComposioSettings::read(&self.lock());
+                let mut settings = ComposioSettings::try_read(&self.lock())?;
+                let mut failed = None;
                 for account in &mut settings.accounts {
                     if account.status == AccountState::Pending {
-                        account.status = account_state(self.http.as_ref(), &key, &account.id)?;
+                        match account_state(self.http.as_ref(), &key, &account.id) {
+                            Ok(state) => account.status = state,
+                            Err(e) => failed = Some(e),
+                        }
                     }
                 }
                 settings.write(&mut self.lock())?;
-                Ok(None)
+                failed.map_or(Ok(None), Err)
             }
             CalendarAction::Disconnect { id } => {
-                let mut settings = ComposioSettings::read(&self.lock());
+                let mut settings = ComposioSettings::try_read(&self.lock())?;
                 if !settings.accounts.iter().any(|a| a.id == id) {
                     return Err("Unknown account.".into());
                 }
-                if let Ok(key) = self.key() {
-                    delete_account(self.http.as_ref(), &key, &id)?;
-                }
+                let key = self
+                    .key()
+                    .map_err(|_| "Save your Composio key first, so the account is disconnected at Composio too.".to_owned())?;
+                delete_account(self.http.as_ref(), &key, &id)?;
                 settings.accounts.retain(|a| a.id != id);
                 settings.write(&mut self.lock())?;
                 Ok(None)

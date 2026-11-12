@@ -606,7 +606,10 @@ fn connect_refresh_and_disconnect_round_trip() {
     assert_eq!(left, ["ca_1"]);
     let last = http.requests().pop().unwrap();
     assert_eq!(last.method, Method::Delete);
-    assert!(last.url.ends_with("/connected_accounts/ca_2"));
+    assert!(
+        last.url
+            .ends_with("/connected_accounts/ca_2?revoke_on_delete=true")
+    );
 }
 
 #[test]
@@ -634,5 +637,141 @@ fn settings_round_trip_through_the_library() {
         ComposioSettings::read(&Db::open_in_memory(&DbKey::from_bytes([1u8; 32])).unwrap())
             .accounts
             .is_empty()
+    );
+}
+
+// --- Review fixes ------------------------------------------------------------
+
+/// Answers after a long wait.
+struct Slow;
+impl CalendarLookup for Slow {
+    fn source(&self) -> &'static str {
+        "slow"
+    }
+    fn events_overlapping(
+        &self,
+        _: i64,
+        _: i64,
+    ) -> Result<Vec<fotwd::calendar::ScheduledEvent>, String> {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        Ok(Vec::new())
+    }
+}
+
+#[test]
+fn a_slow_google_account_does_not_cost_the_apple_answer() {
+    let apple: Arc<dyn CalendarLookup> = Arc::new(fotwd::calendar::Fixed::new(
+        "eventkit",
+        vec![fotwd::calendar::ScheduledEvent {
+            uid: "x".into(),
+            title: "From Apple".into(),
+            start_ms: T,
+            end_ms: T + 30 * MIN,
+            all_day: false,
+            canceled: false,
+            participation: Participation::Unknown,
+            source: "eventkit",
+        }],
+    ));
+    let merged = fotwd::calendar::Many::with_deadline(
+        vec![apple, Arc::new(Slow)],
+        std::time::Duration::from_millis(300),
+    );
+    let began = std::time::Instant::now();
+    let events = merged.events_overlapping(T, T + MIN).unwrap();
+    assert!(
+        began.elapsed() < std::time::Duration::from_secs(2),
+        "{:?}",
+        began.elapsed()
+    );
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].title, "From Apple");
+}
+
+#[test]
+fn unreadable_settings_are_not_overwritten_by_an_action() {
+    let mut db = db();
+    db.put_setting(composio::SETTINGS_KEY, "{not json").unwrap();
+    let store: &'static InMemoryKeyStore = Box::leak(Box::new(InMemoryKeyStore::new()));
+    store
+        .set(
+            SecretKey::ApiKey(Provider::Composio),
+            &fotw_secrets::SecretString::new("k"),
+        )
+        .unwrap();
+    let c = composio::CalendarSettingsControl::new(db, store, FakeComposio::replying(vec![]));
+    let error = c
+        .act(CalendarAction::Connect {
+            acknowledge_egress: true,
+        })
+        .unwrap_err();
+    assert!(error.contains("could not be read"), "{error}");
+    assert_eq!(c.stored_setting_for_tests().as_deref(), Some("{not json"));
+}
+
+#[test]
+fn refresh_keeps_going_after_one_account_fails() {
+    let mut db = db();
+    ComposioSettings {
+        user_id: "u".into(),
+        auth_config_id: Some("ac".into()),
+        acknowledged_egress: true,
+        accounts: vec![
+            account("ca_1", AccountState::Pending),
+            account("ca_2", AccountState::Pending),
+        ],
+    }
+    .write(&mut db)
+    .unwrap();
+    let store: &'static InMemoryKeyStore = Box::leak(Box::new(InMemoryKeyStore::new()));
+    store
+        .set(
+            SecretKey::ApiKey(Provider::Composio),
+            &fotw_secrets::SecretString::new("k"),
+        )
+        .unwrap();
+    let http = FakeComposio::replying(vec![
+        (500, json!({})),
+        (200, json!({"id": "ca_2", "status": "ACTIVE"})),
+    ]);
+    let c = composio::CalendarSettingsControl::new(db, store, http);
+    let result = c.act(CalendarAction::Refresh);
+    let states: Vec<AccountState> = c.read().google_accounts.iter().map(|a| a.status).collect();
+    assert_eq!(states, [AccountState::Pending, AccountState::Active]);
+    assert!(result.is_err(), "the failure is still reported");
+}
+
+#[test]
+fn disconnect_without_a_key_keeps_the_account_and_says_why() {
+    let mut db = db();
+    ComposioSettings {
+        user_id: "u".into(),
+        auth_config_id: Some("ac".into()),
+        acknowledged_egress: true,
+        accounts: vec![account("ca_1", AccountState::Active)],
+    }
+    .write(&mut db)
+    .unwrap();
+    let store: &'static InMemoryKeyStore = Box::leak(Box::new(InMemoryKeyStore::new()));
+    let http = FakeComposio::replying(vec![]);
+    let c = composio::CalendarSettingsControl::new(db, store, http.clone());
+    let error = c
+        .act(CalendarAction::Disconnect { id: "ca_1".into() })
+        .unwrap_err();
+    assert!(error.contains("key"), "{error}");
+    assert_eq!(c.read().google_accounts.len(), 1);
+    assert!(http.requests().is_empty());
+}
+
+#[test]
+fn disconnect_revokes_the_google_grant() {
+    let http = FakeComposio::replying(vec![(200, json!({"success": true}))]);
+    composio::delete_account(http.as_ref(), "k", "ca_1").unwrap();
+    assert!(
+        http.requests()[0]
+            .url
+            .ends_with("/connected_accounts/ca_1?revoke_on_delete=true"),
+        "{}",
+        http.requests()[0].url
     );
 }

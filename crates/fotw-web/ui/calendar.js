@@ -32,6 +32,7 @@ globalThis.FOTWCalendar = {
     signin.target = '_blank'; signin.rel = 'noopener noreferrer'; signin.hidden = true;
     const accounts = root.appendChild(make('ul', '', 'calendar-accounts'));
     const message = root.appendChild(note('', 'calendar-status')); message.setAttribute('role', 'status');
+    const retry = root.appendChild(make('button', 'Try again', 'calendar-retry')); retry.type = 'button'; retry.hidden = true;
     parent.appendChild(root);
 
     let current = null, busy = false, polls = 0, timer = null;
@@ -86,6 +87,8 @@ globalThis.FOTWCalendar = {
       } catch (_) {
         busy = false; enable();
         message.textContent = 'Could not reach FlyOnTheWall. Try again.';
+        // A dropped refresh must not end the wait for a sign-in.
+        schedule();
       }
     }
 
@@ -98,10 +101,20 @@ globalThis.FOTWCalendar = {
     ack.addEventListener('change', enable);
     connect.addEventListener('click', () => { polls = 0; return act({ action: 'connect', acknowledge_egress: Boolean(ack.checked) }); });
 
-    (async () => {
+    async function load() {
+      retry.hidden = true;
       try { paint(await api(ROUTE)); }
-      catch (error) { root.hidden = true; if (error && error.status !== 404) message.textContent = 'Could not load calendar settings.'; }
-    })();
+      catch (error) {
+        // A missing route means this server has no calendar settings; any
+        // other failure stays visible so it can be retried.
+        if (error && error.status === 404) { root.hidden = true; return; }
+        root.hidden = false;
+        message.textContent = 'Could not load calendar settings.';
+        retry.hidden = false;
+      }
+    }
+    retry.addEventListener('click', load);
+    load();
     return root;
   },
 };

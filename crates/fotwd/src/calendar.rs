@@ -183,15 +183,28 @@ impl CalendarLookup for Fixed {
 /// when every store fails is the lookup an error.
 pub struct Many {
     stores: Vec<Arc<dyn CalendarLookup>>,
+    deadline: Duration,
 }
 
 impl Many {
-    /// All of `stores`, in order.
+    /// All of `stores`, each given [`MANY_DEADLINE`] to answer.
     #[must_use]
     pub fn new(stores: Vec<Arc<dyn CalendarLookup>>) -> Self {
-        Self { stores }
+        Self::with_deadline(stores, MANY_DEADLINE)
+    }
+
+    /// All of `stores`, read side by side; a store that has not answered by
+    /// `deadline` is left out rather than holding up the others.
+    #[must_use]
+    pub fn with_deadline(stores: Vec<Arc<dyn CalendarLookup>>, deadline: Duration) -> Self {
+        Self { stores, deadline }
     }
 }
+
+/// How long [`Many`] waits for its slowest store: under
+/// [`NETWORK_LOOKUP_TIMEOUT`], so Apple Calendar's answer survives a Google
+/// account that never answers.
+pub const MANY_DEADLINE: Duration = Duration::from_secs(6);
 
 impl CalendarLookup for Many {
     fn source(&self) -> &'static str {
@@ -203,20 +216,42 @@ impl CalendarLookup for Many {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Vec<ScheduledEvent>, String> {
-        let mut events = Vec::new();
-        let mut failures = Vec::new();
+        let until = std::time::Instant::now() + self.deadline;
+        let (tx, rx) = mpsc::channel();
         for store in &self.stores {
-            match store.events_overlapping(start_ms, end_ms) {
+            let (store, tx) = (Arc::clone(store), tx.clone());
+            // Detached: a store past the deadline finishes on its own.
+            let _ = std::thread::Builder::new()
+                .name("fotw-calendar-store".into())
+                .spawn(move || {
+                    let answer = store.events_overlapping(start_ms, end_ms);
+                    let _ = tx.send((store.source(), answer));
+                });
+        }
+        drop(tx);
+        let mut events = Vec::new();
+        let (mut answered, mut failures) = (0, Vec::new());
+        while answered < self.stores.len() {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            let Ok((source, answer)) = rx.recv_timeout(left) else {
+                break;
+            };
+            answered += 1;
+            match answer {
                 Ok(found) => events.extend(found.into_iter().map(|mut e| {
                     if e.source.is_empty() {
-                        e.source = store.source();
+                        e.source = source;
                     }
                     e
                 })),
-                Err(e) => failures.push(format!("{}: {e}", store.source())),
+                Err(e) => failures.push(format!("{source}: {e}")),
             }
         }
-        if !self.stores.is_empty() && failures.len() == self.stores.len() {
+        let succeeded = answered - failures.len();
+        if !self.stores.is_empty() && succeeded == 0 {
+            if failures.is_empty() {
+                return Err("no calendar answered in time".into());
+            }
             return Err(failures.join("; "));
         }
         Ok(events)

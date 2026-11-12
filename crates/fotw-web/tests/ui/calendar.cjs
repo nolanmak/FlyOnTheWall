@@ -152,3 +152,31 @@ test('the module never uses innerHTML', () => {
   const source = fs.readFileSync(path.join(__dirname, '../../ui/calendar.js'), 'utf8');
   assert.ok(!/innerHTML|outerHTML|insertAdjacentHTML/.test(source));
 });
+
+test('a failed refresh keeps polling', async () => {
+  const w = rig();
+  w.respond(() => status({ composio_key_saved: true, composio_acknowledged: true, google_accounts: [{ id: 'ca_1', status: 'pending', added_at_ms: 1 }] }));
+  w.mount();
+  await flush();
+  assert.equal(w.timers.length, 1);
+  w.respond(() => new Error('network'));
+  await w.timers.pop()();
+  await flush();
+  assert.equal(w.timers.length, 1, 'polling resumes after a failed refresh');
+});
+
+test('a failed first load stays visible with a retry', async () => {
+  const w = rig();
+  w.respond(() => Object.assign(new Error('boom'), { status: 500 }));
+  const root = w.mount();
+  await flush();
+  assert.equal(root.hidden, false);
+  assert.match(w.byId('calendar-status').textContent, /Could not load/);
+  const retry = w.byId('calendar-retry');
+  assert.equal(retry.hidden, false);
+  w.respond(() => status());
+  await retry.click();
+  await flush();
+  assert.equal(retry.hidden, true);
+  assert.match(w.byId('calendar-apple').textContent, /granted/);
+});
