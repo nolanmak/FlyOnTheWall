@@ -2323,7 +2323,7 @@ fn key_command(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("set") => {
             let Some(slug) = args.get(1) else {
-                eprintln!("usage: fotwd key set <deepgram|elevenlabs|openai|anthropic>");
+                eprintln!("usage: fotwd key set <deepgram|elevenlabs|openai|anthropic|composio>");
                 return ExitCode::FAILURE;
             };
             let Some(provider) = Provider::from_slug(slug) else {

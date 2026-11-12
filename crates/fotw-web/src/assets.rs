@@ -193,6 +193,7 @@ mod tests {
             "app.css",
             "documents.js",
             "github.js",
+            "calendar.js",
         ] {
             assert!(Ui::get(name).is_some(), "{name} must be in the binary");
         }

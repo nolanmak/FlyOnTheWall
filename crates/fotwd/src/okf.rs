@@ -201,6 +201,19 @@ pub(crate) fn ymd_utc(epoch_ms: i64) -> (i64, u32, u32) {
     )
 }
 
+/// Epoch day from a civil date, UTC: Hinnant's `days_from_civil`, the inverse
+/// of [`ymd_utc`]. Kept beside it so the workspace's calendar arithmetic stays
+/// in one place.
+pub(crate) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let m = i64::from(m);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

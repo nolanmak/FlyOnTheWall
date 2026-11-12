@@ -601,6 +601,17 @@ async fn serve_until_stopped(
         .set_model_setup(Arc::new(crate::model_setup_control::DashboardModels::new(
             root.parent().unwrap_or(&root).to_owned(),
         )));
+    // Calendar settings (#295 follow-up): Apple Calendar status and the
+    // optional Google connection through Composio.
+    if let (Ok(db), Ok(store)) = (crate::open_library(&root), crate::secrets::keystore()) {
+        server.state().set_calendar(Arc::new(
+            crate::calendar::composio::CalendarSettingsControl::new(
+                db,
+                store,
+                Arc::new(crate::calendar::composio::ReqwestHttp::default()),
+            ),
+        ));
+    }
     if let Ok(db) = crate::open_library(&root) {
         server
             .state()

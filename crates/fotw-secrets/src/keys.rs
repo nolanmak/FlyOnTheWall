@@ -21,15 +21,19 @@ pub enum Provider {
     OpenAi,
     /// Anthropic — summarization.
     Anthropic,
+    /// Composio — optional Google Calendar connection for naming recordings.
+    /// Sees calendar event titles and times, never audio or transcripts.
+    Composio,
 }
 
 impl Provider {
     /// Every provider, in the order the settings screen lists them.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Deepgram,
         Self::ElevenLabs,
         Self::OpenAi,
         Self::Anthropic,
+        Self::Composio,
     ];
 
     /// The lowercase identifier used in keychain accounts and in the
@@ -43,6 +47,7 @@ impl Provider {
             Self::ElevenLabs => "elevenlabs",
             Self::OpenAi => "openai",
             Self::Anthropic => "anthropic",
+            Self::Composio => "composio",
         }
     }
 
@@ -62,6 +67,7 @@ impl Provider {
             Self::ElevenLabs => "ElevenLabs",
             Self::OpenAi => "OpenAI",
             Self::Anthropic => "Anthropic",
+            Self::Composio => "Composio",
         }
     }
 }
@@ -97,11 +103,12 @@ impl SecretKey {
     /// new variant that nobody adds to the scan would make KEY-01's test
     /// quietly narrower, so the test iterates this rather than a hand-written
     /// list.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::ApiKey(Provider::Deepgram),
         Self::ApiKey(Provider::ElevenLabs),
         Self::ApiKey(Provider::OpenAi),
         Self::ApiKey(Provider::Anthropic),
+        Self::ApiKey(Provider::Composio),
         Self::DbMasterKey,
     ];
 
@@ -189,6 +196,10 @@ mod tests {
             SecretKey::ApiKey(Provider::Anthropic).account(),
             "apikey:anthropic"
         );
+        assert_eq!(
+            SecretKey::ApiKey(Provider::Composio).account(),
+            "apikey:composio"
+        );
         assert_eq!(SecretKey::DbMasterKey.account(), "db:masterkey");
     }
 
@@ -201,7 +212,7 @@ mod tests {
         }
         assert_eq!(
             seen.len(),
-            5,
+            Provider::ALL.len() + 1,
             "expected one entry per provider plus the master key"
         );
     }

@@ -8,9 +8,11 @@
 //! refreshes it. This process never sees a token, so KEY-01's "no key
 //! anywhere but the keychain" holds trivially: there is no key. It is the
 //! same shape as EXP-06's Notion decision (a user-owned credential, a direct
-//! API), one step further out. Composio and its kind were rejected outright:
-//! a hosted integration platform is a vendor relay for meeting content, and
-//! §2 exists to forbid exactly that.
+//! API), one step further out. Composio and its kind were rejected outright
+//! here: a hosted integration platform is a vendor relay for meeting content,
+//! and §2 exists to forbid exactly that. (The one opt-in use of Composio,
+//! calendar naming in `calendar::composio`, carries event titles and times,
+//! never meeting content.)
 //!
 //! The network call happens inside the `gh` child process rather than the
 //! daemon's allowlisted HTTP client, so the CON-08 obligation is discharged

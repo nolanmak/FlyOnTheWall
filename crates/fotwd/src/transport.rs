@@ -35,6 +35,10 @@ pub const ALLOWED_HOSTS: &[&str] = &[
     "api.eu.residency.elevenlabs.io",
     "api.in.residency.elevenlabs.io",
     "api.sg.residency.elevenlabs.io",
+    // Optional Google Calendar connection (calendar::composio). Only reached
+    // once the user saves a Composio key and connects an account; it sees the
+    // recording's time window and returns event titles and times.
+    "backend.composio.dev",
 ];
 
 /// Whether `url` targets a host the daemon is permitted to contact.

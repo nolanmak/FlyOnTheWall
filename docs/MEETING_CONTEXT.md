@@ -18,9 +18,11 @@ meeting document. Corrections are not yet shared across meetings or accounts.
 
 ## Next: calendar/email evidence
 
-The shipped meeting detector still uses `NoCalendar`. Calendar and email account
-connections are not implemented by this change. Connecting an account alone will
-not make transcription context-aware; the following flow is needed:
+The shipped meeting detector still uses `NoCalendar`. Calendars are now read to
+name recordings (Apple Calendar through EventKit, and Google accounts connected
+through Composio), but email is not connected, and calendar data is not yet used
+for name repair. Connecting an account alone will not make transcription
+context-aware; the following flow is needed:
 
 1. Link a recording to a calendar event using its actual start/end, conferencing
    URL, organizer, and event ID. Ask when concurrent events make the match ambiguous.
@@ -44,11 +46,12 @@ not make transcription context-aware; the following flow is needed:
    respect unsaved edits and document revisions. Propagate saved changes through
    the existing GitHub sync and provide an updated download.
 
-Composio supports Google Calendar and Gmail OAuth, including custom scopes. It is
-an optional integration provider; a direct provider connection fits the app's
-existing preference for avoiding a hosted integration relay. Choose the account
-provider and connection approach before implementing OAuth and token storage.
-No calendar/email account was connected as part of this change.
+Google Calendar can now be connected through Composio from Settings › Calendars
+(opt-in, `crates/fotwd/src/calendar/composio.rs`). It is used only to name
+recordings: titles, times, status and the user's own response. From the
+attendee list only the entry marked as the user (`self`) is read, for that
+response; other attendees' names and addresses are ignored. Descriptions and
+email are not read; the flow above still applies before they are.
 
 Primary references:
 - https://docs.composio.dev/toolkits/googlecalendar

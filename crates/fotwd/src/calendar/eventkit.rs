@@ -203,6 +203,7 @@ pub fn from_raw(raw: &RawEvent) -> ScheduledEvent {
         all_day: raw.all_day,
         canceled: raw.canceled,
         participation: raw.my_status.unwrap_or(Participation::Unknown),
+        source: "eventkit",
     }
 }
 

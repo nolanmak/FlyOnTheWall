@@ -2324,8 +2324,9 @@ async function main() {
   await loadSpeech();
   const modelSetup = document.getElementById("model-setup-mount");
   if (modelSetup && typeof FOTWCleanup !== "undefined") FOTWCleanup.settings(modelSetup.parentNode, api);
-  if (modelSetup && typeof FOTWCleanup !== "undefined") FOTWCleanup.settings(modelSetup.parentNode, api);
   if (modelSetup && typeof FOTWModels !== "undefined") FOTWModels.mount(modelSetup, api);
+  const settingsPanel = document.getElementById("settings-panel");
+  if (settingsPanel && typeof FOTWCalendar !== "undefined") FOTWCalendar.settings(settingsPanel, api);
   await loadMeetings();
   await loadNoteDraftControl();
   await loadGithub();
