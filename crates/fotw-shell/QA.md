@@ -239,6 +239,20 @@ only through `prompt_preview`. Wiring the daemon's `Detector` into
 `ShellHost::poll_detection` is what turns 6b.1–6b.9 into things a user can
 reach.
 
+## 6c. Calendar naming (#295)
+
+Run from the signed `.app` (`just run`): the calendar grant belongs to the
+bundle, and a bare binary never looks the calendar up. Use a made-up event.
+
+| # | Action | Expected | Result |
+|---|---|---|---|
+| 6c.1 | First launch after this lands. | macOS asks for calendar access once. `fotwd.log` then says `calendar : access granted` (or `off …` if you refused). | |
+| 6c.2 | Create a Calendar.app event "QA naming check" starting now, 15 min long. Record for a minute, stop. | The meeting appears as **QA naming check** within seconds, and keeps that name after the summary lands. `fotwd.log` says `calendar : named the meeting after its calendar event` and does not contain the title. | |
+| 6c.3 | Rename that meeting, then wait for a backfill pass (or restart the daemon). | Your rename stays. | |
+| 6c.4 | Record with no event on the calendar. | Today's naming: `Untitled recording — …`, then a transcript-based title. | |
+| 6c.5 | Turn calendar access off in System Settings › Privacy & Security › Calendars, then record during an event. | Today's naming, no error anywhere. | |
+| 6c.6 | Decline the event in Calendar.app (or mark it all-day) and record during it. | Not used for the name. | |
+
 ## 7. Lifecycle and failure
 
 | # | Step | Expected | Result |

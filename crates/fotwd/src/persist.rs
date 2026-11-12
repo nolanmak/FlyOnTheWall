@@ -25,6 +25,30 @@ use crate::session::SessionOutcome;
 /// disk. Dropping it here would make the library quietly lossy in exactly the
 /// case where the user most needs to find the recording.
 pub fn persist_session(db: &mut Db, outcome: &SessionOutcome, title: &str) -> StoreResult<String> {
+    persist_session_linked(db, outcome, title, None)
+}
+
+/// [`persist_session`], named after a calendar event when one matched (#295).
+///
+/// With a `link`, the meeting takes the event's title and records which event
+/// it was; without one, it takes `fallback_title`, exactly as
+/// [`persist_session`] does.
+///
+/// # Errors
+/// As [`persist_session`].
+pub fn persist_session_linked(
+    db: &mut Db,
+    outcome: &SessionOutcome,
+    fallback_title: &str,
+    link: Option<&crate::calendar::CalendarLink>,
+) -> StoreResult<String> {
+    let title = link.map_or(fallback_title, |l| l.title.as_str());
+    let linked = |meeting: &mut NewMeeting| {
+        if let Some(l) = link {
+            meeting.calendar_uid = Some(l.uid.clone());
+            meeting.calendar_source = Some(l.source.clone());
+        }
+    };
     // Validate before creating a row: a bad clock must not leave a phantom meeting.
     let capture_end = outcome
         .capture_ended_at_ms
@@ -58,6 +82,7 @@ pub fn persist_session(db: &mut Db, outcome: &SessionOutcome, title: &str) -> St
             })?;
         let mut meeting = NewMeeting::new(device_id(), timezone());
         meeting.title = title.into();
+        linked(&mut meeting);
         meeting.started_at_ms = i64::try_from(outcome.started_at_ms).map_err(|_| {
             fotw_store::StoreError::InvalidArgument("capture clock exceeds storage range".into())
         })?;
@@ -114,6 +139,7 @@ pub fn persist_session(db: &mut Db, outcome: &SessionOutcome, title: &str) -> St
         };
     let mut m = NewMeeting::new(device_id(), timezone());
     m.title = title.to_owned();
+    linked(&mut m);
     // The real capture start, not now: they differ by the length of the
     // meeting, and using now would make every recording show zero duration.
     if outcome.started_at_ms > 0 || capture_end.is_some() {

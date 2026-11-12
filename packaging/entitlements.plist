@@ -8,6 +8,12 @@
 	<key>com.apple.security.device.audio-input</key>
 	<true/>
 
+	<!-- Hardened Runtime resource access for EventKit: names a recording
+	     after the calendar event it overlaps (#295). Read-only, and the app
+	     works the same with access denied. -->
+	<key>com.apple.security.personal-information.calendars</key>
+	<true/>
+
 	<!-- Deliberately NOT sandboxed. Tap behaviour under App Sandbox is
 	     undocumented and reported fragile, and every working implementation
 	     runs non-sandboxed. Developer ID distribution only; the Mac App Store

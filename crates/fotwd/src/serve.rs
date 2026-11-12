@@ -740,6 +740,14 @@ async fn serve_until_stopped(
         println!("  log        : {} (0600)", log.display());
     }
     crate::journal::record(&format!("daemon   : listening on {addr}"));
+    // Calendar naming (#295). Asked here, once, because a lookup runs during a
+    // save and must never be the thing that raises a system dialog. On its own
+    // thread: the dialog waits on a person. Only from the signed `.app`, which
+    // is what the grant belongs to; a test binary must never prompt.
+    #[cfg(target_os = "macos")]
+    if crate::recording::DaemonRecorder::launched_as_app() {
+        spawn_calendar_access_request();
+    }
 
     match launch {
         Launch::OpenBrowser => {
@@ -1168,6 +1176,18 @@ pub fn delta_partial(seg: &fotw_stt::TranscriptSegment) -> fotw_web::Delta {
 /// into terminal scrollback; the user asks for that explicitly.
 pub fn print_launch_url(state: &fotw_web::AppState) {
     println!("{}", state.launch_url());
+}
+
+/// Ask for calendar access once, off the async runtime, and log the answer.
+#[cfg(target_os = "macos")]
+fn spawn_calendar_access_request() {
+    let _ = std::thread::Builder::new()
+        .name("fotw-calendar-access".into())
+        .spawn(|| {
+            let access =
+                crate::calendar::eventkit::request_access(std::time::Duration::from_secs(600));
+            crate::journal::record(&format!("calendar : access {}", access.label()));
+        });
 }
 
 #[cfg(test)]
