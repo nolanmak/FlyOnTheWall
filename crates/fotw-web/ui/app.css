@@ -870,3 +870,94 @@ button, summary { min-height: 36px; }
 }
 .settings-panel .gh-settings { padding-left: 0; padding-right: 0; }
 .recording-limit { flex: none; padding: 0.4rem 1rem; }
+
+/* ---------------------------------------------------------- calendars */
+.cal-settings .cal-body { display: grid; gap: 12px; padding: 8px 0 4px; font-size: 13px; max-width: 640px; }
+.cal-lede { margin: 0; color: var(--muted); }
+.cal-card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  display: grid;
+  gap: 10px;
+}
+.cal-card-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.cal-title { margin: 0; font-size: 14px; font-weight: 650; color: var(--fg); }
+.cal-via { color: var(--muted); font-size: 12px; }
+.cal-card-head .cal-pill { margin-left: auto; }
+.cal-sub { margin: 0; color: var(--muted); line-height: 1.45; max-width: 60ch; }
+
+.cal-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+.cal-pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.cal-pill.is-active { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, transparent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.cal-pill.is-pending { color: var(--caution); border-color: color-mix(in srgb, var(--caution) 35%, transparent); background: color-mix(in srgb, var(--caution) 10%, transparent); }
+.cal-pill.is-failed { color: var(--caution); background: color-mix(in srgb, var(--caution) 16%, transparent); }
+
+.cal-key-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.cal-input {
+  flex: 1 1 220px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+}
+.cal-key-saved { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); }
+
+.cal-primary, .cal-ghost {
+  font: inherit;
+  font-weight: 600;
+  border-radius: 8px;
+  padding: 7px 14px;
+  cursor: pointer;
+  min-height: 34px;
+}
+.cal-primary { background: var(--accent); color: var(--surface); border: 1px solid var(--accent); }
+.cal-primary:hover:not(:disabled) { filter: brightness(1.08); }
+.cal-ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); font-weight: 500; }
+.cal-ghost:hover:not(:disabled) { color: var(--fg); border-color: var(--muted); }
+.cal-primary:disabled, .cal-ghost:disabled { opacity: .5; cursor: default; }
+
+.cal-accounts { list-style: none; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.cal-account { display: flex; align-items: center; gap: 10px; padding: 10px 12px; }
+.cal-account + .cal-account { border-top: 1px solid var(--line); }
+.cal-avatar {
+  flex: none;
+  width: 30px; height: 30px;
+  border-radius: 50%;
+  display: grid; place-items: center;
+  font-weight: 700; font-size: 13px;
+  color: var(--accent);
+  background: var(--selected);
+}
+.cal-account-text { display: grid; min-width: 0; flex: 1; }
+.cal-email { color: var(--fg); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cal-meta { color: var(--muted); font-size: 12px; }
+.cal-account .cal-ghost { padding: 5px 10px; min-height: 30px; font-size: 12px; }
+
+.cal-ack { display: flex; align-items: flex-start; gap: 8px; color: var(--muted); line-height: 1.4; }
+.cal-ack input { margin-top: 2px; }
+.cal-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.cal-link { color: var(--accent); font-weight: 600; text-decoration: none; }
+.cal-link:hover { text-decoration: underline; }
+.cal-status { margin: 0; color: var(--muted); min-height: 1em; }
+.cal-status:empty { display: none; }
+
+@media (max-width: 520px) {
+  .cal-account { flex-wrap: wrap; }
+  .cal-account .cal-pill { order: 3; }
+}

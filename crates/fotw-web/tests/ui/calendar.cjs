@@ -52,7 +52,7 @@ test('shows Apple Calendar access and asks for a key first', async () => {
   const root = w.mount();
   await flush();
   assert.equal(root.hidden, false);
-  assert.match(w.byId('calendar-apple').textContent, /granted/);
+  assert.equal(w.byId('calendar-apple').textContent, 'On');
   assert.equal(w.byId('calendar-key-row').hidden, false);
   assert.equal(w.byId('calendar-connect').disabled, true, 'no connect without a key');
 });
@@ -178,5 +178,43 @@ test('a failed first load stays visible with a retry', async () => {
   await retry.click();
   await flush();
   assert.equal(retry.hidden, true);
-  assert.match(w.byId('calendar-apple').textContent, /granted/);
+  assert.equal(w.byId('calendar-apple').textContent, 'On');
+});
+
+test('each Google account is shown by its address', async () => {
+  const w = rig();
+  w.respond(() => status({
+    composio_key_saved: true, composio_acknowledged: true,
+    google_accounts: [
+      { id: 'ca_1', status: 'active', added_at_ms: 1, email: 'pat@example.test' },
+      { id: 'ca_2', status: 'active', added_at_ms: 2, email: 'pat@example.test' },
+      { id: 'ca_3', status: 'pending', added_at_ms: 3, email: null },
+    ],
+  }));
+  w.mount();
+  await flush();
+  const rows = w.byId('calendar-accounts').children;
+  assert.equal(rows.length, 3);
+  assert.match(w.all(rows[0]).map(c => c.textContent).join(' '), /pat@example\.test/);
+  assert.equal(w.all(rows[0]).find(n => n.tagName === 'button')['aria-label'], 'Disconnect pat@example.test');
+  assert.match(w.text(), /Also connected above/, 'a second connection of the same address is pointed out');
+  assert.match(w.text(), /Google account 3/, 'an account with no address yet falls back to its position');
+});
+
+test('opening the section names accounts that have no address yet', async () => {
+  const w = rig();
+  w.respond(() => status({
+    composio_key_saved: true, composio_acknowledged: true,
+    google_accounts: [{ id: 'ca_1', status: 'active', added_at_ms: 1, email: null }],
+  }));
+  w.mount();
+  await flush();
+  for (const run of w.timers.splice(0)) await run();
+  await flush();
+  assert.ok(w.requests.some(r => r.body?.action === 'refresh'), 'asks the daemon to look the address up');
+  const before = w.requests.length;
+  for (const run of w.timers.splice(0)) await run();
+  await flush();
+  assert.equal(w.requests.filter(r => r.body?.action === 'refresh').length, 1, 'only once per page load');
+  assert.ok(w.requests.length >= before);
 });

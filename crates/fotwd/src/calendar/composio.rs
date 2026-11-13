@@ -40,6 +40,9 @@ pub const TOOLKIT: &str = "googlecalendar";
 /// Reads every calendar on the account in one call.
 pub const EVENTS_TOOL: &str = "GOOGLECALENDAR_EVENTS_LIST_ALL_CALENDARS";
 
+/// Lists the account's calendars; the primary one's id is the address.
+pub const CALENDARS_TOOL: &str = "GOOGLECALENDAR_LIST_CALENDARS";
+
 /// Where the non-secret connection state lives in the library.
 pub const SETTINGS_KEY: &str = "calendar_composio";
 
@@ -521,6 +524,7 @@ pub fn list_events(
     http: &dyn ComposioHttp,
     key: &str,
     account_id: &str,
+    user_id: &str,
     start_ms: i64,
     end_ms: i64,
 ) -> Result<Vec<ScheduledEvent>, String> {
@@ -531,6 +535,9 @@ pub fn list_events(
             &format!("/tools/execute/{EVENTS_TOOL}"),
             json!({
                 "connected_account_id": account_id,
+                // Composio refuses to run a tool on an account unless the
+                // request also names the user it belongs to.
+                "user_id": user_id,
                 "version": "latest",
                 "arguments": {
                     "time_min": rfc3339_utc(start_ms),
@@ -550,6 +557,52 @@ pub fn list_events(
         ));
     }
     Ok(events_from(body.get("data").unwrap_or(&body)))
+}
+
+/// The Google address of `account_id`: the id of its primary calendar.
+///
+/// `Ok(None)` when no primary calendar with an address-shaped id is listed.
+///
+/// # Errors
+/// Composio refused, could not be reached, or the tool call failed.
+pub fn primary_email(
+    http: &dyn ComposioHttp,
+    key: &str,
+    account_id: &str,
+    user_id: &str,
+) -> Result<Option<String>, String> {
+    let body = call(
+        http,
+        key,
+        &Request::post(
+            &format!("/tools/execute/{CALENDARS_TOOL}"),
+            json!({
+                "connected_account_id": account_id,
+                "user_id": user_id,
+                "version": "latest",
+                "arguments": {"max_results": 250},
+            }),
+        ),
+    )?;
+    if body.get("successful").and_then(Value::as_bool) == Some(false) {
+        return Err(format!(
+            "listing calendars failed{}",
+            message_of(&body)
+                .map(|m| format!(": {m}"))
+                .unwrap_or_default()
+        ));
+    }
+    let calendars = body
+        .pointer("/data/calendars")
+        .or_else(|| body.pointer("/data/items"))
+        .and_then(Value::as_array);
+    Ok(calendars
+        .into_iter()
+        .flatten()
+        .find(|c| c.get("primary").and_then(Value::as_bool) == Some(true))
+        .and_then(|c| c.get("id").and_then(Value::as_str))
+        .filter(|id| id.contains('@') && id.len() <= 254)
+        .map(str::to_owned))
 }
 
 // --- Stored state ------------------------------------------------------------
@@ -619,6 +672,7 @@ pub type KeySource = Arc<dyn Fn() -> Result<Option<String>, String> + Send + Syn
 pub struct ComposioCalendar {
     http: Arc<dyn ComposioHttp>,
     key: KeySource,
+    user_id: String,
     accounts: Vec<Account>,
     deadline: Duration,
 }
@@ -630,10 +684,16 @@ pub const ACCOUNTS_DEADLINE: Duration = Duration::from_secs(5);
 impl ComposioCalendar {
     /// Read `accounts` through `http`, with the key from `key`.
     #[must_use]
-    pub fn new(http: Arc<dyn ComposioHttp>, key: KeySource, accounts: Vec<Account>) -> Self {
+    pub fn new(
+        http: Arc<dyn ComposioHttp>,
+        key: KeySource,
+        user_id: String,
+        accounts: Vec<Account>,
+    ) -> Self {
         Self {
             http,
             key,
+            user_id,
             accounts,
             deadline: ACCOUNTS_DEADLINE,
         }
@@ -675,16 +735,24 @@ impl CalendarLookup for ComposioCalendar {
         let until = std::time::Instant::now() + self.deadline;
         let (tx, rx) = std::sync::mpsc::channel();
         for account in &active {
-            let (http, key, id, tx) = (
+            let (http, key, id, user, tx) = (
                 Arc::clone(&self.http),
                 key.clone(),
                 account.id.clone(),
+                self.user_id.clone(),
                 tx.clone(),
             );
             let _ = std::thread::Builder::new()
                 .name("fotw-composio-account".into())
                 .spawn(move || {
-                    let _ = tx.send(list_events(http.as_ref(), &key, &id, start_ms, end_ms));
+                    let _ = tx.send(list_events(
+                        http.as_ref(),
+                        &key,
+                        &id,
+                        &user,
+                        start_ms,
+                        end_ms,
+                    ));
                 });
         }
         drop(tx);
@@ -735,6 +803,7 @@ pub fn for_library(db: &Db) -> Option<ComposioCalendar> {
         ComposioCalendar::new(
             Arc::new(ReqwestHttp::default()),
             keychain_key(),
+            settings.user_id,
             settings.accounts,
         )
     })
@@ -877,6 +946,7 @@ impl CalendarControl for CalendarSettingsControl {
                     id: link.account_id,
                     status: AccountState::Pending,
                     added_at_ms: fotw_store::now_ms(),
+                    email: None,
                 });
                 settings.write(&mut self.lock())?;
                 Ok(Some(link.redirect_url))
@@ -885,10 +955,19 @@ impl CalendarControl for CalendarSettingsControl {
                 let key = self.key()?;
                 let mut settings = ComposioSettings::try_read(&self.lock())?;
                 let mut failed = None;
+                let user_id = settings.user_id.clone();
                 for account in &mut settings.accounts {
                     if account.status == AccountState::Pending {
                         match account_state(self.http.as_ref(), &key, &account.id) {
                             Ok(state) => account.status = state,
+                            Err(e) => failed = Some(e),
+                        }
+                    }
+                    // Named once, when first seen active, so Settings can
+                    // say which Google account each row is.
+                    if account.status == AccountState::Active && account.email.is_none() {
+                        match primary_email(self.http.as_ref(), &key, &account.id, &user_id) {
+                            Ok(email) => account.email = email,
                             Err(e) => failed = Some(e),
                         }
                     }
