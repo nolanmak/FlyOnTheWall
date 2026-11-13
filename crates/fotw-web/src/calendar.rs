@@ -19,6 +19,10 @@ pub struct GoogleAccount {
     pub status: AccountState,
     /// When the user started connecting it, epoch milliseconds.
     pub added_at_ms: i64,
+    /// The Google address, read from the account's primary calendar once it
+    /// is active. Absent until then.
+    #[serde(default)]
+    pub email: Option<String>,
 }
 
 /// A connected account's state, as the page shows it.

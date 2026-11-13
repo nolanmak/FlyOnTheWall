@@ -39,6 +39,7 @@ impl CalendarControl for Fake {
                     id: "ca_1".into(),
                     status: AccountState::Pending,
                     added_at_ms: 1,
+                    email: None,
                 });
                 Ok(Some("https://connect.composio.dev/link/abc".into()))
             }
