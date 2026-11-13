@@ -60,3 +60,31 @@ pub fn skip_if_engine_live() {
          test has nothing to check and must not run its body"
     );
 }
+
+/// Make the script a test just wrote executable, safely under parallel tests.
+///
+/// On Linux, `execve` of a file fails with `ETXTBSY` ("Text file busy") while
+/// any process holds it open for writing. A test thread that forks a child
+/// while another thread is still writing its script hands that child the
+/// open write descriptor, and the second thread's spawn then fails at random
+/// (seen in CI on `cli_runner`). So the file that will be executed is never
+/// written by this process: it is moved aside and copied back by `cp`, a
+/// separate process whose descriptors no test thread can inherit.
+///
+/// # Panics
+/// The file cannot be moved, copied or made executable. Test code only.
+#[cfg(unix)]
+pub fn make_executable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let staged = path.with_extension("fotw-staged");
+    std::fs::rename(path, &staged).expect("stage the script");
+    let copied = std::process::Command::new("cp")
+        .arg(&staged)
+        .arg(path)
+        .status()
+        .expect("run cp");
+    assert!(copied.success(), "cp failed for {}", path.display());
+    std::fs::remove_file(&staged).expect("remove the staged script");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .expect("make the script executable");
+}

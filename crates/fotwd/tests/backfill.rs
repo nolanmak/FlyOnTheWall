@@ -102,8 +102,7 @@ fn working_cli(name: &str) -> String {
          if [ $((n % 2)) -eq 0 ]; then cat \"$d/a.json\"; else cat \"$d/b.json\"; fi\n",
     )
     .unwrap();
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fotwd::testing::make_executable(&bin);
     bin.to_string_lossy().into_owned()
 }
 
@@ -238,8 +237,7 @@ fn failing_cli(name: &str) -> String {
     std::fs::create_dir_all(&dir).unwrap();
     let bin = dir.join(STUB_ENGINE_NAME);
     std::fs::write(&bin, "#!/bin/sh\ncat > /dev/null\nexit 3\n").unwrap();
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fotwd::testing::make_executable(&bin);
     bin.to_string_lossy().into_owned()
 }
 

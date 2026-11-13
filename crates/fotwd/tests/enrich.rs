@@ -62,8 +62,7 @@ fn failing_cli(name: &str) -> String {
     std::fs::write(&bin, "#!/bin/sh\necho 'usage limit reached' >&2\nexit 1\n").unwrap();
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fotwd::testing::make_executable(&bin);
     }
     bin.to_string_lossy().into_owned()
 }
@@ -323,8 +322,7 @@ fn scripted_cli(name: &str, replies: &[&str]) -> ScriptedCli {
     .unwrap();
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fotwd::testing::make_executable(&bin);
     }
     let binary = bin.to_string_lossy().into_owned();
     ScriptedCli { dir, binary }
@@ -688,8 +686,7 @@ async fn an_engine_that_vanishes_mid_pass_is_reported_by_name_not_as_no_engine()
     .unwrap();
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&cli.binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fotwd::testing::make_executable(std::path::Path::new(&cli.binary));
     }
     cli_settings(&mut db, &cli.binary);
 
