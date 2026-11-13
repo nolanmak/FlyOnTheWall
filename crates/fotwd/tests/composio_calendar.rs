@@ -292,8 +292,15 @@ fn listing_events_asks_for_the_window_across_all_calendars() {
             google_event("e1", "Design review", "2026-11-12T18:00:00Z", "2026-11-12T18:30:00Z")
         ]}}),
     )]);
-    let events =
-        composio::list_events(http.as_ref(), "k", "ca_1", "fotw-user", T - 30 * MIN, T + 40 * MIN).unwrap();
+    let events = composio::list_events(
+        http.as_ref(),
+        "k",
+        "ca_1",
+        "fotw-user",
+        T - 30 * MIN,
+        T + 40 * MIN,
+    )
+    .unwrap();
     assert_eq!(events.len(), 1);
     let request = &http.requests()[0];
     assert_eq!(request.method, Method::Post);
@@ -318,14 +325,16 @@ fn a_failed_tool_call_is_an_error() {
         200,
         json!({"successful": false, "error": "token expired", "data": {}}),
     )]);
-    let error = composio::list_events(http.as_ref(), "k", "ca_1", "fotw-user", T, T + MIN).unwrap_err();
+    let error =
+        composio::list_events(http.as_ref(), "k", "ca_1", "fotw-user", T, T + MIN).unwrap_err();
     assert!(error.contains("token expired"), "{error}");
 }
 
 #[test]
 fn a_rejected_key_says_so() {
     let http = FakeComposio::replying(vec![(401, json!({"error": "bad key"}))]);
-    let error = composio::list_events(http.as_ref(), "k", "ca_1", "fotw-user", T, T + MIN).unwrap_err();
+    let error =
+        composio::list_events(http.as_ref(), "k", "ca_1", "fotw-user", T, T + MIN).unwrap_err();
     assert!(error.contains("rejected"), "{error}");
 }
 
@@ -571,11 +580,14 @@ fn connect_refresh_and_disconnect_round_trip() {
             json!({"redirect_url": "https://connect.composio.dev/l/2", "connected_account_id": "ca_2"}),
         ),
         (200, json!({"id": "ca_1", "status": "ACTIVE"})), // refresh ca_1
-        (200, json!({"successful": true, "data": {"calendars": [ // ca_1's address
+        (
+            200,
+            json!({"successful": true, "data": {"calendars": [ // ca_1's address
             {"id": "team@group.calendar.google.com", "accessRole": "reader"},
-            {"id": "pat@example.test", "primary": true, "accessRole": "owner"}]}})),
+            {"id": "pat@example.test", "primary": true, "accessRole": "owner"}]}}),
+        ),
         (200, json!({"id": "ca_2", "status": "INITIATED"})), // refresh ca_2
-        (200, json!({"success": true})),                  // delete ca_2
+        (200, json!({"success": true})),                     // delete ca_2
     ]);
     let (c, _) = control(http.clone());
     c.act(CalendarAction::SaveKey { key: "k".into() }).unwrap();
@@ -606,9 +618,19 @@ fn connect_refresh_and_disconnect_round_trip() {
     c.act(CalendarAction::Refresh).unwrap();
     let states: Vec<AccountState> = c.read().google_accounts.iter().map(|a| a.status).collect();
     assert_eq!(states, [AccountState::Active, AccountState::Pending]);
-    let emails: Vec<Option<String>> = c.read().google_accounts.iter().map(|a| a.email.clone()).collect();
+    let emails: Vec<Option<String>> = c
+        .read()
+        .google_accounts
+        .iter()
+        .map(|a| a.email.clone())
+        .collect();
     assert_eq!(emails, [Some("pat@example.test".to_owned()), None]);
-    let emails: Vec<Option<String>> = c.read().google_accounts.iter().map(|a| a.email.clone()).collect();
+    let emails: Vec<Option<String>> = c
+        .read()
+        .google_accounts
+        .iter()
+        .map(|a| a.email.clone())
+        .collect();
     assert_eq!(emails, [Some("pat@example.test".to_owned()), None]);
 
     c.act(CalendarAction::Disconnect { id: "ca_2".into() })
@@ -875,16 +897,25 @@ fn a_stalled_account_does_not_block_the_next_one() {
 
 #[test]
 fn the_primary_calendar_names_the_account() {
-    let http = FakeComposio::replying(vec![(200, json!({"successful": true, "data": {"calendars": [
-        {"id": "x@import.calendar.google.com", "accessRole": "reader"},
-        {"id": "pat@example.test", "primary": true, "accessRole": "owner"},
-    ]}}))]);
+    let http = FakeComposio::replying(vec![(
+        200,
+        json!({"successful": true, "data": {"calendars": [
+            {"id": "x@import.calendar.google.com", "accessRole": "reader"},
+            {"id": "pat@example.test", "primary": true, "accessRole": "owner"},
+        ]}}),
+    )]);
     assert_eq!(
-        composio::primary_email(http.as_ref(), "k", "ca_1", "fotw-user").unwrap().as_deref(),
+        composio::primary_email(http.as_ref(), "k", "ca_1", "fotw-user")
+            .unwrap()
+            .as_deref(),
         Some("pat@example.test")
     );
     let request = &http.requests()[0];
-    assert!(request.url.ends_with("/tools/execute/GOOGLECALENDAR_LIST_CALENDARS"));
+    assert!(
+        request
+            .url
+            .ends_with("/tools/execute/GOOGLECALENDAR_LIST_CALENDARS")
+    );
     let body = request.body.as_ref().unwrap();
     assert_eq!(body["user_id"], "fotw-user");
     assert_eq!(body["connected_account_id"], "ca_1");
@@ -892,10 +923,16 @@ fn the_primary_calendar_names_the_account() {
 
 #[test]
 fn no_primary_calendar_means_no_name() {
-    let http = FakeComposio::replying(vec![(200, json!({"successful": true, "data": {"calendars": [
-        {"id": "not-an-address", "primary": true},
-    ]}}))]);
-    assert_eq!(composio::primary_email(http.as_ref(), "k", "ca_1", "u").unwrap(), None);
+    let http = FakeComposio::replying(vec![(
+        200,
+        json!({"successful": true, "data": {"calendars": [
+            {"id": "not-an-address", "primary": true},
+        ]}}),
+    )]);
+    assert_eq!(
+        composio::primary_email(http.as_ref(), "k", "ca_1", "u").unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -911,14 +948,23 @@ fn refresh_names_active_accounts_that_have_no_address_yet() {
     .unwrap();
     let store: &'static InMemoryKeyStore = Box::leak(Box::new(InMemoryKeyStore::new()));
     store
-        .set(SecretKey::ApiKey(Provider::Composio), &fotw_secrets::SecretString::new("k"))
+        .set(
+            SecretKey::ApiKey(Provider::Composio),
+            &fotw_secrets::SecretString::new("k"),
+        )
         .unwrap();
-    let http = FakeComposio::replying(vec![(200, json!({"successful": true, "data": {"calendars": [
-        {"id": "pat@example.test", "primary": true},
-    ]}}))]);
+    let http = FakeComposio::replying(vec![(
+        200,
+        json!({"successful": true, "data": {"calendars": [
+            {"id": "pat@example.test", "primary": true},
+        ]}}),
+    )]);
     let c = composio::CalendarSettingsControl::new(db, store, http.clone());
     c.act(CalendarAction::Refresh).unwrap();
-    assert_eq!(c.read().google_accounts[0].email.as_deref(), Some("pat@example.test"));
+    assert_eq!(
+        c.read().google_accounts[0].email.as_deref(),
+        Some("pat@example.test")
+    );
     // Named once: a second refresh makes no calls.
     c.act(CalendarAction::Refresh).unwrap();
     assert_eq!(http.requests().len(), 1);
@@ -926,7 +972,10 @@ fn refresh_names_active_accounts_that_have_no_address_yet() {
 
 #[test]
 fn the_lookup_sends_the_user_with_every_account() {
-    let http = FakeComposio::replying(vec![(200, json!({"successful": true, "data": {"events": []}}))]);
+    let http = FakeComposio::replying(vec![(
+        200,
+        json!({"successful": true, "data": {"events": []}}),
+    )]);
     let lookup = ComposioCalendar::new(
         http.clone(),
         Arc::new(|| Ok(Some("k".to_owned()))),
@@ -934,5 +983,8 @@ fn the_lookup_sends_the_user_with_every_account() {
         vec![account("ca_1", AccountState::Active)],
     );
     lookup.events_overlapping(T, T + MIN).unwrap();
-    assert_eq!(http.requests()[0].body.as_ref().unwrap()["user_id"], "fotw-user");
+    assert_eq!(
+        http.requests()[0].body.as_ref().unwrap()["user_id"],
+        "fotw-user"
+    );
 }
