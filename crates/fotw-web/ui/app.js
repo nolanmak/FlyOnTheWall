@@ -1166,6 +1166,10 @@ function renderRecording(body) {
   autoStopAt = body.auto_stop_at_ms ?? null;
   paintRecordingLimit();
   showRecordingControls(true);
+  // A recording started anywhere (this tab, the menu bar, the meeting
+  // pop-up) opens the live view once, on the change into recording. Later
+  // polls leave the user where they navigated to.
+  if (recState === "recording" && was !== "recording" && !liveIsShowing()) showLive();
 
   el.recording.hidden = recState === "idle";
   // The badge is static markup ("recording", index.html), so the finishing
@@ -1463,6 +1467,8 @@ async function retryCapture(source, button) {
 // Navigation only: the session model survives showing another meeting.
 // Starting a new capture resets the model via status.session_id, never here.
 function showLive() {
+  // Already open: rebuilding would remount the notes editor mid-sentence.
+  if (liveIsShowing()) return;
   if (typeof FOTWNotes !== "undefined") FOTWNotes.flushAll();
   ++detailRequest;
   currentDetail = null;

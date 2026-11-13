@@ -516,3 +516,31 @@ test('a live caption arriving after the final text that covers it stays gone',()
  // The next utterance still shows.
  h.ctx.appendDeltas([caption(2,18500,'how are')]);assert.match(rows(),/how are/);
 });
+
+test('a recording started elsewhere (menu bar, pop-up) opens the live view in an idle tab', () => {
+  const h = harness();
+  h.ctx.renderRecording({ state: 'idle' });
+  assert.equal(h.ctx.liveIsShowing(), false);
+  h.ctx.renderRecording({ state: 'recording', session_id: 'B', started_at_ms: 1000 });
+  assert.equal(h.ctx.liveIsShowing(), true);
+  h.ctx.appendDeltas([d(0, 17000, 'hello from the popup')]);
+  assert.match(h.document.getElementById('segments').textContent, /hello from the popup/);
+});
+
+test('a start that goes through preparing still opens the live view once it is recording', () => {
+  const h = harness();
+  h.ctx.renderRecording({ state: 'idle' });
+  h.ctx.renderRecording({ state: 'preparing', session_id: 'B' });
+  h.ctx.renderRecording({ state: 'recording', session_id: 'B', started_at_ms: 1000 });
+  assert.equal(h.ctx.liveIsShowing(), true);
+});
+
+test('later polls do not pull the user back after they open a saved meeting', () => {
+  const h = harness();
+  h.ctx.renderRecording({ state: 'idle' });
+  h.ctx.renderRecording({ state: 'recording', session_id: 'B', started_at_ms: 1000 });
+  h.old();
+  assert.equal(h.ctx.liveIsShowing(), false);
+  h.ctx.renderRecording({ state: 'recording', session_id: 'B', started_at_ms: 1000 });
+  assert.equal(h.ctx.liveIsShowing(), false);
+});
