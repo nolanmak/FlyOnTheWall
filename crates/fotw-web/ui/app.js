@@ -1149,6 +1149,9 @@ function paintRecordButton() {
   else el.record.disabled = !el.consent.checked;
 }
 
+// The session the live view last opened itself for.
+let autoOpenedSession = null;
+
 function renderRecording(body) {
   noteClock?.update(body);
   if (body.session_id) selectLiveSession(body.session_id);
@@ -1167,9 +1170,13 @@ function renderRecording(body) {
   paintRecordingLimit();
   showRecordingControls(true);
   // A recording started anywhere (this tab, the menu bar, the meeting
-  // pop-up) opens the live view once, on the change into recording. Later
-  // polls leave the user where they navigated to.
-  if (recState === "recording" && was !== "recording" && !liveIsShowing()) showLive();
+  // pop-up) opens the live view once per session, when it is first seen
+  // recording. Later polls leave the user where they navigated to; a new
+  // session (back-to-back meetings) opens again.
+  if (recState === "recording" && body.session_id && body.session_id !== autoOpenedSession) {
+    autoOpenedSession = body.session_id;
+    if (!liveIsShowing()) showLive();
+  }
 
   el.recording.hidden = recState === "idle";
   // The badge is static markup ("recording", index.html), so the finishing
@@ -1468,7 +1475,12 @@ async function retryCapture(source, button) {
 // Starting a new capture resets the model via status.session_id, never here.
 function showLive() {
   // Already open: rebuilding would remount the notes editor mid-sentence.
-  if (liveIsShowing()) return;
+  // Still supersede any saved meeting that is loading, so it cannot replace
+  // the live view when it arrives.
+  if (liveIsShowing()) {
+    ++detailRequest;
+    return;
+  }
   if (typeof FOTWNotes !== "undefined") FOTWNotes.flushAll();
   ++detailRequest;
   currentDetail = null;

@@ -544,3 +544,26 @@ test('later polls do not pull the user back after they open a saved meeting', ()
   h.ctx.renderRecording({ state: 'recording', session_id: 'B', started_at_ms: 1000 });
   assert.equal(h.ctx.liveIsShowing(), false);
 });
+
+test('a new session while still recording opens the live view for it', () => {
+  const h = harness();
+  h.ctx.renderRecording({ state: 'idle' });
+  h.ctx.renderRecording({ state: 'recording', session_id: 'B', started_at_ms: 1000 });
+  h.old();
+  assert.equal(h.ctx.liveIsShowing(), false);
+  h.ctx.renderRecording({ state: 'recording', session_id: 'C', started_at_ms: 9000 });
+  assert.equal(h.ctx.liveIsShowing(), true, 'back-to-back meetings switch to the new one');
+});
+
+test('showing live while already live still cancels a pending saved-meeting load', async () => {
+  const h = harness(); let finish;
+  h.ctx.api = () => new Promise(resolve => { finish = resolve; });
+  h.ctx.renderDetail = detail => { h.nodes.get('detail').textContent = detail.meeting.id; };
+  h.ctx.renderRecording({ state: 'idle' });
+  h.ctx.renderRecording({ state: 'recording', session_id: 'B', started_at_ms: 1000 });
+  const loading = h.ctx.openMeeting('saved-1');
+  h.ctx.showLive();
+  finish({ meeting: { id: 'saved-1' }, segments: [] });
+  await loading;
+  assert.equal(h.ctx.liveIsShowing(), true);
+});
