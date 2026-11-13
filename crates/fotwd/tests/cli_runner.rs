@@ -268,9 +268,10 @@ fn shim_with_sibling() -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 fn write_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt as _;
     let path = dir.join(name);
     std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Not a plain chmod: see `make_executable` for the ETXTBSY race this
+    // test hit in CI.
+    fotwd::testing::make_executable(&path);
     path
 }
