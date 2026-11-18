@@ -17,6 +17,8 @@ impl CalendarControl for Fake {
             composio_key_saved: *self.key_saved.lock().unwrap(),
             composio_acknowledged: false,
             google_accounts: self.accounts.lock().unwrap().clone(),
+            invitee_names: true,
+            notice: None,
             redirect_url: None,
             error: None,
         }
@@ -45,6 +47,10 @@ impl CalendarControl for Fake {
             }
             _ => Ok(None),
         }
+    }
+    fn fix_recent_names(&self) -> Result<usize, String> {
+        self.actions.lock().unwrap().push("FixRecentNames".into());
+        Ok(2)
     }
 }
 
@@ -199,5 +205,49 @@ fn an_oversized_or_blank_key_is_refused_before_the_control() {
         }
         .validated()
         .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn fixing_recent_names_reports_how_many_meetings_changed() {
+    let (h, c) = rig().await;
+    let response = h
+        .post(
+            ROUTE,
+            &h.authorised(),
+            Some(r#"{"action":"fix_recent_names"}"#),
+        )
+        .await;
+    let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(body["notice"], "Fixed names in 2 meetings.");
+    assert!(
+        c.actions
+            .lock()
+            .unwrap()
+            .contains(&"FixRecentNames".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn the_invitee_names_switch_reaches_the_control() {
+    let (h, c) = rig().await;
+    let response = h
+        .post(
+            ROUTE,
+            &h.authorised(),
+            Some(r#"{"action":"set_invitee_names","enabled":false}"#),
+        )
+        .await;
+    assert_eq!(response.status, 200);
+    assert!(
+        c.actions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|a| a.contains("SetInviteeNames(false)"))
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&response.body).unwrap()["invitee_names"],
+        true
     );
 }

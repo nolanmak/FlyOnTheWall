@@ -49,6 +49,13 @@ pub struct CalendarSettingsResponse {
     pub composio_acknowledged: bool,
     /// Google accounts connected through Composio.
     pub google_accounts: Vec<GoogleAccount>,
+    /// Whether the invite's names are given to the summary engine as
+    /// spellings. Names only, never addresses.
+    #[serde(default)]
+    pub invitee_names: bool,
+    /// A result to show, such as how many meetings had names fixed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
     /// After `connect`: the Google sign-in page to open.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redirect_url: Option<String>,
@@ -80,6 +87,14 @@ pub enum CalendarAction {
         /// Composio's connected-account id.
         id: String,
     },
+    /// Turn sending invite names to the summary engine on or off.
+    SetInviteeNames {
+        /// On or off.
+        enabled: bool,
+    },
+    /// Look up the invites of recent calendar-named meetings and fix
+    /// misheard names in them.
+    FixRecentNames,
 }
 
 impl std::fmt::Debug for CalendarAction {
@@ -92,6 +107,8 @@ impl std::fmt::Debug for CalendarAction {
             }
             Self::Refresh => f.write_str("Refresh"),
             Self::Disconnect { id } => write!(f, "Disconnect({id})"),
+            Self::SetInviteeNames { enabled } => write!(f, "SetInviteeNames({enabled})"),
+            Self::FixRecentNames => f.write_str("FixRecentNames"),
         }
     }
 }
@@ -122,7 +139,11 @@ impl CalendarAction {
                     return Err("Unknown account.".into());
                 }
             }
-            Self::ForgetKey | Self::Connect { .. } | Self::Refresh => {}
+            Self::ForgetKey
+            | Self::Connect { .. }
+            | Self::Refresh
+            | Self::SetInviteeNames { .. }
+            | Self::FixRecentNames => {}
         }
         Ok(self)
     }
@@ -137,6 +158,16 @@ pub trait CalendarControl: std::fmt::Debug + Send + Sync {
     /// # Errors
     /// A message for the user.
     fn act(&self, action: CalendarAction) -> Result<Option<String>, String>;
+
+    /// Fix misheard names in recent calendar-named meetings from their
+    /// invites; returns how many meetings changed. May take a while: one
+    /// calendar lookup per meeting.
+    ///
+    /// # Errors
+    /// A message for the user.
+    fn fix_recent_names(&self) -> Result<usize, String> {
+        Err("Not available.".into())
+    }
 }
 
 /// Authenticated GET.
@@ -164,8 +195,22 @@ pub async fn post(
         return crate::ingress::not_found();
     };
     match tokio::task::spawn_blocking(move || {
-        let outcome = action.validated().and_then(|valid| control.act(valid));
+        let mut notice = None;
+        let outcome = action.validated().and_then(|valid| {
+            if valid == CalendarAction::FixRecentNames {
+                let fixed = control.fix_recent_names()?;
+                notice = Some(match fixed {
+                    0 => "No misheard names found in recent meetings.".to_owned(),
+                    1 => "Fixed names in 1 meeting.".to_owned(),
+                    n => format!("Fixed names in {n} meetings."),
+                });
+                Ok(None)
+            } else {
+                control.act(valid)
+            }
+        });
         let mut response = control.read();
+        response.notice = notice;
         match outcome {
             Ok(url) => response.redirect_url = url,
             Err(error) => response.error = Some(error),

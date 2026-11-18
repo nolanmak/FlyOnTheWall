@@ -24,7 +24,7 @@ pub struct DocumentExcerpt {
 }
 
 /// An explicit, meeting-scoped spelling correction supplied by the user.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NameCorrection {
     /// Name as transcribed.
     pub from: String,

@@ -66,6 +66,7 @@ pub mod coverage;
 pub mod document;
 pub mod error;
 pub mod hash;
+pub mod invitee_context;
 pub mod local_model;
 pub mod local_timing;
 pub mod note_context;

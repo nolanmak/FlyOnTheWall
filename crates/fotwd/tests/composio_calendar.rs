@@ -470,6 +470,7 @@ fn many_calendars_merge_and_keep_each_events_source() {
             canceled: false,
             participation: Participation::Unknown,
             source: "eventkit",
+            invitees: Vec::new(),
         }],
     ));
     let broken: Arc<dyn CalendarLookup> = Arc::new(Broken);
@@ -709,6 +710,7 @@ fn a_slow_google_account_does_not_cost_the_apple_answer() {
             canceled: false,
             participation: Participation::Unknown,
             source: "eventkit",
+            invitees: Vec::new(),
         }],
     ));
     let merged = fotwd::calendar::Many::with_deadline(
@@ -987,4 +989,120 @@ fn the_lookup_sends_the_user_with_every_account() {
         http.requests()[0].body.as_ref().unwrap()["user_id"],
         "fotw-user"
     );
+}
+
+#[test]
+fn invitees_come_from_the_attendee_list_by_name() {
+    let data = json!({"items": [{
+        "id": "e1", "summary": "Weekly review",
+        "start": {"dateTime": "2026-11-12T18:00:00Z"}, "end": {"dateTime": "2026-11-12T18:30:00Z"},
+        "attendees": [
+            {"email": "me@example.test", "self": true, "responseStatus": "accepted"},
+            {"email": "rafiat@example.test", "responseStatus": "accepted"},
+            {"email": "zay.healy@example.test", "displayName": "Zay Healy"},
+            {"email": "c_123@resource.calendar.google.com", "resource": true, "displayName": "Room 4"},
+        ],
+    }]});
+    let events = composio::events_from(&data);
+    assert_eq!(events[0].invitees, ["Rafiat", "Zay Healy"]);
+}
+
+#[test]
+fn the_matched_link_carries_the_invitees() {
+    let http = FakeComposio::replying(vec![(
+        200,
+        json!({"successful": true, "data": {"items": [{
+            "id": "e1", "summary": "Weekly review",
+            "start": {"dateTime": "2026-11-12T18:00:00Z"}, "end": {"dateTime": "2026-11-12T18:30:00Z"},
+            "attendees": [{"email": "rafiat@example.test"}],
+        }]}}),
+    )]);
+    let lookup: Arc<dyn CalendarLookup> = Arc::new(ComposioCalendar::new(
+        http,
+        Arc::new(|| Ok(Some("k".to_owned()))),
+        "u".into(),
+        vec![account("ca_1", AccountState::Active)],
+    ));
+    let link =
+        fotwd::calendar::lookup_match(lookup, T, T + 25 * MIN, std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+    assert_eq!(link.invitees, ["Rafiat"]);
+}
+
+#[test]
+fn the_invitee_names_switch_is_saved() {
+    let (c, _) = control(FakeComposio::replying(vec![]));
+    assert!(c.read().invitee_names, "on by default");
+    c.act(CalendarAction::SetInviteeNames { enabled: false })
+        .unwrap();
+    assert!(!c.read().invitee_names);
+}
+
+#[test]
+fn fixing_recent_names_looks_up_each_calendar_meetings_invite() {
+    let now = fotw_store::now_ms();
+    let mut db = db();
+    // A calendar-named meeting from an hour ago where "Rafiat" was heard as "Rafael".
+    let mut m = fotw_store::NewMeeting::new("dev-1", "UTC");
+    m.title = "Weekly review".into();
+    m.started_at_ms = now - 3_600_000;
+    m.calendar_uid = Some("evt-1".into());
+    m.calendar_source = Some("composio".into());
+    let id = db.meetings().create(m).unwrap();
+    let transcript = db
+        .meetings()
+        .create_transcript(&id, "deepgram", "nova-3", true)
+        .unwrap();
+    db.meetings()
+        .append_segments(
+            &transcript,
+            &[fotw_store::NewSegment::new(
+                0,
+                0,
+                900,
+                "Rafael, do you wanna go first?",
+            )],
+        )
+        .unwrap();
+    // And one with no calendar match, which is left alone.
+    let other = db
+        .meetings()
+        .create(fotw_store::NewMeeting::new("dev-1", "UTC"))
+        .unwrap();
+    ComposioSettings {
+        user_id: "fotw-user".into(),
+        auth_config_id: Some("ac".into()),
+        acknowledged_egress: true,
+        accounts: vec![account("ca_1", AccountState::Active)],
+    }
+    .write(&mut db)
+    .unwrap();
+    let store: &'static InMemoryKeyStore = Box::leak(Box::new(InMemoryKeyStore::new()));
+    store
+        .set(
+            SecretKey::ApiKey(Provider::Composio),
+            &fotw_secrets::SecretString::new("k"),
+        )
+        .unwrap();
+    let event = json!({"successful": true, "data": {"items": [{
+        "id": "evt-1", "summary": "Weekly review",
+        "start": {"dateTime": composio::rfc3339_utc(now - 3_600_000)},
+        "end": {"dateTime": composio::rfc3339_utc(now - 1_800_000)},
+        "attendees": [{"email": "rafiat@example.test"}, {"email": "me@example.test", "self": true}],
+    }]}});
+    let http = FakeComposio::replying(vec![(200, event)]);
+    let c = composio::CalendarSettingsControl::new(db, store, http);
+
+    assert_eq!(c.fix_recent_names().unwrap(), 1);
+    let stored = c.invitees_for_tests(&id);
+    assert_eq!(stored.names, ["Rafiat"]);
+    assert_eq!(stored.corrections[0].from, "Rafael");
+    assert!(c.invitees_for_tests(&other).names.is_empty());
+}
+
+#[test]
+fn fixing_recent_names_through_act_does_not_deadlock() {
+    let (c, _) = control(FakeComposio::replying(vec![]));
+    assert_eq!(c.act(CalendarAction::FixRecentNames).unwrap(), None);
 }

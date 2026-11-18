@@ -15,12 +15,13 @@
 //!
 //! # What is read, and what is kept
 //!
-//! A lookup reads the title, times, all-day flag, status and the user's own
-//! response for events near the recording, from Apple Calendar and, when the
-//! user connected one, Google accounts through Composio (see [`composio`] for
-//! what that sends off the machine). Only the chosen event's title and
-//! identifier are stored. Attendees, notes, location and links are never read.
-//! The title then behaves like any other meeting title.
+//! A lookup reads the title, times, all-day flag, status and attendee list
+//! for events near the recording, from Apple Calendar and, when the user
+//! connected one, Google accounts through Composio (see [`composio`] for what
+//! that sends off the machine). The chosen event's title, identifier and
+//! invitee *names* are kept: names fix misheard names
+//! (`crate::invitees`); addresses are only used to derive a name and are
+//! never stored. Notes, location and links are never read.
 //!
 //! # A calendar never holds up a save
 //!
@@ -80,6 +81,9 @@ pub struct ScheduledEvent {
     /// Which calendar store it came from, saved as `meetings.calendar_source`.
     /// Empty means "whichever lookup returned it".
     pub source: &'static str,
+    /// Other people invited, by name (never by address): the calendar's
+    /// display name, or one derived from the address. Excludes the user.
+    pub invitees: Vec<String>,
 }
 
 impl ScheduledEvent {
@@ -112,6 +116,9 @@ pub struct CalendarLink {
     pub uid: String,
     /// Which calendar store answered, stored as `meetings.calendar_source`.
     pub source: String,
+    /// The event's invitees by name, kept with the meeting to fix misheard
+    /// names (`crate::invitees`).
+    pub invitees: Vec<String>,
 }
 
 /// Where events come from.
@@ -379,6 +386,7 @@ pub fn lookup_match(
                 e.source
             }
             .to_owned(),
+            invitees: e.invitees.clone(),
         }),
     )
 }
