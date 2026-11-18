@@ -1106,3 +1106,61 @@ fn fixing_recent_names_through_act_does_not_deadlock() {
     let (c, _) = control(FakeComposio::replying(vec![]));
     assert_eq!(c.act(CalendarAction::FixRecentNames).unwrap(), None);
 }
+
+#[test]
+fn fixing_recent_names_adds_new_invitees_to_a_partial_list() {
+    let now = fotw_store::now_ms();
+    let mut db = db();
+    let mut m = fotw_store::NewMeeting::new("dev-1", "UTC");
+    m.started_at_ms = now - 3_600_000;
+    m.calendar_uid = Some("evt-1".into());
+    let id = db.meetings().create(m).unwrap();
+    let transcript = db
+        .meetings()
+        .create_transcript(&id, "deepgram", "nova-3", true)
+        .unwrap();
+    db.meetings()
+        .append_segments(
+            &transcript,
+            &[fotw_store::NewSegment::new(
+                0,
+                0,
+                900,
+                "Raphael, do you wanna go first?",
+            )],
+        )
+        .unwrap();
+    // An earlier run kept only the names Apple's copy of the invite had.
+    fotwd::invitees::store_names(&mut db, &id, &["Matt Foss".to_owned()]).unwrap();
+    ComposioSettings {
+        user_id: "fotw-user".into(),
+        auth_config_id: Some("ac".into()),
+        acknowledged_egress: true,
+        accounts: vec![account("ca_1", AccountState::Active)],
+    }
+    .write(&mut db)
+    .unwrap();
+    let store: &'static InMemoryKeyStore = Box::leak(Box::new(InMemoryKeyStore::new()));
+    store
+        .set(
+            SecretKey::ApiKey(Provider::Composio),
+            &fotw_secrets::SecretString::new("k"),
+        )
+        .unwrap();
+    let event = json!({"successful": true, "data": {"items": [{
+        "id": "evt-1", "summary": "Weekly review",
+        "start": {"dateTime": composio::rfc3339_utc(now - 3_600_000)},
+        "end": {"dateTime": composio::rfc3339_utc(now - 1_800_000)},
+        "attendees": [{"email": "rafiat@example.test"}, {"email": "matt@example.test", "displayName": "Matt Foss"}],
+    }]}});
+    let c = composio::CalendarSettingsControl::new(
+        db,
+        store,
+        FakeComposio::replying(vec![(200, event)]),
+    );
+
+    assert_eq!(c.fix_recent_names().unwrap(), 1);
+    let stored = c.invitees_for_tests(&id);
+    assert_eq!(stored.names, ["Matt Foss", "Rafiat"]);
+    assert_eq!(stored.corrections[0].from, "Raphael");
+}
