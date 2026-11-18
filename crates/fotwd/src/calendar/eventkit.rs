@@ -226,7 +226,7 @@ pub fn from_raw(raw: &RawEvent) -> ScheduledEvent {
         invitees: raw
             .invitees
             .iter()
-            .filter_map(|n| crate::invitees::clean_name(n))
+            .filter_map(|n| crate::invitees::invitee_name(Some(n), None))
             .collect(),
     }
 }

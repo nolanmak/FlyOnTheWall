@@ -365,3 +365,18 @@ fn persisting_a_matched_recording_keeps_the_invitee_names() {
         ["Rafiat", "Zay Healy"]
     );
 }
+
+#[test]
+fn the_same_event_from_two_calendars_pools_its_invitees() {
+    // Apple's copy of a Google invite often has no usable names; Google's does.
+    let mut apple = event("apple-uid", "Weekly review", T10, T10 + 30 * MIN);
+    apple.source = "eventkit";
+    let mut google = event("google-uid", "Weekly review", T10, T10 + 30 * MIN);
+    google.source = "composio";
+    google.invitees = vec!["Rafiat".into(), "Zay".into()];
+    let calendar: Arc<dyn CalendarLookup> = Arc::new(Fixed::new("test", vec![apple, google]));
+    let link = lookup_match(calendar, T10, T10 + 30 * MIN, Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(link.invitees, ["Rafiat", "Zay"]);
+}

@@ -386,7 +386,7 @@ pub fn lookup_match(
                 e.source
             }
             .to_owned(),
-            invitees: e.invitees.clone(),
+            invitees: pooled_invitees(&usable, e),
         }),
     )
 }
@@ -412,6 +412,25 @@ pub fn for_library_root(root: &std::path::Path) -> (Arc<dyn CalendarLookup>, Dur
         ),
         None => (system(), LOOKUP_TIMEOUT),
     }
+}
+
+/// The chosen event's invitees, plus those of the same event as another
+/// calendar store has it (same title and start). A Google invite shown in Apple
+/// Calendar often has no usable names; Google's own copy does.
+fn pooled_invitees(events: &[ScheduledEvent], chosen: &ScheduledEvent) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let same = events
+        .iter()
+        .filter(|e| e.title == chosen.title && e.start_ms == chosen.start_ms);
+    for name in std::iter::once(chosen)
+        .chain(same)
+        .flat_map(|e| &e.invitees)
+    {
+        if !names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            names.push(name.clone());
+        }
+    }
+    names
 }
 
 /// The calendar this machine can read right now.

@@ -223,3 +223,25 @@ async fn enrichment_finds_invite_corrections_before_anything_is_summarised() {
         ("Rafael", "Rafiat")
     );
 }
+
+#[test]
+fn ph_sounds_like_f_so_raphael_is_caught_too() {
+    let found = invitees::corrections_for(
+        &text(&["Raphael, do you wanna go first?"]),
+        &names(&["Rafiat"]),
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(
+        (found[0].from.as_str(), found[0].to.as_str()),
+        ("Raphael", "Rafiat")
+    );
+}
+
+#[test]
+fn a_name_given_as_an_address_becomes_a_name() {
+    // Apple Calendar shows Google invitees without a display name this way.
+    assert_eq!(
+        invitees::invitee_name(Some("rafiat@example.test"), None).as_deref(),
+        Some("Rafiat")
+    );
+}
