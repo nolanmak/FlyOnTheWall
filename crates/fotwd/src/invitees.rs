@@ -121,8 +121,23 @@ pub fn name_from_email(email: &str) -> Option<String> {
 #[must_use]
 pub fn invitee_name(display: Option<&str>, email: Option<&str>) -> Option<String> {
     display
-        .and_then(clean_name)
+        .and_then(|d| {
+            // Apple Calendar shows an invitee with no display name as their
+            // address; that is still a name to be had.
+            if d.contains('@') {
+                name_from_email(d)
+            } else {
+                clean_name(d)
+            }
+        })
         .or_else(|| email.and_then(name_from_email))
+}
+
+/// `word` as it sounds for matching: "ph" is "f" ("Raphael" → "Rafael").
+fn sounded(word: &str) -> String {
+    word.replace("ph", "f")
+        .replace("Ph", "F")
+        .replace("PH", "F")
 }
 
 fn first_name(name: &str) -> &str {
@@ -176,7 +191,15 @@ pub fn corrections_for(texts: &[String], names: &[String]) -> Vec<NameCorrection
             {
                 continue;
             }
-            let fixed = matcher.apply(word);
+            let mut fixed = matcher.apply(word);
+            if fixed == word {
+                // Spelled differently, sounds the same: "Raphael" for "Rafiat"
+                // reads as "Rafael" to the matcher.
+                let spoken = sounded(word);
+                if spoken != word {
+                    fixed = matcher.apply(&spoken);
+                }
+            }
             if fixed != word
                 && let Some(to) = firsts.iter().find(|f| f.eq_ignore_ascii_case(&fixed))
             {
