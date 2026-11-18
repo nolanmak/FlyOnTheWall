@@ -53,6 +53,16 @@ globalThis.FOTWCalendar = {
     const signin = actions.appendChild(make('a', 'Continue to Google sign-in →', 'calendar-signin', 'cal-link'));
     signin.target = '_blank'; signin.rel = 'noopener noreferrer'; signin.hidden = true;
 
+    // Names from invites
+    const namesCard = body.appendChild(make('section', '', '', 'cal-card'));
+    const namesHead = namesCard.appendChild(make('div', '', '', 'cal-card-head'));
+    namesHead.appendChild(make('h3', 'Names from invites', '', 'cal-title'));
+    namesCard.appendChild(make('p', 'When a recording matches an event, misheard names are corrected to the invite’s spelling in the summary and shared documents (Rafael → Rafiat). The stored transcript is never rewritten.', '', 'cal-sub'));
+    const inviteLabel = namesCard.appendChild(make('label', '', '', 'cal-ack'));
+    const invite = inviteLabel.appendChild(make('input', '', 'calendar-invitee-names')); invite.type = 'checkbox';
+    inviteLabel.appendChild(make('span', ' Also give invitee names to the summary engine as spellings. Names only, never email addresses.'));
+    const fixNames = namesCard.appendChild(make('div', '', '', 'cal-actions')).appendChild(button('Fix names in recent meetings', 'calendar-fix-names', 'cal-ghost'));
+
     const message = body.appendChild(make('p', '', 'calendar-status', 'cal-status')); message.setAttribute('role', 'status');
     const retry = body.appendChild(button('Try again', 'calendar-retry', 'cal-ghost')); retry.hidden = true;
     parent.appendChild(root);
@@ -100,7 +110,8 @@ globalThis.FOTWCalendar = {
       const url = typeof doc.redirect_url === 'string' && doc.redirect_url.startsWith('https://') ? doc.redirect_url : '';
       if (url) { signin.href = url; signin.hidden = false; }
       if (!list.some(a => a.status === 'pending')) signin.hidden = true;
-      message.textContent = doc.error || (url ? 'Sign in on the Google page, then come back here.' : '');
+      invite.checked = Boolean(doc.invitee_names);
+      message.textContent = doc.error || doc.notice || (url ? 'Sign in on the Google page, then come back here.' : '');
       enable();
       schedule();
       // Accounts connected before addresses were recorded get named once.
@@ -115,6 +126,8 @@ globalThis.FOTWCalendar = {
       connect.disabled = busy || !saved || !(ack.checked || (current && current.composio_acknowledged));
       keySave.disabled = busy;
       keyForget.disabled = busy;
+      invite.disabled = busy;
+      fixNames.disabled = busy;
     }
 
     function schedule() {
@@ -146,6 +159,8 @@ globalThis.FOTWCalendar = {
     });
     keyForget.addEventListener('click', () => act({ action: 'forget_key' }));
     ack.addEventListener('change', enable);
+    invite.addEventListener('change', () => act({ action: 'set_invitee_names', enabled: Boolean(invite.checked) }));
+    fixNames.addEventListener('click', () => { message.textContent = 'Looking up recent invites…'; return act({ action: 'fix_recent_names' }, true); });
     connect.addEventListener('click', () => { polls = 0; return act({ action: 'connect', acknowledge_egress: Boolean(ack.checked) }); });
 
     async function load() {

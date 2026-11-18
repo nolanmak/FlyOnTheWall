@@ -228,6 +228,14 @@ pub async fn enrich_meeting_with(
     // empty one gets the same treatment.
     let segments = crate::summarize::stored_segments(db, meeting_id).unwrap_or_default();
 
+    // Misheard names → the calendar invite's spelling, before the summary is
+    // written, so it and every document built from it use them.
+    if !segments.is_empty()
+        && let Err(e) = crate::invitees::refresh_corrections(db, meeting_id)
+    {
+        report.problems.push(format!("invitee names: {e}"));
+    }
+
     // Whether this machine may name the meeting at all. Both halves matter:
     // the prefix catches the placeholder minted at persist time, and the
     // receipt catches a first-utterance title an earlier engineless pass wrote

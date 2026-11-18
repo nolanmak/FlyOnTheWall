@@ -88,14 +88,63 @@ fn save_checked(
 }
 
 pub(crate) fn name_corrections(db: &mut Db, id: &str) -> Vec<fotw_web::documents::NameCorrection> {
-    read(db, id)
+    name_corrections_for(db, id)
+}
+
+/// Every name correction for a meeting: the user's own, from its sharing
+/// document, then any found from the calendar invite (`crate::invitees`).
+/// A user correction of the same spelling wins.
+pub fn name_corrections_for(db: &mut Db, id: &str) -> Vec<fotw_web::documents::NameCorrection> {
+    let mut all: Vec<fotw_web::documents::NameCorrection> = read(db, id)
         .ok()
         .and_then(|s| s.document)
         .map(|d| d.name_corrections)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    for found in crate::invitees::read(db, id).corrections {
+        if !all.iter().any(|c| c.from == found.from) {
+            all.push(found);
+        }
+    }
+    all
 }
 
-fn correct_current_summary(
+/// Add `found` to the meeting's sharing document, if it has one, and rewrite
+/// its text with them, as "Remember name correction" does. A user's own
+/// correction of the same spelling is kept. Nothing happens without a
+/// document or when nothing changes.
+///
+/// # Errors
+/// The document could not be read or saved.
+pub(crate) fn add_corrections_to_document(
+    db: &mut Db,
+    id: &str,
+    found: &[fotw_web::documents::NameCorrection],
+) -> Result<(), String> {
+    let state = read(db, id)?;
+    let Some(mut doc) = state.document else {
+        return Ok(());
+    };
+    let before = doc.clone();
+    for correction in found {
+        if doc.name_corrections.len() >= 50 {
+            break;
+        }
+        if !doc
+            .name_corrections
+            .iter()
+            .any(|c| c.from == correction.from)
+        {
+            doc.name_corrections.push(correction.clone());
+        }
+    }
+    doc.markdown = fotw_web::documents::corrected_names(&doc.markdown, &doc.name_corrections);
+    if doc.name_corrections == before.name_corrections && doc.markdown == before.markdown {
+        return Ok(());
+    }
+    save(db, id, state.revision, &doc).map(|_| ())
+}
+
+pub(crate) fn correct_current_summary(
     db: &mut Db,
     id: &str,
     names: &[fotw_web::documents::NameCorrection],

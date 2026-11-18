@@ -358,6 +358,20 @@ fn as_event(value: &Value) -> Option<ScheduledEvent> {
         canceled: value.get("status").and_then(Value::as_str) == Some("cancelled"),
         participation,
         source: "composio",
+        invitees: value
+            .get("attendees")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|p| p.get("self").and_then(Value::as_bool) != Some(true))
+            .filter(|p| p.get("resource").and_then(Value::as_bool) != Some(true))
+            .filter_map(|p| {
+                crate::invitees::invitee_name(
+                    p.get("displayName").and_then(Value::as_str),
+                    p.get("email").and_then(Value::as_str),
+                )
+            })
+            .collect(),
     })
 }
 
@@ -839,6 +853,59 @@ impl CalendarSettingsControl {
         }
     }
 
+    /// [`CalendarControl::fix_recent_names`], for a caller already holding
+    /// the action lock.
+    fn fix_recent_names_held(&self) -> Result<usize, String> {
+        let since = fotw_store::now_ms() - RECENT_NAMES_WINDOW_MS;
+        let meetings = recent_calendar_meetings(&self.lock(), since)?;
+        if meetings.is_empty() {
+            return Ok(0);
+        }
+        let calendar = self.all_calendars();
+        let mut fixed = 0;
+        for (id, start, end) in meetings {
+            let known = !crate::invitees::read(&self.lock(), &id).names.is_empty();
+            if !known {
+                // Off the library lock: this is a network round trip.
+                let link = super::lookup_match(
+                    Arc::clone(&calendar),
+                    start,
+                    end,
+                    super::NETWORK_LOOKUP_TIMEOUT,
+                );
+                let Ok(Some(link)) = link else { continue };
+                if link.invitees.is_empty() {
+                    continue;
+                }
+                crate::invitees::store_names(&mut self.lock(), &id, &link.invitees)?;
+            }
+            if !crate::invitees::refresh_corrections(&mut self.lock(), &id)?.is_empty() {
+                fixed += 1;
+            }
+        }
+        Ok(fixed)
+    }
+
+    /// Apple Calendar plus the connected Google accounts, as one store.
+    fn all_calendars(&self) -> Arc<dyn CalendarLookup> {
+        let settings = ComposioSettings::read(&self.lock());
+        let store = self.store;
+        let google = ComposioCalendar::new(
+            Arc::clone(&self.http),
+            Arc::new(move || read_key(store)),
+            settings.user_id,
+            settings.accounts,
+        );
+        Arc::new(super::Many::new(vec![super::system(), Arc::new(google)]))
+    }
+
+    /// A meeting's stored invitees. For tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn invitees_for_tests(&self, meeting_id: &str) -> crate::invitees::MeetingInvitees {
+        crate::invitees::read(&self.lock(), meeting_id)
+    }
+
     /// The raw stored row. For tests.
     #[doc(hidden)]
     #[must_use]
@@ -879,9 +946,19 @@ impl CalendarControl for CalendarSettingsControl {
                 .unwrap_or(false),
             composio_acknowledged: settings.acknowledged_egress,
             google_accounts: settings.accounts,
+            invitee_names: crate::invitees::enabled(&self.lock()),
+            notice: None,
             redirect_url: None,
             error: None,
         }
+    }
+
+    fn fix_recent_names(&self) -> Result<usize, String> {
+        let _acting = self
+            .acting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.fix_recent_names_held()
     }
 
     fn act(&self, action: CalendarAction) -> Result<Option<String>, String> {
@@ -988,6 +1065,35 @@ impl CalendarControl for CalendarSettingsControl {
                 settings.write(&mut self.lock())?;
                 Ok(None)
             }
+            CalendarAction::SetInviteeNames { enabled } => {
+                crate::invitees::set_enabled(&mut self.lock(), enabled)?;
+                Ok(None)
+            }
+            // Routed to `fix_recent_names` by the web layer.
+            CalendarAction::FixRecentNames => self.fix_recent_names_held().map(|_| None),
         }
     }
+}
+
+/// How far back "Fix names in recent meetings" looks.
+pub const RECENT_NAMES_WINDOW_MS: i64 = 14 * 86_400_000;
+
+/// Calendar-named meetings since `since_ms`, newest first, with their span.
+fn recent_calendar_meetings(db: &Db, since_ms: i64) -> Result<Vec<(String, i64, i64)>, String> {
+    let conn = db.conn();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, started_at_ms,
+                    COALESCE(ended_at_ms, started_at_ms + COALESCE(duration_ms, 3600000))
+               FROM meetings
+              WHERE calendar_uid IS NOT NULL AND started_at_ms >= ?1
+              ORDER BY started_at_ms DESC
+              LIMIT 50",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([since_ms], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }

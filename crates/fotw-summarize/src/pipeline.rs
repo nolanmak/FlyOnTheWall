@@ -119,6 +119,9 @@ pub struct PipelineConfig {
     pub max_output_tokens: usize,
     /// Recorded source/engine facts, kept out of cited speech and the system prompt.
     pub speech_context: Option<crate::speech_context::SpeechContext>,
+    /// Names from the calendar invite, given as spellings
+    /// (`crate::invitee_context`). Empty means none are sent.
+    pub invitees: Vec<String>,
     /// Coverage measurement settings.
     pub coverage: CoverageConfig,
     /// Evidence validator settings.
@@ -134,6 +137,7 @@ impl Default for PipelineConfig {
             chat_session_open: false,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             speech_context: None,
+            invitees: Vec::new(),
             coverage: CoverageConfig::default(),
             validator: ValidatorConfig::default(),
         }
@@ -576,6 +580,10 @@ impl<'a> Pipeline<'a> {
     }
 
     fn instruction_with_speech(&self, instruction: String) -> String {
+        let instruction = match crate::invitee_context::render(&self.config.invitees) {
+            Some(names) => format!("{names}\n\n{instruction}"),
+            None => instruction,
+        };
         match &self.config.speech_context {
             Some(context) => format!("{}\n\n{instruction}", context.render()),
             None => instruction,
@@ -1926,6 +1934,26 @@ mod tests {
             }
         }
         assert_eq!(reduced, 1);
+    }
+    #[test]
+    fn invitee_names_reach_every_instruction_and_are_absent_without_them() {
+        let transport = MockTransport::new();
+        let adapter = AnthropicAdapter::new(transport.clone(), "fixture-prose", "fixture-key");
+        let with = Pipeline::new(&adapter, &adapter).with_config(PipelineConfig {
+            invitees: vec!["Rafiat".into(), "Zay Healy".into()],
+            ..PipelineConfig::default()
+        });
+        let instruction = with.instruction_with_speech("Summarise.".into());
+        assert!(
+            instruction.contains("- Rafiat\n- Zay Healy"),
+            "{instruction}"
+        );
+        assert!(instruction.ends_with("Summarise."));
+        let without = Pipeline::new(&adapter, &adapter);
+        assert_eq!(
+            without.instruction_with_speech("Summarise.".into()),
+            "Summarise."
+        );
     }
     #[test]
     fn engine_metadata_and_output_budget_are_checked_before_any_model_call() {

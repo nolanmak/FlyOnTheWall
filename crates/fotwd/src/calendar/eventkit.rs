@@ -1,8 +1,8 @@
 //! The macOS calendar, read through EventKit (#295, the read slice of MTG-01).
 //!
-//! Read-only, and only what naming needs: title, times, all-day, status and the
-//! user's own response. Attendee names, notes, location and links are never
-//! read.
+//! Read-only, and only what naming needs: title, times, all-day, status, the
+//! user's own response and other attendees' names (not rooms or resources).
+//! Notes, location and links are never read.
 //!
 //! # Access
 //!
@@ -20,6 +20,7 @@ use objc2::rc::autoreleasepool;
 use objc2::runtime::Bool;
 use objc2_event_kit::{
     EKAuthorizationStatus, EKEntityType, EKEvent, EKEventStatus, EKEventStore, EKParticipantStatus,
+    EKParticipantType,
 };
 use objc2_foundation::{NSDate, NSError};
 
@@ -150,6 +151,8 @@ pub struct RawEvent {
     pub canceled: bool,
     /// The current user's attendee status, when they are an attendee.
     pub my_status: Option<Participation>,
+    /// Other attendees' names, as the calendar shows them.
+    pub invitees: Vec<String>,
 }
 
 fn raw(event: &EKEvent) -> RawEvent {
@@ -169,6 +172,21 @@ fn raw(event: &EKEvent) -> RawEvent {
                 }
             })
         });
+        // Other people by name; rooms and resources are not people.
+        let invitees = event
+            .attendees()
+            .map(|people| {
+                people
+                    .iter()
+                    .filter(|p| !p.isCurrentUser())
+                    .filter(|p| {
+                        let kind = p.participantType();
+                        kind != EKParticipantType::Room && kind != EKParticipantType::Resource
+                    })
+                    .filter_map(|p| p.name().map(|n| n.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
         RawEvent {
             external_id: event
                 .calendarItemExternalIdentifier()
@@ -181,6 +199,7 @@ fn raw(event: &EKEvent) -> RawEvent {
             all_day: event.isAllDay(),
             canceled: event.status() == EKEventStatus::Canceled,
             my_status,
+            invitees,
         }
     }
 }
@@ -204,6 +223,11 @@ pub fn from_raw(raw: &RawEvent) -> ScheduledEvent {
         canceled: raw.canceled,
         participation: raw.my_status.unwrap_or(Participation::Unknown),
         source: "eventkit",
+        invitees: raw
+            .invitees
+            .iter()
+            .filter_map(|n| crate::invitees::clean_name(n))
+            .collect(),
     }
 }
 
@@ -222,6 +246,7 @@ mod tests {
             all_day: false,
             canceled: false,
             my_status: Some(Participation::Accepted),
+            invitees: vec!["Rafiat Adeyemi".into(), "Room <B2>".into()],
         }
     }
 
@@ -229,6 +254,7 @@ mod tests {
     fn maps_times_to_epoch_milliseconds() {
         let e = from_raw(&raw_event());
         assert_eq!(e.start_ms, 1_800_000_000_000);
+        assert_eq!(e.invitees, ["Rafiat Adeyemi"], "names kept, markup dropped");
         assert_eq!(e.end_ms, 1_800_001_800_500);
         assert_eq!(e.title, "Design review");
         assert_eq!(e.participation, Participation::Accepted);

@@ -42,6 +42,23 @@ pub fn persist_session_linked(
     fallback_title: &str,
     link: Option<&crate::calendar::CalendarLink>,
 ) -> StoreResult<String> {
+    let id = persist_linked_meeting(db, outcome, fallback_title, link)?;
+    // The invite's names, kept to fix misheard names once the transcript is
+    // read (`crate::invitees`). Best-effort: a meeting is never lost to it.
+    if let Some(link) = link.filter(|l| !l.invitees.is_empty())
+        && let Err(e) = crate::invitees::store_names(db, &id, &link.invitees)
+    {
+        crate::diag!("  ! could not keep the invitee names: {e}");
+    }
+    Ok(id)
+}
+
+fn persist_linked_meeting(
+    db: &mut Db,
+    outcome: &SessionOutcome,
+    fallback_title: &str,
+    link: Option<&crate::calendar::CalendarLink>,
+) -> StoreResult<String> {
     let title = link.map_or(fallback_title, |l| l.title.as_str());
     let linked = |meeting: &mut NewMeeting| {
         if let Some(l) = link {

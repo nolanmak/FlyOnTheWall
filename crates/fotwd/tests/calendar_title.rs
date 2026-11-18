@@ -30,6 +30,7 @@ fn event(uid: &str, title: &str, start: i64, end: i64) -> ScheduledEvent {
         canceled: false,
         participation: Participation::Accepted,
         source: "",
+        invitees: Vec::new(),
     }
 }
 
@@ -88,6 +89,7 @@ fn lookup_returns_the_matching_event_as_a_link() {
             title: "Weekly 1:1 — Product".into(),
             uid: "evt-1".into(),
             source: "test".into(),
+            invitees: Vec::new(),
         }
     );
 }
@@ -239,6 +241,7 @@ fn link(title: &str) -> CalendarLink {
         title: title.into(),
         uid: "evt-1".into(),
         source: "eventkit".into(),
+        invitees: Vec::new(),
     }
 }
 
@@ -348,5 +351,17 @@ fn an_event_named_like_the_placeholder_is_not_used() {
     assert_eq!(
         lookup_match(calendar, T10, T10 + 30 * MIN, Duration::from_secs(2)).unwrap(),
         None
+    );
+}
+
+#[test]
+fn persisting_a_matched_recording_keeps_the_invitee_names() {
+    let (dir, mut db) = library();
+    let mut with_people = link("Weekly review");
+    with_people.invitees = vec!["Rafiat".into(), "Zay Healy".into()];
+    let id = persisted(&mut db, dir.path(), Some(&with_people));
+    assert_eq!(
+        fotwd::invitees::read(&db, &id).names,
+        ["Rafiat", "Zay Healy"]
     );
 }

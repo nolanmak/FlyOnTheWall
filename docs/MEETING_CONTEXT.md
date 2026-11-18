@@ -48,10 +48,13 @@ context-aware; the following flow is needed:
 
 Google Calendar can now be connected through Composio from Settings › Calendars
 (opt-in, `crates/fotwd/src/calendar/composio.rs`). It is used only to name
-recordings: titles, times, status and the user's own response. From the
-attendee list only the entry marked as the user (`self`) is read, for that
-response; other attendees' names and addresses are ignored. Descriptions and
-email are not read; the flow above still applies before they are.
+recordings, and its invitees' names to fix misheard names
+(`crates/fotwd/src/invitees.rs`): capitalised near-misses of an invitee's first
+name in the transcript become name corrections (summary, sharing document and
+shared copies; the stored transcript is unchanged), and the names are given to
+the summary engine as spellings unless turned off in Settings › Calendars.
+Addresses are used only to derive a name and are never stored or sent.
+Descriptions and email are not read.
 
 Primary references:
 - https://docs.composio.dev/toolkits/googlecalendar

@@ -23,6 +23,7 @@ fn event(uid: &str, title: &str, start: i64, end: i64) -> ScheduledEvent {
         canceled: false,
         participation: Participation::Unknown,
         source: "",
+        invitees: Vec::new(),
     }
 }
 

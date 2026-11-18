@@ -218,3 +218,29 @@ test('opening the section names accounts that have no address yet', async () => 
   assert.equal(w.requests.filter(r => r.body?.action === 'refresh').length, 1, 'only once per page load');
   assert.ok(w.requests.length >= before);
 });
+
+test('the invite-names switch reflects and saves the setting', async () => {
+  const w = rig();
+  w.respond(() => status({ invitee_names: true }));
+  w.mount();
+  await flush();
+  const toggle = w.byId('calendar-invitee-names');
+  assert.equal(toggle.checked, true);
+  w.respond(() => status({ invitee_names: false }));
+  toggle.checked = false;
+  await toggle.change();
+  await flush();
+  assert.deepEqual(w.requests.at(-1).body, { action: 'set_invitee_names', enabled: false });
+  assert.equal(toggle.checked, false);
+});
+
+test('fixing recent names shows how many meetings changed', async () => {
+  const w = rig();
+  w.mount();
+  await flush();
+  w.respond(() => status({ notice: 'Fixed names in 2 meetings.' }));
+  await w.byId('calendar-fix-names').click();
+  await flush();
+  assert.deepEqual(w.requests.at(-1).body, { action: 'fix_recent_names' });
+  assert.equal(w.byId('calendar-status').textContent, 'Fixed names in 2 meetings.');
+});

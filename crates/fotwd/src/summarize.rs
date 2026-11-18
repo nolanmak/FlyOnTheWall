@@ -249,6 +249,8 @@ where
             })
         })
         .collect::<Result<Vec<_>, fotw_store::StoreError>>()?;
+    // The invite's spellings, unless turned off in Settings › Calendars.
+    let invitees = crate::invitees::for_summary(db, meeting_id);
     let outcome = {
         let borrowed = Mutex::new(&mut *db);
         let check = || {
@@ -260,6 +262,7 @@ where
         let pipeline = Pipeline::new(&prose, &extraction).with_config(PipelineConfig {
             speech_context: Some(fotw_summarize::speech_context::SpeechContext::new(epochs)),
             template_body: template.prompt_body(),
+            invitees,
             ..PipelineConfig::default()
         });
 
