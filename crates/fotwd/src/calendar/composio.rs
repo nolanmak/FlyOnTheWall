@@ -864,20 +864,29 @@ impl CalendarSettingsControl {
         let calendar = self.all_calendars();
         let mut fixed = 0;
         for (id, start, end) in meetings {
-            let known = !crate::invitees::read(&self.lock(), &id).names.is_empty();
-            if !known {
-                // Off the library lock: this is a network round trip.
-                let link = super::lookup_match(
-                    Arc::clone(&calendar),
-                    start,
-                    end,
-                    super::NETWORK_LOOKUP_TIMEOUT,
-                );
-                let Ok(Some(link)) = link else { continue };
-                if link.invitees.is_empty() {
-                    continue;
+            // Always look again: an earlier pass may have kept a partial list
+            // (Apple's copy of a Google invite), and new names only add.
+            // Off the library lock: this is a network round trip.
+            let link = super::lookup_match(
+                Arc::clone(&calendar),
+                start,
+                end,
+                super::NETWORK_LOOKUP_TIMEOUT,
+            );
+            let known = crate::invitees::read(&self.lock(), &id).names;
+            let mut names = known.clone();
+            if let Ok(Some(link)) = link {
+                for name in link.invitees {
+                    if !names.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                        names.push(name);
+                    }
                 }
-                crate::invitees::store_names(&mut self.lock(), &id, &link.invitees)?;
+            }
+            if names.is_empty() {
+                continue;
+            }
+            if names != known {
+                crate::invitees::store_names(&mut self.lock(), &id, &names)?;
             }
             if !crate::invitees::refresh_corrections(&mut self.lock(), &id)?.is_empty() {
                 fixed += 1;
