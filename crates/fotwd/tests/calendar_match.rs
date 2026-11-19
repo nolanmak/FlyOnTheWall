@@ -173,3 +173,34 @@ fn on_a_tie_the_copy_with_invitees_wins() {
     );
     assert_eq!(matched(&[google, apple], at(0), at(40)), Some("z-google"));
 }
+
+#[test]
+fn a_long_block_does_not_beat_the_meeting_inside_it() {
+    // A 7am–3pm block on one calendar, the 30-minute invite on another; the
+    // recording ran 2:00–2:43.
+    let block = event("block", "Code & Coffee", at(-420), at(60));
+    let invite = event("invite", "Weekly Review Call", at(0), at(30));
+    assert_eq!(
+        matched(&[block.clone(), invite.clone()], at(0), at(43)),
+        Some("invite")
+    );
+    assert_eq!(matched(&[invite, block], at(0), at(43)), Some("invite"));
+}
+
+#[test]
+fn a_block_many_times_longer_than_the_recording_never_names_it() {
+    let block = event("block", "Code & Coffee", at(-420), at(60));
+    assert_eq!(matched(&[block], at(0), at(43)), None);
+}
+
+#[test]
+fn a_long_meeting_recorded_in_full_still_matches() {
+    let workshop = event("workshop", "Planning offsite", at(0), at(180));
+    assert_eq!(matched(&[workshop], at(0), at(170)), Some("workshop"));
+}
+
+#[test]
+fn a_one_hour_event_still_names_a_short_recording_inside_it() {
+    let hour = event("hour", "Office hours", at(0), at(60));
+    assert_eq!(matched(&[hour], at(10), at(25)), Some("hour"));
+}
