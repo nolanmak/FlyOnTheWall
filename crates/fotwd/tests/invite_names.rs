@@ -245,3 +245,21 @@ fn a_name_given_as_an_address_becomes_a_name() {
         Some("Rafiat")
     );
 }
+
+#[test]
+fn a_possessive_is_matched_on_its_name() {
+    let found = invitees::corrections_for(
+        &text(&["Rafael's goal of x, y, z was really good."]),
+        &names(&["Rafiat"]),
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(
+        (found[0].from.as_str(), found[0].to.as_str()),
+        ("Rafael", "Rafiat")
+    );
+    // And the correction then reads naturally in place.
+    assert_eq!(
+        fotw_web::documents::corrected_names("Rafael's goal", &found),
+        "Rafiat's goal"
+    );
+}

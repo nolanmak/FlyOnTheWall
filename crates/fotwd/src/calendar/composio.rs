@@ -873,6 +873,12 @@ impl CalendarSettingsControl {
                 end,
                 super::NETWORK_LOOKUP_TIMEOUT,
             );
+            // Counts only: names never reach the journal.
+            let found = match &link {
+                Ok(Some(l)) => format!("{} invitee(s) from {}", l.invitees.len(), l.source),
+                Ok(None) => "no matching event".to_owned(),
+                Err(e) => format!("lookup failed ({e})"),
+            };
             let known = crate::invitees::read(&self.lock(), &id).names;
             let mut names = known.clone();
             if let Ok(Some(link)) = link {
@@ -883,12 +889,19 @@ impl CalendarSettingsControl {
                 }
             }
             if names.is_empty() {
+                crate::journal::record(&format!("names    : meeting {id}: {found}; no names"));
                 continue;
             }
             if names != known {
                 crate::invitees::store_names(&mut self.lock(), &id, &names)?;
             }
-            if !crate::invitees::refresh_corrections(&mut self.lock(), &id)?.is_empty() {
+            let corrections = crate::invitees::refresh_corrections(&mut self.lock(), &id)?;
+            crate::journal::record(&format!(
+                "names    : meeting {id}: {found}; {} kept, {} correction(s)",
+                names.len(),
+                corrections.len()
+            ));
+            if !corrections.is_empty() {
                 fixed += 1;
             }
         }

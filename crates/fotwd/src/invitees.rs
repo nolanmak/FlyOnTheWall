@@ -182,6 +182,11 @@ pub fn corrections_for(texts: &[String], names: &[String]) -> Vec<NameCorrection
     for text in texts {
         for word in text.split(|c: char| !(c.is_alphabetic() || c == '\'' || c == '’')) {
             let word = word.trim_matches(['\'', '’']);
+            // "Rafael's goal": the name is "Rafael".
+            let word = word
+                .strip_suffix("'s")
+                .or_else(|| word.strip_suffix("’s"))
+                .unwrap_or(word);
             let capitalised = word.chars().next().is_some_and(char::is_uppercase)
                 && word.chars().skip(1).any(char::is_lowercase);
             if !capitalised
