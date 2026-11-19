@@ -380,3 +380,17 @@ fn the_same_event_from_two_calendars_pools_its_invitees() {
         .unwrap();
     assert_eq!(link.invitees, ["Rafiat", "Zay"]);
 }
+
+#[test]
+fn a_differently_titled_copy_at_the_same_time_still_lends_its_invitees() {
+    let mut apple = event("apple-uid", "Foss weekly", T10, T10 + 30 * MIN);
+    apple.participation = Participation::Accepted;
+    let mut google = event("google-uid", "Weekly Review Call", T10, T10 + 30 * MIN);
+    google.participation = Participation::Unknown;
+    google.invitees = vec!["Rafiat".into()];
+    let calendar: Arc<dyn CalendarLookup> = Arc::new(Fixed::new("test", vec![apple, google]));
+    let link = lookup_match(calendar, T10, T10 + 30 * MIN, Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(link.invitees, ["Rafiat"]);
+}
