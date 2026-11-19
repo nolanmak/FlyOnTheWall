@@ -45,6 +45,10 @@ pub const EARLY_GRACE_MS: i64 = 10 * 60_000;
 /// counted as that event: late starts and overruns.
 pub const LATE_GRACE_MS: i64 = 30 * 60_000;
 
+/// Events longer than this, and more than four times the recording, are
+/// blocks rather than meetings and never name one.
+pub const LONG_BLOCK_MS: i64 = 2 * 60 * 60_000;
+
 /// The longest a save waits on the calendar.
 pub const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -104,6 +108,12 @@ impl ScheduledEvent {
     /// Real overlap with the recording, without the grace windows.
     fn overlap(&self, start_ms: i64, end_ms: i64) -> i64 {
         (self.end_ms.min(end_ms) - self.start_ms.max(start_ms)).max(0)
+    }
+
+    /// Overlap over the combined span of event and recording, in millionths.
+    fn fit(&self, start_ms: i64, end_ms: i64) -> i64 {
+        let union = (self.end_ms.max(end_ms) - self.start_ms.min(start_ms)).max(1);
+        self.overlap(start_ms, end_ms).saturating_mul(1_000_000) / union
     }
 }
 
@@ -279,7 +289,9 @@ pub enum LookupError {
 /// The event that names a recording spanning `[start_ms, end_ms]`, if any.
 ///
 /// Candidates are eligible events whose `[start − 10 min, end + 30 min]` window
-/// touches the recording. The one with the most real overlap wins; ties go to
+/// touches the recording, leaving out blocks over two hours and four times the
+/// recording. The best fit (overlap over combined span) wins, then the most
+/// real overlap; ties go to
 /// the nearest start, then a copy that lists invitees, then an accepted
 /// invitation, then the earliest start,
 /// then the identifier, so the same calendar always gives the same answer.
@@ -290,12 +302,26 @@ pub fn match_event(
     end_ms: i64,
 ) -> Option<&ScheduledEvent> {
     let end_ms = end_ms.max(start_ms);
+    let recorded = (end_ms - start_ms).max(1);
     events
         .iter()
         .filter(|e| e.eligible() && e.near(start_ms, end_ms))
+        // A block many times longer than the recording (a day of "Code &
+        // Coffee", a focus block) is not the meeting that was recorded.
+        .filter(|e| {
+            let length = e.end_ms - e.start_ms;
+            !(length > LONG_BLOCK_MS && length > recorded.saturating_mul(4))
+        })
         .min_by(|a, b| {
-            b.overlap(start_ms, end_ms)
-                .cmp(&a.overlap(start_ms, end_ms))
+            // How well the event and the recording line up: overlap over
+            // their combined span. A 30-minute invite fits a 43-minute call
+            // far better than the 8-hour block it sits inside.
+            b.fit(start_ms, end_ms)
+                .cmp(&a.fit(start_ms, end_ms))
+                .then_with(|| {
+                    b.overlap(start_ms, end_ms)
+                        .cmp(&a.overlap(start_ms, end_ms))
+                })
                 .then_with(|| {
                     (a.start_ms - start_ms)
                         .unsigned_abs()
