@@ -436,8 +436,26 @@ fn pooled_invitees(events: &[ScheduledEvent], chosen: &ScheduledEvent) -> Vec<St
             names.push(name.clone());
         }
     }
+    if names.is_empty() {
+        // The chosen event knows nobody (an Apple block for a meeting whose
+        // invite lives in Google, often with a different end). Borrow from
+        // an event that starts within a few minutes of it and does list
+        // invitees: the same meeting as another calendar has it.
+        if let Some(twin) = events
+            .iter()
+            .filter(|e| !e.invitees.is_empty())
+            .filter(|e| (e.start_ms - chosen.start_ms).abs() <= SAME_MEETING_START_MS)
+            .min_by_key(|e| (e.start_ms - chosen.start_ms).abs())
+        {
+            names.clone_from(&twin.invitees);
+        }
+    }
     names
 }
+
+/// How close two events' starts must be to count as the same meeting when
+/// borrowing invitees.
+const SAME_MEETING_START_MS: i64 = 5 * 60_000;
 
 /// The calendar this machine can read right now.
 ///
