@@ -280,7 +280,8 @@ pub enum LookupError {
 ///
 /// Candidates are eligible events whose `[start − 10 min, end + 30 min]` window
 /// touches the recording. The one with the most real overlap wins; ties go to
-/// the nearest start, then an accepted invitation, then the earliest start,
+/// the nearest start, then a copy that lists invitees, then an accepted
+/// invitation, then the earliest start,
 /// then the identifier, so the same calendar always gives the same answer.
 #[must_use]
 pub fn match_event(
@@ -300,6 +301,9 @@ pub fn match_event(
                         .unsigned_abs()
                         .cmp(&(b.start_ms - start_ms).unsigned_abs())
                 })
+                // The same meeting in two calendars: the copy that knows who
+                // was invited (Google's own, not Apple's mirror of it).
+                .then_with(|| a.invitees.is_empty().cmp(&b.invitees.is_empty()))
                 .then_with(|| {
                     let accepted = |e: &ScheduledEvent| e.participation != Participation::Accepted;
                     accepted(a).cmp(&accepted(b))
@@ -415,13 +419,15 @@ pub fn for_library_root(root: &std::path::Path) -> (Arc<dyn CalendarLookup>, Dur
 }
 
 /// The chosen event's invitees, plus those of the same event as another
-/// calendar store has it (same title and start). A Google invite shown in Apple
+/// calendar store has it (same title and start, or the same span). A Google invite shown in Apple
 /// Calendar often has no usable names; Google's own copy does.
 fn pooled_invitees(events: &[ScheduledEvent], chosen: &ScheduledEvent) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
-    let same = events
-        .iter()
-        .filter(|e| e.title == chosen.title && e.start_ms == chosen.start_ms);
+    // Same title and start, or exactly the same span: the same meeting as
+    // another calendar store has it, possibly under its own title.
+    let same = events.iter().filter(|e| {
+        e.start_ms == chosen.start_ms && (e.title == chosen.title || e.end_ms == chosen.end_ms)
+    });
     for name in std::iter::once(chosen)
         .chain(same)
         .flat_map(|e| &e.invitees)
@@ -430,8 +436,26 @@ fn pooled_invitees(events: &[ScheduledEvent], chosen: &ScheduledEvent) -> Vec<St
             names.push(name.clone());
         }
     }
+    if names.is_empty() {
+        // The chosen event knows nobody (an Apple block for a meeting whose
+        // invite lives in Google, often with a different end). Borrow from
+        // an event that starts within a few minutes of it and does list
+        // invitees: the same meeting as another calendar has it.
+        if let Some(twin) = events
+            .iter()
+            .filter(|e| !e.invitees.is_empty())
+            .filter(|e| (e.start_ms - chosen.start_ms).abs() <= SAME_MEETING_START_MS)
+            .min_by_key(|e| (e.start_ms - chosen.start_ms).abs())
+        {
+            names.clone_from(&twin.invitees);
+        }
+    }
     names
 }
+
+/// How close two events' starts must be to count as the same meeting when
+/// borrowing invitees.
+const SAME_MEETING_START_MS: i64 = 5 * 60_000;
 
 /// The calendar this machine can read right now.
 ///

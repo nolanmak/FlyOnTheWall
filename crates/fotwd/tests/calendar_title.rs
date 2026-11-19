@@ -380,3 +380,46 @@ fn the_same_event_from_two_calendars_pools_its_invitees() {
         .unwrap();
     assert_eq!(link.invitees, ["Rafiat", "Zay"]);
 }
+
+#[test]
+fn a_differently_titled_copy_at_the_same_time_still_lends_its_invitees() {
+    let mut apple = event("apple-uid", "Foss weekly", T10, T10 + 30 * MIN);
+    apple.participation = Participation::Accepted;
+    let mut google = event("google-uid", "Weekly Review Call", T10, T10 + 30 * MIN);
+    google.participation = Participation::Unknown;
+    google.invitees = vec!["Rafiat".into()];
+    let calendar: Arc<dyn CalendarLookup> = Arc::new(Fixed::new("test", vec![apple, google]));
+    let link = lookup_match(calendar, T10, T10 + 30 * MIN, Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(link.invitees, ["Rafiat"]);
+}
+
+#[test]
+fn an_event_without_invitees_borrows_them_from_one_starting_at_the_same_time() {
+    // Apple: an hour block with no invitees. Google: the 30-minute invite.
+    let apple = event("apple-uid", "Foss weekly", T10, T10 + 60 * MIN);
+    let mut google = event("google-uid", "Weekly Review Call", T10, T10 + 30 * MIN);
+    google.invitees = vec!["Rafiat".into(), "Zay".into()];
+    let calendar: Arc<dyn CalendarLookup> = Arc::new(Fixed::new("test", vec![apple, google]));
+    let link = lookup_match(calendar, T10, T10 + 43 * MIN, Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        link.title, "Foss weekly",
+        "the better-overlapping event still names it"
+    );
+    assert_eq!(link.invitees, ["Rafiat", "Zay"]);
+}
+
+#[test]
+fn an_unrelated_event_later_lends_nothing() {
+    let apple = event("apple-uid", "Foss weekly", T10, T10 + 60 * MIN);
+    let mut later = event("later-uid", "Other call", T10 + 20 * MIN, T10 + 50 * MIN);
+    later.invitees = vec!["Someone".into()];
+    let calendar: Arc<dyn CalendarLookup> = Arc::new(Fixed::new("test", vec![apple, later]));
+    let link = lookup_match(calendar, T10, T10 + 60 * MIN, Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    assert!(link.invitees.is_empty());
+}

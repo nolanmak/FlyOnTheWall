@@ -161,3 +161,15 @@ fn an_event_with_its_end_before_its_start_is_ignored() {
 fn a_recording_with_no_events_matches_nothing() {
     assert_eq!(matched(&[], at(0), at(30)), None);
 }
+
+#[test]
+fn on_a_tie_the_copy_with_invitees_wins() {
+    let apple = event("a-apple", "Weekly review", at(0), at(30));
+    let mut google = event("z-google", "Weekly Review Call", at(0), at(30));
+    google.invitees = vec!["Rafiat".into()];
+    assert_eq!(
+        matched(&[apple.clone(), google.clone()], at(0), at(40)),
+        Some("z-google")
+    );
+    assert_eq!(matched(&[google, apple], at(0), at(40)), Some("z-google"));
+}
