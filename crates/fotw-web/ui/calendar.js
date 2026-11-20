@@ -57,7 +57,7 @@ globalThis.FOTWCalendar = {
     const namesCard = body.appendChild(make('section', '', '', 'cal-card'));
     const namesHead = namesCard.appendChild(make('div', '', '', 'cal-card-head'));
     namesHead.appendChild(make('h3', 'Names from invites', '', 'cal-title'));
-    namesCard.appendChild(make('p', 'When a recording matches an event, misheard names are corrected to the invite’s spelling in the summary and shared documents (Rafael → Rafiat). The stored transcript is never rewritten.', '', 'cal-sub'));
+    namesCard.appendChild(make('p', 'When a recording matches an event, misheard names are corrected to the invite’s spelling in the summary and shared documents (Rafael → Rafiya). The stored transcript is never rewritten.', '', 'cal-sub'));
     const inviteLabel = namesCard.appendChild(make('label', '', '', 'cal-ack'));
     const invite = inviteLabel.appendChild(make('input', '', 'calendar-invitee-names')); invite.type = 'checkbox';
     inviteLabel.appendChild(make('span', ' Also give invitee names to the summary engine as spellings. Names only, never email addresses.'));

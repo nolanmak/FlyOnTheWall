@@ -246,7 +246,7 @@ mod tests {
             all_day: false,
             canceled: false,
             my_status: Some(Participation::Accepted),
-            invitees: vec!["Rafiat Adeyemi".into(), "Room <B2>".into()],
+            invitees: vec!["Rafiya Lindqvist".into(), "Room <B2>".into()],
         }
     }
 
@@ -254,7 +254,11 @@ mod tests {
     fn maps_times_to_epoch_milliseconds() {
         let e = from_raw(&raw_event());
         assert_eq!(e.start_ms, 1_800_000_000_000);
-        assert_eq!(e.invitees, ["Rafiat Adeyemi"], "names kept, markup dropped");
+        assert_eq!(
+            e.invitees,
+            ["Rafiya Lindqvist"],
+            "names kept, markup dropped"
+        );
         assert_eq!(e.end_ms, 1_800_001_800_500);
         assert_eq!(e.title, "Design review");
         assert_eq!(e.participation, Participation::Accepted);

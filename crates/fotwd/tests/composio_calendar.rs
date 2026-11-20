@@ -998,13 +998,13 @@ fn invitees_come_from_the_attendee_list_by_name() {
         "start": {"dateTime": "2026-11-12T18:00:00Z"}, "end": {"dateTime": "2026-11-12T18:30:00Z"},
         "attendees": [
             {"email": "me@example.test", "self": true, "responseStatus": "accepted"},
-            {"email": "rafiat@example.test", "responseStatus": "accepted"},
-            {"email": "zay.healy@example.test", "displayName": "Zay Healy"},
+            {"email": "rafiya@example.test", "responseStatus": "accepted"},
+            {"email": "kit.marlow@example.test", "displayName": "Kit Marlow"},
             {"email": "c_123@resource.calendar.google.com", "resource": true, "displayName": "Room 4"},
         ],
     }]});
     let events = composio::events_from(&data);
-    assert_eq!(events[0].invitees, ["Rafiat", "Zay Healy"]);
+    assert_eq!(events[0].invitees, ["Rafiya", "Kit Marlow"]);
 }
 
 #[test]
@@ -1014,7 +1014,7 @@ fn the_matched_link_carries_the_invitees() {
         json!({"successful": true, "data": {"items": [{
             "id": "e1", "summary": "Weekly review",
             "start": {"dateTime": "2026-11-12T18:00:00Z"}, "end": {"dateTime": "2026-11-12T18:30:00Z"},
-            "attendees": [{"email": "rafiat@example.test"}],
+            "attendees": [{"email": "rafiya@example.test"}],
         }]}}),
     )]);
     let lookup: Arc<dyn CalendarLookup> = Arc::new(ComposioCalendar::new(
@@ -1027,7 +1027,7 @@ fn the_matched_link_carries_the_invitees() {
         fotwd::calendar::lookup_match(lookup, T, T + 25 * MIN, std::time::Duration::from_secs(2))
             .unwrap()
             .unwrap();
-    assert_eq!(link.invitees, ["Rafiat"]);
+    assert_eq!(link.invitees, ["Rafiya"]);
 }
 
 #[test]
@@ -1043,7 +1043,7 @@ fn the_invitee_names_switch_is_saved() {
 fn fixing_recent_names_looks_up_each_calendar_meetings_invite() {
     let now = fotw_store::now_ms();
     let mut db = db();
-    // A calendar-named meeting from an hour ago where "Rafiat" was heard as "Rafael".
+    // A calendar-named meeting from an hour ago where "Rafiya" was heard as "Rafael".
     let mut m = fotw_store::NewMeeting::new("dev-1", "UTC");
     m.title = "Weekly review".into();
     m.started_at_ms = now - 3_600_000;
@@ -1089,14 +1089,14 @@ fn fixing_recent_names_looks_up_each_calendar_meetings_invite() {
         "id": "evt-1", "summary": "Weekly review",
         "start": {"dateTime": composio::rfc3339_utc(now - 3_600_000)},
         "end": {"dateTime": composio::rfc3339_utc(now - 1_800_000)},
-        "attendees": [{"email": "rafiat@example.test"}, {"email": "me@example.test", "self": true}],
+        "attendees": [{"email": "rafiya@example.test"}, {"email": "me@example.test", "self": true}],
     }]}});
     let http = FakeComposio::replying(vec![(200, event)]);
     let c = composio::CalendarSettingsControl::new(db, store, http);
 
     assert_eq!(c.fix_recent_names().unwrap(), 1);
     let stored = c.invitees_for_tests(&id);
-    assert_eq!(stored.names, ["Rafiat"]);
+    assert_eq!(stored.names, ["Rafiya"]);
     assert_eq!(stored.corrections[0].from, "Rafael");
     assert!(c.invitees_for_tests(&other).names.is_empty());
 }
@@ -1131,7 +1131,7 @@ fn fixing_recent_names_adds_new_invitees_to_a_partial_list() {
         )
         .unwrap();
     // An earlier run kept only the names Apple's copy of the invite had.
-    fotwd::invitees::store_names(&mut db, &id, &["Matt Foss".to_owned()]).unwrap();
+    fotwd::invitees::store_names(&mut db, &id, &["Pat Rivera".to_owned()]).unwrap();
     ComposioSettings {
         user_id: "fotw-user".into(),
         auth_config_id: Some("ac".into()),
@@ -1151,7 +1151,7 @@ fn fixing_recent_names_adds_new_invitees_to_a_partial_list() {
         "id": "evt-1", "summary": "Weekly review",
         "start": {"dateTime": composio::rfc3339_utc(now - 3_600_000)},
         "end": {"dateTime": composio::rfc3339_utc(now - 1_800_000)},
-        "attendees": [{"email": "rafiat@example.test"}, {"email": "matt@example.test", "displayName": "Matt Foss"}],
+        "attendees": [{"email": "rafiya@example.test"}, {"email": "matt@example.test", "displayName": "Pat Rivera"}],
     }]}});
     let c = composio::CalendarSettingsControl::new(
         db,
@@ -1161,6 +1161,6 @@ fn fixing_recent_names_adds_new_invitees_to_a_partial_list() {
 
     assert_eq!(c.fix_recent_names().unwrap(), 1);
     let stored = c.invitees_for_tests(&id);
-    assert_eq!(stored.names, ["Matt Foss", "Rafiat"]);
+    assert_eq!(stored.names, ["Pat Rivera", "Rafiya"]);
     assert_eq!(stored.corrections[0].from, "Raphael");
 }

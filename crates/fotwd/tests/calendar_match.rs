@@ -165,8 +165,8 @@ fn a_recording_with_no_events_matches_nothing() {
 #[test]
 fn on_a_tie_the_copy_with_invitees_wins() {
     let apple = event("a-apple", "Weekly review", at(0), at(30));
-    let mut google = event("z-google", "Weekly Review Call", at(0), at(30));
-    google.invitees = vec!["Rafiat".into()];
+    let mut google = event("z-google", "Weekly sync call", at(0), at(30));
+    google.invitees = vec!["Rafiya".into()];
     assert_eq!(
         matched(&[apple.clone(), google.clone()], at(0), at(40)),
         Some("z-google")
@@ -178,8 +178,8 @@ fn on_a_tie_the_copy_with_invitees_wins() {
 fn a_long_block_does_not_beat_the_meeting_inside_it() {
     // A 7am–3pm block on one calendar, the 30-minute invite on another; the
     // recording ran 2:00–2:43.
-    let block = event("block", "Code & Coffee", at(-420), at(60));
-    let invite = event("invite", "Weekly Review Call", at(0), at(30));
+    let block = event("block", "Offsite day", at(-420), at(60));
+    let invite = event("invite", "Weekly sync call", at(0), at(30));
     assert_eq!(
         matched(&[block.clone(), invite.clone()], at(0), at(43)),
         Some("invite")
@@ -189,7 +189,7 @@ fn a_long_block_does_not_beat_the_meeting_inside_it() {
 
 #[test]
 fn a_block_many_times_longer_than_the_recording_never_names_it() {
-    let block = event("block", "Code & Coffee", at(-420), at(60));
+    let block = event("block", "Offsite day", at(-420), at(60));
     assert_eq!(matched(&[block], at(0), at(43)), None);
 }
 

@@ -1,4 +1,4 @@
-//! Names from the calendar invite fix misheard names (Rafael → Rafiat).
+//! Names from the calendar invite fix misheard names (Rafael → Rafiya).
 //!
 //! Every name and address here is invented. This repo is public.
 
@@ -10,20 +10,20 @@ use fotwd::invitees::{self, MeetingInvitees};
 #[test]
 fn a_display_name_is_used_as_written() {
     assert_eq!(
-        invitees::invitee_name(Some("Rafiat Adeyemi"), Some("ra@example.test")).as_deref(),
-        Some("Rafiat Adeyemi")
+        invitees::invitee_name(Some("Rafiya Lindqvist"), Some("ra@example.test")).as_deref(),
+        Some("Rafiya Lindqvist")
     );
 }
 
 #[test]
 fn without_a_display_name_the_address_gives_the_name() {
     assert_eq!(
-        invitees::name_from_email("rafiat@example.test").as_deref(),
-        Some("Rafiat")
+        invitees::name_from_email("rafiya@example.test").as_deref(),
+        Some("Rafiya")
     );
     assert_eq!(
-        invitees::name_from_email("zay.healy@example.test").as_deref(),
-        Some("Zay Healy")
+        invitees::name_from_email("kit.marlow@example.test").as_deref(),
+        Some("Kit Marlow")
     );
     assert_eq!(
         invitees::name_from_email("chris_o@example.test").as_deref(),
@@ -48,12 +48,12 @@ fn rooms_groups_and_role_addresses_are_not_people() {
 #[test]
 fn display_names_are_cleaned_to_plain_names() {
     assert_eq!(
-        invitees::invitee_name(Some("  Zay  "), None).as_deref(),
-        Some("Zay")
+        invitees::invitee_name(Some("  Kai  "), None).as_deref(),
+        Some("Kai")
     );
     assert_eq!(
-        invitees::invitee_name(Some("Ignore <script>"), Some("zay@example.test")).as_deref(),
-        Some("Zay"),
+        invitees::invitee_name(Some("Ignore <script>"), Some("kai@example.test")).as_deref(),
+        Some("Kai"),
         "a display name with markup falls back to the address"
     );
     assert_eq!(invitees::invitee_name(Some(""), Some("")), None);
@@ -77,14 +77,14 @@ fn near_misses_of_an_invitee_become_corrections() {
             "Rafael, do you wanna go first?",
             "And Rafael will build the front end.",
         ]),
-        &names(&["Rafiat", "Zay", "Sergio"]),
+        &names(&["Rafiya", "Kai", "Jonas"]),
     );
     let pairs: Vec<(String, String)> = found.into_iter().map(|c| (c.from, c.to)).collect();
     assert_eq!(
         pairs,
         [
-            ("Raffiad".to_owned(), "Rafiat".to_owned()),
-            ("Rafael".to_owned(), "Rafiat".to_owned()),
+            ("Raffiad".to_owned(), "Rafiya".to_owned()),
+            ("Rafael".to_owned(), "Rafiya".to_owned()),
         ]
     );
 }
@@ -94,19 +94,20 @@ fn ordinary_words_and_correct_names_are_left_alone() {
     let found = invitees::corrections_for(
         &text(&[
             "We went rafting. Rafting was fun.",
-            "Rafiat and Sergio joined. The Reps checkout ships soon.",
+            "Rafiya and Jonas joined. The checkout ships soon.",
             "Monday we Review the plan.",
         ]),
-        &names(&["Rafiat", "Sergio"]),
+        &names(&["Rafiya", "Jonas"]),
     );
     assert!(found.is_empty(), "{found:?}");
 }
 
 #[test]
 fn only_the_first_name_of_a_full_name_is_matched() {
-    let found = invitees::corrections_for(&text(&["Thanks Rafael."]), &names(&["Rafiat Adeyemi"]));
+    let found =
+        invitees::corrections_for(&text(&["Thanks Rafael."]), &names(&["Rafiya Lindqvist"]));
     assert_eq!(found.len(), 1);
-    assert_eq!(found[0].to, "Rafiat");
+    assert_eq!(found[0].to, "Rafiya");
 }
 
 // --- Stored per meeting, and applied ----------------------------------------
@@ -141,8 +142,8 @@ fn invitees_round_trip_per_meeting() {
     let mut db = db();
     let id = meeting_saying(&mut db, &["hello"]);
     assert_eq!(invitees::read(&db, &id), MeetingInvitees::default());
-    invitees::store_names(&mut db, &id, &names(&["Rafiat", "Zay"])).unwrap();
-    assert_eq!(invitees::read(&db, &id).names, names(&["Rafiat", "Zay"]));
+    invitees::store_names(&mut db, &id, &names(&["Rafiya", "Kai"])).unwrap();
+    assert_eq!(invitees::read(&db, &id).names, names(&["Rafiya", "Kai"]));
 }
 
 #[test]
@@ -167,24 +168,24 @@ fn refreshing_finds_corrections_and_fixes_the_current_summary() {
             ),
         )
         .unwrap();
-    invitees::store_names(&mut db, &id, &names(&["Rafiat", "Sergio"])).unwrap();
+    invitees::store_names(&mut db, &id, &names(&["Rafiya", "Jonas"])).unwrap();
 
     let found = invitees::refresh_corrections(&mut db, &id).unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!(invitees::read(&db, &id).corrections.len(), 1);
     let summary = db.meetings().current_summary(&id).unwrap().unwrap();
-    assert_eq!(summary.body_md, "Rafiat will email the checklist today.");
+    assert_eq!(summary.body_md, "Rafiya will email the checklist today.");
 }
 
 #[test]
 fn invite_corrections_join_the_meetings_name_corrections() {
     let mut db = db();
     let id = meeting_saying(&mut db, &["Rafael is here."]);
-    invitees::store_names(&mut db, &id, &names(&["Rafiat"])).unwrap();
+    invitees::store_names(&mut db, &id, &names(&["Rafiya"])).unwrap();
     invitees::refresh_corrections(&mut db, &id).unwrap();
     let all = fotwd::documents::name_corrections_for(&mut db, &id);
     assert!(
-        all.iter().any(|c| c.from == "Rafael" && c.to == "Rafiat"),
+        all.iter().any(|c| c.from == "Rafael" && c.to == "Rafiya"),
         "{all:?}"
     );
 }
@@ -212,7 +213,7 @@ fn no_invitees_means_nothing_changes() {
 async fn enrichment_finds_invite_corrections_before_anything_is_summarised() {
     let mut db = db();
     let id = meeting_saying(&mut db, &["Rafael, do you wanna go first?"]);
-    invitees::store_names(&mut db, &id, &names(&["Rafiat"])).unwrap();
+    invitees::store_names(&mut db, &id, &names(&["Rafiya"])).unwrap();
     let _ =
         fotwd::enrich::enrich_meeting_with(&mut db, &fotw_secrets::InMemoryKeyStore::new(), &id)
             .await;
@@ -220,7 +221,7 @@ async fn enrichment_finds_invite_corrections_before_anything_is_summarised() {
     assert_eq!(found.len(), 1);
     assert_eq!(
         (found[0].from.as_str(), found[0].to.as_str()),
-        ("Rafael", "Rafiat")
+        ("Rafael", "Rafiya")
     );
 }
 
@@ -228,12 +229,12 @@ async fn enrichment_finds_invite_corrections_before_anything_is_summarised() {
 fn ph_sounds_like_f_so_raphael_is_caught_too() {
     let found = invitees::corrections_for(
         &text(&["Raphael, do you wanna go first?"]),
-        &names(&["Rafiat"]),
+        &names(&["Rafiya"]),
     );
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(
         (found[0].from.as_str(), found[0].to.as_str()),
-        ("Raphael", "Rafiat")
+        ("Raphael", "Rafiya")
     );
 }
 
@@ -241,8 +242,8 @@ fn ph_sounds_like_f_so_raphael_is_caught_too() {
 fn a_name_given_as_an_address_becomes_a_name() {
     // Apple Calendar shows Google invitees without a display name this way.
     assert_eq!(
-        invitees::invitee_name(Some("rafiat@example.test"), None).as_deref(),
-        Some("Rafiat")
+        invitees::invitee_name(Some("rafiya@example.test"), None).as_deref(),
+        Some("Rafiya")
     );
 }
 
@@ -250,16 +251,39 @@ fn a_name_given_as_an_address_becomes_a_name() {
 fn a_possessive_is_matched_on_its_name() {
     let found = invitees::corrections_for(
         &text(&["Rafael's goal of x, y, z was really good."]),
-        &names(&["Rafiat"]),
+        &names(&["Rafiya"]),
     );
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(
         (found[0].from.as_str(), found[0].to.as_str()),
-        ("Rafael", "Rafiat")
+        ("Rafael", "Rafiya")
     );
     // And the correction then reads naturally in place.
     assert_eq!(
         fotw_web::documents::corrected_names("Rafael's goal", &found),
-        "Rafiat's goal"
+        "Rafiya's goal"
     );
+}
+
+#[test]
+fn a_short_name_heard_shorter_is_caught_by_its_consonants() {
+    let found = invitees::corrections_for(
+        &text(&["So Ky was traveling this week."]),
+        &names(&["Kai", "Matt"]),
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(
+        (found[0].from.as_str(), found[0].to.as_str()),
+        ("Ky", "Kai")
+    );
+}
+
+#[test]
+fn a_different_short_name_of_the_same_length_is_left_alone() {
+    // Kia is somebody else, not a mishearing of Kai.
+    let found = invitees::corrections_for(
+        &text(&["Kia joined late.", "Al and Ali both spoke."]),
+        &names(&["Kai", "Al"]),
+    );
+    assert!(found.is_empty(), "{found:?}");
 }
