@@ -133,6 +133,27 @@ pub fn invitee_name(display: Option<&str>, email: Option<&str>) -> Option<String
         .or_else(|| email.and_then(name_from_email))
 }
 
+/// Whether `word` is a short name heard shorter: "Ze" for "Zay". Only for
+/// names of three letters or fewer, which string similarity cannot reach;
+/// the heard word must be shorter than the name (so "Zoe" is somebody else),
+/// start with the same letter, and keep the same consonants.
+fn short_name_heard(word: &str, name: &str) -> bool {
+    let consonants = |w: &str| -> String {
+        sounded(w)
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_alphabetic() && !"aeiouy".contains(*c))
+            .collect()
+    };
+    let (word_len, name_len) = (word.chars().count(), name.chars().count());
+    name_len <= 3
+        && (2..name_len).contains(&word_len)
+        && word.chars().next().map(|c| c.to_ascii_lowercase())
+            == name.chars().next().map(|c| c.to_ascii_lowercase())
+        && !consonants(name).is_empty()
+        && consonants(word) == consonants(name)
+}
+
 /// `word` as it sounds for matching: "ph" is "f" ("Raphael" → "Rafael").
 fn sounded(word: &str) -> String {
     word.replace("ph", "f")
@@ -204,6 +225,11 @@ pub fn corrections_for(texts: &[String], names: &[String]) -> Vec<NameCorrection
                 if spoken != word {
                     fixed = matcher.apply(&spoken);
                 }
+            }
+            if fixed == word
+                && let Some(short) = firsts.iter().find(|f| short_name_heard(word, f))
+            {
+                fixed.clone_from(short);
             }
             if fixed != word
                 && let Some(to) = firsts.iter().find(|f| f.eq_ignore_ascii_case(&fixed))

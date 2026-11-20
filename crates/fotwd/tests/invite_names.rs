@@ -263,3 +263,26 @@ fn a_possessive_is_matched_on_its_name() {
         "Rafiat's goal"
     );
 }
+
+#[test]
+fn a_short_name_heard_shorter_is_caught_by_its_consonants() {
+    let found = invitees::corrections_for(
+        &text(&["So Ze was traveling in Germany this week."]),
+        &names(&["Zay", "Matt"]),
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(
+        (found[0].from.as_str(), found[0].to.as_str()),
+        ("Ze", "Zay")
+    );
+}
+
+#[test]
+fn a_different_short_name_of_the_same_length_is_left_alone() {
+    // Zoe is somebody else, not a mishearing of Zay.
+    let found = invitees::corrections_for(
+        &text(&["Zoe joined late.", "Al and Ali both spoke."]),
+        &names(&["Zay", "Al"]),
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
