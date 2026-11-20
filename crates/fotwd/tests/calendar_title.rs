@@ -358,11 +358,11 @@ fn an_event_named_like_the_placeholder_is_not_used() {
 fn persisting_a_matched_recording_keeps_the_invitee_names() {
     let (dir, mut db) = library();
     let mut with_people = link("Weekly review");
-    with_people.invitees = vec!["Rafiat".into(), "Zay Healy".into()];
+    with_people.invitees = vec!["Rafiya".into(), "Kit Marlow".into()];
     let id = persisted(&mut db, dir.path(), Some(&with_people));
     assert_eq!(
         fotwd::invitees::read(&db, &id).names,
-        ["Rafiat", "Zay Healy"]
+        ["Rafiya", "Kit Marlow"]
     );
 }
 
@@ -373,48 +373,48 @@ fn the_same_event_from_two_calendars_pools_its_invitees() {
     apple.source = "eventkit";
     let mut google = event("google-uid", "Weekly review", T10, T10 + 30 * MIN);
     google.source = "composio";
-    google.invitees = vec!["Rafiat".into(), "Zay".into()];
+    google.invitees = vec!["Rafiya".into(), "Kai".into()];
     let calendar: Arc<dyn CalendarLookup> = Arc::new(Fixed::new("test", vec![apple, google]));
     let link = lookup_match(calendar, T10, T10 + 30 * MIN, Duration::from_secs(2))
         .unwrap()
         .unwrap();
-    assert_eq!(link.invitees, ["Rafiat", "Zay"]);
+    assert_eq!(link.invitees, ["Rafiya", "Kai"]);
 }
 
 #[test]
 fn a_differently_titled_copy_at_the_same_time_still_lends_its_invitees() {
-    let mut apple = event("apple-uid", "Foss weekly", T10, T10 + 30 * MIN);
+    let mut apple = event("apple-uid", "Team weekly", T10, T10 + 30 * MIN);
     apple.participation = Participation::Accepted;
-    let mut google = event("google-uid", "Weekly Review Call", T10, T10 + 30 * MIN);
+    let mut google = event("google-uid", "Weekly sync call", T10, T10 + 30 * MIN);
     google.participation = Participation::Unknown;
-    google.invitees = vec!["Rafiat".into()];
+    google.invitees = vec!["Rafiya".into()];
     let calendar: Arc<dyn CalendarLookup> = Arc::new(Fixed::new("test", vec![apple, google]));
     let link = lookup_match(calendar, T10, T10 + 30 * MIN, Duration::from_secs(2))
         .unwrap()
         .unwrap();
-    assert_eq!(link.invitees, ["Rafiat"]);
+    assert_eq!(link.invitees, ["Rafiya"]);
 }
 
 #[test]
 fn an_event_without_invitees_borrows_them_from_one_starting_at_the_same_time() {
     // Apple: an hour block with no invitees. Google: the 30-minute invite.
-    let apple = event("apple-uid", "Foss weekly", T10, T10 + 60 * MIN);
-    let mut google = event("google-uid", "Weekly Review Call", T10, T10 + 30 * MIN);
-    google.invitees = vec!["Rafiat".into(), "Zay".into()];
+    let apple = event("apple-uid", "Team weekly", T10, T10 + 60 * MIN);
+    let mut google = event("google-uid", "Weekly sync call", T10, T10 + 30 * MIN);
+    google.invitees = vec!["Rafiya".into(), "Kai".into()];
     let calendar: Arc<dyn CalendarLookup> = Arc::new(Fixed::new("test", vec![apple, google]));
     let link = lookup_match(calendar, T10, T10 + 43 * MIN, Duration::from_secs(2))
         .unwrap()
         .unwrap();
     assert_eq!(
-        link.title, "Foss weekly",
+        link.title, "Team weekly",
         "the better-overlapping event still names it"
     );
-    assert_eq!(link.invitees, ["Rafiat", "Zay"]);
+    assert_eq!(link.invitees, ["Rafiya", "Kai"]);
 }
 
 #[test]
 fn an_unrelated_event_later_lends_nothing() {
-    let apple = event("apple-uid", "Foss weekly", T10, T10 + 60 * MIN);
+    let apple = event("apple-uid", "Team weekly", T10, T10 + 60 * MIN);
     let mut later = event("later-uid", "Other call", T10 + 20 * MIN, T10 + 50 * MIN);
     later.invitees = vec!["Someone".into()];
     let calendar: Arc<dyn CalendarLookup> = Arc::new(Fixed::new("test", vec![apple, later]));

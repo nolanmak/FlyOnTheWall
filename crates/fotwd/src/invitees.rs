@@ -5,7 +5,7 @@
 //!
 //! * **Corrections, locally.** Capitalised words in the transcript that are
 //!   near-misses of an invitee's first name ("Rafael", "Raffiad" for
-//!   "Rafiat") become name corrections, the same kind a user adds with
+//!   "Rafiya") become name corrections, the same kind a user adds with
 //!   "Remember name correction". The summary, the sharing document and
 //!   shared transcript copies then use the invite's spelling; the stored
 //!   transcript itself is never rewritten.
@@ -69,7 +69,7 @@ pub fn clean_name(raw: &str) -> Option<String> {
     plain.then_some(collapsed)
 }
 
-/// A person's name from an address: `zay.healy@` → "Zay Healy". `None` for
+/// A person's name from an address: `kit.marlow@` → "Kit Marlow". `None` for
 /// rooms, groups and role addresses.
 #[must_use]
 pub fn name_from_email(email: &str) -> Option<String> {
@@ -131,6 +131,27 @@ pub fn invitee_name(display: Option<&str>, email: Option<&str>) -> Option<String
             }
         })
         .or_else(|| email.and_then(name_from_email))
+}
+
+/// Whether `word` is a short name heard shorter: "Ky" for "Kai". Only for
+/// names of three letters or fewer, which string similarity cannot reach;
+/// the heard word must be shorter than the name (so "Kia" is somebody else),
+/// start with the same letter, and keep the same consonants.
+fn short_name_heard(word: &str, name: &str) -> bool {
+    let consonants = |w: &str| -> String {
+        sounded(w)
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_alphabetic() && !"aeiouy".contains(*c))
+            .collect()
+    };
+    let (word_len, name_len) = (word.chars().count(), name.chars().count());
+    name_len <= 3
+        && (2..name_len).contains(&word_len)
+        && word.chars().next().map(|c| c.to_ascii_lowercase())
+            == name.chars().next().map(|c| c.to_ascii_lowercase())
+        && !consonants(name).is_empty()
+        && consonants(word) == consonants(name)
 }
 
 /// `word` as it sounds for matching: "ph" is "f" ("Raphael" → "Rafael").
@@ -198,12 +219,17 @@ pub fn corrections_for(texts: &[String], names: &[String]) -> Vec<NameCorrection
             }
             let mut fixed = matcher.apply(word);
             if fixed == word {
-                // Spelled differently, sounds the same: "Raphael" for "Rafiat"
+                // Spelled differently, sounds the same: "Raphael" for "Rafiya"
                 // reads as "Rafael" to the matcher.
                 let spoken = sounded(word);
                 if spoken != word {
                     fixed = matcher.apply(&spoken);
                 }
+            }
+            if fixed == word
+                && let Some(short) = firsts.iter().find(|f| short_name_heard(word, f))
+            {
+                fixed.clone_from(short);
             }
             if fixed != word
                 && let Some(to) = firsts.iter().find(|f| f.eq_ignore_ascii_case(&fixed))

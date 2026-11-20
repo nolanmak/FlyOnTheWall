@@ -1940,12 +1940,12 @@ mod tests {
         let transport = MockTransport::new();
         let adapter = AnthropicAdapter::new(transport.clone(), "fixture-prose", "fixture-key");
         let with = Pipeline::new(&adapter, &adapter).with_config(PipelineConfig {
-            invitees: vec!["Rafiat".into(), "Zay Healy".into()],
+            invitees: vec!["Rafiya".into(), "Kit Marlow".into()],
             ..PipelineConfig::default()
         });
         let instruction = with.instruction_with_speech("Summarise.".into());
         assert!(
-            instruction.contains("- Rafiat\n- Zay Healy"),
+            instruction.contains("- Rafiya\n- Kit Marlow"),
             "{instruction}"
         );
         assert!(instruction.ends_with("Summarise."));
