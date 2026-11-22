@@ -47,7 +47,7 @@ pub enum SearchSource {
     Note,
     /// `summaries.body_md`, any version, not only the current one.
     Summary,
-    /// `segments.text` — the transcript body.
+    /// `segments.text` — the body of the meeting's primary transcript.
     Transcript,
 }
 
@@ -303,8 +303,10 @@ impl Db {
     /// 150,000-segment corpus in `tests/search.rs`: **p95 371 ms**
     /// one-statement, **p95 18 ms** two-statement, against a 100 ms budget.
     ///
-    /// So phase one ranks — index only, no source-table reads at all unless a
-    /// filter needs them — and phase two renders a preview for the `LIMIT`
+    /// So phase one ranks — from the index alone for titles, notes and
+    /// summaries unless a filter needs a source table; transcript hits are
+    /// also looked up to see which version they belong to, see
+    /// `PRIMARY_SEGMENTS` — and phase two renders a preview for the `LIMIT`
     /// rows that survived. Ranking is unchanged; only the number of previews
     /// is.
     pub fn search(&self, q: &SearchQuery) -> Result<Vec<SearchHit>> {
@@ -486,17 +488,39 @@ impl Db {
     }
 }
 
-/// Phase one with no filters: four index scans, `bm25()`, and nothing else.
+/// The transcript branch's `FROM`: only segments of a primary transcript.
 ///
-/// Note what is *not* here — no join to `meetings`, `segments`, `notes` or
-/// `summaries`. An unfiltered ranking never touches a source table, so its cost
-/// is the doclist walk and nothing more.
+/// A rewritten transcript keeps the version it replaced, for revert, and every
+/// segment of every version is in `segments_fts`. Without this join a phrase
+/// both versions hold is found once per version, and a passage the rewrite
+/// removed is still found.
+///
+/// It is applied here, while ranking, and not when a hit is rendered: `LIMIT`
+/// and `OFFSET` have to count only the hits that will be shown, or pages come
+/// back short. Summaries have no such rule; every version is searchable.
+///
+/// The transcript must also be the segment's own meeting's. The two are
+/// separate foreign keys and an imported archive can disagree; without the
+/// check a segment filed under one meeting would be found, and shown under
+/// that meeting, because some other meeting's transcript is primary.
+const PRIMARY_SEGMENTS: &str = "FROM segments_fts
+               JOIN segments sg ON sg.rowid = segments_fts.rowid
+               JOIN transcripts tr ON tr.id = sg.transcript_id
+                                  AND tr.meeting_id = sg.meeting_id
+                                  AND tr.is_primary = 1";
+
+/// Phase one with no filters: four index scans and `bm25()`.
+///
+/// Note what is *not* here — no join to `meetings`, `notes` or `summaries`.
+/// Titles, notes and summaries are ranked from the index alone. Transcript
+/// hits cost two indexed lookups each, to `segments` and `transcripts`,
+/// because which version a segment belongs to is not in the index.
 static RANK_SQL_PLAIN: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     rank_sql(
         "FROM meetings_fts WHERE meetings_fts MATCH :q",
         "FROM notes_fts WHERE notes_fts MATCH :q",
         "FROM summaries_fts WHERE summaries_fts MATCH :q",
-        "FROM segments_fts WHERE segments_fts MATCH :q",
+        &format!("{PRIMARY_SEGMENTS} WHERE segments_fts MATCH :q"),
     )
 });
 
@@ -522,8 +546,7 @@ static RANK_SQL_FILTERED: std::sync::LazyLock<String> = std::sync::LazyLock::new
               WHERE summaries_fts MATCH :q {FILTERS}"
         ),
         &format!(
-            "FROM segments_fts
-               JOIN segments sg ON sg.rowid = segments_fts.rowid
+            "{PRIMARY_SEGMENTS}
                JOIN meetings m ON m.id = sg.meeting_id
               WHERE segments_fts MATCH :q {FILTERS}"
         ),
