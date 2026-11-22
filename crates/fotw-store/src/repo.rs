@@ -327,13 +327,33 @@ impl MeetingRepo<'_> {
         Ok(id)
     }
 
+    /// Create a transcript and insert its segments in one transaction.
+    /// When `make_primary` is set, the primary switch commits with the segments.
+    /// Either everything supplied commits or nothing does; an empty
+    /// `segments` creates a transcript with no segments.
+    pub fn create_transcript_with_segments(
+        &mut self,
+        meeting_id: &str,
+        provider: &str,
+        model: &str,
+        make_primary: bool,
+        segments: &[NewSegment],
+    ) -> Result<String> {
+        let tx = self.db.conn_mut().transaction()?;
+        let id = insert_transcript(&tx, meeting_id, provider, model, make_primary)?;
+        insert_segments(&tx, &id, segments)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
     /// The primary transcript for a meeting, if it has one.
     ///
     /// `Ok(None)` means no transcript of the meeting is marked primary. Usually
     /// it has none yet — a normal state, since recording without a provider
-    /// configured is supported — but `create_transcript(.., false)` can leave
-    /// it with transcripts and no primary, and then search finds none of them. A
-    /// real SQLite failure stays an `Err`: two callers previously hand-rolled
+    /// configured is supported — but either `create_transcript` or
+    /// `create_transcript_with_segments` with `make_primary = false` can leave it with
+    /// transcripts and no primary, and then search finds none of them.
+    /// A real SQLite failure stays an `Err`: two callers previously hand-rolled
     /// this query with `.ok()`, which rendered a database error as "no
     /// transcript" and would have shown an empty meeting instead of a fault.
     pub fn primary_transcript_id(&self, meeting_id: &str) -> Result<Option<String>> {
