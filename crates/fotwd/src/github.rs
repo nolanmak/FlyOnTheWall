@@ -317,6 +317,30 @@ impl ArtifactVersion {
         self.summary.is_some() || self.document.is_some()
     }
 }
+
+fn save_artifact_receipt(
+    db: &mut Db,
+    meeting_id: &str,
+    version: &ArtifactVersion,
+) -> Result<(), GithubError> {
+    crate::receipts::update(db, ARTIFACT_RECEIPTS_KEY, |all| {
+        all.insert(meeting_id.to_owned(), version.clone());
+        true
+    })
+    .map_err(|_| GithubError::Failed("files pushed but document receipt could not be saved".into()))
+}
+
+fn save_transcript_receipt(
+    db: &mut Db,
+    meeting_id: &str,
+    receipt: &GithubReceipt,
+) -> fotw_store::Result<()> {
+    crate::receipts::update(db, RECEIPTS_KEY, |all| {
+        all.insert(meeting_id.to_owned(), receipt.clone());
+        true
+    })
+}
+
 fn read_artifact_receipts(db: &Db) -> HashMap<String, ArtifactVersion> {
     db.get_setting(ARTIFACT_RECEIPTS_KEY)
         .ok()
@@ -1278,26 +1302,10 @@ impl GithubExporter {
         let mut receipt_lost = false;
         {
             let mut db = self.lock_db();
-            let mut artifacts = read_artifact_receipts(&db);
-            artifacts.insert(meeting_id.to_owned(), version.clone());
-            let artifact_json = serde_json::to_string(&artifacts)
-                .map_err(|_| GithubError::Failed("could not encode document receipts".into()))?;
-            db.put_setting(ARTIFACT_RECEIPTS_KEY, &artifact_json)
-                .map_err(|_| {
-                    GithubError::Failed(
-                        "files pushed but document receipt could not be saved".into(),
-                    )
-                })?;
-            let mut receipts = read_receipts(&db);
-            receipts.insert(meeting_id.to_owned(), receipt.clone());
-            match serde_json::to_string(&receipts) {
-                Ok(json) => {
-                    if let Err(e) = db.put_setting(RECEIPTS_KEY, &json) {
-                        diag!("  ! pushed, but could not save the receipt: {e}");
-                        receipt_lost = true;
-                    }
-                }
-                Err(e) => diag!("  ! pushed, but could not encode the receipt: {e}"),
+            save_artifact_receipt(&mut db, meeting_id, version)?;
+            if let Err(e) = save_transcript_receipt(&mut db, meeting_id, &receipt) {
+                diag!("  ! pushed, but could not save the receipt: {e}");
+                receipt_lost = true;
             }
         }
         // Acted on after that block and never inside it: the retry table is
@@ -1432,6 +1440,81 @@ fn transcript_path(prefix: &str, started_at_ms: i64, title: &str, meeting_id: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn transcript(db: &mut Db, id: &str, clock: u64) {
+        save_transcript_receipt(
+            db,
+            id,
+            &GithubReceipt {
+                path: format!("fixture-{clock}.md"),
+                pushed_at_ms: clock,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    fn artifact(db: &mut Db, id: &str, version: u64) {
+        save_artifact_receipt(
+            db,
+            id,
+            &ArtifactVersion {
+                summary: None,
+                document: Some(i64::try_from(version).unwrap()),
+                repo: "fixture/repo".into(),
+                branch: "main".into(),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn receipt_transcript_independent_writers() {
+        crate::receipts::tests::independent_writers(RECEIPTS_KEY, transcript);
+    }
+
+    #[test]
+    fn receipt_artifact_independent_writers() {
+        crate::receipts::tests::independent_writers(ARTIFACT_RECEIPTS_KEY, artifact);
+    }
+
+    #[test]
+    fn receipt_transcript_repush_after_clock_step_back() {
+        let fixture = crate::receipts::tests::Fixture::new();
+        let (mut first, mut second) = (fixture.open(), fixture.open());
+        transcript(&mut first, "fixture", 20);
+        transcript(&mut second, "fixture", 10);
+        let receipt = &read_receipts(&fixture.open())["fixture"];
+        assert_eq!(receipt.path, "fixture-10.md");
+        assert_eq!(receipt.pushed_at_ms, 10);
+    }
+
+    #[test]
+    fn receipt_github_legacy_blobs() {
+        let fixture = crate::receipts::tests::Fixture::new();
+        let mut db = fixture.open();
+        let transcript = r#"{ "fixture": {"repo":"fixture/repo","path":"fixture.md","commit":"abc","pushed_at_ms":10} }"#;
+        let artifact =
+            r#"{ "fixture": {"summary":null,"document":2,"repo":"fixture/repo","branch":"main"} }"#;
+        db.put_setting(RECEIPTS_KEY, transcript).unwrap();
+        db.put_setting(ARTIFACT_RECEIPTS_KEY, artifact).unwrap();
+        drop(db);
+        let reader = fixture.open();
+        assert_eq!(read_receipts(&reader)["fixture"].started_at_ms, 0);
+        assert_eq!(read_receipts(&reader)["fixture"].title, "");
+        assert_eq!(read_artifact_receipts(&reader)["fixture"].document, Some(2));
+        assert_eq!(
+            reader.get_setting(RECEIPTS_KEY).unwrap().as_deref(),
+            Some(transcript)
+        );
+        assert_eq!(
+            reader
+                .get_setting(ARTIFACT_RECEIPTS_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(artifact)
+        );
+    }
 
     #[test]
     fn only_an_unambiguous_private_answer_counts_as_private() {

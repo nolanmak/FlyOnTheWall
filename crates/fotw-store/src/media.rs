@@ -26,7 +26,7 @@
 //! un-transcribed keeps its audio, which costs disk. The other way costs the
 //! meeting.
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::db::Db;
 use crate::error::{Result, StoreError};
@@ -307,14 +307,7 @@ impl Db {
     ///
     /// Propagates SQLite failures.
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
-        self.conn()
-            .query_row(
-                "SELECT value FROM settings WHERE key = ?1",
-                params![key],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(Into::into)
+        get_setting(self.conn(), key)
     }
 
     /// Write a `settings` value, replacing whatever was there.
@@ -323,18 +316,56 @@ impl Db {
     ///
     /// Propagates SQLite failures.
     pub fn put_setting(&mut self, key: &str, value: &str) -> Result<()> {
-        let now = now_ms();
-        self.conn().execute(
-            "INSERT INTO settings (key, value, updated_at, lamport, origin_device_id)
-             VALUES (?1, ?2, ?3, 0, ?4)
-             ON CONFLICT (key) DO UPDATE SET
-                 value = excluded.value,
-                 updated_at = excluded.updated_at,
-                 lamport = settings.lamport + 1",
-            params![key, value, now, self_device_id(self)],
-        )?;
+        put_setting(self.conn(), key, value)
+    }
+
+    /// Update one setting from its current value under the SQLite writer lock.
+    ///
+    /// Return `None` from `update` to skip the write. The callback runs inside
+    /// the transaction and should only compute the new value.
+    ///
+    /// # Errors
+    ///
+    /// Propagates SQLite or callback failures and rolls back the update.
+    pub fn update_setting(
+        &mut self,
+        key: &str,
+        update: impl FnOnce(Option<&str>) -> Result<Option<String>>,
+    ) -> Result<()> {
+        let tx = self
+            .conn_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = get_setting(&tx, key)?;
+        if let Some(value) = update(current.as_deref())? {
+            put_setting(&tx, key, &value)?;
+        }
+        tx.commit()?;
         Ok(())
     }
+}
+
+fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        params![key],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn put_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    let now = now_ms();
+    conn.execute(
+        "INSERT INTO settings (key, value, updated_at, lamport, origin_device_id)
+         VALUES (?1, ?2, ?3, 0, ?4)
+         ON CONFLICT (key) DO UPDATE SET
+             value = excluded.value,
+             updated_at = excluded.updated_at,
+             lamport = settings.lamport + 1",
+        params![key, value, now, self_device_id(conn)],
+    )?;
+    Ok(())
 }
 
 /// The device to stamp on rows this install writes.
@@ -342,15 +373,14 @@ impl Db {
 /// Reads `devices.is_self` when there is one and falls back to a literal
 /// rather than failing: a settings write must not be the thing that discovers
 /// the device table was never seeded.
-fn self_device_id(db: &Db) -> String {
-    db.conn()
-        .query_row("SELECT id FROM devices WHERE is_self = 1", [], |r| {
-            r.get::<_, String>(0)
-        })
-        .optional()
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "local".to_owned())
+fn self_device_id(conn: &Connection) -> String {
+    conn.query_row("SELECT id FROM devices WHERE is_self = 1", [], |r| {
+        r.get::<_, String>(0)
+    })
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| "local".to_owned())
 }
 
 /// §9.7 invariant 5, at the write.

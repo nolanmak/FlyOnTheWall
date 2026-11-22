@@ -80,10 +80,12 @@ pub(crate) const FALLBACK_PREFIX: &str = "Untitled recording";
 ///
 /// # What that costs, and the size at which it stops being free (#89)
 ///
-/// One row holds one entry per meeting ever enriched, and every writer rewrites
-/// the whole row: [`read_receipts`] parses the map, the caller changes one
-/// entry, `stamp` re-serialises all of them. An entry is a 36-byte UUID plus
-/// two millisecond clocks plus a title capped at
+/// One row holds one entry per meeting ever enriched, and every write rewrites
+/// the whole row: `receipts::update` parses the current map under the SQLite
+/// writer lock, the caller changes its entries (one for a stamp, several for a
+/// legacy-title adoption), and the whole map is re-serialised unless the caller
+/// skips the write. An entry is a 36-byte UUID plus two millisecond clocks
+/// plus a title capped at
 /// [`TITLE_BUDGET_BYTES`](fotw_summarize::title::TITLE_BUDGET_BYTES) — call it
 /// ~180 bytes of JSON.
 ///
@@ -95,12 +97,13 @@ pub(crate) const FALLBACK_PREFIX: &str = "Untitled recording";
 ///
 /// At the 33 meetings of the first real library that is ~6 KB — genuinely
 /// nothing beside a single LLM call. At 10 000 it is ~1.8 MB parsed and
-/// re-serialised twice per enrichment and once a minute forever, through
-/// SQLCipher, which is no longer nothing. [`crate::github`]'s map has exactly
-/// the same shape and the same ceiling, so whichever way this goes it goes for
-/// both: a `meeting_receipts` table keyed by meeting id, or a column apiece.
-/// Both are migrations, and neither is worth one until the library is an order
-/// of magnitude larger than any that exists.
+/// re-serialised twice per enrichment, and parsed again once a minute for as
+/// long as the daemon runs, through SQLCipher, which is no longer nothing.
+/// [`crate::github`]'s map has exactly the same shape and the same ceiling, so
+/// whichever way this goes it goes for both: a `meeting_receipts` table keyed
+/// by meeting id, or a column apiece. Both are migrations, and neither is
+/// worth one until the library is an order of magnitude larger than any that
+/// exists.
 pub const RECEIPTS_KEY: &str = "enrich_receipts";
 
 /// What enrichment left behind for one meeting: two clocks and a string, each
@@ -208,10 +211,13 @@ pub async fn enrich_meeting_with(
     // The started stamp, before anything else: it is the grace anchor the
     // GitHub exporter measures against (#76), and it has to be on disk before
     // the minutes of LLM calls below, not after them.
-    let mut receipt = read_receipts(db).remove(meeting_id).unwrap_or_default();
-    receipt.started_at_ms = u64::try_from(fotw_store::now_ms()).unwrap_or(0);
-    receipt.finished_at_ms = 0;
-    stamp(db, meeting_id, &receipt, &mut report);
+    let mut receipt = start_receipt(
+        db,
+        meeting_id,
+        u64::try_from(fotw_store::now_ms()).unwrap_or(0),
+        &mut report,
+    );
+    let previous_title = receipt.minted_title.clone();
 
     // Capture before reading any source content. A credential lookup can yield
     // to another editor even when no hosted engine is eventually configured.
@@ -340,7 +346,9 @@ pub async fn enrich_meeting_with(
     // keychain or library failure in [`enrich_meeting`] — are exactly what the
     // exporter's grace window is for.
     receipt.finished_at_ms = u64::try_from(fotw_store::now_ms()).unwrap_or(0);
-    stamp(db, meeting_id, &receipt, &mut report);
+    let minted_title =
+        (receipt.minted_title != previous_title).then_some(receipt.minted_title.as_str());
+    stamp(db, meeting_id, &receipt, minted_title, &mut report);
 
     report
 }
@@ -419,22 +427,55 @@ fn mint(
     }
 }
 
+/// Record a pass starting and carry its current title proof into enrichment.
+pub(crate) fn start_receipt(
+    db: &mut Db,
+    meeting_id: &str,
+    started_at_ms: u64,
+    report: &mut EnrichReport,
+) -> EnrichReceipt {
+    let mut receipt = EnrichReceipt {
+        started_at_ms,
+        ..EnrichReceipt::default()
+    };
+    let started = crate::receipts::update(db, RECEIPTS_KEY, |all| {
+        let current: &mut EnrichReceipt = all.entry(meeting_id.to_owned()).or_default();
+        receipt.minted_title.clone_from(&current.minted_title);
+        *current = receipt.clone();
+        true
+    });
+    if let Err(e) = started {
+        report.problems.push(format!("enrichment stamp: {e}"));
+        if let Some(current) = read_receipts(db).remove(meeting_id) {
+            receipt.minted_title = current.minted_title;
+        }
+    }
+    receipt
+}
+
 /// Write one meeting's enrichment receipt.
 ///
 /// Best-effort by the module's own rule: a stamp that could not be stored is
 /// one more problem, never an error. The cost of losing one is a meeting the
 /// exporter holds back until the grace window opens, which is the behaviour
 /// the window exists to provide.
-fn stamp(db: &mut Db, meeting_id: &str, receipt: &EnrichReceipt, report: &mut EnrichReport) {
-    let mut all = read_receipts(db);
-    all.insert(meeting_id.to_owned(), receipt.clone());
-    match serde_json::to_string(&all) {
-        Ok(json) => {
-            if let Err(e) = db.put_setting(RECEIPTS_KEY, &json) {
-                report.problems.push(format!("enrichment stamp: {e}"));
-            }
+pub(crate) fn stamp(
+    db: &mut Db,
+    meeting_id: &str,
+    receipt: &EnrichReceipt,
+    minted_title: Option<&str>,
+    report: &mut EnrichReport,
+) {
+    if let Err(e) = crate::receipts::update(db, RECEIPTS_KEY, |all| {
+        let current: &mut EnrichReceipt = all.entry(meeting_id.to_owned()).or_default();
+        current.started_at_ms = receipt.started_at_ms;
+        current.finished_at_ms = receipt.finished_at_ms;
+        if let Some(title) = minted_title {
+            current.minted_title = title.to_owned();
         }
-        Err(e) => report.problems.push(format!("enrichment stamp: {e}")),
+        true
+    }) {
+        report.problems.push(format!("enrichment stamp: {e}"));
     }
 }
 
@@ -700,8 +741,7 @@ pub struct LegacyTitles {
 /// transcript read and a string compare, which is why it can run unasked.
 pub fn adopt_legacy_titles(db: &mut Db) -> LegacyTitles {
     let mut found = LegacyTitles::default();
-    let mut receipts = read_receipts(db);
-    let mut adopted_any = false;
+    let mut candidates = Vec::new();
     let mut offset = 0i64;
 
     loop {
@@ -724,25 +764,7 @@ pub fn adopt_legacy_titles(db: &mut Db) -> LegacyTitles {
             if fallback_title(&segments).as_deref() != Some(meeting.title.as_str()) {
                 continue;
             }
-            // Both clocks stay as they are — zero on a meeting no pass has
-            // ever reached. They mean "when the last enrichment pass ran", and
-            // this is not one. `github::export_ready` reads a clockless stamp
-            // as ancient rather than as a pass in flight, which is the same
-            // answer it already gave a meeting with no stamp at all.
-            let receipt = receipts.entry(meeting.id.clone()).or_default();
-            if receipt.minted_title == meeting.title {
-                // Already classified as this machine's own work, by #76 or by
-                // an earlier sweep. Replaceable, so still a re-title candidate.
-                found.wearing.push(meeting.id);
-            } else if receipt.minted_title.is_empty() {
-                receipt.minted_title = meeting.title.clone();
-                adopted_any = true;
-                found.adopted.push(meeting.id.clone());
-                found.wearing.push(meeting.id);
-            }
-            // Anything else is a receipt naming a *different* title: #76
-            // classified this meeting already, and what it recorded is a
-            // rename. Left alone.
+            candidates.push((meeting.id, meeting.title));
         }
         if last_page {
             break;
@@ -750,19 +772,25 @@ pub fn adopt_legacy_titles(db: &mut Db) -> LegacyTitles {
         offset += SWEEP_PAGE;
     }
 
-    if adopted_any {
-        match serde_json::to_string(&receipts) {
-            Ok(json) => {
-                if let Err(e) = db.put_setting(RECEIPTS_KEY, &json) {
-                    found.problems.push(format!("legacy titles: {e}"));
-                    found.adopted.clear();
+    if !candidates.is_empty()
+        && let Err(e) = crate::receipts::update(db, RECEIPTS_KEY, |all| {
+            for (id, title) in candidates {
+                let receipt: &mut EnrichReceipt = all.entry(id.clone()).or_default();
+                // Adoption only fills in the title proof. Keep both clocks
+                // from the latest receipt, including any pass started during the sweep.
+                if receipt.minted_title.is_empty() {
+                    receipt.minted_title.clone_from(&title);
+                    found.adopted.push(id.clone());
+                }
+                if receipt.minted_title == title {
+                    found.wearing.push(id);
                 }
             }
-            Err(e) => {
-                found.problems.push(format!("legacy titles: {e}"));
-                found.adopted.clear();
-            }
-        }
+            !found.adopted.is_empty()
+        })
+    {
+        found.problems.push(format!("legacy titles: {e}"));
+        found.adopted.clear();
     }
     found
 }
@@ -832,13 +860,18 @@ pub async fn retitle_meetings(db: &mut Db, store: &dyn KeyStore, ids: &[String])
         if segments.is_empty() {
             continue;
         }
-        // Re-read rather than snapshot: the daemon may be enriching this same
-        // library, and the clocks in its stamp are the exporter's grace anchor.
-        let mut receipt = read_receipts(db).remove(meeting_id).unwrap_or_default();
+        let mut receipt = EnrichReceipt::default();
         let mut report = EnrichReport::default();
         title_from_engine(db, &engine, meeting_id, &mut receipt, &mut report, false).await;
-        if report.title.is_some() {
-            stamp(db, meeting_id, &receipt, &mut report);
+        if report.title.is_some()
+            && let Err(e) = crate::receipts::update(db, RECEIPTS_KEY, |all| {
+                let current: &mut EnrichReceipt = all.entry(meeting_id.clone()).or_default();
+                // Retitling has no enrichment attempt clocks of its own.
+                current.minted_title = receipt.minted_title;
+                true
+            })
+        {
+            report.problems.push(format!("enrichment stamp: {e}"));
         }
         problems.extend(
             report
