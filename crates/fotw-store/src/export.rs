@@ -1053,16 +1053,22 @@ impl MeetingDoc {
 
     /// A one-line description for OKF frontmatter.
     ///
-    /// The first substantive line of the summary — skipping headings and
-    /// blank lines — bounded so the frontmatter stays a scalar; the title
-    /// when there is no summary yet; a constant when there is neither.
+    /// The first substantive line of the summary — skipping headings, quoted
+    /// lines and blank lines — bounded so the frontmatter stays a scalar; the
+    /// title when the summary has no such line or there is no summary yet; a
+    /// constant when there is neither.
     fn okf_description(&self) -> String {
         const BUDGET: usize = 200;
         let from_summary = self.current_summary().and_then(|s| {
             s.body_md
                 .lines()
                 .map(str::trim)
-                .find(|line| !line.is_empty() && !line.starts_with('#'))
+                // Lines starting with `>` are skipped along with headings and
+                // blanks: a low-grounding summary opens with a `> [!WARNING]`
+                // banner, and taking it made the marker the whole description
+                // (#105). The test is the first character only, so a prose
+                // line that happens to start with `>` is skipped too.
+                .find(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with('>'))
                 .map(ToOwned::to_owned)
         });
         let text = from_summary
