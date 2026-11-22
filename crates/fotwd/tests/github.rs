@@ -2044,3 +2044,180 @@ fn a_failure_before_the_claim_does_not_deadlock_against_the_library() {
     assert!(failed, "the brief cannot be read");
     assert_eq!(reported, GithubSyncState::Failed);
 }
+
+// ------------------------------------------- colliding file names
+
+/// Two ids minted inside one ~65 s window: UUIDv7s whose first 8 hex digits,
+/// the part the file name's id fragment is cut from, are the same.
+const EARLIER_ID: &str = "01a2044d-1c00-7000-8000-00000000000a";
+const LATER_ID: &str = "01a2044d-9f00-7000-8000-00000000000b";
+
+/// A ready meeting under a fixed id, so a test does not depend on two ids
+/// really landing in one window.
+fn meeting_with_id(db: &mut Db, id: &str, title: &str, started_at_ms: i64, words: &str) {
+    db.conn()
+        .execute(
+            &format!(
+                "INSERT INTO meetings (id, title, started_at_ms, tz, state, created_at, updated_at, origin_device_id) \
+                 VALUES ('{id}', '{title}', {started_at_ms}, 'UTC', 'ready', {started_at_ms}, {started_at_ms}, 'dev-1')"
+            ),
+            [],
+        )
+        .unwrap();
+    let tid = db
+        .meetings()
+        .create_transcript(id, "deepgram", "nova-3", true)
+        .unwrap();
+    db.meetings()
+        .append_segments(&tid, &[NewSegment::new(0, 0, 1_500, words)])
+        .unwrap();
+}
+
+/// Two meetings titled "Planning" on 2025-08-21 whose ids share a window:
+/// a recording stopped and started again inside one calendar event.
+fn colliding_library() -> Db {
+    let mut db = library();
+    meeting_with_id(
+        &mut db,
+        EARLIER_ID,
+        "Planning",
+        1_755_734_400_000,
+        "the first meeting",
+    );
+    meeting_with_id(
+        &mut db,
+        LATER_ID,
+        "Planning",
+        1_755_736_200_000,
+        "the second meeting",
+    );
+    db
+}
+
+/// What each `PUT` committed: (path, decoded content).
+fn committed(gh: &ScriptedGh) -> Vec<(String, String)> {
+    gh.calls()
+        .into_iter()
+        .filter(|(args, _)| args.get(1).map(String::as_str) == Some("-X"))
+        .map(|(args, stdin)| {
+            let path = args[3]
+                .trim_start_matches("repos/octocat/notes/contents/")
+                .to_owned();
+            let body: serde_json::Value = serde_json::from_slice(&stdin.unwrap()).unwrap();
+            let content = B64.decode(body["content"].as_str().unwrap()).unwrap();
+            (path, String::from_utf8(content).unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn same_titled_meetings_minted_together_are_pushed_to_two_paths() {
+    let short = format!(
+        "meetings/{}",
+        fotwd::okf::transcript_filename(1_755_734_400_000, "Planning", EARLIER_ID)
+    );
+    // The local export of the same library: GitHub must name each meeting's
+    // file as `export-okf` does.
+    let local = tempfile::TempDir::new().unwrap();
+    fotwd::okf::export_bundle(&mut colliding_library(), local.path()).unwrap();
+    let local_name = |words: &str| {
+        std::fs::read_dir(local.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .find(|n| {
+                std::fs::read_to_string(local.path().join(n))
+                    .unwrap()
+                    .contains(words)
+            })
+            .unwrap_or_default()
+    };
+
+    // Either push order gives each meeting the same path.
+    for order in [[EARLIER_ID, LATER_ID], [LATER_ID, EARLIER_ID]] {
+        let mut db = colliding_library();
+        store_settings(&mut db, MANUAL);
+        let mut script = create_script();
+        script.extend(create_script());
+        let gh = ScriptedGh::scripted(script);
+        let dir = tempfile::TempDir::new().unwrap();
+        let exporter = GithubExporter::new(
+            db,
+            dir.path().join("sessions"),
+            Arc::clone(&gh) as Arc<dyn GhRunner>,
+        );
+        for id in order {
+            exporter.push(id).expect("the scripted push lands");
+        }
+
+        let first = exporter.receipt_for(EARLIER_ID).unwrap().path;
+        let second = exporter.receipt_for(LATER_ID).unwrap().path;
+        assert_ne!(first, second, "two meetings, two files ({order:?})");
+        assert_eq!(
+            first, short,
+            "the earlier-minted meeting keeps the short name"
+        );
+        assert_eq!(
+            second,
+            format!("meetings/{}", local_name("the second meeting"))
+        );
+
+        let puts = committed(&gh);
+        assert_eq!(puts.len(), 2);
+        for (path, content) in &puts {
+            let words = if *path == first {
+                "the first meeting"
+            } else {
+                "the second meeting"
+            };
+            assert!(content.contains(words), "{path} carries {words:?}");
+        }
+    }
+}
+
+/// A meeting pushed before this change keeps the path its receipt recorded,
+/// even when that is now the other meeting's name, and the other meeting is
+/// sent somewhere else rather than over it.
+#[test]
+fn a_recorded_path_is_kept_and_never_handed_to_another_meeting() {
+    let short = format!(
+        "meetings/{}",
+        fotwd::okf::transcript_filename(1_755_734_400_000, "Planning", EARLIER_ID)
+    );
+    let mut db = colliding_library();
+    store_settings(&mut db, MANUAL);
+    db.put_setting(
+        fotwd::github::RECEIPTS_KEY,
+        &format!(
+            r#"{{"{LATER_ID}":{{"repo":"octocat/notes","path":"{short}","commit":"old","pushed_at_ms":1,"title":"Planning","started_at_ms":1755736200000}}}}"#
+        ),
+    )
+    .unwrap();
+    let script = vec![
+        ok(""),
+        ok(PRIVATE_REPO),
+        ok("oldsha42\n"),
+        ok(PUT_OK),
+        ok(""),
+        ok(PRIVATE_REPO),
+        http_err(404),
+        ok(PUT_OK),
+    ];
+    let gh = ScriptedGh::scripted(script);
+    let dir = tempfile::TempDir::new().unwrap();
+    let exporter = GithubExporter::new(
+        db,
+        dir.path().join("sessions"),
+        Arc::clone(&gh) as Arc<dyn GhRunner>,
+    );
+
+    let repushed = exporter.push(LATER_ID).unwrap();
+    assert_eq!(repushed.path, short, "a recorded path is not renamed");
+    let minted = exporter.push(EARLIER_ID).unwrap();
+    assert_ne!(
+        minted.path, short,
+        "a path another meeting's receipt holds is not reused"
+    );
+    let puts = committed(&gh);
+    assert_eq!(puts[1].0, minted.path);
+    assert!(puts[1].1.contains("the first meeting"));
+}

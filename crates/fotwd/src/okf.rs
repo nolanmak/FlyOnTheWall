@@ -6,11 +6,15 @@
 //! bundle: the stable file names, the `index.md` progressive-disclosure
 //! listing, and the `log.md` change history. Both the GitHub export
 //! ([`crate::github`]) and the local folder export ([`crate::main`]'s
-//! `export-okf`) build the same bundle from it, so the two cannot drift.
+//! `export-okf`) render and name files with these helpers, so the two cannot
+//! drift in how they do it. A GitHub receipt can still pin a meeting to a
+//! different path, or hold a path that a first push must not take, so a
+//! meeting's GitHub path is not always its local file name.
 
+use std::collections::HashMap;
 use std::path::Path;
 
-use fotw_store::Db;
+use fotw_store::{Db, Meeting, StoreError};
 
 /// Write the whole library as a local OKF bundle under `dest`: one markdown
 /// file per meeting, plus `index.md` and `log.md`. Returns how many meetings
@@ -29,8 +33,9 @@ pub fn export_bundle(db: &mut Db, dest: &Path) -> std::io::Result<usize> {
     std::fs::create_dir_all(dest)?;
 
     // Page through every meeting, newest first — `list` caps at 200, so a
-    // busy library must not stop at the first page.
-    let mut entries: Vec<BundleEntry> = Vec::new();
+    // busy library must not stop at the first page. All of them are read
+    // before any file is named, because a name can depend on the others.
+    let mut meetings: Vec<Meeting> = Vec::new();
     let mut offset = 0;
     loop {
         let page = db
@@ -38,26 +43,30 @@ pub fn export_bundle(db: &mut Db, dest: &Path) -> std::io::Result<usize> {
             .list(200, offset)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         let full = page.len() == 200;
-        for m in &page {
-            let Ok(doc) = db.export_meeting(&m.id) else {
-                eprintln!("  ! skipped {}: could not export", m.id);
-                continue;
-            };
-            let filename = transcript_filename(m.started_at_ms, &m.title, &m.id);
-            std::fs::write(dest.join(&filename), doc.to_markdown())?;
-            entries.push(BundleEntry {
-                filename,
-                title: m.title.clone(),
-                started_at_ms: u64::try_from(m.started_at_ms).unwrap_or(0),
-                // A local snapshot has no push history; the meeting's own date
-                // is the honest "added" date for the change log.
-                logged_at_ms: u64::try_from(m.started_at_ms).unwrap_or(0),
-            });
-        }
+        meetings.extend(page);
         if !full {
             break;
         }
         offset += 200;
+    }
+    let names = transcript_filenames(&meetings);
+
+    let mut entries: Vec<BundleEntry> = Vec::new();
+    for m in &meetings {
+        let Ok(doc) = db.export_meeting(&m.id) else {
+            eprintln!("  ! skipped {}: could not export", m.id);
+            continue;
+        };
+        let filename = names[m.id.as_str()].clone();
+        std::fs::write(dest.join(&filename), doc.to_markdown())?;
+        entries.push(BundleEntry {
+            filename,
+            title: m.title.clone(),
+            started_at_ms: u64::try_from(m.started_at_ms).unwrap_or(0),
+            // A local snapshot has no push history; the meeting's own date
+            // is the honest "added" date for the change log.
+            logged_at_ms: u64::try_from(m.started_at_ms).unwrap_or(0),
+        });
     }
 
     std::fs::write(dest.join("index.md"), render_index(&entries))?;
@@ -80,11 +89,15 @@ pub struct BundleEntry {
     pub logged_at_ms: u64,
 }
 
-/// The stable file name for a meeting's transcript: `YYYY-MM-DD-slug-id.md`.
+/// The short file name for a meeting's transcript: `YYYY-MM-DD-slug-id8.md`.
 ///
-/// Deterministic from fields that exist at export time, with the id fragment
-/// carrying uniqueness — two "Standup" meetings on the same day must not fight
-/// over one name.
+/// Deterministic from fields that exist at export time. The id fragment is
+/// up to the first 8 ASCII alphanumeric characters of the id, lowercased,
+/// skipping punctuation. For a UUIDv7 that is the top of its timestamp, which
+/// changes only about every 65 seconds: two same-titled
+/// meetings on one day whose ids were minted inside that window get the same
+/// short name. [`transcript_filenames`] gives the name a meeting is actually
+/// exported under, which settles that.
 #[must_use]
 pub fn transcript_filename(started_at_ms: i64, title: &str, meeting_id: &str) -> String {
     let (y, m, d) = ymd_utc(started_at_ms);
@@ -95,6 +108,131 @@ pub fn transcript_filename(started_at_ms: i64, title: &str, meeting_id: &str) ->
         .collect::<String>()
         .to_ascii_lowercase();
     format!("{y:04}-{m:02}-{d:02}-{}-{id8}.md", slug(title))
+}
+
+/// The name for a meeting whose short name another meeting has: the same
+/// date and slug, with a fragment that stands for the whole id.
+///
+/// For a canonical lowercase hyphenated UUID, which is every id the store
+/// mints, the fragment is its 32 hex digits. For any other id (an archive
+/// import keeps ids as they are) it is `_` followed by the lowercase hex of
+/// the id's UTF-8 bytes. Both encodings are one-to-one, the first is all hex
+/// and the second starts with `_`, so two distinct ids never get one name.
+/// Neither is ever a short name either: a short fragment has at most 8
+/// characters and no `_`, and a slug never contains `_`. A non-UUID id this
+/// long can make a name longer than a filesystem allows; the store never
+/// mints one.
+#[must_use]
+pub fn full_id_filename(started_at_ms: i64, title: &str, meeting_id: &str) -> String {
+    let (y, m, d) = ymd_utc(started_at_ms);
+    let fragment = if is_canonical_uuid(meeting_id) {
+        meeting_id.replace('-', "")
+    } else {
+        let mut hex = String::from("_");
+        for b in meeting_id.bytes() {
+            hex.push_str(&format!("{b:02x}"));
+        }
+        hex
+    };
+    format!("{y:04}-{m:02}-{d:02}-{}-{fragment}.md", slug(title))
+}
+
+/// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` in lowercase hex, as
+/// [`fotw_store::new_id`] renders it.
+fn is_canonical_uuid(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(i, b)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                b == b'-'
+            } else {
+                b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
+            }
+        })
+}
+
+/// The file name each meeting is exported under, keyed by meeting id.
+///
+/// A meeting keeps its short [`transcript_filename`] unless another meeting
+/// with the same short name has a smaller id; then it gets
+/// [`full_id_filename`]. The rule depends only on the set of meetings, never
+/// on the order they are listed or exported in.
+///
+/// The ownership rule is the lexicographically smallest stored id. Store ids
+/// are UUIDv7s, and those one process mints sort in creation order, so of two
+/// colliding meetings minted by one process the one minted first keeps the
+/// name it always had, and a meeting it mints later never renames it. Across
+/// processes, restarts or archive imports, id order is not guaranteed to be
+/// creation order. A meeting's name does change when the set changes under
+/// it:
+///
+/// * the smaller-id meeting of a pair is deleted, or retitled so it no
+///   longer shares the name: the other moves to the short name;
+/// * a meeting with a smaller id gains the name, by an archive import of an
+///   older meeting or by retitling an earlier-minted meeting into the
+///   title: it takes the short name and the one that had it moves to the
+///   whole-id name.
+///
+/// The local export removes nothing, so the moved meeting's old file stays
+/// behind, unless the other meeting now writes over it. A GitHub path is
+/// pinned by its receipt and does not move.
+#[must_use]
+pub fn transcript_filenames(meetings: &[Meeting]) -> HashMap<&str, String> {
+    let mut first: HashMap<String, &str> = HashMap::new();
+    for m in meetings {
+        let short = transcript_filename(m.started_at_ms, &m.title, &m.id);
+        let owner = first.entry(short).or_insert(&m.id);
+        if m.id.as_str() < *owner {
+            *owner = &m.id;
+        }
+    }
+    meetings
+        .iter()
+        .map(|m| {
+            let short = transcript_filename(m.started_at_ms, &m.title, &m.id);
+            let name = if first[&short] == m.id {
+                short
+            } else {
+                full_id_filename(m.started_at_ms, &m.title, &m.id)
+            };
+            (m.id.as_str(), name)
+        })
+        .collect()
+}
+
+/// The file name [`transcript_filenames`] gives `meeting` in this library.
+///
+/// Only a meeting starting on the same UTC day can share its name, but the
+/// library lists newest first, so this reads every meeting started on or
+/// after that day and stops looking at the first one before it (the rest of
+/// the 200-meeting page holding that one has already been read). The cost
+/// grows with the number of meetings newer than `meeting`.
+///
+/// # Errors
+///
+/// A store error listing meetings.
+pub fn library_filename(db: &mut Db, meeting: &Meeting) -> Result<String, StoreError> {
+    let day_start = meeting.started_at_ms.div_euclid(86_400_000) * 86_400_000;
+    let mut same_day: Vec<Meeting> = Vec::new();
+    let mut offset = 0;
+    // Newest first, so paging can stop at the first meeting before that day.
+    'pages: loop {
+        let page = db.meetings().list(200, offset)?;
+        let full = page.len() == 200;
+        for m in page {
+            if m.started_at_ms < day_start {
+                break 'pages;
+            }
+            same_day.push(m);
+        }
+        if !full {
+            break;
+        }
+        offset += 200;
+    }
+    if !same_day.iter().any(|m| m.id == meeting.id) {
+        same_day.push(meeting.clone());
+    }
+    Ok(transcript_filenames(&same_day)[meeting.id.as_str()].clone())
 }
 
 /// The bundle's `index.md`: an OKF progressive-disclosure listing, newest
@@ -237,6 +375,43 @@ mod tests {
             transcript_filename(0, "", "abc"),
             "1970-01-01-meeting-abc.md"
         );
+        assert_eq!(
+            full_id_filename(
+                1_755_734_400_000,
+                "Weekly Standup",
+                "01890c2a-ffff-7000-8000-00000000000b"
+            ),
+            "2025-08-21-weekly-standup-01890c2affff7000800000000000000b.md"
+        );
+    }
+
+    /// Ids the store did not mint, as an archive import can bring in, still
+    /// get distinct whole-id names, and never a short name.
+    #[test]
+    fn a_whole_id_name_is_distinct_for_ids_the_store_did_not_mint() {
+        let t = 1_755_734_400_000;
+        let ids = [
+            "m-1",
+            "m1",
+            "M1",
+            "abc",
+            "01890C2A-FFFF-7000-8000-00000000000B",
+            "01890c2a-ffff-7000-8000-00000000000b",
+        ];
+        let full: Vec<String> = ids
+            .iter()
+            .map(|id| full_id_filename(t, "Sync", id))
+            .collect();
+        assert_eq!(full[0], "2025-08-21-sync-_6d2d31.md");
+        assert_eq!(full[1], "2025-08-21-sync-_6d31.md");
+        for (i, a) in full.iter().enumerate() {
+            for (j, b) in full.iter().enumerate() {
+                assert!(i == j || a != b, "{} and {} share {a}", ids[i], ids[j]);
+            }
+            for id in ids {
+                assert_ne!(*a, transcript_filename(t, "Sync", id));
+            }
+        }
     }
 
     #[test]

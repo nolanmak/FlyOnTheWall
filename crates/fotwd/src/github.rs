@@ -795,18 +795,19 @@ impl GithubExport for GithubExporter {
                     "the library refused to export the meeting".to_owned(),
                 ))
             })?;
-            let existing = read_receipts(&db).remove(meeting_id);
-            let path = existing.as_ref().map_or_else(
-                || {
-                    transcript_path(
-                        &settings.path_prefix,
-                        meeting.started_at_ms,
-                        &meeting.title,
-                        meeting_id,
-                    )
-                },
-                |r| r.path.clone(),
-            );
+            let mut receipts = read_receipts(&db);
+            let existing = receipts.remove(meeting_id);
+            let path = match &existing {
+                Some(r) => r.path.clone(),
+                None => {
+                    let name = crate::okf::library_filename(&mut db, &meeting).map_err(|_| {
+                        Prepare::Failed(GithubError::Failed(
+                            "the library refused to read the meeting".to_owned(),
+                        ))
+                    })?;
+                    mint_path(&settings, &meeting, &name, &receipts)
+                }
+            };
             let version = ArtifactVersion::from_doc(&doc, &settings);
             let stem = path.strip_suffix(".md").unwrap_or(&path);
             let mut companions = Vec::new();
@@ -1419,14 +1420,38 @@ fn classify(out: &GhOutput) -> GithubError {
     GithubError::Failed(short)
 }
 
-/// `prefix/YYYY-MM-DD-title-slug-idfragment.md` — the prefix plus the shared
-/// [`crate::okf::transcript_filename`], so the GitHub path and a local OKF
-/// export name the same meeting the same file.
-fn transcript_path(prefix: &str, started_at_ms: i64, title: &str, meeting_id: &str) -> String {
-    format!(
-        "{prefix}{}",
-        crate::okf::transcript_filename(started_at_ms, title, meeting_id)
-    )
+/// The path for a meeting's first push: the prefix plus the name
+/// [`crate::okf::library_filename`] gives it, which is the name a local OKF
+/// export of the same library gives the meeting at that moment. Afterwards
+/// the two can differ: the receipt pins this path, while the local name
+/// follows the library.
+///
+/// Unless another meeting's receipt already holds that path in this
+/// repository. A receipt pins its path for good (a retitle does not move it),
+/// so one minted under another title, or by a build that cut the id fragment
+/// shorter than it needed, can name the file this meeting would otherwise
+/// get. Committing there would replace that meeting's file while it still
+/// reads as synced, so this meeting takes the whole-id name instead, which no
+/// other meeting can have.
+fn mint_path(
+    settings: &GithubSettings,
+    meeting: &fotw_store::Meeting,
+    name: &str,
+    others: &HashMap<String, GithubReceipt>,
+) -> String {
+    let prefix = &settings.path_prefix;
+    let path = format!("{prefix}{name}");
+    let taken = others
+        .values()
+        .any(|r| r.repo == settings.repo && r.path == path);
+    if taken {
+        format!(
+            "{prefix}{}",
+            crate::okf::full_id_filename(meeting.started_at_ms, &meeting.title, &meeting.id)
+        )
+    } else {
+        path
+    }
 }
 
 #[cfg(test)]
