@@ -70,7 +70,8 @@ fn outcome(dir: &std::path::Path, segments: Vec<TranscriptSegment>) -> SessionOu
             silent: 0,
             total: 400,
         }),
-        dropped_samples: 0,
+        system_dropped_samples: 0,
+        mic_dropped_samples: 0,
         segments,
         stt_errors: Vec::new(),
     }

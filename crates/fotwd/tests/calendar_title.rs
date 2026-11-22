@@ -208,7 +208,8 @@ fn outcome(dir: &std::path::Path) -> SessionOutcome {
             silent: 0,
             total: 400,
         }),
-        dropped_samples: 0,
+        system_dropped_samples: 0,
+        mic_dropped_samples: 0,
         segments: vec![TranscriptSegment {
             id: "seg-0".into(),
             session_id: "test-session".into(),

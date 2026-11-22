@@ -381,3 +381,152 @@ async fn each_leg_records_its_own_format_so_a_mono_mic_is_not_read_as_stereo() {
          {sys}) for the same wall clock"
     );
 }
+
+/// A tap that opens with one callback too large for the session's ring, then
+/// delivers ordinary audible buffers until stopped.
+///
+/// The capture sink admits whole callbacks or none, so an oversized first
+/// callback into an empty ring is dropped in full: the loss is exactly
+/// `burst` samples, with no timing in it. Its buffers are audible so the leg
+/// does not also report itself silent.
+struct BurstTap {
+    id: TapId,
+    burst: usize,
+    stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BurstTap {
+    fn boxed(burst: usize) -> Box<dyn AudioTap> {
+        Box::new(Self {
+            id: TapId::system_default(),
+            burst,
+            stopped: std::sync::Arc::default(),
+            worker: None,
+        })
+    }
+}
+
+impl AudioTap for BurstTap {
+    fn id(&self) -> &TapId {
+        &self.id
+    }
+    fn format(&self) -> StreamFormat {
+        StreamFormat::new(48_000, 2, SampleFormat::F32)
+    }
+    fn format_is_authoritative(&self) -> bool {
+        true
+    }
+    fn start(
+        &mut self,
+        mut sink: Box<dyn fotw_audio::FrameSink>,
+    ) -> Result<StreamFormat, fotw_audio::TapError> {
+        use fotw_audio::{CaptureTimestamp, FrameFlags};
+        let stopped = std::sync::Arc::clone(&self.stopped);
+        let burst = self.burst;
+        self.worker = Some(std::thread::spawn(move || {
+            let audible: Vec<f32> = (0..960).map(|i| ((i as f32) * 0.05).sin() * 0.5).collect();
+            let mut frames = 0u64;
+            if burst > 0 {
+                sink.on_frames(
+                    &vec![0.25f32; burst],
+                    CaptureTimestamp::new(0, 0),
+                    FrameFlags::empty(),
+                );
+                frames += (burst / 2) as u64;
+            }
+            while !stopped.load(std::sync::atomic::Ordering::Acquire) {
+                sink.on_frames(
+                    &audible,
+                    CaptureTimestamp::new(frames, 0),
+                    FrameFlags::empty(),
+                );
+                frames += (audible.len() / 2) as u64;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }));
+        Ok(self.format())
+    }
+    fn stop(&mut self) -> Result<(), fotw_audio::TapError> {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        Ok(())
+    }
+}
+
+/// Ring losses are reported against the leg whose ring lost them (#93).
+///
+/// The pump used to add the two rings' drop counts together, so the one
+/// warning a human reads could not say whether the microphone or the system
+/// tap lost audio, and a mic overrun read exactly like a system overrun.
+#[tokio::test]
+async fn ring_loss_is_reported_on_the_leg_that_lost_it() {
+    // Larger than the session's ten-second stereo ring, so each burst is
+    // rejected whole. Different sizes so each count names its own leg.
+    const SYSTEM_BURST: usize = 48_000 * 2 * 11;
+    const MIC_BURST: usize = 48_000 * 2 * 12;
+    for (case, system_burst, mic_burst) in [
+        ("mic only", 0, MIC_BURST),
+        ("system only", SYSTEM_BURST, 0),
+        ("both", SYSTEM_BURST, MIC_BURST),
+        ("neither", 0, 0),
+    ] {
+        let root = tmpdir(&format!("ringloss-{}", case.replace(' ', "-")));
+        let outcome = session::run(
+            &root,
+            BurstTap::boxed(system_burst),
+            Some(BurstTap::boxed(mic_burst)),
+            Transcription::Disabled,
+            Duration::from_millis(900),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome.dropped_samples(),
+            (system_burst + mic_burst) as u64,
+            "{case}: the combined total keeps its meaning"
+        );
+        assert_eq!(
+            (outcome.system_dropped_samples, outcome.mic_dropped_samples),
+            (system_burst as u64, mic_burst as u64),
+            "{case}: each leg's loss is on its own leg in the outcome"
+        );
+        let losses: Vec<&String> = outcome
+            .stt_errors
+            .iter()
+            .filter(|e| e.contains("dropped at a full ring"))
+            .collect();
+        let mut expected = Vec::new();
+        if system_burst > 0 {
+            expected.push(format!("capture (system): {system_burst} samples"));
+        }
+        if mic_burst > 0 {
+            expected.push(format!("capture (mic): {mic_burst} samples"));
+        }
+        assert_eq!(
+            losses.len(),
+            expected.len(),
+            "{case}: one entry per leg that lost audio and none for a leg that \
+             did not: {:?}",
+            outcome.stt_errors
+        );
+        for (entry, prefix) in losses.iter().zip(&expected) {
+            assert!(
+                entry.starts_with(prefix.as_str()),
+                "{case}: expected an entry starting {prefix:?}, got {entry:?}"
+            );
+        }
+        if case == "neither" {
+            assert!(
+                outcome.stt_errors.is_empty(),
+                "a healthy recording reports no degradation: {:?}",
+                outcome.stt_errors
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
