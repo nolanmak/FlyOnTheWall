@@ -159,7 +159,7 @@ Priority: **P0** = v1 does not ship without it. **P1** = fast-follow. **P2** = l
 | MTG-04 | **Detection arms; the user starts.** Detection never begins capture. See [§11](#11-legal--consent) — this is not a UX preference, it is the conduct pleaded against Granola. | P0 | M |
 | MTG-05 | **Recording→event matching** by maximal temporal overlap within `[start − 10 min, end + 30 min]`, tie-broken by matched conference URL then start-time delta. Handle late starts, overruns, back-to-back splits, and no-event cases. Always user-overridable. | P0 | L |
 | MTG-06 | **Attendee names seed speaker labels, locally only.** Names must never be sent to an STT provider. Invitee *names* (never addresses) go to the summary engine as spellings by default, because a meeting's transcript already carries those names to it and correct spellings in client-facing summaries outweigh the marginal exposure; one switch in Settings › Calendars turns it off (`crates/fotwd/src/invitees.rs`). | P0 | M |
-| MTG-07 | **Full-text search** across transcripts, notes, summaries and titles, with date / folder / tag / participant filters and snippet previews. Acceptance: < 100 ms p95 two-term query over 1,250 meetings on a 2020-era laptop. | P0 | M |
+| MTG-07 | **Full-text search** across transcripts (the primary version), notes, summaries (every version) and titles, with date / folder / tag / participant filters and snippet previews. Acceptance: < 100 ms p95 two-term query over 1,250 meetings on a 2020-era laptop. | P0 | M |
 | MTG-08 | **Folders (one level of nesting) + free-form tags.** A meeting may live in several folders. | P0 | M |
 | MTG-09 | **Import pre-recorded audio files.** Granola cannot do this at all. | P1 | M |
 | MTG-10 | **Pre-meeting brief from local history only** — 2–3 bullets of open threads from prior notes with the same attendees or recurring series. No web enrichment. | P1 | M |
@@ -935,7 +935,7 @@ CREATE TABLE tombstones (
 
 ### 9.4 Search
 
-Four FTS5 external-content tables (`segments`, `notes`, `summaries`, `meetings`) kept in sync by AFTER INSERT/UPDATE/DELETE triggers using the documented `'delete'` command form. Tokenizer `unicode61 remove_diacritics 2` everywhere — **not `porter` on transcripts**, which mangles product names and acronyms. Rank with `bm25()`, preview with `snippet()`, weight titles and notes above transcript body.
+Four FTS5 external-content tables (`segments`, `notes`, `summaries`, `meetings`) kept in sync by AFTER INSERT/UPDATE/DELETE triggers using the documented `'delete'` command form. Tokenizer `unicode61 remove_diacritics 2` everywhere — **not `porter` on transcripts**, which mangles product names and acronyms. Rank with `bm25()`, preview with `snippet()`, weight titles and notes above transcript body. Transcript hits come from the meeting's primary transcript only; every summary version stays searchable.
 
 > **Correction (2026-08-11).** The weighting **cannot be expressed as `bm25()` column weights**: each index has one content column, and the four are different corpora with incomparable IDF scales — a term rare among 150,000 segments scores far higher than the same term among 1,250 titles, so the scores were never on a common ruler. Apply a multiplier per index instead, defaulting to 8/4/2/1.
 >

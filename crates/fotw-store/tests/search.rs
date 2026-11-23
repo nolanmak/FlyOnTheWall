@@ -32,9 +32,16 @@ fn meeting_with_transcript(db: &mut Db, title: &str, lines: &[&str]) -> String {
         .meetings()
         .create(NewMeeting::new("dev-1", "UTC").title(title))
         .unwrap();
+    primary_transcript(db, &id, lines);
+    id
+}
+
+/// Give a meeting a new primary transcript whose segments are `lines`, the way
+/// a rewrite does: the version that was primary is demoted and kept.
+fn primary_transcript(db: &mut Db, meeting_id: &str, lines: &[&str]) -> String {
     let t = db
         .meetings()
-        .create_transcript(&id, "deepgram", "nova-3", true)
+        .create_transcript(meeting_id, "deepgram", "nova-3", true)
         .unwrap();
     let segments: Vec<NewSegment> = lines
         .iter()
@@ -45,7 +52,48 @@ fn meeting_with_transcript(db: &mut Db, title: &str, lines: &[&str]) -> String {
         })
         .collect();
     db.meetings().append_segments(&t, &segments).unwrap();
-    id
+    t
+}
+
+/// The ids of one transcript version's segments that contain `word`, sorted.
+fn segments_saying(db: &Db, transcript_id: &str, word: &str) -> Vec<String> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT id FROM segments
+              WHERE transcript_id = ?1 AND instr(text, ?2) > 0 ORDER BY id",
+        )
+        .unwrap();
+    stmt.query_map(params![transcript_id, word], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// The segments a search for `word` lands on, sorted.
+///
+/// Asked twice, without a filter and with one every meeting passes, because
+/// those are two different ranking statements and a rule written into one of
+/// them is not thereby written into the other.
+fn segments_found(db: &Db, word: &str) -> Vec<String> {
+    let found = |q: SearchQuery| {
+        let mut ids: Vec<String> = db
+            .search(&q)
+            .unwrap()
+            .into_iter()
+            .filter(|h| h.source == SearchSource::Transcript)
+            .map(|h| h.row_id)
+            .collect();
+        ids.sort();
+        ids
+    };
+    let plain = found(SearchQuery::new(word));
+    let filtered = found(SearchQuery::new(word).after(0));
+    assert_eq!(
+        plain, filtered,
+        "searching {word:?} with and without a filter disagree"
+    );
+    plain
 }
 
 /// Distinct terms an index holds for `term`, read out of the FTS index itself
@@ -627,6 +675,220 @@ fn deleting_a_transcript_retracts_its_segments_from_the_index() {
         "the token survived in the index after its segment was cascaded away"
     );
     db.verify_search_index().unwrap();
+}
+
+// ------------------------------------------------------- transcript versions
+
+/// A rewrite keeps the transcript it replaces so that it can be reverted, and
+/// every segment of every version is in the index. Search must answer from the
+/// primary version alone, or each phrase the two versions share is found once
+/// per version and the passages the rewrite removed are still found (#73).
+///
+/// Summaries are the opposite case and stay that way: every version is
+/// searchable, because a superseded summary has no other way back.
+#[test]
+fn only_the_primary_transcript_version_is_searchable() {
+    let mut db = db();
+    let id = db
+        .meetings()
+        .create(NewMeeting::new("dev-1", "UTC").title("Budget review"))
+        .unwrap();
+    let original = primary_transcript(
+        &mut db,
+        &id,
+        &[
+            "the marlinspike budget was approved",
+            "the marlinspike budget was approved",
+            "we come back to the marlinspike timeline next week",
+            "some crosstalk about the thistledown vendor",
+        ],
+    );
+
+    // Control: one version, and every passage in it is found.
+    assert_eq!(
+        segments_found(&db, "marlinspike"),
+        segments_saying(&db, &original, "marlinspike")
+    );
+    assert_eq!(segments_found(&db, "thistledown").len(), 1);
+
+    // The rewrite drops the echoed line and the crosstalk.
+    let rewritten = primary_transcript(
+        &mut db,
+        &id,
+        &[
+            "the marlinspike budget was approved",
+            "we come back to the marlinspike timeline next week",
+        ],
+    );
+
+    let found = segments_found(&db, "marlinspike");
+    assert_eq!(found.len(), 2, "one hit for each time it was really said");
+    assert_eq!(found, segments_saying(&db, &rewritten, "marlinspike"));
+    assert!(
+        segments_found(&db, "thistledown").is_empty(),
+        "a passage only the replaced version holds is still found"
+    );
+    // Control: the replaced version was not deleted or unindexed to get there.
+    assert!(index_holds_term(&db, "segments_fts", "thistledown"));
+
+    // Reverting makes the original searchable again, and only the original.
+    db.meetings().set_primary_transcript(&original).unwrap();
+    let found = segments_found(&db, "marlinspike");
+    assert_eq!(found.len(), 3);
+    assert_eq!(found, segments_saying(&db, &original, "marlinspike"));
+    assert_eq!(
+        segments_found(&db, "thistledown"),
+        segments_saying(&db, &original, "thistledown")
+    );
+
+    for body in ["the kestrelwing draft", "the final wording"] {
+        db.meetings()
+            .insert_summary(
+                &id,
+                NewSummary::new("dev-1", "anthropic", "claude", "h", body),
+            )
+            .unwrap();
+    }
+    let hits = db
+        .search(&SearchQuery::new("kestrelwing").after(0))
+        .unwrap();
+    assert_eq!(hits.len(), 1, "a superseded summary is still searchable");
+    assert_eq!(hits[0].source, SearchSource::Summary);
+    db.verify_search_index().unwrap();
+}
+
+/// The replaced version has to be left out while ranking, before `LIMIT` and
+/// `OFFSET` count anything. Dropping its hits from a page that has already
+/// been cut returns short pages, and here an empty first one: equal scores are
+/// ordered by rowid, so the older version's hits come first.
+#[test]
+fn hits_in_a_replaced_transcript_take_no_places_in_a_page() {
+    let mut db = db();
+    let id = db
+        .meetings()
+        .create(NewMeeting::new("dev-1", "UTC").title("Site walk"))
+        .unwrap();
+    let said = "the gantrycrane inspection is still open";
+    primary_transcript(&mut db, &id, &[said; 4]);
+    let rewritten = primary_transcript(&mut db, &id, &[said; 3]);
+    let current = segments_saying(&db, &rewritten, "gantrycrane");
+
+    for query in [
+        SearchQuery::new("gantrycrane"),
+        SearchQuery::new("gantrycrane").after(0),
+    ] {
+        let all = db.search(&query).unwrap();
+        assert_eq!(all.len(), 3, "{query:?}");
+
+        let mut paged = Vec::new();
+        for (offset, expected) in [(0, 2), (2, 1), (4, 0)] {
+            let page = db.search(&query.clone().limit(2).offset(offset)).unwrap();
+            assert_eq!(page.len(), expected, "page at offset {offset}: {query:?}");
+            paged.extend(page);
+        }
+        assert_eq!(paged, all, "paging must reproduce the unpaged order");
+
+        let mut found: Vec<String> = all.into_iter().map(|h| h.row_id).collect();
+        found.sort();
+        assert_eq!(found, current);
+    }
+}
+
+#[test]
+fn switching_back_restores_only_the_original_transcript_to_search_pages() {
+    let mut db = db();
+    let id = db
+        .meetings()
+        .create(NewMeeting::new("dev-1", "UTC").title("Workshop review"))
+        .unwrap();
+    let original = primary_transcript(
+        &mut db,
+        &id,
+        &["the flywheel inspection is scheduled for tomorrow"; 2],
+    );
+    // The shorter rewrite ranks first for "flywheel" if both versions compete.
+    let rewritten = primary_transcript(&mut db, &id, &["flywheel approved"]);
+    assert_eq!(
+        segments_found(&db, "approved"),
+        segments_saying(&db, &rewritten, "approved")
+    );
+
+    db.meetings().set_primary_transcript(&original).unwrap();
+    let expected = segments_saying(&db, &original, "flywheel");
+    for query in [
+        SearchQuery::new("flywheel").limit(2),
+        SearchQuery::new("flywheel").after(0).limit(2),
+    ] {
+        let mut found: Vec<_> = db
+            .search(&query)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.row_id)
+            .collect();
+        found.sort();
+        assert_eq!(
+            found, expected,
+            "first page after switching back: {query:?}"
+        );
+        assert!(db.search(&query.offset(2)).unwrap().is_empty());
+    }
+    assert!(segments_found(&db, "approved").is_empty());
+}
+
+/// `segments.meeting_id` and `segments.transcript_id` are separate foreign
+/// keys, and nothing ties them together: an imported archive can hold a
+/// segment filed under one meeting that points at another meeting's primary
+/// transcript. Such a segment is in neither meeting's primary transcript, so
+/// it is not a hit for either, whether or not a filter is set. Here the
+/// meeting it is filed under has no transcript at all.
+#[test]
+fn a_segment_filed_under_another_meeting_than_its_transcript_is_not_found() {
+    let mut db = db();
+    let stray_meeting = db
+        .meetings()
+        .create(NewMeeting::new("dev-1", "UTC").title("Hallway chat"))
+        .unwrap();
+    let owner = db
+        .meetings()
+        .create(NewMeeting::new("dev-1", "UTC").title("Launch sync"))
+        .unwrap();
+    let owner_transcript = primary_transcript(
+        &mut db,
+        &owner,
+        &[
+            "the quillfeather rollout is on track",
+            "quillfeather docs ship friday",
+        ],
+    );
+    let owned = segments_saying(&db, &owner_transcript, "quillfeather");
+    db.conn()
+        .execute_batch(&format!(
+            "INSERT INTO folders (id, name, created_at, updated_at, origin_device_id)
+                  VALUES ('f-stray', 'Stray', 0, 0, 'dev-1');
+             UPDATE meetings SET folder_id = 'f-stray' WHERE id = '{stray_meeting}';
+             INSERT INTO segments
+                    (id, transcript_id, meeting_id, idx, start_ms, end_ms, channel, text)
+             VALUES ('sg-stray', '{owner_transcript}', '{stray_meeting}', 99, 0, 1000,
+                     'mic', 'the quillfeather budget slipped');"
+        ))
+        .unwrap();
+    // Control: the stray row is indexed, so leaving it out is the search's doing.
+    assert!(index_holds_term(&db, "segments_fts", "slipped"));
+
+    assert_eq!(
+        segments_found(&db, "quillfeather"),
+        owned,
+        "only the owner's own segments are hits"
+    );
+    assert!(segments_found(&db, "slipped").is_empty());
+
+    let in_stray_folder = db
+        .search(&SearchQuery::new("quillfeather").folder("f-stray"))
+        .unwrap();
+    assert!(
+        in_stray_folder.is_empty(),
+        "a search restricted to the meeting the segment is filed under finds it: {in_stray_folder:?}"
+    );
 }
 
 // ------------------------------------------------------------ search:rebuild

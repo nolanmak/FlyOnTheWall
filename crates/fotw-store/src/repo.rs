@@ -329,8 +329,10 @@ impl MeetingRepo<'_> {
 
     /// The primary transcript for a meeting, if it has one.
     ///
-    /// `Ok(None)` means the meeting genuinely has no transcript yet — a normal
-    /// state, since recording without a provider configured is supported. A
+    /// `Ok(None)` means no transcript of the meeting is marked primary. Usually
+    /// it has none yet — a normal state, since recording without a provider
+    /// configured is supported — but `create_transcript(.., false)` can leave
+    /// it with transcripts and no primary, and then search finds none of them. A
     /// real SQLite failure stays an `Err`: two callers previously hand-rolled
     /// this query with `.ok()`, which rendered a database error as "no
     /// transcript" and would have shown an empty meeting instead of a fault.
