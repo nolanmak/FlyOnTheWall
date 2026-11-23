@@ -233,6 +233,7 @@ fn outcome(dir: &std::path::Path) -> SessionOutcome {
             timestamp_source: TimestampSource::Provider,
         }],
         stt_errors: Vec::new(),
+        capture_lease: Default::default(),
     }
 }
 

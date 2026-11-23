@@ -490,6 +490,9 @@ async fn frozen_exclusions_survive_rebuilds_and_all_speech_paths() {
             }
             // Archive the actual WAL, then inspect decoded content rather than
             // accepting a nonempty compressed file as proof of source exclusion.
+            // The outcome holds the session's capture lease until its meeting
+            // would be saved; archiving takes that lease itself.
+            outcome.capture_lease.release();
             let encoded = fotw_pipeline::wal::encode_session(&outcome.dir).unwrap();
             for (track, is_mic) in [(&encoded.system, false), (&encoded.mic, true)] {
                 let decoded =

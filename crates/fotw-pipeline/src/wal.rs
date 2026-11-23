@@ -627,11 +627,25 @@ impl SessionWal {
     /// Close the session cleanly, stamping `ended_at_ms`.
     ///
     /// After this the session is no longer offered for recovery.
-    pub fn finalize(mut self) -> std::io::Result<PathBuf> {
+    pub fn finalize(self) -> std::io::Result<PathBuf> {
+        self.finalize_keeping_lease().map(|(dir, _owner)| dir)
+    }
+
+    /// [`finalize`](Self::finalize), handing back the capture lease instead
+    /// of releasing it.
+    ///
+    /// The daemon holds the lease until the meeting is in the library: from
+    /// the moment the WAL is finalized until then, the session directory is
+    /// the only record of the meeting, and start-up recovery in this or
+    /// another process must not index it while its finisher is still alive.
+    /// The lease covers only this session's directory.
+    pub fn finalize_keeping_lease(
+        mut self,
+    ) -> std::io::Result<(PathBuf, crate::capture_clock::CaptureOwner)> {
         self.flush()?;
         self.manifest.ended_at_ms = Some(now_ms());
         self.write_manifest()?;
-        Ok(self.dir)
+        Ok((self.dir, self.capture_owner))
     }
 
     /// Close the session, transcode both legs to Opus, and unlink the PCM.

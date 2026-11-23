@@ -179,6 +179,7 @@ async fn main() -> Result<(), String> {
             dropped_samples: 0,
             segments,
             stt_errors: Vec::new(),
+            capture_lease: Default::default(),
         };
         let id = persist::persist_session(&mut db, &outcome, title).map_err(|e| e.to_string())?;
 

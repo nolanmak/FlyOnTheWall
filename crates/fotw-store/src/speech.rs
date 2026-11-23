@@ -163,7 +163,18 @@ impl Db {
         ended_at_ms: i64,
         sources: &[SpeechSource],
     ) -> Result<String> {
-        self.project_capture(session, meeting, Some(ended_at_ms), 0, sources)
+        self.project_capture(session, meeting, Some(ended_at_ms), 0, sources, false)
+    }
+
+    /// Project a live capture only if no meeting is already linked to it.
+    pub fn finalize_new_speech_capture(
+        &mut self,
+        session: &str,
+        meeting: NewMeeting,
+        ended_at_ms: i64,
+        sources: &[SpeechSource],
+    ) -> Result<String> {
+        self.project_capture(session, meeting, Some(ended_at_ms), 0, sources, true)
     }
 
     /// Index an interrupted recording and any validated committed receipts,
@@ -175,7 +186,7 @@ impl Db {
         observed_elapsed_ms: i64,
         sources: &[SpeechSource],
     ) -> Result<String> {
-        self.project_capture(session, meeting, None, observed_elapsed_ms, sources)
+        self.project_capture(session, meeting, None, observed_elapsed_ms, sources, false)
     }
 
     fn project_capture(
@@ -185,6 +196,7 @@ impl Db {
         ended_at_ms: Option<i64>,
         observed_elapsed: i64,
         sources: &[SpeechSource],
+        require_unlinked: bool,
     ) -> Result<String> {
         if !sources.is_empty() || ended_at_ms.is_some() {
             validate(sources)?;
@@ -192,6 +204,9 @@ impl Db {
         let tx = self
             .conn_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if require_unlinked {
+            crate::session_notes::ensure_unlinked(&tx, session)?;
+        }
         let meeting_id = if let Some(ended) = ended_at_ms {
             crate::session_notes::finalize_in_transaction(&tx, session, meeting, ended, None)?
         } else {

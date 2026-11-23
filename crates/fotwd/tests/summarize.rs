@@ -301,6 +301,7 @@ fn seeded_meeting(db: &mut Db, dir: &std::path::Path) -> String {
             ),
         ],
         stt_errors: Vec::new(),
+        capture_lease: Default::default(),
     };
     persist::persist_session(db, &outcome, "Weekly sync").unwrap()
 }
