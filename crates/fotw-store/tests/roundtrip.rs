@@ -780,6 +780,64 @@ fn the_frontmatter_carries_okf_type_and_provenance() {
     );
 }
 
+/// The decoded `description:` scalar of an exported meeting's frontmatter,
+/// and the Markdown that follows the frontmatter.
+fn okf_description_and_body(db: &Db, meeting_id: &str) -> (String, String) {
+    let md = db.export_meeting(meeting_id).unwrap().to_markdown();
+    let end = md[4..].find("\n---\n").expect("frontmatter is not closed") + 4;
+    let line = md[4..end]
+        .lines()
+        .find(|line| line.starts_with("description: "))
+        .expect("OKF description missing");
+    let description = fotw_store::export::parse_yaml_scalar(&line["description: ".len()..]);
+    (description, md[end..].to_owned())
+}
+
+fn set_current_summary_body(db: &Db, body_md: &str) {
+    let changed = db
+        .conn()
+        .execute(
+            "UPDATE summaries SET body_md = ?1 WHERE id = 'sum-3'",
+            [body_md],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "the fixture's current summary is sum-3");
+}
+
+#[test]
+fn the_okf_description_skips_a_leading_admonition() {
+    // #105. A low-grounding summary opens with a `> [!WARNING]` banner above
+    // the prose, and the description is the one line other tools show in
+    // lists: it must be the prose, not the banner's marker.
+    let (_f, db) = fixture();
+    set_current_summary_body(
+        &db,
+        "> [!WARNING]\n> Low grounding: check the transcript.\n\nThe team agreed to ship the exporter.",
+    );
+
+    let (description, body) = okf_description_and_body(&db, "mtg-1");
+    assert_eq!(description, "The team agreed to ship the exporter.");
+    // Only the description skips the banner: the note itself still warns.
+    assert!(
+        body.contains("> [!WARNING]\n> Low grounding: check the transcript."),
+        "the warning was dropped from the exported body:\n{body}"
+    );
+}
+
+#[test]
+fn an_all_quoted_summary_falls_back_to_the_title() {
+    // #105. A warning with nothing under it has no prose to offer, so the
+    // description is the title, as it is when there is no summary at all.
+    let (_f, db) = fixture();
+    set_current_summary_body(
+        &db,
+        "> [!WARNING]\n> Low grounding: check the transcript.\n",
+    );
+
+    let (description, _body) = okf_description_and_body(&db, "mtg-1");
+    assert_eq!(description, "Design review: caf\u{e9} vs cafe\u{301}");
+}
+
 #[test]
 fn a_title_that_would_break_the_frontmatter_is_quoted() {
     // A colon in a title is ordinary and turns unquoted YAML into either a
