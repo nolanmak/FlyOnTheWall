@@ -15,6 +15,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "support/held_local.rs"]
+mod held_local;
+use held_local::{Release, TIMEOUT, held_after_more_input};
+
 struct Factory {
     fail: bool,
     block_drop: Option<Arc<(Mutex<bool>, Condvar)>>,
@@ -66,13 +70,6 @@ impl Drop for Model {
                 ready = release.1.wait(ready).unwrap();
             }
         }
-    }
-}
-struct Release(Arc<(Mutex<bool>, Condvar)>);
-impl Drop for Release {
-    fn drop(&mut self) {
-        *self.0.0.lock().unwrap() = true;
-        self.0.1.notify_all();
     }
 }
 fn factory(fail: bool) -> Arc<dyn RecognizerFactory> {
@@ -269,5 +266,44 @@ async fn blocked_local_initialization_keeps_input_and_cannot_infer_after_the_sto
     assert_eq!(
         reader.read_from(137 * 16 + 16000, 16000).unwrap(),
         audio[16000..]
+    );
+}
+
+/// A source that ends without Stop sealing its input has no final end: the
+/// worker must still stop once the model returns, keep every sample, and
+/// leave the source to a restart rather than complete it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn input_dropped_during_inference_without_stop_ends_the_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let (stream, release, audio) = held_after_more_input(dir.path()).await;
+    let status = stream.status_reader();
+    drop(stream);
+    drop(release);
+    let deadline = Instant::now() + TIMEOUT;
+    while status.read().worker_running {
+        assert!(Instant::now() < deadline, "the worker never stopped");
+        tokio::task::yield_now().await;
+    }
+    // `Drop` already set the phase, so it says nothing about the worker. The
+    // checks that do are: the worker stopped, nothing was sealed, every sample
+    // was kept, and a restart completes the source.
+    let mut reader = ReplayReader::open(dir.path(), "fixture", ReplaySource::Mic).unwrap();
+    assert_eq!(reader.sealed_end().unwrap(), None);
+    assert_eq!(reader.saved_end().unwrap(), 137 * 16 + audio.len() as u64);
+    let mut retained = Vec::new();
+    while retained.len() < audio.len() {
+        let at = 137 * 16 + retained.len() as u64;
+        let want = (audio.len() - retained.len()).min(16_000);
+        retained.extend(reader.read_from(at, want).unwrap());
+    }
+    assert_eq!(retained, audio);
+    drop(reader);
+    let (restarted, _) = FailoverStream::resume_local(dir.path(), resume(factory(false)))
+        .await
+        .unwrap();
+    assert!(restarted.finish().await, "{:?}", restarted.status());
+    assert_eq!(
+        restarted.status().committed_sample,
+        137 * 16 + audio.len() as u64
     );
 }
