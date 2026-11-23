@@ -259,6 +259,47 @@ fn a_promotion_interrupted_before_the_database_row_is_finished_on_the_next_start
     assert_eq!(rows[0].audio.len(), 2, "the recording rows never landed");
 }
 
+/// The session directory is the only record of which published media belongs
+/// to the meeting until the `recordings` rows exist. If writing the rows
+/// fails (or the process dies there), the directory must still be on disk so
+/// the next start can write them; retiring it first loses that for good.
+#[test]
+fn a_promotion_whose_rows_cannot_be_written_keeps_the_session_for_the_next_start() {
+    let root = tmpdir("rows-before-retire");
+    let dir = finished_session(&root);
+    let meeting_id = {
+        let mut db = db_at(&root);
+        let mut m = NewMeeting::new("dev-1", "UTC");
+        m.started_at_ms = NOW as i64;
+        db.meetings().create(m).unwrap()
+    };
+    {
+        // The row write fails on this connection only: the same failure a
+        // process dying at that step leaves behind.
+        let mut db = db_at(&root);
+        db.conn()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fixture_refuse_rows BEFORE INSERT ON recordings \
+                 BEGIN SELECT RAISE(FAIL, 'fixture: row write refused'); END;",
+            )
+            .unwrap();
+        let failed = retention::promote_session(&mut db, &root, &dir, &meeting_id, NOW);
+        assert!(failed.is_err(), "the injected row failure was not reported");
+    }
+    assert!(
+        dir.exists(),
+        "the session directory was retired before the rows that reference its media existed"
+    );
+    assert!(db_at(&root).audio_inventory().unwrap()[0].audio.is_empty());
+
+    let mut db = db_at(&root);
+    let done = retention::resume_promotions(&mut db, &root);
+    assert_eq!(done.len(), 1, "the next start did not find the promotion");
+    assert!(done[0].is_ok(), "{done:?}");
+    assert!(!dir.exists(), "retired once the rows exist");
+    assert_eq!(db.audio_inventory().unwrap()[0].audio.len(), 2);
+}
+
 #[test]
 fn deleting_a_promoted_meeting_reaches_the_audio_promotion_actually_wrote() {
     // §9.6 unlinks `media/<yyyy>/<mm>/<meeting_id>/` recursively, and
@@ -596,4 +637,93 @@ fn a_live_session_on_disk_counts_as_a_recording_and_a_crashed_one_stops_counting
     // And a cleanly finished one never blocks it at all.
     wal.finalize().unwrap();
     assert!(!retention::recording_in_flight(&sessions, mtime));
+}
+
+#[test]
+fn mismatched_promotion_identity_cannot_retire_the_only_source() {
+    use fotw_pipeline::promote;
+
+    let root = tmpdir("mismatched-promotion");
+    let dir = finished_session(&root);
+    let mut db = db_at(&root);
+    let correct = db
+        .meetings()
+        .create(NewMeeting::new("fixture", "UTC"))
+        .unwrap();
+    let wrong = db
+        .meetings()
+        .create(NewMeeting::new("fixture", "UTC"))
+        .unwrap();
+    promote::claim(&dir, &correct, NOW).unwrap();
+    promote::encode(&dir).unwrap();
+    let mut stamped = promote::publish(&dir, &root).unwrap();
+    stamped.meeting_id = wrong;
+    promote::stamp(&dir, &stamped).unwrap();
+    let _ = retention::resume_promotions(&mut db, &root);
+    assert!(
+        dir.exists(),
+        "retired the source under a different meeting's identity"
+    );
+    assert!(
+        db.audio_inventory()
+            .unwrap()
+            .iter()
+            .all(|row| row.audio.is_empty())
+    );
+}
+
+#[test]
+fn a_stamped_archive_missing_retained_audio_does_not_become_playable() {
+    use fotw_pipeline::promote;
+    use std::io::Write;
+
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let dir = finished_session(root);
+    let mut db = db_at(root);
+    let meeting = db
+        .meetings()
+        .create(NewMeeting::new("fixture", "UTC"))
+        .unwrap();
+    promote::claim(&dir, &meeting, NOW).unwrap();
+    promote::encode(&dir).unwrap();
+    let stamped = promote::publish(&dir, root).unwrap();
+    promote::stamp(&dir, &stamped).unwrap();
+    let mut raw = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join("system.pcm"))
+        .unwrap();
+    raw.write_all(&[1, 0].repeat(1600)).unwrap();
+    raw.sync_data().unwrap();
+
+    let results = retention::resume_promotions(&mut db, root);
+    assert_eq!(results.len(), 1);
+    assert!(results[0].is_err());
+    assert!(dir.exists());
+    assert!(
+        db.audio_inventory().unwrap()[0].audio.is_empty(),
+        "the library offered a stamped recording that omits retained audio"
+    );
+}
+
+#[test]
+fn a_refused_second_channel_rolls_back_both_playback_rows() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let dir = finished_session(root);
+    let mut db = db_at(root);
+    let meeting = db
+        .meetings()
+        .create(NewMeeting::new("fixture", "UTC"))
+        .unwrap();
+    db.conn()
+        .execute_batch(
+            "CREATE TEMP TRIGGER refuse_mic BEFORE INSERT ON recordings WHEN new.channel='mic'
+         BEGIN SELECT RAISE(FAIL, 'fixture microphone write refused'); END;",
+        )
+        .unwrap();
+
+    assert!(retention::promote_session(&mut db, root, &dir, &meeting, NOW).is_err());
+    assert!(dir.exists());
+    assert!(db.audio_inventory().unwrap()[0].audio.is_empty());
 }

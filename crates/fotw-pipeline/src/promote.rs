@@ -172,6 +172,12 @@ pub enum PromoteError {
         /// The session.
         dir: PathBuf,
     },
+    /// A claimed destination disagrees with the capture or publication.
+    #[error("promotion identity changed for session {dir}")]
+    IdentityChanged {
+        /// The source directory.
+        dir: PathBuf,
+    },
     /// A published track is missing or the wrong size, so the session
     /// directory is still the only copy and stays put.
     #[error("{path} is {got:?} bytes, not the {want} that were published")]
@@ -366,7 +372,14 @@ pub fn retire(
     session_dir: impl AsRef<Path>,
     data_root: impl AsRef<Path>,
 ) -> Result<u64, PromoteError> {
-    let dir = session_dir.as_ref();
+    retire_verified(session_dir.as_ref(), data_root.as_ref(), None)
+}
+
+fn retire_verified(
+    dir: &Path,
+    root: &Path,
+    indexed: Option<&Promotion>,
+) -> Result<u64, PromoteError> {
     let capture_owner = wal::archive_owner(dir).map_err(|error| {
         if error.kind() == std::io::ErrorKind::WouldBlock {
             PromoteError::PendingTranscription {
@@ -377,25 +390,7 @@ pub fn retire(
             io("acquiring archive ownership", dir)(error)
         }
     })?;
-    let root = data_root.as_ref();
-    let manifest = manifest_of(dir)?;
-    let promoted = manifest
-        .promoted
-        .as_ref()
-        .ok_or_else(|| PromoteError::NotPublished {
-            dir: dir.to_path_buf(),
-        })?;
-    verify(root, promoted, dir, &manifest)?;
-    wal::verify_retained_pcm(
-        dir,
-        manifest
-            .encoded
-            .as_ref()
-            .ok_or_else(|| PromoteError::NotEncoded {
-                dir: dir.to_owned(),
-            })?,
-    )
-    .map_err(io("verifying retained raw audio", dir))?;
+    let manifest = verify_stamped_audio(dir, root, indexed)?;
 
     let replay_guard = crate::replay::retirement_guard(dir, &manifest.id)
         .map_err(|error| PromoteError::PendingTranscription {
@@ -421,6 +416,53 @@ pub fn retire(
     Ok(freed)
 }
 
+/// Verify the exact publication and its retained audio before indexing it.
+/// The returned ownership should be held through the library write when present.
+///
+/// # Errors
+///
+/// Ownership, identity, published media or retained audio could not be verified.
+pub fn verify_before_indexing(
+    dir: &Path,
+    root: &Path,
+    published: &Promotion,
+) -> Result<Option<crate::capture_clock::CaptureOwner>, PromoteError> {
+    let owner = wal::archive_owner(dir).map_err(io("acquiring archive ownership", dir))?;
+    verify_stamped_audio(dir, root, Some(published))?;
+    Ok(owner)
+}
+
+fn verify_stamped_audio(
+    dir: &Path,
+    root: &Path,
+    expected: Option<&Promotion>,
+) -> Result<Manifest, PromoteError> {
+    let manifest = manifest_of(dir)?;
+    let promoted = manifest
+        .promoted
+        .as_ref()
+        .ok_or_else(|| PromoteError::NotPublished {
+            dir: dir.to_path_buf(),
+        })?;
+    check_identity(dir, &ready_claim(dir, &manifest)?, promoted)?;
+    if expected.is_some_and(|expected| expected != promoted) {
+        return Err(identity_changed(dir));
+    }
+    verify(root, promoted, dir, &manifest)?;
+    wal::verify_retained_pcm(
+        dir,
+        manifest
+            .encoded
+            .as_ref()
+            .ok_or_else(|| PromoteError::NotEncoded {
+                dir: dir.to_owned(),
+            })?,
+    )
+    .map_err(io("verifying retained raw audio", dir))?;
+
+    Ok(manifest)
+}
+
 /// Run the whole sequence, skipping whatever is already done.
 ///
 /// Idempotent and resumable: after a crash at any point, calling this again
@@ -439,27 +481,55 @@ pub fn promote(
     let dir = session_dir.as_ref();
     let root = data_root.as_ref();
 
-    let manifest = manifest_of(dir)?;
-    ready_claim(dir, &manifest)?;
-
-    // Already published and still intact? Then all that is left is the retire
-    // that the last run did not reach.
-    if let Some(done) = manifest.promoted.clone()
-        && verify(root, &done, dir, &manifest).is_ok()
-    {
-        retire_finished_replay(dir, root)?;
-        return Ok(done);
-    }
-
-    encode(dir)?;
-    let promotion = publish(dir, root)?;
-    stamp(dir, &promotion)?;
-    retire_finished_replay(dir, root)?;
+    let promotion = publish_stamped_inner(dir, root, None)?;
+    retire_finished(dir, root, &promotion)?;
     Ok(promotion)
 }
 
-fn retire_finished_replay(dir: &Path, root: &Path) -> Result<(), PromoteError> {
-    match retire(dir, root) {
+/// Publish the validated claim, leaving the source for the library write.
+///
+/// # Errors
+///
+/// A mismatched claim or stamp, or failure to encode, publish or stamp.
+pub fn publish_stamped(
+    dir: &Path,
+    root: &Path,
+    expected_meeting: &str,
+) -> Result<Promotion, PromoteError> {
+    publish_stamped_inner(dir, root, Some(expected_meeting))
+}
+
+fn publish_stamped_inner(
+    dir: &Path,
+    root: &Path,
+    expected_meeting: Option<&str>,
+) -> Result<Promotion, PromoteError> {
+    let manifest = manifest_of(dir)?;
+    let claim = ready_claim(dir, &manifest)?;
+    if expected_meeting.is_some_and(|expected| expected != claim.meeting_id) {
+        return Err(identity_changed(dir));
+    }
+    if let Some(done) = &manifest.promoted {
+        check_identity(dir, &claim, done)?;
+        if verify(root, done, dir, &manifest).is_ok() {
+            return Ok(done.clone());
+        }
+    }
+    encode(dir)?;
+    let promotion = publish(dir, root)?;
+    check_identity(dir, &claim, &promotion)?;
+    stamp(dir, &promotion)?;
+    Ok(promotion)
+}
+
+/// Attempt ordinary retirement after the caller has indexed these exact tracks.
+///
+/// # Errors
+///
+/// Stamp or claim mismatch, or an ordinary retirement error other than pending
+/// transcription, which leaves the directory in place for a retry.
+pub fn retire_finished(dir: &Path, root: &Path, indexed: &Promotion) -> Result<(), PromoteError> {
+    match retire_verified(dir, root, Some(indexed)) {
         Ok(_) | Err(PromoteError::PendingTranscription { .. }) => Ok(()),
         Err(error) => Err(error),
     }
@@ -537,12 +607,43 @@ fn ready_claim(dir: &Path, manifest: &Manifest) -> Result<Claim, PromoteError> {
             dir: dir.to_path_buf(),
         });
     }
-    manifest
+    let claim = manifest
         .claim
         .clone()
         .ok_or_else(|| PromoteError::Unclaimed {
             dir: dir.to_path_buf(),
+        })?;
+    use std::path::Component::Normal;
+    let components: Vec<_> = Path::new(&claim.rel_dir).components().collect();
+    let [Normal(media), Normal(year), Normal(month), Normal(meeting)] = components.as_slice()
+    else {
+        return Err(identity_changed(dir));
+    };
+    if *media != MEDIA_DIR
+        || !year
+            .to_str()
+            .is_some_and(|year| year.len() >= 4 && year.bytes().all(|b| b.is_ascii_digit()))
+        || !month.to_str().is_some_and(|month| {
+            month.len() == 2 && month.parse::<u8>().is_ok_and(|n| (1..=12).contains(&n))
         })
+        || *meeting != claim.meeting_id.as_str()
+    {
+        return Err(identity_changed(dir));
+    }
+    Ok(claim)
+}
+
+fn identity_changed(dir: &Path) -> PromoteError {
+    PromoteError::IdentityChanged {
+        dir: dir.to_owned(),
+    }
+}
+
+fn check_identity(dir: &Path, claim: &Claim, stamp: &Promotion) -> Result<(), PromoteError> {
+    if stamp.meeting_id != claim.meeting_id || stamp.rel_dir != claim.rel_dir {
+        return Err(identity_changed(dir));
+    }
+    Ok(())
 }
 
 fn publish_one(
