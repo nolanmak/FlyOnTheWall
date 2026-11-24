@@ -1322,3 +1322,17 @@ fn fixing_recent_names_adds_new_invitees_to_a_partial_list() {
     assert_eq!(stored.names, ["Pat Rivera", "Rafiya"]);
     assert_eq!(stored.corrections[0].from, "Raphael");
 }
+
+#[test]
+fn fixing_recent_names_reports_an_invalid_invitee_map() {
+    let mut db = db();
+    let mut meeting = fotw_store::NewMeeting::new("dev-1", "UTC");
+    meeting.started_at_ms = fotw_store::now_ms() - 3_600_000;
+    meeting.calendar_uid = Some("checklist".to_owned());
+    db.meetings().create(meeting).unwrap();
+    db.put_setting(fotwd::invitees::SETTINGS_KEY, "{").unwrap();
+    let store = Box::leak(Box::new(InMemoryKeyStore::new()));
+    let control = composio::CalendarSettingsControl::new(db, store, FakeComposio::replying(vec![]));
+    let error = control.fix_recent_names().unwrap_err();
+    assert!(error.contains("Could not update saved invitees"));
+}

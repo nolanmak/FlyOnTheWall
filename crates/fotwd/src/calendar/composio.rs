@@ -979,26 +979,18 @@ impl CalendarSettingsControl {
                 Ok(None) => "no matching event".to_owned(),
                 Err(e) => format!("lookup failed ({e})"),
             };
-            let known = crate::invitees::read(&self.lock(), &id).names;
-            let mut names = known.clone();
-            if let Ok(Some(link)) = link {
-                for name in link.invitees {
-                    if !names.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
-                        names.push(name);
-                    }
-                }
-            }
-            if names.is_empty() {
+            let additional_names = match link {
+                Ok(Some(link)) => link.invitees,
+                _ => Vec::new(),
+            };
+            let (count, corrections) =
+                crate::invitees::refresh_with_invitees(&mut self.lock(), &id, &additional_names)?;
+            if count == 0 {
                 crate::journal::record(&format!("names    : meeting {id}: {found}; no names"));
                 continue;
             }
-            if names != known {
-                crate::invitees::store_names(&mut self.lock(), &id, &names)?;
-            }
-            let corrections = crate::invitees::refresh_corrections(&mut self.lock(), &id)?;
             crate::journal::record(&format!(
-                "names    : meeting {id}: {found}; {} kept, {} correction(s)",
-                names.len(),
+                "names    : meeting {id}: {found}; {count} kept, {} correction(s)",
                 corrections.len()
             ));
             if !corrections.is_empty() {

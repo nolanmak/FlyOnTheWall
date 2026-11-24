@@ -287,3 +287,182 @@ fn a_different_short_name_of_the_same_length_is_left_alone() {
     );
     assert!(found.is_empty(), "{found:?}");
 }
+
+#[test]
+fn an_invitee_update_preserves_a_map_that_cannot_be_decoded() {
+    check_unreadable_invitee_map(b"\n", false);
+}
+
+#[test]
+fn an_invitee_update_preserves_a_map_that_cannot_be_read() {
+    check_unreadable_invitee_map(b"\xff", true);
+}
+
+fn check_unreadable_invitee_map(suffix: &[u8], read_error: bool) {
+    let mut db = db();
+    let first = meeting_saying(&mut db, &["The checklist is ready."]);
+    let other = meeting_saying(&mut db, &["Rafael will send the agenda."]);
+    invitees::store_names(&mut db, &first, &names(&["Kit Marlow"])).unwrap();
+    invitees::store_names(&mut db, &other, &names(&["Rafiya Lindqvist"])).unwrap();
+    assert_eq!(
+        invitees::refresh_corrections(&mut db, &other)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let key = invitees::SETTINGS_KEY;
+    let mut damaged = db.get_setting(key).unwrap().unwrap().into_bytes();
+    if !read_error {
+        assert_eq!(damaged.pop(), Some(b'}'));
+    }
+    damaged.extend_from_slice(suffix);
+    db.conn()
+        .execute(
+            "UPDATE settings SET value = CAST(?2 AS TEXT) WHERE key = ?1",
+            (key, damaged.as_slice()),
+        )
+        .unwrap();
+    if read_error {
+        assert!(db.get_setting(key).is_err());
+    } else {
+        let stored = db.get_setting(key).unwrap().unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(&stored).is_err());
+    }
+
+    let result = invitees::store_names(&mut db, &first, &names(&["Kai Marlow"]));
+    let stored: Vec<u8> = db
+        .conn()
+        .query_row(
+            "SELECT CAST(value AS BLOB) FROM settings WHERE key = ?1",
+            [key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let replaced_with_one_meeting = serde_json::from_slice::<serde_json::Value>(&stored)
+        .ok()
+        .and_then(|value| {
+            value
+                .as_object()
+                .map(|map| map.len() == 1 && map.contains_key(&first))
+        })
+        .unwrap_or(false);
+    assert!(
+        result.is_err() && stored == damaged,
+        "update returned {result:?}; stored bytes preserved: {}; replaced with only the updated meeting: {replaced_with_one_meeting}",
+        stored == damaged
+    );
+}
+
+#[test]
+fn a_segment_read_failure_preserves_saved_invitee_corrections() {
+    check_failed_transcript_lookup(false);
+}
+
+#[test]
+fn a_primary_lookup_failure_preserves_saved_invitee_corrections() {
+    check_failed_transcript_lookup(true);
+}
+
+fn check_failed_transcript_lookup(primary_read_fault: bool) {
+    let mut db = db();
+    let id = meeting_saying(&mut db, &["Rafael is here."]);
+    invitees::store_names(&mut db, &id, &names(&["Rafiya"])).unwrap();
+    db.meetings()
+        .insert_summary(
+            &id,
+            fotw_store::NewSummary::new("fixture", "fixture", "fixture", "h", "Rafael is here."),
+        )
+        .unwrap();
+    assert_eq!(
+        invitees::refresh_corrections(&mut db, &id).unwrap().len(),
+        1
+    );
+    let document_payload = r#"{
+        "title":"Checklist review",
+        "purpose":"Confirm the agenda.",
+        "audience":"The meeting team",
+        "markdown":"Rafiya is here.",
+        "review_notes":[],
+        "excerpts":[],
+        "source_segments":1,
+        "started_at_ms":0
+    }"#;
+    db.save_sharing_document(&id, 0, document_payload).unwrap();
+    let document = db.sharing_document(&id).unwrap().unwrap();
+    let summary = db.meetings().current_summary(&id).unwrap().unwrap();
+    let key = invitees::SETTINGS_KEY;
+    let before = db.get_setting(key).unwrap();
+    let transcript = db.meetings().primary_transcript_id(&id).unwrap().unwrap();
+
+    if primary_read_fault {
+        db.conn()
+            .execute_batch("ALTER TABLE transcripts RENAME TO unavailable_transcripts")
+            .unwrap();
+        assert!(db.meetings().primary_transcript_id(&id).is_err());
+    } else {
+        db.conn()
+            .execute_batch("ALTER TABLE segments RENAME TO unavailable_segments")
+            .unwrap();
+        assert_eq!(
+            db.meetings().primary_transcript_id(&id).unwrap().as_deref(),
+            Some(transcript.as_str())
+        );
+        assert!(db.meetings().transcript_segments(&transcript).is_err());
+    }
+
+    let result = invitees::refresh_corrections(&mut db, &id);
+    assert_eq!(db.sharing_document(&id).unwrap(), Some(document));
+    assert_eq!(
+        db.meetings().current_summary(&id).unwrap().unwrap().id,
+        summary.id
+    );
+    let preserved = before == db.get_setting(key).unwrap();
+    let remaining = invitees::read(&db, &id).corrections.len();
+    assert!(
+        result.is_err() && preserved && remaining == 1,
+        "refresh returned {result:?}; stored bytes preserved: {preserved}; remaining corrections: {remaining}"
+    );
+}
+
+#[test]
+fn a_missing_primary_preserves_saved_invitee_corrections() {
+    let mut db = db();
+    let id = meeting_saying(&mut db, &["Rafael is here."]);
+    invitees::store_names(&mut db, &id, &names(&["Rafiya"])).unwrap();
+    assert_eq!(
+        invitees::refresh_corrections(&mut db, &id).unwrap().len(),
+        1
+    );
+    let before = db.get_setting(invitees::SETTINGS_KEY).unwrap();
+    db.conn()
+        .execute(
+            "UPDATE transcripts SET is_primary = 0 WHERE meeting_id = ?1",
+            [&id],
+        )
+        .unwrap();
+    assert!(db.meetings().primary_transcript_id(&id).unwrap().is_none());
+    assert!(
+        invitees::refresh_corrections(&mut db, &id)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(db.get_setting(invitees::SETTINGS_KEY).unwrap(), before);
+}
+
+#[test]
+fn an_empty_refresh_does_not_require_the_writer_slot() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("library.db");
+    let key = DbKey::from_bytes([7; 32]);
+    let writer = Db::open(&path, &key).unwrap();
+    let mut reader = Db::open(&path, &key).unwrap();
+    reader
+        .conn()
+        .busy_timeout(std::time::Duration::ZERO)
+        .unwrap();
+    writer.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let result = invitees::refresh_corrections(&mut reader, "synthetic-meeting");
+    assert_eq!(result, Ok(vec![]));
+}

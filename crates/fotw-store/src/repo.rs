@@ -58,6 +58,22 @@ pub struct MeetingRepo<'a> {
 }
 
 impl Db {
+    /// The primary transcript id, distinguishing absence from a failed read.
+    ///
+    /// # Errors
+    ///
+    /// Propagates store failures.
+    pub fn primary_transcript_id(&self, meeting_id: &str) -> Result<Option<String>> {
+        self.conn()
+            .query_row(
+                "SELECT id FROM transcripts WHERE meeting_id = ?1 AND is_primary = 1",
+                params![meeting_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Meeting-scoped reads and writes.
     pub fn meetings(&mut self) -> MeetingRepo<'_> {
         MeetingRepo { db: self }
@@ -447,16 +463,7 @@ impl MeetingRepo<'_> {
     /// this query with `.ok()`, which rendered a database error as "no
     /// transcript" and would have shown an empty meeting instead of a fault.
     pub fn primary_transcript_id(&self, meeting_id: &str) -> Result<Option<String>> {
-        use rusqlite::OptionalExtension;
-        self.db
-            .conn()
-            .query_row(
-                "SELECT id FROM transcripts WHERE meeting_id = ?1 AND is_primary = 1",
-                params![meeting_id],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(Into::into)
+        self.db.primary_transcript_id(meeting_id)
     }
 
     /// Promote a transcript to primary, demoting the incumbent atomically.

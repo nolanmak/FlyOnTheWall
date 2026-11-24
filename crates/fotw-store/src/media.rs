@@ -323,6 +323,35 @@ impl Db {
     ///
     /// Propagates SQLite failures.
     pub fn put_setting(&mut self, key: &str, value: &str) -> Result<()> {
+        self.write_setting(key, value)
+    }
+
+    /// Read and optionally replace one setting under the same writer lock.
+    /// The callback may read related rows using the same connection.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a transaction, read, callback or write failure.
+    pub fn update_setting<T>(
+        &mut self,
+        key: &str,
+        update: impl FnOnce(&Self, Option<String>) -> std::result::Result<(Option<String>, T), String>,
+    ) -> std::result::Result<T, String> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            self.conn(),
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|e| e.to_string())?;
+        let current = self.get_setting(key).map_err(|e| e.to_string())?;
+        let (replacement, result) = update(self, current)?;
+        if let Some(value) = replacement {
+            self.write_setting(key, &value).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(result)
+    }
+
+    fn write_setting(&self, key: &str, value: &str) -> Result<()> {
         let now = now_ms();
         self.conn().execute(
             "INSERT INTO settings (key, value, updated_at, lamport, origin_device_id)
@@ -371,4 +400,38 @@ fn check_rel_path(rel: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn setting_update_holds_the_writer_lock_during_the_read_and_merge() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("library.db");
+    let key = crate::DbKey::from_bytes([7; 32]);
+    let mut first = Db::open(&path, &key).unwrap();
+    let mut second = Db::open(&path, &key).unwrap();
+    second
+        .conn()
+        .busy_timeout(std::time::Duration::ZERO)
+        .unwrap();
+    first.put_setting("checklists", "agenda").unwrap();
+
+    first
+        .update_setting("checklists", |_, current| {
+            assert_eq!(current.as_deref(), Some("agenda"));
+            assert!(second.put_setting("checklists", "notes").is_err());
+            Ok((Some("agenda,schedule".to_owned()), ()))
+        })
+        .unwrap();
+
+    second
+        .update_setting("checklists", |_, current| {
+            assert_eq!(current.as_deref(), Some("agenda,schedule"));
+            Ok((Some("agenda,schedule,notes".to_owned()), ()))
+        })
+        .unwrap();
+    assert_eq!(
+        first.get_setting("checklists").unwrap().as_deref(),
+        Some("agenda,schedule,notes")
+    );
 }
