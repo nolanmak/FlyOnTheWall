@@ -492,21 +492,18 @@ pub fn sweep(
     let usage = usage(&meetings);
     let plan = plan_sweep(now_ms, &meetings, &settings);
 
-    // Refresh the per-meeting deadline whichever mode this is: the settings
-    // screen's "audio goes on <date>" comes from it, and a dry run is exactly
-    // when a user is looking at that screen.
     let mut errors = Vec::new();
-    for m in &meetings {
-        let deadline = m
-            .expires_at_ms(settings.default_days)
-            .and_then(|d| i64::try_from(d).ok());
-        if let Err(e) = db.set_purge_after(&m.meeting_id, deadline) {
-            errors.push(format!("recording deadline for {}: {e}", m.meeting_id));
-        }
-    }
-
     let (mut bytes_reclaimed, mut files_removed) = (0u64, 0usize);
     if mode.deletes() {
+        // Apply refreshes the deadline shown in the library.
+        for m in &meetings {
+            let deadline = m
+                .expires_at_ms(settings.default_days)
+                .and_then(|d| i64::try_from(d).ok());
+            if let Err(e) = db.set_purge_after(&m.meeting_id, deadline) {
+                errors.push(format!("recording deadline for {}: {e}", m.meeting_id));
+            }
+        }
         let (reclaimed, failures) = plan.apply(data_root);
         bytes_reclaimed = reclaimed;
         for (path, e) in failures {
