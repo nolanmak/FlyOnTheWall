@@ -231,12 +231,28 @@ async fn the_provider_keys_and_router_overrides_are_stripped_from_the_child() {
         "ANTHROPIC_SMALL_FAST_MODEL",
     ];
 
-    // Deliberately set here so the assertion is not vacuous on a machine that
-    // has none of them. Nothing else in this file reads these.
+    const CHILD: &str = "FOTW_TEST_SCRUB_ENV_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "the_provider_keys_and_router_overrides_are_stripped_from_the_child",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .envs(SCRUBBED.iter().map(|key| (key, "leaked")))
+            .output()
+            .expect("run the isolated test");
+        assert!(
+            output.status.success(),
+            "isolated test failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
     for key in SCRUBBED {
-        // SAFETY: single-threaded at this point in the test, and no other test
-        // in this binary reads these variables.
-        unsafe { std::env::set_var(key, "leaked") };
+        assert_eq!(std::env::var(key).as_deref(), Ok("leaked"));
     }
 
     // Concatenate every scrubbed var with no separator: a clean child prints

@@ -8,6 +8,10 @@
 //! transcript is the same with captions on or off; and a caption engine that
 //! keeps failing pauses captions without touching recording or final text.
 
+#[path = "fixtures/scratch.rs"]
+mod scratch;
+use scratch::scratch;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,13 +28,6 @@ use tokio::sync::mpsc;
 
 /// Text no final engine produces, to find caption text wherever it lands.
 const MARKER: &str = "CAPTION-ONLY-7f3a";
-
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let base = std::env::temp_dir().join(format!("fotwd-captions-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(base.join("sessions")).unwrap();
-    base
-}
 
 /// Speech-like audio from the first frame (see tests/local_stt.rs).
 fn tone(seconds: f32) -> WavData {
@@ -120,13 +117,16 @@ impl CaptionEngine for Captions {
 }
 
 struct Run {
+    // Callers inspect session files after the helper returns.
+    _root: tempfile::TempDir,
     outcome: session::SessionOutcome,
     tapped: Vec<(TranscriptSegment, TapKind)>,
     captions: Option<CaptionStatus>,
 }
 
 async fn record(name: &str, captions: Option<Captions>) -> Run {
-    let root = tmpdir(name);
+    let root_dir = scratch(name);
+    let root = root_dir.path();
     let mut control = SessionControl::new();
     let tapped = Arc::new(Mutex::new(Vec::new()));
     let sink = tapped.clone();
@@ -162,6 +162,7 @@ async fn record(name: &str, captions: Option<Captions>) -> Run {
         .and_then(|s| s.captions);
     let tapped = tapped.lock().unwrap().clone();
     Run {
+        _root: root_dir,
         outcome,
         tapped,
         captions,

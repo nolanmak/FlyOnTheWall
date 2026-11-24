@@ -6,32 +6,20 @@
 //! stopped, WAL finalized, transcript drained — so `run_with_stop` is the real
 //! function and `run` is the delegate that passes a signal nobody holds.
 
+#[path = "fixtures/scratch.rs"]
+mod scratch;
+#[path = "fixtures/tone.rs"]
+mod tone;
+
+use scratch::scratch;
+use tone::tone;
+
 use std::time::{Duration, Instant};
 
 use fotw_audio::platform::file::{FileAudioSource, ReplaySpeed};
 use fotw_audio::wav::WavData;
-use fotw_audio::{AudioTap, SampleFormat, StreamFormat, TapId};
+use fotw_audio::{AudioTap, TapId};
 use fotwd::session::{self, StopSignal, Transcription};
-
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("fotwd-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
-}
-
-fn tone(seconds: f32) -> WavData {
-    let format = StreamFormat::new(48_000, 2, SampleFormat::I16);
-    let n = (48_000.0 * seconds) as usize;
-    let mut samples = Vec::with_capacity(n * 2);
-    for i in 0..n {
-        let t = i as f32 / 48_000.0;
-        let v = (t * 440.0 * std::f32::consts::TAU).sin() * 0.5;
-        samples.push(v);
-        samples.push(v);
-    }
-    WavData { format, samples }
-}
 
 fn source(data: WavData) -> Box<dyn AudioTap> {
     Box::new(FileAudioSource::from_wav(
@@ -63,7 +51,8 @@ fn a_clone_shares_the_latch() {
 /// ends when it is told to, not an hour later.
 #[tokio::test]
 async fn a_stop_ends_a_long_session_early() {
-    let root = tmpdir("stop-early");
+    let root_dir = scratch("stop-early");
+    let root = root_dir.path().join("sessions");
     let stop = StopSignal::new();
 
     let held = stop.clone();
@@ -86,6 +75,11 @@ async fn a_stop_ends_a_long_session_early() {
     let took = began.elapsed();
 
     assert!(
+        root_dir.path().join("model-work.lock").is_file(),
+        "capture admission must use this test's owned data root"
+    );
+
+    assert!(
         took < Duration::from_secs(10),
         "stop was ignored; the session ran for {took:?}"
     );
@@ -104,7 +98,8 @@ async fn a_stop_ends_a_long_session_early() {
 /// sweeper for as long as it lives — so the duration stays a ceiling.
 #[tokio::test]
 async fn the_duration_still_ends_a_session_nobody_stops() {
-    let root = tmpdir("stop-duration");
+    let root_dir = scratch("stop-duration");
+    let root = root_dir.path().join("sessions");
     let began = Instant::now();
 
     let outcome = session::run_with_stop(
@@ -129,7 +124,8 @@ async fn the_duration_still_ends_a_session_nobody_stops() {
 /// a second `stop()` that will never come.
 #[tokio::test]
 async fn a_signal_stopped_in_advance_refuses_capture_at_once() {
-    let root = tmpdir("stop-advance");
+    let root_dir = scratch("stop-advance");
+    let root = root_dir.path().join("sessions");
     let stop = StopSignal::new();
     stop.stop();
 
