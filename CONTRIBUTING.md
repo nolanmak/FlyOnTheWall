@@ -37,6 +37,8 @@ on you.
 | just | Runs the recipes in `justfile` | `brew install just` or `cargo install just` |
 | cmake | Builds the Opus library that `opusic-sys` bundles. The Command Line Tools do not include it | `brew install cmake` |
 | Node 18 or newer | The web UI tests only (`node --test`). There is nothing to `npm install` | `brew install node`, or any Node installer |
+| Python 3.9 or later | Runs the speech evaluation unit tests in `just test` and `just ci` | Use a `python3` on PATH |
+| Swift 6.0 or later (macOS tests) | Runs the model-free speech protocol and helper checks in `just test` and `just ci` | Use Command Line Tools with `swift --version` reporting 6.0 or later |
 | cargo-deny (optional) | The dependency license check CI runs. `just ci` skips it, and says so, when it is missing | `cargo install --locked cargo-deny` |
 | Windows target (optional) | The Windows cross-check CI runs. `just ci` skips it, and says so, when it is missing | `rustup target add x86_64-pc-windows-msvc` |
 
@@ -45,7 +47,7 @@ on you.
 
 The app itself needs macOS 14.4 or later. The test suite also runs on Linux (CI
 runs it on Ubuntu); there you need a C compiler, `make` and `perl` for the
-vendored OpenSSL that SQLCipher is built against, plus cmake, just and Node.
+vendored OpenSSL that SQLCipher is built against, plus cmake, just, Node and Python 3.9 or later.
 Linux also needs `pkg-config` and the system libdbus development package
 (`sudo apt-get install libdbus-1-dev pkg-config` on Debian/Ubuntu). Secret
 Service uses system libdbus; we do not bundle its C sources.
@@ -56,27 +58,28 @@ Service uses system libdbus; we do not bundle its C sources.
 just ci
 ```
 
-That runs what CI runs (`.github/workflows/ci.yml`), in CI's order:
+This runs the core workspace checks on your machine, in the order below.
 
 | Recipe | What it runs |
 |---|---|
-| `just lint` | `cargo fmt --all --check`, then `cargo clippy --workspace --all-targets -- -D warnings` |
-| `just test` | `cargo test --workspace`, then `node --test crates/fotw-web/tests/ui/*.cjs` |
-| `just deny` | `cargo deny check licenses bans sources`, or a "skipped" line if cargo-deny is not installed |
-| `just seam` | `cargo check -p fotw-audio --target x86_64-pc-windows-msvc`, or a "skipped" line if that target is not installed; then a grep that fails if a macOS audio type appears outside `crates/fotw-audio/src/platform/macos/` |
+| `just lint` | Format check, workspace Clippy on all targets, then daemon Clippy with experimental echo-cancellation hooks enabled. Both lint passes deny warnings. |
+| `just test` | Workspace Rust tests, targeted experimental echo-cancellation tests, Node UI tests, Python speech-evaluation tests, and the model-free smoke-example tests. macOS also runs the Swift protocol and fake-helper checks. |
+| `just deny` | Dependency license, ban and source checks. Prints a skip message if cargo-deny is missing. |
+| `just seam` | Windows cross-check for `fotw-audio` when the Rust target is installed, plus a check that macOS audio types stay inside the macOS platform module. |
+| `just lockfiles` | Resolves the standalone `tools/aec-eval` workspace using its checked-in lockfile, without compiling it. |
 
-Where CI still differs from a local `just ci`:
+The macOS Swift checks use a fake helper with no models or external runtime
+checkout. The [optional runtime-backed helper build](helpers/fotw-speechd/README.md)
+requires Swift 6.2 or later and a verified runtime source checkout.
 
-- CI runs the tests on both `ubuntu-latest` and `macos-15`.
-- CI sets `RUSTFLAGS=-D warnings` on every job, and its lint job runs on
-  Ubuntu. Code compiled only off macOS (`cfg(not(target_os = "macos"))`) is
-  therefore linted in CI but not by `just lint` on a Mac.
-- CI also runs `cargo deny check advisories` as a separate job on every push,
-  every pull request and once a week, so a newly published RustSec advisory
-  turns only that check red. Run it locally with `cargo deny check advisories`.
-- A check that is skipped locally still runs in CI. Install cargo-deny and the
-  Windows target (see [Prerequisites](#prerequisites)) to see those failures
-  before you push.
+[Hosted CI](.github/workflows/ci.yml) runs the Rust and UI test suites on
+`ubuntu-latest` and `macos-15`, lints on Ubuntu, and sets
+`RUSTFLAGS=-D warnings` across jobs. It also runs the Windows target check,
+standalone echo-cancellation evaluations and dependency checks, Linux keyring
+interop, and a help check for the resource QA script. Separate advisory jobs
+run on pushes to main, pull requests and the weekly schedule.
+The [consumer compatibility workflow](.github/workflows/murmur-compatibility.yml)
+runs on relevant shared-crate changes.
 
 The recipes build with 3 parallel cargo jobs so the machine stays usable; set
 `CARGO_BUILD_JOBS` to change that.
