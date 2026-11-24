@@ -1183,6 +1183,10 @@ fn spawn_sweeper(root: &Path, health: Option<Arc<Health>>) -> Result<(), String>
 /// is the one thing here that cannot be recovered by running it again, and the
 /// evidence that it happened has to outlive the process that did it.
 fn sweep_once(db: &mut fotw_store::Db, data_root: &Path) -> String {
+    if let Err(error) = retention::settings(db) {
+        diag!("  ! retention sweep skipped: {error}");
+        return format!("sweep skipped: {error}");
+    }
     let mut archived = 0usize;
     for outcome in retention::resume_promotions(db, data_root) {
         match outcome {
@@ -1315,4 +1319,57 @@ mod native_reentry_tests {
         assert!(error.contains("Activity Monitor"));
         assert!(error.contains("fotwd"));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn a_scheduled_sweep_skips_recovery_until_the_policy_is_readable() {
+    let root = tempfile::tempdir().unwrap();
+    let residue = root.path().join("sessions/checklist.retired");
+    std::fs::create_dir_all(&residue).unwrap();
+    let mut db = fotw_store::Db::open_in_memory(&fotw_store::DbKey::from_bytes([7; 32])).unwrap();
+    db.put_setting(retention::SETTINGS_KEY, "{").unwrap();
+
+    let status = sweep_once(&mut db, root.path());
+    assert!(status.contains("sweep skipped"));
+    assert!(status.contains("fotwd retention --days 90 --budget-gib 20"));
+    assert!(residue.is_dir());
+
+    retention::set_settings(&mut db, &Default::default()).unwrap();
+    assert!(sweep_once(&mut db, root.path()).contains("0 error(s)"));
+    assert!(!residue.exists());
+}
+
+#[cfg(test)]
+#[path = "../tests/support/retention_recovery.rs"]
+mod retention_recovery;
+
+#[test]
+fn a_policy_saved_during_scheduled_recovery_protects_audio() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut db, tracks) = retention_recovery::archive_during_recovery(
+        root.path(),
+        r#"UPDATE settings SET value = '{"default_days":90,"budget_bytes":1073741824}' WHERE key = 'retention'"#,
+    );
+    retention::set_settings(&mut db, &Default::default()).unwrap();
+    let status = sweep_once(&mut db, root.path());
+    assert_eq!(retention::settings(&db).unwrap().default_days, 90);
+    assert!(status.contains("1 archived"), "{status}");
+    assert!(tracks.iter().all(|track| track.is_file()), "{status}");
+}
+
+#[test]
+fn a_policy_damaged_during_scheduled_recovery_stops_the_sweep() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut db, tracks) = retention_recovery::archive_during_recovery(
+        root.path(),
+        "UPDATE settings SET value = '{' WHERE key = 'retention'",
+    );
+    retention::set_settings(&mut db, &Default::default()).unwrap();
+    let status = sweep_once(&mut db, root.path());
+    assert!(
+        status.contains("retention settings are damaged"),
+        "{status}"
+    );
+    assert!(tracks.iter().all(|track| track.is_file()), "{status}");
 }

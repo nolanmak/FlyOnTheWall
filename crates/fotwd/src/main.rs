@@ -1262,9 +1262,6 @@ fn textwrap(s: &str, width: usize) -> Vec<String> {
 /// policy the user configured; this command is how they see what that policy
 /// means before trusting it.
 fn retention_command(root: PathBuf, args: &[String]) -> ExitCode {
-    use fotwd::retention::{self, SweepMode};
-
-    let data_root = data_root_of(&root);
     let mut db = match open_db(&root) {
         Ok(d) => d,
         Err(e) => {
@@ -1273,42 +1270,80 @@ fn retention_command(root: PathBuf, args: &[String]) -> ExitCode {
         }
     };
 
-    // Settings changes land before the plan is computed, so `--budget-gib 5
-    // --apply` shows and carries out the *new* budget rather than the old one.
-    let mut settings = retention::settings(&db);
-    let mut changed = false;
-    if let Some(v) = flag_value(args, "--days") {
-        match v.parse::<u32>() {
-            Ok(d) => {
-                settings.default_days = d;
-                changed = true;
-            }
-            Err(_) => {
-                eprintln!("fotwd: --days takes a whole number of days");
-                return ExitCode::FAILURE;
-            }
+    retention_with_db(&mut db, &root, args)
+}
+
+fn retention_with_db(db: &mut Db, root: &std::path::Path, args: &[String]) -> ExitCode {
+    use fotwd::retention::{self, SweepMode};
+
+    let data_root = data_root_of(root);
+    let days = match flag_value(args, "--days")
+        .map(|value| value.parse::<u32>())
+        .transpose()
+    {
+        Ok(days) => days,
+        Err(_) => {
+            eprintln!("fotwd: --days takes a whole number of days");
+            return ExitCode::FAILURE;
         }
-    }
-    if let Some(v) = flag_value(args, "--budget-gib") {
-        match v.parse::<f64>() {
-            Ok(g) if g >= 0.0 => {
-                settings.budget_bytes = (g * 1_073_741_824.0) as u64;
-                changed = true;
-            }
-            _ => {
-                eprintln!("fotwd: --budget-gib takes a non-negative number");
-                return ExitCode::FAILURE;
-            }
+    };
+    let budget = match flag_value(args, "--budget-gib")
+        .map(|value| value.parse::<f64>())
+        .transpose()
+    {
+        Ok(None) => None,
+        Ok(Some(gib)) if gib >= 0.0 => Some(gib * 1_073_741_824.0),
+        _ => {
+            eprintln!("fotwd: --budget-gib takes a non-negative number");
+            return ExitCode::FAILURE;
         }
+    };
+    let replacement = days
+        .zip(budget)
+        .filter(|(_, bytes)| *bytes < u64::MAX as f64);
+    let mut settings = match (retention::settings(db), replacement) {
+        (Ok(settings), _) => settings,
+        (Err(retention::SettingsError::Damaged), Some((default_days, budget_bytes))) => {
+            let replacement = fotw_pipeline::retention::RetentionSettings {
+                default_days,
+                budget_bytes: budget_bytes as u64,
+            };
+            return match retention::set_settings(db, &replacement) {
+                Ok(()) => {
+                    println!(
+                        "Saved replacement retention settings. Run retention again to preview or apply them."
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!(
+                        "fotwd: could not save replacement retention settings: {error}. Retry when the library is available."
+                    );
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        (Err(error), _) => {
+            eprintln!("fotwd: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(days) = days {
+        settings.default_days = days;
     }
-    if changed && let Err(e) = retention::set_settings(&mut db, &settings) {
-        eprintln!("fotwd: {e}");
+    if let Some(budget) = budget {
+        settings.budget_bytes = budget as u64;
+    }
+    if (days.is_some() || budget.is_some())
+        && let Err(error) = retention::set_settings(db, &settings)
+    {
+        eprintln!("fotwd: {error}");
         return ExitCode::FAILURE;
     }
 
     // Finish any promotion an earlier run left half-done first, or the
     // accounting below is missing whatever is still sitting in `sessions/`.
-    for outcome in retention::resume_promotions(&mut db, &data_root) {
+    for outcome in retention::resume_promotions(db, &data_root) {
         match outcome {
             Ok(p) => println!(
                 "  archived   : {} (deferred from an earlier run)",
@@ -1320,7 +1355,7 @@ fn retention_command(root: PathBuf, args: &[String]) -> ExitCode {
 
     let apply = args.iter().any(|a| a == "--apply");
     let now = fotw_store::now_ms().max(0) as u64;
-    if apply && retention::recording_in_flight(&root, now) {
+    if apply && retention::recording_in_flight(root, now) {
         // Same rule the background sweeper follows, for the same reason:
         // competing for disk I/O with a live capture is how buffers get
         // dropped.
@@ -1334,7 +1369,7 @@ fn retention_command(root: PathBuf, args: &[String]) -> ExitCode {
     } else {
         SweepMode::DryRun
     };
-    match retention::sweep(&mut db, &data_root, now, mode) {
+    match retention::sweep(db, &data_root, now, mode) {
         Ok(report) => {
             print!("{}", report.render());
             if report.errors.is_empty() {
@@ -1348,6 +1383,21 @@ fn retention_command(root: PathBuf, args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn a_retention_partial_update_refuses_to_replace_an_invalid_policy() {
+    let root = tempfile::tempdir().unwrap();
+    let mut db = Db::open_in_memory(&fotw_store::DbKey::from_bytes([7; 32])).unwrap();
+    let key = fotwd::retention::SETTINGS_KEY;
+    db.put_setting(key, "{").unwrap();
+    let args = ["--days".to_owned(), "90".to_owned(), "--apply".to_owned()];
+    assert_eq!(
+        retention_with_db(&mut db, &root.path().join("sessions"), &args),
+        ExitCode::FAILURE
+    );
+    assert_eq!(db.get_setting(key).unwrap().as_deref(), Some("{"));
 }
 
 /// Open the library beside the sessions, keyed from the OS keychain.
@@ -2670,4 +2720,75 @@ async fn summarize_command(root: PathBuf, meeting_id: String, slug: Option<Strin
             ExitCode::FAILURE
         }
     }
+}
+
+#[cfg(test)]
+#[path = "../tests/support/retention_recovery.rs"]
+mod retention_recovery;
+
+#[test]
+fn a_policy_first_saved_during_command_recovery_protects_audio() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut db, tracks) = retention_recovery::archive_during_recovery(
+        root.path(),
+        r#"INSERT OR IGNORE INTO settings (key,value,updated_at,lamport,origin_device_id)
+           VALUES ('retention','{"default_days":90,"budget_bytes":1073741824}',0,0,'fixture')"#,
+    );
+    let args = ["--apply".to_owned()];
+    let result = retention_with_db(&mut db, &root.path().join("sessions"), &args);
+    assert_eq!(result, ExitCode::SUCCESS);
+    assert_eq!(fotwd::retention::settings(&db).unwrap().default_days, 90);
+    assert!(tracks.iter().all(|track| track.is_file()));
+}
+
+#[test]
+fn a_complete_update_can_repair_the_policy_without_running_retention() {
+    for apply in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let residue = sessions.join("checklist.retired");
+        std::fs::create_dir_all(&residue).unwrap();
+        let mut db = Db::open_in_memory(&fotw_store::DbKey::from_bytes([7; 32])).unwrap();
+        db.put_setting(fotwd::retention::SETTINGS_KEY, "{").unwrap();
+        let mut args = vec!["--days", "90", "--budget-gib", "12"];
+        if apply {
+            args.push("--apply");
+        }
+        assert_eq!(
+            retention_with_db(
+                &mut db,
+                &sessions,
+                &args.into_iter().map(str::to_owned).collect::<Vec<_>>()
+            ),
+            ExitCode::SUCCESS
+        );
+        let policy = fotwd::retention::settings(&db).unwrap();
+        assert_eq!(policy.default_days, 90);
+        assert_eq!(policy.budget_bytes, 12 * 1024 * 1024 * 1024);
+        assert!(residue.is_dir());
+    }
+}
+
+#[test]
+fn a_policy_read_failure_tells_the_user_to_retry_and_skips_recovery() {
+    let root = tempfile::tempdir().unwrap();
+    let sessions = root.path().join("sessions");
+    let residue = sessions.join("checklist.retired");
+    std::fs::create_dir_all(&residue).unwrap();
+    let mut db = Db::open_in_memory(&fotw_store::DbKey::from_bytes([7; 32])).unwrap();
+    db.conn()
+        .execute_batch("ALTER TABLE settings RENAME TO unavailable_settings")
+        .unwrap();
+    let args = ["--days", "90", "--budget-gib", "12"].map(str::to_owned);
+    assert_eq!(
+        retention_with_db(&mut db, &sessions, &args),
+        ExitCode::FAILURE
+    );
+    assert!(residue.is_dir());
+    let error = fotwd::retention::settings(&db).unwrap_err().to_string();
+    assert!(
+        error.contains("Retry when the library is available"),
+        "{error}"
+    );
+    assert!(!error.contains("--budget-gib"), "{error}");
 }

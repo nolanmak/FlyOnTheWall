@@ -398,18 +398,39 @@ fn record(db: &mut Db, promoted: &Promotion) -> Result<(), String> {
 
 // ------------------------------------------------------------------- settings
 
-/// The retention settings in force, falling back to §9.5's defaults.
+/// Why a stored retention policy is unavailable.
+#[derive(Debug, thiserror::Error)]
+pub enum SettingsError {
+    /// The library could not complete the read.
+    #[error(
+        "Could not read the retention settings right now. Retry when the library is available ({0})."
+    )]
+    Unreadable(#[source] fotw_store::StoreError),
+    /// The stored policy cannot be decoded.
+    #[error(
+        "The stored retention settings are damaged. Choose both limits and replace them with \
+         `fotwd retention --days 90 --budget-gib 20`, substituting your desired values."
+    )]
+    Damaged,
+}
+
+/// The retention settings in force. Defaults apply to a missing row.
 ///
-/// A missing or unparseable value is the defaults, never "retention off". The
-/// failure mode of guessing wrong in that direction is a disk that silently
-/// fills, which is the entire problem this feature exists to solve.
-#[must_use]
-pub fn settings(db: &Db) -> RetentionSettings {
-    db.get_setting(SETTINGS_KEY)
-        .ok()
-        .flatten()
-        .and_then(|v| serde_json::from_str(&v).ok())
-        .unwrap_or_default()
+/// # Errors
+///
+/// The saved policy could not be read or decoded.
+pub fn settings(db: &Db) -> Result<RetentionSettings, SettingsError> {
+    match db.get_setting(SETTINGS_KEY) {
+        Ok(None) => Ok(RetentionSettings::default()),
+        Ok(Some(value)) => serde_json::from_str(&value).map_err(|_| SettingsError::Damaged),
+        Err(fotw_store::StoreError::Sqlite(error))
+            if std::error::Error::source(&error)
+                .is_some_and(|cause| cause.is::<std::str::Utf8Error>()) =>
+        {
+            Err(SettingsError::Damaged)
+        }
+        Err(error) => Err(SettingsError::Unreadable(error)),
+    }
 }
 
 /// Persist the retention settings.
@@ -487,14 +508,12 @@ pub fn sweep(
     now_ms: u64,
     mode: SweepMode,
 ) -> Result<SweepReport, String> {
-    let settings = settings(db);
+    let settings = settings(db).map_err(|error| error.to_string())?;
     let meetings = inventory(db, data_root)?;
     let usage = usage(&meetings);
     let plan = plan_sweep(now_ms, &meetings, &settings);
 
-    // Refresh the per-meeting deadline whichever mode this is: the settings
-    // screen's "audio goes on <date>" comes from it, and a dry run is exactly
-    // when a user is looking at that screen.
+    // Refresh the deadline stored on recording rows from the current policy.
     let mut errors = Vec::new();
     for m in &meetings {
         let deadline = m
