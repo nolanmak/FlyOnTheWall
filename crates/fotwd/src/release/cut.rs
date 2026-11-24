@@ -230,6 +230,7 @@ pub(crate) mod tests {
                 from: "Jon".into(),
                 to: "John".into(),
             }],
+            include_summary_spellings: true,
             recipients: vec![super::super::types::ReleaseRecipient {
                 address: "ada@example.com".into(),
                 display_name: Some("Ada Example".into()),

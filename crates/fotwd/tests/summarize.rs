@@ -1130,3 +1130,63 @@ async fn a_segment_owned_by_another_meeting_never_reaches_this_meetings_summary(
          ({b}); a cross-meeting segment reached the provider"
     );
 }
+
+#[tokio::test]
+async fn an_unreadable_opt_out_keeps_invitee_names_out_of_summary_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = db_at(dir.path());
+    let id = seeded_meeting(&mut db, dir.path());
+    let name = "Rafiya Lindqvist";
+    let key = fotwd::invitees::ENABLED_KEY;
+    fotwd::invitees::store_names(&mut db, &id, &[name.to_owned()]).unwrap();
+    fotwd::invitees::set_enabled(&mut db, false).unwrap();
+    assert_eq!(db.get_setting(key).unwrap().as_deref(), Some("false"));
+
+    db.conn()
+        .execute(
+            "UPDATE settings SET value = CAST(?2 AS TEXT) WHERE key = ?1",
+            (key, &b"false\xff"[..]),
+        )
+        .unwrap();
+    assert!(db.get_setting(key).is_err());
+    assert_eq!(fotwd::invitees::read(&db, &id).names, [name]);
+
+    let reply = |text: &str| {
+        serde_json::json!({
+            "content": [{"type": "text", "text": text}],
+            "usage": {"input_tokens": 100, "output_tokens": 20},
+            "stop_reason": "end_turn"
+        })
+    };
+    let mock = Arc::new(
+        MockTransport::new()
+            .with_json(reply("Numbers were above target."))
+            .with_json(reply(
+                r#"{"action_items":[],"decisions":[],"open_questions":[],"follow_ups":[],"topics":[]}"#,
+            )),
+    );
+    let outcome = summarize::summarize_meeting_with(
+        &mut db,
+        &anthropic(),
+        &id,
+        &general(),
+        Arc::clone(&mock),
+    )
+    .await
+    .unwrap();
+
+    assert!(mock.call_count() > 0, "no request was made");
+    for (index, request) in mock.requests().iter().enumerate() {
+        assert!(
+            !request.body.to_string().contains(name),
+            "summary request {index} carried an invitee spelling after the opt-out became unreadable"
+        );
+    }
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|message| message.contains("Invitee names are withheld")),
+        "the command needs a warning in its summary result"
+    );
+}

@@ -361,6 +361,7 @@ mod tests {
                 })
                 .collect(),
             corrections: vec![],
+            include_summary_spellings: true,
             recipients: vec![
                 ReleaseRecipient {
                     address: "ana.reyes@example.com".into(),

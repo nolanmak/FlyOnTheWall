@@ -53,6 +53,9 @@ pub struct CalendarSettingsResponse {
     /// spellings. Names only, never addresses.
     #[serde(default)]
     pub invitee_names: bool,
+    /// Whether the saved choice needs an explicit replacement.
+    #[serde(default)]
+    pub invitee_names_needs_repair: bool,
     /// A result to show, such as how many meetings had names fixed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notice: Option<String>,

@@ -1198,6 +1198,40 @@ fn the_invitee_names_switch_is_saved() {
 }
 
 #[test]
+fn an_unreadable_invitee_names_switch_reports_how_to_reset_it() {
+    let mut db = db();
+    let key = fotwd::invitees::ENABLED_KEY;
+    fotwd::invitees::set_enabled(&mut db, false).unwrap();
+    db.conn()
+        .execute(
+            "UPDATE settings SET value = CAST(?2 AS TEXT) WHERE key = ?1",
+            (key, &b"false\xff"[..]),
+        )
+        .unwrap();
+    let store = Box::leak(Box::new(InMemoryKeyStore::new()));
+    let control = composio::CalendarSettingsControl::new(db, store, FakeComposio::replying(vec![]));
+    let state = control.read();
+    assert!(!state.invitee_names);
+    assert!(state.invitee_names_needs_repair);
+    assert!(state.error.unwrap().contains("Save your choice again"));
+
+    control
+        .act(CalendarAction::SetInviteeNames { enabled: false })
+        .unwrap();
+    let state = control.read();
+    assert!(!state.invitee_names);
+    assert!(!state.invitee_names_needs_repair);
+    assert!(state.error.is_none());
+
+    control
+        .act(CalendarAction::SetInviteeNames { enabled: true })
+        .unwrap();
+    let state = control.read();
+    assert!(state.invitee_names);
+    assert!(state.error.is_none());
+}
+
+#[test]
 fn fixing_recent_names_looks_up_each_calendar_meetings_invite() {
     let now = fotw_store::now_ms();
     let mut db = db();

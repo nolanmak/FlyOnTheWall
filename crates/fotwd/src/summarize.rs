@@ -306,7 +306,7 @@ where
         })
         .collect::<Result<Vec<_>, fotw_store::StoreError>>()?;
     // The invite's spellings, unless turned off in Settings › Calendars.
-    let invitees = crate::invitees::for_summary(db, meeting_id);
+    let (invitees, invitee_warning) = crate::invitees::summary_inputs(db, meeting_id);
     let outcome = {
         let borrowed = Mutex::new(&mut *db);
         let check = || {
@@ -366,7 +366,11 @@ where
     }
     // Flattened only now: the CLI's `warning :` lines and the enrich report's
     // problems are lists, and neither has an above or a below.
-    let warnings: Vec<String> = warnings.into_iter().map(|w| w.text).collect();
+    let warnings: Vec<String> = warnings
+        .into_iter()
+        .map(|w| w.text)
+        .chain(invitee_warning)
+        .collect();
 
     let coverage = if outcome.coverage.total_claims == 0 {
         1.0

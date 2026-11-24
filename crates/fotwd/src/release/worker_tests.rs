@@ -1643,3 +1643,92 @@ async fn the_outbox_lists_waiting_rows_oldest_first_with_the_badge() {
     assert_eq!(detail.subject, "Notes: Planning sync (2026-09-21)");
     assert!(r.control.detail("no-such-meeting").is_none());
 }
+
+#[tokio::test]
+async fn saved_invitee_preference_controls_only_release_summary_spellings() {
+    use super::{cut::tests::Fake, render, review, summary};
+    use serde_json::{Value, json};
+
+    let r = rig();
+    let mut attendees = five_attendees();
+    attendees[1].display_name = Some("Bea Example".to_owned());
+    let id = r.meeting_at(T0 - HOUR, 10, attendees);
+    r.pass().await;
+    let row = r.row(&id);
+    let mut baseline = None;
+
+    for (choice, bytes) in [
+        ("default", None),
+        ("On", Some(&b"true"[..])),
+        ("Off", Some(&b"false"[..])),
+        ("invalid", Some(&b"not a boolean"[..])),
+        ("unreadable", Some(&b"false\xff"[..])),
+    ] {
+        let (input, print) = {
+            let mut db = r.lock();
+            if let Some(bytes) = bytes {
+                crate::invitees::set_enabled(&mut db, false).unwrap();
+                db.conn()
+                    .execute(
+                        "UPDATE settings SET value = CAST(?2 AS TEXT) WHERE key = ?1",
+                        (crate::invitees::ENABLED_KEY, bytes),
+                    )
+                    .unwrap();
+            }
+            load_input(&mut db, &row).unwrap()
+        };
+        assert_eq!(input.recipients.len(), row.recipients.len());
+        for (recipient, saved) in input.recipients.iter().zip(&row.recipients) {
+            assert_eq!(recipient.address, saved.address);
+            assert_eq!(recipient.is_self, saved.is_self);
+        }
+
+        let retained = [0];
+        let summary_fake = Fake::new(&[json!({
+            "summary": [{"text": "The plan was agreed.", "citations": [0]}],
+            "decisions": [], "action_items": []
+        })]);
+        let summary = summary::run_with(&summary_fake, "test", &input, &retained)
+            .await
+            .unwrap();
+        let payload = render::render(&input, &retained, &summary).unwrap();
+        let review_fake = Fake::new(&[json!({"findings": []})]);
+        review::run_with(&review_fake, "test", &input, &retained, &payload)
+            .await
+            .unwrap();
+
+        let mut summary_notes: Value =
+            serde_json::from_str(&summary_fake.request(0).user_notes.unwrap()).unwrap();
+        let names = summary_notes["recipient_display_names"].take();
+        let review_packet: Value =
+            serde_json::from_str(&review_fake.request(0).user_notes.unwrap()).unwrap();
+        if let Some((baseline_names, baseline_review, baseline_summary, baseline_print)) = &baseline
+        {
+            assert_eq!(
+                &review_packet, baseline_review,
+                "{choice}: changed the review packet for the same release payload"
+            );
+            assert_eq!(&summary_notes, baseline_summary, "{choice}");
+            assert_eq!(&print, baseline_print, "{choice}");
+            if choice == "On" {
+                assert_eq!(&names, baseline_names);
+            } else {
+                assert_eq!(names, json!([]), "{choice}: summary received display names");
+            }
+        } else {
+            assert!(names.as_array().unwrap().contains(&json!("Bea Example")));
+            assert!(
+                review_packet["review_packet"]["recipients"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!({
+                        "display_name": "Bea Example",
+                        "first_name": "Bea",
+                        "address_local_part": "bo",
+                        "transcript_speaker": null
+                    }))
+            );
+            baseline = Some((names, review_packet, summary_notes, print));
+        }
+    }
+}

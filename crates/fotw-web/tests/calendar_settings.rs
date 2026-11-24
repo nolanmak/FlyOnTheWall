@@ -18,6 +18,7 @@ impl CalendarControl for Fake {
             composio_acknowledged: false,
             google_accounts: self.accounts.lock().unwrap().clone(),
             invitee_names: true,
+            invitee_names_needs_repair: false,
             notice: None,
             redirect_url: None,
             error: None,
