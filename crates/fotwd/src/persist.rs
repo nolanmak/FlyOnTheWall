@@ -471,9 +471,9 @@ fn speech_sources(outcome: &SessionOutcome) -> StoreResult<Option<PreparedProjec
 
 /// The primary transcript for a meeting, if it has one.
 ///
-/// Delegates to the store rather than repeating the query: the hand-rolled
-/// version used `.ok()`, which turned a real SQLite failure into "no
-/// transcript" and would have shown an empty meeting instead of an error.
+/// Delegates to the store rather than repeating the query. A store error
+/// still reads as `None` here, the same as "no transcript"; a caller that
+/// must tell the two apart uses `MeetingRepo::primary_transcript_id`.
 pub fn primary_transcript_id(db: &mut Db, meeting_id: &str) -> Option<String> {
     db.meetings()
         .primary_transcript_id(meeting_id)
@@ -503,7 +503,9 @@ pub struct DedupeReport {
 ///
 /// # Errors
 ///
-/// Whatever the store failed with.
+/// Whatever the store failed with after the primary transcript was found.
+/// A failed primary lookup is not an error here: [`primary_transcript_id`]
+/// reads it as no transcript, and the pass writes nothing.
 pub fn dedupe_meeting(db: &mut Db, meeting_id: &str) -> StoreResult<DedupeReport> {
     let Some(old_transcript) = primary_transcript_id(db, meeting_id) else {
         return Ok(DedupeReport {
@@ -534,17 +536,15 @@ pub fn dedupe_meeting(db: &mut Db, meeting_id: &str) -> StoreResult<DedupeReport
         .map(|t| (t.provider.clone(), t.model.clone()))
         .unwrap_or_else(|| ("deepgram".to_owned(), "unknown".to_owned()));
 
-    // `make_primary: true` demotes the old primary in the same transaction;
-    // the old rows stay for revert. Dense re-index, as persist writes.
-    let new_transcript = db
-        .meetings()
-        .create_transcript(meeting_id, &provider, &model, true)?;
+    // Dense re-index, as persist writes.
     let rows: Vec<NewSegment> = segments
         .iter()
         .enumerate()
         .map(|(i, s)| to_row(i as i64, s))
         .collect();
-    db.meetings().append_segments(&new_transcript, &rows)?;
+    let new_transcript = db
+        .meetings()
+        .create_transcript_with_segments(meeting_id, &provider, &model, true, &rows)?;
 
     Ok(DedupeReport {
         before,
