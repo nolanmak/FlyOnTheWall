@@ -2225,7 +2225,7 @@ async fn stt_test(
     use std::time::Instant;
 
     use fotw_pipeline::resample::{Downmixer, Resampler16k};
-    use fotw_stt::{LocalStream, LocalStreamConfig, Source, StreamEvent, WhisperEngine};
+    use fotw_stt::{LocalStream, LocalStreamConfig, Source, WhisperEngine};
 
     let audio = match fotw_audio::wav::read(wav) {
         Ok(a) => a,
@@ -2280,21 +2280,7 @@ async fn stt_test(
     for piece in pcm.chunks(320) {
         stream.write(piece);
     }
-    let mut lines = 0usize;
-    let print = async {
-        while let Some(event) = events.recv().await {
-            match event {
-                StreamEvent::Final(seg) => {
-                    lines += 1;
-                    let s = seg.start_ms / 1_000;
-                    println!("  [{:02}:{:02}] {}", s / 60, s % 60, seg.text);
-                }
-                StreamEvent::Error(e) => eprintln!("  ! {e}"),
-                _ => {}
-            }
-        }
-    };
-    let (_, ()) = tokio::join!(stream.close(), print);
+    let (lines, status) = finish_stt_test(stream.close(), &mut events).await;
 
     let seconds = pcm.len() as f64 / 16_000.0;
     let took = started.elapsed().as_secs_f64();
@@ -2303,10 +2289,45 @@ async fn stt_test(
         "  {lines} line(s) from {seconds:.1}s of audio in {took:.1}s ({:.1}x real time)",
         seconds / took.max(0.001)
     );
-    if lines == 0 {
+    if status != ExitCode::SUCCESS {
+        eprintln!("  ! transcription diagnostic incomplete");
+    } else if lines == 0 {
         println!("  (nothing recognized: is there speech in the file, and is it loud enough?)");
     }
-    ExitCode::SUCCESS
+    status
+}
+
+#[cfg(any(target_os = "macos", test))]
+async fn finish_stt_test(
+    close: impl std::future::Future<Output = Result<(), fotw_stt::SttError>>,
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<fotw_stt::StreamEvent>,
+) -> (usize, ExitCode) {
+    use fotw_stt::StreamEvent;
+
+    // A successful close acknowledges all final events. If close failed,
+    // drain what is buffered without waiting on a potentially stuck worker.
+    let mut status = ExitCode::SUCCESS;
+    if let Err(error) = close.await {
+        eprintln!("  ! could not complete transcription: {error}");
+        status = ExitCode::FAILURE;
+    }
+    events.close();
+    let mut lines = 0;
+    while let Some(event) = events.recv().await {
+        match event {
+            StreamEvent::Final(seg) => {
+                lines += 1;
+                let s = seg.start_ms / 1_000;
+                println!("  [{:02}:{:02}] {}", s / 60, s % 60, seg.text);
+            }
+            StreamEvent::Error(e) => {
+                eprintln!("  ! {e}");
+                status = ExitCode::FAILURE;
+            }
+            _ => {}
+        }
+    }
+    (lines, status)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2669,5 +2690,87 @@ async fn summarize_command(root: PathBuf, meeting_id: String, slug: Option<Strin
             eprintln!("fotwd: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod stt_test_status {
+    use super::finish_stt_test;
+    use fotw_stt::{StreamEvent, SttError, SttErrorClass};
+    use std::{future::ready, process::ExitCode};
+
+    fn error() -> SttError {
+        SttError::new(
+            SttErrorClass::Server,
+            "fixture",
+            "synthetic inference failure",
+        )
+    }
+
+    #[tokio::test]
+    async fn stream_error_fails_even_when_close_succeeds() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(StreamEvent::Error(error())).unwrap();
+        assert_eq!(
+            finish_stt_test(ready(Ok(())), &mut rx).await.1,
+            ExitCode::FAILURE
+        );
+    }
+
+    #[tokio::test]
+    async fn close_error_fails_without_a_stream_error() {
+        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(
+            finish_stt_test(ready(Err(error())), &mut rx).await.1,
+            ExitCode::FAILURE
+        );
+    }
+
+    #[tokio::test]
+    async fn silence_succeeds_when_the_stream_closes_cleanly() {
+        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(
+            finish_stt_test(ready(Ok(())), &mut rx).await,
+            (0, ExitCode::SUCCESS)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_overrun_fails_even_while_the_worker_is_blocked() {
+        use fotw_stt::{LocalStream, LocalStreamConfig, Recognizer, RecognizerFactory, Source};
+        use std::sync::{Arc, Barrier};
+
+        struct BlockedFactory(Arc<Barrier>);
+
+        impl RecognizerFactory for BlockedFactory {
+            fn model(&self) -> &str {
+                "fixture"
+            }
+
+            fn language(&self) -> Option<&str> {
+                None
+            }
+
+            fn create(&self) -> Result<Box<dyn Recognizer>, SttError> {
+                self.0.wait();
+                Err(error())
+            }
+        }
+
+        let release = Arc::new(Barrier::new(2));
+        let (stream, mut rx) = LocalStream::open(
+            LocalStreamConfig::new("fixture", Source::System),
+            Arc::new(BlockedFactory(release.clone())),
+        );
+        for _ in 0..(61 * 50) {
+            stream.write(&[0; 320]);
+        }
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            finish_stt_test(stream.close(), &mut rx),
+        )
+        .await;
+        release.wait();
+        assert_eq!(status.unwrap().1, ExitCode::FAILURE);
     }
 }
