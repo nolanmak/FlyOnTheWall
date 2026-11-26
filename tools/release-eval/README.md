@@ -82,11 +82,13 @@ review) and scores it per §7:
 - **Retention.** The share of clean segments (in clean meetings, plus the
   unplanted segments of planted meetings) that the attachment keeps.
 
-Until #329 (cut, summary, renderer) merges, the runner uses a clearly marked,
-temporary `FixturePreparer`. It keeps every segment and writes one fixed
-summary bullet; only the review is production code. This measures the review
-on its own, with every planted passage present in the email, and retention is
-100% by construction. Replace it with #329's preparer once that merges.
+The runner's preparer makes the same production calls as the worker's
+`EnginePreparer`: `release::cut::run`, `release::summary::run`,
+`release::render::render` and `release::review::run`, over an engine built
+from the flags. Engine ids follow `EnginePreparer` (`claude-cli:default`,
+`codex-cli:default`, `anthropic-api:<model>`). The per-category table also
+shows whether each catch came from the cut (the quote is absent from the
+payload) or from a review finding.
 
 Thresholds (#330): at least 95% caught overall, 100% for `credential` and
 `about_recipient`, at most 20% false holds, and at least 90% retention.

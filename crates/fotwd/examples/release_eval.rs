@@ -22,23 +22,22 @@
 //!
 //! Output carries meeting ids, categories and numbers only, never corpus text.
 //!
-//! # Temporary preparer (until #329 lands)
+//! # The pipeline
 //!
-//! The cut, release summary and renderer are built in #329 and are not merged
-//! yet. [`FixturePreparer`] stands in for them **inside this runner only**: it
-//! keeps every segment (no cut), writes one fixed summary bullet, and renders
-//! the 5.4 layout. Only `review` is the production code. With nothing removed
-//! upstream, every planted passage reaches the payload, so this measures the
-//! review alone, which is the strictest case for catching; retention is then
-//! 100% by construction. Swap in #329's preparer when it merges.
+//! [`RealPreparer`] runs the production steps the worker's `EnginePreparer`
+//! runs: `release::cut::run`, `release::summary::run`,
+//! `release::render::render` and `release::review::run`, over an engine built
+//! from the flags instead of the library's settings. Engine ids follow
+//! `EnginePreparer` (`claude-cli:default`, `codex-cli:default`,
+//! `anthropic-api:<model>`); the CLI's version is printed alongside.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use fotwd::release::review;
+use fotwd::release;
 use fotwd::release::types::{
-    BoxFuture, Bullet, Category, Cut, Finding, IndexMap, Payload, PrepareError, PrepareInput,
-    Preparer, ReleaseRecipient, ReleaseSummary, Section, SourceSegment,
+    BoxFuture, Category, Cut, Finding, IndexMap, Payload, PrepareError, PrepareInput, Preparer,
+    ReleaseRecipient, ReleaseSummary, SourceSegment,
 };
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -108,46 +107,24 @@ impl Meeting {
     }
 }
 
-// ---- TEMPORARY: stands in for #329 inside this runner only ----------------
-
-/// Keep-everything cut, one fixed bullet, the 5.4 layout, and the production
-/// review. Remove once #329's preparer is merged.
-struct FixturePreparer {
+/// The production cut, summary, render and review over one engine: the same
+/// calls `release::engine_preparer::EnginePreparer` makes, without a library.
+struct RealPreparer {
     engine: fotwd::engine::Engine,
     engine_id: String,
 }
 
-fn hms(ms: u64) -> String {
-    let s = ms / 1_000;
-    format!("{:02}:{:02}:{:02}", s / 3_600, (s / 60) % 60, s % 60)
-}
-
-impl Preparer for FixturePreparer {
+impl Preparer for RealPreparer {
     fn cut<'a>(&'a self, input: &'a PrepareInput) -> BoxFuture<'a, Result<Cut, PrepareError>> {
-        let end_index = input.segments.len().saturating_sub(1);
-        Box::pin(async move {
-            Ok(Cut {
-                end_index,
-                omit_ranges: vec![],
-                reviewer_retained: None,
-            })
-        })
+        Box::pin(release::cut::run(&self.engine, input))
     }
 
     fn summarize<'a>(
         &'a self,
-        _input: &'a PrepareInput,
+        input: &'a PrepareInput,
         retained: &'a [usize],
     ) -> BoxFuture<'a, Result<ReleaseSummary, PrepareError>> {
-        Box::pin(async move {
-            Ok(ReleaseSummary {
-                summary: vec![Bullet {
-                    text: "The meeting's notes are attached.".into(),
-                    citations: vec![*retained.first().ok_or(PrepareError::ModelFailed)?],
-                }],
-                ..ReleaseSummary::default()
-            })
-        })
+        Box::pin(release::summary::run(&self.engine, input, retained))
     }
 
     fn render(
@@ -156,58 +133,7 @@ impl Preparer for FixturePreparer {
         retained: &[usize],
         summary: &ReleaseSummary,
     ) -> Result<Payload, PrepareError> {
-        let mut lines = vec![
-            format!("# Notes: {}", input.event_title),
-            format!("Recorded {} ({})", input.started_at_ms, input.tz),
-            String::new(),
-        ];
-        let mut map = IndexMap::default();
-        let mut omitted = 0usize;
-        for seg in &input.segments {
-            if retained.contains(&seg.index) {
-                if omitted > 0 {
-                    lines.push(format!("*[… {omitted} segments omitted …]*"));
-                    omitted = 0;
-                }
-                map.attachment_lines
-                    .push((lines.len(), lines.len(), seg.index));
-                lines.push(format!(
-                    "**{} · {}** {}",
-                    hms(seg.offset_ms),
-                    seg.speaker,
-                    seg.text
-                ));
-            } else {
-                omitted += 1;
-            }
-        }
-        if omitted > 0 {
-            lines.push("*[… remainder omitted …]*".into());
-        }
-        let mut body = String::new();
-        for (section, name, bullets) in [
-            (Section::Summary, "Summary", &summary.summary),
-            (Section::Decisions, "Decisions", &summary.decisions),
-            (Section::ActionItems, "Action items", &summary.action_items),
-        ] {
-            if bullets.is_empty() {
-                continue;
-            }
-            body.push_str(name);
-            body.push('\n');
-            for (i, b) in bullets.iter().enumerate() {
-                map.bullets.push((section, i + 1, b.citations.clone()));
-                body.push_str(&format!("- {}\n", b.text));
-            }
-            body.push('\n');
-        }
-        Ok(Payload {
-            subject: format!("Notes: {}", input.event_title),
-            body,
-            attachment_name: "fixture.md".into(),
-            attachment: lines.join("\n") + "\n",
-            index_map: map,
-        })
+        release::render::render(input, retained, summary)
     }
 
     fn review<'a>(
@@ -216,15 +142,13 @@ impl Preparer for FixturePreparer {
         retained: &'a [usize],
         payload: &'a Payload,
     ) -> BoxFuture<'a, Result<Vec<Finding>, PrepareError>> {
-        Box::pin(review::run(&self.engine, input, retained, payload))
+        Box::pin(release::review::run(&self.engine, input, retained, payload))
     }
 
     fn engine_id(&self) -> String {
         self.engine_id.clone()
     }
 }
-
-// ---- END TEMPORARY ----------------------------------------------------------
 
 struct Outcome {
     retained: Vec<usize>,
@@ -280,6 +204,8 @@ struct Tally {
     planted: usize,
     caught: usize,
     caught_same_category: usize,
+    removed_by_cut: usize,
+    covered_by_finding: usize,
 }
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -313,7 +239,7 @@ fn engine(args: &[String]) -> Result<(fotwd::engine::Engine, String), String> {
     match kind.as_str() {
         "claude-cli" => {
             let bin = binary("claude")?;
-            let id = format!("claude-cli ({}; subscription default model)", version(&bin));
+            let id = format!("claude-cli:default ({})", version(&bin));
             Ok((
                 fotwd::engine::Engine::ClaudeCli {
                     binary: bin,
@@ -324,7 +250,7 @@ fn engine(args: &[String]) -> Result<(fotwd::engine::Engine, String), String> {
         }
         "codex" => {
             let bin = binary("codex")?;
-            let id = format!("codex ({}; configured default model)", version(&bin));
+            let id = format!("codex-cli:default ({})", version(&bin));
             Ok((
                 fotwd::engine::Engine::Codex {
                     binary: bin,
@@ -343,7 +269,7 @@ fn engine(args: &[String]) -> Result<(fotwd::engine::Engine, String), String> {
                     key: fotw_secrets::SecretString::new(key),
                     settings_version: None,
                 },
-                format!("anthropic:{model}"),
+                format!("anthropic-api:{model}"),
             ))
         }
         other => Err(format!("unknown engine {other}")),
@@ -381,7 +307,7 @@ async fn main() -> Result<(), String> {
     }
 
     let (engine, engine_id) = engine(&args)?;
-    let preparer = FixturePreparer { engine, engine_id };
+    let preparer = RealPreparer { engine, engine_id };
     eprintln!(
         "engine: {}  meetings: {}  jobs: {jobs}",
         preparer.engine_id(),
@@ -415,14 +341,21 @@ async fn main() -> Result<(), String> {
     let mut held_planted = Vec::new();
     let mut false_hold_ids = Vec::new();
     let mut extra_findings = 0usize;
+    let mut low_retention = Vec::new();
     for (i, out) in &results {
         let m = &meetings[*i];
         let planted_idx: Vec<usize> = m.planted.iter().flat_map(|p| p.indices.clone()).collect();
+        let (mut here, mut kept) = (0usize, 0usize);
         for idx in 0..m.segments.len() {
             if !planted_idx.contains(&idx) {
-                clean_segments += 1;
-                clean_kept += usize::from(out.retained.contains(&idx));
+                here += 1;
+                kept += usize::from(out.retained.contains(&idx));
             }
+        }
+        clean_segments += here;
+        clean_kept += kept;
+        if kept * 10 < here * 9 {
+            low_retention.push(format!("{} {kept}/{here}", m.id));
         }
         if out.findings.is_err() {
             held += 1;
@@ -451,10 +384,10 @@ async fn main() -> Result<(), String> {
         for planted in &m.planted {
             let t = by_cat.entry(cat_name(planted.category)).or_default();
             t.planted += 1;
-            let (caught, same) = match &out.findings {
+            let (caught, same, absent, found) = match &out.findings {
                 Err(_) => {
                     held_planted.push(m.id.clone());
-                    (true, false)
+                    (true, false, false, false)
                 }
                 Ok(findings) => {
                     let absent = !text.contains(&planted.quote);
@@ -465,11 +398,15 @@ async fn main() -> Result<(), String> {
                     (
                         absent || !hit.is_empty(),
                         hit.iter().any(|f| f.category == planted.category),
+                        absent,
+                        !hit.is_empty(),
                     )
                 }
             };
             t.caught += usize::from(caught);
             t.caught_same_category += usize::from(same);
+            t.removed_by_cut += usize::from(absent);
+            t.covered_by_finding += usize::from(found);
             if !caught {
                 missed.push(format!("{} ({})", m.id, cat_name(planted.category)));
             }
@@ -488,15 +425,17 @@ async fn main() -> Result<(), String> {
         .fold((0, 0), |(p, c), t| (p + t.planted, c + t.caught));
     println!("engine: {}", preparer.engine_id());
     println!(
-        "{:<18} {:>7} {:>7} {:>8} {:>13}",
-        "category", "planted", "caught", "caught%", "same-category"
+        "{:<18} {:>7} {:>7} {:>8} {:>8} {:>8} {:>13}",
+        "category", "planted", "caught", "caught%", "cut", "finding", "same-category"
     );
     for (cat, t) in &by_cat {
         println!(
-            "{cat:<18} {:>7} {:>7} {:>7.1}% {:>13}",
+            "{cat:<18} {:>7} {:>7} {:>7.1}% {:>8} {:>8} {:>13}",
             t.planted,
             t.caught,
             pct(t.caught, t.planted),
+            t.removed_by_cut,
+            t.covered_by_finding,
             t.caught_same_category
         );
     }
@@ -519,17 +458,19 @@ async fn main() -> Result<(), String> {
     println!("missed: {missed:?}");
     println!("false-hold meetings: {false_hold_ids:?}");
     println!("held planted meetings: {held_planted:?}");
+    println!("meetings under 90% retention: {low_retention:?}");
 
     if let Some(out) = arg(&args, "--out") {
         let report = serde_json::json!({
             "engine_id": preparer.engine_id(),
             "planted": planted, "caught": caught,
             "by_category": by_cat.iter().map(|(c, t)| (c.clone(), serde_json::json!({
-                "planted": t.planted, "caught": t.caught, "caught_same_category": t.caught_same_category
+                "planted": t.planted, "caught": t.caught, "caught_same_category": t.caught_same_category,
+                "removed_by_cut": t.removed_by_cut, "covered_by_finding": t.covered_by_finding
             }))).collect::<serde_json::Map<_, _>>(),
             "clean_meetings": clean, "false_holds": false_holds,
             "clean_segments": clean_segments, "clean_kept": clean_kept,
-            "held": held, "missed": missed, "false_hold_ids": false_hold_ids,
+            "held": held, "missed": missed, "low_retention": low_retention, "false_hold_ids": false_hold_ids,
         });
         std::fs::write(
             out,
