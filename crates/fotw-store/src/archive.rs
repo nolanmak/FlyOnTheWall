@@ -83,6 +83,10 @@ use crate::export::{
 };
 use crate::migrations::LATEST_SCHEMA_VERSION;
 
+/// `app_meta` keys owned by attendee release (#326 D17). Device-local: never
+/// exported, never imported. The release tables are never archived at all.
+const RELEASE_PREFIX: &str = "release_";
+
 /// The versioned document kind for a whole library.
 pub const LIBRARY_SCHEMA: &str = "flyonthewall/library@1";
 
@@ -357,7 +361,11 @@ impl Db {
             includes_audio: opts.include_audio,
             meetings: ids,
             devices: self.fetch_all("ORDER BY id")?,
-            app_meta: self.fetch_all("WHERE key NOT GLOB 'summary_input_epoch:*' ORDER BY key")?,
+            app_meta: self.fetch_all(
+                "WHERE key NOT GLOB 'summary_input_epoch:*' AND key NOT GLOB 'enrich_pass:*' \
+                 AND key NOT GLOB 'release_*'
+                 AND key NOT GLOB 'ownership_repair:*' ORDER BY key",
+            )?,
             settings: self.fetch_all("ORDER BY key")?,
             session_notes: self.fetch_all("ORDER BY session_id")?,
             session_note_links: self.fetch_all("ORDER BY session_id")?,
@@ -439,9 +447,16 @@ impl Db {
         // Concurrency generations belong to this live library only. Treat
         // even a supplied archive row as derived state, never an old owner's
         // authority over newly imported content. Source inserts rebuild it.
+        // Attendee release state is device-local (#326 D17): importing an
+        // archive must never turn release on, so a `release_*` row is
+        // dropped even when a hand-edited archive carries one.
         manifest.app_meta.retain(|row| {
             !row.key
                 .starts_with(crate::setting_version::MEETING_INPUT_PREFIX)
+                && !row.key.starts_with(crate::repo::ENRICH_PASS_PREFIX)
+                && !row.key.starts_with(RELEASE_PREFIX)
+                // What 0013 repaired in *that* library is not a fact about this one.
+                && !row.key.starts_with(crate::migrations::OWNERSHIP_REPAIR_PREFIX)
         });
 
         // Read and parse every meeting document before opening the write
@@ -462,6 +477,12 @@ impl Db {
                     doc.meeting.id
                 )));
             }
+            check_ownership(&doc).map_err(|detail| {
+                StoreError::InvalidArgument(format!(
+                    "{} cannot be imported: {detail}. Nothing was imported.",
+                    path.display()
+                ))
+            })?;
             docs.push(doc);
         }
 
@@ -573,6 +594,93 @@ impl Db {
 }
 
 // -------------------------------------------------------------- the inserter
+
+/// Refuse a meeting file whose rows belong to another meeting (#336).
+///
+/// Foreign keys alone accept a row that says it is meeting B's but names
+/// meeting A's transcript, and every reader that follows `transcript_id` would
+/// then show B's words as A's: in A's summary, its shared document, and
+/// whatever is sent to A's attendees. So every child row must name this
+/// meeting, and every transcript reference must be one of this file's own
+/// transcripts.
+fn check_ownership(doc: &MeetingDoc) -> std::result::Result<(), String> {
+    let meeting = doc.meeting.id.as_str();
+    let own = |table: &str, id: &str, owner: &str| {
+        if owner == meeting {
+            Ok(())
+        } else {
+            Err(format!(
+                "{table} row `{id}` belongs to meeting `{owner}`, not `{meeting}`"
+            ))
+        }
+    };
+    let transcripts: BTreeSet<&str> = doc.transcripts.iter().map(|t| t.id.as_str()).collect();
+    let transcript = |table: &str, id: &str, transcript: Option<&str>| match transcript {
+        Some(t) if !transcripts.contains(t) => Err(format!(
+            "{table} row `{id}` names transcript `{t}`, which is not one of meeting \
+             `{meeting}`'s transcripts"
+        )),
+        _ => Ok(()),
+    };
+
+    for t in &doc.transcripts {
+        own("transcripts", &t.id, &t.meeting_id)?;
+    }
+    for s in &doc.segments {
+        own("segments", &s.id, &s.meeting_id)?;
+        transcript("segments", &s.id, Some(&s.transcript_id))?;
+    }
+    for e in &doc.speech_epochs {
+        own("speech_epochs", &e.id, &e.meeting_id)?;
+        transcript("speech_epochs", &e.id, Some(&e.transcript_id))?;
+    }
+    for r in &doc.speech_receipts {
+        own("speech_receipts", &r.id, &r.meeting_id)?;
+        transcript("speech_receipts", &r.id, Some(&r.transcript_id))?;
+    }
+    for s in &doc.summaries {
+        own("summaries", &s.id, &s.meeting_id)?;
+        transcript("summaries", &s.id, s.transcript_id.as_deref())?;
+    }
+    for j in &doc.post_pass_jobs {
+        own("post_pass_jobs", &j.meeting_id, &j.meeting_id)?;
+        transcript(
+            "post_pass_jobs",
+            &j.meeting_id,
+            j.live_transcript_id.as_deref(),
+        )?;
+        transcript(
+            "post_pass_jobs",
+            &j.meeting_id,
+            j.cleaned_transcript_id.as_deref(),
+        )?;
+    }
+    for w in &doc.post_pass_windows {
+        own("post_pass_windows", &w.id, &w.meeting_id)?;
+    }
+    for p in &doc.participants {
+        own("meeting_participants", &p.id, &p.meeting_id)?;
+    }
+    for t in &doc.meeting_tags {
+        own("meeting_tags", &t.tag_id, &t.meeting_id)?;
+    }
+    for n in &doc.notes {
+        own("notes", &n.id, &n.meeting_id)?;
+    }
+    for a in &doc.note_anchors {
+        own("note_anchors", &a.id, &a.meeting_id)?;
+    }
+    for d in &doc.documents {
+        own("meeting_documents", &d.id, &d.meeting_id)?;
+    }
+    for a in &doc.action_items {
+        own("action_items", &a.id, &a.meeting_id)?;
+    }
+    for r in &doc.recordings {
+        own("recordings", &r.id, &r.meeting_id)?;
+    }
+    Ok(())
+}
 
 /// Insert every row of one table, classifying each failure.
 fn insert_rows<T: TableRow + PartialEq>(

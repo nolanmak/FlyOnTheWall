@@ -1,0 +1,134 @@
+{
+  "id": "c11-interview-loop",
+  "kind": "clean",
+  "event_title": "Interview loop redesign",
+  "tz": "Europe/Berlin",
+  "started_at_ms": 1785830400000,
+  "scheduled_minutes": 45,
+  "recipients": [
+    {
+      "address": "greta.hoffmann@example.com",
+      "display_name": "Greta Hoffmann",
+      "is_self": true
+    },
+    {
+      "address": "youssef.amrani@example.com",
+      "display_name": "Youssef Amrani",
+      "is_self": false
+    },
+    {
+      "address": "olivia.chen@example.com",
+      "display_name": "Olivia Chen",
+      "is_self": false
+    },
+    {
+      "address": "felix.wagner@example.com",
+      "display_name": "Felix Wagner",
+      "is_self": false
+    },
+    {
+      "address": "talent@example.org",
+      "display_name": null,
+      "is_self": false
+    }
+  ],
+  "segments": [
+    {
+      "offset_s": 0,
+      "speaker": "me",
+      "text": "The goal today is to redesign the engineering interview loop. Candidates told us it's too long."
+    },
+    {
+      "offset_s": 166,
+      "speaker": "Speaker 2",
+      "text": "Right now it's five hours onsite plus a take-home. We're losing candidates at the take-home stage."
+    },
+    {
+      "offset_s": 333,
+      "speaker": "Speaker 3",
+      "text": "I'd drop the take-home and replace it with a paired coding session."
+    },
+    {
+      "offset_s": 476,
+      "speaker": "Speaker 4",
+      "text": "Pairing is more realistic anyway. It's how we work."
+    },
+    {
+      "offset_s": 595,
+      "speaker": "me",
+      "text": "What about system design?"
+    },
+    {
+      "offset_s": 690,
+      "speaker": "Speaker 2",
+      "text": "Keep it for senior roles, drop it for juniors, replace it with a debugging exercise."
+    },
+    {
+      "offset_s": 844,
+      "speaker": "Speaker 3",
+      "text": "I like that. The debugging exercise is closer to the job."
+    },
+    {
+      "offset_s": 975,
+      "speaker": "me",
+      "text": "How do we keep scoring consistent?"
+    },
+    {
+      "offset_s": 1082,
+      "speaker": "Speaker 4",
+      "text": "A rubric for each round, with examples of strong and weak signals."
+    },
+    {
+      "offset_s": 1225,
+      "speaker": "Speaker 2",
+      "text": "And calibration sessions every quarter where interviewers score the same recorded mock interview."
+    },
+    {
+      "offset_s": 1391,
+      "speaker": "me",
+      "text": "Good. How long is the new loop?"
+    },
+    {
+      "offset_s": 1486,
+      "speaker": "Speaker 3",
+      "text": "Four hours total, split across two days if the candidate prefers."
+    },
+    {
+      "offset_s": 1617,
+      "speaker": "me",
+      "text": "Candidate experience?"
+    },
+    {
+      "offset_s": 1700,
+      "speaker": "Speaker 2",
+      "text": "A prep guide sent in advance, explaining each round and what we're looking for."
+    },
+    {
+      "offset_s": 1855,
+      "speaker": "Speaker 4",
+      "text": "We could also share a sample debugging exercise so it's not a surprise."
+    },
+    {
+      "offset_s": 1998,
+      "speaker": "me",
+      "text": "Love that. Who drafts the rubrics?"
+    },
+    {
+      "offset_s": 2105,
+      "speaker": "Speaker 3",
+      "text": "I'll take the coding round, Felix can take debugging."
+    },
+    {
+      "offset_s": 2224,
+      "speaker": "Speaker 4",
+      "text": "Yes."
+    },
+    {
+      "offset_s": 2295,
+      "speaker": "me",
+      "text": "Great. Let's pilot with the next three backend loops."
+    }
+  ],
+  "planted": [],
+  "notes": ""
+}

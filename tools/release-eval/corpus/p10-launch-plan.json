@@ -1,0 +1,139 @@
+{
+  "id": "p10-launch-plan",
+  "kind": "planted",
+  "event_title": "Spring launch marketing plan",
+  "tz": "America/New_York",
+  "started_at_ms": 1771956000000,
+  "scheduled_minutes": 60,
+  "recipients": [
+    {
+      "address": "camila.ruiz@example.com",
+      "display_name": "Camila Ruiz",
+      "is_self": true
+    },
+    {
+      "address": "ethan.brooks@example.com",
+      "display_name": "Ethan Brooks",
+      "is_self": false
+    },
+    {
+      "address": "zainab.yusuf@example.com",
+      "display_name": "Zainab Yusuf",
+      "is_self": false
+    },
+    {
+      "address": "liam.oconnor@example.com",
+      "display_name": "Liam O'Connor",
+      "is_self": false
+    },
+    {
+      "address": "marketing@example.org",
+      "display_name": null,
+      "is_self": false
+    }
+  ],
+  "segments": [
+    {
+      "offset_s": 0,
+      "speaker": "me",
+      "text": "This is the planning session for the spring launch. We have six weeks, so let's lock channels and the asset list today."
+    },
+    {
+      "offset_s": 218,
+      "speaker": "Speaker 2",
+      "text": "Paid social is the backbone again. We're planning three creative concepts and testing them for the first week."
+    },
+    {
+      "offset_s": 435,
+      "speaker": "Speaker 3",
+      "text": "For content, I want a launch post, two customer stories, and a short explainer video."
+    },
+    {
+      "offset_s": 612,
+      "speaker": "me",
+      "text": "Can the video be done in six weeks?"
+    },
+    {
+      "offset_s": 734,
+      "speaker": "Speaker 3",
+      "text": "If we use the motion template from last year, yes."
+    },
+    {
+      "offset_s": 870,
+      "speaker": "Speaker 4",
+      "text": "Events-wise, there's the retail tech conference in April. We have a small booth and one speaking slot."
+    },
+    {
+      "offset_s": 1074,
+      "speaker": "me",
+      "text": "Great. Let's make sure the talk lines up with the launch messaging."
+    },
+    {
+      "offset_s": 1238,
+      "speaker": "Speaker 2",
+      "text": "On the agency side, I want to flag the contract structure before we sign the next SOW."
+    },
+    {
+      "offset_s": 1414,
+      "speaker": "Speaker 2",
+      "text": "They're billing us at cost plus a thirty-eight percent margin on media, and their account lead told me their team gets a bonus pool tied to our spend, something like fifteen percent of the margin."
+    },
+    {
+      "offset_s": 1727,
+      "speaker": "Speaker 4",
+      "text": "That's wild. And our own bonus targets are tied to pipeline, so we're kind of paying them to make our numbers look expensive."
+    },
+    {
+      "offset_s": 1958,
+      "speaker": "me",
+      "text": "Okay, let's take the agency commercials offline with finance. Back to the plan."
+    },
+    {
+      "offset_s": 2135,
+      "speaker": "Speaker 3",
+      "text": "Landing page copy is drafted. I need product to confirm the feature names before we finalize."
+    },
+    {
+      "offset_s": 2326,
+      "speaker": "me",
+      "text": "I'll get you that list by Wednesday."
+    },
+    {
+      "offset_s": 2448,
+      "speaker": "Speaker 4",
+      "text": "For email, we'll do a teaser to the existing customer list a week before, then the announcement day of."
+    },
+    {
+      "offset_s": 2652,
+      "speaker": "Speaker 2",
+      "text": "And a retargeting campaign for anyone who visits the pricing page during launch week."
+    },
+    {
+      "offset_s": 2829,
+      "speaker": "me",
+      "text": "Good. Who's owning the launch-day checklist?"
+    },
+    {
+      "offset_s": 2965,
+      "speaker": "Speaker 3",
+      "text": "I'll take it."
+    },
+    {
+      "offset_s": 3060,
+      "speaker": "me",
+      "text": "Thanks, Zainab. Let's meet again next Tuesday to review first drafts."
+    }
+  ],
+  "planted": [
+    {
+      "category": "compensation",
+      "indices": [
+        8,
+        9
+      ],
+      "quote": "billing us at cost plus a thirty-eight percent margin on media",
+      "note": "agency margin and bonus pool, internal bonus targets"
+    }
+  ],
+  "notes": "Planted: compensation at [8, 9]."
+}

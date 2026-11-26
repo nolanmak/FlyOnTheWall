@@ -150,6 +150,16 @@ another. In auto mode a refusal ends that pass and is written
 to `fotwd.log`. No meeting is set aside as failed, so owed meetings are pushed on a
 later pass once the repository is private or the acknowledgement is stored.
 
+## Emailing a meeting to its invitees
+
+Sharing documents and GitHub sync never email anyone. Attendee release is a
+separate, opt-in feature that is off by default. It emails a reviewed copy of a
+meeting to its invitees in domains you allow. That copy is a release summary
+and a cleaned transcript made only for that email. It never includes the
+sharing brief or the meeting summary, and it never reads or writes a sharing
+document's cut. GitHub sync stays the owners' archive and is unchanged by
+release. See [Attendee release](ATTENDEE_RELEASE.md).
+
 ## Implementation and boundaries
 
 - `fotwd::documents` shares the existing engine adapters, transport allowlist and

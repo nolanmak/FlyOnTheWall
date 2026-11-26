@@ -5,8 +5,11 @@
 //!
 //! Composio holds the Google sign-in and makes the Calendar API calls. When a
 //! recording is saved, it is told the recording's time window and returns the
-//! events in it, from which only title, times, status and the user's own
-//! response are kept. Audio, transcripts and summaries never go to Composio.
+//! events in it, from which title, times, status, the user's own response and
+//! invitee names are kept. With attendee release turned on, the addresses of
+//! the matched event's attendees in an allowed domain are stored as well (see
+//! [`super::release`]); no other address is ever stored. Audio, transcripts
+//! and summaries never go to Composio.
 //! This is a hosted relay, which docs/REQUIREMENTS.md §2 otherwise rules out,
 //! so it exists only behind an explicit opt-in with the disclosure shown in
 //! Settings (KEY-04).
@@ -29,7 +32,7 @@ use fotw_web::calendar::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{CalendarLookup, Participation, ScheduledEvent};
+use super::{Attendee, AttendeeKind, CalendarLookup, Participation, Response, ScheduledEvent};
 
 /// Every Composio call starts with this.
 pub const BASE: &str = "https://backend.composio.dev/api/v3.1";
@@ -372,7 +375,72 @@ fn as_event(value: &Value) -> Option<ScheduledEvent> {
                 )
             })
             .collect(),
+        ical_uid: value
+            .get("iCalUID")
+            .and_then(Value::as_str)
+            .filter(|u| !u.is_empty())
+            .map(str::to_owned),
+        attendees: attendees_of(value),
     })
+}
+
+/// Everyone on a Google event, for attendee release: the attendee list, then
+/// the organiser when the list leaves them out (Google omits the list
+/// entirely for an event with no guests).
+fn attendees_of(value: &Value) -> Vec<Attendee> {
+    let text = |p: &Value, key: &str| {
+        p.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let flag = |p: &Value, key: &str| p.get(key).and_then(Value::as_bool) == Some(true);
+    let mut people: Vec<Attendee> = value
+        .get("attendees")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|p| Attendee {
+            address: text(p, "email"),
+            display_name: text(p, "displayName"),
+            response: match p.get("responseStatus").and_then(Value::as_str) {
+                Some("accepted") => Response::Accepted,
+                Some("tentative") => Response::Tentative,
+                Some("needsAction") => Response::NeedsAction,
+                Some("declined") => Response::Declined,
+                _ => Response::Unknown,
+            },
+            // Google does not mark groups; they look like people (R5).
+            kind: if flag(p, "resource") {
+                AttendeeKind::Resource
+            } else {
+                AttendeeKind::Person
+            },
+            is_self: flag(p, "self"),
+            is_organizer: flag(p, "organizer"),
+        })
+        .collect();
+    if let Some(organizer) = value.get("organizer") {
+        let address = text(organizer, "email");
+        let same = |a: &Attendee| match (&a.address, &address) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            _ => false,
+        };
+        if let Some(listed) = people.iter_mut().find(|a| same(a)) {
+            listed.is_organizer = true;
+        } else if address.is_some() {
+            people.push(Attendee {
+                address,
+                display_name: text(organizer, "displayName"),
+                response: Response::Unknown,
+                kind: AttendeeKind::Person,
+                is_self: flag(organizer, "self"),
+                is_organizer: true,
+            });
+        }
+    }
+    people
 }
 
 /// A Google `start`/`end`: `(epoch ms, all_day)`.
@@ -731,6 +799,28 @@ impl CalendarLookup for ComposioCalendar {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Vec<ScheduledEvent>, String> {
+        self.read(start_ms, end_ms, false)
+    }
+
+    /// Every active account must be read, and a missing key is an error.
+    fn events_overlapping_complete(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<ScheduledEvent>, String> {
+        self.read(start_ms, end_ms, true)
+    }
+}
+
+impl ComposioCalendar {
+    /// Read every active account. `complete`: any account that cannot be
+    /// read fails the read, instead of being skipped.
+    fn read(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+        complete: bool,
+    ) -> Result<Vec<ScheduledEvent>, String> {
         let active: Vec<&Account> = self
             .accounts
             .iter()
@@ -742,6 +832,9 @@ impl CalendarLookup for ComposioCalendar {
         // Read inside the lookup, so a slow keychain counts against the
         // lookup's deadline rather than holding the save.
         let Some(key) = (self.key)()? else {
+            if complete {
+                return Err("no Composio key is saved".into());
+            }
             return Ok(Vec::new());
         };
         // Side by side, under one deadline: an account that stalls must not
@@ -781,6 +874,13 @@ impl CalendarLookup for ComposioCalendar {
                 Ok(Err(_)) => {}
                 Err(_) => break,
             }
+        }
+        if complete && read < active.len() {
+            return Err(format!(
+                "{} of {} Google account(s) could not be read",
+                active.len() - read,
+                active.len()
+            ));
         }
         if read == 0 {
             return Err(format!(
