@@ -517,6 +517,16 @@ async fn serve_until_stopped(
         startup.recorder = Some(recorder.clone());
     }
 
+    // Attendee release (#326 5.3): no send is in flight at startup, so any
+    // attachment temp file is a leftover from a crash. Codes only (D15).
+    if let Err(e) = crate::release::sweep_temp(root.parent().unwrap_or(&root)) {
+        diag!(
+            "  ! release: temp sweep failed ({})",
+            e.raw_os_error()
+                .map_or_else(|| "io".to_owned(), |n| format!("os_{n}"))
+        );
+    }
+
     // The GitHub export target (issue #63). Its own library connection, as
     // the sweeper has one, so a push never holds the UI's mutex through a
     // subprocess. Non-fatal on purpose: a UI without the export section
