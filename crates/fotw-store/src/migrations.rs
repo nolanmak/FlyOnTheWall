@@ -14,7 +14,7 @@ use crate::key::DbKey;
 ///
 /// Bump this in the same commit that appends to [`migration_set`]; the two
 /// drifting apart is what [`crate::Db::open`]'s refusal is guarding against.
-pub const LATEST_SCHEMA_VERSION: usize = 11;
+pub const LATEST_SCHEMA_VERSION: usize = 12;
 
 /// Every migration, oldest first. Append only — a released migration is
 /// immutable, because editing one changes the schema of databases that already
@@ -65,7 +65,94 @@ fn migration_set(new_library: bool) -> Migrations<'static> {
             .comment("local meeting input generations for stale-result fencing"),
         M::up(include_str!("schema/0011_post_pass.sql"))
             .comment("post-meeting cleanup pass jobs and checkpoints"),
+        // File 0013, not 0012: the number is reserved by a parallel change
+        // (attendee release). This one is independent of it and only has to
+        // run after it, so the integrator orders the two by list position.
+        M::up_with_hook(
+            include_str!("schema/0013_segment_meeting_ownership.sql"),
+            |tx| check_references(tx, OWNERSHIP_REBUILT_TABLES),
+        )
+        .comment("a transcript's rows belong to the transcript's meeting"),
     ])
+}
+
+/// The tables 0013 rebuilds, which therefore run their copy with foreign keys
+/// switched off (see [`migrate`]) and are checked by hand before commit.
+const OWNERSHIP_REBUILT_TABLES: &[&str] = &[
+    "segments",
+    "speech_epochs",
+    "speech_receipts",
+    "summaries",
+    "post_pass_jobs",
+];
+
+/// Fail the migration if any row of `tables` violates a foreign key.
+///
+/// The table-rebuild migrations run with `PRAGMA foreign_keys = OFF`, so this
+/// is the only thing standing between a bad copy and a committed library that
+/// breaks its own references. Scoped to the rebuilt tables on purpose: a
+/// whole-database check would refuse to open a library over an unrelated
+/// legacy row this migration never touched.
+fn check_references(
+    tx: &rusqlite::Transaction<'_>,
+    tables: &[&str],
+) -> std::result::Result<(), rusqlite_migration::HookError> {
+    for table in tables {
+        let mut stmt = tx.prepare(&format!("PRAGMA foreign_key_check(\"{table}\")"))?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let parent: String = row.get(2)?;
+            return Err(rusqlite_migration::HookError::Hook(format!(
+                "after rebuilding {table}, a row still violates its reference to {parent}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The library key prefix 0013 writes its repair counts under.
+pub(crate) const OWNERSHIP_REPAIR_PREFIX: &str = "ownership_repair:";
+
+/// What 0013 found and did in one table of a library that already held rows
+/// whose meeting disagreed with their transcript's meeting (#343).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct OwnershipRepair {
+    /// The table the rows were in.
+    #[serde(skip)]
+    pub table: String,
+    /// Mismatched rows found (for `post_pass_jobs`, mismatched pointers).
+    pub found: u64,
+    /// Rows moved to their transcript's meeting.
+    pub rehomed: u64,
+    /// Rows deleted because no single owner could be proven.
+    pub removed: u64,
+    /// Transcript pointers set to NULL.
+    pub cleared: u64,
+}
+
+impl crate::Db {
+    /// The repairs migration 0013 made, one entry per table where it found
+    /// anything; empty for a library that never held a mismatched row.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or a report that does not parse.
+    pub fn ownership_repairs(&self) -> Result<Vec<OwnershipRepair>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT key, value FROM app_meta WHERE key GLOB 'ownership_repair:*' ORDER BY key",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (key, value) = row?;
+            let mut repair: OwnershipRepair = serde_json::from_str(&value).map_err(|e| {
+                StoreError::InvalidArgument(format!("unreadable {key} report: {e}"))
+            })?;
+            repair.table = key[OWNERSHIP_REPAIR_PREFIX.len()..].to_owned();
+            out.push(repair);
+        }
+        Ok(out)
+    }
 }
 
 /// Read `PRAGMA user_version`.
@@ -125,7 +212,17 @@ pub(crate) fn migrate(
         backup_before_migration(conn, path, found, key)?;
     }
 
-    migration_set(new_library).to_latest(conn)?;
+    // Table-rebuild migrations (0013) drop and recreate tables that others
+    // reference. With enforcement on, that DROP runs an implicit DELETE whose
+    // ON DELETE CASCADE would empty every child table. SQLite's documented
+    // procedure is to switch enforcement off for the rebuild, which has to
+    // happen here: inside the migration transaction the pragma is a no-op.
+    // Each rebuilding migration checks its own tables before commit, and
+    // enforcement comes back on whether the run succeeded or not.
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let migrated = migration_set(new_library).to_latest(conn);
+    conn.pragma_update(None, "foreign_keys", true)?;
+    migrated?;
     Ok(())
 }
 
@@ -189,4 +286,78 @@ pub(crate) fn backups_dir(db_path: &Path) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("backups")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use rusqlite::Connection;
+
+    use super::{LATEST_SCHEMA_VERSION, OWNERSHIP_REBUILT_TABLES, migration_set};
+
+    /// Every trigger, index and column on the tables 0013 rebuilds.
+    fn shape(conn: &Connection) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for table in OWNERSHIP_REBUILT_TABLES {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT type || ' ' || name FROM sqlite_schema
+                     WHERE tbl_name = ?1 AND type IN ('index', 'trigger')
+                       AND name NOT LIKE 'sqlite_autoindex_%'",
+                )
+                .unwrap();
+            for name in stmt.query_map([table], |r| r.get::<_, String>(0)).unwrap() {
+                out.insert(name.unwrap());
+            }
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, type, \"notnull\", dflt_value, pk FROM pragma_table_info(?1)",
+                )
+                .unwrap();
+            let cols = stmt
+                .query_map([table], |r| {
+                    Ok(format!(
+                        "column {table}.{} {} nn={} default={:?} pk={}",
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                })
+                .unwrap();
+            for col in cols {
+                out.insert(col.unwrap());
+            }
+        }
+        out
+    }
+
+    /// The rebuild recreates by hand everything that dropping a table takes
+    /// with it. Measured against whatever the migration before it left, so a
+    /// trigger, index or column another migration adds to one of these tables
+    /// fails here rather than vanishing from users' libraries.
+    #[test]
+    fn the_ownership_rebuild_keeps_every_trigger_index_and_column() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let migrations = migration_set(true);
+        migrations
+            .to_version(&mut conn, LATEST_SCHEMA_VERSION - 1)
+            .unwrap();
+        let before = shape(&conn);
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        migrations.to_latest(&mut conn).unwrap();
+        let after = shape(&conn);
+        assert!(
+            before.is_subset(&after),
+            "lost by the rebuild: {:?}",
+            before.difference(&after).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            after.difference(&before).collect::<Vec<_>>(),
+            Vec::<&String>::new(),
+            "the rebuild should add references, not columns, triggers or indexes"
+        );
+    }
 }

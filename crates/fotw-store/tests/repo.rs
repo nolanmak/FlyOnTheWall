@@ -412,8 +412,9 @@ fn stored_segments_carry_their_channel_back_out() {
 }
 
 /// #336: a segment that says it is another meeting's is not part of this
-/// transcript, even when it names it. The schema does not yet forbid the
-/// pairing, and an earlier import of an edited archive could write it.
+/// transcript, even when it names it. Since #343 the schema refuses the
+/// pairing and migration 0013 repairs old rows, so the row is forced in with
+/// enforcement off: the reader-side filter stays as defence in depth.
 #[test]
 fn transcript_readers_skip_a_segment_owned_by_another_meeting() {
     let mut db = db();
@@ -440,11 +441,15 @@ fn transcript_readers_skip_a_segment_owned_by_another_meeting() {
         .append_segments(&b_transcript, &[NewSegment::new(0, 0, 900, "meeting b")])
         .unwrap();
     db.conn()
+        .execute_batch("PRAGMA foreign_keys = OFF")
+        .unwrap();
+    db.conn()
         .execute(
             "UPDATE segments SET transcript_id = ?1, idx = 1 WHERE meeting_id = ?2",
             [&a_transcript, &b],
         )
         .unwrap();
+    db.conn().execute_batch("PRAGMA foreign_keys = ON").unwrap();
 
     let text = db.meetings().transcript_text(&a_transcript).unwrap();
     assert_eq!(text, vec![(0, "meeting a".to_owned())]);
