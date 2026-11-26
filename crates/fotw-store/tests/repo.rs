@@ -488,6 +488,86 @@ fn an_enrich_report_for_an_unknown_meeting_is_not_found() {
     ));
 }
 
+/// #335: only the newest pass to claim a meeting may record its status. An
+/// older claim's write is dropped and reported as `false`, never an error, and
+/// the claim is local state that deletion cleans up.
+#[test]
+fn only_the_newest_enrich_pass_records_the_status() {
+    let mut db = db();
+    let meeting = db
+        .meetings()
+        .create(NewMeeting::new("dev-1", "UTC"))
+        .unwrap();
+
+    let older = db.meetings().begin_enrich_pass(&meeting).unwrap();
+    let newer = db.meetings().begin_enrich_pass(&meeting).unwrap();
+    assert_ne!(older, newer, "each claim is fresh");
+
+    assert!(
+        db.meetings()
+            .set_enrich_report_if_newest(&meeting, &newer, "ok", None)
+            .unwrap()
+    );
+    assert!(
+        !db.meetings()
+            .set_enrich_report_if_newest(&meeting, &older, "failed", Some("late"))
+            .unwrap(),
+        "a superseded pass's write must be dropped"
+    );
+    let row = db.meetings().get(&meeting).unwrap();
+    assert_eq!(row.enrich_status.as_deref(), Some("ok"));
+    assert_eq!(row.enrich_detail, None);
+
+    // The newest pass may write again, and a later claim supersedes it too.
+    assert!(
+        db.meetings()
+            .set_enrich_report_if_newest(&meeting, &newer, "failed", Some("again"))
+            .unwrap()
+    );
+    let newest = db.meetings().begin_enrich_pass(&meeting).unwrap();
+    assert!(
+        !db.meetings()
+            .set_enrich_report_if_newest(&meeting, &newer, "ok", None)
+            .unwrap()
+    );
+    assert_eq!(
+        db.meetings()
+            .get(&meeting)
+            .unwrap()
+            .enrich_status
+            .as_deref(),
+        Some("failed")
+    );
+
+    assert!(matches!(
+        db.meetings().begin_enrich_pass("nope").unwrap_err(),
+        StoreError::NotFound {
+            kind: "meeting",
+            ..
+        }
+    ));
+    assert!(matches!(
+        db.meetings()
+            .set_enrich_report_if_newest("nope", &newest, "ok", None)
+            .unwrap_err(),
+        StoreError::NotFound {
+            kind: "meeting",
+            ..
+        }
+    ));
+
+    db.delete_meeting(&meeting).unwrap();
+    let left: i64 = db
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM app_meta WHERE key GLOB 'enrich_pass:*'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(left, 0, "deleting the meeting deletes its claim");
+}
+
 /// The backfill sweeper's query (#74): 33 meetings in the real library missed
 /// their single enrichment window, so "has a transcript but no summary" has to
 /// be answerable without a manual command per meeting.
