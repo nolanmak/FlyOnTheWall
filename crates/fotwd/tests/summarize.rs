@@ -1069,8 +1069,9 @@ fn library_meeting(db: &mut Db, title: &str, text: &str) -> String {
 }
 
 /// #336: "a summary can be built from segments that belong to another
-/// meeting". The schema does not yet tie a segment's own `meeting_id` to its
-/// transcript's meeting, and before the importer checked, an archive (plain,
+/// meeting". Since #343 the schema ties a segment's own `meeting_id` to its
+/// transcript's meeting and migration 0013 repairs old rows; before either,
+/// and before the importer checked, an archive (plain,
 /// user-editable JSON by design) could write a segment that says it is
 /// meeting B's but names meeting A's transcript. A library may already hold
 /// such a row, so the reader must not treat B's words as A's: they would go
@@ -1092,7 +1093,12 @@ async fn a_segment_owned_by_another_meeting_never_reaches_this_meetings_summary(
     let a_transcript = db.meetings().primary_transcript_id(&a).unwrap().unwrap();
 
     // The row a pre-#336 import of a hand-edited archive accepted: still
-    // meeting B's, but filed under A's transcript. Every foreign key resolves.
+    // meeting B's, but filed under A's transcript. The schema now refuses it,
+    // so it is forced in with enforcement off; the reader filter stays as
+    // defence in depth.
+    db.conn()
+        .execute_batch("PRAGMA foreign_keys = OFF")
+        .unwrap();
     let moved = db
         .conn()
         .execute(
@@ -1100,6 +1106,7 @@ async fn a_segment_owned_by_another_meeting_never_reaches_this_meetings_summary(
             [&a_transcript, &b],
         )
         .unwrap();
+    db.conn().execute_batch("PRAGMA foreign_keys = ON").unwrap();
     assert_eq!(moved, 1);
 
     let mock = Arc::new(MockTransport::new().with_json(serde_json::json!({

@@ -386,6 +386,11 @@ async fn serve_until_stopped(
     // daemon's steps was asking. In the journal this is the difference between
     // "it died before the library" and "it died after" (#102).
     let db = crate::open_library(&root).map_err(|e| format!("could not open the library: {e}"))?;
+    // Not fatal: the repair already happened inside the migration, and this
+    // is only the report of it.
+    for line in crate::journal::ownership_repaired(&db.ownership_repairs().unwrap_or_default()) {
+        crate::journal::record(&line);
+    }
     let source = Arc::new(StoreSource::new(db));
 
     // 0 — the default — means the OS picks. A fixed port is guessable by a

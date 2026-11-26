@@ -63,7 +63,7 @@ pub use crate::export::{Blob, Clipboard, MEETING_SCHEMA, MeetingDoc};
 pub use crate::ids::{new_id, now_ms};
 pub use crate::key::DbKey;
 pub use crate::media::{AudioFile, AudioRow, NewRecording};
-pub use crate::migrations::LATEST_SCHEMA_VERSION;
+pub use crate::migrations::{LATEST_SCHEMA_VERSION, OwnershipRepair};
 pub use crate::models::{
     Meeting, NewMeeting, NewSegment, NewSummary, NoteAnchor, StoredSegment, Summary,
 };
