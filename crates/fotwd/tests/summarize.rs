@@ -903,3 +903,52 @@ async fn a_title_reply_after_a_meeting_edit_is_rejected_and_keeps_the_current_ti
         );
     }
 }
+
+/// Repro: "blank engine output is saved as a successful summary".
+///
+/// The engine answers Call A (the prose) with nothing but whitespace and
+/// Call B with an empty body. Nothing was written, so nothing may be stored:
+/// the run must be an error and no summary version may exist. On main the
+/// pipeline turns the blank reply into one blank block, coverage over zero
+/// claims reads as 100% (so not even the grounding banner fires), the empty
+/// extraction parses as `Extraction::default()`, and a blank `body_md` is
+/// inserted as version 1 and reported as success (enrichment then stamps it
+/// `"ok"`).
+#[tokio::test]
+async fn a_blank_engine_reply_is_not_stored_as_a_successful_summary() {
+    let dir = tmpdir("blankreply");
+    let mut db = db_at(&dir);
+    let id = seeded_meeting(&mut db, &dir);
+    let engine = anthropic();
+
+    let mock = Arc::new(
+        MockTransport::new()
+            .with_json(serde_json::json!({
+                "content": [{"type": "text", "text": "  \n\t\n  "}],
+                "usage": {"input_tokens": 100, "output_tokens": 3},
+                "stop_reason": "end_turn"
+            }))
+            .with_json(serde_json::json!({
+                "content": [{"type": "text", "text": ""}],
+                "usage": {"input_tokens": 100, "output_tokens": 0},
+                "stop_reason": "end_turn"
+            })),
+    );
+
+    let result =
+        summarize::summarize_meeting_with(&mut db, &engine, &id, &general(), Arc::clone(&mock))
+            .await;
+    let stored = db.meetings().current_summary(&id).unwrap();
+
+    assert!(
+        stored.is_none(),
+        "a blank engine reply was saved as summary version {:?} with body {:?}",
+        stored.as_ref().map(|s| s.version),
+        stored.as_ref().map(|s| s.body_md.clone()),
+    );
+    assert!(
+        result.is_err(),
+        "a blank engine reply was reported as a successful summary: {:?}",
+        result.map(|o| (o.version, o.markdown, o.coverage, o.warnings)),
+    );
+}
