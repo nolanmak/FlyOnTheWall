@@ -1046,3 +1046,80 @@ async fn a_blank_reply_keeps_the_previous_good_summary_current() {
         current.body_md
     );
 }
+
+/// A library meeting with one primary transcript holding `text`.
+fn library_meeting(db: &mut Db, title: &str, text: &str) -> String {
+    let mut meeting = fotw_store::NewMeeting::new("fixture-device", "UTC");
+    meeting.title = title.into();
+    meeting.started_at_ms = 0;
+    let id = db.meetings().create(meeting).unwrap();
+    let transcript = db
+        .meetings()
+        .create_transcript(&id, "deepgram", "nova-3", true)
+        .unwrap();
+    db.meetings()
+        .append_segments(
+            &transcript,
+            &[fotw_store::NewSegment::new(0, 0, 1_000, text)],
+        )
+        .unwrap();
+    db.meetings().finish(&id, 60_000).unwrap();
+    db.meetings().set_state(&id, "ready").unwrap();
+    id
+}
+
+/// #336: "a summary can be built from segments that belong to another
+/// meeting". The schema does not yet tie a segment's own `meeting_id` to its
+/// transcript's meeting, and before the importer checked, an archive (plain,
+/// user-editable JSON by design) could write a segment that says it is
+/// meeting B's but names meeting A's transcript. A library may already hold
+/// such a row, so the reader must not treat B's words as A's: they would go
+/// out in A's summary request, and so to A's attendees.
+#[tokio::test]
+async fn a_segment_owned_by_another_meeting_never_reaches_this_meetings_summary() {
+    let dir = tmpdir("cross-meeting-segments");
+    let mut db = db_at(&dir);
+    let a = library_meeting(
+        &mut db,
+        "Budget review",
+        "Alpha budget stays at forty thousand for the quarter.",
+    );
+    let b = library_meeting(
+        &mut db,
+        "Private one-on-one",
+        "Bravo private compensation details for one person only.",
+    );
+    let a_transcript = db.meetings().primary_transcript_id(&a).unwrap().unwrap();
+
+    // The row a pre-#336 import of a hand-edited archive accepted: still
+    // meeting B's, but filed under A's transcript. Every foreign key resolves.
+    let moved = db
+        .conn()
+        .execute(
+            "UPDATE segments SET transcript_id = ?1, idx = 1 WHERE meeting_id = ?2",
+            [&a_transcript, &b],
+        )
+        .unwrap();
+    assert_eq!(moved, 1);
+
+    let mock = Arc::new(MockTransport::new().with_json(serde_json::json!({
+        "content": [{"type": "text", "text": "Budget unchanged."}],
+        "usage": {"input_tokens": 100, "output_tokens": 20},
+        "stop_reason": "end_turn"
+    })));
+    let _ =
+        summarize::summarize_meeting_with(&mut db, &anthropic(), &a, &general(), Arc::clone(&mock))
+            .await;
+
+    assert!(mock.call_count() > 0, "no summary request was made");
+    let body = mock.request(0).body.to_string();
+    assert!(
+        body.contains("Alpha budget"),
+        "meeting A's own transcript did not reach its summary request"
+    );
+    assert!(
+        !body.contains("Bravo private compensation"),
+        "meeting A's summary request carried a segment whose meeting_id is meeting B \
+         ({b}); a cross-meeting segment reached the provider"
+    );
+}

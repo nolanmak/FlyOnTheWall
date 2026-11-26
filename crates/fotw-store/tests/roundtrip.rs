@@ -670,6 +670,54 @@ fn a_corrupt_meeting_file_fails_the_import_without_writing_half_of_it() {
     );
 }
 
+/// #336: a meeting file whose segment says it is meeting 3's but names meeting
+/// 1's transcript satisfies every foreign key, and would make meeting 3's
+/// words part of meeting 1's summary. It is refused, and nothing lands.
+#[test]
+fn a_meeting_file_naming_another_meetings_transcript_is_refused_whole() {
+    let (f, source) = fixture();
+    source
+        .export_library(&f.archive, &ArchiveOptions::default(), &mut |_| {})
+        .unwrap();
+
+    let path = f.archive.join("meetings/mtg-3.json");
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    doc["segments"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": "seg-foreign",
+            "transcript_id": "tr-1",
+            "meeting_id": "mtg-3",
+            "idx": 99,
+            "start_ms": 0,
+            "end_ms": 1000,
+            "channel": "system",
+            "speaker_label": null,
+            "person_id": null,
+            "text": "Words from meeting three.",
+            "confidence": null,
+            "is_final": 1,
+            "words": null
+        }));
+    std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+
+    let mut dest = open_at(&f.fresh.join("db.sqlite3"));
+    let err = dest.import_library(&f.archive).unwrap_err().to_string();
+    assert!(
+        err.contains("mtg-3.json")
+            && err.contains("segments row `seg-foreign`")
+            && err.contains("transcript `tr-1`")
+            && err.contains("Nothing was imported"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        dest.meetings().list(10, 0).unwrap().is_empty(),
+        "a refused import left rows behind"
+    );
+}
+
 // ------------------------------------------------------ per-meeting documents
 
 #[test]
