@@ -903,3 +903,103 @@ async fn a_title_reply_after_a_meeting_edit_is_rejected_and_keeps_the_current_ti
         );
     }
 }
+
+/// A library meeting with one primary transcript holding `text`.
+fn library_meeting(db: &mut Db, title: &str, text: &str) -> String {
+    let mut meeting = fotw_store::NewMeeting::new("fixture-device", "UTC");
+    meeting.title = title.into();
+    meeting.started_at_ms = 0;
+    let id = db.meetings().create(meeting).unwrap();
+    let transcript = db
+        .meetings()
+        .create_transcript(&id, "deepgram", "nova-3", true)
+        .unwrap();
+    db.meetings()
+        .append_segments(
+            &transcript,
+            &[fotw_store::NewSegment::new(0, 0, 1_000, text)],
+        )
+        .unwrap();
+    db.meetings().finish(&id, 60_000).unwrap();
+    db.meetings().set_state(&id, "ready").unwrap();
+    id
+}
+
+/// Repro: "a summary can be built from segments that belong to another
+/// meeting". Every summary input is read as `segments WHERE transcript_id =
+/// <primary transcript of the meeting>`, and nothing in the schema or the
+/// importer ties a segment's own `meeting_id` to its transcript's meeting. An
+/// archive (plain, user-editable JSON by design) whose meeting B file holds a
+/// segment row that names meeting A's transcript is accepted as-is, and B's
+/// words then go out in A's summary request, and so to A's attendees.
+#[tokio::test]
+async fn a_segment_owned_by_another_meeting_never_reaches_this_meetings_summary() {
+    let dir = tmpdir("cross-meeting-segments");
+    let source_dir = dir.join("source");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    let mut source = db_at(&source_dir);
+    let a = library_meeting(
+        &mut source,
+        "Budget review",
+        "Alpha budget stays at forty thousand for the quarter.",
+    );
+    let b = library_meeting(
+        &mut source,
+        "Private one-on-one",
+        "Bravo private compensation details for one person only.",
+    );
+    let a_transcript = source
+        .meetings()
+        .primary_transcript_id(&a)
+        .unwrap()
+        .unwrap();
+    let archive = dir.join("archive");
+    source
+        .export_library(&archive, &fotw_store::ArchiveOptions::default(), &mut |_| {})
+        .unwrap();
+    drop(source);
+
+    // Meeting B's own file: its segment still says it belongs to B, but names
+    // A's transcript. Every foreign key in it resolves.
+    let path = archive.join("meetings").join(format!("{b}.json"));
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let segments = doc["segments"].as_array_mut().unwrap();
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0]["meeting_id"], serde_json::json!(b));
+    segments[0]["transcript_id"] = serde_json::json!(a_transcript);
+    segments[0]["idx"] = serde_json::json!(1);
+    std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+
+    let target_dir = dir.join("target");
+    std::fs::create_dir_all(&target_dir).unwrap();
+    let mut db = db_at(&target_dir);
+    let report = db.import_library(&archive).unwrap();
+    eprintln!("import report: {report:?}");
+
+    let mock = Arc::new(MockTransport::new().with_json(serde_json::json!({
+        "content": [{"type": "text", "text": "Budget unchanged."}],
+        "usage": {"input_tokens": 100, "output_tokens": 20},
+        "stop_reason": "end_turn"
+    })));
+    let _ = summarize::summarize_meeting_with(
+        &mut db,
+        &anthropic(),
+        &a,
+        &general(),
+        Arc::clone(&mock),
+    )
+    .await;
+
+    assert!(mock.call_count() > 0, "no summary request was made");
+    let body = mock.request(0).body.to_string();
+    assert!(
+        body.contains("Alpha budget"),
+        "meeting A's own transcript did not reach its summary request"
+    );
+    assert!(
+        !body.contains("Bravo private compensation"),
+        "meeting A's summary request carried a segment whose meeting_id is meeting B \
+         ({b}); a cross-meeting segment reached the provider"
+    );
+}
