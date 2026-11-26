@@ -44,6 +44,7 @@ struct Inner {
     speech_recovery: OnceLock<Arc<dyn crate::speech_recovery::SpeechRecoveryControl>>,
     documents: OnceLock<Arc<dyn crate::documents::DocumentControl>>,
     cleanup: OnceLock<Arc<dyn crate::cleanup::CleanupControl>>,
+    release: OnceLock<Arc<dyn crate::release::ReleaseControl>>,
 }
 
 impl std::fmt::Debug for dyn RecorderControl {
@@ -155,6 +156,16 @@ impl AppState {
         self.inner.documents.get().cloned()
     }
 
+    /// Attach attendee release (#326) before serving requests.
+    pub fn set_release(&self, control: Arc<dyn crate::release::ReleaseControl>) {
+        let _ = self.inner.release.set(control);
+    }
+
+    /// Attendee release, absent until the daemon attaches it.
+    pub fn release(&self) -> Option<Arc<dyn crate::release::ReleaseControl>> {
+        self.inner.release.get().cloned()
+    }
+
     /// Assemble the state for a server whose policy is already fixed to a
     /// port.
     #[must_use]
@@ -221,6 +232,7 @@ impl AppState {
                 capture: OnceLock::new(),
                 speech_recovery: OnceLock::new(),
                 cleanup: OnceLock::new(),
+                release: OnceLock::new(),
                 tickets: TokenTable::new(WS_TICKET_TTL),
                 handoff: TokenTable::new(HANDOFF_TTL),
                 hub: Arc::new(DeltaHub::new()),

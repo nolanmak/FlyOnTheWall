@@ -386,6 +386,11 @@ async fn serve_until_stopped(
     // daemon's steps was asking. In the journal this is the difference between
     // "it died before the library" and "it died after" (#102).
     let db = crate::open_library(&root).map_err(|e| format!("could not open the library: {e}"))?;
+    // Not fatal: the repair already happened inside the migration, and this
+    // is only the report of it.
+    for line in crate::journal::ownership_repaired(&db.ownership_repairs().unwrap_or_default()) {
+        crate::journal::record(&line);
+    }
     let source = Arc::new(StoreSource::new(db));
 
     // 0 — the default — means the OS picks. A fixed port is guessable by a
@@ -517,6 +522,25 @@ async fn serve_until_stopped(
         startup.recorder = Some(recorder.clone());
     }
 
+    // Attendee release (#326 5.3): no send is in flight at startup, so any
+    // attachment temp file is a leftover from a crash. Codes only (D15).
+    if let Err(e) = crate::release::sweep_temp(root.parent().unwrap_or(&root)) {
+        diag!(
+            "  ! release: temp sweep failed ({})",
+            e.raw_os_error()
+                .map_or_else(|| "io".to_owned(), |n| format!("os_{n}"))
+        );
+    }
+    // The release worker and its controls (#326). The preparer resolves the
+    // configured engine per call, so release can be switched on before an
+    // engine exists; the worker pauses `engine_unavailable` until one does.
+    let release = crate::secrets::keystore().ok().and_then(|store| {
+        let preparer: Arc<dyn crate::release::types::Preparer> = Arc::new(
+            crate::release::engine_preparer::EnginePreparer::new(store, root.clone()),
+        );
+        start_release(&root, Some(preparer))
+    });
+
     // The GitHub export target (issue #63). Its own library connection, as
     // the sweeper has one, so a push never holds the UI's mutex through a
     // subprocess. Non-fatal on purpose: a UI without the export section
@@ -625,6 +649,10 @@ async fn serve_until_stopped(
         server
             .state()
             .set_documents(Arc::new(crate::documents::Documents::new(db, store)));
+    }
+
+    if let Some(release) = release {
+        server.state().set_release(release);
     }
 
     if let Ok(db) = crate::open_library(&root) {
@@ -852,6 +880,79 @@ async fn serve_until_stopped(
     } else {
         server.serve().await.map_err(|e| format!("server: {e}"))
     }
+}
+
+/// Start attendee release (#326, #331) for the library at `root`: the
+/// prepare loop (every 60 s) and the send loop (every 15 s), on their own
+/// threads and their own library connection, and the control the web layer
+/// serves. Rows left in `sending` by a previous daemon go to review first.
+///
+/// Nothing starts without a `preparer` (cut, summary, render and review,
+/// #329/#330): release is then simply absent, and `None` is returned.
+/// Non-fatal like every other control here; codes only in the log (D15).
+#[must_use]
+pub fn start_release(
+    root: &Path,
+    preparer: Option<Arc<dyn crate::release::types::Preparer>>,
+) -> Option<Arc<dyn fotw_web::release::ReleaseControl>> {
+    use crate::release::worker::{
+        Clock, Deps, PREPARE_INTERVAL, ResolvedEnginePolicy, SEND_INTERVAL, Worker,
+    };
+    let preparer = preparer?;
+    let db = match crate::open_library(root) {
+        Ok(db) => Arc::new(std::sync::Mutex::new(db)),
+        Err(_) => {
+            diag!("  ! release: not started (library_unavailable)");
+            return None;
+        }
+    };
+    let clock: Clock = Arc::new(fotw_store::now_ms);
+    let runner: Arc<dyn crate::release::MailRunner> =
+        Arc::new(crate::release::SystemGws::default());
+    let policy: Arc<dyn crate::release::worker::PolicyCheck> = Arc::new(ResolvedEnginePolicy);
+    let calendar_root = root.to_owned();
+    let worker = Arc::new(Worker::new(Deps {
+        db: Arc::clone(&db),
+        library: root.parent().unwrap_or(root).to_owned(),
+        preparer: Arc::clone(&preparer),
+        runner: Arc::clone(&runner),
+        calendar: Arc::new(move || crate::calendar::for_library_root(&calendar_root)),
+        policy: Arc::clone(&policy),
+        clock: Arc::clone(&clock),
+    }));
+    worker.recover();
+    let control =
+        crate::release::control::Control::new(db, runner, policy, preparer, clock, worker.pauses());
+
+    let preparing = Arc::clone(&worker);
+    let prepare = std::thread::Builder::new()
+        .name("fotw-release-prepare".into())
+        .spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                diag!("  ! release: prepare loop not started (runtime_failed)");
+                return;
+            };
+            loop {
+                runtime.block_on(preparing.prepare_pass());
+                std::thread::sleep(PREPARE_INTERVAL);
+            }
+        });
+    let sending = Arc::clone(&worker);
+    let send = std::thread::Builder::new()
+        .name("fotw-release-send".into())
+        .spawn(move || {
+            loop {
+                sending.send_tick();
+                std::thread::sleep(SEND_INTERVAL);
+            }
+        });
+    if prepare.is_err() || send.is_err() {
+        diag!("  ! release: worker threads not started (spawn_failed)");
+    }
+    Some(Arc::new(control))
 }
 
 /// Start the auto-push worker on its own thread.

@@ -1,0 +1,141 @@
+{
+  "id": "p07-support-escalation",
+  "kind": "planted",
+  "event_title": "Support escalation review",
+  "tz": "America/Los_Angeles",
+  "started_at_ms": 1780516800000,
+  "scheduled_minutes": 30,
+  "recipients": [
+    {
+      "address": "grace.nakamura@example.com",
+      "display_name": "Grace Nakamura",
+      "is_self": true
+    },
+    {
+      "address": "ravi.shah@example.com",
+      "display_name": "Ravi Shah",
+      "is_self": false
+    },
+    {
+      "address": "elena.petrova@example.com",
+      "display_name": "Elena Petrova",
+      "is_self": false
+    },
+    {
+      "address": "support-leads@example.org",
+      "display_name": null,
+      "is_self": false
+    }
+  ],
+  "segments": [
+    {
+      "offset_s": 0,
+      "speaker": "me",
+      "text": "Let's look at this week's escalations. We had seven, which is up from four last week."
+    },
+    {
+      "offset_s": 88,
+      "speaker": "Speaker 2",
+      "text": "Three of them are the same root cause, the CSV export timing out for accounts with more than fifty thousand rows."
+    },
+    {
+      "offset_s": 196,
+      "speaker": "Speaker 3",
+      "text": "Engineering has a fix in review. They're moving the export to a background job with an email link."
+    },
+    {
+      "offset_s": 291,
+      "speaker": "me",
+      "text": "Do we have an ETA?"
+    },
+    {
+      "offset_s": 338,
+      "speaker": "Speaker 3",
+      "text": "They're saying Tuesday's release."
+    },
+    {
+      "offset_s": 399,
+      "speaker": "me",
+      "text": "Okay. Ravi, can you draft a macro for the agents so customers know a fix is coming?"
+    },
+    {
+      "offset_s": 487,
+      "speaker": "Speaker 2",
+      "text": "Yes, I'll have it up in an hour."
+    },
+    {
+      "offset_s": 542,
+      "speaker": "Speaker 3",
+      "text": "The fourth escalation was the clinic group that got double-billed. Finance already issued the refund."
+    },
+    {
+      "offset_s": 643,
+      "speaker": "me",
+      "text": "Did someone follow up personally?"
+    },
+    {
+      "offset_s": 704,
+      "speaker": "Speaker 3",
+      "text": "I called their office manager yesterday. She was gracious about it."
+    },
+    {
+      "offset_s": 785,
+      "speaker": "Speaker 2",
+      "text": "Speaking of calls, Elena, how did your date go Saturday? The guy from the climbing gym?"
+    },
+    {
+      "offset_s": 873,
+      "speaker": "Speaker 3",
+      "text": "Oh god. He spent forty minutes talking about his ex and then asked if I wanted to split a cab back to his place. Hard no."
+    },
+    {
+      "offset_s": 988,
+      "speaker": "Speaker 2",
+      "text": "Stop. Are you going to see him at the gym now?"
+    },
+    {
+      "offset_s": 1056,
+      "speaker": "Speaker 3",
+      "text": "I'm switching to the Tuesday class, which is a shame because the Thursday instructor is way better."
+    },
+    {
+      "offset_s": 1158,
+      "speaker": "me",
+      "text": "Okay, okay. Back to the list. The last three are one-offs?"
+    },
+    {
+      "offset_s": 1232,
+      "speaker": "Speaker 2",
+      "text": "Yes. A login loop on an old Safari version, a webhook misconfiguration on the customer side, and one feature request that got escalated by mistake."
+    },
+    {
+      "offset_s": 1361,
+      "speaker": "me",
+      "text": "Let's close the feature request and route it to product. Anything else?"
+    },
+    {
+      "offset_s": 1442,
+      "speaker": "Speaker 3",
+      "text": "Just that weekend coverage is thin next month, I'll post the schedule for volunteers."
+    },
+    {
+      "offset_s": 1530,
+      "speaker": "me",
+      "text": "Thanks both. Same time next week."
+    }
+  ],
+  "planted": [
+    {
+      "category": "off_meeting",
+      "indices": [
+        10,
+        11,
+        12,
+        13
+      ],
+      "quote": "how did your date go Saturday?",
+      "note": "dating talk in the middle of the meeting"
+    }
+  ],
+  "notes": "Planted: off_meeting at [10, 11, 12, 13]."
+}
