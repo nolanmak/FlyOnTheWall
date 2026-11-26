@@ -183,13 +183,26 @@ pub struct SessionOutcome {
     /// keeps an optional source even when initially unavailable; zero counts
     /// mean it never delivered retained audio.
     pub mic_buffers: Option<LegBuffers>,
-    /// Samples the ring dropped because the pump fell behind.
-    pub dropped_samples: u64,
+    /// Interleaved samples the system leg's rings dropped because the pump
+    /// fell behind, including rings retired by a tap rebuild (#93).
+    pub system_dropped_samples: u64,
+    /// The same for the mic leg. Reported per leg rather than summed, for the
+    /// reason [`LegBuffers`] is: a total cannot say which device has the hole.
+    /// [`dropped_samples`](Self::dropped_samples) is their sum.
+    pub mic_dropped_samples: u64,
     /// Finalized transcript segments.
     pub segments: Vec<TranscriptSegment>,
 }
 
 impl SessionOutcome {
+    /// Samples the rings dropped because the pump fell behind, both legs
+    /// together. Derived from the per-leg counts, so it cannot drift from them.
+    #[must_use]
+    pub const fn dropped_samples(&self) -> u64 {
+        self.system_dropped_samples
+            .saturating_add(self.mic_dropped_samples)
+    }
+
     /// Whether any audible audio was captured at all.
     ///
     /// # Why either leg is enough
@@ -2109,8 +2122,7 @@ async fn run_unsupervised(
     let PumpCounts {
         system_samples,
         mic_samples,
-        dropped_samples,
-        abandoned_samples,
+        ring_losses,
         archive_warnings,
     } = match tokio::time::timeout(deadlines.join, pump_counts).await {
         Ok(Ok(counts)) => counts?,
@@ -2183,25 +2195,10 @@ async fn run_unsupervised(
     for warning in archive_warnings {
         control.errors.record(warning);
     }
-    if dropped_samples > 0 {
-        control.errors.record(format!(
-            "capture: {dropped_samples} samples were dropped at a full ring — \
-             the pump could not keep up with the audio thread"
-        ));
-    }
-
-    // The same hole from the other cause: the tap went on delivering after it
-    // was told to stop, and rather than drain it forever the pump gave up and
-    // finalized what it had (#85). Reported for the same reason as a ring
-    // drop — this audio exists nowhere — and the meeting is otherwise intact,
-    // which is precisely why the pump ends itself instead of being abandoned.
-    if abandoned_samples > 0 {
-        control.errors.record(format!(
-            "capture: {abandoned_samples} samples were still in the ring when \
-             the {:?} drain deadline expired — the tap kept delivering after \
-             it was stopped, so the last moments of this meeting are missing",
-            deadlines.drain
-        ));
+    // Ring drops and an abandoned drain tail (#85), one entry per affected leg
+    // and cause, named so the remedy is looked for on the right device (#93).
+    for warning in ring_losses.warnings(deadlines.drain) {
+        control.errors.record(warning);
     }
 
     // Last, so it is what `SttErrors::latest()` shows: it is the only entry
@@ -2242,7 +2239,8 @@ async fn run_unsupervised(
         mic_samples,
         system_buffers,
         mic_buffers,
-        dropped_samples,
+        system_dropped_samples: ring_losses.dropped.system,
+        mic_dropped_samples: ring_losses.dropped.mic,
         segments,
         // Drained after the collector has finished, so a failure that arrived
         // during the provider's final flush is still carried out.
@@ -2576,8 +2574,7 @@ pub async fn run_supervised(
     let PumpCounts {
         system_samples,
         mic_samples,
-        dropped_samples,
-        abandoned_samples,
+        ring_losses,
         archive_warnings,
     } = match tokio::time::timeout(deadlines.join, pump_counts).await {
         Ok(Ok(counts)) => counts?,
@@ -2635,20 +2632,8 @@ pub async fn run_supervised(
     for warning in archive_warnings {
         control.errors.record(warning);
     }
-    if dropped_samples > 0 {
-        control.errors.record(format!(
-            "capture: {dropped_samples} samples were dropped at a full ring — \
-             the pump could not keep up with the audio thread"
-        ));
-    }
-
-    if abandoned_samples > 0 {
-        control.errors.record(format!(
-            "capture: {abandoned_samples} samples were still in the ring when \
-             the {:?} drain deadline expired — the tap kept delivering after \
-             it was stopped, so the last moments of this meeting are missing",
-            deadlines.drain
-        ));
+    for warning in ring_losses.warnings(deadlines.drain) {
+        control.errors.record(warning);
     }
 
     // Named but never fired on this path — the pump closes the taps itself, so
@@ -2677,7 +2662,8 @@ pub async fn run_supervised(
         mic_samples,
         system_buffers,
         mic_buffers,
-        dropped_samples,
+        system_dropped_samples: ring_losses.dropped.system,
+        mic_dropped_samples: ring_losses.dropped.mic,
         segments,
         stt_errors: control.errors.drain(),
     })
@@ -3244,6 +3230,70 @@ impl PumpStop<'_> {
 #[cfg(test)]
 const GENEROUS_DRAIN: Duration = Duration::from_secs(30);
 
+/// Interleaved samples counted for each capture leg on its own.
+///
+/// Named fields rather than a `[system, mic]` pair, so a value cannot be
+/// handed to the wrong leg without the mistake being spelled out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LegSamples {
+    system: u64,
+    mic: u64,
+}
+
+impl LegSamples {
+    /// Each leg with the label its degradation entries use.
+    const fn labelled(self) -> [(&'static str, u64); 2] {
+        [("system", self.system), ("mic", self.mic)]
+    }
+}
+
+/// Audio the rings lost, by cause and by leg (#93).
+///
+/// Both causes leave a hole that exists nowhere, because the ring sits
+/// upstream of the WAL: a drop is audio the pump was too slow to collect
+/// (#79), an abandoned tail is audio the tap went on delivering after it was
+/// told to stop, which the pump gave up draining at its deadline (#85).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RingLosses {
+    /// Rejected at a full ring, including rings retired by a tap rebuild.
+    dropped: LegSamples,
+    /// Still in the rings when the drain deadline expired; zero on every
+    /// clean stop.
+    abandoned: LegSamples,
+}
+
+impl RingLosses {
+    /// The degradation entries for these losses: one per leg and cause with a
+    /// loss, system before mic and drops before abandoned tails, and none for
+    /// a recording that lost nothing.
+    ///
+    /// Both recording paths build their entries here, so the text is the same
+    /// on each. Which counts each path passes in is checked by a session-level
+    /// test per path, not by this function.
+    fn warnings(&self, drain: Duration) -> Vec<String> {
+        let mut warnings = Vec::new();
+        for (leg, n) in self.dropped.labelled() {
+            if n > 0 {
+                warnings.push(format!(
+                    "capture ({leg}): {n} samples were dropped at a full ring — the \
+                     pump could not keep up with the audio thread"
+                ));
+            }
+        }
+        for (leg, n) in self.abandoned.labelled() {
+            if n > 0 {
+                warnings.push(format!(
+                    "capture ({leg}): {n} samples were still in the ring when the \
+                     {drain:?} drain deadline expired — the tap kept delivering \
+                     after it was stopped, so the last moments of this meeting are \
+                     missing"
+                ));
+            }
+        }
+        warnings
+    }
+}
+
 /// What one pump run moved, and what it did not.
 struct PumpCounts {
     archive_warnings: Vec<String>,
@@ -3251,11 +3301,8 @@ struct PumpCounts {
     system_samples: u64,
     /// Interleaved samples written to the mic leg.
     mic_samples: u64,
-    /// Samples the rings dropped because the pump fell behind.
-    dropped_samples: u64,
-    /// Samples still in the rings when the drain deadline expired, and zero
-    /// on every clean stop (#85).
-    abandoned_samples: u64,
+    /// What the rings lost and on which leg (#79/#85/#93).
+    ring_losses: RingLosses,
 }
 
 /// Drain both rings until stopped, writing raw audio and feeding the provider.
@@ -3543,7 +3590,7 @@ fn pump_drain(
     // teardown it never performed — left `moved` true on every pass and the
     // pump never looked at it again (#85).
     let mut drain_by: Option<Instant> = None;
-    let mut abandoned = 0u64;
+    let mut abandoned = LegSamples::default();
 
     loop {
         if drain_by.is_none() && stop.stopped.load(Ordering::Acquire) {
@@ -3726,7 +3773,10 @@ fn pump_drain(
             // finalize below still runs, which is the whole point: a session
             // left unfinalized is one `promote::pending` skips for good.
             Some(by) if Instant::now() >= by => {
-                abandoned = (sys.slots() + mic.slots()) as u64;
+                abandoned = LegSamples {
+                    system: sys.slots() as u64,
+                    mic: mic.slots() as u64,
+                };
                 break;
             }
             Some(_) => {}
@@ -3771,9 +3821,10 @@ fn pump_drain(
     wal.finalize()
         .map_err(|e| format!("finalize failed: {e}"))?;
     // Read after the drain, so this is the final count rather than a snapshot
-    // taken while the taps were still delivering. Both legs are summed: the
-    // caller's field is one number, and either leg falling behind means the
-    // same thing about this machine.
+    // taken while the taps were still delivering. Kept per leg, each with the
+    // drops of its own retired rings: summed, a mic overrun and a system
+    // overrun are the same number and nobody can tell which leg has the hole
+    // (#93). The caller still derives the one combined total from these.
     let mut archive_warnings = capture_warnings;
     if let Some(sup) = &supervision {
         for meta in std::iter::once(&sup.system).chain(sup.mic.iter()) {
@@ -3787,16 +3838,19 @@ fn pump_drain(
             }
         }
     }
+    let dropped = LegSamples {
+        system: sys.dropped_frames() + supervision.as_ref().map_or(0, |s| s.system.retired_drops),
+        mic: mic.dropped_frames()
+            + supervision
+                .as_ref()
+                .and_then(|s| s.mic.as_ref())
+                .map_or(0, |m| m.retired_drops),
+    };
     Ok(PumpCounts {
         archive_warnings,
         system_samples: sys_written,
         mic_samples: mic_written,
-        dropped_samples: sys.dropped_frames()
-            + mic.dropped_frames()
-            + supervision.as_ref().map_or(0, |s| {
-                s.system.retired_drops + s.mic.as_ref().map_or(0, |m| m.retired_drops)
-            }),
-        abandoned_samples: abandoned,
+        ring_losses: RingLosses { dropped, abandoned },
     })
 }
 
@@ -4562,7 +4616,8 @@ mod pump_clock_tests {
         let _ = std::fs::remove_dir_all(&root);
 
         assert_eq!(
-            counts.dropped_samples, expected,
+            counts.ring_losses.dropped.system + counts.ring_losses.dropped.mic,
+            expected,
             "the shortfall both rings counted"
         );
     }
@@ -4650,7 +4705,7 @@ mod pump_drain_tests {
         .expect("an expired drain is not an error");
 
         assert!(
-            counts.abandoned_samples > 0,
+            counts.ring_losses.abandoned != LegSamples::default(),
             "the pump reported nothing abandoned, so either it drained a full \
              ring in no time at all or the tail went unreported"
         );
@@ -4702,10 +4757,131 @@ mod pump_drain_tests {
             "the drain deadline ate audio a healthy stop had time to write"
         );
         assert_eq!(
-            counts.abandoned_samples, 0,
+            counts.ring_losses.abandoned,
+            LegSamples::default(),
             "a clean drain must not report an abandoned tail"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An abandoned tail belongs to the leg whose ring still held it (#93):
+    /// with only one ring left full at the deadline, the other leg reports
+    /// nothing abandoned.
+    #[test]
+    fn an_abandoned_tail_stays_on_the_leg_that_left_it() {
+        for full_leg in [0usize, 1] {
+            let root = tmp_root(&format!("abandon-leg-{full_leg}"));
+            let wal = SessionWal::create(&root, CAPTURE_RATE, CHANNELS).expect("a session");
+            let (sys_full, mic_full, _) = full_rings();
+            let (_, sys_empty) = AudioRing::with_capacity_frames(RING_SAMPLES);
+            let (_, mic_empty) = AudioRing::with_capacity_frames(RING_SAMPLES);
+            let (sys, mic) = if full_leg == 0 {
+                (sys_full, mic_empty)
+            } else {
+                (sys_empty, mic_full)
+            };
+
+            let stop = AtomicBool::new(true);
+            let counts = pump_loop(
+                wal,
+                sys,
+                mic,
+                capture_format(),
+                Some(capture_format()),
+                no_feeds(),
+                PumpStop {
+                    capture: None,
+                    stopped: &stop,
+                    drain: Duration::ZERO,
+                },
+            )
+            .expect("an expired drain is not an error");
+
+            let tail = counts.ring_losses.abandoned;
+            let (full, empty) = if full_leg == 0 {
+                (tail.system, tail.mic)
+            } else {
+                (tail.mic, tail.system)
+            };
+            assert!(
+                full > 0,
+                "leg {full_leg} was left full and reported nothing abandoned: {tail:?}"
+            );
+            assert_eq!(
+                empty, 0,
+                "the leg whose ring was empty was blamed for the other's tail"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// The text a human reads names the leg, one entry per affected leg and
+    /// cause, and nothing at all for a recording that lost none (#93).
+    #[test]
+    fn ring_loss_warnings_name_the_leg_that_lost_audio() {
+        let drain = Duration::from_millis(1_500);
+        assert!(
+            RingLosses {
+                dropped: LegSamples { system: 0, mic: 0 },
+                abandoned: LegSamples { system: 0, mic: 0 }
+            }
+            .warnings(drain)
+            .is_empty()
+        );
+
+        let dropped = |leg: &str, n: u64| {
+            format!(
+                "capture ({leg}): {n} samples were dropped at a full ring — the \
+                 pump could not keep up with the audio thread"
+            )
+        };
+        let abandoned = |leg: &str, n: u64| {
+            format!(
+                "capture ({leg}): {n} samples were still in the ring when the \
+                 1.5s drain deadline expired — the tap kept delivering after it \
+                 was stopped, so the last moments of this meeting are missing"
+            )
+        };
+        assert_eq!(
+            RingLosses {
+                dropped: LegSamples { system: 0, mic: 7 },
+                abandoned: LegSamples { system: 0, mic: 0 }
+            }
+            .warnings(drain),
+            vec![dropped("mic", 7)]
+        );
+        assert_eq!(
+            RingLosses {
+                dropped: LegSamples { system: 5, mic: 0 },
+                abandoned: LegSamples { system: 0, mic: 0 }
+            }
+            .warnings(drain),
+            vec![dropped("system", 5)]
+        );
+        assert_eq!(
+            RingLosses {
+                dropped: LegSamples { system: 5, mic: 7 },
+                abandoned: LegSamples { system: 0, mic: 0 }
+            }
+            .warnings(drain),
+            vec![dropped("system", 5), dropped("mic", 7)]
+        );
+        assert_eq!(
+            RingLosses {
+                dropped: LegSamples { system: 0, mic: 0 },
+                abandoned: LegSamples { system: 0, mic: 3 }
+            }
+            .warnings(drain),
+            vec![abandoned("mic", 3)]
+        );
+        assert_eq!(
+            RingLosses {
+                dropped: LegSamples { system: 0, mic: 7 },
+                abandoned: LegSamples { system: 2, mic: 0 }
+            }
+            .warnings(drain),
+            vec![dropped("mic", 7), abandoned("system", 2)]
+        );
     }
 }
 
@@ -5393,6 +5569,408 @@ mod supervised_recovery_tests {
         }
     }
 
+    /// #93 at the daemon's supervised session level, through `run_supervised`
+    /// itself: whichever ring overruns, the outcome's per-leg fields and the
+    /// degradation entries name that leg and never the other. Different sizes
+    /// on each leg, so a loss booked on the wrong leg cannot pass.
+    #[tokio::test]
+    async fn a_supervised_overrun_is_reported_on_the_leg_that_overran() {
+        use fotw_audio::{
+            AppInfo, BoxFuture, DeviceInfo, Permission, PermissionState, PlatformCaps,
+            PlatformEvent,
+        };
+        // Larger than the session's ring, so the supervised sink rejects the
+        // whole callback and the loss is exact.
+        const SYSTEM_BURST: usize = RING_SAMPLES + 48_000 * 2 * 3;
+        const MIC_BURST: usize = RING_SAMPLES + 48_000 * 2 * 2;
+        struct BurstTap {
+            id: TapId,
+            burst: usize,
+        }
+        impl AudioTap for BurstTap {
+            fn id(&self) -> &TapId {
+                &self.id
+            }
+            fn format(&self) -> StreamFormat {
+                StreamFormat::new(48_000, 2, SampleFormat::F32)
+            }
+            fn format_is_authoritative(&self) -> bool {
+                false
+            }
+            fn start(&mut self, mut sink: Box<dyn FrameSink>) -> Result<StreamFormat, TapError> {
+                if self.burst > 0 {
+                    sink.on_frames(
+                        &vec![0.25; self.burst],
+                        CaptureTimestamp::new(0, 0),
+                        FrameFlags::empty(),
+                    );
+                }
+                // Audible audio that fits, so neither leg reports itself silent.
+                sink.on_frames(
+                    &[0.25; 960],
+                    CaptureTimestamp::new((self.burst / 2) as u64, 0),
+                    FrameFlags::empty(),
+                );
+                Ok(self.format())
+            }
+            fn stop(&mut self) -> Result<(), TapError> {
+                Ok(())
+            }
+        }
+        struct BurstPlatform {
+            base: MockPlatform,
+            system_burst: usize,
+            mic_burst: usize,
+        }
+        impl AudioPlatform for BurstPlatform {
+            fn caps(&self) -> PlatformCaps {
+                self.base.caps()
+            }
+            fn permission(&self, p: Permission) -> PermissionState {
+                self.base.permission(p)
+            }
+            fn request_permission(&self, p: Permission) -> BoxFuture<'static, PermissionState> {
+                self.base.request_permission(p)
+            }
+            fn mics(&self) -> Vec<DeviceInfo> {
+                self.base.mics()
+            }
+            fn capturable_apps(&self) -> Vec<AppInfo> {
+                self.base.capturable_apps()
+            }
+            fn events(&self) -> std::sync::mpsc::Receiver<PlatformEvent> {
+                self.base.events()
+            }
+            fn open_system(
+                &self,
+                _: SystemScope,
+                _: FormatRequest,
+            ) -> Result<Box<dyn AudioTap>, TapError> {
+                Ok(Box::new(BurstTap {
+                    id: TapId::system_default(),
+                    burst: self.system_burst,
+                }))
+            }
+            fn open_mic(
+                &self,
+                _: &DeviceId,
+                _: FormatRequest,
+            ) -> Result<Box<dyn AudioTap>, TapError> {
+                Ok(Box::new(BurstTap {
+                    id: TapId::mic("default"),
+                    burst: self.mic_burst,
+                }))
+            }
+        }
+
+        for (case, system_burst, mic_burst) in [
+            ("mic only", 0, MIC_BURST),
+            ("system only", SYSTEM_BURST, 0),
+            ("both", SYSTEM_BURST, MIC_BURST),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            // Never advanced, so no watchdog stall and no rebuild.
+            let clock = ManualClock::new();
+            let control = SessionControl::new();
+            let driver = async {
+                while !control.ready.is_ready() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                control.stop.stop();
+            };
+            let platform = Arc::new(BurstPlatform {
+                base: MockPlatform::macos_taps(),
+                system_burst,
+                mic_burst,
+            });
+            let (outcome, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(
+                    run_supervised(
+                        root.path(),
+                        platform,
+                        clock.clone(),
+                        Transcription::Disabled,
+                        Duration::from_secs(60),
+                        control.clone()
+                    ),
+                    driver
+                )
+            })
+            .await
+            .expect("fixture recording must finish");
+            let outcome = outcome.unwrap();
+
+            assert_eq!(
+                (outcome.system_dropped_samples, outcome.mic_dropped_samples),
+                (system_burst as u64, mic_burst as u64),
+                "{case}: each ring's loss belongs to its own leg"
+            );
+            assert_eq!(
+                outcome.dropped_samples(),
+                (system_burst + mic_burst) as u64,
+                "{case}: the combined total"
+            );
+            let losses: Vec<&String> = outcome
+                .stt_errors
+                .iter()
+                .filter(|e| e.contains("dropped at a full ring"))
+                .collect();
+            let mut expected = Vec::new();
+            if system_burst > 0 {
+                expected.push(format!(
+                    "capture (system): {system_burst} samples were dropped at a full ring"
+                ));
+            }
+            if mic_burst > 0 {
+                expected.push(format!(
+                    "capture (mic): {mic_burst} samples were dropped at a full ring"
+                ));
+            }
+            assert_eq!(
+                losses.len(),
+                expected.len(),
+                "{case}: one entry per leg that lost audio: {:?}",
+                outcome.stt_errors
+            );
+            for (entry, prefix) in losses.iter().zip(&expected) {
+                assert!(
+                    entry.starts_with(prefix.as_str()),
+                    "{case}: expected an entry starting {prefix:?}, got {entry:?}"
+                );
+            }
+            if system_burst == 0 {
+                assert!(
+                    !outcome
+                        .stt_errors
+                        .iter()
+                        .any(|e| e.starts_with("capture (system):")),
+                    "{case}: the system leg lost nothing and must not be blamed: {:?}",
+                    outcome.stt_errors
+                );
+            }
+        }
+    }
+
+    /// #93's abandoned tail through `run_supervised` itself, with a different
+    /// tail on each leg so a reversed attribution cannot pass.
+    ///
+    /// Deterministic without sleeps or a production hook. The session's
+    /// injected clock is read on the pump thread only inside the supervisors'
+    /// poll, so a gate on it parks the pump there. While it is parked the test
+    /// fills each ring by a known amount and stops the session. The driver and
+    /// `run_supervised` share one task under `tokio::join!`, and
+    /// `run_supervised` sets the pump's stop latch right after it records the
+    /// stop time with no await in between. So once the driver sees the stop
+    /// time, the latch is set. Only then does the gate open: the pump drains one
+    /// pass, sees the latch, and with a zero drain deadline abandons what the
+    /// rings still hold.
+    #[tokio::test]
+    async fn a_supervised_drain_deadline_reports_each_legs_own_abandoned_tail() {
+        use fotw_audio::{
+            AppInfo, BoxFuture, DeviceInfo, Permission, PermissionState, PlatformCaps,
+            PlatformEvent,
+        };
+        use std::sync::{Condvar, Mutex};
+        type SharedSink = Arc<Mutex<Option<Box<dyn FrameSink>>>>;
+        // Under the ring's capacity so nothing is dropped, more than the pump
+        // drains in the passes it gets, and different on each leg.
+        const SYSTEM_FILL: usize = 48_000 * 2 * 3;
+        const MIC_FILL: usize = 48_000 * 2 * 5;
+
+        /// The fixture clock, plus a gate that parks every thread but the
+        /// test's own on its next read while armed.
+        #[derive(Default)]
+        struct GateState {
+            armed_except: Option<std::thread::ThreadId>,
+            parked: bool,
+        }
+        struct GateClock {
+            inner: Arc<ManualClock>,
+            state: Mutex<GateState>,
+            changed: Condvar,
+        }
+        impl Clock for GateClock {
+            fn now_ns(&self) -> u64 {
+                let mut state = self.state.lock().unwrap();
+                while state
+                    .armed_except
+                    .is_some_and(|test| test != std::thread::current().id())
+                {
+                    state.parked = true;
+                    self.changed.notify_all();
+                    state = self.changed.wait(state).unwrap();
+                }
+                drop(state);
+                self.inner.now_ns()
+            }
+        }
+
+        /// A tap that hands its sink to the test and delivers nothing itself.
+        struct HeldTap {
+            id: TapId,
+            sink: SharedSink,
+        }
+        impl AudioTap for HeldTap {
+            fn id(&self) -> &TapId {
+                &self.id
+            }
+            fn format(&self) -> StreamFormat {
+                StreamFormat::new(48_000, 2, SampleFormat::F32)
+            }
+            fn format_is_authoritative(&self) -> bool {
+                false
+            }
+            fn start(&mut self, sink: Box<dyn FrameSink>) -> Result<StreamFormat, TapError> {
+                *self.sink.lock().unwrap() = Some(sink);
+                Ok(self.format())
+            }
+            fn stop(&mut self) -> Result<(), TapError> {
+                Ok(())
+            }
+        }
+        struct HeldPlatform {
+            base: MockPlatform,
+            system: SharedSink,
+            mic: SharedSink,
+        }
+        impl AudioPlatform for HeldPlatform {
+            fn caps(&self) -> PlatformCaps {
+                self.base.caps()
+            }
+            fn permission(&self, p: Permission) -> PermissionState {
+                self.base.permission(p)
+            }
+            fn request_permission(&self, p: Permission) -> BoxFuture<'static, PermissionState> {
+                self.base.request_permission(p)
+            }
+            fn mics(&self) -> Vec<DeviceInfo> {
+                self.base.mics()
+            }
+            fn capturable_apps(&self) -> Vec<AppInfo> {
+                self.base.capturable_apps()
+            }
+            fn events(&self) -> std::sync::mpsc::Receiver<PlatformEvent> {
+                self.base.events()
+            }
+            fn open_system(
+                &self,
+                _: SystemScope,
+                _: FormatRequest,
+            ) -> Result<Box<dyn AudioTap>, TapError> {
+                Ok(Box::new(HeldTap {
+                    id: TapId::system_default(),
+                    sink: self.system.clone(),
+                }))
+            }
+            fn open_mic(
+                &self,
+                _: &DeviceId,
+                _: FormatRequest,
+            ) -> Result<Box<dyn AudioTap>, TapError> {
+                Ok(Box::new(HeldTap {
+                    id: TapId::mic("default"),
+                    sink: self.mic.clone(),
+                }))
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        // The inner clock is never advanced, so no watchdog stall and no rebuild.
+        let clock = Arc::new(GateClock {
+            inner: ManualClock::new(),
+            state: Mutex::default(),
+            changed: Condvar::new(),
+        });
+        let platform = Arc::new(HeldPlatform {
+            base: MockPlatform::macos_taps(),
+            system: Arc::default(),
+            mic: Arc::default(),
+        });
+        let mut control = SessionControl::new();
+        control.deadlines = FinishDeadlines {
+            drain: Duration::ZERO,
+            ..FinishDeadlines::default()
+        };
+        let driver = async {
+            while !control.ready.is_ready() {
+                tokio::task::yield_now().await;
+            }
+            // Park the pump at its next supervisor poll.
+            {
+                let mut state = clock.state.lock().unwrap();
+                state.armed_except = Some(std::thread::current().id());
+                let (state, timeout) = clock
+                    .changed
+                    .wait_timeout_while(state, Duration::from_secs(10), |s| !s.parked)
+                    .unwrap();
+                assert!(!timeout.timed_out(), "the pump never reached its poll");
+                drop(state);
+            }
+            for (sink, fill) in [(&platform.system, SYSTEM_FILL), (&platform.mic, MIC_FILL)] {
+                sink.lock().unwrap().as_mut().unwrap().on_frames(
+                    &vec![0.25; fill],
+                    CaptureTimestamp::new(0, 0),
+                    FrameFlags::empty(),
+                );
+            }
+            control.stop.stop();
+            while control.ready.capture_ended_at_ms().is_none() {
+                tokio::task::yield_now().await;
+            }
+            // The latch is set (see above): let the pump go.
+            clock.state.lock().unwrap().armed_except = None;
+            clock.changed.notify_all();
+        };
+        let (outcome, ()) = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::join!(
+                run_supervised(
+                    root.path(),
+                    platform.clone(),
+                    clock.clone(),
+                    Transcription::Disabled,
+                    Duration::from_secs(60),
+                    control.clone()
+                ),
+                driver
+            )
+        })
+        .await
+        .expect("fixture recording must finish");
+        let outcome = outcome.unwrap();
+
+        // Whatever each leg's ring did not reach the WAL is its abandoned tail.
+        let system_tail = SYSTEM_FILL as u64 - outcome.system_samples;
+        let mic_tail = MIC_FILL as u64 - outcome.mic_samples;
+        assert!(
+            system_tail > 0 && mic_tail > 0 && system_tail != mic_tail,
+            "the fixture must leave a different tail on each leg: system \
+             {system_tail}, mic {mic_tail}"
+        );
+        let tails: Vec<&String> = outcome
+            .stt_errors
+            .iter()
+            .filter(|e| e.contains("drain deadline expired"))
+            .collect();
+        assert_eq!(
+            tails,
+            [
+                &format!(
+                    "capture (system): {system_tail} samples were still in the ring when \
+                     the 0ns drain deadline expired — the tap kept delivering after it \
+                     was stopped, so the last moments of this meeting are missing"
+                ),
+                &format!(
+                    "capture (mic): {mic_tail} samples were still in the ring when the \
+                     0ns drain deadline expired — the tap kept delivering after it was \
+                     stopped, so the last moments of this meeting are missing"
+                ),
+            ],
+            "each leg's own tail, named and counted: {:?}",
+            outcome.stt_errors
+        );
+        assert_eq!(outcome.dropped_samples(), 0, "a tail is not a ring drop");
+    }
+
     #[test]
     fn invalid_capture_does_not_strand_the_recording() {
         for (name, pcm, expected) in [
@@ -5486,6 +6064,339 @@ mod supervised_recovery_tests {
                 );
                 assert!(samples[expected.len()..].iter().all(|sample| *sample == 0));
             }
+        }
+    }
+
+    /// Ring capacity for the loss fixtures below, in interleaved samples.
+    const LOSS_RING: usize = 4_096;
+    /// What each leg's overrun loses: [system, mic]. Different, so a count on
+    /// the wrong leg cannot pass for the right one.
+    const LOSS: LegSamples = LegSamples {
+        system: 6_000,
+        mic: 8_000,
+    };
+
+    /// A ring holding `real` samples, after which a callback of `lost` samples
+    /// arrives that does not fit. Capture admission takes whole callbacks or
+    /// none, so exactly `lost` samples are dropped.
+    fn overrun_ring(real: usize, lost: u64) -> RingConsumer {
+        let (mut producer, consumer) = AudioRing::with_capacity_frames(LOSS_RING);
+        if real > 0 {
+            assert_eq!(producer.push_complete_block(&vec![0.25; real]), real);
+        }
+        if lost > 0 {
+            assert_eq!(producer.push_complete_block(&vec![0.25; lost as usize]), 0);
+        }
+        assert_eq!(consumer.dropped_frames(), lost);
+        consumer
+    }
+
+    /// Both legs, already stopped, through the unsupervised pump or the
+    /// supervised one: the two entry points the two recording paths use.
+    fn drain_overruns(lost: LegSamples, real: usize, supervised: bool) -> PumpCounts {
+        let root = tempfile::tempdir().unwrap();
+        let archive = TrackFormat::new(48_000, 2);
+        let stream = StreamFormat::new(48_000, 2, SampleFormat::F32);
+        let wal = SessionWal::create_with_formats(root.path(), archive, Some(archive)).unwrap();
+        let supervision = supervised.then(|| {
+            let clock = ManualClock::new();
+            let (system, _, _, _) = fake_leg(
+                "system",
+                LegChannel::System,
+                TapId::system_default(),
+                archive,
+                &clock,
+            );
+            let (mic, _, _, _) = fake_leg(
+                "mic",
+                LegChannel::Mic,
+                TapId::mic("default"),
+                archive,
+                &clock,
+            );
+            Supervision {
+                plat: Arc::new(MockPlatform::macos_taps()),
+                epoch_ns: 0,
+                system,
+                mic: Some(mic),
+                interval: SUPERVISE_INTERVAL,
+                last: Instant::now(),
+            }
+        });
+        let stopped = AtomicBool::new(true);
+        pump_drain(
+            wal,
+            overrun_ring(real, lost.system),
+            overrun_ring(real, lost.mic),
+            stream,
+            Some(stream),
+            SttFeeds {
+                system: None,
+                mic: None,
+                echo_gate: None,
+                ..SttFeeds::default()
+            },
+            PumpStop {
+                capture: None,
+                stopped: &stopped,
+                drain: GENEROUS_DRAIN,
+            },
+            supervision,
+        )
+        .expect("the pump drains cleanly")
+    }
+
+    /// The pump used to sum both rings' drops, so a mic overrun and a system
+    /// overrun produced the same number and the same warning (#93). Each leg
+    /// now keeps its own count, on both pump paths, and they agree.
+    #[test]
+    fn ring_drops_stay_on_the_leg_that_overran_on_both_pump_paths() {
+        for (case, lost) in [
+            (
+                "mic only",
+                LegSamples {
+                    system: 0,
+                    mic: LOSS.mic,
+                },
+            ),
+            (
+                "system only",
+                LegSamples {
+                    system: LOSS.system,
+                    mic: 0,
+                },
+            ),
+            ("both", LOSS),
+            ("neither", LegSamples::default()),
+        ] {
+            let unsupervised = drain_overruns(lost, 960, false);
+            let supervised = drain_overruns(lost, 960, true);
+            for (path, counts) in [("unsupervised", &unsupervised), ("supervised", &supervised)] {
+                assert_eq!(
+                    counts.ring_losses.dropped, lost,
+                    "{case}, {path}: each leg reports its own ring's drops"
+                );
+                assert_eq!(
+                    counts.ring_losses.abandoned,
+                    LegSamples::default(),
+                    "{case}, {path}: a drop is not an abandoned tail"
+                );
+                assert_eq!(
+                    (counts.system_samples, counts.mic_samples),
+                    (960, 960),
+                    "{case}, {path}: the audio that fit is still written"
+                );
+            }
+        }
+    }
+
+    /// A rebuild retires a leg's ring and hands the pump a new one. The old
+    /// ring's drops are carried on the leg it belonged to, not on whichever
+    /// leg the pump happens to sum them into (#93).
+    #[test]
+    fn a_retired_rings_drops_stay_with_its_own_leg() {
+        for (index, channel) in [(0usize, LegChannel::System), (1, LegChannel::Mic)] {
+            let root = tempfile::tempdir().unwrap();
+            let clock = ManualClock::new();
+            let plat = MockPlatform::macos_taps();
+            let mut scratch = vec![0.0; 48_000];
+            let archive = TrackFormat::new(48_000, 2);
+            let stream = StreamFormat::new(48_000, 2, SampleFormat::F32);
+            let mut wal =
+                SessionWal::create_with_formats(root.path(), archive, Some(archive)).unwrap();
+            let (mut system, _, _, _) = fake_leg(
+                "system",
+                LegChannel::System,
+                TapId::system_default(),
+                archive,
+                &clock,
+            );
+            let (mut mic, _, _, _) = fake_leg(
+                "mic",
+                LegChannel::Mic,
+                TapId::mic("default"),
+                archive,
+                &clock,
+            );
+            let expected = if channel == LegChannel::System {
+                LegSamples {
+                    system: LOSS.system,
+                    mic: 0,
+                }
+            } else {
+                LegSamples {
+                    system: 0,
+                    mic: LOSS.mic,
+                }
+            };
+            let mut retiring = overrun_ring(0, expected.system + expected.mic);
+            let meta = if channel == LegChannel::System {
+                &mut system
+            } else {
+                &mut mic
+            };
+            // Six seconds without a buffer: the leg's tap is rebuilt and the
+            // overrun ring retired, as in `invalid_capture_does_not_strand_the_recording`.
+            supervise_channel(&mut wal, meta, &mut retiring, &plat, 0, &mut scratch).unwrap();
+            clock.advance(Duration::from_secs(6));
+            supervise_channel(&mut wal, meta, &mut retiring, &plat, 0, &mut scratch).unwrap();
+            assert_eq!(meta.supervisor.rebuilds(), 1, "the leg was rebuilt");
+            assert_eq!(
+                retiring.dropped_frames(),
+                0,
+                "the pump now holds a new ring"
+            );
+
+            let (_, other) = AudioRing::with_capacity_frames(LOSS_RING);
+            let (sys_cons, mic_cons) = if channel == LegChannel::System {
+                (retiring, other)
+            } else {
+                (other, retiring)
+            };
+            let stopped = AtomicBool::new(true);
+            let counts = pump_drain(
+                wal,
+                sys_cons,
+                mic_cons,
+                stream,
+                Some(stream),
+                SttFeeds {
+                    system: None,
+                    mic: None,
+                    echo_gate: None,
+                    ..SttFeeds::default()
+                },
+                PumpStop {
+                    capture: None,
+                    stopped: &stopped,
+                    drain: GENEROUS_DRAIN,
+                },
+                Some(Supervision {
+                    plat: Arc::new(MockPlatform::macos_taps()),
+                    epoch_ns: 0,
+                    system,
+                    mic: Some(mic),
+                    interval: SUPERVISE_INTERVAL,
+                    last: Instant::now(),
+                }),
+            )
+            .unwrap();
+            assert_eq!(
+                counts.ring_losses.dropped, expected,
+                "leg {index}: the retired ring's drops belong to its own leg"
+            );
+        }
+    }
+
+    /// A leg rebuilt twice keeps every retired ring's drops, plus its live
+    /// ring's, and the other leg stays at zero. Overwriting instead of adding
+    /// on each rebuild would keep only the last retired generation.
+    #[test]
+    fn repeated_rebuilds_of_one_leg_keep_every_retired_rings_drops() {
+        for channel in [LegChannel::System, LegChannel::Mic] {
+            let root = tempfile::tempdir().unwrap();
+            let clock = ManualClock::new();
+            let plat = MockPlatform::macos_taps();
+            let mut scratch = vec![0.0; 48_000];
+            let archive = TrackFormat::new(48_000, 2);
+            let stream = StreamFormat::new(48_000, 2, SampleFormat::F32);
+            let mut wal =
+                SessionWal::create_with_formats(root.path(), archive, Some(archive)).unwrap();
+            let (mut system, _, _, _) = fake_leg(
+                "system",
+                LegChannel::System,
+                TapId::system_default(),
+                archive,
+                &clock,
+            );
+            let (mut mic, _, _, _) = fake_leg(
+                "mic",
+                LegChannel::Mic,
+                TapId::mic("default"),
+                archive,
+                &clock,
+            );
+            let meta = if channel == LegChannel::System {
+                &mut system
+            } else {
+                &mut mic
+            };
+            // Generation 1 loses 5000 and generation 2 loses 6000 before each
+            // is retired by a starvation rebuild; the live ring then loses 7000.
+            let mut ring = overrun_ring(0, 5_000);
+            for (lost, generation) in [(5_000u64, 1u32), (6_000, 2)] {
+                if generation == 2 {
+                    ring = overrun_ring(0, lost);
+                }
+                supervise_channel(&mut wal, meta, &mut ring, &plat, 0, &mut scratch).unwrap();
+                let mut polls = 0;
+                while meta.supervisor.rebuilds() < generation && polls < 400 {
+                    clock.advance(Duration::from_secs(1));
+                    supervise_channel(&mut wal, meta, &mut ring, &plat, 0, &mut scratch).unwrap();
+                    polls += 1;
+                }
+                assert_eq!(
+                    meta.supervisor.rebuilds(),
+                    generation,
+                    "rebuild {generation}"
+                );
+            }
+            let (_, other) = AudioRing::with_capacity_frames(LOSS_RING);
+            let live = overrun_ring(0, 7_000);
+            let (sys_cons, mic_cons) = if channel == LegChannel::System {
+                (live, other)
+            } else {
+                (other, live)
+            };
+            let stopped = AtomicBool::new(true);
+            let counts = pump_drain(
+                wal,
+                sys_cons,
+                mic_cons,
+                stream,
+                Some(stream),
+                SttFeeds {
+                    system: None,
+                    mic: None,
+                    echo_gate: None,
+                    ..SttFeeds::default()
+                },
+                PumpStop {
+                    capture: None,
+                    stopped: &stopped,
+                    drain: GENEROUS_DRAIN,
+                },
+                Some(Supervision {
+                    plat: Arc::new(MockPlatform::macos_taps()),
+                    epoch_ns: 0,
+                    system,
+                    mic: Some(mic),
+                    interval: SUPERVISE_INTERVAL,
+                    last: Instant::now(),
+                }),
+            )
+            .unwrap();
+            let (expected, leg) = if channel == LegChannel::System {
+                (
+                    LegSamples {
+                        system: 18_000,
+                        mic: 0,
+                    },
+                    "system",
+                )
+            } else {
+                (
+                    LegSamples {
+                        system: 0,
+                        mic: 18_000,
+                    },
+                    "mic",
+                )
+            };
+            assert_eq!(
+                counts.ring_losses.dropped, expected,
+                "{leg}: both retired generations and the live ring, on this leg only"
+            );
         }
     }
 

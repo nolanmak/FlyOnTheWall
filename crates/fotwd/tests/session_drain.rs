@@ -447,6 +447,17 @@ async fn a_pump_that_gives_up_draining_reports_the_tail_it_dropped() {
         "the abandoned tail was not reported: {:?}",
         outcome.stt_errors
     );
+    // And against the leg that lost it: this session has only a system tap,
+    // so the tail is the system leg's and no other leg is blamed (#93).
+    assert!(
+        outcome
+            .stt_errors
+            .iter()
+            .filter(|e| e.contains("drain deadline"))
+            .all(|e| e.starts_with("capture (system):")),
+        "the abandoned tail was not attributed to the system leg: {:?}",
+        outcome.stt_errors
+    );
 
     let manifest = std::fs::read_to_string(outcome.dir.join("manifest.json")).expect("a manifest");
     assert!(

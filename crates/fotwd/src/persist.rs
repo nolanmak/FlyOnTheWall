@@ -565,7 +565,8 @@ fn outcome_shallow(o: &SessionOutcome) -> SessionOutcome {
         stt_errors: o.stt_errors.clone(),
         system_buffers: o.system_buffers,
         mic_buffers: o.mic_buffers,
-        dropped_samples: o.dropped_samples,
+        system_dropped_samples: o.system_dropped_samples,
+        mic_dropped_samples: o.mic_dropped_samples,
         segments: Vec::new(),
     }
 }
@@ -672,7 +673,8 @@ mod tests {
                 total: 100,
             },
             mic_buffers: None,
-            dropped_samples: 0,
+            system_dropped_samples: 0,
+            mic_dropped_samples: 0,
             segments: Vec::new(),
         };
         let id = persist_session(&mut db, &outcome, "Untitled recording — 1754900000").unwrap();

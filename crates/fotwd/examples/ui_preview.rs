@@ -176,7 +176,8 @@ async fn main() -> Result<(), String> {
                 total: (t / 10).max(1),
             },
             mic_buffers: None,
-            dropped_samples: 0,
+            system_dropped_samples: 0,
+            mic_dropped_samples: 0,
             segments,
             stt_errors: Vec::new(),
         };

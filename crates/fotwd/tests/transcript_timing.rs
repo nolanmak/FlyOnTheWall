@@ -195,7 +195,7 @@ async fn check_capture(speech_ms: u64, mic_delay: Duration) {
         .unwrap()
         .unwrap()
         .unwrap();
-    assert_eq!(outcome.dropped_samples, 0);
+    assert_eq!(outcome.dropped_samples(), 0);
     assert_eq!(outcome.segments.len(), 2, "{:?}", outcome.stt_errors);
     let id = outcome.dir.file_name().unwrap().to_str().unwrap();
     for seg in &outcome.segments {

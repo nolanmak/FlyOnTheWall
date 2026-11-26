@@ -1149,9 +1149,11 @@ async fn spawn_session(
     let persisted = match outcome {
         Ok(outcome) => {
             work.require_save();
-            // Each entry names its own leg or stage ("mic: …", "capture: …"),
-            // and since #79 they are not all transcription failures — a ring
-            // drop rides this channel too, because it is the only one anybody
+            // Each entry names its own leg or stage ("mic: …", "capture
+            // (system): …", "capture (mic): …", "capture: …"), and since #79
+            // they are not all transcription failures — ring drops and an
+            // abandoned drain tail ride this channel too, one entry per
+            // affected leg and cause (#93), because it is the only one anybody
             // reads.
             journal::record(&format!(
                 "recording: session ended — {} segment(s), {} degradation(s)",

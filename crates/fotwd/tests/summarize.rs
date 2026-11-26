@@ -287,7 +287,8 @@ fn seeded_meeting(db: &mut Db, dir: &std::path::Path) -> String {
             total: 10,
         },
         mic_buffers: None,
-        dropped_samples: 0,
+        system_dropped_samples: 0,
+        mic_dropped_samples: 0,
         segments: vec![
             seg(
                 0,
