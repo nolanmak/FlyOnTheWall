@@ -58,6 +58,9 @@ tokio = { workspace = true, features = [
 sha2 = "0.11"
 # Filesystem free-space and no-follow checks; already in Cargo.lock.
 libc = "0.2"
+# The attendee release tables' compare-and-set statements (#331). The same
+# version fotw-store pins (its features unify), so no new supply chain.
+rusqlite = "0.40.2"
 reqwest = { version = "0.13.4", default-features = false, features = ["http2", "native-tls", "json", "charset", "blocking"] }
 
 # Private HTTP/1 IPC over an already authenticated Unix stream. No connector,

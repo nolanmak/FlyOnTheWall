@@ -714,7 +714,11 @@ impl GithubExporter {
 ///   is what stops the gate stranding an archive, and it also covers the
 ///   passes that die before the started stamp — a keychain or library that
 ///   would not open (`enrich.rs`'s wrapper).
-fn export_ready(receipt: Option<&crate::enrich::EnrichReceipt>, updated_at: i64, now: u64) -> bool {
+pub(crate) fn export_ready(
+    receipt: Option<&crate::enrich::EnrichReceipt>,
+    updated_at: i64,
+    now: u64,
+) -> bool {
     let long_enough_ago = |then: u64| now.saturating_sub(then) > ENRICH_GRACE_MS;
     match receipt {
         Some(r) if r.finished_at_ms > 0 => true,
