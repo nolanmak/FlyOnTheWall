@@ -1315,94 +1315,134 @@ async fn a_local_fallback_cannot_undo_a_rename_during_credential_resolution() {
 }
 
 // ------------------------------------------------------ overlapping passes
+//
+// #335: "an older failed pass can mark a newer successful summary as failed".
+// Nothing serialises enrichment passes on one meeting — the post-finalize
+// pass, a backfill pass and a manual `fotwd summarize` can all be in flight at
+// once — so the status write has to be decided by which pass is newest, not
+// by which one finished last.
+//
+// The overlaps are built deterministically with FIFOs, never sleeps: a parked
+// engine invocation announces itself on `ready<n>` and blocks on `gate<n>`,
+// and the test decides when each one may answer.
 
-/// Reported against 0987f7a: "an older failed pass can mark a newer
-/// successful summary as failed".
+/// A stub CLI whose invocations can be parked and released one at a time.
 ///
-/// Two enrichment passes overlap on one meeting (the post-finalize pass and
-/// a backfill pass, say). Nothing serialises them. The older pass (A) is
-/// mid-call when the newer pass (B) runs to completion and stores a summary
-/// with `enrich_status = 'ok'`. A's engine call then fails, and A writes
-/// `failed` over B's `ok` unconditionally, so the dashboard prints "Summary
-/// failed" over a summary the user can read.
-///
-/// The overlap is built deterministically with two FIFOs, no sleeps: A's
-/// engine invocation announces itself on `ready` and parks on `gate`; the
-/// test runs B to completion only after `ready`, and opens `gate` only after
-/// B has finished.
-#[tokio::test]
-async fn an_older_failed_pass_does_not_mark_a_newer_summary_failed() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("db.sqlite3");
+/// Invocation `n` answers `<n>.json` if the test wrote one, and otherwise
+/// fails with "usage limit reached". If [`park`](Self::park)ed, it first
+/// signals `ready<n>` and waits on `gate<n>`.
+struct GatedCli {
+    dir: std::path::PathBuf,
+    binary: String,
+}
+
+impl GatedCli {
+    fn new(root: &std::path::Path) -> Self {
+        let dir = root.join("engine");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join(STUB_ENGINE_NAME);
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\n\
+             cat > /dev/null\n\
+             d=$(dirname \"$0\")\n\
+             n=$(cat \"$d/n\" 2>/dev/null || echo 0)\n\
+             n=$((n+1))\n\
+             echo \"$n\" > \"$d/n\"\n\
+             if [ -p \"$d/gate$n\" ]; then\n\
+               echo ready > \"$d/ready$n\"\n\
+               read go < \"$d/gate$n\"\n\
+             fi\n\
+             if [ -f \"$d/$n.json\" ]; then cat \"$d/$n.json\"; else\n\
+               echo 'usage limit reached' >&2; exit 1; fi\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            fotwd::testing::make_executable(&bin);
+        }
+        let binary = bin.to_string_lossy().into_owned();
+        Self { dir, binary }
+    }
+
+    /// Invocation `n` answers `reply` instead of failing.
+    fn reply(&self, n: usize, reply: &str) {
+        std::fs::write(self.dir.join(format!("{n}.json")), envelope(reply)).unwrap();
+    }
+
+    /// Invocation `n` waits for [`release`](Self::release) before answering.
+    fn park(&self, n: usize) {
+        for fifo in [format!("ready{n}"), format!("gate{n}")] {
+            let status = std::process::Command::new("mkfifo")
+                .arg(self.dir.join(&fifo))
+                .status()
+                .unwrap();
+            assert!(status.success(), "mkfifo {fifo}");
+        }
+    }
+
+    /// Resolves once invocation `n` is running and parked.
+    async fn ready(&self, n: usize) {
+        let path = self.dir.join(format!("ready{n}"));
+        tokio::task::spawn_blocking(move || std::fs::read_to_string(path).unwrap())
+            .await
+            .unwrap();
+    }
+
+    /// Let invocation `n` answer. Opened read-write so this never blocks,
+    /// whether or not the parked reader has reached its end yet; the handle
+    /// is returned so the bytes stay in the pipe until the caller drops it.
+    fn release(&self, n: usize) -> std::fs::File {
+        use std::io::Write;
+        let mut gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.dir.join(format!("gate{n}")))
+            .unwrap();
+        gate.write_all(b"go\n").unwrap();
+        gate
+    }
+}
+
+/// A file-backed library opened twice, as two overlapping passes hold it, with
+/// a human-titled meeting so no pass makes a title call — every engine
+/// invocation below is Call A or Call B of some pass.
+fn two_connections(root: &std::path::Path) -> (Db, Db, String) {
+    let path = root.join("db.sqlite3");
     let key = DbKey::from_bytes([0x5a; 32]);
     let mut db_a = Db::open(&path, &key).unwrap();
-    let mut db_b = Db::open(&path, &key).unwrap();
-
+    let db_b = Db::open(&path, &key).unwrap();
     let meeting = meeting_with_transcript(&mut db_a);
-    // A human title, so neither pass makes a title call: every engine
-    // invocation below is a summary call, and the script's counter maps
-    // exactly onto "A's Call A, then B's Call A and Call B".
     db_a.meetings()
         .set_title(&meeting, "Synthetic planning sync")
         .unwrap();
+    (db_a, db_b, meeting)
+}
 
-    let engine_dir = dir.path().join("engine");
-    std::fs::create_dir_all(&engine_dir).unwrap();
-    for fifo in ["ready", "gate"] {
-        let status = std::process::Command::new("mkfifo")
-            .arg(engine_dir.join(fifo))
-            .status()
-            .unwrap();
-        assert!(status.success(), "mkfifo {fifo}");
-    }
-    std::fs::write(engine_dir.join("2.json"), envelope(PROSE)).unwrap();
-    std::fs::write(engine_dir.join("3.json"), envelope(EXTRACTION)).unwrap();
-    let bin = engine_dir.join(STUB_ENGINE_NAME);
-    std::fs::write(
-        &bin,
-        "#!/bin/sh\n\
-         cat > /dev/null\n\
-         d=$(dirname \"$0\")\n\
-         n=$(cat \"$d/n\" 2>/dev/null || echo 0)\n\
-         n=$((n+1))\n\
-         echo \"$n\" > \"$d/n\"\n\
-         if [ \"$n\" = 1 ]; then\n\
-           echo ready > \"$d/ready\"\n\
-           read go < \"$d/gate\"\n\
-           echo 'usage limit reached' >&2; exit 1\n\
-         fi\n\
-         if [ -f \"$d/$n.json\" ]; then cat \"$d/$n.json\"; else\n\
-           echo \"the script ran out of answers at call $n\" >&2; exit 1; fi\n",
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        fotwd::testing::make_executable(&bin);
-    }
-    cli_settings(&mut db_a, &bin.to_string_lossy());
+fn reopen(root: &std::path::Path) -> Db {
+    Db::open(root.join("db.sqlite3"), &DbKey::from_bytes([0x5a; 32])).unwrap()
+}
 
+/// The report itself: the older pass (A) is mid-call when the newer pass (B)
+/// stores a summary and records `ok`; A's call then fails. A must not write
+/// `failed` over B's `ok` — and must say it did not.
+#[tokio::test]
+async fn an_older_failed_pass_does_not_mark_a_newer_summary_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut db_a, mut db_b, meeting) = two_connections(dir.path());
+    let cli = GatedCli::new(dir.path());
+    cli.park(1); // A's Call A, which will fail.
+    cli.reply(2, PROSE); // B's Call A.
+    cli.reply(3, EXTRACTION); // B's Call B.
+    cli_settings(&mut db_a, &cli.binary);
     let store = InMemoryKeyStore::new();
-    let ready = engine_dir.join("ready");
-    let gate = engine_dir.join("gate");
 
     let older = enrich_meeting_with(&mut db_a, &store, &meeting);
     let newer = async {
-        // Blocks until A's engine invocation is in flight.
-        tokio::task::spawn_blocking(move || std::fs::read_to_string(ready).unwrap())
-            .await
-            .unwrap();
+        cli.ready(1).await;
         let report = enrich_meeting_with(&mut db_b, &store, &meeting).await;
         // B is done and its `ok` is on disk. Only now may A's call fail.
-        // O_RDWR so the open never blocks, whether or not A's reader is
-        // already parked on the other end.
-        use std::io::Write;
-        let mut g = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(gate)
-            .unwrap();
-        g.write_all(b"go\n").unwrap();
-        (report, g)
+        (report, cli.release(1))
     };
     let (older_report, (newer_report, _gate)) = tokio::join!(older, newer);
 
@@ -1417,7 +1457,7 @@ async fn an_older_failed_pass_does_not_mark_a_newer_summary_failed() {
         older_report.problems
     );
 
-    let mut db = Db::open(&path, &key).unwrap();
+    let mut db = reopen(dir.path());
     assert!(
         db.meetings().current_summary(&meeting).unwrap().is_some(),
         "the newer pass's summary is stored and current"
@@ -1429,5 +1469,128 @@ async fn an_older_failed_pass_does_not_mark_a_newer_summary_failed() {
         "an older pass's failure was recorded over the newer pass's success \
          (detail: {:?})",
         row.enrich_detail
+    );
+    assert_eq!(row.enrich_detail, None);
+    assert!(
+        older_report
+            .problems
+            .iter()
+            .any(|p| p.contains("newer pass owns")),
+        "the dropped write is a problem line, not silence: {:?}",
+        older_report.problems
+    );
+}
+
+/// The other direction, which must keep working: the older pass (A) succeeds
+/// while the newer pass (B) is mid-call, and then B fails. B is the newest, so
+/// B's `failed` is what the meeting records; A's `ok` was the stale write.
+#[tokio::test]
+async fn a_newer_failed_pass_is_recorded_over_an_older_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut db_a, mut db_b, meeting) = two_connections(dir.path());
+    let cli = GatedCli::new(dir.path());
+    cli.park(1); // A's Call A, held until B has started.
+    cli.reply(1, PROSE);
+    cli.park(2); // B's Call A, which will fail once A is done.
+    cli.reply(3, EXTRACTION); // A's Call B.
+    cli_settings(&mut db_a, &cli.binary);
+    let store = InMemoryKeyStore::new();
+    let (a_done_tx, a_done_rx) = tokio::sync::oneshot::channel();
+    let (b_go_tx, b_go_rx) = tokio::sync::oneshot::channel();
+
+    let older = async {
+        let report = enrich_meeting_with(&mut db_a, &store, &meeting).await;
+        a_done_tx.send(()).unwrap();
+        report
+    };
+    let newer = async {
+        b_go_rx.await.unwrap();
+        enrich_meeting_with(&mut db_b, &store, &meeting).await
+    };
+    let control = async {
+        cli.ready(1).await;
+        b_go_tx.send(()).unwrap();
+        cli.ready(2).await;
+        let first = cli.release(1);
+        a_done_rx.await.unwrap();
+        (first, cli.release(2))
+    };
+    let (older_report, newer_report, _gates) = tokio::join!(older, newer, control);
+
+    assert!(
+        older_report.summary_version.is_some(),
+        "the older pass must have stored a summary: {:?}",
+        older_report.problems
+    );
+    assert!(
+        newer_report.summary_version.is_none(),
+        "the newer pass must have failed: {:?}",
+        newer_report.problems
+    );
+
+    let mut db = reopen(dir.path());
+    let row = db.meetings().get(&meeting).unwrap();
+    assert_eq!(
+        row.enrich_status.as_deref(),
+        Some("failed"),
+        "the newest pass's result is the meeting's status (detail: {:?})",
+        row.enrich_detail
+    );
+    assert!(
+        row.enrich_detail
+            .as_deref()
+            .is_some_and(|d| d.contains("usage limit")),
+        "and its reason with it: {:?}",
+        row.enrich_detail
+    );
+}
+
+/// The manual retry takes part in the same rule. A daemon pass (A) is mid-call
+/// when `fotwd summarize` repairs the meeting; A then fails. The repaired
+/// meeting must stay `ok`.
+#[tokio::test]
+async fn a_manual_summary_is_not_marked_failed_by_an_older_daemon_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut db_a, mut db_b, meeting) = two_connections(dir.path());
+    let cli = GatedCli::new(dir.path());
+    cli.park(1); // The daemon pass's Call A, which will fail.
+    cli.reply(2, PROSE); // The manual run's Call A.
+    cli.reply(3, EXTRACTION); // The manual run's Call B.
+    cli_settings(&mut db_a, &cli.binary);
+    let store = InMemoryKeyStore::new();
+    let template = TemplateSet::builtin()
+        .for_event_title("Synthetic planning sync")
+        .unwrap()
+        .clone();
+
+    let daemon = enrich_meeting_with(&mut db_a, &store, &meeting);
+    let manual = async {
+        cli.ready(1).await;
+        let run =
+            fotwd::summarize::summarize_meeting_manually(&mut db_b, &store, &meeting, &template)
+                .await;
+        (run, cli.release(1))
+    };
+    let (daemon_report, (manual_run, _gate)) = tokio::join!(daemon, manual);
+
+    let manual_run = manual_run.expect("the manual run must succeed");
+    assert!(
+        daemon_report.summary_version.is_none(),
+        "the daemon pass must have failed: {:?}",
+        daemon_report.problems
+    );
+
+    let mut db = reopen(dir.path());
+    let row = db.meetings().get(&meeting).unwrap();
+    assert_eq!(
+        row.enrich_status.as_deref(),
+        Some("ok"),
+        "an older daemon pass marked a manually repaired meeting failed \
+         (detail: {:?})",
+        row.enrich_detail
+    );
+    assert_eq!(
+        manual_run.status_problem, None,
+        "the manual run was the newest pass, so its `ok` must land"
     );
 }

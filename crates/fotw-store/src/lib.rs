@@ -71,7 +71,7 @@ pub use crate::notes::{MAX_NOTE_BYTES, NoteDocument};
 pub use crate::post_pass::{
     CANCELLED as POST_PASS_CANCELLED, POST_PASS_WAIT_MS, PostPassJob, PostPassState,
 };
-pub use crate::repo::MeetingRepo;
+pub use crate::repo::{EnrichPass, MeetingRepo};
 pub use crate::search::{FTS_TABLES, SearchHit, SearchQuery, SearchSource, SearchWeights};
 
 pub use crate::session_notes::{SessionNoteDocument, SessionNoteDraftSummary};
