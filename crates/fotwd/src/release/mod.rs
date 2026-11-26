@@ -22,7 +22,10 @@
 //! this module formats an address, subject, body, title or `gws` output into a
 //! line, an error or a notice.
 
+pub mod cut;
 pub mod mail;
+pub mod render;
+pub mod summary;
 pub mod types;
 
 use std::path::{Path, PathBuf};
