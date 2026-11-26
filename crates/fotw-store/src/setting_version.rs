@@ -38,7 +38,7 @@ impl SettingVersion {
             }
             return Ok(self); // Never refresh an already frozen observation.
         }
-        let epoch = input_epoch(db.conn(), meeting_id)?.ok_or_else(|| {
+        let epoch = db.meeting_input_epoch(meeting_id)?.ok_or_else(|| {
             StoreError::InvalidArgument("meeting input generation is unavailable".into())
         })?;
         self.inputs = Some((meeting_id.into(), epoch));
@@ -91,6 +91,16 @@ impl SettingVersion {
 }
 
 impl Db {
+    /// Read the current generation of a meeting's inputs.
+    ///
+    /// Returns `None` if the meeting or its generation is missing.
+    ///
+    /// # Errors
+    /// The generation could not be read or is invalid.
+    pub fn meeting_input_epoch(&self, meeting_id: &str) -> Result<Option<String>> {
+        input_epoch(self.conn(), meeting_id)
+    }
+
     /// Observe a setting's value and revision in one SQLite read.
     ///
     /// Use the guarded publication methods to check this observation within

@@ -245,33 +245,35 @@ pub fn corrections_for(texts: &[String], names: &[String]) -> Vec<NameCorrection
     found
 }
 
-fn read_all(db: &Db) -> BTreeMap<String, MeetingInvitees> {
+fn decode_all(value: Option<&str>) -> Result<BTreeMap<String, MeetingInvitees>, String> {
+    value.map_or_else(
+        || Ok(BTreeMap::new()),
+        |json| serde_json::from_str(json).map_err(|_| "Invalid saved invitee map".to_owned()),
+    )
+}
+
+fn encode_all(all: &BTreeMap<String, MeetingInvitees>) -> Result<String, String> {
+    serde_json::to_string(all).map_err(|e| e.to_string())
+}
+
+fn update_error(error: String) -> String {
+    format!(
+        "Could not update saved invitees: {error}. Retry when the library is available. \
+         If this persists, check the library or restore a healthy backup."
+    )
+}
+
+/// A meeting's invitees, or empty when no readable names were recorded.
+#[must_use]
+pub fn read(db: &Db, meeting_id: &str) -> MeetingInvitees {
     db.get_setting(SETTINGS_KEY)
         .ok()
-        .flatten()
-        .and_then(|json| serde_json::from_str(&json).ok())
+        .and_then(|value| decode_all(value.as_deref()).ok())
+        .and_then(|mut all| all.remove(meeting_id))
         .unwrap_or_default()
 }
 
-fn write_all(db: &mut Db, all: &BTreeMap<String, MeetingInvitees>) -> Result<(), String> {
-    let json = serde_json::to_string(all).map_err(|e| e.to_string())?;
-    db.put_setting(SETTINGS_KEY, &json)
-        .map_err(|e| e.to_string())
-}
-
-/// A meeting's invitees; empty when none were recorded.
-#[must_use]
-pub fn read(db: &Db, meeting_id: &str) -> MeetingInvitees {
-    read_all(db).remove(meeting_id).unwrap_or_default()
-}
-
-/// Keep `names` as `meeting_id`'s invitees, replacing any before. Corrections
-/// are recomputed by [`refresh_corrections`].
-///
-/// # Errors
-/// The library write failed.
-pub fn store_names(db: &mut Db, meeting_id: &str, names: &[String]) -> Result<(), String> {
-    let mut all = read_all(db);
+fn normalized_names(names: &[String]) -> Vec<String> {
     let mut unique = Vec::new();
     for name in names.iter().filter_map(|n| clean_name(n)) {
         if !unique
@@ -282,14 +284,28 @@ pub fn store_names(db: &mut Db, meeting_id: &str, names: &[String]) -> Result<()
         }
     }
     unique.truncate(MAX_INVITEES);
-    all.insert(
-        meeting_id.to_owned(),
-        MeetingInvitees {
-            names: unique,
-            corrections: Vec::new(),
-        },
-    );
-    write_all(db, &all)
+    unique
+}
+
+/// Keep `names` as `meeting_id`'s invitees, replacing any before. Corrections
+/// are recomputed by [`refresh_corrections`].
+///
+/// # Errors
+/// The library could not be read or written.
+pub fn store_names(db: &mut Db, meeting_id: &str, names: &[String]) -> Result<(), String> {
+    let unique = normalized_names(names);
+    db.update_setting(SETTINGS_KEY, |_, current| {
+        let mut all = decode_all(current.as_deref())?;
+        all.insert(
+            meeting_id.to_owned(),
+            MeetingInvitees {
+                names: unique,
+                corrections: Vec::new(),
+            },
+        );
+        Ok((Some(encode_all(&all)?), ()))
+    })
+    .map_err(update_error)
 }
 
 /// Find corrections for `meeting_id` from its stored transcript, keep them,
@@ -298,27 +314,111 @@ pub fn store_names(db: &mut Db, meeting_id: &str, names: &[String]) -> Result<()
 /// # Errors
 /// The library could not be read or written.
 pub fn refresh_corrections(db: &mut Db, meeting_id: &str) -> Result<Vec<NameCorrection>, String> {
-    let mut all = read_all(db);
-    let Some(entry) = all.get_mut(meeting_id) else {
-        return Ok(Vec::new());
+    refresh_with_invitees(db, meeting_id, &[]).map(|(_, corrections)| corrections)
+}
+
+/// Merge names found in a calendar repair and refresh corrections together.
+pub(crate) fn refresh_with_invitees(
+    db: &mut Db,
+    meeting_id: &str,
+    additional_names: &[String],
+) -> Result<(usize, Vec<NameCorrection>), String> {
+    let (count, found, replacement) =
+        prepare_refresh(db, meeting_id, additional_names).map_err(update_error)?;
+    let Some(replacement) = replacement else {
+        return Ok((count, found));
     };
-    if entry.names.is_empty() {
-        return Ok(Vec::new());
-    }
-    let texts: Vec<String> = crate::summarize::stored_segments(db, meeting_id)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|s| s.text)
-        .collect();
-    entry.corrections = corrections_for(&texts, &entry.names);
-    let found = entry.corrections.clone();
-    write_all(db, &all)?;
+    save_refresh(db, meeting_id, replacement).map_err(update_error)?;
     if !found.is_empty() {
         crate::documents::add_corrections_to_document(db, meeting_id, &found)?;
         let names = crate::documents::name_corrections_for(db, meeting_id);
         crate::documents::correct_current_summary(db, meeting_id, &names)?;
     }
-    Ok(found)
+    Ok((count, found))
+}
+
+struct PreparedRefresh {
+    previous: Option<MeetingInvitees>,
+    replacement: MeetingInvitees,
+    input_epoch: String,
+}
+
+type Refresh = (usize, Vec<NameCorrection>, Option<PreparedRefresh>);
+
+fn prepare_refresh(
+    db: &Db,
+    meeting_id: &str,
+    additional_names: &[String],
+) -> Result<Refresh, String> {
+    let current = db
+        .get_setting(SETTINGS_KEY)
+        .map_err(|error| error.to_string())?;
+    let previous = decode_all(current.as_deref())?.remove(meeting_id);
+    let mut entry = previous.clone().unwrap_or_default();
+    let old_count = entry.names.len();
+    for name in additional_names.iter().filter_map(|name| clean_name(name)) {
+        if !entry
+            .names
+            .iter()
+            .any(|old| old.eq_ignore_ascii_case(&name))
+        {
+            entry.names.push(name);
+        }
+    }
+    if entry.names.len() != old_count {
+        entry.names = normalized_names(&entry.names);
+    }
+    let count = entry.names.len();
+    if count == 0 {
+        return Ok((0, Vec::new(), None));
+    }
+
+    let input_epoch = db
+        .meeting_input_epoch(meeting_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Meeting input generation is unavailable".to_owned())?;
+    let primary = db
+        .primary_transcript_id(meeting_id)
+        .map_err(|error| format!("Could not read the primary transcript: {error}"))?;
+    let found = if let Some(transcript_id) = primary {
+        let texts: Vec<String> = crate::summarize::load_segments(db, meeting_id, &transcript_id)
+            .map_err(|error| format!("Could not read transcript segments: {error}"))?
+            .into_iter()
+            .map(|segment| segment.text)
+            .collect();
+        entry.corrections = corrections_for(&texts, &entry.names);
+        entry.corrections.clone()
+    } else if previous
+        .as_ref()
+        .is_some_and(|old| old.names == entry.names)
+    {
+        return Ok((count, Vec::new(), None));
+    } else {
+        Vec::new()
+    };
+
+    let update = PreparedRefresh {
+        previous,
+        replacement: entry,
+        input_epoch,
+    };
+    Ok((count, found, Some(update)))
+}
+
+fn save_refresh(db: &mut Db, meeting_id: &str, update: PreparedRefresh) -> Result<(), String> {
+    db.update_setting(SETTINGS_KEY, |db, current| {
+        let mut all = decode_all(current.as_deref())?;
+        let input_epoch = db
+            .meeting_input_epoch(meeting_id)
+            .map_err(|error| error.to_string())?;
+        if all.get(meeting_id) != update.previous.as_ref()
+            || input_epoch.as_ref() != Some(&update.input_epoch)
+        {
+            return Err("Saved names or meeting inputs changed during refresh".to_owned());
+        }
+        all.insert(meeting_id.to_owned(), update.replacement);
+        Ok((Some(encode_all(&all)?), ()))
+    })
 }
 
 /// Invitee names to give the summary engine as spellings, when allowed.
@@ -347,4 +447,106 @@ pub fn enabled(db: &Db) -> bool {
 pub fn set_enabled(db: &mut Db, on: bool) -> Result<(), String> {
     db.put_setting(ENABLED_KEY, if on { "true" } else { "false" })
         .map_err(|e| e.to_string())
+}
+
+#[test]
+fn a_refresh_cannot_overwrite_newer_names_or_use_a_changed_transcript() {
+    for change_map in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("library.db");
+        let key = fotw_store::DbKey::from_bytes([7; 32]);
+        let mut db = Db::open(&path, &key).unwrap();
+        let mut writer = Db::open(&path, &key).unwrap();
+        let id = db
+            .meetings()
+            .create(fotw_store::NewMeeting::new("fixture", "UTC"))
+            .unwrap();
+        let transcript = db
+            .meetings()
+            .create_transcript(&id, "fixture", "fixture", true)
+            .unwrap();
+        db.meetings()
+            .append_segments(
+                &transcript,
+                &[fotw_store::NewSegment::new(0, 0, 100, "Rafael is here.")],
+            )
+            .unwrap();
+        store_names(&mut db, &id, &["Rafiya".to_owned()]).unwrap();
+        let (_, found, update) = prepare_refresh(&db, &id, &[]).unwrap();
+        assert_eq!(found.len(), 1);
+        let update = update.unwrap();
+
+        if change_map {
+            store_names(&mut writer, &id, &["Kai".to_owned()]).unwrap();
+        } else {
+            writer
+                .conn()
+                .execute(
+                    "UPDATE segments SET text = 'The meeting is ready.' WHERE transcript_id = ?1",
+                    [&transcript],
+                )
+                .unwrap();
+        }
+        let before = writer.get_setting(SETTINGS_KEY).unwrap();
+        let error = save_refresh(&mut db, &id, update).unwrap_err();
+        assert!(error.contains("changed during refresh"));
+        assert_eq!(db.get_setting(SETTINGS_KEY).unwrap(), before);
+    }
+}
+
+#[test]
+fn a_calendar_refresh_preserves_a_concurrent_update_to_another_meeting() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("library.db");
+    let key = fotw_store::DbKey::from_bytes([7; 32]);
+    let mut db = Db::open(&path, &key).unwrap();
+    let mut writer = Db::open(&path, &key).unwrap();
+    let meeting = db
+        .meetings()
+        .create(fotw_store::NewMeeting::new("First fixture", "UTC"))
+        .unwrap();
+    let other = db
+        .meetings()
+        .create(fotw_store::NewMeeting::new("Second fixture", "UTC"))
+        .unwrap();
+    let transcript = db
+        .meetings()
+        .create_transcript(&meeting, "fixture", "fixture", true)
+        .unwrap();
+    db.meetings()
+        .append_segments(
+            &transcript,
+            &[fotw_store::NewSegment::new(0, 0, 100, "Rafael is here.")],
+        )
+        .unwrap();
+    store_names(&mut db, &other, &["Kai".to_owned()]).unwrap();
+
+    let (count, found, update) = prepare_refresh(&db, &meeting, &["Rafiya".to_owned()]).unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(found.len(), 1);
+    let update = update.unwrap();
+    store_names(&mut writer, &other, &["Morgan".to_owned()]).unwrap();
+
+    save_refresh(&mut db, &meeting, update).unwrap();
+    let saved = read(&writer, &meeting);
+    assert_eq!(saved.names, ["Rafiya"]);
+    assert_eq!(saved.corrections, found);
+    assert_eq!(read(&writer, &other).names, ["Morgan"]);
+}
+
+#[test]
+fn calendar_repair_normalizes_existing_names_when_adding_a_name() {
+    let root = tempfile::tempdir().unwrap();
+    let key = fotw_store::DbKey::from_bytes([7; 32]);
+    let mut db = Db::open(root.path().join("library.db"), &key).unwrap();
+    let meeting = db
+        .meetings()
+        .create(fotw_store::NewMeeting::new("fixture", "UTC"))
+        .unwrap();
+    let stored = serde_json::json!({ &meeting: { "names": ["  Kit  "] } });
+    db.put_setting(SETTINGS_KEY, &stored.to_string()).unwrap();
+
+    refresh_with_invitees(&mut db, &meeting, &["Kai".to_owned()]).unwrap();
+
+    assert_eq!(read(&db, &meeting).names, ["Kit", "Kai"]);
 }
