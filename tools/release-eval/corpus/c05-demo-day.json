@@ -1,0 +1,119 @@
+{
+  "id": "c05-demo-day",
+  "kind": "clean",
+  "event_title": "Q1 demo day",
+  "tz": "America/Chicago",
+  "started_at_ms": 1774645200000,
+  "scheduled_minutes": 45,
+  "recipients": [
+    {
+      "address": "rebecca.stone@example.com",
+      "display_name": "Rebecca Stone",
+      "is_self": true
+    },
+    {
+      "address": "hiro.watanabe@example.com",
+      "display_name": "Hiro Watanabe",
+      "is_self": false
+    },
+    {
+      "address": "marisol.vega@example.com",
+      "display_name": "Marisol Vega",
+      "is_self": false
+    },
+    {
+      "address": "daniel.frost@example.com",
+      "display_name": "Daniel Frost",
+      "is_self": false
+    },
+    {
+      "address": "all-eng@example.org",
+      "display_name": null,
+      "is_self": false
+    }
+  ],
+  "segments": [
+    {
+      "offset_s": 0,
+      "speaker": "me",
+      "text": "Welcome to demo day! Four teams are presenting. Let's start with search."
+    },
+    {
+      "offset_s": 159,
+      "speaker": "Speaker 2",
+      "text": "Thanks. We shipped typo-tolerant search. Watch, if I search \"invioce\", it still finds invoices."
+    },
+    {
+      "offset_s": 345,
+      "speaker": "Speaker 3",
+      "text": "That's great. Does it handle multiple typos?"
+    },
+    {
+      "offset_s": 478,
+      "speaker": "Speaker 2",
+      "text": "Up to two per word, and it ranks exact matches higher."
+    },
+    {
+      "offset_s": 610,
+      "speaker": "me",
+      "text": "Next up, Marisol and the onboarding team."
+    },
+    {
+      "offset_s": 730,
+      "speaker": "Speaker 3",
+      "text": "We rebuilt the first-run checklist. Activation in the beta cohort is up nine points."
+    },
+    {
+      "offset_s": 902,
+      "speaker": "Speaker 4",
+      "text": "I want to call out Marisol's work here. She ran all the user interviews and rewrote the checklist copy herself, and it shows. Fantastic job."
+    },
+    {
+      "offset_s": 1141,
+      "speaker": "me",
+      "text": "Agreed, that was a really thoughtful project. Daniel, you're next."
+    },
+    {
+      "offset_s": 1300,
+      "speaker": "Speaker 4",
+      "text": "We added bulk editing to the admin console. You can select up to five hundred users and change roles at once."
+    },
+    {
+      "offset_s": 1499,
+      "speaker": "Speaker 2",
+      "text": "Is there an undo?"
+    },
+    {
+      "offset_s": 1592,
+      "speaker": "Speaker 4",
+      "text": "Yes, for ten minutes after the change."
+    },
+    {
+      "offset_s": 1711,
+      "speaker": "me",
+      "text": "Last one is the infra team, presented by Hiro."
+    },
+    {
+      "offset_s": 1844,
+      "speaker": "Speaker 2",
+      "text": "We moved the job queue to the new cluster with zero downtime. Queue latency dropped by about half."
+    },
+    {
+      "offset_s": 2030,
+      "speaker": "Speaker 3",
+      "text": "How did you test the cutover?"
+    },
+    {
+      "offset_s": 2136,
+      "speaker": "Speaker 2",
+      "text": "We dual-wrote for a week and compared outputs before switching reads."
+    },
+    {
+      "offset_s": 2295,
+      "speaker": "me",
+      "text": "Great demos, everyone. Recordings will be in the shared drive. Big thanks to all the teams."
+    }
+  ],
+  "planted": [],
+  "notes": "Hard negative: public praise of a teammate's work."
+}

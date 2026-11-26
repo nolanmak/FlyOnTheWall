@@ -1,0 +1,184 @@
+{
+  "id": "c08-architecture-review",
+  "kind": "clean",
+  "event_title": "Event bus architecture review",
+  "tz": "America/New_York",
+  "started_at_ms": 1790096400000,
+  "scheduled_minutes": 30,
+  "recipients": [
+    {
+      "address": "nadia.haddad@example.com",
+      "display_name": "Nadia Haddad",
+      "is_self": true
+    },
+    {
+      "address": "owen.pritchard@example.com",
+      "display_name": "Owen Pritchard",
+      "is_self": false
+    },
+    {
+      "address": "mei-lin.zhou@example.com",
+      "display_name": "Mei-Lin Zhou",
+      "is_self": false
+    },
+    {
+      "address": "chris.abernathy@example.com",
+      "display_name": "Chris Abernathy",
+      "is_self": false
+    },
+    {
+      "address": "architecture@example.org",
+      "display_name": null,
+      "is_self": false
+    }
+  ],
+  "segments": [
+    {
+      "offset_s": 0,
+      "speaker": "me",
+      "text": "Okay, architecture review for the event bus proposal. Owen, take it away."
+    },
+    {
+      "offset_s": 140,
+      "speaker": "Speaker 2",
+      "text": "The problem is that our services talk point to point, so every new consumer means another integration. The proposal is a shared event bus with schemas in a registry."
+    },
+    {
+      "offset_s": 384,
+      "speaker": "Speaker 3",
+      "text": "Which broker are we proposing?"
+    },
+    {
+      "offset_s": 477,
+      "speaker": "Speaker 2",
+      "text": "The managed Kafka offering from our cloud provider. We considered a self-hosted cluster, but the ops cost is too high for our team size."
+    },
+    {
+      "offset_s": 687,
+      "speaker": "Speaker 4",
+      "text": "How do we handle schema evolution?"
+    },
+    {
+      "offset_s": 791,
+      "speaker": "Speaker 2",
+      "text": "Backward-compatible changes only by default. Breaking changes require a new topic version and a migration period."
+    },
+    {
+      "offset_s": 978,
+      "speaker": "me",
+      "text": "Who owns the registry?"
+    },
+    {
+      "offset_s": 1071,
+      "speaker": "Speaker 2",
+      "text": "The platform team, with a lightweight review process for new schemas."
+    },
+    {
+      "offset_s": 1210,
+      "speaker": "Speaker 4",
+      "text": "What about ordering guarantees? Billing events need strict ordering per customer."
+    },
+    {
+      "offset_s": 1362,
+      "speaker": "Speaker 2",
+      "text": "We'd partition by customer ID, which gives per-customer ordering."
+    },
+    {
+      "offset_s": 1490,
+      "speaker": "Speaker 3",
+      "text": "And replays? If a consumer has a bug, can it reprocess?"
+    },
+    {
+      "offset_s": 1618,
+      "speaker": "Speaker 2",
+      "text": "Retention would be seven days, and consumers can reset their offset."
+    },
+    {
+      "offset_s": 1757,
+      "speaker": "me",
+      "text": "Seven days feels short for billing. Can we do thirty for that topic?"
+    },
+    {
+      "offset_s": 1897,
+      "speaker": "Speaker 2",
+      "text": "Yes, retention is per topic."
+    },
+    {
+      "offset_s": 1990,
+      "speaker": "Speaker 3",
+      "text": "Let's go back to the migration plan. Which services move first?"
+    },
+    {
+      "offset_s": 2118,
+      "speaker": "Speaker 2",
+      "text": "Notifications, because it has the most consumers and the least risk."
+    },
+    {
+      "offset_s": 2258,
+      "speaker": "me",
+      "text": "We're past time, but this is important. Can everyone stay a bit longer? I'd rather decide today."
+    },
+    {
+      "offset_s": 2420,
+      "speaker": "Speaker 2",
+      "text": "The second wave is billing and search indexing, which need the ordering guarantees."
+    },
+    {
+      "offset_s": 2572,
+      "speaker": "Speaker 4",
+      "text": "For billing, I'd want a dual-run period where both paths are active and we compare results."
+    },
+    {
+      "offset_s": 2735,
+      "speaker": "Speaker 2",
+      "text": "Agreed, two weeks of dual-run with a reconciliation report."
+    },
+    {
+      "offset_s": 2863,
+      "speaker": "Speaker 3",
+      "text": "What's the rollback plan if the bus has an outage?"
+    },
+    {
+      "offset_s": 2979,
+      "speaker": "Speaker 2",
+      "text": "Producers buffer locally for up to an hour and alert if the buffer fills."
+    },
+    {
+      "offset_s": 3119,
+      "speaker": "me",
+      "text": "And monitoring? Consumer lag is the key metric."
+    },
+    {
+      "offset_s": 3235,
+      "speaker": "Speaker 2",
+      "text": "Lag dashboards per consumer group, with alerts at five minutes of lag for critical consumers."
+    },
+    {
+      "offset_s": 3398,
+      "speaker": "Speaker 3",
+      "text": "Can we add a dead-letter topic per consumer for poison messages?"
+    },
+    {
+      "offset_s": 3526,
+      "speaker": "Speaker 2",
+      "text": "Yes, I'll add that to the design."
+    },
+    {
+      "offset_s": 3631,
+      "speaker": "me",
+      "text": "Okay, I think the decision is approve with changes: thirty-day retention for billing, dead-letter topics, and the dual-run for billing."
+    },
+    {
+      "offset_s": 3840,
+      "speaker": "Speaker 3",
+      "text": "Agreed."
+    },
+    {
+      "offset_s": 3910,
+      "speaker": "Speaker 4",
+      "text": "Agreed. Let's send the updated doc around for async sign-off."
+    }
+  ],
+  "planted": [],
+  "notes": "OVERRUN: scheduled 30 minutes but runs past an hour; business discussion continues to the final segment with no personal tail."
+}

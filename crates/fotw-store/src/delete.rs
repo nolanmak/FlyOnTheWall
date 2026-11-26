@@ -148,6 +148,12 @@ pub(crate) fn delete_meeting_in(
         // in a later migration would be silently missed, whereas a missing
         // cascade is caught by tests/delete.rs.
         tx.execute("DELETE FROM meetings WHERE id = ?1", params![meeting_id])?;
+        // The enrichment pass token (#335) is keyed by id in `app_meta`, which
+        // no cascade reaches.
+        tx.execute(
+            "DELETE FROM app_meta WHERE key = ?1",
+            params![format!("{}{meeting_id}", crate::repo::ENRICH_PASS_PREFIX)],
+        )?;
 
         // Identity only. If a title or a path ever appears in this statement,
         // the byte-scan acceptance test below is what will catch it.

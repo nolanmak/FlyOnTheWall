@@ -92,7 +92,7 @@ pub(crate) fn stored_segments(
     let Some(transcript_id) = crate::persist::primary_transcript_id(db, meeting_id) else {
         return Err(SummarizeRunError::NoTranscript(meeting_id.to_owned()));
     };
-    Ok(load_segments(db, &transcript_id)?)
+    Ok(load_segments(db, meeting_id, &transcript_id)?)
 }
 
 /// Summarise a stored meeting, resolving the engine and using the daemon's
@@ -114,6 +114,62 @@ pub async fn summarize_meeting(
 ) -> Result<SummarizeOutcome, SummarizeRunError> {
     let engine = crate::engine::resolve_engine(store, db).ok_or(SummarizeRunError::NoKey)?;
     summarize_meeting_on(db, &engine, meeting_id, template).await
+}
+
+/// What `fotwd summarize <id>` did, beyond the summary itself.
+#[derive(Debug)]
+pub struct ManualSummary {
+    /// The run's outcome, exactly as [`summarize_meeting`] returns it.
+    pub outcome: SummarizeOutcome,
+    /// Why the meeting's `enrich_status` was not set to `ok`, when it was not:
+    /// a newer pass owns it now (#335), or the store refused the write. The
+    /// summary itself is stored either way.
+    pub status_problem: Option<String>,
+}
+
+/// [`summarize_meeting`], taking part in #335's newest-pass-owns-status rule.
+///
+/// The manual retry claims the meeting's status before its engine runs, the
+/// same as the daemon's pass does, so a daemon pass that was already in
+/// flight and fails after this succeeds cannot mark the repaired meeting
+/// `failed` again. On success it records `ok` only while it is still the
+/// newest claim. On failure it records nothing — the one-way rule #89 set for
+/// this command: it can move a meeting out of `failed`, never into it.
+///
+/// # Errors
+///
+/// Whatever [`summarize_meeting`] failed with.
+pub async fn summarize_meeting_manually(
+    db: &mut Db,
+    store: &dyn KeyStore,
+    meeting_id: &str,
+    template: &Template,
+) -> Result<ManualSummary, SummarizeRunError> {
+    let pass = db.meetings().begin_enrich_pass(meeting_id);
+    let outcome = summarize_meeting(db, store, meeting_id, template).await?;
+    let status_problem = match pass {
+        Err(e) => Some(format!(
+            "the summary was stored, but its status was not: {e}"
+        )),
+        Ok(pass) => match db
+            .meetings()
+            .set_enrich_report_if_newest(meeting_id, &pass, "ok", None)
+        {
+            Ok(true) => None,
+            Ok(false) => Some(
+                "the summary was stored; a newer pass owns this meeting's status, so it was \
+                 left as that pass recorded it"
+                    .to_owned(),
+            ),
+            Err(e) => Some(format!(
+                "the summary was stored, but its status was not: {e}"
+            )),
+        },
+    };
+    Ok(ManualSummary {
+        outcome,
+        status_problem,
+    })
 }
 
 /// [`summarize_meeting`] on an engine the caller already resolved.
@@ -164,7 +220,7 @@ where
         return Err(SummarizeRunError::NoTranscript(meeting_id.to_owned()));
     };
 
-    let segments = load_segments(db, &transcript_id)?;
+    let segments = load_segments(db, meeting_id, &transcript_id)?;
     if segments.is_empty() {
         return Err(SummarizeRunError::NoTranscript(meeting_id.to_owned()));
     }
@@ -272,6 +328,15 @@ where
         check()?;
         outcome
     };
+    // Second guard behind the pipeline's own (#334), checked on what the
+    // *model* wrote and before our admonitions are added: a warning banner
+    // over nothing is still nothing, and storing it would make a blank
+    // version the current one while reporting success.
+    if outcome.markdown().trim().is_empty() {
+        return Err(SummarizeRunError::Pipeline(
+            fotw_summarize::SummarizeError::EmptyResponse,
+        ));
+    }
     let warnings = user_warnings(&outcome);
 
     // The admonitions ride in *our* rendered markdown, never in
@@ -613,15 +678,24 @@ fn user_warnings(outcome: &SummaryOutcome) -> Vec<UserWarning> {
 /// the summariser wants (`session_id`, `revision`, `timestamp_source`) are
 /// reconstructed rather than persisted, because they describe how the text was
 /// obtained rather than what it says.
+///
+/// Scoped to `meeting_id` as well as the transcript (#336): nothing in the
+/// schema yet ties a segment's own meeting to its transcript's, and every
+/// summary, title and shared document is built from what this returns, so a
+/// row naming another meeting must never be read as this one's words.
 pub(crate) fn load_segments(
     db: &Db,
+    meeting_id: &str,
     transcript_id: &str,
 ) -> Result<Vec<TranscriptSegment>, fotw_store::StoreError> {
     let mut stmt = db.conn().prepare(
-        "SELECT idx, start_ms, end_ms, channel, speaker_label, text, confidence, is_final, words
-           FROM segments WHERE transcript_id = ?1 ORDER BY idx",
+        "SELECT s.idx, s.start_ms, s.end_ms, s.channel, s.speaker_label, s.text, s.confidence,
+                s.is_final, s.words
+           FROM segments s JOIN transcripts t ON t.id = s.transcript_id
+          WHERE s.transcript_id = ?1 AND s.meeting_id = ?2 AND t.meeting_id = ?2
+          ORDER BY s.idx",
     )?;
-    let rows = stmt.query_map([transcript_id], |r| {
+    let rows = stmt.query_map([transcript_id, meeting_id], |r| {
         let channel: String = r.get(3)?;
         let words: Option<Vec<u8>> = r.get(8)?;
         Ok(TranscriptSegment {

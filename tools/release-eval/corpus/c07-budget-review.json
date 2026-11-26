@@ -1,0 +1,114 @@
+{
+  "id": "c07-budget-review",
+  "kind": "clean",
+  "event_title": "Q2 project budget check-in",
+  "tz": "Asia/Kolkata",
+  "started_at_ms": 1775642400000,
+  "scheduled_minutes": 45,
+  "recipients": [
+    {
+      "address": "neha.iyer@example.com",
+      "display_name": "Neha Iyer",
+      "is_self": true
+    },
+    {
+      "address": "vikram.bose@example.com",
+      "display_name": "Vikram Bose",
+      "is_self": false
+    },
+    {
+      "address": "leah.goldberg@example.com",
+      "display_name": "Leah Goldberg",
+      "is_self": false
+    },
+    {
+      "address": "pmo@example.org",
+      "display_name": null,
+      "is_self": false
+    }
+  ],
+  "segments": [
+    {
+      "offset_s": 0,
+      "speaker": "me",
+      "text": "Let's go through the Q2 project budgets. I'll share the tracker."
+    },
+    {
+      "offset_s": 150,
+      "speaker": "Speaker 2",
+      "text": "The data center migration is on track. We've used about forty percent of the project budget line with half the work done."
+    },
+    {
+      "offset_s": 382,
+      "speaker": "Speaker 3",
+      "text": "The localization project is a bit over on the translation vendor line, maybe ten percent."
+    },
+    {
+      "offset_s": 574,
+      "speaker": "me",
+      "text": "What drove the overage?"
+    },
+    {
+      "offset_s": 683,
+      "speaker": "Speaker 3",
+      "text": "We added two languages mid-quarter. It was approved, the budget just wasn't updated."
+    },
+    {
+      "offset_s": 861,
+      "speaker": "me",
+      "text": "Okay, let's update the budget line to reflect the scope change."
+    },
+    {
+      "offset_s": 1011,
+      "speaker": "Speaker 2",
+      "text": "The new laptop refresh is under budget because the vendor had a promotion."
+    },
+    {
+      "offset_s": 1175,
+      "speaker": "me",
+      "text": "Nice. Can we reallocate the savings?"
+    },
+    {
+      "offset_s": 1298,
+      "speaker": "Speaker 2",
+      "text": "Finance said we can move it to the training budget if we file the request this month."
+    },
+    {
+      "offset_s": 1475,
+      "speaker": "Speaker 3",
+      "text": "The team has been asking for conference tickets, so that would help."
+    },
+    {
+      "offset_s": 1639,
+      "speaker": "me",
+      "text": "Let's draft the request together."
+    },
+    {
+      "offset_s": 1762,
+      "speaker": "Speaker 2",
+      "text": "Any concerns for Q3?"
+    },
+    {
+      "offset_s": 1858,
+      "speaker": "Speaker 3",
+      "text": "Cloud costs are trending up with the new region. We should forecast that carefully."
+    },
+    {
+      "offset_s": 2035,
+      "speaker": "me",
+      "text": "Let's ask the infra team for a forecast by the end of the month."
+    },
+    {
+      "offset_s": 2186,
+      "speaker": "Speaker 2",
+      "text": "I'll set up the meeting."
+    },
+    {
+      "offset_s": 2295,
+      "speaker": "me",
+      "text": "Great. Thanks both."
+    }
+  ],
+  "planted": [],
+  "notes": "Hard negative: project budget lines and a vendor promotion, no salaries, margins or banking."
+}

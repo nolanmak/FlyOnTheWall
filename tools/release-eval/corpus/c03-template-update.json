@@ -1,0 +1,119 @@
+{
+  "id": "c03-template-update",
+  "kind": "clean",
+  "event_title": "Order form template update",
+  "tz": "Europe/London",
+  "started_at_ms": 1776866400000,
+  "scheduled_minutes": 30,
+  "recipients": [
+    {
+      "address": "harriet.doyle@example.com",
+      "display_name": "Harriet Doyle",
+      "is_self": true
+    },
+    {
+      "address": "sebastian.kruger@example.com",
+      "display_name": "Sebastian Kruger",
+      "is_self": false
+    },
+    {
+      "address": "amara.nwosu@example.com",
+      "display_name": "Amara Nwosu",
+      "is_self": false
+    },
+    {
+      "address": "sales-ops@example.org",
+      "display_name": null,
+      "is_self": false
+    }
+  ],
+  "segments": [
+    {
+      "offset_s": 0,
+      "speaker": "me",
+      "text": "This is just to roll out the new order form template to sales ops."
+    },
+    {
+      "offset_s": 104,
+      "speaker": "Speaker 2",
+      "text": "Legal signed off on the template last week, so the language is final. We're only changing the layout and the fields."
+    },
+    {
+      "offset_s": 242,
+      "speaker": "Speaker 3",
+      "text": "What changed for the reps?"
+    },
+    {
+      "offset_s": 311,
+      "speaker": "Speaker 2",
+      "text": "The product lines are now a dropdown instead of free text, and the start date auto-fills from the opportunity."
+    },
+    {
+      "offset_s": 449,
+      "speaker": "me",
+      "text": "That should cut down the errors we've been seeing."
+    },
+    {
+      "offset_s": 536,
+      "speaker": "Speaker 3",
+      "text": "Do the old templates stop working?"
+    },
+    {
+      "offset_s": 614,
+      "speaker": "Speaker 2",
+      "text": "They'll still open, but the CRM will warn if someone generates one after the first of May."
+    },
+    {
+      "offset_s": 735,
+      "speaker": "me",
+      "text": "Let's announce it in the sales channel and at Monday's team meeting."
+    },
+    {
+      "offset_s": 838,
+      "speaker": "Speaker 3",
+      "text": "I can record a two-minute walkthrough video."
+    },
+    {
+      "offset_s": 925,
+      "speaker": "me",
+      "text": "Perfect. What about non-standard deals?"
+    },
+    {
+      "offset_s": 1003,
+      "speaker": "Speaker 2",
+      "text": "Same as before. Anything outside the template goes through the deal desk queue."
+    },
+    {
+      "offset_s": 1115,
+      "speaker": "Speaker 3",
+      "text": "Can the deal desk queue link be in the template footer?"
+    },
+    {
+      "offset_s": 1210,
+      "speaker": "Speaker 2",
+      "text": "Good idea, I'll add it."
+    },
+    {
+      "offset_s": 1279,
+      "speaker": "me",
+      "text": "And training for the new hires starting in May?"
+    },
+    {
+      "offset_s": 1366,
+      "speaker": "Speaker 3",
+      "text": "I'll add the walkthrough to their onboarding checklist."
+    },
+    {
+      "offset_s": 1461,
+      "speaker": "me",
+      "text": "Great. Let's ship it Thursday."
+    },
+    {
+      "offset_s": 1530,
+      "speaker": "Speaker 2",
+      "text": "Sounds good."
+    }
+  ],
+  "planted": [],
+  "notes": "Hard negative: 'legal signed off on the template' with no legal advice."
+}

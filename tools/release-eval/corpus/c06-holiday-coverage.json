@@ -1,0 +1,119 @@
+{
+  "id": "c06-holiday-coverage",
+  "kind": "clean",
+  "event_title": "Holiday support coverage",
+  "tz": "Australia/Sydney",
+  "started_at_ms": 1796166000000,
+  "scheduled_minutes": 30,
+  "recipients": [
+    {
+      "address": "isla.fraser@example.com",
+      "display_name": "Isla Fraser",
+      "is_self": true
+    },
+    {
+      "address": "raj.malhotra@example.com",
+      "display_name": "Raj Malhotra",
+      "is_self": false
+    },
+    {
+      "address": "bianca.russo@example.com",
+      "display_name": "Bianca Russo",
+      "is_self": false
+    },
+    {
+      "address": "support-leads@example.org",
+      "display_name": null,
+      "is_self": false
+    }
+  ],
+  "segments": [
+    {
+      "offset_s": 0,
+      "speaker": "me",
+      "text": "Let's sort out support coverage for the holiday period."
+    },
+    {
+      "offset_s": 95,
+      "speaker": "Speaker 2",
+      "text": "The company holiday calendar is out. The office is closed on Christmas Day, Boxing Day, and New Year's Day."
+    },
+    {
+      "offset_s": 223,
+      "speaker": "Speaker 3",
+      "text": "And the shutdown week between Christmas and New Year applies to everyone except support and on-call."
+    },
+    {
+      "offset_s": 352,
+      "speaker": "me",
+      "text": "Right. So we need coverage on the twenty-ninth, thirtieth, and thirty-first."
+    },
+    {
+      "offset_s": 456,
+      "speaker": "Speaker 2",
+      "text": "Volume last year in that week was about forty percent of normal."
+    },
+    {
+      "offset_s": 550,
+      "speaker": "Speaker 3",
+      "text": "So two agents per shift should be enough."
+    },
+    {
+      "offset_s": 627,
+      "speaker": "me",
+      "text": "Let's do a sign-up sheet and give priority to people who covered last year."
+    },
+    {
+      "offset_s": 731,
+      "speaker": "Speaker 2",
+      "text": "Should we turn on the holiday autoresponder?"
+    },
+    {
+      "offset_s": 817,
+      "speaker": "Speaker 3",
+      "text": "Yes, with expected response times and a link to the status page."
+    },
+    {
+      "offset_s": 911,
+      "speaker": "me",
+      "text": "I'll draft the autoresponder text today."
+    },
+    {
+      "offset_s": 988,
+      "speaker": "Speaker 2",
+      "text": "And for public holidays in other regions, the US team covers Australia Day for us."
+    },
+    {
+      "offset_s": 1100,
+      "speaker": "Speaker 3",
+      "text": "We cover the US on Thanksgiving, same as last year."
+    },
+    {
+      "offset_s": 1186,
+      "speaker": "me",
+      "text": "Great. Escalation path during the shutdown?"
+    },
+    {
+      "offset_s": 1264,
+      "speaker": "Speaker 2",
+      "text": "Same on-call rotation as usual, the schedule is already in the paging tool."
+    },
+    {
+      "offset_s": 1367,
+      "speaker": "me",
+      "text": "Okay. Let's post the sign-up sheet tomorrow and close it by Friday."
+    },
+    {
+      "offset_s": 1470,
+      "speaker": "Speaker 3",
+      "text": "I'll handle that."
+    },
+    {
+      "offset_s": 1530,
+      "speaker": "me",
+      "text": "Thanks both."
+    }
+  ],
+  "planted": [],
+  "notes": "Hard negative: public holiday schedule discussion."
+}

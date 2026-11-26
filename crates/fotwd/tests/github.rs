@@ -330,6 +330,107 @@ fn a_push_commits_the_markdown_and_saves_the_receipt() {
     );
 }
 
+/// A scripted `gh` that also remembers which account each call asked to run as.
+#[derive(Debug, Default)]
+struct AccountGh {
+    inner: ScriptedGh,
+    accounts: Mutex<Vec<Option<String>>>,
+}
+
+impl GhRunner for AccountGh {
+    fn run(&self, args: &[String], stdin: Option<&[u8]>) -> Result<GhOutput, String> {
+        self.run_as(None, args, stdin)
+    }
+
+    fn run_as(
+        &self,
+        account: Option<&str>,
+        args: &[String],
+        stdin: Option<&[u8]>,
+    ) -> Result<GhOutput, String> {
+        self.accounts
+            .lock()
+            .unwrap()
+            .push(account.map(ToOwned::to_owned));
+        self.inner.run(args, stdin)
+    }
+}
+
+#[test]
+fn every_gh_call_of_a_push_runs_as_the_repository_owner() {
+    // Someone logged in to two gh accounts who switches the active one for
+    // other work must not have pushes start failing with repo_not_found.
+    let mut db = library();
+    let meeting = enriched_meeting(&mut db, "Weekly Standup", 1_755_734_400_000);
+    store_settings(&mut db, MANUAL);
+    let gh = Arc::new(AccountGh {
+        inner: ScriptedGh {
+            script: Mutex::new(create_script().into()),
+            calls: Mutex::new(Vec::new()),
+        },
+        accounts: Mutex::new(Vec::new()),
+    });
+    let dir = tempfile::TempDir::new().unwrap();
+    let exporter = GithubExporter::new(
+        db,
+        dir.path().join("sessions"),
+        Arc::clone(&gh) as Arc<dyn GhRunner>,
+    );
+
+    exporter.push(&meeting).expect("the scripted push lands");
+
+    let accounts = gh.accounts.lock().unwrap().clone();
+    assert!(!accounts.is_empty());
+    assert!(
+        accounts.iter().all(|a| a.as_deref() == Some("octocat")),
+        "every call runs as the owner of octocat/notes: {accounts:?}"
+    );
+}
+
+/// A fake `gh` that holds a token for `octocat` only, and otherwise reports
+/// which token the call it was given ran with.
+#[cfg(unix)]
+fn fake_gh(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join("gh");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\n\
+         if [ \"$1 $2\" = \"auth token\" ]; then\n\
+           [ \"$6\" = octocat ] && { echo tok-octocat; exit 0; }\n\
+           echo \"no account $6\" >&2; exit 1\n\
+         fi\n\
+         echo \"GH_TOKEN=${GH_TOKEN-unset}\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn the_real_runner_uses_the_owners_token_and_falls_back_to_the_active_account() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let gh = fake_gh(dir.path());
+    let args = vec!["api".to_owned(), "user".to_owned()];
+
+    let pinned = fotwd::github::run_gh_program_for_test(&gh, Some("octocat"), &args).unwrap();
+    assert_eq!(pinned.status, 0);
+    assert_eq!(pinned.stdout.trim(), "GH_TOKEN=tok-octocat");
+
+    // An owner gh has no login for — an organisation, say — runs as the
+    // active account, as every push did before.
+    let org = fotwd::github::run_gh_program_for_test(&gh, Some("some-org"), &args).unwrap();
+    assert_eq!(org.stdout.trim(), "GH_TOKEN=unset");
+    assert!(
+        !org.stderr.contains("no account"),
+        "the lookup's failure is not the call's"
+    );
+
+    let unpinned = fotwd::github::run_gh_program_for_test(&gh, None, &args).unwrap();
+    assert_eq!(unpinned.stdout.trim(), "GH_TOKEN=unset");
+}
+
 #[test]
 fn a_repush_reuses_the_path_and_sends_the_sha() {
     let r = rig(MANUAL, create_script());

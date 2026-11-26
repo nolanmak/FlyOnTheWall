@@ -79,6 +79,19 @@ pub enum SummarizeError {
     /// rendered as if it were finished.
     #[error("generation stopped early: {0}")]
     Truncated(String),
+
+    /// The model finished normally but wrote no prose — the reply was empty or
+    /// whitespace (#334).
+    ///
+    /// An error rather than an empty summary: a blank document stored as a new
+    /// version would bury the previous good one and be reported as success,
+    /// while saying nothing at all about the meeting. Coverage cannot catch it
+    /// either, because zero claims measures as fully grounded.
+    #[error(
+        "the summary engine returned an empty reply, so no summary was saved; \
+         the transcript is unchanged and can be summarised again"
+    )]
+    EmptyResponse,
 }
 
 impl SummarizeError {
@@ -97,7 +110,10 @@ impl SummarizeError {
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Transport(_) | Self::SchemaViolation(_) => true,
+            // A blank reply to a well-formed request is the model's bad
+            // answer, like a schema violation: the same request can come back
+            // with prose.
+            Self::Transport(_) | Self::SchemaViolation(_) | Self::EmptyResponse => true,
             Self::Http { status, .. } => *status == 429 || *status >= 500,
             Self::CitationsWithStructuredOutput
             | Self::UnsupportedCapability { .. }
@@ -115,6 +131,11 @@ mod tests {
     #[test]
     fn mutually_exclusive_features_are_never_retryable() {
         assert!(!SummarizeError::CitationsWithStructuredOutput.is_retryable());
+    }
+
+    #[test]
+    fn an_empty_reply_is_retryable() {
+        assert!(SummarizeError::EmptyResponse.is_retryable());
     }
 
     #[test]

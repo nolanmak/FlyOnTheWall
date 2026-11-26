@@ -730,6 +730,135 @@ pub async fn document(
     }
 }
 
+// ------------------------------------------------------- attendee release
+
+/// What a server without release answers: the page can still draw the
+/// settings form and explain why it does nothing.
+const RELEASE_UNAVAILABLE: &str = "attendee release is not available";
+
+fn release_unavailable() -> crate::release::ReleaseSettingsResponse {
+    crate::release::ReleaseSettingsResponse {
+        settings: crate::release::ReleaseSettings::default(),
+        error: Some(RELEASE_UNAVAILABLE.to_owned()),
+        auto_unlocked: false,
+        paused: None,
+    }
+}
+
+/// `GET /api/settings/release` (#326 5.1).
+pub async fn release_settings(State(state): State<AppState>) -> Response {
+    let Some(control) = state.release() else {
+        return json(&state, &release_unavailable());
+    };
+    match tokio::task::spawn_blocking(move || control.settings()).await {
+        Ok(doc) => json(&state, &doc),
+        Err(_) => server_error(),
+    }
+}
+
+/// `POST /api/settings/release`. Validation, preflight and the D11 unlock
+/// live behind the trait; a refusal comes back as stored settings + `error`.
+pub async fn release_set_settings(
+    State(state): State<AppState>,
+    body: Result<
+        axum::Json<crate::release::ReleaseSettings>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> Response {
+    // A malformed body is refused exactly as a wrong token is.
+    let Ok(axum::Json(submitted)) = body else {
+        return not_found();
+    };
+    let Some(control) = state.release() else {
+        return json(&state, &release_unavailable());
+    };
+    // The control's future is `Send`; preflight may run a subprocess, so it
+    // runs on its own task rather than this connection's.
+    match tokio::spawn(async move { control.set_settings(submitted).await }).await {
+        Ok(doc) => json(&state, &doc),
+        Err(_) => server_error(),
+    }
+}
+
+/// `GET /api/meetings/{id}/release` (5.7).
+pub async fn meeting_release(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let Some(control) = state.release() else {
+        return json(
+            &state,
+            &crate::release::MeetingReleaseStatus {
+                state: "not_eligible".to_owned(),
+                reasons: vec!["release_off".to_owned()],
+                recipient_count: 0,
+                send_at: None,
+                sent_at: None,
+            },
+        );
+    };
+    match tokio::task::spawn_blocking(move || control.meeting_status(&id)).await {
+        Ok(doc) => json(&state, &doc),
+        Err(_) => server_error(),
+    }
+}
+
+/// `GET /api/release/outbox` (5.7).
+pub async fn release_outbox(State(state): State<AppState>) -> Response {
+    let Some(control) = state.release() else {
+        return json(
+            &state,
+            &crate::release::Outbox {
+                items: Vec::new(),
+                badge: 0,
+                paused: None,
+            },
+        );
+    };
+    match tokio::task::spawn_blocking(move || control.outbox()).await {
+        Ok(doc) => json(&state, &doc),
+        Err(_) => server_error(),
+    }
+}
+
+/// `GET /api/release/outbox/{meeting_id}`: the stored snapshot, or a bare 404
+/// when the meeting has no Outbox row.
+pub async fn release_outbox_detail(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(control) = state.release() else {
+        return not_found();
+    };
+    match tokio::task::spawn_blocking(move || control.detail(&id)).await {
+        Ok(Some(doc)) => json(&state, &doc),
+        Ok(None) => not_found(),
+        Err(_) => server_error(),
+    }
+}
+
+/// `POST /api/release/outbox/{meeting_id}`. A refused action (the row moved
+/// on, or its state does not allow it) is a 409 with the control's
+/// user-facing text, so the page can say why and reload.
+pub async fn release_outbox_act(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Result<axum::Json<crate::release::OutboxAction>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Some(control) = state.release() else {
+        return not_found();
+    };
+    let Ok(axum::Json(action)) = body else {
+        return not_found();
+    };
+    match tokio::task::spawn_blocking(move || control.act(&id, action)).await {
+        Ok(Ok(doc)) => json(&state, &doc),
+        Ok(Err(error)) => {
+            let mut response = json(&state, &serde_json::json!({ "error": error }));
+            *response.status_mut() = StatusCode::CONFLICT;
+            response
+        }
+        Err(_) => server_error(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
