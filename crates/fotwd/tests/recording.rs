@@ -11,41 +11,23 @@
 //! it. `DaemonRecorder::launched_as_app` exists so the daemon can say which it
 //! got, and `serve` prints a warning when it is the wrong one.
 
+#[path = "fixtures/scratch.rs"]
+mod scratch;
+#[path = "fixtures/tone.rs"]
+mod tone;
+
+use scratch::scratch;
+use tone::tone;
+
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use fotw_audio::TapId;
 use fotw_audio::platform::file::{FileAudioSource, ReplaySpeed};
-use fotw_audio::wav::WavData;
-use fotw_audio::{SampleFormat, StreamFormat, TapId};
 use fotw_web::{RecorderControl, RecorderError, RecordingState};
 use fotwd::recording::{DaemonRecorder, Finisher};
-
-/// A data root with a `sessions/` inside it.
-///
-/// The nesting is load-bearing: `AuditLog::at` writes to the *parent* of the
-/// sessions directory, so a flat temp dir would append every test's audit
-/// entries to a shared `/tmp/audit.jsonl`.
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let base = std::env::temp_dir().join(format!("fotwd-rec-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(base.join("sessions")).unwrap();
-    base
-}
-
-fn tone(seconds: f32) -> WavData {
-    let format = StreamFormat::new(48_000, 2, SampleFormat::I16);
-    let n = (48_000.0 * seconds) as usize;
-    let mut samples = Vec::with_capacity(n * 2);
-    for i in 0..n {
-        let t = i as f32 / 48_000.0;
-        let v = (t * 440.0 * std::f32::consts::TAU).sin() * 0.5;
-        samples.push(v);
-        samples.push(v);
-    }
-    WavData { format, samples }
-}
 
 /// A recorder whose taps are a file and whose finisher is the caller's.
 ///
@@ -160,14 +142,16 @@ async fn until(mut f: impl FnMut() -> bool) -> bool {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fresh_recorder_is_idle() {
-    let root = tmpdir("idle");
+    let root_dir = scratch("idle");
+    let root = root_dir.path();
     let rec = recorder(&root.join("sessions"), Arc::new(AtomicU64::new(0)));
     assert!(!rec.status().is_recording());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unattended_recording_finalizes_on_its_own() {
-    let root = tmpdir("automatic-stop");
+    let root_dir = scratch("automatic-stop");
+    let root = root_dir.path();
     let gate = Arc::new(Gate::default());
     let rec = gated_recorder(&root.join("sessions"), Arc::clone(&gate));
     let started = rec.start().expect("start");
@@ -196,7 +180,8 @@ async fn an_unattended_recording_finalizes_on_its_own() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn starting_reports_recording_and_writes_the_audit_entry() {
-    let root = tmpdir("start");
+    let root_dir = scratch("start");
+    let root = root_dir.path();
     let rec = recorder(&root.join("sessions"), Arc::new(AtomicU64::new(0)));
 
     let status = rec.start().expect("start");
@@ -219,7 +204,8 @@ async fn starting_reports_recording_and_writes_the_audit_entry() {
 /// A double-clicked button must not open a second tap on the same device.
 #[tokio::test(flavor = "multi_thread")]
 async fn starting_twice_is_refused() {
-    let root = tmpdir("twice");
+    let root_dir = scratch("twice");
+    let root = root_dir.path();
     let rec = recorder(&root.join("sessions"), Arc::new(AtomicU64::new(0)));
 
     rec.start().expect("first start");
@@ -242,7 +228,8 @@ async fn starting_twice_is_refused() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn stopping_when_idle_says_so() {
-    let root = tmpdir("stop-idle");
+    let root_dir = scratch("stop-idle");
+    let root = root_dir.path();
     let rec = recorder(&root.join("sessions"), Arc::new(AtomicU64::new(0)));
     assert!(matches!(rec.stop(), Err(RecorderError::NotRecording)));
 }
@@ -252,12 +239,13 @@ async fn stopping_when_idle_says_so() {
 /// proof that persist happened after the slot was already let go.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stopped_session_finishes_and_frees_the_slot() {
-    let root = tmpdir("finish");
+    let root_dir = scratch("finish");
+    let root = root_dir.path();
     let finished = Arc::new(AtomicU64::new(0));
     let rec = recorder(&root.join("sessions"), Arc::clone(&finished));
 
     rec.start().expect("start");
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(until(|| rec.status().state == RecordingState::Recording).await);
 
     let stopping = rec.stop().expect("stop");
     assert_eq!(
@@ -287,13 +275,14 @@ async fn a_stopped_session_finishes_and_frees_the_slot() {
 /// daemon is the normal case, not an edge one.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_meeting_can_start_after_the_first_finishes() {
-    let root = tmpdir("second");
+    let root_dir = scratch("second");
+    let root = root_dir.path();
     let finished = Arc::new(AtomicU64::new(0));
     let rec = recorder(&root.join("sessions"), Arc::clone(&finished));
 
     rec.start().expect("first");
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    rec.stop().ok();
+    assert!(until(|| rec.status().state == RecordingState::Recording).await);
+    rec.stop().expect("stop");
     // Waiting on `Idle` rather than `!is_recording()`: the latter is true the
     // moment stop trips, and the start below would then race the first
     // session's own teardown for the slot.
@@ -301,7 +290,7 @@ async fn a_second_meeting_can_start_after_the_first_finishes() {
 
     rec.start().expect("a second meeting must be startable");
     assert!(rec.status().is_recording());
-    rec.stop().ok();
+    rec.stop().expect("stop");
 }
 
 // --------------------------------------------------------- #77, finishing
@@ -317,7 +306,8 @@ async fn a_second_meeting_can_start_after_the_first_finishes() {
 /// nothing after capture can grow them (the second-stop test pins that).
 #[tokio::test(flavor = "multi_thread")]
 async fn stopping_freezes_the_clock_it_reports() {
-    let root = tmpdir("frozen-clock");
+    let root_dir = scratch("frozen-clock");
+    let root = root_dir.path();
     let gate = Arc::new(Gate::default());
     let rec = gated_recorder(&root.join("sessions"), Arc::clone(&gate));
 
@@ -359,7 +349,8 @@ async fn stopping_freezes_the_clock_it_reports() {
 /// after the slot is freed, so `gate.reached()` proves the slot is already open.
 #[tokio::test(flavor = "multi_thread")]
 async fn starting_while_the_previous_meeting_finalizes_is_allowed() {
-    let root = tmpdir("start-while-finalizing");
+    let root_dir = scratch("start-while-finalizing");
+    let root = root_dir.path();
     let gate = Arc::new(Gate::default());
     let rec = gated_recorder(&root.join("sessions"), Arc::clone(&gate));
 
@@ -404,7 +395,8 @@ async fn starting_while_the_previous_meeting_finalizes_is_allowed() {
 /// end time.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_stop_never_moves_the_end_time() {
-    let root = tmpdir("second-stop");
+    let root_dir = scratch("second-stop");
+    let root = root_dir.path();
     let gate = Arc::new(Gate::default());
     let rec = gated_recorder(&root.join("sessions"), Arc::clone(&gate));
 
@@ -437,7 +429,8 @@ async fn a_second_stop_never_moves_the_end_time() {
 /// survived a green CI for the life of the feature.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_full_cycle_spells_recording_then_finishing_then_idle() {
-    let root = tmpdir("wire-cycle");
+    let root_dir = scratch("wire-cycle");
+    let root = root_dir.path();
     let gate = Arc::new(Gate::default());
     let rec = gated_recorder(&root.join("sessions"), Arc::clone(&gate));
 
@@ -468,7 +461,8 @@ async fn a_full_cycle_spells_recording_then_finishing_then_idle() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn live_status_names_the_capture_session_not_the_saved_meeting() {
-    let root = tmpdir("session-identity");
+    let root_dir = scratch("session-identity");
+    let root = root_dir.path();
     let rec = recorder(&root.join("sessions"), Arc::new(AtomicU64::new(0)));
     let started = rec.start().expect("start");
     let id = started.session_id.as_deref().expect("capture identity");
@@ -486,7 +480,8 @@ async fn live_status_names_the_capture_session_not_the_saved_meeting() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_old_native_stop_target_cannot_stop_a_new_recording() {
-    let root = tmpdir("native-stale-stop");
+    let root_dir = scratch("native-stale-stop");
+    let root = root_dir.path();
     let rec = recorder(&root.join("sessions"), Arc::new(AtomicU64::new(0)));
     rec.start().unwrap();
     let old = rec.observe().stop_target().cloned().unwrap();
@@ -509,8 +504,10 @@ async fn an_old_native_stop_target_cannot_stop_a_new_recording() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn native_stop_targets_cannot_cross_recorder_instances() {
-    let aroot = tmpdir("native-stop-owner-a");
-    let broot = tmpdir("native-stop-owner-b");
+    let aroot_dir = scratch("native-stop-owner-a");
+    let aroot = aroot_dir.path();
+    let broot_dir = scratch("native-stop-owner-b");
+    let broot = broot_dir.path();
     let a = recorder(&aroot.join("sessions"), Arc::new(AtomicU64::new(0)));
     let b = recorder(&broot.join("sessions"), Arc::new(AtomicU64::new(0)));
     a.start().unwrap();
@@ -533,7 +530,8 @@ async fn native_stop_targets_cannot_cross_recorder_instances() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_idle_native_observation_has_no_stop_target() {
-    let root = tmpdir("native-idle-observation");
+    let root_dir = scratch("native-idle-observation");
+    let root = root_dir.path();
     let rec = recorder(&root.join("sessions"), Arc::new(AtomicU64::new(0)));
     let observation = rec.observe();
     assert_eq!(observation.status().state, RecordingState::Idle);
@@ -548,7 +546,8 @@ async fn a_native_stop_target_exists_during_setup_and_cannot_reach_the_next_atte
             self.0.open();
         }
     }
-    let root = tmpdir("native-stop-during-setup");
+    let root_dir = scratch("native-stop-during-setup");
+    let root = root_dir.path();
     let gate = Arc::new(Gate::default());
     let _release = Release(Arc::clone(&gate));
     let tap_gate = Arc::clone(&gate);
@@ -642,7 +641,8 @@ async fn native_start_without_acknowledgement_never_resolves_transcription_or_op
         fotw_shell::StartOrigin::Menu,
         fotw_shell::StartOrigin::Hotkey,
     ] {
-        let root = tmpdir(&format!("native-no-ack-{}", origin.label()));
+        let root_dir = scratch(&format!("native-no-ack-{}", origin.label()));
+        let root = root_dir.path();
         let configured = Arc::new(AtomicU64::new(0));
         let opened = Arc::new(AtomicU64::new(0));
         let rec =
@@ -664,7 +664,8 @@ async fn native_start_without_acknowledgement_never_resolves_transcription_or_op
 
 #[tokio::test(flavor = "multi_thread")]
 async fn native_start_cancelled_before_admission_never_configures_or_opens_capture() {
-    let root = tmpdir("native-precancelled-start");
+    let root_dir = scratch("native-precancelled-start");
+    let root = root_dir.path();
     let configured = Arc::new(AtomicU64::new(0));
     let opened = Arc::new(AtomicU64::new(0));
     let rec = counted_native_recorder(&root.join("sessions"), configured.clone(), opened.clone());
@@ -686,7 +687,8 @@ async fn native_start_cancelled_before_admission_never_configures_or_opens_captu
 
 #[tokio::test(flavor = "multi_thread")]
 async fn native_start_records_the_actual_human_origin() {
-    let root = tmpdir("native-start-origin");
+    let root_dir = scratch("native-start-origin");
+    let root = root_dir.path();
     let rec = recorder(&root.join("sessions"), Arc::new(AtomicU64::new(0)));
     rec.start_native(
         fotw_shell::StartOrigin::Hotkey,
@@ -714,7 +716,8 @@ async fn native_start_cancelled_during_configuration_never_opens_capture() {
             self.0.open();
         }
     }
-    let root = tmpdir("native-cancel-during-config");
+    let root_dir = scratch("native-cancel-during-config");
+    let root = root_dir.path();
     let gate = Arc::new(Gate::default());
     let _release = Release(gate.clone());
     let configuration_gate = gate.clone();
@@ -772,7 +775,8 @@ async fn native_configuration_keeps_observation_and_stop_responsive() {
             self.0.open();
         }
     }
-    let root = tmpdir("native-observe-during-config");
+    let root_dir = scratch("native-observe-during-config");
+    let root = root_dir.path();
     let gate = Arc::new(Gate::default());
     let _release = Release(gate.clone());
     let configuration_gate = gate.clone();
@@ -852,7 +856,8 @@ async fn native_configuration_keeps_observation_and_stop_responsive() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_audit_releases_preparation_without_configuring_or_opening_capture() {
-    let root = tmpdir("native-audit-reservation");
+    let root_dir = scratch("native-audit-reservation");
+    let root = root_dir.path();
     std::fs::create_dir(root.join("audit.jsonl")).unwrap();
     let rec = Arc::new(DaemonRecorder::with_parts(
         root.join("sessions"),
@@ -882,7 +887,8 @@ async fn failed_audit_releases_preparation_without_configuring_or_opening_captur
 
 #[tokio::test(flavor = "multi_thread")]
 async fn configuration_unwind_releases_only_its_reserved_attempt() {
-    let root = tmpdir("native-config-unwind");
+    let root_dir = scratch("native-config-unwind");
+    let root = root_dir.path();
     let attempts = Arc::new(AtomicU64::new(0));
     let factory_attempts = attempts.clone();
     let opened = Arc::new(AtomicU64::new(0));
@@ -946,7 +952,8 @@ async fn shutdown_waits_for_background_persistence_after_the_live_slot_is_idle()
             self.0.open();
         }
     }
-    let root = tmpdir("native-shutdown-persist");
+    let root_dir = scratch("native-shutdown-persist");
+    let root = root_dir.path();
     let gate = Arc::new(Gate::default());
     let _release = Release(gate.clone());
     let rec = gated_recorder(&root.join("sessions"), gate.clone());
@@ -980,7 +987,8 @@ async fn shutdown_waits_for_background_persistence_after_the_live_slot_is_idle()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_panicking_persistence_worker_releases_ownership_and_reports_unconfirmed_save() {
-    let root = tmpdir("native-shutdown-save-panic");
+    let root_dir = scratch("native-shutdown-save-panic");
+    let root = root_dir.path();
     let rec = recorder_with(
         &root.join("sessions"),
         Box::new(|_, _| panic!("injected save failure")),
@@ -992,7 +1000,8 @@ async fn a_panicking_persistence_worker_releases_ownership_and_reports_unconfirm
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_before_start_refuses_configuration_audit_and_capture() {
-    let root = tmpdir("native-shutdown-before-start");
+    let root_dir = scratch("native-shutdown-before-start");
+    let root = root_dir.path();
     let configured = Arc::new(AtomicU64::new(0));
     let opened = Arc::new(AtomicU64::new(0));
     let rec = counted_native_recorder(&root.join("sessions"), configured.clone(), opened.clone());

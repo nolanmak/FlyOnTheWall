@@ -13,36 +13,23 @@
 //! waits for the session to say capture is live, and answers an error naming
 //! the fix if it does not.
 
+#[path = "fixtures/scratch.rs"]
+mod scratch;
+#[path = "fixtures/tone.rs"]
+mod tone;
+
+use scratch::scratch;
+use tone::tone;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use fotw_audio::platform::file::{FileAudioSource, ReplaySpeed};
-use fotw_audio::wav::WavData;
 use fotw_audio::{AudioTap, FrameSink, SampleFormat, StreamFormat, TapError, TapId};
 use fotw_web::{RecorderControl, RecorderError, RecordingState};
 use fotwd::recording::DaemonRecorder;
 use fotwd::session::{self, ReadySignal, SessionControl, Transcription};
-
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let base = std::env::temp_dir().join(format!("fotwd-rdy-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(base.join("sessions")).unwrap();
-    base
-}
-
-fn tone(seconds: f32) -> WavData {
-    let format = StreamFormat::new(48_000, 2, SampleFormat::I16);
-    let n = (48_000.0 * seconds) as usize;
-    let mut samples = Vec::with_capacity(n * 2);
-    for i in 0..n {
-        let t = i as f32 / 48_000.0;
-        let v = (t * 440.0 * std::f32::consts::TAU).sin() * 0.5;
-        samples.push(v);
-        samples.push(v);
-    }
-    WavData { format, samples }
-}
 
 fn file_tap() -> Box<dyn AudioTap> {
     Box::new(FileAudioSource::from_wav(
@@ -144,14 +131,14 @@ fn a_signal_tripped_from_another_thread_wakes_the_waiter() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_reports_ready_once_the_taps_are_running() {
-    let root = tmpdir("ready");
+    let root_dir = scratch("ready");
     let control = SessionControl::new();
     let ready = control.ready.clone();
     let stop = control.stop.clone();
 
     let task = tokio::spawn(async move {
         session::run_with_control(
-            &root.join("sessions"),
+            &root_dir.path().join("sessions"),
             file_tap(),
             None,
             Transcription::Disabled,
@@ -184,14 +171,14 @@ async fn a_session_reports_ready_once_the_taps_are_running() {
 /// A session whose tap wedges must never claim capture is live.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wedged_tap_never_reports_ready() {
-    let root = tmpdir("wedged-session");
+    let root_dir = scratch("wedged-session");
     let control = SessionControl::new();
     let ready = control.ready.clone();
     let (tap, released) = WedgedTap::wedged();
 
     tokio::spawn(async move {
         session::run_with_control(
-            &root.join("sessions"),
+            &root_dir.path().join("sessions"),
             tap,
             None,
             Transcription::Disabled,
@@ -232,7 +219,8 @@ fn recorder(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_healthy_device_reports_recording() {
-    let root = tmpdir("healthy");
+    let root_dir = scratch("healthy");
+    let root = root_dir.path();
     let rec = recorder(
         &root.join("sessions"),
         Box::new(|| Ok((file_tap(), None))),
@@ -248,7 +236,8 @@ async fn a_healthy_device_reports_recording() {
 /// not a red badge over an empty disk.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wedged_device_fails_the_start_instead_of_lying() {
-    let root = tmpdir("wedged");
+    let root_dir = scratch("wedged");
+    let root = root_dir.path();
     let released = Arc::new(AtomicBool::new(false));
     struct Release(Arc<AtomicBool>);
     impl Drop for Release {
@@ -311,7 +300,8 @@ async fn a_wedged_device_fails_the_start_instead_of_lying() {
 /// idle, or Start is dead until the daemon restarts.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_start_that_cannot_open_a_device_leaves_the_recorder_idle() {
-    let root = tmpdir("no-device");
+    let root_dir = scratch("no-device");
+    let root = root_dir.path();
     let rec = recorder(
         &root.join("sessions"),
         Box::new(|| Err("no such device".to_owned())),
@@ -401,7 +391,8 @@ impl AudioTap for OrderedTap {
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn microphone_starts_before_system_so_both_tracks_capture() {
-    let root = tmpdir("mic-first");
+    let root_dir = scratch("mic-first");
+    let root = root_dir.path();
     let flag = Arc::new(AtomicBool::new(false));
     let system = Box::new(OrderedTap {
         inner: file_tap(),
@@ -494,7 +485,8 @@ impl fotw_audio::AudioPlatform for OrderedPlatform {
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn supervised_start_preserves_both_tracks_with_order_sensitive_devices() {
-    let root = tmpdir("supervised-mic-first");
+    let root_dir = scratch("supervised-mic-first");
+    let root = root_dir.path();
     let platform = Arc::new(OrderedPlatform {
         inner: fotw_audio::platform::file::FilePlatform::new(ReplaySpeed::Realtime)
             .with_mic(tone(2.0))

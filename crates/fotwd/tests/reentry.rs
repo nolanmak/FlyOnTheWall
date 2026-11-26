@@ -50,13 +50,12 @@ async fn a_live_daemon_hands_a_second_serve_a_working_login_link() {
 
 #[tokio::test]
 async fn a_dead_or_foreign_daemon_is_not_mistaken_for_a_live_one() {
-    // Nothing listens here: the caller must fall through to a fresh start.
-    let vacant = {
-        let sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        sock.local_addr().unwrap().port()
-        // Dropped: the port is free again.
-    };
-    assert!(fetch_fresh_launch_url(vacant, "deadbeef").await.is_err());
+    // Own the ephemeral port without listening, so a parallel test cannot
+    // acquire it before the client sees connection refusal.
+    let vacant = tokio::net::TcpSocket::new_v4().unwrap();
+    vacant.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = vacant.local_addr().unwrap().port();
+    assert!(fetch_fresh_launch_url(port, "deadbeef").await.is_err());
 
     // Something else entirely listens: a wrong token answers 404, and 404 is
     // "not our daemon", never "open that".
