@@ -14,7 +14,7 @@ use fotw_stt::{Source, TimestampSource, TranscriptSegment};
 use fotw_summarize::coverage::{LOW_GROUNDING_BANNER, LOW_GROUNDING_THRESHOLD};
 use fotw_summarize::document::TranscriptDocument;
 use fotw_summarize::pipeline::{Pipeline, PipelineConfig, SummaryOutcome, Warning};
-use fotw_summarize::template::Template;
+use fotw_summarize::template::{Template, TemplateSet};
 use fotw_summarize::title;
 use fotw_summarize::{AnthropicAdapter, LlmAdapter, Preset};
 
@@ -51,6 +51,48 @@ pub struct SummarizeOutcome {
     pub dropped_items: usize,
     /// What the user should be told, already worded for a human.
     pub warnings: Vec<String>,
+}
+
+/// A parsed template, optionally bound to the meeting inputs used to select it.
+pub struct SelectedTemplate<'a> {
+    template: &'a Template,
+    title_inputs: Option<fotw_store::SettingVersion>,
+}
+
+impl<'a> SelectedTemplate<'a> {
+    /// Match the meeting title under an input observation taken before reading it.
+    ///
+    /// # Errors
+    /// The meeting or its input observation could not be read.
+    pub fn for_title(
+        db: &mut Db,
+        meeting_id: &str,
+        templates: &'a TemplateSet,
+    ) -> fotw_store::Result<Option<Self>> {
+        let inputs = db
+            .setting_version(crate::engine::SETTINGS_KEY)?
+            .with_meeting_inputs(db, meeting_id)?;
+        let title = db.meetings().get(meeting_id)?.title;
+        Ok(templates.for_event_title(&title).map(|template| Self {
+            template,
+            title_inputs: Some(inputs),
+        }))
+    }
+
+    /// The parsed template selected for this run.
+    #[must_use]
+    pub fn template(&self) -> &'a Template {
+        self.template
+    }
+}
+
+impl<'a> From<&'a Template> for SelectedTemplate<'a> {
+    fn from(template: &'a Template) -> Self {
+        Self {
+            template,
+            title_inputs: None,
+        }
+    }
 }
 
 /// Errors from a summarisation run.
@@ -106,11 +148,11 @@ pub(crate) fn stored_segments(
 ///
 /// [`SummarizeRunError::NoKey`] when nothing is configured, plus whatever
 /// [`summarize_meeting_on`] failed with.
-pub async fn summarize_meeting(
+pub async fn summarize_meeting<'a>(
     db: &mut Db,
     store: &dyn KeyStore,
     meeting_id: &str,
-    template: &Template,
+    template: impl Into<SelectedTemplate<'a>>,
 ) -> Result<SummarizeOutcome, SummarizeRunError> {
     let engine = crate::engine::resolve_engine(store, db).ok_or(SummarizeRunError::NoKey)?;
     summarize_meeting_on(db, &engine, meeting_id, template).await
@@ -139,11 +181,11 @@ pub struct ManualSummary {
 /// # Errors
 ///
 /// Whatever [`summarize_meeting`] failed with.
-pub async fn summarize_meeting_manually(
+pub async fn summarize_meeting_manually<'a>(
     db: &mut Db,
     store: &dyn KeyStore,
     meeting_id: &str,
-    template: &Template,
+    template: impl Into<SelectedTemplate<'a>>,
 ) -> Result<ManualSummary, SummarizeRunError> {
     let pass = db.meetings().begin_enrich_pass(meeting_id);
     let outcome = summarize_meeting(db, store, meeting_id, template).await?;
@@ -185,11 +227,11 @@ pub async fn summarize_meeting_manually(
 ///
 /// [`SummarizeRunError::NoTranscript`] with nothing to summarise, and whatever
 /// the store or the pipeline failed with.
-pub async fn summarize_meeting_on(
+pub async fn summarize_meeting_on<'a>(
     db: &mut Db,
     engine: &crate::engine::Engine,
     meeting_id: &str,
-    template: &Template,
+    template: impl Into<SelectedTemplate<'a>>,
 ) -> Result<SummarizeOutcome, SummarizeRunError> {
     let transport = Arc::new(AllowlistedTransport::new());
     summarize_meeting_with(db, engine, meeting_id, template, transport).await
@@ -205,17 +247,27 @@ pub async fn summarize_meeting_on(
 /// # Errors
 ///
 /// As [`summarize_meeting_on`].
-pub async fn summarize_meeting_with<T>(
+pub async fn summarize_meeting_with<'a, T>(
     db: &mut Db,
     engine: &crate::engine::Engine,
     meeting_id: &str,
-    template: &Template,
+    template: impl Into<SelectedTemplate<'a>>,
     transport: Arc<T>,
 ) -> Result<SummarizeOutcome, SummarizeRunError>
 where
     T: fotw_summarize::transport::HttpTransport + 'static,
 {
+    let SelectedTemplate {
+        template,
+        title_inputs,
+    } = template.into();
     let stamp = PolicyStamp::capture(db, engine, meeting_id)?;
+    if title_inputs
+        .as_ref()
+        .is_some_and(|inputs| inputs != stamp.version())
+    {
+        return Err(changed().into());
+    }
     let Some(transcript_id) = crate::persist::primary_transcript_id(db, meeting_id) else {
         return Err(SummarizeRunError::NoTranscript(meeting_id.to_owned()));
     };

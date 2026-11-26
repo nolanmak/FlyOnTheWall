@@ -2581,14 +2581,9 @@ async fn summarize_command(root: PathBuf, meeting_id: String, slug: Option<Strin
             return ExitCode::FAILURE;
         }
     };
-    let title = db
-        .meetings()
-        .get(&meeting_id)
-        .map(|m| m.title)
-        .unwrap_or_default();
     let template = match &slug {
         Some(s) => match set.get(s) {
-            Some(t) => t.clone(),
+            Some(t) => t.into(),
             None => {
                 eprintln!(
                     "fotwd: no template `{s}` in {}",
@@ -2606,17 +2601,22 @@ async fn summarize_command(root: PathBuf, meeting_id: String, slug: Option<Strin
         },
         // The divergence from Granola worth shipping: a template can claim a
         // calendar-event-title pattern and become the default for it.
-        None => match set.for_event_title(&title) {
-            Some(t) => t.clone(),
-            None => {
+        None => match fotwd::summarize::SelectedTemplate::for_title(&mut db, &meeting_id, &set) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
                 eprintln!("fotwd: no templates are installed — run `fotwd templates install`");
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!("fotwd: {e}");
                 return ExitCode::FAILURE;
             }
         },
     };
-    println!("  template   : {} ({})", template.name, template.slug);
+    let selected = template.template();
+    println!("  template   : {} ({})", selected.name, selected.slug);
 
-    match fotwd::summarize::summarize_meeting_manually(&mut db, store, &meeting_id, &template).await
+    match fotwd::summarize::summarize_meeting_manually(&mut db, store, &meeting_id, template).await
     {
         Ok(fotwd::summarize::ManualSummary {
             outcome: out,

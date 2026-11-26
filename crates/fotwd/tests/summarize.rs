@@ -1130,3 +1130,34 @@ async fn a_segment_owned_by_another_meeting_never_reaches_this_meetings_summary(
          ({b}); a cross-meeting segment reached the provider"
     );
 }
+
+#[tokio::test]
+async fn refuses_a_title_template_selected_for_superseded_inputs() {
+    let dir = tmpdir("stale-template-selection");
+    let mut db = db_at(&dir);
+    let id = seeded_meeting(&mut db, &dir);
+    let set = TemplateSet::builtin();
+    let selection = summarize::SelectedTemplate::for_title(&mut db, &id, &set)
+        .unwrap()
+        .unwrap();
+    let mut writer = db_at(&dir);
+    let title = writer.meetings().get(&id).unwrap().title;
+    writer.meetings().set_title(&id, &title).unwrap();
+
+    let response = |text: &str| {
+        serde_json::json!({
+            "content": [{"type": "text", "text": text}],
+            "usage": {"input_tokens": 100, "output_tokens": 10},
+            "stop_reason": "end_turn"
+        })
+    };
+    let mock = Arc::new(MockTransport::new()
+        .with_json(response("Numbers were above target."))
+        .with_json(response(r#"{"action_items":[],"decisions":[],"open_questions":[],"follow_ups":[],"topics":[]}"#)));
+    let result =
+        summarize::summarize_meeting_with(&mut db, &anthropic(), &id, selection, mock.clone())
+            .await;
+    assert_eq!(mock.call_count(), 0);
+    assert!(result.is_err());
+    assert!(db.meetings().current_summary(&id).unwrap().is_none());
+}
