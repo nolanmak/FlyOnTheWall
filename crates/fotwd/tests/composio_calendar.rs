@@ -12,7 +12,7 @@ use fotw_web::calendar::{AccountState, CalendarAction, CalendarControl};
 use fotwd::calendar::composio::{
     self, Account, ComposioCalendar, ComposioHttp, ComposioSettings, Method, Request,
 };
-use fotwd::calendar::{CalendarLookup, Participation};
+use fotwd::calendar::{AttendeeKind, CalendarLookup, Participation, Response};
 use serde_json::{Value, json};
 
 const MIN: i64 = 60_000;
@@ -169,6 +169,160 @@ fn objects_that_are_not_events_are_ignored() {
         {"kind": "calendar#calendarListEntry", "id": "primary"},
     ]});
     assert!(composio::events_from(&data).is_empty());
+}
+
+#[test]
+fn attendee_fields_and_ical_uid_are_read_for_release() {
+    let data = json!({"items": [{
+        "id": "inst_20261112T180000Z",
+        "iCalUID": "series-1@example.com",
+        "summary": "Planning",
+        "status": "confirmed",
+        "start": {"dateTime": "2026-11-12T18:00:00Z"},
+        "end": {"dateTime": "2026-11-12T18:30:00Z"},
+        "organizer": {"email": "host@example.com", "displayName": "Host"},
+        "attendees": [
+            {"email": "Me@Example.com", "self": true, "responseStatus": "accepted"},
+            {"email": "peer@example.com", "displayName": "Peer", "responseStatus": "needsAction"},
+            {"email": "maybe@example.com", "responseStatus": "tentative"},
+            {"email": "no@example.com", "responseStatus": "declined"},
+            {"email": "room-2@resource.example.com", "resource": true, "responseStatus": "accepted"},
+            {"email": "odd@example.com", "responseStatus": "somethingNew"},
+        ],
+    }]});
+    let events = composio::events_from(&data);
+    let e = &events[0];
+    assert_eq!(
+        e.uid, "inst_20261112T180000Z",
+        "the instance id stays the uid"
+    );
+    assert_eq!(e.ical_uid.as_deref(), Some("series-1@example.com"));
+    let got: Vec<(Option<&str>, Response, AttendeeKind, bool, bool)> = e
+        .attendees
+        .iter()
+        .map(|a| {
+            (
+                a.address.as_deref(),
+                a.response,
+                a.kind,
+                a.is_self,
+                a.is_organizer,
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (
+                Some("Me@Example.com"),
+                Response::Accepted,
+                AttendeeKind::Person,
+                true,
+                false
+            ),
+            (
+                Some("peer@example.com"),
+                Response::NeedsAction,
+                AttendeeKind::Person,
+                false,
+                false
+            ),
+            (
+                Some("maybe@example.com"),
+                Response::Tentative,
+                AttendeeKind::Person,
+                false,
+                false
+            ),
+            (
+                Some("no@example.com"),
+                Response::Declined,
+                AttendeeKind::Person,
+                false,
+                false
+            ),
+            (
+                Some("room-2@resource.example.com"),
+                Response::Accepted,
+                AttendeeKind::Resource,
+                false,
+                false
+            ),
+            (
+                Some("odd@example.com"),
+                Response::Unknown,
+                AttendeeKind::Person,
+                false,
+                false
+            ),
+            // Not on the attendee list, so added from `organizer`.
+            (
+                Some("host@example.com"),
+                Response::Unknown,
+                AttendeeKind::Person,
+                false,
+                true
+            ),
+        ]
+    );
+    assert_eq!(e.attendees[1].display_name.as_deref(), Some("Peer"));
+    // Name repair is untouched: names only, the user and rooms left out.
+    assert!(e.invitees.iter().all(|n| !n.contains('@')));
+}
+
+#[test]
+fn an_organizer_on_the_attendee_list_is_marked_not_added() {
+    let data = json!({"items": [{
+        "id": "e1",
+        "summary": "Planning",
+        "start": {"dateTime": "2026-11-12T18:00:00Z"},
+        "end": {"dateTime": "2026-11-12T18:30:00Z"},
+        "organizer": {"email": "HOST@example.com", "self": true},
+        "attendees": [
+            {"email": "host@example.com", "organizer": true, "self": true, "responseStatus": "accepted"},
+            {"email": "peer@example.com", "responseStatus": "accepted"},
+        ],
+    }]});
+    let e = &composio::events_from(&data)[0];
+    assert_eq!(e.ical_uid, None);
+    assert_eq!(e.attendees.len(), 2);
+    assert!(e.attendees[0].is_organizer && e.attendees[0].is_self);
+    assert!(!e.attendees[1].is_organizer);
+}
+
+#[test]
+fn an_event_with_no_attendee_list_still_has_its_organizer() {
+    let data = json!({"items": [{
+        "id": "e1",
+        "summary": "Focus",
+        "start": {"dateTime": "2026-11-12T18:00:00Z"},
+        "end": {"dateTime": "2026-11-12T18:30:00Z"},
+        "organizer": {"email": "me@example.com", "self": true},
+    }]});
+    let e = &composio::events_from(&data)[0];
+    assert_eq!(e.attendees.len(), 1);
+    assert!(e.attendees[0].is_self && e.attendees[0].is_organizer);
+}
+
+#[test]
+fn an_account_that_fails_makes_a_complete_read_fail() {
+    let http = FakeComposio::replying(vec![
+        (401, json!({})),
+        (
+            200,
+            json!({"successful": true, "data": {"items": [google_event("e2", "Planning", "2026-11-12T18:00:00Z", "2026-11-12T18:30:00Z")]}}),
+        ),
+    ]);
+    let lookup = ComposioCalendar::new(
+        http,
+        Arc::new(|| Ok(Some("k".to_owned()))),
+        "fotw-user".into(),
+        vec![
+            account("ca_1", AccountState::Active),
+            account("ca_2", AccountState::Active),
+        ],
+    );
+    assert!(lookup.events_overlapping_complete(T, T + MIN).is_err());
 }
 
 // --- Client ------------------------------------------------------------------
@@ -471,6 +625,8 @@ fn many_calendars_merge_and_keep_each_events_source() {
             participation: Participation::Unknown,
             source: "eventkit",
             invitees: Vec::new(),
+            ical_uid: None,
+            attendees: Vec::new(),
         }],
     ));
     let broken: Arc<dyn CalendarLookup> = Arc::new(Broken);
@@ -711,6 +867,8 @@ fn a_slow_google_account_does_not_cost_the_apple_answer() {
             participation: Participation::Unknown,
             source: "eventkit",
             invitees: Vec::new(),
+            ical_uid: None,
+            attendees: Vec::new(),
         }],
     ));
     let merged = fotwd::calendar::Many::with_deadline(
