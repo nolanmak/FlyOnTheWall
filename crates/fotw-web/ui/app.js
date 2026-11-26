@@ -446,6 +446,9 @@ function renderDetail(detail) {
   // removed. Draws nothing at all when export is off or absent.
   mountGithubSync(detail, el.detail);
 
+  // Attendee release (#326 5.7): one line from the status endpoint.
+  if (typeof FOTWRelease !== "undefined") FOTWRelease.line(detail.meeting.id, el.detail, api);
+
   mountSharingDocument(detail, el.detail);
 
   if (typeof FOTWSpeechRecovery !== "undefined") {
@@ -2345,6 +2348,9 @@ async function main() {
   if (modelSetup && typeof FOTWModels !== "undefined") FOTWModels.mount(modelSetup, api);
   const settingsPanel = document.getElementById("settings-panel");
   if (settingsPanel && typeof FOTWCalendar !== "undefined") FOTWCalendar.settings(settingsPanel, api);
+  if (settingsPanel && typeof FOTWRelease !== "undefined") FOTWRelease.settings(settingsPanel, api);
+  const outboxMount = document.getElementById("release-outbox-mount");
+  if (outboxMount && typeof FOTWRelease !== "undefined") FOTWRelease.outbox(outboxMount, api);
   await loadMeetings();
   await loadNoteDraftControl();
   await loadGithub();
