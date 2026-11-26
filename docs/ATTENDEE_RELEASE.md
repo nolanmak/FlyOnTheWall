@@ -224,13 +224,19 @@ auto-scheduled send records nothing. The decisions are kept in an append-only
 table that is not deleted along with meetings, so deleting meetings can't
 change the unlock.
 
-The engine id is the engine kind and a model name, for example
-`claude-cli:claude-opus-5`. The kind is `anthropic-api`, `claude-cli` or
-`codex-cli`. The model name is the one the sharing-document path asks for
-(currently `claude-opus-5`). Switching to a different engine kind starts the
-count again for that engine. The `claude` and `codex` CLIs run their own
-configured model, so changing a CLI's default model does **not** change the
-engine id.
+The engine id is the engine kind plus a model name:
+
+- `anthropic-api:<model>` for the Anthropic API engine. The model is the one
+  the sharing-document path asks for (currently `claude-opus-5`).
+- `claude-cli:default` and `codex-cli:default` for the CLI engines. The CLIs
+  run their own default model, which FlyOnTheWall can't see, so the id says
+  `default` rather than naming a model.
+
+Switching to a different engine starts the count again for that engine id.
+Changing a CLI's default model does **not** change the engine id, so it does
+**not** re-lock auto mode. If you change the model your `claude` or `codex`
+CLI uses, consider switching back to approval mode until you trust the new
+model.
 
 The rule is checked again on every worker pass. If it stops holding, for
 example because you switched engines, auto acts like approval: new rows get
@@ -505,6 +511,11 @@ check and the sender equality are what pin the account.
   attachment), the index map, and for each recipient the display name, first
   name and the part of the address before `@`. Full recipient addresses never
   reach the engine.
+- **What passes through Composio.** If Google Calendar is connected through
+  Composio, event titles, times and attendee lists pass through it when a
+  recording is saved. Audio, transcripts and summaries never do. Attendee
+  addresses are stored on this device the same way whether the event came
+  from Google or from Apple Calendar.
 - **What goes to Google.** The email itself, through your `gws` login, straight
   from this machine to the Gmail API.
 
@@ -567,12 +578,15 @@ Results, recorded in [#347](https://github.com/nolanmak/FlyOnTheWall/pull/347):
 
 | Engine (eval runner label) | Daemon engine id | Caught | `credential` | `about_recipient` | Other categories | False holds | Retention |
 |---|---|---|---|---|---|---|---|
-| `claude-cli` (Claude Code 2.1.332, subscription default model), run 1 | `claude-cli:claude-opus-5` | 37/37 | 7/7 | 6/6 | 6/6 each | 0/12 | 683/683\* |
-| `claude-cli`, run 2 | `claude-cli:claude-opus-5` | 37/37 | 7/7 | 6/6 | 6/6 each | 0/12 | 683/683\* |
-| `codex` (codex-cli 0.153.4, configured default model) | `codex-cli:claude-opus-5` | 37/37 | 7/7 | 6/6 | 6/6 each | 0/12 | 683/683\* |
+| `claude-cli` (Claude Code 2.1.332, subscription default model), run 1 | `claude-cli:default` | 37/37 | 7/7 | 6/6 | 6/6 each | 0/12 | 683/683\* |
+| `claude-cli`, run 2 | `claude-cli:default` | 37/37 | 7/7 | 6/6 | 6/6 each | 0/12 | 683/683\* |
+| `codex` (codex-cli 0.153.4, configured default model) | `codex-cli:default` | 37/37 | 7/7 | 6/6 | 6/6 each | 0/12 | 683/683\* |
 
 No run was held as `model_failed`. The `anthropic-api` engine has not been
 measured.
+
+This table will be updated when the eval is re-run through the real cut and
+summary.
 
 \* **These runs measure the review on its own.** The eval runner still uses a
 temporary `FixturePreparer` in place of the real cut and summary. It keeps
