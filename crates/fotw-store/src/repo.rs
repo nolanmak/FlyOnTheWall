@@ -5,7 +5,7 @@
 //! method here, wrapped in one transaction, so a caller cannot forget the
 //! second half.
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::db::Db;
 use crate::error::{Result, StoreError};
@@ -684,85 +684,77 @@ impl MeetingRepo<'_> {
         s: NewSummary,
         version: Option<&crate::SettingVersion>,
     ) -> Result<Summary> {
-        let id = new_id();
-        let now = now_ms();
-
-        let tx = self.db.conn_mut().transaction()?;
+        let tx = self
+            .db
+            .conn_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(version) = version {
             version.ensure_for_meeting(&tx, meeting_id)?;
         }
-
-        // Guard explicitly: a summary for a nonexistent meeting would
-        // otherwise surface as an opaque FK violation.
-        let exists: bool = tx
-            .query_row(
-                "SELECT 1 FROM meetings WHERE id = ?1",
-                params![meeting_id],
-                |_| Ok(true),
-            )
-            .optional()?
-            .unwrap_or(false);
-        if !exists {
-            return Err(StoreError::NotFound {
-                kind: "meeting",
-                id: meeting_id.to_owned(),
-            });
-        }
-
-        let version: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(version), 0) + 1 FROM summaries WHERE meeting_id = ?1",
-            params![meeting_id],
-            |r| r.get(0),
-        )?;
-
-        tx.execute(
-            "UPDATE summaries SET is_current = 0 WHERE meeting_id = ?1 AND is_current = 1",
-            params![meeting_id],
-        )?;
-
-        tx.execute(
-            "INSERT INTO summaries (
-                 id, meeting_id, version, template_id, transcript_id,
-                 provider, model, prompt_hash, body_md, coverage,
-                 input_tokens, output_tokens, cost_micros,
-                 is_current, created_at, origin_device_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, ?14, ?15)",
-            params![
-                id,
-                meeting_id,
-                version,
-                s.template_id,
-                s.transcript_id,
-                s.provider,
-                s.model,
-                s.prompt_hash,
-                s.body_md,
-                s.coverage,
-                s.input_tokens,
-                s.output_tokens,
-                s.cost_micros,
-                now,
-                s.origin_device_id,
-            ],
-        )?;
-
-        let sql = format!("SELECT {} FROM summaries WHERE id = ?1", Summary::COLUMNS);
-        let out = tx.query_row(&sql, params![id], |r| Ok(Summary::from_row(r)))??;
+        ensure_summary_meeting(&tx, meeting_id)?;
+        let out = append_summary(&tx, meeting_id, s)?;
         tx.commit()?;
         Ok(out)
     }
 
+    /// Append a correction when the current summary's body changes.
+    ///
+    /// A no-op only reads. A possible append acquires the writer before
+    /// rereading the current summary and reapplies the transform if the body
+    /// changed. The transform must be deterministic and have no side effects.
+    pub fn correct_current_summary(
+        &mut self,
+        meeting_id: &str,
+        mut correct: impl FnMut(&str) -> String,
+    ) -> Result<()> {
+        let conn = self.db.conn();
+        ensure_summary_meeting(conn, meeting_id)?;
+        let Some(observed) = read_current_summary(conn, meeting_id)? else {
+            return Ok(());
+        };
+        let corrected = correct(&observed.body_md);
+        if corrected == observed.body_md {
+            return Ok(());
+        }
+
+        let tx = self
+            .db
+            .conn_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_summary_meeting(&tx, meeting_id)?;
+        if let Some(current) = read_current_summary(&tx, meeting_id)? {
+            let body_md = if current.body_md == observed.body_md {
+                corrected
+            } else {
+                correct(&current.body_md)
+            };
+            if body_md != current.body_md {
+                append_summary(
+                    &tx,
+                    meeting_id,
+                    NewSummary {
+                        body_md,
+                        origin_device_id: "local".into(),
+                        provider: current.provider,
+                        model: current.model,
+                        prompt_hash: current.prompt_hash,
+                        template_id: current.template_id,
+                        transcript_id: current.transcript_id,
+                        coverage: current.coverage,
+                        input_tokens: None,
+                        output_tokens: None,
+                        cost_micros: None,
+                    },
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// The summary the UI should show, if there is one.
     pub fn current_summary(&self, meeting_id: &str) -> Result<Option<Summary>> {
-        let sql = format!(
-            "SELECT {} FROM summaries WHERE meeting_id = ?1 AND is_current = 1",
-            Summary::COLUMNS
-        );
-        self.db
-            .conn()
-            .query_row(&sql, params![meeting_id], |r| Ok(Summary::from_row(r)))
-            .optional()?
-            .transpose()
+        read_current_summary(self.db.conn(), meeting_id)
     }
 
     /// Every summary version, newest first. The history is the point of the
@@ -801,6 +793,81 @@ impl MeetingRepo<'_> {
                 id: meeting_id.to_owned(),
             })
     }
+}
+
+fn ensure_summary_meeting(conn: &Connection, meeting_id: &str) -> Result<()> {
+    // Guard explicitly: a summary for a nonexistent meeting would
+    // otherwise surface as an opaque FK violation.
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM meetings WHERE id = ?1",
+            params![meeting_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !exists {
+        return Err(StoreError::NotFound {
+            kind: "meeting",
+            id: meeting_id.to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+fn append_summary(conn: &Transaction<'_>, meeting_id: &str, s: NewSummary) -> Result<Summary> {
+    let id = new_id();
+    let now = now_ms();
+    let version: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) + 1 FROM summaries WHERE meeting_id = ?1",
+        params![meeting_id],
+        |r| r.get(0),
+    )?;
+
+    conn.execute(
+        "UPDATE summaries SET is_current = 0 WHERE meeting_id = ?1 AND is_current = 1",
+        params![meeting_id],
+    )?;
+
+    conn.execute(
+        "INSERT INTO summaries (
+                 id, meeting_id, version, template_id, transcript_id,
+                 provider, model, prompt_hash, body_md, coverage,
+                 input_tokens, output_tokens, cost_micros,
+                 is_current, created_at, origin_device_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, ?14, ?15)",
+        params![
+            id,
+            meeting_id,
+            version,
+            s.template_id,
+            s.transcript_id,
+            s.provider,
+            s.model,
+            s.prompt_hash,
+            s.body_md,
+            s.coverage,
+            s.input_tokens,
+            s.output_tokens,
+            s.cost_micros,
+            now,
+            s.origin_device_id,
+        ],
+    )?;
+
+    let sql = format!("SELECT {} FROM summaries WHERE id = ?1", Summary::COLUMNS);
+    conn.query_row(&sql, params![id], |r| Ok(Summary::from_row(r)))?
+}
+
+fn read_current_summary(conn: &Connection, meeting_id: &str) -> Result<Option<Summary>> {
+    let sql = format!(
+        "SELECT {} FROM summaries WHERE meeting_id = ?1 AND is_current = 1",
+        Summary::COLUMNS
+    );
+    conn.query_row(&sql, params![meeting_id], |r| Ok(Summary::from_row(r)))
+        .optional()?
+        .transpose()
 }
 
 pub(crate) fn insert_meeting(conn: &rusqlite::Connection, m: NewMeeting) -> Result<String> {
