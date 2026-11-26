@@ -31,7 +31,7 @@ globalThis.FOTWCalendar = {
     const googleHead = googleCard.appendChild(make('div', '', '', 'cal-card-head'));
     googleHead.appendChild(make('h3', 'Google Calendar', '', 'cal-title'));
     googleHead.appendChild(make('span', 'via Composio', '', 'cal-via'));
-    googleCard.appendChild(make('p', 'Event titles and times pass through Composio (backend.composio.dev) when a recording is saved. Audio, transcripts and summaries never do.', '', 'cal-sub'));
+    googleCard.appendChild(make('p', 'Event titles and times pass through Composio (backend.composio.dev) when a recording is saved. Audio, transcripts and summaries never do. With attendee release on, the addresses of the matched event’s invitees in your allowed domains are stored with the meeting; no other address is.', '', 'cal-sub'));
 
     const keySaved = googleCard.appendChild(make('div', '', '', 'cal-key-saved'));
     const keyState = keySaved.appendChild(make('span', '', 'calendar-key-state', 'cal-key-state'));

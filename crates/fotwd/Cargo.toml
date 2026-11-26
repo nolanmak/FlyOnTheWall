@@ -113,6 +113,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
   "NSError",
   "NSPredicate",
   "NSString",
+  "NSURL",
 ] }
 objc2-event-kit = { version = "0.3.2", default-features = false, features = [
   "std",
