@@ -266,6 +266,39 @@ struct Section {
     evidence: Vec<usize>,
 }
 
+/// Validate a model cut over a transcript of `len` segments: `end_index` is a
+/// source index, every omitted range is ascending and inside the source, and
+/// the last included segment is not itself omitted. Ranges after the boundary
+/// are redundant, but harmless. Shared by sharing documents and the attendee
+/// release cut (D6); the messages are repair feedback for the model.
+pub(crate) fn validate_cut(
+    len: usize,
+    end_index: usize,
+    omit_ranges: &[[usize; 2]],
+) -> Result<(), String> {
+    if end_index >= len {
+        return Err(format!(
+            "The last included index must be between 0 and {}.",
+            len.saturating_sub(1)
+        ));
+    }
+    if omit_ranges.iter().any(|[a, b]| a > b || *b >= len) {
+        return Err(
+            "Omitted ranges must contain valid source indices in ascending order.".to_owned(),
+        );
+    }
+    if omit_ranges
+        .iter()
+        .any(|[a, b]| end_index >= *a && end_index <= *b)
+    {
+        return Err(
+            "The last included segment was also omitted. Choose a retained ending index."
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn decode(raw: &str, input: &Input) -> Result<SharingDocument, String> {
     let raw = raw.trim();
     let raw = raw
@@ -291,32 +324,10 @@ fn decode(raw: &str, input: &Input) -> Result<SharingDocument, String> {
     {
         return Err(invalid());
     }
-    if draft.end_index >= input.transcript.len() {
-        return Err(format!(
-            "The last included index must be between 0 and {}.",
-            input.transcript.len() - 1
-        ));
-    }
-    // Ranges after the boundary are redundant, but harmless. Validate them
-    // against the source, then the retained predicate also applies the cutoff.
-    if draft
-        .omit_ranges
-        .iter()
-        .any(|[a, b]| a > b || *b >= input.transcript.len())
-    {
-        return Err(
-            "Omitted ranges must contain valid source indices in ascending order.".to_owned(),
-        );
-    }
+    validate_cut(input.transcript.len(), draft.end_index, &draft.omit_ranges)?;
     let retained = |i: usize| {
         i <= draft.end_index && !draft.omit_ranges.iter().any(|[a, b]| i >= *a && i <= *b)
     };
-    if !retained(draft.end_index) {
-        return Err(
-            "The last included segment was also omitted. Choose a retained ending index."
-                .to_owned(),
-        );
-    }
     // The document's own heading and stored title follow the meeting's title,
     // not the model's, except when the meeting is still untitled.
     let title = effective_title(&input.meeting_title, &draft.title);
@@ -1141,6 +1152,18 @@ mod tests {
             doc.excerpts.iter().map(|e| e.index).collect::<Vec<_>>(),
             vec![0, 2, 3]
         );
+    }
+    #[test]
+    fn validate_cut_is_the_shared_index_check() {
+        assert_eq!(validate_cut(5, 3, &[[1, 1], [4, 4]]), Ok(()));
+        assert_eq!(
+            validate_cut(5, 5, &[]),
+            Err("The last included index must be between 0 and 4.".to_owned())
+        );
+        assert!(validate_cut(5, 3, &[[2, 1]]).is_err());
+        assert!(validate_cut(5, 3, &[[1, 5]]).is_err());
+        assert!(validate_cut(5, 3, &[[2, 3]]).is_err(), "end_index omitted");
+        assert!(validate_cut(0, 0, &[]).is_err(), "an empty transcript");
     }
     struct EditingStore {
         inner: fotw_secrets::InMemoryKeyStore,
