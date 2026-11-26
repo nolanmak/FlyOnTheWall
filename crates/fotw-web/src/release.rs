@@ -92,6 +92,16 @@ pub struct MeetingReleaseStatus {
     /// Epoch ms, when sent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sent_at: Option<i64>,
+    /// The matched calendar event's frozen title; only when a row exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_title: Option<String>,
+    /// The matched event's scheduled start, epoch ms; `None` without a row
+    /// or on a row created before times were stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_start_ms: Option<i64>,
+    /// The matched event's scheduled end, epoch ms; `None` likewise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_end_ms: Option<i64>,
 }
 
 /// One frozen recipient as the Outbox shows it.
@@ -151,6 +161,13 @@ pub struct OutboxItem {
     pub created_at: i64,
     /// Epoch ms, when scheduled.
     pub send_at: Option<i64>,
+    /// The matched event's scheduled start, epoch ms; `None` on rows created
+    /// before times were stored.
+    #[serde(default)]
+    pub event_start_ms: Option<i64>,
+    /// The matched event's scheduled end, epoch ms; `None` likewise.
+    #[serde(default)]
+    pub event_end_ms: Option<i64>,
 }
 
 /// `GET /api/release/outbox` response.
@@ -202,6 +219,9 @@ pub enum OutboxAction {
     Cancel,
     /// Retry a held row.
     Retry,
+    /// The calendar match is wrong: stop the release for good. Allowed from
+    /// `preparing`, `needs_review`, `scheduled` and `held`.
+    WrongEvent,
 }
 
 /// A boxed, sendable future.

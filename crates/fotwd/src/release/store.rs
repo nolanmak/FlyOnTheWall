@@ -52,6 +52,7 @@ pub const REASON_ORDER: &[&str] = &[
     "body_too_large",
     "send_refused",
     "by_user",
+    "wrong_event",
     "no_recipients",
 ];
 
@@ -88,6 +89,11 @@ pub struct ReleaseRow {
     pub ical_uid: Option<String>,
     /// Frozen raw calendar title.
     pub event_title: String,
+    /// The matched event's scheduled start, epoch ms; `None` on rows created
+    /// before it was stored.
+    pub event_start_ms: Option<i64>,
+    /// The matched event's scheduled end, epoch ms; `None` likewise.
+    pub event_end_ms: Option<i64>,
     /// Frozen recipients (D4).
     pub recipients: Vec<Recipient>,
     /// The cut, when one has been made.
@@ -291,7 +297,8 @@ const COLUMNS: &str = "meeting_id, state, reasons_json, source, source_event_id,
      event_title, recipients_json, end_index, omit_ranges_json, reviewer_retained_json, \
      summary_json, rendered_subject, rendered_body, rendered_attachment, \
      rendered_attachment_name, index_map_json, findings_json, input_fingerprint, engine_id, \
-     approved_by, send_at, sent_to_json, sent_at, message_id, created_at, updated_at";
+     approved_by, send_at, sent_to_json, sent_at, message_id, created_at, updated_at, \
+     event_start_ms, event_end_ms";
 
 fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ReleaseRow> {
     let reasons: String = r.get(2)?;
@@ -344,6 +351,8 @@ fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ReleaseRow> {
         message_id: r.get(24)?,
         created_at: r.get(25)?,
         updated_at: r.get(26)?,
+        event_start_ms: r.get(27)?,
+        event_end_ms: r.get(28)?,
     })
 }
 
@@ -411,6 +420,10 @@ pub struct NewRelease<'a> {
     pub ical_uid: Option<&'a str>,
     /// Raw calendar title.
     pub event_title: &'a str,
+    /// The event's scheduled start, epoch ms.
+    pub event_start_ms: i64,
+    /// The event's scheduled end, epoch ms.
+    pub event_end_ms: i64,
     /// Recipients after the allowed-domain filter.
     pub recipients: &'a [Recipient],
 }
@@ -428,8 +441,8 @@ pub fn insert_preparing(
     let n = conn.execute(
         "INSERT OR IGNORE INTO meeting_releases
            (meeting_id, state, reasons_json, source, source_event_id, ical_uid, event_title,
-            recipients_json, created_at, updated_at)
-         VALUES (?1, 'preparing', '[]', ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            recipients_json, created_at, updated_at, event_start_ms, event_end_ms)
+         VALUES (?1, 'preparing', '[]', ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9)",
         params![
             new.meeting_id,
             new.source,
@@ -437,7 +450,9 @@ pub fn insert_preparing(
             new.ical_uid,
             new.event_title,
             json(&new.recipients),
-            now_ms
+            now_ms,
+            new.event_start_ms,
+            new.event_end_ms
         ],
     )?;
     Ok(n == 1)
@@ -555,6 +570,9 @@ pub mod decision {
     pub const AUTO: &str = "auto";
     /// Send again anyway; not counted for the unlock.
     pub const SENT_AGAIN: &str = "sent_again";
+    /// The calendar match was wrong; not counted for the unlock. It says
+    /// nothing about the engine's summaries.
+    pub const WRONG_EVENT: &str = "wrong_event";
 }
 
 /// Append a decision (D19).
@@ -577,7 +595,9 @@ pub fn record_decision(
     Ok(())
 }
 
-/// `(human decisions, approved_unchanged)` for `engine_id` (D11).
+/// `(human decisions, approved_unchanged)` for `engine_id` (D11). Only
+/// review decisions count: `auto`, `sent_again` and `wrong_event` are in
+/// neither number.
 ///
 /// # Errors
 ///

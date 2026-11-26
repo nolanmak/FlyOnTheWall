@@ -981,3 +981,8 @@ button, summary { min-height: 36px; }
 .release-seg { display: block; padding: 2px 0; overflow-wrap: anywhere; }
 .release-seg.is-cut { color: var(--muted); }
 .release-seg.is-flagged { background: var(--selected); }
+.release-match { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; margin: 0 0 8px; overflow-wrap: anywhere; }
+.release-match .release-wrong-event { display: inline; margin: 0; }
+.release-match .release-confirm { flex-basis: 100%; }
+.release-match .release-confirm button { margin-right: 8px; }
+.release-match .gh-note:empty { display: none; }

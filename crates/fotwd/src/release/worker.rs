@@ -546,6 +546,8 @@ impl Worker {
                         source_event_id: &event.uid,
                         ical_uid: event.ical_uid.as_deref(),
                         event_title: &event.title,
+                        event_start_ms: event.start_ms,
+                        event_end_ms: event.end_ms,
                         recipients: &recipients,
                     };
                     if store::insert_preparing(db.conn(), &new, now).unwrap_or(false) {

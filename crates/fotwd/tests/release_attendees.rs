@@ -12,7 +12,6 @@ use fotwd::calendar::release::{
 };
 use fotwd::calendar::{
     Attendee, AttendeeKind, CalendarLookup, Fixed, Many, Participation, Response, ScheduledEvent,
-    match_event,
 };
 
 const MIN: i64 = 60_000;
@@ -301,7 +300,7 @@ fn a_meeting_running_to_twice_its_scheduled_length_still_passes() {
 }
 
 #[test]
-fn a_recording_covering_less_than_half_the_event_fails() {
+fn any_overlap_with_the_event_is_enough() {
     let events = [event(
         "composio",
         "g-1",
@@ -309,18 +308,32 @@ fn a_recording_covering_less_than_half_the_event_fails() {
         at(0),
         at(60),
     )];
-    // The naming matcher still picks it: release is stricter.
+    // Started seven minutes early and covered only the first few minutes.
     assert_eq!(
-        match_event(&events, at(0), at(25)).map(|e| e.uid.as_str()),
-        Some("g-1")
+        chosen(&events, at(-7), at(5), "composio", "g-1"),
+        Ok(("g-1".into(), at(0)))
     );
+    // A recording entirely outside the event is not this event.
     assert_eq!(
-        chosen(&events, at(0), at(25), "composio", "g-1"),
+        chosen(&events, at(61), at(90), "composio", "g-1"),
+        Err(NotEligible::EventNotFound)
+    );
+}
+
+#[test]
+fn another_invite_overlapping_more_is_a_rival() {
+    let events = [
+        event("composio", "g-1", Some("a@example.com"), at(0), at(30)),
+        event("composio", "g-2", Some("b@example.com"), at(30), at(60)),
+    ];
+    // Recorded 25..55: mostly the second meeting, so the first is not it.
+    assert_eq!(
+        chosen(&events, at(25), at(55), "composio", "g-1"),
         Err(NotEligible::NoConfidentMatch)
     );
-    // Exactly half is enough.
+    // Recorded 0..35: mostly the first, which still matches.
     assert_eq!(
-        chosen(&events, at(0), at(30), "composio", "g-1"),
+        chosen(&events, at(0), at(35), "composio", "g-1"),
         Ok(("g-1".into(), at(0)))
     );
 }

@@ -69,11 +69,11 @@ chooses them, so a prompt injection in a transcript cannot add a recipient.
 2. **The match must be confident.** The candidates are the events the matcher
    would consider: declined, untitled and long focus blocks are left out. Copies
    of one invite (the same iCalendar UID and start time, as seen in both Apple
-   Calendar and Google) count as one event. The match is confident only when
-   exactly one candidate has **at least half of its own scheduled length**
-   inside the recording, and that candidate is the event the meeting was named
-   after. A meeting that ran long still passes. A recording that covers less
-   than half of its event never does. Otherwise the reason is
+   Calendar and Google) count as one event. The match is confident when the
+   event the meeting was named after **overlaps the recording at all** and no
+   other candidate overlaps it as much or more. A recording that started early,
+   ran late or covered only part of the event still matches; a wrong match can
+   be rejected with **Wrong meeting**. Otherwise the reason is
    `no_confident_match`, which is also the reason for a meeting with no matched
    event at all. Release never borrows attendees from nearby events.
 3. **Attendees, minus exclusions.** The recipients are that event's attendees,
@@ -85,12 +85,18 @@ chooses them, so a prompt injection in a transcript cannot add a recipient.
    not match `example.com`. Addresses outside the allowed domains are never
    stored. If no one is left, the reason is `no_recipients`.
 5. **Frozen.** When the release row is created, the list is stored on it along
-   with the event title, the calendar source, the event id and the iCalendar
-   UID. Nothing updates the list after that. A later decline or a new invitee
+   with the event title, the event's scheduled start and end, the calendar
+   source, the event id and the iCalendar UID. Nothing updates the list after
+   that. A later decline or a new invitee
    is ignored (see [R6](#accepted-risks-and-limits)). At send time the list can
    only **shrink**: it is filtered again against the current allowed domains.
    If you remove a domain, its addresses are not sent to. If nobody is left,
    the row ends as `dropped` with reason `no_recipients`.
+6. **You can reject the match.** The meeting page and the Outbox show
+   `Matched to: <event title> · <start–end>` in your local time. If that is
+   the wrong event, **Wrong meeting** stops the release for good (see
+   [The Outbox](#the-outbox)). Doing nothing means the match stands. Rows
+   created before the times were stored show the title only.
 
 A release with more than 50 recipients always needs review
 (`many_recipients`). The list is not shortened.
@@ -219,7 +225,19 @@ decisions:
 
 Human decisions are *approved unchanged* (Approve with no Edit cuts),
 *approved edited* (Approve after Edit cuts) and *dropped* (Drop). Auto-scheduled
-sends and **Send again anyway** are recorded but do not count. Cancelling an
+sends, **Send again anyway** and **Wrong meeting** are recorded but do not
+count: they are in neither the 20 nor the 80%. A wrong calendar match says
+nothing about the summary engine.
+
+| Decision | Recorded by | Counts toward the unlock |
+|---|---|---|
+| `approved_unchanged` | Approve & send, no Edit cuts | Yes (numerator and denominator) |
+| `approved_edited` | Approve & send after Edit cuts | Denominator only |
+| `dropped` | Drop | Denominator only |
+| `auto` | An auto-scheduled send | No |
+| `sent_again` | Send again anyway | No |
+| `wrong_event` | Wrong meeting | No |
+ Cancelling an
 auto-scheduled send records nothing. The decisions are kept in an append-only
 table that is not deleted along with meetings, so deleting meetings can't
 change the unlock.
@@ -330,8 +348,10 @@ not sent.
 - `sent`: the email went out. The row records the addresses actually used and
   the message id when `gws` returned one. Nothing ever sends a second email for
   this meeting automatically.
-- `dropped` with reason `by_user` (you dropped it) or `no_recipients` (every
-  recipient was filtered out at send time).
+- `dropped` with reason `by_user` (you dropped it), `wrong_event` (you said
+  the release was matched to the wrong calendar event) or `no_recipients`
+  (every recipient was filtered out at send time). A dropped meeting is never
+  given a new release row, so it is never prepared or sent again.
 
 ## Sending at most once
 
@@ -358,7 +378,8 @@ that automatically resends confidential content is not.
 
 The **Release outbox** lists every row in `needs_review`, `scheduled` or
 `held`, oldest first. The badge counts `needs_review` plus `held`. Opening a
-row shows the frozen recipients (name and address), every reason, each finding
+row shows the matched calendar event (`Matched to: <title> · <start–end>`), the
+frozen recipients (name and address), every reason, each finding
 linked to its excerpt or bullet, the stored subject, body and attachment, and
 every transcript segment with a tick for the ones that will be sent.
 
@@ -367,6 +388,7 @@ every transcript segment with a tick for the ones that will be sent.
 | **Approve & send** | `needs_review` (not `send_outcome_unknown`) | Schedules the send for now. Records *approved unchanged*, or *approved edited* after Edit cuts. If the inputs changed, the release is prepared again instead. |
 | **Edit cuts** | `needs_review` (not `send_outcome_unknown`); `held(body_too_large)` | Tick any segments, including ones the model left out. Saving reruns the summary, render and review from your selection. The result always returns to `needs_review(edited)`, even in auto mode. |
 | **Drop** | `needs_review`, `held` | Ends as `dropped(by_user)` and records *dropped*. |
+| **Wrong meeting** | `preparing`, `needs_review`, `scheduled`, `held` (also on the meeting page) | Asks you to confirm ("Stop the release for this meeting? Nobody will be emailed."), then ends as `dropped(wrong_event)` and records *wrong event*, which does not count toward the auto unlock. Not offered once the row is `sending`, `sent` or `dropped`. The meeting is never released. |
 | **Cancel send** | `scheduled` | Back to `needs_review(review_required)`. It only works if it lands before the send starts. Records nothing. |
 | **Retry** | `held` | `model_failed` and `body_too_large` are prepared again. `send_refused` resends the same snapshot now. |
 | **Send again anyway** | `needs_review(send_outcome_unknown)` only | Asks you to confirm first, because the email may already have gone out. Check the sending account's Sent folder before confirming. Records *sent again*, which does not count toward the auto unlock. |
@@ -388,7 +410,13 @@ Each meeting page shows one release line:
 | `sending` | `Sending` |
 | `held` | `Held: <reason>` |
 | `sent` | `Sent to N people, <date time>` |
-| `dropped` | `Not released (dropped)` |
+| `dropped` | `Not released (dropped)` (`wrong_event`: `Not released: matched to the wrong calendar event`) |
+
+Once a meeting has a release row, a second line names the event it was matched
+to: `Matched to: <event title> · <start–end>`, in local time, or the title
+alone for rows created before the times were stored. While the row is
+`preparing`, `needs_review`, `scheduled` or `held` it has a **Wrong meeting**
+button, which works as it does in the Outbox.
 
 ### Owner notice
 
@@ -634,8 +662,11 @@ API.
 
 - `GET/POST /api/settings/release` returns `{settings, error?, auto_unlocked, paused?}`.
   A refused save returns the stored settings unchanged, plus `error`.
-- `GET /api/meetings/{id}/release` returns `{state, reasons, recipient_count, send_at?, sent_at?}`.
-- `GET /api/release/outbox` returns `{items, badge, paused}`.
+- `GET /api/meetings/{id}/release` returns `{state, reasons, recipient_count, send_at?, sent_at?, event_title?, event_start_ms?, event_end_ms?}`.
+  The event fields are present only when the meeting has a release row; the
+  times are absent on rows created before they were stored.
+- `GET /api/release/outbox` returns `{items, badge, paused}`. Each item carries
+  `event_title`, `event_start_ms` and `event_end_ms` (the times may be `null`).
 - `GET /api/release/outbox/{meeting_id}` returns the stored snapshot.
-- `POST /api/release/outbox/{meeting_id}` takes `{"action": "approve" | "send_again" | "drop" | "cancel" | "retry"}`
+- `POST /api/release/outbox/{meeting_id}` takes `{"action": "approve" | "send_again" | "drop" | "cancel" | "retry" | "wrong_event"}`
   or `{"action": "edit_cuts", "retained": [...]}`.

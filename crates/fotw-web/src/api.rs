@@ -791,6 +791,9 @@ pub async fn meeting_release(State(state): State<AppState>, Path(id): Path<Strin
                 recipient_count: 0,
                 send_at: None,
                 sent_at: None,
+                event_title: None,
+                event_start_ms: None,
+                event_end_ms: None,
             },
         );
     };

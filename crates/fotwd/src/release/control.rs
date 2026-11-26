@@ -212,6 +212,9 @@ impl Inner {
                 recipient_count,
                 send_at: row.send_at,
                 sent_at: row.sent_at,
+                event_title: Some(row.event_title),
+                event_start_ms: row.event_start_ms,
+                event_end_ms: row.event_end_ms,
             };
         }
         let not_eligible = |reason: &str| MeetingReleaseStatus {
@@ -220,6 +223,9 @@ impl Inner {
             recipient_count: 0,
             send_at: None,
             sent_at: None,
+            event_title: None,
+            event_start_ms: None,
+            event_end_ms: None,
         };
         let Some(current) = settings::load(&db).in_force().filter(|s| s.enabled) else {
             return not_eligible("release_off");
@@ -379,6 +385,38 @@ impl Inner {
                 })
                 .map_err(|_| STORE_FAILED.to_owned())?
             }
+            OutboxAction::WrongEvent => {
+                // The person says the calendar match was wrong: stop for good,
+                // from any state where nothing has gone out yet. Its decision
+                // is logged and never counts for the unlock (D19): it is about
+                // the calendar, not the engine. A dropped row is never
+                // re-created, so the meeting stays unreleased.
+                let open = [
+                    state::PREPARING,
+                    state::NEEDS_REVIEW,
+                    state::SCHEDULED,
+                    state::HELD,
+                ];
+                if !open.contains(&row.state.as_str()) {
+                    return Err(moved());
+                }
+                transact(db.conn(), |tx| {
+                    let applied = store::cas_in(
+                        tx,
+                        id,
+                        &row.state,
+                        state::DROPPED,
+                        Reasons::Set(&["wrong_event"]),
+                        &[("send_at", Value::Null)],
+                        now,
+                    )?;
+                    if applied {
+                        store::record_decision(tx, id, &engine_id, decision::WRONG_EVENT, now)?;
+                    }
+                    Ok(applied)
+                })
+                .map_err(|_| STORE_FAILED.to_owned())?
+            }
             OutboxAction::Cancel => {
                 if row.state != state::SCHEDULED {
                     return Err(moved());
@@ -504,6 +542,8 @@ fn item(row: &ReleaseRow) -> OutboxItem {
         finding_count: row.findings.len(),
         created_at: row.created_at,
         send_at: row.send_at,
+        event_start_ms: row.event_start_ms,
+        event_end_ms: row.event_end_ms,
     }
 }
 

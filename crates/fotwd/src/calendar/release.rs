@@ -64,10 +64,11 @@ impl NotEligible {
 /// Candidates are the events the matcher would consider: eligible, and not a
 /// block many times the recording's length. Copies of one invite (the same
 /// iCalendar UID and start, as Apple Calendar and Google both show it) count
-/// once. The match is confident when exactly one candidate has at least half
-/// of its own scheduled length inside the recording, and the chosen copy is
-/// that candidate. A meeting that ran long still passes; a recording that
-/// covers less than half of its event never does.
+/// once. The match is confident when the chosen copy is a candidate that
+/// overlaps the recording at all, and no other candidate overlaps it more. A
+/// recording that started early, ran late or covered only part of the event
+/// still matches; one that overlaps another invite at least as much as the
+/// chosen one does not. A wrong match left over is rejected in the Outbox.
 ///
 /// # Errors
 /// [`NotEligible::EventNotFound`] when no copy with that source and id
@@ -95,13 +96,15 @@ pub fn confident_match<'a>(
     if !candidate(chosen) || !covered(chosen, start_ms, end_ms) {
         return Err(NotEligible::NoConfidentMatch);
     }
-    // Copies of one invite count once; any other covered candidate is a
-    // rival, and with a rival the recording could have been either.
+    // Copies of one invite count once. Another invite that overlaps the
+    // recording at least as much as the chosen one is a rival: then the
+    // matcher's choice is not clearly the meeting that was recorded.
     let chosen_key = invite_key(chosen);
+    let chosen_overlap = chosen.overlap(start_ms, end_ms);
     let rival = events
         .iter()
         .filter(|e| candidate(e) && covered(e, start_ms, end_ms))
-        .any(|e| invite_key(e) != chosen_key);
+        .any(|e| invite_key(e) != chosen_key && e.overlap(start_ms, end_ms) >= chosen_overlap);
     if rival {
         return Err(NotEligible::NoConfidentMatch);
     }
@@ -122,14 +125,14 @@ const fn touches(e: &ScheduledEvent, start_ms: i64, end_ms: i64) -> bool {
     e.start_ms <= end_ms && start_ms <= e.end_ms
 }
 
-/// Whether at least half of the event's own scheduled length is inside the
-/// recording. A zero-length event counts when it falls inside it.
+/// Whether the event overlaps the recording at all. A zero-length event
+/// counts when it falls inside it.
 fn covered(e: &ScheduledEvent, start_ms: i64, end_ms: i64) -> bool {
     let length = e.end_ms - e.start_ms;
     if length <= 0 {
         return length == 0 && start_ms <= e.start_ms && e.start_ms <= end_ms;
     }
-    e.overlap(start_ms, end_ms).saturating_mul(2) >= length
+    e.overlap(start_ms, end_ms) > 0
 }
 
 /// Read `calendar` for the recording `[start_ms, end_ms]` and apply
