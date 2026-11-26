@@ -580,7 +580,6 @@ impl Db {
 
 // -------------------------------------------------------------- the inserter
 
-/// Insert every row of one table, classifying each failure.
 /// Refuse a meeting file whose rows belong to another meeting (#336).
 ///
 /// Foreign keys alone accept a row that says it is meeting B's but names
@@ -668,6 +667,7 @@ fn check_ownership(doc: &MeetingDoc) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// Insert every row of one table, classifying each failure.
 fn insert_rows<T: TableRow + PartialEq>(
     tx: &Transaction<'_>,
     rows: &[T],
