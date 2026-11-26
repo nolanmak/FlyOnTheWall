@@ -34,7 +34,7 @@ ulid = "1"
 # explicit at the call site, and over crossbeam because ArrayQueue is MPMC
 # with per-slot atomics and no bulk-memcpy path -- the wrong shape for audio
 # blocks. See docs/REQUIREMENTS.md 5.1.
-rtrb = "0.3"
+rtrb = "0.4"
 # Shared by the STT transport and (soon) the daemon's HTTP/WS server, so the
 # version lives here. tokio-tungstenite stays local to fotw-stt: it is the only
 # crate that opens a socket to a provider, and its TLS choice is load-bearing
