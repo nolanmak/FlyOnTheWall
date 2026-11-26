@@ -904,6 +904,149 @@ async fn a_title_reply_after_a_meeting_edit_is_rejected_and_keeps_the_current_ti
     }
 }
 
+/// #334: "blank engine output is saved as a successful summary".
+///
+/// The engine answers Call A (the prose) with nothing but whitespace and
+/// Call B with an empty body. Nothing was written, so nothing may be stored:
+/// the run must be an error and no summary version may exist. Before #334 the
+/// pipeline turned the blank reply into one blank block, coverage over zero
+/// claims read as 100% (so not even the grounding banner fired), the empty
+/// extraction parsed as `Extraction::default()`, and a blank `body_md` was
+/// inserted as version 1 and reported as success (enrichment then stamped it
+/// `"ok"`).
+#[tokio::test]
+async fn a_blank_engine_reply_is_not_stored_as_a_successful_summary() {
+    let dir = tmpdir("blankreply");
+    let mut db = db_at(&dir);
+    let id = seeded_meeting(&mut db, &dir);
+    let engine = anthropic();
+
+    let mock = Arc::new(
+        MockTransport::new()
+            .with_json(serde_json::json!({
+                "content": [{"type": "text", "text": "  \n\t\n  "}],
+                "usage": {"input_tokens": 100, "output_tokens": 3},
+                "stop_reason": "end_turn"
+            }))
+            .with_json(serde_json::json!({
+                "content": [{"type": "text", "text": ""}],
+                "usage": {"input_tokens": 100, "output_tokens": 0},
+                "stop_reason": "end_turn"
+            })),
+    );
+
+    let result =
+        summarize::summarize_meeting_with(&mut db, &engine, &id, &general(), Arc::clone(&mock))
+            .await;
+    let stored = db.meetings().current_summary(&id).unwrap();
+
+    assert!(
+        stored.is_none(),
+        "a blank engine reply was saved as summary version {:?} with body {:?}",
+        stored.as_ref().map(|s| s.version),
+        stored.as_ref().map(|s| s.body_md.clone()),
+    );
+    assert!(
+        result.is_err(),
+        "a blank engine reply was reported as a successful summary: {:?}",
+        result.map(|o| (o.version, o.markdown, o.coverage, o.warnings)),
+    );
+}
+
+const EMPTY_EXTRACTION: &str =
+    r#"{"action_items":[],"decisions":[],"open_questions":[],"follow_ups":[],"topics":[]}"#;
+
+fn reply(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "content": [{"type": "text", "text": text}],
+        "usage": {"input_tokens": 100, "output_tokens": 3},
+        "stop_reason": "end_turn"
+    })
+}
+
+/// #334, the other half: Call B answered properly, Call A did not. A valid
+/// extraction does not make a blank document a summary, and the error is
+/// the dedicated one, worded for the user who will read it.
+#[tokio::test]
+async fn a_blank_prose_reply_is_refused_even_when_extraction_is_valid() {
+    let dir = tmpdir("blankprose-validb");
+    let mut db = db_at(&dir);
+    let id = seeded_meeting(&mut db, &dir);
+
+    let mock = Arc::new(
+        MockTransport::new()
+            .with_json(reply("\n   \n"))
+            .with_json(reply(EMPTY_EXTRACTION)),
+    );
+    let err = summarize::summarize_meeting_with(
+        &mut db,
+        &anthropic(),
+        &id,
+        &general(),
+        Arc::clone(&mock),
+    )
+    .await
+    .expect_err("a blank document is not a summary");
+
+    assert!(
+        matches!(
+            err,
+            summarize::SummarizeRunError::Pipeline(fotw_summarize::SummarizeError::EmptyResponse)
+        ),
+        "{err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("empty reply") && message.contains("no summary was saved"),
+        "{message}"
+    );
+    assert!(db.meetings().current_summary(&id).unwrap().is_none());
+    assert_eq!(
+        mock.call_count(),
+        1,
+        "extraction was paid for after the prose came back blank"
+    );
+}
+
+/// #334: regenerating must never let a blank reply bury a good summary. The
+/// previous version stays current, and no new version is minted.
+#[tokio::test]
+async fn a_blank_reply_keeps_the_previous_good_summary_current() {
+    let dir = tmpdir("blank-keeps-previous");
+    let mut db = db_at(&dir);
+    let id = seeded_meeting(&mut db, &dir);
+
+    let good = Arc::new(
+        MockTransport::new()
+            .with_json(reply("The quarterly numbers came in above target."))
+            .with_json(reply(EMPTY_EXTRACTION)),
+    );
+    let first = summarize::summarize_meeting_with(&mut db, &anthropic(), &id, &general(), good)
+        .await
+        .expect("the first run is a real summary");
+
+    let blank = Arc::new(
+        MockTransport::new()
+            .with_json(reply("  \t "))
+            .with_json(reply(EMPTY_EXTRACTION)),
+    );
+    let result =
+        summarize::summarize_meeting_with(&mut db, &anthropic(), &id, &general(), blank).await;
+    assert!(result.is_err(), "the blank regenerate reported success");
+
+    let current = db
+        .meetings()
+        .current_summary(&id)
+        .unwrap()
+        .expect("the previous summary disappeared");
+    assert_eq!(current.version, first.version, "a new version was minted");
+    assert!(
+        current.body_md.contains("quarterly numbers"),
+        "the current summary is no longer the good one: {:?}",
+        current.body_md
+    );
+}
+
 /// A library meeting with one primary transcript holding `text`.
 fn library_meeting(db: &mut Db, title: &str, text: &str) -> String {
     let mut meeting = fotw_store::NewMeeting::new("fixture-device", "UTC");

@@ -357,7 +357,9 @@ impl Db {
             includes_audio: opts.include_audio,
             meetings: ids,
             devices: self.fetch_all("ORDER BY id")?,
-            app_meta: self.fetch_all("WHERE key NOT GLOB 'summary_input_epoch:*' ORDER BY key")?,
+            app_meta: self.fetch_all(
+                "WHERE key NOT GLOB 'summary_input_epoch:*' AND key NOT GLOB 'enrich_pass:*' ORDER BY key",
+            )?,
             settings: self.fetch_all("ORDER BY key")?,
             session_notes: self.fetch_all("ORDER BY session_id")?,
             session_note_links: self.fetch_all("ORDER BY session_id")?,
@@ -442,6 +444,7 @@ impl Db {
         manifest.app_meta.retain(|row| {
             !row.key
                 .starts_with(crate::setting_version::MEETING_INPUT_PREFIX)
+                && !row.key.starts_with(crate::repo::ENRICH_PASS_PREFIX)
         });
 
         // Read and parse every meeting document before opening the write

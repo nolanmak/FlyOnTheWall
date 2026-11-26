@@ -116,6 +116,62 @@ pub async fn summarize_meeting(
     summarize_meeting_on(db, &engine, meeting_id, template).await
 }
 
+/// What `fotwd summarize <id>` did, beyond the summary itself.
+#[derive(Debug)]
+pub struct ManualSummary {
+    /// The run's outcome, exactly as [`summarize_meeting`] returns it.
+    pub outcome: SummarizeOutcome,
+    /// Why the meeting's `enrich_status` was not set to `ok`, when it was not:
+    /// a newer pass owns it now (#335), or the store refused the write. The
+    /// summary itself is stored either way.
+    pub status_problem: Option<String>,
+}
+
+/// [`summarize_meeting`], taking part in #335's newest-pass-owns-status rule.
+///
+/// The manual retry claims the meeting's status before its engine runs, the
+/// same as the daemon's pass does, so a daemon pass that was already in
+/// flight and fails after this succeeds cannot mark the repaired meeting
+/// `failed` again. On success it records `ok` only while it is still the
+/// newest claim. On failure it records nothing — the one-way rule #89 set for
+/// this command: it can move a meeting out of `failed`, never into it.
+///
+/// # Errors
+///
+/// Whatever [`summarize_meeting`] failed with.
+pub async fn summarize_meeting_manually(
+    db: &mut Db,
+    store: &dyn KeyStore,
+    meeting_id: &str,
+    template: &Template,
+) -> Result<ManualSummary, SummarizeRunError> {
+    let pass = db.meetings().begin_enrich_pass(meeting_id);
+    let outcome = summarize_meeting(db, store, meeting_id, template).await?;
+    let status_problem = match pass {
+        Err(e) => Some(format!(
+            "the summary was stored, but its status was not: {e}"
+        )),
+        Ok(pass) => match db
+            .meetings()
+            .set_enrich_report_if_newest(meeting_id, &pass, "ok", None)
+        {
+            Ok(true) => None,
+            Ok(false) => Some(
+                "the summary was stored; a newer pass owns this meeting's status, so it was \
+                 left as that pass recorded it"
+                    .to_owned(),
+            ),
+            Err(e) => Some(format!(
+                "the summary was stored, but its status was not: {e}"
+            )),
+        },
+    };
+    Ok(ManualSummary {
+        outcome,
+        status_problem,
+    })
+}
+
 /// [`summarize_meeting`] on an engine the caller already resolved.
 ///
 /// The engine is an argument rather than something to go and find, because
@@ -272,6 +328,15 @@ where
         check()?;
         outcome
     };
+    // Second guard behind the pipeline's own (#334), checked on what the
+    // *model* wrote and before our admonitions are added: a warning banner
+    // over nothing is still nothing, and storing it would make a blank
+    // version the current one while reporting success.
+    if outcome.markdown().trim().is_empty() {
+        return Err(SummarizeRunError::Pipeline(
+            fotw_summarize::SummarizeError::EmptyResponse,
+        ));
+    }
     let warnings = user_warnings(&outcome);
 
     // The admonitions ride in *our* rendered markdown, never in
