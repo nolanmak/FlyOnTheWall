@@ -12,7 +12,6 @@ use fotwd::calendar::release::{
 };
 use fotwd::calendar::{
     Attendee, AttendeeKind, CalendarLookup, Fixed, Many, Participation, Response, ScheduledEvent,
-    match_event,
 };
 
 const MIN: i64 = 60_000;
