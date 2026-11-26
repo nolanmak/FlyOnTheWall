@@ -23,6 +23,7 @@
 //! line, an error or a notice.
 
 pub mod mail;
+pub mod review;
 pub mod types;
 
 use std::path::{Path, PathBuf};
