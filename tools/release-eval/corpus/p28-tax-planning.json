@@ -1,0 +1,133 @@
+{
+  "id": "p28-tax-planning",
+  "kind": "planted",
+  "event_title": "Year-end finance planning",
+  "tz": "America/New_York",
+  "started_at_ms": 1795028400000,
+  "scheduled_minutes": 60,
+  "recipients": [
+    {
+      "address": "victoria.hale@example.com",
+      "display_name": "Victoria Hale",
+      "is_self": true
+    },
+    {
+      "address": "ahmed.siddiqui@example.com",
+      "display_name": "Ahmed Siddiqui",
+      "is_self": false
+    },
+    {
+      "address": "jenna.park@example.com",
+      "display_name": "Jenna Park",
+      "is_self": false
+    },
+    {
+      "address": "finance-ops@example.org",
+      "display_name": null,
+      "is_self": false
+    }
+  ],
+  "segments": [
+    {
+      "offset_s": 0,
+      "speaker": "me",
+      "text": "Let's go through year-end planning. Audit prep, tax, and the bonus accrual."
+    },
+    {
+      "offset_s": 165,
+      "speaker": "Speaker 2",
+      "text": "Audit fieldwork starts January twelfth. The auditors sent the PBC list."
+    },
+    {
+      "offset_s": 329,
+      "speaker": "Speaker 3",
+      "text": "Most items are routine. The new revenue contracts will get the most attention."
+    },
+    {
+      "offset_s": 508,
+      "speaker": "me",
+      "text": "Let's make sure the contract memos are done before the holidays."
+    },
+    {
+      "offset_s": 659,
+      "speaker": "Speaker 3",
+      "text": "I'll draft the memos for the two multi-year contracts this week and send them to you for review."
+    },
+    {
+      "offset_s": 851,
+      "speaker": "Speaker 2",
+      "text": "On tax, our advisors want us to take the R&D credit for the last three years with an amended return, roughly four hundred thousand. They're also recommending we elect to treat the Canadian subsidiary as a disregarded entity so the losses flow up to the parent, and their view is the IRS position on software development costs is aggressive enough that we should reserve for about half of the credit."
+    },
+    {
+      "offset_s": 1427,
+      "speaker": "Speaker 3",
+      "text": "They also said we shouldn't move the IP to the Irish entity this year, because the exit tax would wipe out the benefit."
+    },
+    {
+      "offset_s": 1647,
+      "speaker": "me",
+      "text": "Okay, let's take the tax memo to the audit committee."
+    },
+    {
+      "offset_s": 1784,
+      "speaker": "Speaker 3",
+      "text": "For the bonus accrual, the plan is a pool of one point two million. Executive bonuses are at a hundred and twenty percent of target, so the CEO is getting about one hundred and eighty thousand and the CFO one forty."
+    },
+    {
+      "offset_s": 2127,
+      "speaker": "Speaker 2",
+      "text": "And the engineering pool is only funded at eighty-five percent, which is going to be a tough message."
+    },
+    {
+      "offset_s": 2333,
+      "speaker": "me",
+      "text": "Got it. Let's make sure the accrual matches what comp committee approved."
+    },
+    {
+      "offset_s": 2497,
+      "speaker": "Speaker 2",
+      "text": "Other items, the fixed asset count is scheduled for December fifth."
+    },
+    {
+      "offset_s": 2662,
+      "speaker": "Speaker 3",
+      "text": "And we need to renew the D and O insurance policy by end of December."
+    },
+    {
+      "offset_s": 2827,
+      "speaker": "me",
+      "text": "Let's get quotes from two brokers."
+    },
+    {
+      "offset_s": 2950,
+      "speaker": "Speaker 2",
+      "text": "I'll reach out this week."
+    },
+    {
+      "offset_s": 3060,
+      "speaker": "me",
+      "text": "Thanks both."
+    }
+  ],
+  "planted": [
+    {
+      "category": "legal_financial",
+      "indices": [
+        5,
+        6
+      ],
+      "quote": "our advisors want us to take the R&D credit for the last three years",
+      "note": "tax positions and entity election advice"
+    },
+    {
+      "category": "compensation",
+      "indices": [
+        8,
+        9
+      ],
+      "quote": "Executive bonuses are at a hundred and twenty percent of target",
+      "note": "bonus pool and executive bonus amounts"
+    }
+  ],
+  "notes": "Planted: legal_financial at [5, 6]; compensation at [8, 9]."
+}

@@ -25,6 +25,7 @@
 pub mod cut;
 pub mod mail;
 pub mod render;
+pub mod review;
 pub mod summary;
 pub mod types;
 

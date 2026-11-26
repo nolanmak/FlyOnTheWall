@@ -1,0 +1,139 @@
+{
+  "id": "c01-sprint-planning",
+  "kind": "clean",
+  "event_title": "Sprint 42 planning",
+  "tz": "America/Los_Angeles",
+  "started_at_ms": 1770660000000,
+  "scheduled_minutes": 60,
+  "recipients": [
+    {
+      "address": "marcus.bell@example.com",
+      "display_name": "Marcus Bell",
+      "is_self": true
+    },
+    {
+      "address": "lena.okafor@example.com",
+      "display_name": "Lena Okafor",
+      "is_self": false
+    },
+    {
+      "address": "tomasz.wierzbicki@example.com",
+      "display_name": "Tomasz Wierzbicki",
+      "is_self": false
+    },
+    {
+      "address": "hana.sato@example.com",
+      "display_name": "Hana Sato",
+      "is_self": false
+    },
+    {
+      "address": "eng-platform@example.org",
+      "display_name": null,
+      "is_self": false
+    }
+  ],
+  "segments": [
+    {
+      "offset_s": 0,
+      "speaker": "me",
+      "text": "Sprint 42 planning. Capacity is a bit lower this time because of the conference, so let's be realistic."
+    },
+    {
+      "offset_s": 204,
+      "speaker": "Speaker 2",
+      "text": "I have the password reset flow at the top of the backlog. Support says it's the number one ticket driver."
+    },
+    {
+      "offset_s": 408,
+      "speaker": "Speaker 3",
+      "text": "What's the scope? Just the email link, or the whole flow?"
+    },
+    {
+      "offset_s": 558,
+      "speaker": "Speaker 2",
+      "text": "The whole flow. Request form, the email with a signed link that expires in thirty minutes, and the new password screen with the strength meter."
+    },
+    {
+      "offset_s": 816,
+      "speaker": "Speaker 4",
+      "text": "Design is done. The only open question is the copy when the link has expired."
+    },
+    {
+      "offset_s": 993,
+      "speaker": "me",
+      "text": "Let's say something like \"This link has expired, request a new one\" with a button. Keep it simple."
+    },
+    {
+      "offset_s": 1183,
+      "speaker": "Speaker 3",
+      "text": "Should we rate-limit reset requests per account?"
+    },
+    {
+      "offset_s": 1319,
+      "speaker": "Speaker 2",
+      "text": "Yes, five per hour, and we always show the same confirmation message so we don't leak which emails exist."
+    },
+    {
+      "offset_s": 1523,
+      "speaker": "me",
+      "text": "Good. Estimate?"
+    },
+    {
+      "offset_s": 1618,
+      "speaker": "Speaker 3",
+      "text": "Five points for backend, three for frontend."
+    },
+    {
+      "offset_s": 1754,
+      "speaker": "me",
+      "text": "Okay. Next, the flaky test cleanup from the retro."
+    },
+    {
+      "offset_s": 1890,
+      "speaker": "Speaker 2",
+      "text": "I quarantined twelve tests last week. Fixing them is about three points."
+    },
+    {
+      "offset_s": 2054,
+      "speaker": "Speaker 4",
+      "text": "I'd also like to pick up the settings page accessibility fixes, mostly focus order and labels."
+    },
+    {
+      "offset_s": 2244,
+      "speaker": "me",
+      "text": "That's two points?"
+    },
+    {
+      "offset_s": 2339,
+      "speaker": "Speaker 4",
+      "text": "Two or three."
+    },
+    {
+      "offset_s": 2434,
+      "speaker": "me",
+      "text": "Let's call it three. Tomasz, can you take the webhook retry dashboard?"
+    },
+    {
+      "offset_s": 2598,
+      "speaker": "Speaker 3",
+      "text": "Yes, I'll pair with Lena on the alerting part."
+    },
+    {
+      "offset_s": 2734,
+      "speaker": "me",
+      "text": "Total is around twenty-two points, which fits. Anything we're forgetting?"
+    },
+    {
+      "offset_s": 2897,
+      "speaker": "Speaker 2",
+      "text": "The dependency upgrade for the HTTP client. Security flagged an advisory."
+    },
+    {
+      "offset_s": 3060,
+      "speaker": "me",
+      "text": "Let's slot that first, it's small. Okay, that's the plan. Thanks, everyone."
+    }
+  ],
+  "planted": [],
+  "notes": "Hard negative: designing a password reset feature with no actual password or code."
+}
