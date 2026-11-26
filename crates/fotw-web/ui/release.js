@@ -51,6 +51,7 @@
     inputs_changed: 'the meeting changed after this was prepared',
     send_outcome_unknown: 'may already have been sent; check before resending',
     by_user: 'dropped by you',
+    wrong_event: 'matched to the wrong calendar event',
   };
   // What each worker pause stops (#326 D10): gws only sending, the engine
   // only preparing, unreadable settings everything.
@@ -87,28 +88,107 @@
       case 'sending': return 'Sending';
       case 'held': return 'Held: ' + reasonText(reasons[0] || 'unknown');
       case 'sent': return 'Sent to ' + people(n) + (status.sent_at ? ', ' + stamp(status.sent_at) : '');
-      case 'dropped': return 'Not released (dropped)';
+      case 'dropped':
+        return reasons.includes('wrong_event') ? 'Not released: ' + reasonText('wrong_event') : 'Not released (dropped)';
       default: return 'Release: ' + String(status.state);
     }
   }
 
+  // The matched calendar event, in local time. Rows created before times
+  // were stored carry the title only.
+  function matchText(doc) {
+    const start = Number(doc.event_start_ms), end = Number(doc.event_end_ms);
+    let when = '';
+    if (doc.event_start_ms != null && Number.isFinite(start)) {
+      when = stamp(start);
+      if (doc.event_end_ms != null && Number.isFinite(end)) {
+        const a = new Date(start), b = new Date(end);
+        const sameDay = a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+        when += '–' + (sameDay ? clock(end) : stamp(end));
+      }
+    }
+    return 'Matched to: ' + (doc.event_title || 'Untitled event') + (when ? ' · ' + when : '');
+  }
+
+  // Wrong meeting is offered only while nothing has gone out (the daemon
+  // refuses it from sending, sent and dropped).
+  const WRONG_EVENT_STATES = ['preparing', 'needs_review', 'scheduled', 'held'];
+
+  // Fill `block` with "Matched to: …", its Wrong meeting button and an inline
+  // confirmation; returns the status note. `prefix` keeps the meeting line's
+  // ids apart from the Outbox detail's. `onReject` runs only after the person
+  // confirms.
+  function fillMatch(block, prefix, doc, onReject) {
+    block.replaceChildren();
+    block.appendChild(make('span', matchText(doc), prefix + '-match-text', 'meta'));
+    const confirm = make('div', '', prefix + '-wrong-event-confirm', 'release-confirm');
+    confirm.hidden = true;
+    const status = make('p', '', prefix + '-match-status', 'gh-note');
+    status.setAttribute('role', 'status');
+    if (WRONG_EVENT_STATES.includes(doc.state)) {
+      const wrong = block.appendChild(button('Wrong meeting', prefix + '-wrong-event', 'release-link release-wrong-event'));
+      confirm.appendChild(make('p', 'Stop the release for this meeting? Nobody will be emailed.', prefix + '-wrong-event-question'));
+      const yes = confirm.appendChild(button('Stop the release', prefix + '-wrong-event-yes'));
+      const no = confirm.appendChild(button('Keep the release', prefix + '-wrong-event-no'));
+      wrong.addEventListener('click', () => { confirm.hidden = false; no.focus?.(); });
+      no.addEventListener('click', () => { confirm.hidden = true; });
+      yes.addEventListener('click', () => { confirm.hidden = true; return onReject(status); });
+    }
+    block.appendChild(confirm);
+    block.appendChild(status);
+    return status;
+  }
+
+  const refusal = error => (error && typeof error.code === 'string' && error.code ? error.code : 'Could not reach FlyOnTheWall. Try again.');
+
   function line(id, parent, api) {
+    const ROUTE = '/api/meetings/' + encodeURIComponent(id) + '/release';
     const root = make('p', '', 'release-line', 'meta release-line');
     root.setAttribute('role', 'status');
     root.hidden = true;
     parent.appendChild(root);
-    (async () => {
+    const match = make('div', '', 'release-line-match', 'release-match');
+    match.hidden = true;
+    parent.appendChild(match);
+    let lastNote = null;
+
+    function paint(status) {
+      // With release off every meeting would say so; that is noise, not news.
+      const off = status.state === 'not_eligible' && reasonsOf(status).every(r => r === 'release_off');
+      root.textContent = lineText(status);
+      root.hidden = off;
+      // Only a release row names an event.
+      if (off || !status.event_title) {
+        match.replaceChildren();
+        match.hidden = true;
+        return;
+      }
+      lastNote = fillMatch(match, 'release-line', status, async note => {
+        note.textContent = 'Working…';
+        try {
+          await api('/api/release/outbox/' + encodeURIComponent(id), post({ action: 'wrong_event' }));
+          await load();
+        } catch (error) {
+          // The row probably moved on: say why, then show where it is now.
+          const why = refusal(error);
+          await load();
+          (lastNote || note).textContent = why;
+        }
+      });
+      match.hidden = false;
+    }
+
+    async function load() {
       try {
-        const status = await api('/api/meetings/' + encodeURIComponent(id) + '/release');
+        const status = await api(ROUTE);
         if (root.isConnected === false) return;
-        // With release off every meeting would say so; that is noise, not news.
-        const off = status.state === 'not_eligible' && reasonsOf(status).every(r => r === 'release_off');
-        root.textContent = lineText(status);
-        root.hidden = off;
+        paint(status);
       } catch (_) {
         root.hidden = true;
+        match.hidden = true;
       }
-    })();
+    }
+    load();
     return root;
   }
 
@@ -320,6 +400,9 @@
       const nodes = [];
       nodes.push(make('h3', row.event_title || 'Untitled meeting'));
       nodes.push(make('p', lineText(row), 'release-detail-line', 'meta'));
+      const match = make('div', '', 'release-detail-match', 'release-match');
+      fillMatch(match, 'release-detail', row, note => act(id, { action: 'wrong_event' }, note));
+      nodes.push(match);
 
       const to = make('ul', '', 'release-recipients', 'release-recipients');
       for (const r of doc.recipients || []) {

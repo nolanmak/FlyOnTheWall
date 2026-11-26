@@ -1643,3 +1643,228 @@ async fn the_outbox_lists_waiting_rows_oldest_first_with_the_badge() {
     assert_eq!(detail.subject, "Notes: Planning sync (2026-09-21)");
     assert!(r.control.detail("no-such-meeting").is_none());
 }
+
+// ================================================== wrong calendar event
+
+impl Rig {
+    /// A meeting left in `which` (`preparing`, `needs_review`, `scheduled`
+    /// or `held`).
+    async fn in_state(&self, which: &str) -> String {
+        match which {
+            state::PREPARING => {
+                self.preparer.failing("cut", PrepareError::SettingsChanged);
+                let id = self.meeting();
+                self.pass().await;
+                self.preparer.heal();
+                id
+            }
+            state::NEEDS_REVIEW => self.reviewed().await,
+            state::SCHEDULED => self.scheduled().await,
+            state::HELD => {
+                self.preparer.failing("review", PrepareError::ModelFailed);
+                let id = self.meeting();
+                self.pass().await;
+                self.preparer.heal();
+                id
+            }
+            other => panic!("no rig for {other}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_new_row_stores_the_matched_events_scheduled_times() {
+    let r = rig();
+    r.preparer.failing("cut", PrepareError::SettingsChanged);
+    let id = r.meeting();
+    r.pass().await;
+    let row = r.row(&id);
+    assert_eq!(row.state, state::PREPARING);
+    assert_eq!(row.event_start_ms, Some(T0));
+    assert_eq!(row.event_end_ms, Some(T0 + 30 * MIN));
+
+    // The meeting line and the Outbox carry the match.
+    let status = r.control.meeting_status(&id);
+    assert_eq!(status.event_title.as_deref(), Some("Planning sync"));
+    assert_eq!(status.event_start_ms, Some(T0));
+    assert_eq!(status.event_end_ms, Some(T0 + 30 * MIN));
+
+    r.preparer.heal();
+    r.pass().await;
+    let item = &r.control.outbox().items[0];
+    assert_eq!(item.event_title, "Planning sync");
+    assert_eq!(item.event_start_ms, Some(T0));
+    assert_eq!(item.event_end_ms, Some(T0 + 30 * MIN));
+    let detail = r.control.detail(&id).unwrap();
+    assert_eq!(detail.item.event_start_ms, Some(T0));
+}
+
+#[tokio::test]
+async fn a_row_from_before_event_times_shows_the_title_only() {
+    let r = rig();
+    let id = r.reviewed().await;
+    r.lock()
+        .conn()
+        .execute(
+            "UPDATE meeting_releases SET event_start_ms = NULL, event_end_ms = NULL",
+            [],
+        )
+        .unwrap();
+    let status = r.control.meeting_status(&id);
+    assert_eq!(status.event_title.as_deref(), Some("Planning sync"));
+    assert_eq!((status.event_start_ms, status.event_end_ms), (None, None));
+    let item = &r.control.outbox().items[0];
+    assert_eq!((item.event_start_ms, item.event_end_ms), (None, None));
+}
+
+#[tokio::test]
+async fn a_meeting_without_a_row_names_no_event() {
+    let r = rig();
+    let status = r.control.meeting_status("no-such-meeting");
+    assert_eq!(status.state, "not_eligible");
+    assert_eq!(status.event_title, None);
+    assert_eq!((status.event_start_ms, status.event_end_ms), (None, None));
+}
+
+#[tokio::test]
+async fn wrong_event_drops_from_every_open_state() {
+    for which in [
+        state::PREPARING,
+        state::NEEDS_REVIEW,
+        state::SCHEDULED,
+        state::HELD,
+    ] {
+        let r = rig();
+        let id = r.in_state(which).await;
+        assert_eq!(r.row(&id).state, which);
+        let decided = r.decisions();
+        let detail = r.control.act(&id, OutboxAction::WrongEvent).unwrap();
+        assert_eq!(detail.item.state, state::DROPPED, "{which}");
+        let row = r.row(&id);
+        assert_eq!(
+            (row.state.as_str(), row.reasons.clone()),
+            (state::DROPPED, vec!["wrong_event".to_owned()]),
+            "{which}"
+        );
+        assert_eq!(row.send_at, None, "{which}");
+        let mut expected = decided.clone();
+        expected.push(decision::WRONG_EVENT.to_owned());
+        assert_eq!(r.decisions(), expected, "{which}");
+        // Nothing goes out afterwards, and the worker does not pick it up.
+        r.advance(30 * MIN);
+        r.tick();
+        r.pass().await;
+        assert!(r.mail.sent().is_empty(), "{which}");
+        assert_eq!(r.row(&id).state, state::DROPPED, "{which}");
+        let status = r.control.meeting_status(&id);
+        assert_eq!(status.state, "dropped");
+        assert_eq!(status.reasons, ["wrong_event"]);
+    }
+}
+
+#[tokio::test]
+async fn wrong_event_is_refused_once_sent_or_dropped() {
+    let r = rig();
+    let sent = r.scheduled().await;
+    r.tick();
+    assert_eq!(r.row(&sent).state, state::SENT);
+    assert!(r.control.act(&sent, OutboxAction::WrongEvent).is_err());
+    assert_eq!(r.row(&sent).state, state::SENT);
+
+    let dropped = r.reviewed_second().await;
+    r.control.act(&dropped, OutboxAction::Drop).unwrap();
+    let before = r.decisions();
+    assert!(r.control.act(&dropped, OutboxAction::WrongEvent).is_err());
+    assert_eq!(
+        r.state(&dropped),
+        (state::DROPPED.into(), vec!["by_user".into()])
+    );
+    assert_eq!(r.decisions(), before, "a refusal records nothing");
+}
+
+/// The row's state while `gws` ran, and what Wrong meeting got then.
+type Seen = (String, Result<(), String>);
+
+#[test]
+fn wrong_event_is_refused_while_sending() {
+    let r = Arc::new(rig());
+    let id = r.scheduled_sync();
+    let (rr, rid) = (Arc::clone(&r), id.clone());
+    let outcome: Arc<Mutex<Option<Seen>>> = Arc::default();
+    let seen = Arc::clone(&outcome);
+    *r.mail.during_send.lock().unwrap() = Some(Box::new(move || {
+        let during = rr.row(&rid).state;
+        let result = rr.control.act(&rid, OutboxAction::WrongEvent).map(|_| ());
+        *seen.lock().unwrap() = Some((during, result));
+    }));
+    r.tick();
+    let (during, result) = outcome.lock().unwrap().take().unwrap();
+    assert_eq!(during, state::SENDING);
+    assert!(result.is_err());
+    assert_eq!(r.row(&id).state, state::SENT);
+    assert_eq!(r.decisions(), [decision::APPROVED_UNCHANGED]);
+    *r.mail.during_send.lock().unwrap() = None;
+}
+
+#[tokio::test]
+async fn wrong_event_decisions_do_not_count_toward_the_auto_unlock() {
+    let r = rig();
+    let id = r.reviewed().await;
+    r.control.act(&id, OutboxAction::WrongEvent).unwrap();
+    assert_eq!(
+        store::decision_counts(r.lock().conn(), ENGINE).unwrap(),
+        (0, 0),
+        "neither numerator nor denominator"
+    );
+    // 20 of 20 unlocks; ten wrong-event rejections must not dilute it.
+    r.seed_decisions(ENGINE, 20, 0);
+    {
+        let db = r.lock();
+        for _ in 0..10 {
+            store::record_decision(db.conn(), "gone", ENGINE, decision::WRONG_EVENT, 1).unwrap();
+        }
+    }
+    assert_eq!(
+        store::decision_counts(r.lock().conn(), ENGINE).unwrap(),
+        (20, 20)
+    );
+    assert!(r.control.settings().auto_unlocked);
+}
+
+#[tokio::test]
+async fn a_wrong_event_meeting_is_never_prepared_again() {
+    let r = rig();
+    let id = r.reviewed().await;
+    let calls = r.preparer.calls().len();
+    r.control.act(&id, OutboxAction::WrongEvent).unwrap();
+    // Past the eligibility cache, with the meeting edited and the calendar
+    // still offering the same event.
+    r.lock()
+        .conn()
+        .execute(
+            "UPDATE meetings SET updated_at = updated_at + 1 WHERE id = ?1",
+            [&id],
+        )
+        .unwrap();
+    for _ in 0..3 {
+        r.advance(20 * MIN);
+        r.pass().await;
+        r.tick();
+    }
+    assert_eq!(
+        r.state(&id),
+        (state::DROPPED.into(), vec!["wrong_event".into()])
+    );
+    assert_eq!(r.preparer.calls().len(), calls, "never prepared again");
+    assert!(r.mail.sent().is_empty());
+    let rows: i64 = r
+        .lock()
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM meeting_releases WHERE meeting_id = ?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 1);
+}

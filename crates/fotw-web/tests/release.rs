@@ -21,6 +21,8 @@ fn item(state: &str, reasons: &[&str]) -> OutboxItem {
         finding_count: 1,
         created_at: 1_000,
         send_at: None,
+        event_start_ms: Some(1_790_000_000_000),
+        event_end_ms: Some(1_790_001_800_000),
     }
 }
 
@@ -78,6 +80,9 @@ impl ReleaseControl for Fake {
             recipient_count: 2,
             send_at: Some(5_000),
             sent_at: None,
+            event_title: Some("Weekly sync".into()),
+            event_start_ms: Some(1_790_000_000_000),
+            event_end_ms: None,
         }
     }
     fn outbox(&self) -> Outbox {
@@ -97,6 +102,7 @@ impl ReleaseControl for Fake {
             .push((meeting_id.to_owned(), action.clone()));
         match action {
             OutboxAction::Cancel => Err("This release has already started sending.".into()),
+            OutboxAction::WrongEvent => Ok(detail("dropped", &["wrong_event"])),
             _ => Ok(detail("scheduled", &[])),
         }
     }
@@ -296,6 +302,59 @@ async fn actions_reach_the_control_and_a_lost_race_is_a_409_with_text() {
 }
 
 #[tokio::test]
+async fn the_matched_event_is_in_the_status_and_the_outbox() {
+    let (h, _) = rig().await;
+    let status = json(
+        &h.get("/api/meetings/m1/release", &h.authorised())
+            .await
+            .body,
+    );
+    assert_eq!(status["event_title"], "Weekly sync");
+    assert_eq!(status["event_start_ms"], 1_790_000_000_000_i64);
+    assert!(status["event_end_ms"].is_null());
+
+    let list = json(&h.get("/api/release/outbox", &h.authorised()).await.body);
+    assert_eq!(list["items"][0]["event_start_ms"], 1_790_000_000_000_i64);
+    assert_eq!(list["items"][0]["event_end_ms"], 1_790_001_800_000_i64);
+    let one = json(&h.get("/api/release/outbox/m1", &h.authorised()).await.body);
+    assert_eq!(one["item"]["event_start_ms"], 1_790_000_000_000_i64);
+}
+
+#[tokio::test]
+async fn wrong_event_reaches_the_control_and_returns_the_dropped_row() {
+    let (h, c) = rig().await;
+    let response = h
+        .post(
+            "/api/release/outbox/m1",
+            &h.authorised(),
+            Some(r#"{"action":"wrong_event"}"#),
+        )
+        .await;
+    assert_eq!(response.status, 200);
+    let body = json(&response.body);
+    assert_eq!(body["item"]["state"], "dropped");
+    assert_eq!(body["item"]["reasons"][0], "wrong_event");
+    assert_eq!(
+        *c.actions.lock().unwrap(),
+        vec![("m1".to_owned(), OutboxAction::WrongEvent)]
+    );
+}
+
+#[test]
+fn documents_without_event_times_still_parse() {
+    let status: MeetingReleaseStatus =
+        serde_json::from_str(r#"{"state":"sent","reasons":[],"recipient_count":2}"#).unwrap();
+    assert_eq!(status.event_title, None);
+    assert_eq!((status.event_start_ms, status.event_end_ms), (None, None));
+    let item: OutboxItem = serde_json::from_str(
+        r#"{"meeting_id":"m1","event_title":"Weekly sync","state":"held","reasons":[],
+            "recipient_count":1,"finding_count":0,"created_at":1,"send_at":null}"#,
+    )
+    .unwrap();
+    assert_eq!((item.event_start_ms, item.event_end_ms), (None, None));
+}
+
+#[tokio::test]
 async fn without_a_control_settings_are_defaults_with_an_error() {
     let h = common::start().await;
     for response in [
@@ -323,6 +382,11 @@ async fn without_a_control_meetings_are_not_eligible_and_the_outbox_is_empty() {
     let body = json(&status.body);
     assert_eq!(body["state"], "not_eligible");
     assert_eq!(body["reasons"], serde_json::json!(["release_off"]));
+    assert!(
+        body.get("event_title").is_none(),
+        "no row, no matched event"
+    );
+    assert!(body.get("event_start_ms").is_none());
     assert_eq!(body["recipient_count"], 0);
 
     let outbox = h.get("/api/release/outbox", &h.authorised()).await;

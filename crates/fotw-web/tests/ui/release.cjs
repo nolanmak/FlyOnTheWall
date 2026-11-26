@@ -406,3 +406,117 @@ test('a refused action shows why and reloads', async () => {
   assert.equal(w.byId('release-detail-status').textContent, 'This release has already started sending.');
   assert.ok(w.requests.slice(before).some(r => r.url === '/api/release/outbox'), 'the list reloads');
 });
+
+// ------------------------------------------------- matched calendar event
+
+const START = new Date(2026, 0, 2, 9, 0).getTime();
+const END = new Date(2026, 0, 2, 9, 30).getTime();
+
+test('the meeting line names the matched event and its local times', async () => {
+  const { w } = await line({ state: 'needs_review', reasons: ['review_required'], recipient_count: 2, event_title: 'Weekly sync', event_start_ms: START, event_end_ms: END });
+  assert.equal(w.visible(w.byId('release-line-match')), true);
+  assert.equal(w.byId('release-line-match-text').textContent, 'Matched to: Weekly sync · 2026-01-02 09:00–09:30');
+  assert.ok(w.button('Wrong meeting'));
+});
+
+test('a row from before event times shows the title only', async () => {
+  const { w } = await line({ state: 'scheduled', reasons: [], recipient_count: 2, send_at: START, event_title: 'Weekly sync' });
+  assert.equal(w.byId('release-line-match-text').textContent, 'Matched to: Weekly sync');
+});
+
+test('no matched event, no match line', async () => {
+  const { w } = await line({ state: 'not_eligible', reasons: ['no_confident_match'], recipient_count: 0 });
+  assert.equal(w.visible(w.byId('release-line-match')), false);
+  assert.equal(w.button('Wrong meeting'), undefined);
+});
+
+test('Wrong meeting shows for open states only', async () => {
+  const status = state => ({ state, reasons: [], recipient_count: 2, event_title: 'Weekly sync', event_start_ms: START, event_end_ms: END });
+  for (const state of ['preparing', 'needs_review', 'scheduled', 'held']) {
+    const { w } = await line(status(state));
+    assert.ok(w.button('Wrong meeting'), state);
+  }
+  for (const state of ['sending', 'sent', 'dropped']) {
+    const { w } = await line(status(state));
+    assert.equal(w.visible(w.byId('release-line-match')), true, state + ' still names the event');
+    assert.equal(w.button('Wrong meeting'), undefined, state);
+  }
+});
+
+test('Wrong meeting asks first, then posts wrong_event and repaints the line', async () => {
+  const w = rig();
+  let status = { state: 'scheduled', reasons: [], recipient_count: 2, send_at: START, event_title: 'Weekly sync', event_start_ms: START, event_end_ms: END };
+  w.respond((url, options) => {
+    if (options?.method === 'POST') {
+      status = { ...status, state: 'dropped', reasons: ['wrong_event'], send_at: null };
+      return detail({ state: 'dropped', reasons: ['wrong_event'] });
+    }
+    return status;
+  });
+  const root = w.release.line('m1', w.body, w.api);
+  await flush();
+  await w.button('Wrong meeting').click();
+  await flush();
+  assert.equal(posts(w).length, 0, 'nothing is posted before the confirmation');
+  const confirm = w.byId('release-line-wrong-event-confirm');
+  assert.equal(w.visible(confirm), true);
+  assert.equal(w.byId('release-line-wrong-event-question').textContent, 'Stop the release for this meeting? Nobody will be emailed.');
+  await w.byId('release-line-wrong-event-no').click();
+  assert.equal(w.visible(confirm), false);
+  assert.equal(posts(w).length, 0);
+
+  await w.button('Wrong meeting').click();
+  await w.byId('release-line-wrong-event-yes').click();
+  await flush();
+  const [post] = posts(w);
+  assert.equal(post.url, '/api/release/outbox/m1');
+  assert.deepEqual(post.body, { action: 'wrong_event' });
+  assert.equal(root.textContent, 'Not released: matched to the wrong calendar event');
+  assert.equal(w.button('Wrong meeting'), undefined);
+});
+
+test('a refused Wrong meeting says why', async () => {
+  const w = rig();
+  w.respond((url, options) => {
+    if (options?.method === 'POST') return Object.assign(new Error('request failed'), { status: 409, code: 'This release changed state. Reload the Outbox.' });
+    return { state: 'needs_review', reasons: [], recipient_count: 2, event_title: 'Weekly sync' };
+  });
+  w.release.line('m1', w.body, w.api);
+  await flush();
+  await w.button('Wrong meeting').click();
+  await w.byId('release-line-wrong-event-yes').click();
+  await flush();
+  assert.equal(w.byId('release-line-match-status').textContent, 'This release changed state. Reload the Outbox.');
+});
+
+test('a wrong_event drop reads as the wrong calendar event', async () => {
+  const { root } = await line({ state: 'dropped', reasons: ['wrong_event'], recipient_count: 2, event_title: 'Weekly sync' });
+  assert.equal(root.textContent, 'Not released: matched to the wrong calendar event');
+});
+
+test('the outbox detail names the matched event and offers Wrong meeting', async () => {
+  const sent = [];
+  const times = { event_start_ms: START, event_end_ms: END };
+  const { w } = await outbox({ items: [item(times)], one: () => detail(times), act: body => { sent.push(body); return detail({ ...times, state: 'dropped', reasons: ['wrong_event'] }); } });
+  await open(w);
+  assert.equal(w.byId('release-detail-match-text').textContent, 'Matched to: Weekly sync · 2026-01-02 09:00–09:30');
+  await w.button('Wrong meeting').click();
+  await flush();
+  assert.equal(sent.length, 0, 'nothing is posted before the confirmation');
+  assert.equal(w.visible(w.byId('release-detail-wrong-event-confirm')), true);
+  assert.equal(w.byId('release-detail-wrong-event-question').textContent, 'Stop the release for this meeting? Nobody will be emailed.');
+  await w.byId('release-detail-wrong-event-yes').click();
+  await flush();
+  assert.deepEqual(sent, [{ action: 'wrong_event' }]);
+  assert.equal(w.byId('release-detail-line').textContent, 'Not released: matched to the wrong calendar event');
+  assert.equal(w.button('Wrong meeting'), undefined, 'not offered once dropped');
+});
+
+test('the outbox offers Wrong meeting for scheduled and held rows too', async () => {
+  for (const extra of [{ state: 'scheduled', reasons: [], send_at: 5 }, { state: 'held', reasons: ['model_failed'] }]) {
+    const { w } = await outbox({ items: [item(extra)], one: () => detail(extra) });
+    await open(w);
+    assert.ok(w.button('Wrong meeting'), extra.state);
+    assert.equal(w.byId('release-detail-match-text').textContent, 'Matched to: Weekly sync');
+  }
+});

@@ -14,7 +14,7 @@ use crate::key::DbKey;
 ///
 /// Bump this in the same commit that appends to [`migration_set`]; the two
 /// drifting apart is what [`crate::Db::open`]'s refusal is guarding against.
-pub const LATEST_SCHEMA_VERSION: usize = 13;
+pub const LATEST_SCHEMA_VERSION: usize = 14;
 
 /// Every migration, oldest first. Append only — a released migration is
 /// immutable, because editing one changes the schema of databases that already
@@ -72,6 +72,8 @@ fn migration_set(new_library: bool) -> Migrations<'static> {
             |tx| check_references(tx, OWNERSHIP_REBUILT_TABLES),
         )
         .comment("a transcript's rows belong to the transcript's meeting"),
+        M::up(include_str!("schema/0014_release_event_times.sql"))
+            .comment("matched event times on release rows and the wrong_event decision"),
     ])
 }
 
@@ -341,12 +343,10 @@ mod tests {
     fn the_ownership_rebuild_keeps_every_trigger_index_and_column() {
         let mut conn = Connection::open_in_memory().unwrap();
         let migrations = migration_set(true);
-        migrations
-            .to_version(&mut conn, LATEST_SCHEMA_VERSION - 1)
-            .unwrap();
+        migrations.to_version(&mut conn, 12).unwrap();
         let before = shape(&conn);
         conn.pragma_update(None, "foreign_keys", false).unwrap();
-        migrations.to_latest(&mut conn).unwrap();
+        migrations.to_version(&mut conn, 13).unwrap();
         let after = shape(&conn);
         assert!(
             before.is_subset(&after),
@@ -358,5 +358,87 @@ mod tests {
             Vec::<&String>::new(),
             "the rebuild should add references, not columns, triggers or indexes"
         );
+    }
+
+    /// 0014: a release row created before it keeps its data and gains NULL
+    /// event times; the decision log keeps every row, gains `wrong_event`,
+    /// and is still append-only and still refuses an unknown decision.
+    #[test]
+    fn release_event_times_migrate_a_v13_library() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let migrations = migration_set(true);
+        migrations.to_version(&mut conn, 13).unwrap();
+        conn.execute_batch(
+            "INSERT INTO meetings (id, title, started_at_ms, tz, state, created_at, updated_at, origin_device_id)
+               VALUES ('m1', 'Synthetic sync', 0, 'UTC', 'ready', 0, 0, 'd1');
+             INSERT INTO meeting_releases (meeting_id, state, source, source_event_id, event_title,
+                                           recipients_json, created_at, updated_at)
+               VALUES ('m1', 'needs_review', 'eventkit', 'evt-1', 'Planning sync', '[]', 5, 6);
+             INSERT INTO release_decisions (id, meeting_id, engine_id, decision, at_ms)
+               VALUES ('d1', 'm1', 'engine', 'approved_unchanged', 7);",
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO release_decisions (id, meeting_id, engine_id, decision, at_ms)
+                 VALUES ('d0', 'm1', 'engine', 'wrong_event', 7)",
+                [],
+            )
+            .is_err(),
+            "v13 has no wrong_event decision"
+        );
+
+        migrations.to_latest(&mut conn).unwrap();
+        assert_eq!(LATEST_SCHEMA_VERSION, 14);
+
+        let (title, start, end): (String, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT event_title, event_start_ms, event_end_ms FROM meeting_releases",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((title.as_str(), start, end), ("Planning sync", None, None));
+        conn.execute(
+            "UPDATE meeting_releases SET event_start_ms = 1000, event_end_ms = 2000",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO release_decisions (id, meeting_id, engine_id, decision, at_ms)
+             VALUES ('d2', 'm1', 'engine', 'wrong_event', 8)",
+            [],
+        )
+        .unwrap();
+        let kept: Vec<String> = conn
+            .prepare("SELECT id || ':' || decision FROM release_decisions ORDER BY at_ms")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(kept, ["d1:approved_unchanged", "d2:wrong_event"]);
+        assert!(
+            conn.execute(
+                "INSERT INTO release_decisions (id, meeting_id, engine_id, decision, at_ms)
+                 VALUES ('d3', 'm1', 'engine', 'made_up', 9)",
+                [],
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute("UPDATE release_decisions SET at_ms = 0", [])
+                .is_err(),
+            "still append-only"
+        );
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'release_decisions_engine_idx'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1);
     }
 }
