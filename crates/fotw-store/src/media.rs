@@ -102,62 +102,21 @@ impl Db {
     /// [`StoreError::Invalid`] for a path that is absolute or contains `..` —
     /// §9.7 invariant 5, checked at the only place it is cheap to check.
     pub fn upsert_recording(&mut self, meeting_id: &str, rec: &NewRecording) -> Result<String> {
-        check_rel_path(&rec.rel_path)?;
-        let origin: String = self
-            .conn()
-            .query_row(
-                "SELECT origin_device_id FROM meetings WHERE id = ?1",
-                params![meeting_id],
-                |r| r.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| StoreError::NotFound {
-                kind: "meeting",
-                id: meeting_id.to_owned(),
-            })?;
+        upsert_recording(self.conn(), meeting_id, rec)
+    }
 
-        let now = now_ms();
-        // `encrypted = 0`, deliberately and honestly. §10 specifies media at
-        // rest under `age` (STREAM/ChaCha20-Poly1305); that is not built yet,
-        // and a column that claims otherwise would be a lie the export and
-        // backup paths would then repeat to the user.
-        self.conn().execute(
-            "INSERT INTO recordings (
-                 id, meeting_id, channel, rel_path, codec, container,
-                 sample_rate, channels, bitrate_bps, duration_ms, bytes,
-                 encrypted, state, created_at, updated_at, lamport,
-                 origin_device_id
-             ) VALUES (?1, ?2, ?3, ?4, 'opus', 'ogg', ?5, 1, 24000, ?6, ?7,
-                       0, 'complete', ?8, ?8, 0, ?9)
-             ON CONFLICT (meeting_id, channel) DO UPDATE SET
-                 rel_path    = excluded.rel_path,
-                 sample_rate = excluded.sample_rate,
-                 duration_ms = excluded.duration_ms,
-                 bytes       = excluded.bytes,
-                 state       = 'complete',
-                 deleted_at  = NULL,
-                 updated_at  = excluded.updated_at,
-                 lamport     = recordings.lamport + 1",
-            params![
-                new_id(),
-                meeting_id,
-                rec.channel,
-                rec.rel_path,
-                i64::from(rec.sample_rate_hz),
-                i64::try_from(rec.duration_ms).unwrap_or(i64::MAX),
-                i64::try_from(rec.bytes).unwrap_or(i64::MAX),
-                now,
-                origin,
-            ],
-        )?;
-
-        self.conn()
-            .query_row(
-                "SELECT id FROM recordings WHERE meeting_id = ?1 AND channel = ?2",
-                params![meeting_id, rec.channel],
-                |r| r.get(0),
-            )
-            .map_err(Into::into)
+    /// Write every track of a published recording in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Any track write failure rolls back the group.
+    pub fn upsert_recordings(&mut self, meeting_id: &str, tracks: &[NewRecording]) -> Result<()> {
+        let tx = self.conn_mut().transaction()?;
+        for track in tracks {
+            upsert_recording(&tx, meeting_id, track)?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Mark a meeting's audio gone, keeping the rows.
@@ -371,4 +330,65 @@ fn check_rel_path(rel: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn upsert_recording(
+    conn: &rusqlite::Connection,
+    meeting_id: &str,
+    rec: &NewRecording,
+) -> Result<String> {
+    check_rel_path(&rec.rel_path)?;
+    let origin: String = conn
+        .query_row(
+            "SELECT origin_device_id FROM meetings WHERE id = ?1",
+            params![meeting_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::NotFound {
+            kind: "meeting",
+            id: meeting_id.to_owned(),
+        })?;
+
+    let now = now_ms();
+    // `encrypted = 0`, deliberately and honestly. §10 specifies media at
+    // rest under `age` (STREAM/ChaCha20-Poly1305); that is not built yet,
+    // and a column that claims otherwise would be a lie the export and
+    // backup paths would then repeat to the user.
+    conn.execute(
+        "INSERT INTO recordings (
+             id, meeting_id, channel, rel_path, codec, container,
+             sample_rate, channels, bitrate_bps, duration_ms, bytes,
+             encrypted, state, created_at, updated_at, lamport,
+             origin_device_id
+         ) VALUES (?1, ?2, ?3, ?4, 'opus', 'ogg', ?5, 1, 24000, ?6, ?7,
+                   0, 'complete', ?8, ?8, 0, ?9)
+         ON CONFLICT (meeting_id, channel) DO UPDATE SET
+             rel_path    = excluded.rel_path,
+             sample_rate = excluded.sample_rate,
+             duration_ms = excluded.duration_ms,
+             bytes       = excluded.bytes,
+             state       = 'complete',
+             deleted_at  = NULL,
+             updated_at  = excluded.updated_at,
+             lamport     = recordings.lamport + 1",
+        params![
+            new_id(),
+            meeting_id,
+            rec.channel,
+            rec.rel_path,
+            i64::from(rec.sample_rate_hz),
+            i64::try_from(rec.duration_ms).unwrap_or(i64::MAX),
+            i64::try_from(rec.bytes).unwrap_or(i64::MAX),
+            now,
+            origin,
+        ],
+    )?;
+
+    conn.query_row(
+        "SELECT id FROM recordings WHERE meeting_id = ?1 AND channel = ?2",
+        params![meeting_id, rec.channel],
+        |r| r.get(0),
+    )
+    .map_err(Into::into)
 }

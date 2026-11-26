@@ -14,13 +14,9 @@
 //!
 //! # Promotion
 //!
-//! [`promote_session`] runs [`fotw_pipeline::promote`] and then writes the
-//! `recordings` rows. The order is forced and not arbitrary — the row points
-//! at a file, so the file has to exist first. A crash between them leaves
-//! media on disk that the library does not know about, which
-//! [`resume_promotions`] finds and finishes at the next start. The reverse
-//! order would leave the library pointing at audio that does not exist, which
-//! nothing can repair.
+//! [`promote_session`] publishes the audio, writes the `recordings` rows,
+//! and then attempts retirement. If the rows cannot be written, the stamped
+//! directory lets [`resume_promotions`] find the published tracks and retry.
 //!
 //! # Sweeping
 //!
@@ -293,6 +289,7 @@ pub fn promote_session(
     if !meeting_exists(db, meeting_id)? {
         return Err("the meeting no longer exists; refusing to publish its audio".into());
     }
+    check_capture_alias(db, session_dir, meeting_id)?;
     promote::claim(session_dir, meeting_id, started_at_ms).map_err(|e| e.to_string())?;
     publish_claimed(db, data_root, session_dir, meeting_id)
 }
@@ -305,6 +302,21 @@ fn meeting_exists(db: &mut Db, meeting_id: &str) -> Result<bool, String> {
     }
 }
 
+fn check_capture_alias(db: &Db, session_dir: &Path, meeting_id: &str) -> Result<(), String> {
+    let session = session_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "capture has no session identity".to_owned())?;
+    if db
+        .session_note_meeting(session)
+        .map_err(|e| e.to_string())?
+        .is_some_and(|alias| alias != meeting_id)
+    {
+        return Err("promotion claim does not match the capture's saved meeting".into());
+    }
+    Ok(())
+}
+
 fn publish_claimed(
     db: &mut Db,
     data_root: &Path,
@@ -313,7 +325,8 @@ fn publish_claimed(
 ) -> Result<Promotion, String> {
     crate::persist::refresh_speech_projection(db, session_dir, meeting_id)
         .map_err(|e| e.to_string())?;
-    let promoted = promote::promote(session_dir, data_root).map_err(|e| e.to_string())?;
+    let promoted =
+        promote::publish_stamped(session_dir, data_root, meeting_id).map_err(|e| e.to_string())?;
     if db
         .meeting_was_deleted(meeting_id)
         .map_err(|e| e.to_string())?
@@ -322,7 +335,12 @@ fn publish_claimed(
         db.delete_meeting(meeting_id).map_err(|e| e.to_string())?;
         return Err("the meeting was deleted during archiving".into());
     }
+    check_capture_alias(db, session_dir, meeting_id)?;
+    let capture_owner = promote::verify_before_indexing(session_dir, data_root, &promoted)
+        .map_err(|e| e.to_string())?;
     record(db, &promoted)?;
+    drop(capture_owner);
+    promote::retire_finished(session_dir, data_root, &promoted).map_err(|e| e.to_string())?;
     Ok(promoted)
 }
 
@@ -355,6 +373,7 @@ pub fn resume_promotions(db: &mut Db, data_root: &Path) -> Vec<Result<Promotion,
                 .manifest
                 .claim
                 .ok_or_else(|| "capture has no meeting claim".to_owned())?;
+            check_capture_alias(db, &directory, &claim.meeting_id)?;
             if !meeting_exists(db, &claim.meeting_id)? {
                 if db
                     .meeting_was_deleted(&claim.meeting_id)
@@ -380,20 +399,19 @@ pub fn resume_promotions(db: &mut Db, data_root: &Path) -> Vec<Result<Promotion,
 
 /// Write the `recordings` rows for a promotion.
 fn record(db: &mut Db, promoted: &Promotion) -> Result<(), String> {
-    for t in &promoted.tracks {
-        db.upsert_recording(
-            &promoted.meeting_id,
-            &NewRecording {
-                channel: t.channel.clone(),
-                rel_path: t.rel_path.clone(),
-                bytes: t.bytes,
-                duration_ms: t.duration_ms,
-                sample_rate_hz: t.sample_rate_hz,
-            },
-        )
-        .map_err(|e| format!("recording {}: {e}", t.rel_path))?;
-    }
-    Ok(())
+    let tracks: Vec<_> = promoted
+        .tracks
+        .iter()
+        .map(|track| NewRecording {
+            channel: track.channel.clone(),
+            rel_path: track.rel_path.clone(),
+            bytes: track.bytes,
+            duration_ms: track.duration_ms,
+            sample_rate_hz: track.sample_rate_hz,
+        })
+        .collect();
+    db.upsert_recordings(&promoted.meeting_id, &tracks)
+        .map_err(|e| format!("writing playback rows for {}: {e}", promoted.meeting_id))
 }
 
 // ------------------------------------------------------------------- settings
