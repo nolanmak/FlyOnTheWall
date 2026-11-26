@@ -961,3 +961,23 @@ button, summary { min-height: 36px; }
   .cal-account { flex-wrap: wrap; }
   .cal-account .cal-pill { order: 3; }
 }
+
+/* Attendee release (#332) */
+.release-line { margin: 4px 0 8px; }
+.release-outbox { margin: 12px 16px; }
+.release-badge { display: inline-block; min-width: 1.4em; padding: 0 6px; border-radius: 999px; background: var(--caution); color: var(--surface); font-size: 0.8em; text-align: center; }
+.release-banner { padding: 8px 10px; border: 1px solid var(--caution); border-radius: 8px; color: var(--caution); }
+.release-warning { color: var(--caution); }
+.release-items { list-style: none; padding: 0; margin: 8px 0; }
+.release-row { padding: 4px 0; overflow-wrap: anywhere; }
+.release-open, .release-link { background: none; border: none; padding: 0; color: var(--accent); cursor: pointer; text-align: left; font: inherit; }
+.release-link { display: block; margin: 2px 0 2px 1em; text-decoration: underline; }
+.release-detail { border-top: 1px solid var(--line); padding-top: 8px; max-width: var(--reading-width); }
+.release-detail h4 { margin: 12px 0 4px; }
+.release-stored { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px; margin: 0; }
+.release-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+.release-confirm { padding: 8px 10px; border: 1px solid var(--caution); border-radius: 8px; }
+.release-segments { max-height: 360px; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; padding: 6px; }
+.release-seg { display: block; padding: 2px 0; overflow-wrap: anywhere; }
+.release-seg.is-cut { color: var(--muted); }
+.release-seg.is-flagged { background: var(--selected); }
