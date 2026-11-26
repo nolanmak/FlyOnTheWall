@@ -386,6 +386,11 @@ async fn serve_until_stopped(
     // daemon's steps was asking. In the journal this is the difference between
     // "it died before the library" and "it died after" (#102).
     let db = crate::open_library(&root).map_err(|e| format!("could not open the library: {e}"))?;
+    // Not fatal: the repair already happened inside the migration, and this
+    // is only the report of it.
+    for line in crate::journal::ownership_repaired(&db.ownership_repairs().unwrap_or_default()) {
+        crate::journal::record(&line);
+    }
     let source = Arc::new(StoreSource::new(db));
 
     // 0 — the default — means the OS picks. A fixed port is guessable by a
@@ -526,9 +531,15 @@ async fn serve_until_stopped(
                 .map_or_else(|| "io".to_owned(), |n| format!("os_{n}"))
         );
     }
-    // The worker itself needs the release preparer (#329/#330); until that
-    // is wired in, release stays absent and nothing is started.
-    let _release = start_release(&root, None);
+    // The release worker and its controls (#326). The preparer resolves the
+    // configured engine per call, so release can be switched on before an
+    // engine exists; the worker pauses `engine_unavailable` until one does.
+    let release = crate::secrets::keystore().ok().and_then(|store| {
+        let preparer: Arc<dyn crate::release::types::Preparer> = Arc::new(
+            crate::release::engine_preparer::EnginePreparer::new(store, root.clone()),
+        );
+        start_release(&root, Some(preparer))
+    });
 
     // The GitHub export target (issue #63). Its own library connection, as
     // the sweeper has one, so a push never holds the UI's mutex through a
@@ -638,6 +649,10 @@ async fn serve_until_stopped(
         server
             .state()
             .set_documents(Arc::new(crate::documents::Documents::new(db, store)));
+    }
+
+    if let Some(release) = release {
+        server.state().set_release(release);
     }
 
     if let Ok(db) = crate::open_library(&root) {

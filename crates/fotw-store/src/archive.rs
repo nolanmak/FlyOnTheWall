@@ -363,7 +363,8 @@ impl Db {
             devices: self.fetch_all("ORDER BY id")?,
             app_meta: self.fetch_all(
                 "WHERE key NOT GLOB 'summary_input_epoch:*' AND key NOT GLOB 'enrich_pass:*' \
-                 AND key NOT GLOB 'release_*' ORDER BY key",
+                 AND key NOT GLOB 'release_*'
+                 AND key NOT GLOB 'ownership_repair:*' ORDER BY key",
             )?,
             settings: self.fetch_all("ORDER BY key")?,
             session_notes: self.fetch_all("ORDER BY session_id")?,
@@ -454,6 +455,8 @@ impl Db {
                 .starts_with(crate::setting_version::MEETING_INPUT_PREFIX)
                 && !row.key.starts_with(crate::repo::ENRICH_PASS_PREFIX)
                 && !row.key.starts_with(RELEASE_PREFIX)
+                // What 0013 repaired in *that* library is not a fact about this one.
+                && !row.key.starts_with(crate::migrations::OWNERSHIP_REPAIR_PREFIX)
         });
 
         // Read and parse every meeting document before opening the write

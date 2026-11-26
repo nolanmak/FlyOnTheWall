@@ -23,9 +23,14 @@
 //! line, an error or a notice.
 
 pub mod control;
+pub mod cut;
+pub mod engine_preparer;
 pub mod mail;
+pub mod render;
+pub mod review;
 pub mod settings;
 pub mod store;
+pub mod summary;
 pub mod types;
 pub mod worker;
 #[cfg(test)]
