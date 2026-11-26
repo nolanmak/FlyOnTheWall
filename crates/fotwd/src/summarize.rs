@@ -272,6 +272,15 @@ where
         check()?;
         outcome
     };
+    // Second guard behind the pipeline's own (#334), checked on what the
+    // *model* wrote and before our admonitions are added: a warning banner
+    // over nothing is still nothing, and storing it would make a blank
+    // version the current one while reporting success.
+    if outcome.markdown().trim().is_empty() {
+        return Err(SummarizeRunError::Pipeline(
+            fotw_summarize::SummarizeError::EmptyResponse,
+        ));
+    }
     let warnings = user_warnings(&outcome);
 
     // The admonitions ride in *our* rendered markdown, never in
