@@ -32,6 +32,7 @@ pub mod okf;
 pub mod onboard;
 pub mod persist;
 pub mod post_pass;
+mod receipts;
 pub mod recording;
 mod recording_limit;
 pub mod recovery;
