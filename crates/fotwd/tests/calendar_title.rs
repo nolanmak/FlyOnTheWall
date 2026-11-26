@@ -31,6 +31,8 @@ fn event(uid: &str, title: &str, start: i64, end: i64) -> ScheduledEvent {
         participation: Participation::Accepted,
         source: "",
         invitees: Vec::new(),
+        ical_uid: None,
+        attendees: Vec::new(),
     }
 }
 

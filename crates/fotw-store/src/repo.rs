@@ -15,6 +15,11 @@ use crate::models::{
 };
 use crate::post_pass::HOLDS_ENRICHMENT;
 
+/// `WHERE` clause over `segments` for transcript `?1`: its rows that also
+/// belong to the transcript's own meeting (#336).
+const OWN_SEGMENTS: &str = "WHERE transcript_id = ?1
+       AND meeting_id = (SELECT t.meeting_id FROM transcripts t WHERE t.id = ?1)";
+
 /// What "still awaiting enrichment" means, as a `WHERE` clause over `meetings
 /// m` — the one definition [`MeetingRepo::needing_summary`] and
 /// [`MeetingRepo::count_needing_summary`] both read.
@@ -30,6 +35,19 @@ const AWAITING_ENRICHMENT: &str = "EXISTS (SELECT 1 FROM segments s WHERE s.meet
             WHERE su.meeting_id = m.id AND su.is_current = 1)
      AND (m.enrich_status IS NULL
           OR m.enrich_status IN ('no_engine', 'engine_unresolvable'))";
+
+/// The `app_meta` namespace holding each meeting's newest enrichment pass
+/// token (#335). Local concurrency state: archive export skips it and import
+/// drops it, the same as `summary_input_epoch:`.
+pub(crate) const ENRICH_PASS_PREFIX: &str = "enrich_pass:";
+
+/// One pass's claim on a meeting's enrichment status, from
+/// [`MeetingRepo::begin_enrich_pass`]. Opaque: it only compares equal to the
+/// token the library still holds, or it does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrichPass {
+    token: String,
+}
 
 /// Meeting-scoped reads and writes.
 ///
@@ -245,6 +263,98 @@ impl MeetingRepo<'_> {
         Ok(())
     }
 
+    /// Claim the meeting's enrichment status for a pass that is starting now
+    /// (#335).
+    ///
+    /// Every pass that will write `enrich_status` — the daemon's own and the
+    /// manual `fotwd summarize` — calls this before its engine runs, and gets
+    /// back a fresh opaque token. Claiming replaces whatever token a pass
+    /// that started earlier holds, so from this moment on only this pass may
+    /// record the meeting's result through
+    /// [`set_enrich_report_if_newest`](Self::set_enrich_report_if_newest).
+    ///
+    /// The token lives in `app_meta` under `enrich_pass:<meeting id>`: local
+    /// concurrency state like `summary_input_epoch:`, never exported or
+    /// imported, and no migration needed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when there is no such meeting; SQLite failures.
+    pub fn begin_enrich_pass(&mut self, meeting_id: &str) -> Result<EnrichPass> {
+        let tx = self.db.conn_mut().transaction()?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM meetings WHERE id = ?1)",
+            params![meeting_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::NotFound {
+                kind: "meeting",
+                id: meeting_id.to_owned(),
+            });
+        }
+        let token: String = tx.query_row(
+            "INSERT INTO app_meta(key, value, updated_at)
+                  VALUES (?1, lower(hex(randomblob(16))), ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                            updated_at = excluded.updated_at
+             RETURNING value",
+            params![format!("{ENRICH_PASS_PREFIX}{meeting_id}"), now_ms()],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(EnrichPass { token })
+    }
+
+    /// [`set_enrich_report`](Self::set_enrich_report), but only while `pass`
+    /// is still the newest pass to have claimed this meeting (#335).
+    ///
+    /// One statement, so the check and the write cannot be split by another
+    /// connection. `Ok(false)` means a newer pass started (and perhaps
+    /// finished) after this one and owns the status now: the write was
+    /// dropped, and the caller should say so rather than treat it as an
+    /// error.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when there is no such meeting; SQLite failures.
+    pub fn set_enrich_report_if_newest(
+        &mut self,
+        meeting_id: &str,
+        pass: &EnrichPass,
+        status: &str,
+        detail: Option<&str>,
+    ) -> Result<bool> {
+        let n = self.db.conn().execute(
+            "UPDATE meetings SET enrich_status = ?2, enrich_detail = ?3
+              WHERE id = ?1
+                AND (SELECT value FROM app_meta WHERE key = ?4) = ?5",
+            params![
+                meeting_id,
+                status,
+                detail,
+                format!("{ENRICH_PASS_PREFIX}{meeting_id}"),
+                pass.token
+            ],
+        )?;
+        if n == 1 {
+            return Ok(true);
+        }
+        let exists: bool = self.db.conn().query_row(
+            "SELECT EXISTS (SELECT 1 FROM meetings WHERE id = ?1)",
+            params![meeting_id],
+            |row| row.get(0),
+        )?;
+        if exists {
+            Ok(false)
+        } else {
+            Err(StoreError::NotFound {
+                kind: "meeting",
+                id: meeting_id.to_owned(),
+            })
+        }
+    }
+
     /// Meetings that have something to summarise and no summary, oldest first.
     ///
     /// The predicate is shared with
@@ -419,10 +529,15 @@ impl MeetingRepo<'_> {
     }
 
     /// Every segment of a transcript, in order, as `(idx, text)`.
+    ///
+    /// Only segments whose own `meeting_id` is the transcript's meeting
+    /// (#336): the schema does not yet enforce that pairing, and a row that
+    /// names another meeting must never be read as part of this one.
     pub fn transcript_text(&self, transcript_id: &str) -> Result<Vec<(i64, String)>> {
         let conn = self.db.conn();
-        let mut stmt =
-            conn.prepare("SELECT idx, text FROM segments WHERE transcript_id = ?1 ORDER BY idx")?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT idx, text FROM segments {OWN_SEGMENTS} ORDER BY idx"
+        ))?;
         let rows = stmt.query_map(params![transcript_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
         let mut out = Vec::new();
         for row in rows {
@@ -442,10 +557,10 @@ impl MeetingRepo<'_> {
     /// back, so the UI showed an anonymous monologue.
     pub fn transcript_segments(&self, transcript_id: &str) -> Result<Vec<StoredSegment>> {
         let conn = self.db.conn();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT idx, start_ms, end_ms, speaker_label, text, confidence, channel
-               FROM segments WHERE transcript_id = ?1 ORDER BY idx",
-        )?;
+                   FROM segments {OWN_SEGMENTS} ORDER BY idx"
+        ))?;
         let rows = stmt.query_map(params![transcript_id], |r| {
             Ok(StoredSegment {
                 idx: r.get(0)?,

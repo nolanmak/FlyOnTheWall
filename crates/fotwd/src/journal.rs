@@ -353,6 +353,24 @@ pub fn meeting_problems(meeting_id: &str, problems: &[String]) -> String {
     }
 }
 
+/// What the journal is told about rows migration 0013 had to repair (#343):
+/// one line per table, counts only. Repeated at every start, because the
+/// migration runs once and a single line at upgrade time is easy to lose;
+/// the counts stay in `app_meta` as `ownership_repair:<table>`.
+#[must_use]
+pub fn ownership_repaired(repairs: &[fotw_store::OwnershipRepair]) -> Vec<String> {
+    repairs
+        .iter()
+        .map(|r| {
+            format!(
+                "library  : upgrade found {} {} row(s) whose meeting disagreed with their \
+                 transcript's — {} re-homed, {} removed, {} pointer(s) cleared",
+                r.found, r.table, r.rehomed, r.removed, r.cleared
+            )
+        })
+        .collect()
+}
+
 // ------------------------------------------------------ the daemon's own life
 
 /// What the journal is told when `serve` begins.

@@ -35,6 +35,7 @@ pub mod post_pass;
 pub mod recording;
 mod recording_limit;
 pub mod recovery;
+pub mod release;
 pub mod retention;
 pub mod secrets;
 pub mod serve;

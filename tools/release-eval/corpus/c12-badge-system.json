@@ -1,0 +1,119 @@
+{
+  "id": "c12-badge-system",
+  "kind": "clean",
+  "event_title": "Badge reader replacement",
+  "tz": "America/Chicago",
+  "started_at_ms": 1781011800000,
+  "scheduled_minutes": 30,
+  "recipients": [
+    {
+      "address": "brandon.kowalski@example.com",
+      "display_name": "Brandon Kowalski",
+      "is_self": true
+    },
+    {
+      "address": "teresa.alvarado@example.com",
+      "display_name": "Teresa Alvarado",
+      "is_self": false
+    },
+    {
+      "address": "marcus.webb@example.com",
+      "display_name": "Marcus Webb",
+      "is_self": false
+    },
+    {
+      "address": "facilities@example.org",
+      "display_name": null,
+      "is_self": false
+    }
+  ],
+  "segments": [
+    {
+      "offset_s": 0,
+      "speaker": "me",
+      "text": "Morning. Update on the badge reader replacement across the three floors."
+    },
+    {
+      "offset_s": 106,
+      "speaker": "Speaker 2",
+      "text": "The installer finishes floor two this week. Floor three is next Monday."
+    },
+    {
+      "offset_s": 212,
+      "speaker": "Speaker 3",
+      "text": "Do people need new badges?"
+    },
+    {
+      "offset_s": 283,
+      "speaker": "Speaker 2",
+      "text": "No, the new readers work with existing badges. People will just tap instead of swipe."
+    },
+    {
+      "offset_s": 398,
+      "speaker": "me",
+      "text": "What about the access groups?"
+    },
+    {
+      "offset_s": 469,
+      "speaker": "Speaker 2",
+      "text": "They migrate automatically. We're testing a sample of twenty badges per floor before switching over."
+    },
+    {
+      "offset_s": 601,
+      "speaker": "Speaker 3",
+      "text": "What happens if someone's badge doesn't work on day one?"
+    },
+    {
+      "offset_s": 699,
+      "speaker": "Speaker 2",
+      "text": "Reception can issue a temporary visitor badge while we fix the access group."
+    },
+    {
+      "offset_s": 805,
+      "speaker": "me",
+      "text": "Let's put a note in the office channel the day before each floor switches."
+    },
+    {
+      "offset_s": 911,
+      "speaker": "Speaker 3",
+      "text": "Should we mention the mobile badge option?"
+    },
+    {
+      "offset_s": 991,
+      "speaker": "Speaker 2",
+      "text": "Not yet, it's still in pilot with the IT team."
+    },
+    {
+      "offset_s": 1079,
+      "speaker": "me",
+      "text": "Okay. Any issues with the parking garage readers?"
+    },
+    {
+      "offset_s": 1167,
+      "speaker": "Speaker 2",
+      "text": "Those are on a separate system, they're not part of this project."
+    },
+    {
+      "offset_s": 1265,
+      "speaker": "Speaker 3",
+      "text": "The garage system is up for replacement next year in the facilities plan."
+    },
+    {
+      "offset_s": 1371,
+      "speaker": "me",
+      "text": "Good. Let's do a final walkthrough after floor three is done."
+    },
+    {
+      "offset_s": 1468,
+      "speaker": "Speaker 2",
+      "text": "I'll book it."
+    },
+    {
+      "offset_s": 1530,
+      "speaker": "me",
+      "text": "Thanks both."
+    }
+  ],
+  "planted": [],
+  "notes": "Hard negative: physical access discussion with no codes or credentials."
+}

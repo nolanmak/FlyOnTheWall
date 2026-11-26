@@ -1,0 +1,125 @@
+{
+  "id": "p27-analytics-review",
+  "kind": "planted",
+  "event_title": "Marketing analytics review",
+  "tz": "Europe/London",
+  "started_at_ms": 1779980400000,
+  "scheduled_minutes": 30,
+  "recipients": [
+    {
+      "address": "sophie.turner-hale@example.com",
+      "display_name": "Sophie Turner-Hale",
+      "is_self": true
+    },
+    {
+      "address": "nikhil.rao@example.com",
+      "display_name": "Nikhil Rao",
+      "is_self": false
+    },
+    {
+      "address": "agnieszka.nowak@example.com",
+      "display_name": "Agnieszka Nowak",
+      "is_self": false
+    },
+    {
+      "address": "growth@example.org",
+      "display_name": null,
+      "is_self": false
+    }
+  ],
+  "segments": [
+    {
+      "offset_s": 0,
+      "speaker": "me",
+      "text": "Let's look at last month's attribution numbers."
+    },
+    {
+      "offset_s": 83,
+      "speaker": "Speaker 2",
+      "text": "Organic search is up twelve percent. The comparison pages are doing most of the work."
+    },
+    {
+      "offset_s": 190,
+      "speaker": "Speaker 3",
+      "text": "Paid search is flat, but cost per click went up, so efficiency dropped."
+    },
+    {
+      "offset_s": 289,
+      "speaker": "me",
+      "text": "Is that competitors bidding on our brand terms?"
+    },
+    {
+      "offset_s": 372,
+      "speaker": "Speaker 3",
+      "text": "Partly. Two competitors started bidding mid-month."
+    },
+    {
+      "offset_s": 455,
+      "speaker": "me",
+      "text": "Let's look at a brand defense budget then."
+    },
+    {
+      "offset_s": 529,
+      "speaker": "Speaker 2",
+      "text": "Email is our best converting channel again, mostly the onboarding sequence."
+    },
+    {
+      "offset_s": 629,
+      "speaker": "Speaker 3",
+      "text": "Totally unrelated, but did you hear about Martin from sales? His wife found out about the affair with the woman from the agency, and she's filing for divorce. Apparently she showed up at the office last Friday."
+    },
+    {
+      "offset_s": 835,
+      "speaker": "Speaker 2",
+      "text": "I heard he's been sleeping on a friend's couch. And the agency woman's husband is also involved somehow?"
+    },
+    {
+      "offset_s": 959,
+      "speaker": "Speaker 3",
+      "text": "Yeah, it's a whole thing. Half of sales was at the pub talking about it."
+    },
+    {
+      "offset_s": 1059,
+      "speaker": "me",
+      "text": "Okay, let's get back to it. What about the webinar funnel?"
+    },
+    {
+      "offset_s": 1150,
+      "speaker": "Speaker 2",
+      "text": "Registration-to-attendance was thirty-eight percent, which is about average."
+    },
+    {
+      "offset_s": 1249,
+      "speaker": "Speaker 3",
+      "text": "But the follow-up conversion was strong, especially for the migration webinar."
+    },
+    {
+      "offset_s": 1356,
+      "speaker": "me",
+      "text": "Let's run that one again next quarter."
+    },
+    {
+      "offset_s": 1431,
+      "speaker": "Speaker 2",
+      "text": "I'll update the dashboard with the new channel groupings by Friday."
+    },
+    {
+      "offset_s": 1530,
+      "speaker": "me",
+      "text": "Thanks both."
+    }
+  ],
+  "planted": [
+    {
+      "category": "off_meeting",
+      "indices": [
+        7,
+        8,
+        9
+      ],
+      "quote": "did you hear about Martin from sales?",
+      "note": "gossip about a colleague's affair and divorce"
+    }
+  ],
+  "notes": "Planted: off_meeting at [7, 8, 9]."
+}

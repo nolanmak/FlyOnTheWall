@@ -1,0 +1,137 @@
+{
+  "id": "p14-data-platform",
+  "kind": "planted",
+  "event_title": "Data platform office hours",
+  "tz": "Europe/Berlin",
+  "started_at_ms": 1778158800000,
+  "scheduled_minutes": 30,
+  "recipients": [
+    {
+      "address": "katrin.vogel@example.com",
+      "display_name": "Katrin Vogel",
+      "is_self": true
+    },
+    {
+      "address": "lucas.moreau@example.com",
+      "display_name": "Lucas Moreau",
+      "is_self": false
+    },
+    {
+      "address": "ines.barros@example.com",
+      "display_name": "Ines Barros",
+      "is_self": false
+    },
+    {
+      "address": "data-platform@example.org",
+      "display_name": null,
+      "is_self": false
+    }
+  ],
+  "segments": [
+    {
+      "offset_s": 0,
+      "speaker": "me",
+      "text": "Welcome to office hours. Lucas, you had a question about the new ingestion connector?"
+    },
+    {
+      "offset_s": 98,
+      "speaker": "Speaker 2",
+      "text": "Yes. We want to pull from the partner's SFTP drop nightly, but the connector keeps failing auth."
+    },
+    {
+      "offset_s": 205,
+      "speaker": "Speaker 3",
+      "text": "Is that the partner that rotated their host keys last month?"
+    },
+    {
+      "offset_s": 288,
+      "speaker": "Speaker 2",
+      "text": "Probably. The error mentions a host key mismatch."
+    },
+    {
+      "offset_s": 364,
+      "speaker": "me",
+      "text": "Okay, you'll need to update the known hosts entry in the connector config, not the credentials."
+    },
+    {
+      "offset_s": 470,
+      "speaker": "Speaker 3",
+      "text": "And if the credentials do need resetting, the service login for that drop is partner-ingest with password Copper-Lantern-9902. It's in the old vault folder too."
+    },
+    {
+      "offset_s": 621,
+      "speaker": "Speaker 2",
+      "text": "Thanks. Second question, can we land the files straight into the bronze layer?"
+    },
+    {
+      "offset_s": 720,
+      "speaker": "me",
+      "text": "Yes, but add a schema contract so a bad file doesn't poison downstream tables."
+    },
+    {
+      "offset_s": 818,
+      "speaker": "Speaker 3",
+      "text": "There's a template for that in the platform repo."
+    },
+    {
+      "offset_s": 894,
+      "speaker": "Speaker 2",
+      "text": "Great. Honestly the partner's integration team is useless. Their lead is a total [SLUR], he sends every reply in all caps."
+    },
+    {
+      "offset_s": 1023,
+      "speaker": "Speaker 3",
+      "text": "Ha, those people can't build anything without hand-holding."
+    },
+    {
+      "offset_s": 1106,
+      "speaker": "me",
+      "text": "Let's keep it constructive. Is there a technical contact we can escalate to instead?"
+    },
+    {
+      "offset_s": 1204,
+      "speaker": "Speaker 2",
+      "text": "There's an architect on their side, I'll loop her in."
+    },
+    {
+      "offset_s": 1280,
+      "speaker": "me",
+      "text": "Good. Anything else for office hours?"
+    },
+    {
+      "offset_s": 1348,
+      "speaker": "Speaker 3",
+      "text": "Just a reminder that the old Airflow cluster shuts down at the end of the month."
+    },
+    {
+      "offset_s": 1447,
+      "speaker": "Speaker 2",
+      "text": "We have two DAGs left there, I'll migrate them this sprint."
+    },
+    {
+      "offset_s": 1530,
+      "speaker": "me",
+      "text": "Perfect. Thanks, see you next week."
+    }
+  ],
+  "planted": [
+    {
+      "category": "credential",
+      "indices": [
+        5
+      ],
+      "quote": "partner-ingest with password Copper-Lantern-9902",
+      "note": "SFTP service password"
+    },
+    {
+      "category": "offensive",
+      "indices": [
+        9,
+        10
+      ],
+      "quote": "Their lead is a total [SLUR]",
+      "note": "slur and demeaning remark about partner team"
+    }
+  ],
+  "notes": "Planted: credential at [5]; offensive at [9, 10]."
+}

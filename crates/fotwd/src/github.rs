@@ -140,6 +140,33 @@ pub trait GhRunner: Send + Sync {
     /// Only when the process could not be spawned at all — no binary. A `gh`
     /// that ran and failed is an `Ok` with a non-zero status.
     fn run(&self, args: &[String], stdin: Option<&[u8]>) -> Result<GhOutput, String>;
+
+    /// Run `gh` as the logged-in account `account`, when there is one.
+    ///
+    /// `gh` otherwise uses whichever account is active, and that is global: a
+    /// person logged in to two accounts who switches to the other one for
+    /// unrelated work silently points every push at a repository the other
+    /// account cannot see, and pushes stall with `repo_not_found`. The
+    /// exporter passes the repository's owner here. When `gh` has no login for
+    /// that name — an organisation's repository, say — the call runs as the
+    /// active account, exactly as before.
+    ///
+    /// The default ignores `account`, which is what every scripted runner in
+    /// the tests wants: the lookup is the real runner's business, and a test
+    /// script of `gh` calls should not have to answer it.
+    ///
+    /// # Errors
+    ///
+    /// As [`GhRunner::run`].
+    fn run_as(
+        &self,
+        account: Option<&str>,
+        args: &[String],
+        stdin: Option<&[u8]>,
+    ) -> Result<GhOutput, String> {
+        let _ = account;
+        self.run(args, stdin)
+    }
 }
 
 /// The real `gh`, found on `PATH` or in the usual install locations.
@@ -151,37 +178,115 @@ pub struct SystemGh;
 
 impl GhRunner for SystemGh {
     fn run(&self, args: &[String], stdin: Option<&[u8]>) -> Result<GhOutput, String> {
-        use std::io::Write as _;
-        use std::process::{Command, Stdio};
-
-        let program = resolve_gh().ok_or_else(|| "gh is not installed".to_owned())?;
-        let mut child = Command::new(program)
-            .args(args)
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("could not start gh: {e}"))?;
-
-        if let (Some(bytes), Some(mut pipe)) = (stdin, child.stdin.take()) {
-            // A write error here means gh died early; the exit status below
-            // is the better story than this one.
-            let _ = pipe.write_all(bytes);
-        }
-
-        let out = child
-            .wait_with_output()
-            .map_err(|e| format!("could not wait for gh: {e}"))?;
-        Ok(GhOutput {
-            status: out.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        })
+        self.run_as(None, args, stdin)
     }
+
+    fn run_as(
+        &self,
+        account: Option<&str>,
+        args: &[String],
+        stdin: Option<&[u8]>,
+    ) -> Result<GhOutput, String> {
+        let program = resolve_gh().ok_or_else(|| "gh is not installed".to_owned())?;
+        run_gh_program(&program, account, args, stdin)
+    }
+}
+
+/// The token `gh` holds for `account` on github.com, if it is logged in as it.
+///
+/// `gh auth token --user` reads the stored credential without changing which
+/// account is active, so pinning one push never moves anyone else's `gh`.
+fn token_for(program: &std::path::Path, account: &str) -> Option<String> {
+    let out = spawn_gh(
+        program,
+        &[
+            "auth".to_owned(),
+            "token".to_owned(),
+            "--hostname".to_owned(),
+            "github.com".to_owned(),
+            "--user".to_owned(),
+            account.to_owned(),
+        ],
+        None,
+        None,
+    )
+    .ok()?;
+    let token = out.stdout.trim();
+    (out.status == 0 && !token.is_empty()).then(|| token.to_owned())
+}
+
+/// Run `program` as `gh`, as `account` when it has a login for that name.
+///
+/// Public to the crate's tests through [`run_gh_program_for_test`]; the token
+/// never appears in an error, a log line or the returned output.
+fn run_gh_program(
+    program: &std::path::Path,
+    account: Option<&str>,
+    args: &[String],
+    stdin: Option<&[u8]>,
+) -> Result<GhOutput, String> {
+    let token = account.and_then(|a| token_for(program, a));
+    spawn_gh(program, args, stdin, token.as_deref())
+}
+
+/// [`run_gh_program`], for an integration test that points it at a fake `gh`.
+#[doc(hidden)]
+pub fn run_gh_program_for_test(
+    program: &std::path::Path,
+    account: Option<&str>,
+    args: &[String],
+) -> Result<GhOutput, String> {
+    run_gh_program(program, account, args, None)
+}
+
+fn spawn_gh(
+    program: &std::path::Path,
+    args: &[String],
+    stdin: Option<&[u8]>,
+    token: Option<&str>,
+) -> Result<GhOutput, String> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let mut command = Command::new(program);
+    if let Some(token) = token {
+        // `GH_TOKEN` outranks the stored active account for this one
+        // process, and only for it.
+        command.env("GH_TOKEN", token);
+    }
+    let mut child = command
+        .args(args)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not start gh: {e}"))?;
+
+    if let (Some(bytes), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        // A write error here means gh died early; the exit status below
+        // is the better story than this one.
+        let _ = pipe.write_all(bytes);
+    }
+
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("could not wait for gh: {e}"))?;
+    Ok(GhOutput {
+        status: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    })
+}
+
+/// The account a repository's pushes run as: its owner, from `owner/name`.
+fn repo_owner(repo: &str) -> Option<&str> {
+    repo.split_once('/')
+        .map(|(owner, _)| owner)
+        .filter(|owner| !owner.is_empty())
 }
 
 /// `PATH` first — the user's choice wins — then the places Homebrew and a
@@ -609,7 +714,11 @@ impl GithubExporter {
 ///   is what stops the gate stranding an archive, and it also covers the
 ///   passes that die before the started stamp — a keychain or library that
 ///   would not open (`enrich.rs`'s wrapper).
-fn export_ready(receipt: Option<&crate::enrich::EnrichReceipt>, updated_at: i64, now: u64) -> bool {
+pub(crate) fn export_ready(
+    receipt: Option<&crate::enrich::EnrichReceipt>,
+    updated_at: i64,
+    now: u64,
+) -> bool {
     let long_enough_ago = |then: u64| now.saturating_sub(then) > ENRICH_GRACE_MS;
     match receipt {
         Some(r) if r.finished_at_ms > 0 => true,
@@ -1116,10 +1225,15 @@ fn basename(path: &str) -> &str {
 
 impl GithubExporter {
     /// Run `gh`, mapping "could not even start it" to [`GithubError::GhMissing`].
-    fn run_gh(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<GhOutput, GithubError> {
+    fn run_gh(
+        &self,
+        account: Option<&str>,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+    ) -> Result<GhOutput, GithubError> {
         let owned: Vec<String> = args.iter().map(ToString::to_string).collect();
         self.runner
-            .run(&owned, stdin)
+            .run_as(account, &owned, stdin)
             .map_err(|_| GithubError::GhMissing)
     }
 
@@ -1134,12 +1248,16 @@ impl GithubExporter {
     /// so the acknowledgement checked is the one stored beside the repository
     /// being written to, not one saved a moment later for a different one.
     fn preflight(&self, settings: &GithubSettings) -> Result<(), GithubError> {
-        let auth = self.run_gh(&["auth", "status", "--hostname", "github.com"], None)?;
+        let auth = self.run_gh(
+            repo_owner(&settings.repo),
+            &["auth", "status", "--hostname", "github.com"],
+            None,
+        )?;
         if auth.status != 0 {
             return Err(GithubError::NotAuthenticated);
         }
         let repo_url = format!("repos/{}", settings.repo);
-        let repo = self.run_gh(&["api", &repo_url], None)?;
+        let repo = self.run_gh(repo_owner(&settings.repo), &["api", &repo_url], None)?;
         if repo.status != 0 {
             if mentions_http(&repo.stderr, 404) {
                 return Err(GithubError::RepoNotFound);
@@ -1191,7 +1309,11 @@ impl GithubExporter {
                 settings.repo, path, settings.branch
             )
         };
-        let probe = self.run_gh(&["api", &probe_url, "--jq", ".sha"], None)?;
+        let probe = self.run_gh(
+            repo_owner(&settings.repo),
+            &["api", &probe_url, "--jq", ".sha"],
+            None,
+        )?;
         let sha = if probe.status == 0 {
             Some(probe.stdout.trim().to_owned()).filter(|s| !s.is_empty())
         } else if mentions_http(&probe.stderr, 404) {
@@ -1213,6 +1335,7 @@ impl GithubExporter {
 
         let put_url = format!("repos/{}/contents/{}", settings.repo, path);
         let put = self.run_gh(
+            repo_owner(&settings.repo),
             &["api", "-X", "PUT", &put_url, "--input", "-"],
             Some(body.to_string().as_bytes()),
         )?;

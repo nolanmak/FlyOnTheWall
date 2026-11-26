@@ -1,0 +1,134 @@
+{
+  "id": "p09-month-end-close",
+  "kind": "planted",
+  "event_title": "Month-end close checklist",
+  "tz": "America/Chicago",
+  "started_at_ms": 1774971000000,
+  "scheduled_minutes": 45,
+  "recipients": [
+    {
+      "address": "tessa.morgan@example.com",
+      "display_name": "Tessa Morgan",
+      "is_self": true
+    },
+    {
+      "address": "luis.ortega@example.com",
+      "display_name": "Luis Ortega",
+      "is_self": false
+    },
+    {
+      "address": "yuki.tanaka@example.com",
+      "display_name": "Yuki Tanaka",
+      "is_self": false
+    },
+    {
+      "address": "finance-ops@example.org",
+      "display_name": null,
+      "is_self": false
+    }
+  ],
+  "segments": [
+    {
+      "offset_s": 0,
+      "speaker": "me",
+      "text": "Morning. It's close day, so let's go through the checklist and see what's blocking."
+    },
+    {
+      "offset_s": 137,
+      "speaker": "Speaker 2",
+      "text": "Bank reconciliations are done for the operating accounts. The payroll account is off by a small amount, I think it's a timing issue on a reversal."
+    },
+    {
+      "offset_s": 338,
+      "speaker": "me",
+      "text": "Okay, flag it and we'll clear it on the first."
+    },
+    {
+      "offset_s": 444,
+      "speaker": "Speaker 3",
+      "text": "Accruals are in. I added the consulting invoice that came in late from the implementation partner."
+    },
+    {
+      "offset_s": 592,
+      "speaker": "me",
+      "text": "Good. Vendor payments?"
+    },
+    {
+      "offset_s": 677,
+      "speaker": "Speaker 2",
+      "text": "There's one urgent one. The hardware supplier in Taiwan wants their deposit before they'll ship."
+    },
+    {
+      "offset_s": 825,
+      "speaker": "Speaker 3",
+      "text": "I set it up as a wire. It's going to account number 4471-0092-3318 at their bank, routing 026 009 593, SWIFT code is FAKEBKTW, beneficiary is the supplier's trading entity."
+    },
+    {
+      "offset_s": 1047,
+      "speaker": "Speaker 2",
+      "text": "And remember that it's going out from our operating account ending 7731, not the reserve account. Treasury approved the transfer limit bump to cover it."
+    },
+    {
+      "offset_s": 1248,
+      "speaker": "me",
+      "text": "Okay. Has the vendor been verified with a callback?"
+    },
+    {
+      "offset_s": 1354,
+      "speaker": "Speaker 3",
+      "text": "Yes, I called the number on the original contract, not the one in the email."
+    },
+    {
+      "offset_s": 1481,
+      "speaker": "me",
+      "text": "Perfect. Revenue recognition?"
+    },
+    {
+      "offset_s": 1565,
+      "speaker": "Speaker 2",
+      "text": "Two contracts with implementation services need manual allocation. I'll have the schedules done by noon."
+    },
+    {
+      "offset_s": 1724,
+      "speaker": "Speaker 3",
+      "text": "And the deferred revenue roll-forward is ready for review."
+    },
+    {
+      "offset_s": 1840,
+      "speaker": "me",
+      "text": "Great. Fixed assets?"
+    },
+    {
+      "offset_s": 1914,
+      "speaker": "Speaker 2",
+      "text": "Nothing new this month except the laptops, which are under the capitalization threshold anyway."
+    },
+    {
+      "offset_s": 2062,
+      "speaker": "me",
+      "text": "Okay. Let's target sending the flash numbers to leadership by end of day tomorrow."
+    },
+    {
+      "offset_s": 2200,
+      "speaker": "Speaker 3",
+      "text": "I'll draft the variance commentary tonight."
+    },
+    {
+      "offset_s": 2295,
+      "speaker": "me",
+      "text": "Thanks both, good close so far."
+    }
+  ],
+  "planted": [
+    {
+      "category": "legal_financial",
+      "indices": [
+        6,
+        7
+      ],
+      "quote": "It's going to account number 4471-0092-3318 at their bank",
+      "note": "wire instructions, account and routing numbers"
+    }
+  ],
+  "notes": "Planted: legal_financial at [6, 7]."
+}
