@@ -1313,3 +1313,121 @@ async fn a_local_fallback_cannot_undo_a_rename_during_credential_resolution() {
     assert!(report.summary_version.is_none());
     assert!(report.problems.iter().any(|p| p.contains("changed")));
 }
+
+// ------------------------------------------------------ overlapping passes
+
+/// Reported against 0987f7a: "an older failed pass can mark a newer
+/// successful summary as failed".
+///
+/// Two enrichment passes overlap on one meeting (the post-finalize pass and
+/// a backfill pass, say). Nothing serialises them. The older pass (A) is
+/// mid-call when the newer pass (B) runs to completion and stores a summary
+/// with `enrich_status = 'ok'`. A's engine call then fails, and A writes
+/// `failed` over B's `ok` unconditionally, so the dashboard prints "Summary
+/// failed" over a summary the user can read.
+///
+/// The overlap is built deterministically with two FIFOs, no sleeps: A's
+/// engine invocation announces itself on `ready` and parks on `gate`; the
+/// test runs B to completion only after `ready`, and opens `gate` only after
+/// B has finished.
+#[tokio::test]
+async fn an_older_failed_pass_does_not_mark_a_newer_summary_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.sqlite3");
+    let key = DbKey::from_bytes([0x5a; 32]);
+    let mut db_a = Db::open(&path, &key).unwrap();
+    let mut db_b = Db::open(&path, &key).unwrap();
+
+    let meeting = meeting_with_transcript(&mut db_a);
+    // A human title, so neither pass makes a title call: every engine
+    // invocation below is a summary call, and the script's counter maps
+    // exactly onto "A's Call A, then B's Call A and Call B".
+    db_a.meetings()
+        .set_title(&meeting, "Synthetic planning sync")
+        .unwrap();
+
+    let engine_dir = dir.path().join("engine");
+    std::fs::create_dir_all(&engine_dir).unwrap();
+    for fifo in ["ready", "gate"] {
+        let status = std::process::Command::new("mkfifo")
+            .arg(engine_dir.join(fifo))
+            .status()
+            .unwrap();
+        assert!(status.success(), "mkfifo {fifo}");
+    }
+    std::fs::write(engine_dir.join("2.json"), envelope(PROSE)).unwrap();
+    std::fs::write(engine_dir.join("3.json"), envelope(EXTRACTION)).unwrap();
+    let bin = engine_dir.join(STUB_ENGINE_NAME);
+    std::fs::write(
+        &bin,
+        "#!/bin/sh\n\
+         cat > /dev/null\n\
+         d=$(dirname \"$0\")\n\
+         n=$(cat \"$d/n\" 2>/dev/null || echo 0)\n\
+         n=$((n+1))\n\
+         echo \"$n\" > \"$d/n\"\n\
+         if [ \"$n\" = 1 ]; then\n\
+           echo ready > \"$d/ready\"\n\
+           read go < \"$d/gate\"\n\
+           echo 'usage limit reached' >&2; exit 1\n\
+         fi\n\
+         if [ -f \"$d/$n.json\" ]; then cat \"$d/$n.json\"; else\n\
+           echo \"the script ran out of answers at call $n\" >&2; exit 1; fi\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        fotwd::testing::make_executable(&bin);
+    }
+    cli_settings(&mut db_a, &bin.to_string_lossy());
+
+    let store = InMemoryKeyStore::new();
+    let ready = engine_dir.join("ready");
+    let gate = engine_dir.join("gate");
+
+    let older = enrich_meeting_with(&mut db_a, &store, &meeting);
+    let newer = async {
+        // Blocks until A's engine invocation is in flight.
+        tokio::task::spawn_blocking(move || std::fs::read_to_string(ready).unwrap())
+            .await
+            .unwrap();
+        let report = enrich_meeting_with(&mut db_b, &store, &meeting).await;
+        // B is done and its `ok` is on disk. Only now may A's call fail.
+        // O_RDWR so the open never blocks, whether or not A's reader is
+        // already parked on the other end.
+        use std::io::Write;
+        let mut g = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(gate)
+            .unwrap();
+        g.write_all(b"go\n").unwrap();
+        (report, g)
+    };
+    let (older_report, (newer_report, _gate)) = tokio::join!(older, newer);
+
+    assert!(
+        newer_report.summary_version.is_some(),
+        "the newer pass must have stored a summary: {:?}",
+        newer_report.problems
+    );
+    assert!(
+        older_report.summary_version.is_none(),
+        "the older pass must have failed: {:?}",
+        older_report.problems
+    );
+
+    let mut db = Db::open(&path, &key).unwrap();
+    assert!(
+        db.meetings().current_summary(&meeting).unwrap().is_some(),
+        "the newer pass's summary is stored and current"
+    );
+    let row = db.meetings().get(&meeting).unwrap();
+    assert_eq!(
+        row.enrich_status.as_deref(),
+        Some("ok"),
+        "an older pass's failure was recorded over the newer pass's success \
+         (detail: {:?})",
+        row.enrich_detail
+    );
+}
