@@ -108,7 +108,9 @@ There are no prebuilt or signed releases yet. The only way to run FlyOnTheWall i
 - [rustup](https://rustup.rs). The toolchain version is pinned by `rust-toolchain.toml`.
 - [just](https://github.com/casey/just), for example `brew install just`.
 - cmake, for example `brew install cmake`.
-- Node 18 or newer, only for the dashboard's UI tests (`just test`, `just ci`).
+- Node 18 or newer for the dashboard UI tests.
+- Python 3.9 or later for the speech-evaluation tests.
+- Swift 6.0 or later for the macOS model-free speech protocol and helper checks.
 - Optional: [cargo-deny](https://github.com/EmbarkStudios/cargo-deny), to run CI's license, ban and source checks locally with `cargo deny check licenses bans sources`.
 
 ### Build and check
@@ -117,8 +119,10 @@ There are no prebuilt or signed releases yet. The only way to run FlyOnTheWall i
 git clone https://github.com/nolanmak/FlyOnTheWall.git
 cd FlyOnTheWall
 rustup toolchain install 1.95.0   # the version pinned in rust-toolchain.toml
-just ci                           # fmt, clippy, tests, cargo-deny and the platform-seam checks
+just ci                           # core checks for your platform and the standalone lockfile
 ```
+
+See [Building and testing](CONTRIBUTING.md#building-and-testing) for the local recipes and additional hosted checks.
 
 ## First run
 
