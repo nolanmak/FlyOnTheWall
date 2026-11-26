@@ -69,11 +69,11 @@ chooses them, so a prompt injection in a transcript cannot add a recipient.
 2. **The match must be confident.** The candidates are the events the matcher
    would consider: declined, untitled and long focus blocks are left out. Copies
    of one invite (the same iCalendar UID and start time, as seen in both Apple
-   Calendar and Google) count as one event. The match is confident only when
-   exactly one candidate has **at least half of its own scheduled length**
-   inside the recording, and that candidate is the event the meeting was named
-   after. A meeting that ran long still passes. A recording that covers less
-   than half of its event never does. Otherwise the reason is
+   Calendar and Google) count as one event. The match is confident when the
+   event the meeting was named after **overlaps the recording at all** and no
+   other candidate overlaps it as much or more. A recording that started early,
+   ran late or covered only part of the event still matches; a wrong match can
+   be rejected with **Wrong meeting**. Otherwise the reason is
    `no_confident_match`, which is also the reason for a meeting with no matched
    event at all. Release never borrows attendees from nearby events.
 3. **Attendees, minus exclusions.** The recipients are that event's attendees,
