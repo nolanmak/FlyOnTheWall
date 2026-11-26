@@ -491,27 +491,119 @@ fn the_budget_comes_from_the_library_and_survives_a_restart() {
     {
         let mut db = db_at(&root);
         assert_eq!(
-            retention::settings(&db),
+            retention::sweep(&mut db, &root, NOW, SweepMode::DryRun)
+                .unwrap()
+                .settings,
             fotw_pipeline::retention::RetentionSettings::default(),
             "an unconfigured library must fall back to the §9.5 defaults"
         );
         retention::set_settings(&mut db, &want).unwrap();
     }
-    let db = db_at(&root);
-    assert_eq!(retention::settings(&db), want);
+    let mut db = db_at(&root);
+    assert_eq!(
+        retention::sweep(&mut db, &root, NOW, SweepMode::DryRun)
+            .unwrap()
+            .settings,
+        want
+    );
 }
 
 #[test]
-fn a_corrupt_settings_value_falls_back_to_the_defaults_instead_of_disabling_retention() {
-    // Guessing wrong here in the other direction — refusing to sweep — fills
-    // the disk silently, which is the failure this whole feature exists to
-    // prevent.
-    let root = tmpdir("corrupt-settings");
-    let mut db = db_at(&root);
-    db.put_setting("retention", "not json at all").unwrap();
+fn an_unreadable_retention_policy_cannot_authorize_earlier_deletion() {
+    check_invalid_policy_preserves_audio(true);
+}
+
+#[test]
+fn a_malformed_retention_policy_cannot_authorize_earlier_deletion() {
+    check_invalid_policy_preserves_audio(false);
+}
+
+fn check_invalid_policy_preserves_audio(unreadable: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut db = db_at(root);
+    let key = retention::SETTINGS_KEY;
+    let policy = fotw_pipeline::retention::RetentionSettings {
+        default_days: 90,
+        ..Default::default()
+    };
+    retention::set_settings(&mut db, &policy).unwrap();
+    let id = seeded_meeting(
+        &mut db,
+        root,
+        "Checklist review",
+        NOW - 46 * MS_PER_DAY,
+        32,
+        true,
+    );
+    transcript_ready_at(&mut db, &id, NOW - 45 * MS_PER_DAY);
+    let deadline = (NOW + 45 * MS_PER_DAY) as i64;
+    db.set_purge_after(&id, Some(deadline)).unwrap();
+    let control = retention::sweep(&mut db, root, NOW, SweepMode::Apply).unwrap();
+    assert!(control.errors.is_empty(), "{:?}", control.errors);
+    assert!(control.plan.evictions.is_empty());
+    let paths: Vec<_> = db.audio_inventory().unwrap()[0]
+        .audio
+        .iter()
+        .map(|a| root.join(&a.rel_path))
+        .collect();
+    assert_eq!(paths.len(), 2);
+    let before: Vec<_> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+
+    let mut damaged = db.get_setting(key).unwrap().unwrap();
+    assert_eq!(damaged.pop(), Some('}'));
+    db.put_setting(key, &damaged).unwrap();
+    if unreadable {
+        db.conn()
+            .execute(
+                "UPDATE settings SET value = CAST(?2 AS TEXT) WHERE key = ?1",
+                (key, &b"policy\xff"[..]),
+            )
+            .unwrap();
+        assert!(db.get_setting(key).is_err());
+    }
+
+    let result = retention::sweep(&mut db, root, NOW, SweepMode::Apply);
+    let preserved = paths
+        .iter()
+        .zip(&before)
+        .filter(|(path, bytes)| {
+            std::fs::read(path)
+                .as_ref()
+                .is_ok_and(|actual| actual == *bytes)
+        })
+        .count();
+    let removed = result.as_ref().map(|report| report.files_removed);
+    let indexed = db.audio_inventory().unwrap()[0].audio.len();
+    if unreadable {
+        let bytes: Vec<u8> = db
+            .conn()
+            .query_row(
+                "SELECT CAST(value AS BLOB) FROM settings WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bytes, b"policy\xff");
+    } else {
+        assert_eq!(
+            db.get_setting(key).unwrap().as_deref(),
+            Some(damaged.as_str())
+        );
+    }
+    assert!(
+        result.is_err() && preserved == paths.len() && indexed == paths.len(),
+        "sweep returned file count {removed:?}; unchanged files: {preserved}/{}; indexed tracks: {indexed}",
+        paths.len()
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .contains("fotwd retention --days 90 --budget-gib 20")
+    );
     assert_eq!(
-        retention::settings(&db),
-        fotw_pipeline::retention::RetentionSettings::default()
+        db.audio_inventory().unwrap()[0].purge_after_ms,
+        Some(deadline)
     );
 }
 

@@ -731,8 +731,7 @@ pub(crate) fn export_ready(
 }
 
 /// The settings in force, falling back to the defaults — a missing or
-/// unparseable row is a fresh library, never an error. The same shape as
-/// [`crate::retention::settings`], for the same reason.
+/// unparseable row uses the default export settings.
 fn read_settings(db: &Db) -> GithubSettings {
     db.get_setting(SETTINGS_KEY)
         .ok()
