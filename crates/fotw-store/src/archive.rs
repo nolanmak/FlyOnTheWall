@@ -83,6 +83,10 @@ use crate::export::{
 };
 use crate::migrations::LATEST_SCHEMA_VERSION;
 
+/// `app_meta` keys owned by attendee release (#326 D17). Device-local: never
+/// exported, never imported. The release tables are never archived at all.
+const RELEASE_PREFIX: &str = "release_";
+
 /// The versioned document kind for a whole library.
 pub const LIBRARY_SCHEMA: &str = "flyonthewall/library@1";
 
@@ -358,7 +362,8 @@ impl Db {
             meetings: ids,
             devices: self.fetch_all("ORDER BY id")?,
             app_meta: self.fetch_all(
-                "WHERE key NOT GLOB 'summary_input_epoch:*' AND key NOT GLOB 'enrich_pass:*' ORDER BY key",
+                "WHERE key NOT GLOB 'summary_input_epoch:*' AND key NOT GLOB 'enrich_pass:*' \
+                 AND key NOT GLOB 'release_*' ORDER BY key",
             )?,
             settings: self.fetch_all("ORDER BY key")?,
             session_notes: self.fetch_all("ORDER BY session_id")?,
@@ -441,10 +446,14 @@ impl Db {
         // Concurrency generations belong to this live library only. Treat
         // even a supplied archive row as derived state, never an old owner's
         // authority over newly imported content. Source inserts rebuild it.
+        // Attendee release state is device-local (#326 D17): importing an
+        // archive must never turn release on, so a `release_*` row is
+        // dropped even when a hand-edited archive carries one.
         manifest.app_meta.retain(|row| {
             !row.key
                 .starts_with(crate::setting_version::MEETING_INPUT_PREFIX)
                 && !row.key.starts_with(crate::repo::ENRICH_PASS_PREFIX)
+                && !row.key.starts_with(RELEASE_PREFIX)
         });
 
         // Read and parse every meeting document before opening the write

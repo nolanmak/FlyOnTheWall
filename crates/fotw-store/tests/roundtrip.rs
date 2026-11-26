@@ -69,6 +69,16 @@ const ALL_TABLES: &[&str] = &[
     "transcripts",
 ];
 
+/// Device-local attendee release state (#326 D17, N9). These tables are never
+/// archived, so the snapshot leaves them out and
+/// `release_state_never_enters_an_archive` proves they stay out.
+const DEVICE_LOCAL_TABLES: &[&str] = &[
+    "meeting_releases",
+    "release_decisions",
+    "release_eligibility",
+    "release_sent_addresses",
+];
+
 // --------------------------------------------------------------- the snapshot
 
 fn is_fts_object(name: &str) -> bool {
@@ -112,7 +122,7 @@ fn table_names(db: &Db) -> Vec<String> {
         .unwrap();
     let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
     rows.map(Result::unwrap)
-        .filter(|n| !is_fts_object(n))
+        .filter(|n| !is_fts_object(n) && !DEVICE_LOCAL_TABLES.contains(&n.as_str()))
         .collect()
 }
 
@@ -141,7 +151,7 @@ fn snapshot(db: &Db) -> BTreeMap<String, Vec<String>> {
             .join(", ");
         let conn = db.conn();
         let derived_filter = if table == "app_meta" {
-            " WHERE key NOT GLOB 'summary_input_epoch:*'"
+            " WHERE key NOT GLOB 'summary_input_epoch:*' AND key NOT GLOB 'release_*'"
         } else {
             ""
         };
@@ -1584,5 +1594,112 @@ fn derived_input_generations_are_rebuilt_and_never_transferred_in_archives() {
     assert_eq!(
         count, 0,
         "ignore local generation metadata supplied by an archive"
+    );
+}
+
+/// Seed every release table and `release_*` key the daemon writes (#331).
+fn seed_release_state(db: &Db) {
+    db.conn()
+        .execute_batch(
+            r#"
+INSERT INTO app_meta (key, value, updated_at) VALUES
+  ('release_settings', '{"enabled":true,"allowed_domains":["example.com"]}', 1),
+  ('release_notice_last_ms', '1700000000000', 1),
+  ('release_attention_last_ms', '1700000000000', 1);
+INSERT INTO meeting_releases (meeting_id, state, reasons_json, source, source_event_id,
+  event_title, recipients_json, rendered_subject, created_at, updated_at)
+VALUES ('mtg-1', 'needs_review', '["review_required"]', 'eventkit', 'evt-1',
+  'Release only title', '[{"address":"ana@example.com"}]', 'Release only subject', 1, 1);
+INSERT INTO release_eligibility (meeting_id, reason, evaluated_at)
+VALUES ('mtg-2', 'no_confident_match', 1);
+INSERT INTO release_decisions (id, meeting_id, engine_id, decision, at_ms)
+VALUES ('dec-1', 'mtg-1', 'claude-cli:test', 'approved_unchanged', 1);
+INSERT INTO release_sent_addresses (address, first_sent_ms)
+VALUES ('ana@example.com', 1);
+"#,
+        )
+        .unwrap();
+}
+
+#[test]
+fn release_state_never_enters_an_archive() {
+    // #326 D17/N9: release settings, rows and the ledger are device-local.
+    // Importing an archive must never turn release on or move evidence.
+    let (f, source) = fixture();
+    seed_release_state(&source);
+    source
+        .export_library(&f.archive, &ArchiveOptions::default(), &mut |_| {})
+        .unwrap();
+    let mut everything = String::new();
+    for entry in walk(&f.archive) {
+        if let Ok(text) = std::fs::read_to_string(&entry) {
+            everything.push_str(&text);
+        }
+    }
+    for needle in [
+        "release_settings",
+        "release_notice_last_ms",
+        "release_attention_last_ms",
+        "meeting_releases",
+        "release_decisions",
+        "release_eligibility",
+        "release_sent_addresses",
+        "Release only title",
+        "Release only subject",
+        "dec-1",
+    ] {
+        assert!(
+            !everything.contains(needle),
+            "the archive carries `{needle}`"
+        );
+    }
+
+    // A hand-edited archive that smuggles a release key in is not obeyed.
+    let path = f.archive.join("library.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    manifest["app_meta"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "key": "release_settings",
+            "value": r#"{"enabled":true,"allowed_domains":["example.com"]}"#,
+            "updated_at": 0
+        }));
+    std::fs::write(&path, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+    let mut dest = open_at(&f.fresh.join("db.sqlite3"));
+    let report = dest.import_library(&f.archive).unwrap();
+    assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+    assert_same_library(&source, &dest);
+    let count = |sql: &str| -> i64 { dest.conn().query_row(sql, [], |r| r.get(0)).unwrap() };
+    assert_eq!(
+        count("SELECT count(*) FROM app_meta WHERE key GLOB 'release_*'"),
+        0
+    );
+    for table in DEVICE_LOCAL_TABLES {
+        assert_eq!(
+            count(&format!("SELECT count(*) FROM {table}")),
+            0,
+            "{table}"
+        );
+    }
+}
+
+#[test]
+fn deleting_a_meeting_keeps_its_release_decisions() {
+    // D19: the unlock evidence survives meeting deletion; the row does not.
+    let (_f, mut db) = fixture();
+    seed_release_state(&db);
+    db.delete_meeting("mtg-1").unwrap();
+    let count = |sql: &str| -> i64 { db.conn().query_row(sql, [], |r| r.get(0)).unwrap() };
+    assert_eq!(count("SELECT count(*) FROM meeting_releases"), 0);
+    assert_eq!(count("SELECT count(*) FROM release_decisions"), 1);
+    assert_eq!(count("SELECT count(*) FROM release_sent_addresses"), 1);
+    assert!(
+        db.conn()
+            .execute("UPDATE release_decisions SET decision='dropped'", [])
+            .is_err(),
+        "decisions are append-only"
     );
 }
