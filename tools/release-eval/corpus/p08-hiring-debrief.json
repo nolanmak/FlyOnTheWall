@@ -1,0 +1,134 @@
+{
+  "id": "p08-hiring-debrief",
+  "kind": "planted",
+  "event_title": "Backend hiring debrief",
+  "tz": "Asia/Kolkata",
+  "started_at_ms": 1786534200000,
+  "scheduled_minutes": 45,
+  "recipients": [
+    {
+      "address": "arjun.mehta@example.com",
+      "display_name": "Arjun Mehta",
+      "is_self": true
+    },
+    {
+      "address": "divya.raman@example.com",
+      "display_name": "Divya Raman",
+      "is_self": false
+    },
+    {
+      "address": "samuel.osei@example.com",
+      "display_name": "Samuel Osei",
+      "is_self": false
+    },
+    {
+      "address": "recruiting@example.org",
+      "display_name": null,
+      "is_self": false
+    }
+  ],
+  "segments": [
+    {
+      "offset_s": 0,
+      "speaker": "me",
+      "text": "Let's debrief the two onsite loops from this week. Start with the first candidate, the platform engineer."
+    },
+    {
+      "offset_s": 148,
+      "speaker": "Speaker 2",
+      "text": "Strong hire from me. The system design round was excellent, she asked the right clarifying questions before drawing anything."
+    },
+    {
+      "offset_s": 317,
+      "speaker": "Speaker 3",
+      "text": "I'm a hire. Coding was solid, maybe a little slow on the edge cases, but her tests were thorough."
+    },
+    {
+      "offset_s": 455,
+      "speaker": "me",
+      "text": "My round was the behavioral one, and she had good examples of handling incidents calmly. I'm a hire as well."
+    },
+    {
+      "offset_s": 603,
+      "speaker": "Speaker 2",
+      "text": "So that's three hires. Recruiting can move to references."
+    },
+    {
+      "offset_s": 712,
+      "speaker": "me",
+      "text": "Second candidate, the backend generalist."
+    },
+    {
+      "offset_s": 801,
+      "speaker": "Speaker 3",
+      "text": "I'm leaning no hire. He struggled to explain trade-offs in the caching question and kept circling back."
+    },
+    {
+      "offset_s": 950,
+      "speaker": "Speaker 2",
+      "text": "Same. And honestly, with that accent, I don't know how he'd ever run a customer call. Half the time he sounded like he was reading from a call-center script."
+    },
+    {
+      "offset_s": 1148,
+      "speaker": "Speaker 3",
+      "text": "Right, can you imagine him in standup? We'd need subtitles."
+    },
+    {
+      "offset_s": 1256,
+      "speaker": "me",
+      "text": "Let's keep the feedback to the interview signals. What did you see in the coding round, Samuel?"
+    },
+    {
+      "offset_s": 1395,
+      "speaker": "Speaker 3",
+      "text": "He got a working solution but didn't test it, and when I pointed out the off-by-one he took a while to see it."
+    },
+    {
+      "offset_s": 1553,
+      "speaker": "Speaker 2",
+      "text": "My system design notes are similar. Reasonable instincts, but no depth on data modeling."
+    },
+    {
+      "offset_s": 1692,
+      "speaker": "me",
+      "text": "Okay, I'll record no hire with that rationale. Recruiting, please send him a kind decline."
+    },
+    {
+      "offset_s": 1830,
+      "speaker": "me",
+      "text": "For the first candidate, let's make sure the references include someone who managed her directly."
+    },
+    {
+      "offset_s": 1969,
+      "speaker": "Speaker 2",
+      "text": "I'll mention that to the recruiter."
+    },
+    {
+      "offset_s": 2058,
+      "speaker": "Speaker 3",
+      "text": "Do we want to open a second platform slot? The pipeline has two more strong candidates."
+    },
+    {
+      "offset_s": 2186,
+      "speaker": "me",
+      "text": "I'll check headcount with finance and let you know by Monday."
+    },
+    {
+      "offset_s": 2295,
+      "speaker": "me",
+      "text": "Thanks, everyone, these were good loops."
+    }
+  ],
+  "planted": [
+    {
+      "category": "offensive",
+      "indices": [
+        7,
+        8
+      ],
+      "quote": "with that accent, I don't know how he'd ever run a customer call",
+      "note": "mocking a candidate's accent"
+    }
+  ],
+  "notes": "Planted: offensive at [7, 8]."
+}

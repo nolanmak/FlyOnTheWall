@@ -58,6 +58,12 @@ tokio = { workspace = true, features = [
 sha2 = "0.11"
 # Filesystem free-space and no-follow checks; already in Cargo.lock.
 libc = "0.2"
+# Attendee release dates and times in the meeting's IANA zone (D9, 5.4). Reads
+# the system zoneinfo; the bundled database is only for platforms without one.
+jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-zoneinfo", "tzdb-bundle-platform"] }
+# The attendee release tables' compare-and-set statements (#331). The same
+# version fotw-store pins (its features unify), so no new supply chain.
+rusqlite = "0.40.2"
 reqwest = { version = "0.13.4", default-features = false, features = ["http2", "native-tls", "json", "charset", "blocking"] }
 
 # Private HTTP/1 IPC over an already authenticated Unix stream. No connector,
@@ -113,6 +119,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
   "NSError",
   "NSPredicate",
   "NSString",
+  "NSURL",
 ] }
 objc2-event-kit = { version = "0.3.2", default-features = false, features = [
   "std",

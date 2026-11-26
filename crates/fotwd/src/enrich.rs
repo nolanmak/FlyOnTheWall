@@ -219,6 +219,18 @@ pub async fn enrich_meeting_with(
     );
     let previous_title = receipt.minted_title.clone();
 
+    // Claim the meeting's status before any engine runs (#335). Passes are
+    // not serialised, so an older pass can still be mid-call when this one
+    // starts; from here on only the newest claim may record the result, and
+    // an older pass's late failure cannot land over a newer pass's summary.
+    let pass = match db.meetings().begin_enrich_pass(meeting_id) {
+        Ok(pass) => Some(pass),
+        Err(e) => {
+            report.problems.push(format!("enrich report: {e}"));
+            None
+        }
+    };
+
     // Capture before reading any source content. A credential lookup can yield
     // to another editor even when no hosted engine is eventually configured.
     let fallback_version = db
@@ -310,11 +322,25 @@ pub async fn enrich_meeting_with(
         // for #75's reason: "Summary failed" printed over a summary the user
         // can read is a lie about the thing the column is named for. The title
         // failure is not lost — it is in `problems`, which reaches the report.
-        if let Err(e) = db
-            .meetings()
-            .set_enrich_report(meeting_id, status, detail.as_deref())
-        {
-            report.problems.push(format!("enrich report: {e}"));
+        //
+        // And only while this is still the newest pass (#335). A pass that
+        // lost the claim drops its status rather than overwrite the newer
+        // pass's, and says so: the newer pass's result is the one that
+        // describes the meeting as it stands.
+        if let Some(pass) = &pass {
+            match db.meetings().set_enrich_report_if_newest(
+                meeting_id,
+                pass,
+                status,
+                detail.as_deref(),
+            ) {
+                Ok(true) => {}
+                Ok(false) => report.problems.push(format!(
+                    "enrich report: a newer pass owns this meeting's status, so this \
+                     pass's `{status}` was not recorded"
+                )),
+                Err(e) => report.problems.push(format!("enrich report: {e}")),
+            }
         }
     }
 

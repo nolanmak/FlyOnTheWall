@@ -20,8 +20,14 @@
 //! connected one, Google accounts through Composio (see [`composio`] for what
 //! that sends off the machine). The chosen event's title, identifier and
 //! invitee *names* are kept: names fix misheard names
-//! (`crate::invitees`); addresses are only used to derive a name and are
-//! never stored. Notes, location and links are never read.
+//! (`crate::invitees`). For naming, addresses are only used to derive a name
+//! and are never stored. Notes, location and links are never read.
+//!
+//! Attendee release (#326) is the one exception: with it turned on, the
+//! addresses of the chosen event's attendees in an allowed domain, with their
+//! response, are stored with the meeting's release so it can be emailed to
+//! them ([`release`]). Addresses outside the allowed domains are never stored.
+//! With release off, nothing changes.
 //!
 //! # A calendar never holds up a save
 //!
@@ -36,6 +42,7 @@ use std::time::Duration;
 pub mod composio;
 #[cfg(target_os = "macos")]
 pub mod eventkit;
+pub mod release;
 
 /// How long before an event's start a recording may begin and still be
 /// counted as that event.
@@ -65,6 +72,55 @@ pub enum Participation {
     Unknown,
 }
 
+/// An attendee's answer to an invitation, as the calendar has it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Response {
+    /// Accepted.
+    Accepted,
+    /// Tentative, or "maybe".
+    Tentative,
+    /// Invited and not answered yet.
+    NeedsAction,
+    /// Declined.
+    Declined,
+    /// Anything else, or nothing said.
+    Unknown,
+}
+
+/// What an attendee is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttendeeKind {
+    /// A person, or anything the calendar does not say otherwise about.
+    Person,
+    /// A group or mailing list, when the calendar marks it as one.
+    Group,
+    /// A room or other bookable resource.
+    Resource,
+}
+
+/// One attendee of an event, as read from the calendar.
+///
+/// Held in memory only. Attendee release ([`release`]) is the one reader of
+/// the address, and it keeps only addresses in an allowed domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attendee {
+    /// The address as the calendar has it (EventKit: from a `mailto:` URL
+    /// only). `None` when the calendar gives none.
+    pub address: Option<String>,
+    /// The display name, when the calendar has one.
+    pub display_name: Option<String>,
+    /// Their answer to the invitation.
+    pub response: Response,
+    /// Person, group or resource.
+    pub kind: AttendeeKind,
+    /// This is the calendar's own user: the person recording.
+    pub is_self: bool,
+    /// This is the event's organiser.
+    pub is_organizer: bool,
+}
+
 /// An event on the user's calendar, in wall-clock epoch milliseconds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduledEvent {
@@ -88,10 +144,18 @@ pub struct ScheduledEvent {
     /// Other people invited, by name (never by address): the calendar's
     /// display name, or one derived from the address. Excludes the user.
     pub invitees: Vec<String>,
+    /// The event's iCalendar UID, shared by every copy of the same invite in
+    /// different calendars. Not the same thing as [`Self::uid`].
+    pub ical_uid: Option<String>,
+    /// Everyone on the invite, with addresses, including the user and the
+    /// organiser. Only attendee release reads this; naming uses `invitees`.
+    pub attendees: Vec<Attendee>,
 }
 
 impl ScheduledEvent {
-    fn eligible(&self) -> bool {
+    /// Whether the event may name a recording at all: not all-day, not
+    /// canceled, not declined, not reversed, and titled.
+    pub(crate) fn eligible(&self) -> bool {
         !self.all_day
             && !self.canceled
             && self.participation != Participation::Declined
@@ -108,6 +172,13 @@ impl ScheduledEvent {
     /// Real overlap with the recording, without the grace windows.
     fn overlap(&self, start_ms: i64, end_ms: i64) -> i64 {
         (self.end_ms.min(end_ms) - self.start_ms.max(start_ms)).max(0)
+    }
+
+    /// A block many times longer than a recording of `recorded_ms` (a day of
+    /// "Code & Coffee", a focus block): never the meeting that was recorded.
+    pub(crate) fn is_long_block(&self, recorded_ms: i64) -> bool {
+        let length = self.end_ms - self.start_ms;
+        length > LONG_BLOCK_MS && length > recorded_ms.saturating_mul(4)
     }
 
     /// Overlap over the combined span of event and recording, in millionths.
@@ -143,6 +214,20 @@ pub trait CalendarLookup: Send + Sync {
     /// content: it is logged.
     fn events_overlapping(&self, start_ms: i64, end_ms: i64)
     -> Result<Vec<ScheduledEvent>, String>;
+    /// Like [`Self::events_overlapping`], but an error unless every part of
+    /// the store answered. Naming is happy with what it can get; attendee
+    /// release must not decide an event is the only candidate because a
+    /// rival's calendar was down.
+    ///
+    /// # Errors
+    /// Any part of the store could not be read. No event content.
+    fn events_overlapping_complete(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<ScheduledEvent>, String> {
+        self.events_overlapping(start_ms, end_ms)
+    }
 }
 
 /// No calendar: access denied, not yet granted, or not macOS.
@@ -233,6 +318,28 @@ impl CalendarLookup for Many {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Vec<ScheduledEvent>, String> {
+        self.read(start_ms, end_ms, false)
+    }
+
+    /// Every store must answer, in full and in time.
+    fn events_overlapping_complete(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<ScheduledEvent>, String> {
+        self.read(start_ms, end_ms, true)
+    }
+}
+
+impl Many {
+    /// Read every store side by side. `complete`: any store failing or
+    /// missing the deadline fails the read, instead of being skipped.
+    fn read(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+        complete: bool,
+    ) -> Result<Vec<ScheduledEvent>, String> {
         let until = std::time::Instant::now() + self.deadline;
         let (tx, rx) = mpsc::channel();
         for store in &self.stores {
@@ -241,7 +348,11 @@ impl CalendarLookup for Many {
             let _ = std::thread::Builder::new()
                 .name("fotw-calendar-store".into())
                 .spawn(move || {
-                    let answer = store.events_overlapping(start_ms, end_ms);
+                    let answer = if complete {
+                        store.events_overlapping_complete(start_ms, end_ms)
+                    } else {
+                        store.events_overlapping(start_ms, end_ms)
+                    };
                     let _ = tx.send((store.source(), answer));
                 });
         }
@@ -265,6 +376,12 @@ impl CalendarLookup for Many {
             }
         }
         let succeeded = answered - failures.len();
+        if complete && succeeded < self.stores.len() {
+            if failures.is_empty() {
+                return Err("a calendar did not answer in time".into());
+            }
+            return Err(failures.join("; "));
+        }
         if !self.stores.is_empty() && succeeded == 0 {
             if failures.is_empty() {
                 return Err("no calendar answered in time".into());
@@ -308,10 +425,7 @@ pub fn match_event(
         .filter(|e| e.eligible() && e.near(start_ms, end_ms))
         // A block many times longer than the recording (a day of "Code &
         // Coffee", a focus block) is not the meeting that was recorded.
-        .filter(|e| {
-            let length = e.end_ms - e.start_ms;
-            !(length > LONG_BLOCK_MS && length > recorded.saturating_mul(4))
-        })
+        .filter(|e| !e.is_long_block(recorded))
         .min_by(|a, b| {
             // How well the event and the recording line up: overlap over
             // their combined span. A 30-minute invite fits a 43-minute call

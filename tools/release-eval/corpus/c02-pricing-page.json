@@ -1,0 +1,119 @@
+{
+  "id": "c02-pricing-page",
+  "kind": "clean",
+  "event_title": "Pricing page refresh",
+  "tz": "America/New_York",
+  "started_at_ms": 1773770400000,
+  "scheduled_minutes": 30,
+  "recipients": [
+    {
+      "address": "camila.ruiz@example.com",
+      "display_name": "Camila Ruiz",
+      "is_self": true
+    },
+    {
+      "address": "ethan.brooks@example.com",
+      "display_name": "Ethan Brooks",
+      "is_self": false
+    },
+    {
+      "address": "zainab.yusuf@example.com",
+      "display_name": "Zainab Yusuf",
+      "is_self": false
+    },
+    {
+      "address": "web@example.org",
+      "display_name": null,
+      "is_self": false
+    }
+  ],
+  "segments": [
+    {
+      "offset_s": 0,
+      "speaker": "me",
+      "text": "Quick one on the public pricing page refresh. We want it live with the April launch."
+    },
+    {
+      "offset_s": 108,
+      "speaker": "Speaker 2",
+      "text": "The plan cards stay the same: Starter at twelve dollars per user per month, Pro at twenty-nine, and Enterprise is contact sales."
+    },
+    {
+      "offset_s": 248,
+      "speaker": "Speaker 3",
+      "text": "Do we show annual pricing by default?"
+    },
+    {
+      "offset_s": 323,
+      "speaker": "Speaker 2",
+      "text": "Yes, with a toggle for monthly. Annual shows the two months free badge."
+    },
+    {
+      "offset_s": 422,
+      "speaker": "me",
+      "text": "Let's make sure the toggle state persists if someone navigates to the comparison table."
+    },
+    {
+      "offset_s": 529,
+      "speaker": "Speaker 3",
+      "text": "Noted. The comparison table is getting long, I'd like to collapse it into categories."
+    },
+    {
+      "offset_s": 637,
+      "speaker": "me",
+      "text": "Agreed, with the top five features always visible."
+    },
+    {
+      "offset_s": 720,
+      "speaker": "Speaker 2",
+      "text": "Can we add a FAQ section? Sales gets the same five questions every week."
+    },
+    {
+      "offset_s": 819,
+      "speaker": "Speaker 3",
+      "text": "I'll draft answers and send them to sales for a sanity check."
+    },
+    {
+      "offset_s": 910,
+      "speaker": "me",
+      "text": "What about the currency selector?"
+    },
+    {
+      "offset_s": 984,
+      "speaker": "Speaker 2",
+      "text": "We'll show euros and pounds based on location, using the prices already published in the help center."
+    },
+    {
+      "offset_s": 1108,
+      "speaker": "Speaker 3",
+      "text": "The design for mobile stacks the cards vertically with Pro highlighted."
+    },
+    {
+      "offset_s": 1207,
+      "speaker": "me",
+      "text": "Nice. Any experiments planned?"
+    },
+    {
+      "offset_s": 1274,
+      "speaker": "Speaker 2",
+      "text": "An A/B test on the button text. \"Start free trial\" versus \"Try Pro free\"."
+    },
+    {
+      "offset_s": 1373,
+      "speaker": "me",
+      "text": "Okay. Let's target staging by the end of next week."
+    },
+    {
+      "offset_s": 1456,
+      "speaker": "Speaker 3",
+      "text": "I'll have the copy final by Monday."
+    },
+    {
+      "offset_s": 1530,
+      "speaker": "me",
+      "text": "Thanks both."
+    }
+  ],
+  "planted": [],
+  "notes": "Hard negative: public list prices on the pricing page, no margins or internal comp."
+}

@@ -1,0 +1,139 @@
+{
+  "id": "p29-offsite-planning",
+  "kind": "planted",
+  "event_title": "Team offsite planning",
+  "tz": "Australia/Sydney",
+  "started_at_ms": 1785376800000,
+  "scheduled_minutes": 30,
+  "recipients": [
+    {
+      "address": "chloe.bennett@example.com",
+      "display_name": "Chloe Bennett",
+      "is_self": true
+    },
+    {
+      "address": "mateus.costa@example.com",
+      "display_name": "Mateus Costa",
+      "is_self": false
+    },
+    {
+      "address": "yasmin.khalil@example.com",
+      "display_name": "Yasmin Khalil",
+      "is_self": false
+    },
+    {
+      "address": "alex.morgan@example.org",
+      "display_name": "Alex Morgan",
+      "is_self": false
+    }
+  ],
+  "segments": [
+    {
+      "offset_s": 0,
+      "speaker": "me",
+      "text": "Let's plan the team offsite for September. We need a venue, an agenda, and travel."
+    },
+    {
+      "offset_s": 99,
+      "speaker": "Speaker 2",
+      "text": "I found two venues in the Blue Mountains, both with meeting rooms and lodging."
+    },
+    {
+      "offset_s": 199,
+      "speaker": "Speaker 3",
+      "text": "Is one of them closer to the train?"
+    },
+    {
+      "offset_s": 268,
+      "speaker": "Speaker 2",
+      "text": "The second one is a ten-minute shuttle from the station."
+    },
+    {
+      "offset_s": 352,
+      "speaker": "me",
+      "text": "Let's go with that one then. Agenda?"
+    },
+    {
+      "offset_s": 421,
+      "speaker": "Speaker 4",
+      "text": "Day one strategy, day two team workshops, and some unstructured time."
+    },
+    {
+      "offset_s": 513,
+      "speaker": "me",
+      "text": "Let's keep evenings free, people are tired by the end of day one."
+    },
+    {
+      "offset_s": 597,
+      "speaker": "Speaker 3",
+      "text": "Speaking of free evenings, this weekend I'm finally doing the Bondi to Coogee walk and then brunch with my girlfriend's parents. First time meeting them, I'm terrified."
+    },
+    {
+      "offset_s": 757,
+      "speaker": "Speaker 2",
+      "text": "Oh, wear a nice shirt. And don't talk politics, her dad sounds like a lot."
+    },
+    {
+      "offset_s": 849,
+      "speaker": "Speaker 3",
+      "text": "That's the plan. Mum also wants me to bring flowers, she's been texting me all week about it."
+    },
+    {
+      "offset_s": 956,
+      "speaker": "me",
+      "text": "Ha. Okay, travel. Can people book their own flights?"
+    },
+    {
+      "offset_s": 1033,
+      "speaker": "Speaker 2",
+      "text": "Yes, through the travel tool. Most people are local anyway."
+    },
+    {
+      "offset_s": 1117,
+      "speaker": "Speaker 3",
+      "text": "Just please don't put us with the facilitator from last year. With that ridiculous accent, nobody understood a word he said. Sounded like he was talking through a mouthful of marbles."
+    },
+    {
+      "offset_s": 1285,
+      "speaker": "Speaker 4",
+      "text": "Honestly, those people should just not be allowed to run workshops."
+    },
+    {
+      "offset_s": 1377,
+      "speaker": "me",
+      "text": "Let's keep that out of it and pick someone new."
+    },
+    {
+      "offset_s": 1454,
+      "speaker": "Speaker 4",
+      "text": "I'll ask for recommendations from the people team."
+    },
+    {
+      "offset_s": 1530,
+      "speaker": "me",
+      "text": "Great. Let's lock the venue by Friday."
+    }
+  ],
+  "planted": [
+    {
+      "category": "off_meeting",
+      "indices": [
+        7,
+        8,
+        9
+      ],
+      "quote": "this weekend I'm finally doing the Bondi to Coogee walk",
+      "note": "weekend plans and meeting girlfriend's parents"
+    },
+    {
+      "category": "offensive",
+      "indices": [
+        12,
+        13
+      ],
+      "quote": "With that ridiculous accent, nobody understood a word he said",
+      "note": "mocking a facilitator's accent"
+    }
+  ],
+  "notes": "Planted: off_meeting at [7, 8, 9]; offensive at [12, 13]."
+}
