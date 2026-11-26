@@ -1,0 +1,134 @@
+{
+  "id": "c09-support-triage",
+  "kind": "clean",
+  "event_title": "Support bug triage",
+  "tz": "America/Los_Angeles",
+  "started_at_ms": 1784224800000,
+  "scheduled_minutes": 30,
+  "recipients": [
+    {
+      "address": "grace.nakamura@example.com",
+      "display_name": "Grace Nakamura",
+      "is_self": true
+    },
+    {
+      "address": "ravi.shah@example.com",
+      "display_name": "Ravi Shah",
+      "is_self": false
+    },
+    {
+      "address": "elena.petrova@example.com",
+      "display_name": "Elena Petrova",
+      "is_self": false
+    },
+    {
+      "address": "kenji.ito@example.com",
+      "display_name": "Kenji Ito",
+      "is_self": false
+    },
+    {
+      "address": "support-eng@example.org",
+      "display_name": null,
+      "is_self": false
+    }
+  ],
+  "segments": [
+    {
+      "offset_s": 0,
+      "speaker": "me",
+      "text": "Weekly triage. We have fourteen new bugs from support. Let's prioritize."
+    },
+    {
+      "offset_s": 101,
+      "speaker": "Speaker 2",
+      "text": "Top one is the calendar sync dropping recurring events with exceptions."
+    },
+    {
+      "offset_s": 202,
+      "speaker": "Speaker 4",
+      "text": "I reproduced it. It's events where one instance was moved, the sync treats it as deleted."
+    },
+    {
+      "offset_s": 319,
+      "speaker": "me",
+      "text": "Severity?"
+    },
+    {
+      "offset_s": 370,
+      "speaker": "Speaker 2",
+      "text": "High. Twelve customers reported it."
+    },
+    {
+      "offset_s": 446,
+      "speaker": "Speaker 4",
+      "text": "I can fix it this week."
+    },
+    {
+      "offset_s": 513,
+      "speaker": "me",
+      "text": "Great. Next?"
+    },
+    {
+      "offset_s": 572,
+      "speaker": "Speaker 3",
+      "text": "The mobile app shows the wrong timezone for users who travel."
+    },
+    {
+      "offset_s": 664,
+      "speaker": "Speaker 4",
+      "text": "That's a known issue. The fix is in the next mobile release."
+    },
+    {
+      "offset_s": 757,
+      "speaker": "me",
+      "text": "Let's link the tickets so support can update customers."
+    },
+    {
+      "offset_s": 849,
+      "speaker": "Speaker 2",
+      "text": "Then there's a cluster of reports about slow dashboard loading."
+    },
+    {
+      "offset_s": 942,
+      "speaker": "Speaker 4",
+      "text": "That's the analytics query regression. Performance team is on it."
+    },
+    {
+      "offset_s": 1034,
+      "speaker": "Speaker 3",
+      "text": "The rest are small. A typo in the export dialog, a broken help link, and the date picker on Firefox."
+    },
+    {
+      "offset_s": 1160,
+      "speaker": "me",
+      "text": "Let's batch those into a polish ticket."
+    },
+    {
+      "offset_s": 1236,
+      "speaker": "Speaker 2",
+      "text": "And one feature request about dark mode in emails."
+    },
+    {
+      "offset_s": 1320,
+      "speaker": "me",
+      "text": "Route it to product."
+    },
+    {
+      "offset_s": 1379,
+      "speaker": "Speaker 3",
+      "text": "Also, the macro for the recurring events bug should go out today."
+    },
+    {
+      "offset_s": 1471,
+      "speaker": "Speaker 2",
+      "text": "I'll write it."
+    },
+    {
+      "offset_s": 1530,
+      "speaker": "me",
+      "text": "Thanks, everyone."
+    }
+  ],
+  "planted": [],
+  "notes": ""
+}

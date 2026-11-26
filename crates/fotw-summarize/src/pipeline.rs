@@ -251,7 +251,9 @@ impl<'a> Pipeline<'a> {
     /// # Errors
     ///
     /// Any transport, HTTP or decoding failure from either call, and
-    /// [`SummarizeError::Truncated`] if a response stopped early.
+    /// [`SummarizeError::Truncated`] if a response stopped early, and
+    /// [`SummarizeError::EmptyResponse`] if Call A (or its reduce) finished
+    /// with no prose at all (#334).
     ///
     /// A Call B answer that does not parse is **not** one of them: it becomes a
     /// [`Warning::ExtractionFailed`] and the run keeps Call A's prose (#75).
@@ -430,6 +432,10 @@ impl<'a> Pipeline<'a> {
 
             let response = self.prose.complete(&request).await?;
             response.ensure_complete()?;
+            // Per chunk, not only overall (#334): under map-reduce a blank
+            // chunk would otherwise vanish into the merge, and the summary
+            // would silently say nothing about that part of the meeting.
+            ensure_prose(&response.text())?;
             usage = add(usage, response.usage);
             mapped.push(remap_citations(&response.blocks, chunk));
         }
@@ -504,7 +510,12 @@ impl<'a> Pipeline<'a> {
         }
         let response = self.prose.complete(&request).await?;
         response.ensure_complete()?;
-        Ok((parse_markers(&response.text()), response.usage))
+        // Checked after the markers are stripped: an answer that is nothing
+        // but `[[seg:N]]` is provenance with no prose attached to it.
+        let blocks = parse_markers(&response.text());
+        let prose: String = blocks.iter().map(|block| block.text.as_str()).collect();
+        ensure_prose(&prose)?;
+        Ok((blocks, response.usage))
     }
 
     /// Call B: structured extraction, once per chunk, lists concatenated.
@@ -602,6 +613,17 @@ impl PipelineConfig {
     pub fn cache_ttl(&self) -> CacheTtl {
         cache_ttl_for(self.chat_session_open)
     }
+}
+
+/// Refuse a Call A or reduce answer that carries no prose (#334).
+///
+/// Deliberately not applied to Call B: an empty extraction reply means "no
+/// items", and [`parse_extraction`] keeps reading it that way.
+fn ensure_prose(text: &str) -> Result<(), SummarizeError> {
+    if text.trim().is_empty() {
+        return Err(SummarizeError::EmptyResponse);
+    }
+    Ok(())
 }
 
 /// Parse Call B's JSON body, tolerating the wrapping a model adds when it was
@@ -1510,6 +1532,58 @@ mod tests {
         assert!(matches!(error, SummarizeError::Truncated(_)));
     }
 
+    #[test]
+    fn a_blank_call_a_is_an_error_and_extraction_is_never_sent() {
+        // #334: a whitespace-only prose reply used to become a blank summary
+        // measured as 100% grounded (zero claims) with no warning at all.
+        for blank in ["", "   ", " \n\t\n "] {
+            let transport = MockTransport::new()
+                .with_json(json!({
+                    "content": [{ "type": "text", "text": blank }],
+                    "stop_reason": "end_turn"
+                }))
+                .with_json(extraction_response(good_extraction(), 0));
+            let adapter = AnthropicAdapter::new(transport.clone(), "claude-opus-5", "k");
+            let pipeline = Pipeline::new(&adapter, &adapter);
+            let error = block_on(pipeline.run(&document(), "")).expect_err("blank prose");
+            assert!(
+                matches!(error, SummarizeError::EmptyResponse),
+                "{blank:?}: {error:?}"
+            );
+            assert_eq!(
+                transport.requests().len(),
+                1,
+                "{blank:?}: Call B was paid for after Call A had already failed"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_call_b_is_still_no_items_rather_than_an_error() {
+        // The blank-prose guard is Call A's alone. An empty extraction reply
+        // keeps meaning "nothing to extract".
+        let (outcome, _) = run_with(
+            vec![
+                prose_response(true),
+                json!({
+                    "content": [{ "type": "text", "text": "  " }],
+                    "stop_reason": "end_turn"
+                }),
+            ],
+            PipelineConfig::default(),
+            "",
+        );
+        assert_eq!(outcome.validation.extraction.item_count(), 0);
+        assert!(
+            !outcome
+                .warnings
+                .iter()
+                .any(|w| matches!(w, Warning::ExtractionFailed { .. })),
+            "{:?}",
+            outcome.warnings
+        );
+    }
+
     // -- map-reduce ------------------------------------------------------
 
     fn long_document() -> TranscriptDocument {
@@ -1599,6 +1673,76 @@ mod tests {
         }
         let outcome = block_on(pipeline.run(&document, "")).expect("map-reduce runs");
         (outcome, transport.requests())
+    }
+
+    /// A map-reduce run whose prose replies are `map(i)` per chunk and then
+    /// `reduce`, returning the pipeline's error and the requests sent.
+    fn failing_map_reduce(
+        map: impl Fn(usize) -> String,
+        reduce: &str,
+    ) -> (SummarizeError, Vec<RecordedRequest>) {
+        let document = long_document();
+        let capabilities = Capabilities {
+            usable_context_tokens: 12_000,
+            ..Capabilities::anthropic_frontier()
+        };
+        let chunk_count = chunk::plan(&document, &capabilities)
+            .chunks(&document)
+            .len();
+        assert!(chunk_count > 1);
+        let reply = |text: &str| {
+            json!({
+                "content": [{ "type": "text", "text": text }],
+                "stop_reason": "end_turn"
+            })
+        };
+        let mut transport = MockTransport::new();
+        for index in 0..chunk_count {
+            transport = transport.with_json(reply(&map(index)));
+        }
+        transport = transport.with_json(reply(reduce));
+        for _ in 0..chunk_count {
+            transport = transport.with_json(extraction_response(chunked_extraction(), 5));
+        }
+        let adapter = small_context_adapter(transport.clone());
+        let pipeline = Pipeline::new(&adapter, &adapter);
+        let error = block_on(pipeline.run(&document, "")).expect_err("blank prose");
+        (error, transport.requests())
+    }
+
+    #[test]
+    fn a_blank_reduce_is_an_error() {
+        // Whitespace, and markers with no prose: both strip to nothing.
+        for reduce in [" \n ", "[[seg:4]]\n[[seg:5,6]]  "] {
+            let (error, requests) = failing_map_reduce(|_| LONG_CLAIM.to_owned(), reduce);
+            assert!(
+                matches!(error, SummarizeError::EmptyResponse),
+                "{reduce:?}: {error:?}"
+            );
+            // Every map call ran and then the reduce; no extraction followed.
+            assert!(
+                requests
+                    .iter()
+                    .all(|r| r.body["output_config"]["format"].is_null()),
+                "{reduce:?}: extraction was sent after the reduce came back blank"
+            );
+        }
+    }
+
+    #[test]
+    fn one_blank_map_chunk_fails_the_run_instead_of_vanishing_into_the_merge() {
+        let (error, requests) = failing_map_reduce(
+            |index| {
+                if index == 1 {
+                    "\n".to_owned()
+                } else {
+                    LONG_CLAIM.to_owned()
+                }
+            },
+            LONG_CLAIM,
+        );
+        assert!(matches!(error, SummarizeError::EmptyResponse), "{error:?}");
+        assert_eq!(requests.len(), 2, "the run continued past the blank chunk");
     }
 
     #[test]

@@ -1,0 +1,124 @@
+{
+  "id": "c04-roadmap-standup",
+  "kind": "clean",
+  "event_title": "Design system standup",
+  "tz": "Europe/Berlin",
+  "started_at_ms": 1778483700000,
+  "scheduled_minutes": 15,
+  "recipients": [
+    {
+      "address": "jonas.richter@example.com",
+      "display_name": "Jonas Richter",
+      "is_self": true
+    },
+    {
+      "address": "aylin.demir@example.com",
+      "display_name": "Aylin Demir",
+      "is_self": false
+    },
+    {
+      "address": "paolo.greco@example.com",
+      "display_name": "Paolo Greco",
+      "is_self": false
+    },
+    {
+      "address": "design@example.org",
+      "display_name": null,
+      "is_self": false
+    }
+  ],
+  "segments": [
+    {
+      "offset_s": 0,
+      "speaker": "me",
+      "text": "Morning. How was your weekend?"
+    },
+    {
+      "offset_s": 38,
+      "speaker": "Speaker 2",
+      "text": "Good, thanks. Okay, so yesterday I finished the new button variants and pushed them to the library."
+    },
+    {
+      "offset_s": 109,
+      "speaker": "Speaker 3",
+      "text": "I reviewed them, just one comment on the disabled state contrast."
+    },
+    {
+      "offset_s": 161,
+      "speaker": "Speaker 2",
+      "text": "I'll fix that this morning."
+    },
+    {
+      "offset_s": 198,
+      "speaker": "me",
+      "text": "Paolo, how's the table component?"
+    },
+    {
+      "offset_s": 241,
+      "speaker": "Speaker 3",
+      "text": "Sorting and sticky headers are done. I'm working on the empty state and loading skeleton today."
+    },
+    {
+      "offset_s": 307,
+      "speaker": "me",
+      "text": "Do you need anything from engineering?"
+    },
+    {
+      "offset_s": 349,
+      "speaker": "Speaker 3",
+      "text": "Just a quick check that the virtualization works with sticky headers."
+    },
+    {
+      "offset_s": 406,
+      "speaker": "me",
+      "text": "I'll ask the frontend team in their channel."
+    },
+    {
+      "offset_s": 453,
+      "speaker": "Speaker 2",
+      "text": "Also, the icon set update is ready for review."
+    },
+    {
+      "offset_s": 501,
+      "speaker": "me",
+      "text": "Great, I'll look at it after lunch."
+    },
+    {
+      "offset_s": 543,
+      "speaker": "Speaker 3",
+      "text": "One question, are we still releasing the library on Thursday?"
+    },
+    {
+      "offset_s": 595,
+      "speaker": "me",
+      "text": "Yes, Thursday afternoon with release notes."
+    },
+    {
+      "offset_s": 638,
+      "speaker": "Speaker 2",
+      "text": "I'll draft the notes."
+    },
+    {
+      "offset_s": 671,
+      "speaker": "me",
+      "text": "Thanks. Any blockers?"
+    },
+    {
+      "offset_s": 704,
+      "speaker": "Speaker 3",
+      "text": "None."
+    },
+    {
+      "offset_s": 732,
+      "speaker": "Speaker 2",
+      "text": "None from me."
+    },
+    {
+      "offset_s": 765,
+      "speaker": "me",
+      "text": "Great, have a good day."
+    }
+  ],
+  "planted": [],
+  "notes": "Hard negative: one trivial 'how was your weekend / good, thanks' exchange at the start."
+}

@@ -411,6 +411,53 @@ fn stored_segments_carry_their_channel_back_out() {
     assert_eq!(rows[1].channel, "system");
 }
 
+/// #336: a segment that says it is another meeting's is not part of this
+/// transcript, even when it names it. Since #343 the schema refuses the
+/// pairing and migration 0013 repairs old rows, so the row is forced in with
+/// enforcement off: the reader-side filter stays as defence in depth.
+#[test]
+fn transcript_readers_skip_a_segment_owned_by_another_meeting() {
+    let mut db = db();
+    let a = db
+        .meetings()
+        .create(NewMeeting::new("dev-1", "UTC"))
+        .unwrap();
+    let b = db
+        .meetings()
+        .create(NewMeeting::new("dev-1", "UTC"))
+        .unwrap();
+    let a_transcript = db
+        .meetings()
+        .create_transcript(&a, "deepgram", "nova-3", true)
+        .unwrap();
+    let b_transcript = db
+        .meetings()
+        .create_transcript(&b, "deepgram", "nova-3", true)
+        .unwrap();
+    db.meetings()
+        .append_segments(&a_transcript, &[NewSegment::new(0, 0, 900, "meeting a")])
+        .unwrap();
+    db.meetings()
+        .append_segments(&b_transcript, &[NewSegment::new(0, 0, 900, "meeting b")])
+        .unwrap();
+    db.conn()
+        .execute_batch("PRAGMA foreign_keys = OFF")
+        .unwrap();
+    db.conn()
+        .execute(
+            "UPDATE segments SET transcript_id = ?1, idx = 1 WHERE meeting_id = ?2",
+            [&a_transcript, &b],
+        )
+        .unwrap();
+    db.conn().execute_batch("PRAGMA foreign_keys = ON").unwrap();
+
+    let text = db.meetings().transcript_text(&a_transcript).unwrap();
+    assert_eq!(text, vec![(0, "meeting a".to_owned())]);
+    let rows = db.meetings().transcript_segments(&a_transcript).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].text, "meeting a");
+}
+
 /// Titles start as timestamp fallbacks and get replaced once an engine has
 /// read the transcript (#67). The update must not touch anything else.
 #[test]
@@ -486,6 +533,86 @@ fn an_enrich_report_for_an_unknown_meeting_is_not_found() {
             ..
         }
     ));
+}
+
+/// #335: only the newest pass to claim a meeting may record its status. An
+/// older claim's write is dropped and reported as `false`, never an error, and
+/// the claim is local state that deletion cleans up.
+#[test]
+fn only_the_newest_enrich_pass_records_the_status() {
+    let mut db = db();
+    let meeting = db
+        .meetings()
+        .create(NewMeeting::new("dev-1", "UTC"))
+        .unwrap();
+
+    let older = db.meetings().begin_enrich_pass(&meeting).unwrap();
+    let newer = db.meetings().begin_enrich_pass(&meeting).unwrap();
+    assert_ne!(older, newer, "each claim is fresh");
+
+    assert!(
+        db.meetings()
+            .set_enrich_report_if_newest(&meeting, &newer, "ok", None)
+            .unwrap()
+    );
+    assert!(
+        !db.meetings()
+            .set_enrich_report_if_newest(&meeting, &older, "failed", Some("late"))
+            .unwrap(),
+        "a superseded pass's write must be dropped"
+    );
+    let row = db.meetings().get(&meeting).unwrap();
+    assert_eq!(row.enrich_status.as_deref(), Some("ok"));
+    assert_eq!(row.enrich_detail, None);
+
+    // The newest pass may write again, and a later claim supersedes it too.
+    assert!(
+        db.meetings()
+            .set_enrich_report_if_newest(&meeting, &newer, "failed", Some("again"))
+            .unwrap()
+    );
+    let newest = db.meetings().begin_enrich_pass(&meeting).unwrap();
+    assert!(
+        !db.meetings()
+            .set_enrich_report_if_newest(&meeting, &newer, "ok", None)
+            .unwrap()
+    );
+    assert_eq!(
+        db.meetings()
+            .get(&meeting)
+            .unwrap()
+            .enrich_status
+            .as_deref(),
+        Some("failed")
+    );
+
+    assert!(matches!(
+        db.meetings().begin_enrich_pass("nope").unwrap_err(),
+        StoreError::NotFound {
+            kind: "meeting",
+            ..
+        }
+    ));
+    assert!(matches!(
+        db.meetings()
+            .set_enrich_report_if_newest("nope", &newest, "ok", None)
+            .unwrap_err(),
+        StoreError::NotFound {
+            kind: "meeting",
+            ..
+        }
+    ));
+
+    db.delete_meeting(&meeting).unwrap();
+    let left: i64 = db
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM app_meta WHERE key GLOB 'enrich_pass:*'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(left, 0, "deleting the meeting deletes its claim");
 }
 
 /// The backfill sweeper's query (#74): 33 meetings in the real library missed

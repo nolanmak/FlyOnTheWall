@@ -1,0 +1,134 @@
+{
+  "id": "c10-brand-refresh",
+  "kind": "clean",
+  "event_title": "Brand refresh review",
+  "tz": "Europe/London",
+  "started_at_ms": 1790861400000,
+  "scheduled_minutes": 60,
+  "recipients": [
+    {
+      "address": "imogen.clarke@example.com",
+      "display_name": "Imogen Clarke",
+      "is_self": true
+    },
+    {
+      "address": "kwame.mensah@example.com",
+      "display_name": "Kwame Mensah",
+      "is_self": false
+    },
+    {
+      "address": "bea.fontaine@example.com",
+      "display_name": "Bea Fontaine",
+      "is_self": false
+    },
+    {
+      "address": "theo.marsh@example.com",
+      "display_name": "Theo Marsh",
+      "is_self": false
+    },
+    {
+      "address": "brand@example.org",
+      "display_name": null,
+      "is_self": false
+    }
+  ],
+  "segments": [
+    {
+      "offset_s": 0,
+      "speaker": "me",
+      "text": "This is the review of the brand refresh concepts from the studio. We have three directions."
+    },
+    {
+      "offset_s": 207,
+      "speaker": "Speaker 2",
+      "text": "Direction one keeps our current wordmark and updates the color palette to warmer tones."
+    },
+    {
+      "offset_s": 399,
+      "speaker": "Speaker 3",
+      "text": "Direction two is a new wordmark with a geometric typeface and a bolder accent color."
+    },
+    {
+      "offset_s": 591,
+      "speaker": "Speaker 4",
+      "text": "Direction three is the most radical: a new symbol that can work on its own as an app icon."
+    },
+    {
+      "offset_s": 798,
+      "speaker": "me",
+      "text": "Let's talk about each. What did the customer panel prefer?"
+    },
+    {
+      "offset_s": 961,
+      "speaker": "Speaker 2",
+      "text": "Direction two came out on top, especially with newer customers."
+    },
+    {
+      "offset_s": 1123,
+      "speaker": "Speaker 3",
+      "text": "Long-time customers preferred direction one, but not by much."
+    },
+    {
+      "offset_s": 1286,
+      "speaker": "Speaker 4",
+      "text": "Direction three was polarizing, some loved it, some found it cold."
+    },
+    {
+      "offset_s": 1463,
+      "speaker": "me",
+      "text": "What about accessibility of the color palettes?"
+    },
+    {
+      "offset_s": 1611,
+      "speaker": "Speaker 2",
+      "text": "All three pass contrast checks for text, but direction two's accent color fails on white backgrounds for small text."
+    },
+    {
+      "offset_s": 1848,
+      "speaker": "Speaker 3",
+      "text": "The studio can darken it slightly."
+    },
+    {
+      "offset_s": 1981,
+      "speaker": "me",
+      "text": "Rollout cost?"
+    },
+    {
+      "offset_s": 2084,
+      "speaker": "Speaker 4",
+      "text": "Direction one is the cheapest, it's mostly color tokens. Two and three need new assets everywhere."
+    },
+    {
+      "offset_s": 2291,
+      "speaker": "me",
+      "text": "I'm leaning toward direction two with the darker accent."
+    },
+    {
+      "offset_s": 2454,
+      "speaker": "Speaker 2",
+      "text": "Agreed. It feels like us, but more confident."
+    },
+    {
+      "offset_s": 2602,
+      "speaker": "Speaker 3",
+      "text": "I'd like to keep exploring the symbol from direction three as a secondary mark."
+    },
+    {
+      "offset_s": 2794,
+      "speaker": "me",
+      "text": "Let's ask the studio for a combined round. Two weeks?"
+    },
+    {
+      "offset_s": 2942,
+      "speaker": "Speaker 4",
+      "text": "They said ten business days."
+    },
+    {
+      "offset_s": 3060,
+      "speaker": "me",
+      "text": "Perfect. Let's reconvene then."
+    }
+  ],
+  "planted": [],
+  "notes": ""
+}
