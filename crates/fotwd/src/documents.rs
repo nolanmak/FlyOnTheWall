@@ -149,19 +149,15 @@ pub(crate) fn correct_current_summary(
     id: &str,
     names: &[fotw_web::documents::NameCorrection],
 ) -> Result<(), String> {
-    let doc = db.export_meeting(id).map_err(|_| FAILED.to_owned())?;
-    if let Some(s) = doc.current_summary() {
-        let body = fotw_web::documents::corrected_names(&s.body_md, names);
-        if body != s.body_md {
-            db.meetings().insert_summary(id, fotw_store::NewSummary {
-                body_md: body, origin_device_id: "local".into(), provider: s.provider.clone(),
-                model: s.model.clone(), prompt_hash: s.prompt_hash.clone(),
-                template_id: s.template_id.clone(), transcript_id: s.transcript_id.clone(),
-                coverage: s.coverage, input_tokens: None, output_tokens: None, cost_micros: None,
-            }).map_err(|_| "Name correction saved, but the summary could not be updated. Retry the correction.".to_owned())?;
-        }
-    }
-    Ok(())
+    db.meetings()
+        .correct_current_summary(id, |body| fotw_web::documents::corrected_names(body, names))
+        .map_err(|e| match e {
+            fotw_store::StoreError::NotFound { .. } => FAILED.to_owned(),
+            _ => {
+                "Name correction saved, but the summary could not be updated. Retry the correction."
+                    .to_owned()
+            }
+        })
 }
 
 struct Input {

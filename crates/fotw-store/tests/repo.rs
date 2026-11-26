@@ -741,3 +741,152 @@ fn the_count_of_meetings_awaiting_enrichment_is_the_length_of_the_queue() {
         db.meetings().needing_summary(10_000).unwrap().len()
     );
 }
+
+#[test]
+fn a_summary_correction_reapplies_to_a_concurrently_superseding_version() {
+    let (_dir, path) = common::tmp_db();
+    let mut db = Db::open(&path, &test_key()).unwrap();
+    let mut concurrent = Db::open(&path, &test_key()).unwrap();
+    concurrent
+        .conn()
+        .busy_timeout(std::time::Duration::ZERO)
+        .unwrap();
+    let id = db
+        .meetings()
+        .create(NewMeeting::new("fixture", "UTC"))
+        .unwrap();
+    let transcript = db
+        .meetings()
+        .create_transcript(&id, "fixture", "fixture", true)
+        .unwrap();
+    db.meetings()
+        .insert_summary(
+            &id,
+            NewSummary::new(
+                "fixture",
+                "fixture",
+                "fixture",
+                "original-prompt",
+                "Original spelling",
+            ),
+        )
+        .unwrap();
+
+    let mut newer = NewSummary::new(
+        "newer-device",
+        "newer-provider",
+        "newer-model",
+        "newer-prompt",
+        "Newer spelling",
+    );
+    newer.transcript_id = Some(transcript.clone());
+    newer.coverage = Some(0.5);
+    newer.input_tokens = Some(20);
+    newer.output_tokens = Some(10);
+    newer.cost_micros = Some(30);
+    let mut newer = Some(newer);
+
+    db.meetings()
+        .correct_current_summary(&id, |body| {
+            if let Some(newer) = newer.take() {
+                assert_eq!(body, "Original spelling");
+                concurrent.meetings().insert_summary(&id, newer).unwrap();
+            }
+            body.replace("spelling", "name")
+        })
+        .unwrap();
+
+    db.meetings()
+        .correct_current_summary(&id, str::to_owned)
+        .unwrap();
+    let versions = db.meetings().summary_versions(&id).unwrap();
+    assert_eq!(versions.len(), 3);
+    assert_eq!(versions[0].body_md, "Newer name");
+    assert_eq!(versions[0].provider, "newer-provider");
+    assert_eq!(versions[0].model, "newer-model");
+    assert_eq!(versions[0].prompt_hash, "newer-prompt");
+    assert_eq!(
+        versions[0].transcript_id.as_deref(),
+        Some(transcript.as_str())
+    );
+    assert_eq!(versions[0].coverage, Some(0.5));
+    let doc = db.export_meeting(&id).unwrap();
+    let exported = doc.current_summary().unwrap();
+    assert_eq!(exported.input_tokens, None);
+    assert_eq!(exported.output_tokens, None);
+    assert_eq!(exported.cost_micros, None);
+    assert!(versions[0].is_current);
+    assert!(versions[1..].iter().all(|version| !version.is_current));
+}
+
+#[test]
+fn a_noop_summary_correction_does_not_need_the_writer_slot() {
+    let (_dir, path) = common::tmp_db();
+    let mut db = Db::open(&path, &test_key()).unwrap();
+    let mut concurrent = Db::open(&path, &test_key()).unwrap();
+    db.conn().busy_timeout(std::time::Duration::ZERO).unwrap();
+    let empty = db
+        .meetings()
+        .create(NewMeeting::new("fixture", "UTC"))
+        .unwrap();
+    let id = db
+        .meetings()
+        .create(NewMeeting::new("fixture", "UTC"))
+        .unwrap();
+    db.meetings()
+        .insert_summary(
+            &id,
+            NewSummary::new("fixture", "fixture", "fixture", "prompt", "Already correct"),
+        )
+        .unwrap();
+
+    let writer = concurrent
+        .conn_mut()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let empty_result = db.meetings().correct_current_summary(&empty, str::to_owned);
+    let unchanged_result = db.meetings().correct_current_summary(&id, str::to_owned);
+    writer.rollback().unwrap();
+
+    assert!(empty_result.is_ok(), "{empty_result:?}");
+    assert!(unchanged_result.is_ok(), "{unchanged_result:?}");
+    assert_eq!(db.meetings().summary_versions(&id).unwrap().len(), 1);
+}
+
+#[test]
+fn a_failed_summary_correction_leaves_its_source_current() {
+    let mut db = db();
+    let id = db
+        .meetings()
+        .create(NewMeeting::new("fixture", "UTC"))
+        .unwrap();
+    let source = db
+        .meetings()
+        .insert_summary(
+            &id,
+            NewSummary::new(
+                "fixture",
+                "fixture",
+                "fixture",
+                "prompt",
+                "Original spelling",
+            ),
+        )
+        .unwrap();
+    db.conn()
+        .execute_batch(
+            "CREATE TEMP TRIGGER refuse_correction BEFORE INSERT ON summaries
+         BEGIN SELECT RAISE(ABORT, 'fixture refuses correction'); END;",
+        )
+        .unwrap();
+
+    let result = db
+        .meetings()
+        .correct_current_summary(&id, |_| "Corrected name".into());
+
+    assert!(result.is_err());
+    let versions = db.meetings().summary_versions(&id).unwrap();
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].id, source.id);
+    assert!(versions[0].is_current);
+}
