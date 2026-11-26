@@ -574,28 +574,28 @@ is missing from the final email or a finding covers it. A clean meeting is a
 The gate is: at least 95% caught overall, 100% for `credential` and
 `about_recipient`, at most 20% false holds, and at least 90% retention.
 
-Results, recorded in [#347](https://github.com/nolanmak/FlyOnTheWall/pull/347):
+**Full pipeline** (real cut, summary, render and review), recorded in
+[#352](https://github.com/nolanmak/FlyOnTheWall/pull/352):
 
-| Engine (eval runner label) | Daemon engine id | Caught | `credential` | `about_recipient` | Other categories | False holds | Retention |
-|---|---|---|---|---|---|---|---|
-| `claude-cli` (Claude Code 2.1.332, subscription default model), run 1 | `claude-cli:default` | 37/37 | 7/7 | 6/6 | 6/6 each | 0/12 | 683/683\* |
-| `claude-cli`, run 2 | `claude-cli:default` | 37/37 | 7/7 | 6/6 | 6/6 each | 0/12 | 683/683\* |
-| `codex` (codex-cli 0.153.4, configured default model) | `codex-cli:default` | 37/37 | 7/7 | 6/6 | 6/6 each | 0/12 | 683/683\* |
+| Engine id | Caught | `credential` | `about_recipient` | False holds | Retention |
+|---|---|---|---|---|---|
+| `claude-cli:default` (Claude Code 2.1.332) | 37/37 | 7/7 | 6/6 | 0/12 | 98.5% |
+| `codex-cli:default` (codex-cli 0.153.4) | 37/37 | 7/7 | 6/6 | 0/12 | 98.0% |
 
-No run was held as `model_failed`. The `anthropic-api` engine has not been
-measured.
+The gate is met on both engines. Before #352 narrowed the cut prompt's omit
+categories, the cut over-trimmed ordinary budget and hiring meetings on
+`codex-cli:default` (retention 79.6–83.0%).
 
-This table will be updated when the eval is re-run through the real cut and
-summary.
+In the full pipeline the cut removes every planted passage before the review
+sees the email, so these runs say little about the review on its own. The
+review-only runs in [#347](https://github.com/nolanmak/FlyOnTheWall/pull/347)
+(every passage left in the email) also caught 37/37 with 0/12 false holds on
+both engines. No run was held as `model_failed`. The `anthropic-api` engine
+has not been measured.
 
-\* **These runs measure the review on its own.** The eval runner still uses a
-temporary `FixturePreparer` in place of the real cut and summary. It keeps
-every segment and writes one fixed summary bullet, so every planted passage
-reaches the email and retention is 100% by construction. The gate is not met
-until the eval runs again through the real cut and summary. The corpus is
-generated and its planted passages are fairly explicit, so a perfect score
-shows that the contract and prompt work end to end. It does not show that the
-review is robust to subtle cases.
+The corpus is generated and its planted passages are fairly explicit, so these
+scores show that the pipeline works end to end. They do not show that it is
+robust to subtle cases.
 
 To run it yourself (it uses a real engine, so it never runs in CI):
 
