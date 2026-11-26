@@ -925,71 +925,48 @@ fn library_meeting(db: &mut Db, title: &str, text: &str) -> String {
     id
 }
 
-/// Repro: "a summary can be built from segments that belong to another
-/// meeting". Every summary input is read as `segments WHERE transcript_id =
-/// <primary transcript of the meeting>`, and nothing in the schema or the
-/// importer ties a segment's own `meeting_id` to its transcript's meeting. An
-/// archive (plain, user-editable JSON by design) whose meeting B file holds a
-/// segment row that names meeting A's transcript is accepted as-is, and B's
-/// words then go out in A's summary request, and so to A's attendees.
+/// #336: "a summary can be built from segments that belong to another
+/// meeting". The schema does not yet tie a segment's own `meeting_id` to its
+/// transcript's meeting, and before the importer checked, an archive (plain,
+/// user-editable JSON by design) could write a segment that says it is
+/// meeting B's but names meeting A's transcript. A library may already hold
+/// such a row, so the reader must not treat B's words as A's: they would go
+/// out in A's summary request, and so to A's attendees.
 #[tokio::test]
 async fn a_segment_owned_by_another_meeting_never_reaches_this_meetings_summary() {
     let dir = tmpdir("cross-meeting-segments");
-    let source_dir = dir.join("source");
-    std::fs::create_dir_all(&source_dir).unwrap();
-    let mut source = db_at(&source_dir);
+    let mut db = db_at(&dir);
     let a = library_meeting(
-        &mut source,
+        &mut db,
         "Budget review",
         "Alpha budget stays at forty thousand for the quarter.",
     );
     let b = library_meeting(
-        &mut source,
+        &mut db,
         "Private one-on-one",
         "Bravo private compensation details for one person only.",
     );
-    let a_transcript = source
-        .meetings()
-        .primary_transcript_id(&a)
-        .unwrap()
-        .unwrap();
-    let archive = dir.join("archive");
-    source
-        .export_library(&archive, &fotw_store::ArchiveOptions::default(), &mut |_| {})
-        .unwrap();
-    drop(source);
+    let a_transcript = db.meetings().primary_transcript_id(&a).unwrap().unwrap();
 
-    // Meeting B's own file: its segment still says it belongs to B, but names
-    // A's transcript. Every foreign key in it resolves.
-    let path = archive.join("meetings").join(format!("{b}.json"));
-    let mut doc: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    let segments = doc["segments"].as_array_mut().unwrap();
-    assert_eq!(segments.len(), 1);
-    assert_eq!(segments[0]["meeting_id"], serde_json::json!(b));
-    segments[0]["transcript_id"] = serde_json::json!(a_transcript);
-    segments[0]["idx"] = serde_json::json!(1);
-    std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
-
-    let target_dir = dir.join("target");
-    std::fs::create_dir_all(&target_dir).unwrap();
-    let mut db = db_at(&target_dir);
-    let report = db.import_library(&archive).unwrap();
-    eprintln!("import report: {report:?}");
+    // The row a pre-#336 import of a hand-edited archive accepted: still
+    // meeting B's, but filed under A's transcript. Every foreign key resolves.
+    let moved = db
+        .conn()
+        .execute(
+            "UPDATE segments SET transcript_id = ?1, idx = 1 WHERE meeting_id = ?2",
+            [&a_transcript, &b],
+        )
+        .unwrap();
+    assert_eq!(moved, 1);
 
     let mock = Arc::new(MockTransport::new().with_json(serde_json::json!({
         "content": [{"type": "text", "text": "Budget unchanged."}],
         "usage": {"input_tokens": 100, "output_tokens": 20},
         "stop_reason": "end_turn"
     })));
-    let _ = summarize::summarize_meeting_with(
-        &mut db,
-        &anthropic(),
-        &a,
-        &general(),
-        Arc::clone(&mock),
-    )
-    .await;
+    let _ =
+        summarize::summarize_meeting_with(&mut db, &anthropic(), &a, &general(), Arc::clone(&mock))
+            .await;
 
     assert!(mock.call_count() > 0, "no summary request was made");
     let body = mock.request(0).body.to_string();

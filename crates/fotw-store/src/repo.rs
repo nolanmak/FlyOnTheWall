@@ -15,6 +15,11 @@ use crate::models::{
 };
 use crate::post_pass::HOLDS_ENRICHMENT;
 
+/// `WHERE` clause over `segments` for transcript `?1`: its rows that also
+/// belong to the transcript's own meeting (#336).
+const OWN_SEGMENTS: &str = "WHERE transcript_id = ?1
+       AND meeting_id = (SELECT t.meeting_id FROM transcripts t WHERE t.id = ?1)";
+
 /// What "still awaiting enrichment" means, as a `WHERE` clause over `meetings
 /// m` — the one definition [`MeetingRepo::needing_summary`] and
 /// [`MeetingRepo::count_needing_summary`] both read.
@@ -399,10 +404,15 @@ impl MeetingRepo<'_> {
     }
 
     /// Every segment of a transcript, in order, as `(idx, text)`.
+    ///
+    /// Only segments whose own `meeting_id` is the transcript's meeting
+    /// (#336): the schema does not yet enforce that pairing, and a row that
+    /// names another meeting must never be read as part of this one.
     pub fn transcript_text(&self, transcript_id: &str) -> Result<Vec<(i64, String)>> {
         let conn = self.db.conn();
-        let mut stmt =
-            conn.prepare("SELECT idx, text FROM segments WHERE transcript_id = ?1 ORDER BY idx")?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT idx, text FROM segments {OWN_SEGMENTS} ORDER BY idx"
+        ))?;
         let rows = stmt.query_map(params![transcript_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
         let mut out = Vec::new();
         for row in rows {
@@ -422,10 +432,10 @@ impl MeetingRepo<'_> {
     /// back, so the UI showed an anonymous monologue.
     pub fn transcript_segments(&self, transcript_id: &str) -> Result<Vec<StoredSegment>> {
         let conn = self.db.conn();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT idx, start_ms, end_ms, speaker_label, text, confidence, channel
-               FROM segments WHERE transcript_id = ?1 ORDER BY idx",
-        )?;
+                   FROM segments {OWN_SEGMENTS} ORDER BY idx"
+        ))?;
         let rows = stmt.query_map(params![transcript_id], |r| {
             Ok(StoredSegment {
                 idx: r.get(0)?,

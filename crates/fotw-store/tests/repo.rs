@@ -411,6 +411,48 @@ fn stored_segments_carry_their_channel_back_out() {
     assert_eq!(rows[1].channel, "system");
 }
 
+/// #336: a segment that says it is another meeting's is not part of this
+/// transcript, even when it names it. The schema does not yet forbid the
+/// pairing, and an earlier import of an edited archive could write it.
+#[test]
+fn transcript_readers_skip_a_segment_owned_by_another_meeting() {
+    let mut db = db();
+    let a = db
+        .meetings()
+        .create(NewMeeting::new("dev-1", "UTC"))
+        .unwrap();
+    let b = db
+        .meetings()
+        .create(NewMeeting::new("dev-1", "UTC"))
+        .unwrap();
+    let a_transcript = db
+        .meetings()
+        .create_transcript(&a, "deepgram", "nova-3", true)
+        .unwrap();
+    let b_transcript = db
+        .meetings()
+        .create_transcript(&b, "deepgram", "nova-3", true)
+        .unwrap();
+    db.meetings()
+        .append_segments(&a_transcript, &[NewSegment::new(0, 0, 900, "meeting a")])
+        .unwrap();
+    db.meetings()
+        .append_segments(&b_transcript, &[NewSegment::new(0, 0, 900, "meeting b")])
+        .unwrap();
+    db.conn()
+        .execute(
+            "UPDATE segments SET transcript_id = ?1, idx = 1 WHERE meeting_id = ?2",
+            [&a_transcript, &b],
+        )
+        .unwrap();
+
+    let text = db.meetings().transcript_text(&a_transcript).unwrap();
+    assert_eq!(text, vec![(0, "meeting a".to_owned())]);
+    let rows = db.meetings().transcript_segments(&a_transcript).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].text, "meeting a");
+}
+
 /// Titles start as timestamp fallbacks and get replaced once an engine has
 /// read the transcript (#67). The update must not touch anything else.
 #[test]

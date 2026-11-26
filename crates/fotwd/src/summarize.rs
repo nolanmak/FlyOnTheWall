@@ -92,7 +92,7 @@ pub(crate) fn stored_segments(
     let Some(transcript_id) = crate::persist::primary_transcript_id(db, meeting_id) else {
         return Err(SummarizeRunError::NoTranscript(meeting_id.to_owned()));
     };
-    Ok(load_segments(db, &transcript_id)?)
+    Ok(load_segments(db, meeting_id, &transcript_id)?)
 }
 
 /// Summarise a stored meeting, resolving the engine and using the daemon's
@@ -164,7 +164,7 @@ where
         return Err(SummarizeRunError::NoTranscript(meeting_id.to_owned()));
     };
 
-    let segments = load_segments(db, &transcript_id)?;
+    let segments = load_segments(db, meeting_id, &transcript_id)?;
     if segments.is_empty() {
         return Err(SummarizeRunError::NoTranscript(meeting_id.to_owned()));
     }
@@ -613,15 +613,24 @@ fn user_warnings(outcome: &SummaryOutcome) -> Vec<UserWarning> {
 /// the summariser wants (`session_id`, `revision`, `timestamp_source`) are
 /// reconstructed rather than persisted, because they describe how the text was
 /// obtained rather than what it says.
+///
+/// Scoped to `meeting_id` as well as the transcript (#336): nothing in the
+/// schema yet ties a segment's own meeting to its transcript's, and every
+/// summary, title and shared document is built from what this returns, so a
+/// row naming another meeting must never be read as this one's words.
 pub(crate) fn load_segments(
     db: &Db,
+    meeting_id: &str,
     transcript_id: &str,
 ) -> Result<Vec<TranscriptSegment>, fotw_store::StoreError> {
     let mut stmt = db.conn().prepare(
-        "SELECT idx, start_ms, end_ms, channel, speaker_label, text, confidence, is_final, words
-           FROM segments WHERE transcript_id = ?1 ORDER BY idx",
+        "SELECT s.idx, s.start_ms, s.end_ms, s.channel, s.speaker_label, s.text, s.confidence,
+                s.is_final, s.words
+           FROM segments s JOIN transcripts t ON t.id = s.transcript_id
+          WHERE s.transcript_id = ?1 AND s.meeting_id = ?2 AND t.meeting_id = ?2
+          ORDER BY s.idx",
     )?;
-    let rows = stmt.query_map([transcript_id], |r| {
+    let rows = stmt.query_map([transcript_id, meeting_id], |r| {
         let channel: String = r.get(3)?;
         let words: Option<Vec<u8>> = r.get(8)?;
         Ok(TranscriptSegment {
