@@ -52,6 +52,7 @@ fn reference(
 
 struct NativeBackend {
     processor: webrtc_audio_processing::Processor,
+    profile: NativeRelearning,
 }
 impl Backend for NativeBackend {
     type Error = ();
@@ -75,7 +76,30 @@ impl Backend for NativeBackend {
             .map_err(|_| ())
     }
     fn reset(&mut self) -> Result<(), ()> {
-        self.processor = native_processor(true);
+        if matches!(
+            self.profile,
+            NativeRelearning::DrainHistory
+                | NativeRelearning::DrainNoiseMasking
+                | NativeRelearning::BoundedDrainNoiseMasking
+        ) {
+            let zero = [0.0; FRAME];
+            let mut discarded = [0.0; FRAME];
+            // Pinned 16 kHz configuration: 100 transfer frames (1s),
+            // 186 delay blocks (744ms), 128ms filter plus 8ms FFT support.
+            // Two seconds exceeds this serial-history bound. The original
+            // three-second control remains separate for comparison.
+            let frames = if matches!(self.profile, NativeRelearning::BoundedDrainNoiseMasking) {
+                200
+            } else {
+                300
+            };
+            for _ in 0..frames {
+                self.analyze_render(&zero)?;
+                self.process_capture(&zero, &mut discarded)?;
+            }
+            return Ok(());
+        }
+        self.processor = native_processor_initial(true, self.profile);
         Ok(())
     }
 }
@@ -96,6 +120,26 @@ fn run_with_reference(
     mic_trace: &[CaptureObservation],
     bandlimited: bool,
     timestamp_recovery: bool,
+) -> (Vec<f32>, serde_json::Value) {
+    run_with_initial(
+        far,
+        mic,
+        render_trace,
+        mic_trace,
+        bandlimited,
+        timestamp_recovery,
+        NativeRelearning::Default,
+    )
+}
+
+fn run_with_initial(
+    far: &[f32],
+    mic: &[f32],
+    render_trace: &[CaptureObservation],
+    mic_trace: &[CaptureObservation],
+    bandlimited: bool,
+    timestamp_recovery: bool,
+    profile: NativeRelearning,
 ) -> (Vec<f32>, serde_json::Value) {
     let reference_config = ReferenceConfig {
         render_rate_hz: RATE as u32,
@@ -128,7 +172,8 @@ fn run_with_reference(
     assert_eq!(render_trace.len(), mic_trace.len());
     let mut adapter = Adapter::new(
         NativeBackend {
-            processor: native_processor(true),
+            processor: native_processor_initial(true, profile),
+            profile,
         },
         AdapterConfig {
             frame_samples: FRAME,
@@ -257,12 +302,15 @@ fn run_with_reference(
 }
 
 pub(super) fn probe() -> serde_json::Value {
-    probe_with_reference(false)
+    probe_with_reference(false, false)
 }
 pub(super) fn bandlimited_probe() -> serde_json::Value {
-    probe_with_reference(true)
+    probe_with_reference(true, false)
 }
-fn probe_with_reference(bandlimited: bool) -> serde_json::Value {
+pub(super) fn relearning_probe() -> serde_json::Value {
+    probe_with_reference(true, true)
+}
+fn probe_with_reference(bandlimited: bool, compare_initial: bool) -> serde_json::Value {
     let mut fixtures = Vec::new();
     for (label, ppm, fault) in [
         ("nominal", 0.0, false),
@@ -285,6 +333,13 @@ fn probe_with_reference(bandlimited: bool) -> serde_json::Value {
         if bandlimited {
             backends.push("native-webrtc-2.1.0-bandlimited-eval");
             backends.push("native-webrtc-2.1.0-recovery-eval");
+            if compare_initial {
+                backends.push("native-webrtc-2.1.0-steady-initial-eval");
+                backends.push("native-webrtc-2.1.0-noise-masking-eval");
+                backends.push("native-webrtc-2.1.0-drain-history-eval");
+                backends.push("native-webrtc-2.1.0-drain-noise-eval");
+                backends.push("native-webrtc-2.1.0-bounded-drain-eval");
+            }
         }
         for backend in backends {
             let mut lag = 0;
@@ -301,6 +356,56 @@ fn probe_with_reference(bandlimited: bool) -> serde_json::Value {
                 let start = Instant::now();
                 let (out, clocks) = if backend == "passthrough" {
                     (mic.clone(), serde_json::Value::Null)
+                } else if backend.ends_with("steady-initial-eval") {
+                    run_with_initial(
+                        render,
+                        &mic,
+                        &r,
+                        &m,
+                        true,
+                        true,
+                        NativeRelearning::SteadyInitial,
+                    )
+                } else if backend.ends_with("noise-masking-eval") {
+                    run_with_initial(
+                        render,
+                        &mic,
+                        &r,
+                        &m,
+                        true,
+                        true,
+                        NativeRelearning::NoiseMasking,
+                    )
+                } else if backend.ends_with("drain-history-eval") {
+                    run_with_initial(
+                        render,
+                        &mic,
+                        &r,
+                        &m,
+                        true,
+                        true,
+                        NativeRelearning::DrainHistory,
+                    )
+                } else if backend.ends_with("drain-noise-eval") {
+                    run_with_initial(
+                        render,
+                        &mic,
+                        &r,
+                        &m,
+                        true,
+                        true,
+                        NativeRelearning::DrainNoiseMasking,
+                    )
+                } else if backend.ends_with("bounded-drain-eval") {
+                    run_with_initial(
+                        render,
+                        &mic,
+                        &r,
+                        &m,
+                        true,
+                        true,
+                        NativeRelearning::BoundedDrainNoiseMasking,
+                    )
                 } else if backend.ends_with("recovery-eval") {
                     run_with_reference(render, &mic, &r, &m, true, true)
                 } else if backend.ends_with("bandlimited-eval") {
@@ -328,12 +433,63 @@ fn probe_with_reference(bandlimited: bool) -> serde_json::Value {
         "candidate_selected_for_app":false,"bandlimited_resampling_qualified":false,"physical_clock_alignment_qualified":false,
         "bandlimited_reference_evaluated":bandlimited,
         "native_reference_diagnostics":if bandlimited {Some(crate::reference_probe::run())}else{None},
-        "native_conservative_parameters":native_profile_description()})
+        "native_conservative_parameters":native_profile_description(),
+        "relearning_comparison":if compare_initial {Some(serde_json::json!({
+            "steady_initial":"initial filter coefficients use refined/coarse steady settings",
+            "noise_masking_emr_scale":CONSERVATIVE_ENR_SCALE,
+            "noise_masking_definition":"echo-to-estimated-noise ratio, not microphone mixture",
+            "history_drain_10ms_frames":[300,200],
+            "history_drain_safety_qualified":false,
+            "physical_acceptance":false
+        }))}else{None}})
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn silent_history_drain_rejects_a_prior_capture_marker() {
+        for profile in [
+            NativeRelearning::DrainHistory,
+            NativeRelearning::BoundedDrainNoiseMasking,
+        ] {
+            let mut backend = NativeBackend {
+                processor: native_processor_initial(true, profile),
+                profile,
+            };
+            let zero = [0.0; FRAME];
+            let marker = [0.5; FRAME];
+            let mut out = [0.0; FRAME];
+            for _ in 0..32 {
+                backend.analyze_render(&zero).unwrap();
+                backend.process_capture(&marker, &mut out).unwrap();
+            }
+            backend.analyze_render(&zero).unwrap();
+            backend.process_capture(&zero, &mut out).unwrap();
+            assert!(
+                out.iter().copied().map(f32::abs).fold(0.0, f32::max) > 0.1,
+                "control must expose unflushed native capture history"
+            );
+            for _ in 0..3 {
+                backend.analyze_render(&zero).unwrap();
+                backend.process_capture(&marker, &mut out).unwrap();
+            }
+            let started = Instant::now();
+            backend.reset().unwrap();
+            let elapsed = started.elapsed();
+            let mut peak = 0.0_f32;
+            for _ in 0..20 {
+                backend.analyze_render(&zero).unwrap();
+                backend.process_capture(&zero, &mut out).unwrap();
+                peak = peak.max(out.iter().copied().map(f32::abs).fold(0.0, f32::max));
+            }
+            eprintln!("native silent drain: elapsed={elapsed:?}, post-reset marker peak={peak}");
+            assert!(
+                peak < 1.0 / 32768.0,
+                "prior capture must not emerge above one original-PCM quantization step: {peak}"
+            );
+        }
+    }
     #[test]
     fn native_worker_compensates_delay_and_drains_a_partial_stop_on_the_original_clock() {
         use fotw_pipeline::aec_worker::{Config, Worker};
@@ -341,6 +497,7 @@ mod tests {
         let mut worker = Worker::new(
             NativeBackend {
                 processor: native_processor(true),
+                profile: NativeRelearning::Default,
             },
             Config {
                 adapter: AdapterConfig {

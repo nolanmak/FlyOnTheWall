@@ -445,3 +445,67 @@ reference frames fall from 404 to 212 and echo-only reduction improves from
 SNR from 5.68 to 3.75 dB (raw: 4.24 dB). Aggregate acceptance remains false.
 Faster clock recovery alone does not solve native filter relearning during
 overlapping speech. This experiment does not enable or select an app backend.
+
+## Relearning ablations (unqualified experiments)
+
+`--relearning-signals` (feature `native-webrtc`) retains all original controls
+and additionally compares steady initial adaptation, altered echo-to-noise
+masking, and 300/200-hop silent native-history drains. Reset output is discarded;
+these drains retain learned filter state instead of recreating the processor.
+All profiles still fail the complete fault-case quality matrix. Original backend
+metrics match the previous retained report exactly. Neither thresholds nor the
+recording path are changed, and no profile is selected for the app.
+
+The steady-initial profile substitutes the ordinary refined/coarse adaptation
+settings for the more aggressive initial settings. The noise-masking profile
+also scales `emr_transparent` by 16. EMR is echo relative to estimated background
+noise; it is not a microphone-mixture or near-speech detector. Both are controls
+for the relearning hypothesis, not recommended configurations. The
+[retained comparison](results/m4-relearning-ablations.json) includes every failed
+profile. The best fault-case SNR is 10.15 dB versus raw 4.24 dB, still below the
+required 6 dB improvement; its overlap gain is -0.54 dB and echo reduction 19.47 dB.
+
+The 200-hop drain is based on the pinned native configuration's finite-buffer
+budget: 100 transfer frames (1 s), 186 delay blocks (744 ms), 128 ms filter support and
+8 ms FFT support. A marker-control test detects an unflushed prior capture and
+then observes zero marker output after each drain (300/200 hops). These measured
+controls do not prove every route, native internal state or arbitrary input is
+safe. Physical acceptance and overall reset safety remain unqualified.
+
+## Optional LocalVQE comparison
+
+Build the trusted public CPU-only runtime at LocalVQE revision
+`7f61cd05095d42e56a135b303f5bb4d761da22b9`, with ggml revision
+`c044a8eeae2591faa0950c8b5e514cbc4bbfc4ca`, using the upstream
+`localvqe_shared` target. Do not build `bench-assets` or `regression-assets`.
+Only use weights whose download was explicitly authorized for this task.
+
+```sh
+cmake -S LOCALVQE_SOURCE/ggml -B LOCAL_BUILD -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DLOCALVQE_BUILD_SHARED=ON \
+  -DLOCALVQE_CUDA=OFF -DLOCALVQE_VULKAN=OFF -DGGML_METAL=OFF \
+  -DGGML_BLAS=OFF -DGGML_OPENMP=OFF
+cmake --build LOCAL_BUILD --target localvqe_shared --parallel 3
+```
+
+```sh
+cargo run --release --locked --manifest-path tools/aec-eval/Cargo.toml \
+  --features local-vqe -- --local-vqe-signals TRUSTED_LIBRARY VERIFIED_MODEL
+```
+
+The evaluator checks the exact model byte count and SHA256 before loading
+native code. Supported public files are v1.2 F32 (5173088 bytes,
+`4856ecf5f522b23fb2bc5caeac81f323c0ef1c4c156a9c7d40a6adbe092ba9ce`)
+and v1.4-AEC F32 (2924224 bytes,
+`b6e43138588a83bfe903ab5e143b4020b91c1e1629f5a575ac5855ff0003c731`).
+Use the [official weights repository](https://huggingface.co/LocalAI-io/LocalVQE)
+at revision `29ca38495cba9d6393a92a4dd890f28dd81f758d`.
+
+It runs three existing generated rooms, each with near-only/echo-only/overlap
+and raw controls, on CPU with two explicit threads and the extra hard noise gate
+disabled. Model loading is included in each case's wall time. v1.2 intrinsically
+also reduces noise/reverb, while v1.4 is echo-only. The synthetic near source is
+band-shaped noise, so denoising it is not proof of damaged real speech.
+Real speech/word retention must be measured separately. This batch probe does
+not establish streaming tail retention, fault recovery, app integration or
+physical acceptance. It never downloads a model or calls a speech provider.

@@ -1,6 +1,8 @@
 //! AEC comparison with generated signals or opt-in approved public speech.
 #[cfg(feature = "native-webrtc")]
 mod clocked;
+#[cfg(feature = "local-vqe")]
+mod local_vqe;
 mod quality;
 #[cfg(feature = "native-webrtc")]
 mod reference_probe;
@@ -161,6 +163,25 @@ fn run_native(far: &[f32], mic: &[f32]) -> Vec<f32> {
 
 #[cfg(feature = "native-webrtc")]
 fn native_processor(conservative: bool) -> webrtc_audio_processing::Processor {
+    native_processor_initial(conservative, NativeRelearning::Default)
+}
+
+#[cfg(feature = "native-webrtc")]
+#[derive(Clone, Copy)]
+enum NativeRelearning {
+    Default,
+    SteadyInitial,
+    NoiseMasking,
+    DrainHistory,
+    DrainNoiseMasking,
+    BoundedDrainNoiseMasking,
+}
+
+#[cfg(feature = "native-webrtc")]
+fn native_processor_initial(
+    conservative: bool,
+    profile: NativeRelearning,
+) -> webrtc_audio_processing::Processor {
     use webrtc_audio_processing::{Config, Processor, config::EchoCanceller};
     let processor = if conservative {
         let mut config = webrtc_audio_processing::experimental::EchoCanceller3Config::default();
@@ -169,6 +190,10 @@ fn native_processor(conservative: bool) -> webrtc_audio_processing::Processor {
         config.filter.coarse.length_blocks = CONSERVATIVE_FILTER_BLOCKS;
         config.filter.refined_initial.length_blocks = CONSERVATIVE_FILTER_BLOCKS;
         config.filter.coarse_initial.length_blocks = CONSERVATIVE_FILTER_BLOCKS;
+        if matches!(profile, NativeRelearning::SteadyInitial) {
+            config.filter.refined_initial = config.filter.refined;
+            config.filter.coarse_initial = config.filter.coarse;
+        }
         let suppressor = &mut config.suppressor;
         for tuning in [
             &mut suppressor.normal_tuning,
@@ -177,6 +202,14 @@ fn native_processor(conservative: bool) -> webrtc_audio_processing::Processor {
             for mask in [&mut tuning.mask_lf, &mut tuning.mask_hf] {
                 mask.enr_transparent *= CONSERVATIVE_ENR_SCALE;
                 mask.enr_suppress *= CONSERVATIVE_ENR_SCALE;
+                if matches!(
+                    profile,
+                    NativeRelearning::NoiseMasking
+                        | NativeRelearning::DrainNoiseMasking
+                        | NativeRelearning::BoundedDrainNoiseMasking
+                ) {
+                    mask.emr_transparent *= CONSERVATIVE_ENR_SCALE;
+                }
             }
         }
         assert!(
@@ -398,6 +431,10 @@ fn native_profile_description() -> Option<serde_json::Value> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if !args.is_empty() {
+        #[cfg(feature = "local-vqe")]
+        if args[0] == "--local-vqe-signals" {
+            return local_vqe::run(&args[1..]);
+        }
         #[cfg(feature = "native-webrtc")]
         if args.len() == 1 && args[0] == "--clocked-signals" {
             println!("{}", clocked::probe());
@@ -406,6 +443,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "native-webrtc")]
         if args.len() == 1 && args[0] == "--bandlimited-signals" {
             println!("{}", clocked::bandlimited_probe());
+            return Ok(());
+        }
+        #[cfg(feature = "native-webrtc")]
+        if args.len() == 1 && args[0] == "--relearning-signals" {
+            println!("{}", clocked::relearning_probe());
             return Ok(());
         }
         if args.len() == 1 && args[0] == "--heldout-signals" {

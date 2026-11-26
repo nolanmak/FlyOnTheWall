@@ -341,6 +341,7 @@ dependencies = [
  "fotw-audio",
  "fotw-pipeline",
  "fotw-stt",
+ "libloading",
  "serde_json",
  "sha2",
  "sonora",
