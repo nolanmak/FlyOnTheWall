@@ -954,9 +954,17 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
             let data_root = data_root_of(&root);
             let mut archived = None;
             let mut persisted_id = None;
-            match open_db(&root) {
+            // The session's capture lease is held until the meeting is saved,
+            // so a daemon's start-up recovery cannot index it first.
+            let library = open_db(&root).map(|mut db| {
+                let saved =
+                    persist::persist_session_linked(&mut db, &outcome, &default_title(), None);
+                (db, saved)
+            });
+            outcome.capture_lease.release();
+            match library {
                 Err(e) => eprintln!("  ! could not open the library: {e}"),
-                Ok(mut db) => match persist::persist_session(&mut db, &outcome, &default_title()) {
+                Ok((mut db, saved)) => match saved {
                     Err(e) => eprintln!("  ! could not add to the library: {e}"),
                     Ok(id) => {
                         println!("  meeting    : {id}");
@@ -991,6 +999,11 @@ async fn record(root: PathBuf, seconds: u64, acknowledged: bool) -> ExitCode {
                         }
                     }
                 },
+            }
+
+            if persisted_id.is_none() {
+                eprintln!("    Recording files remain at {}", outcome.dir.display());
+                return ExitCode::FAILURE;
             }
 
             // Enrichment (#67/#68): title, summary, action items — derived

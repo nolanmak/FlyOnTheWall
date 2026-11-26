@@ -25,7 +25,7 @@ use crate::session::SessionOutcome;
 /// disk. Dropping it here would make the library quietly lossy in exactly the
 /// case where the user most needs to find the recording.
 pub fn persist_session(db: &mut Db, outcome: &SessionOutcome, title: &str) -> StoreResult<String> {
-    persist_session_linked(db, outcome, title, None)
+    persist_linked_meeting(db, outcome, title, None, false)
 }
 
 /// [`persist_session`], named after a calendar event when one matched (#295).
@@ -34,15 +34,19 @@ pub fn persist_session(db: &mut Db, outcome: &SessionOutcome, title: &str) -> St
 /// it was; without one, it takes `fallback_title`, exactly as
 /// [`persist_session`] does.
 ///
+/// A live save refuses an existing capture alias. The session files contain
+/// the incoming recording and transcript and remain available for recovery.
+///
 /// # Errors
-/// As [`persist_session`].
+///
+/// As [`persist_session`], or an existing capture alias.
 pub fn persist_session_linked(
     db: &mut Db,
     outcome: &SessionOutcome,
     fallback_title: &str,
     link: Option<&crate::calendar::CalendarLink>,
 ) -> StoreResult<String> {
-    let id = persist_linked_meeting(db, outcome, fallback_title, link)?;
+    let id = persist_linked_meeting(db, outcome, fallback_title, link, true)?;
     // The invite's names, kept to fix misheard names once the transcript is
     // read (`crate::invitees`). Best-effort: a meeting is never lost to it.
     if let Some(link) = link.filter(|l| !l.invitees.is_empty())
@@ -58,6 +62,7 @@ fn persist_linked_meeting(
     outcome: &SessionOutcome,
     fallback_title: &str,
     link: Option<&crate::calendar::CalendarLink>,
+    live: bool,
 ) -> StoreResult<String> {
     let title = link.map_or(fallback_title, |l| l.title.as_str());
     let linked = |meeting: &mut NewMeeting| {
@@ -103,7 +108,11 @@ fn persist_linked_meeting(
         meeting.started_at_ms = i64::try_from(outcome.started_at_ms).map_err(|_| {
             fotw_store::StoreError::InvalidArgument("capture clock exceeds storage range".into())
         })?;
-        let id = db.finalize_speech_capture(session, meeting, ended, &prepared.sources)?;
+        let id = if live {
+            db.finalize_new_speech_capture(session, meeting, ended, &prepared.sources)?
+        } else {
+            db.finalize_speech_capture(session, meeting, ended, &prepared.sources)?
+        };
         // The SQL commit is already durable. A failed acknowledgement can be
         // retried idempotently; it must never authorize deleting unsaved text.
         for checkpoint in prepared.checkpoints {
@@ -182,7 +191,11 @@ fn persist_linked_meeting(
             .segments
             .first()
             .map(|s| (s.provider.as_str(), s.model.as_str(), rows.as_slice()));
-        return db.finalize_capture(session, m, ended, transcript);
+        return if live {
+            db.finalize_new_capture(session, m, ended, transcript)
+        } else {
+            db.finalize_capture(session, m, ended, transcript)
+        };
     }
     let meeting_id = db.meetings().create(m)?;
 
@@ -567,6 +580,7 @@ fn outcome_shallow(o: &SessionOutcome) -> SessionOutcome {
         mic_buffers: o.mic_buffers,
         dropped_samples: o.dropped_samples,
         segments: Vec::new(),
+        capture_lease: Default::default(),
     }
 }
 
@@ -674,6 +688,7 @@ mod tests {
             mic_buffers: None,
             dropped_samples: 0,
             segments: Vec::new(),
+            capture_lease: Default::default(),
         };
         let id = persist_session(&mut db, &outcome, "Untitled recording — 1754900000").unwrap();
 

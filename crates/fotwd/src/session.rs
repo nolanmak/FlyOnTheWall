@@ -146,6 +146,41 @@ impl Default for FinishDeadlines {
     }
 }
 
+/// A finalized session's capture lease, held until its meeting is saved.
+///
+/// The WAL releases its lease when it is dropped, and the meeting is written
+/// to the library afterwards. In that window the session directory is the only
+/// record of the meeting, and start-up recovery (this daemon's, or another
+/// process's) must not index it while its finisher is alive: the finisher's own
+/// save would then find a meeting already there. Recovery takes this same
+/// lease before it touches a session, so holding it here closes the window.
+/// It covers only this session's directory: the next recording has its own.
+///
+/// [`release`](Self::release) it once the meeting is saved (or the save has
+/// failed for good) and before archiving, which takes the lease itself. Dropping
+/// the outcome releases it too.
+#[derive(Debug, Default)]
+pub struct CaptureLease(std::sync::Mutex<Option<fotw_pipeline::capture_clock::CaptureOwner>>);
+
+impl CaptureLease {
+    /// Hold `owner` until released.
+    #[must_use]
+    pub fn new(owner: Option<fotw_pipeline::capture_clock::CaptureOwner>) -> Self {
+        Self(std::sync::Mutex::new(owner))
+    }
+
+    /// Let recovery and archiving take the session.
+    pub fn release(&self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+
+    /// Whether this outcome still holds its session's lease.
+    #[must_use]
+    pub fn is_held(&self) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+}
+
 /// What a session produced.
 #[derive(Debug, Default)]
 pub struct SessionOutcome {
@@ -187,6 +222,8 @@ pub struct SessionOutcome {
     pub dropped_samples: u64,
     /// Finalized transcript segments.
     pub segments: Vec<TranscriptSegment>,
+    /// Held from finalize until the meeting is saved; see [`CaptureLease`].
+    pub capture_lease: CaptureLease,
 }
 
 impl SessionOutcome {
@@ -2112,6 +2149,7 @@ async fn run_unsupervised(
         dropped_samples,
         abandoned_samples,
         archive_warnings,
+        capture_lease,
     } = match tokio::time::timeout(deadlines.join, pump_counts).await {
         Ok(Ok(counts)) => counts?,
         // The sender went with the thread.
@@ -2244,6 +2282,7 @@ async fn run_unsupervised(
         mic_buffers,
         dropped_samples,
         segments,
+        capture_lease: CaptureLease::new(capture_lease),
         // Drained after the collector has finished, so a failure that arrived
         // during the provider's final flush is still carried out.
         stt_errors: control.errors.drain(),
@@ -2579,6 +2618,7 @@ pub async fn run_supervised(
         dropped_samples,
         abandoned_samples,
         archive_warnings,
+        capture_lease,
     } = match tokio::time::timeout(deadlines.join, pump_counts).await {
         Ok(Ok(counts)) => counts?,
         Ok(Err(_)) => return Err("pump panicked".to_string()),
@@ -2679,6 +2719,7 @@ pub async fn run_supervised(
         mic_buffers,
         dropped_samples,
         segments,
+        capture_lease: CaptureLease::new(capture_lease),
         stt_errors: control.errors.drain(),
     })
 }
@@ -3256,6 +3297,8 @@ struct PumpCounts {
     /// Samples still in the rings when the drain deadline expired, and zero
     /// on every clean stop (#85).
     abandoned_samples: u64,
+    /// The finalized session's capture lease, handed on to the finisher.
+    capture_lease: Option<fotw_pipeline::capture_clock::CaptureOwner>,
 }
 
 /// Drain both rings until stopped, writing raw audio and feeding the provider.
@@ -3768,7 +3811,10 @@ fn pump_drain(
     // Finalize stamps `ended_at_ms`. Without it every cleanly-ended meeting
     // looks crashed and reappears in the recovery list forever, which trains
     // the user to ignore the one prompt that matters.
-    wal.finalize()
+    // The lease stays held past finalize, until the finisher has written the
+    // meeting to the library: see `CaptureLease`.
+    let (_, capture_lease) = wal
+        .finalize_keeping_lease()
         .map_err(|e| format!("finalize failed: {e}"))?;
     // Read after the drain, so this is the final count rather than a snapshot
     // taken while the taps were still delivering. Both legs are summed: the
@@ -3797,6 +3843,7 @@ fn pump_drain(
                 s.system.retired_drops + s.mic.as_ref().map_or(0, |m| m.retired_drops)
             }),
         abandoned_samples: abandoned,
+        capture_lease: Some(capture_lease),
     })
 }
 

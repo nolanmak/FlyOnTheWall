@@ -68,6 +68,23 @@ impl Db {
         Ok(id)
     }
 
+    /// Save a live capture only if no meeting is already linked to it.
+    pub fn finalize_new_capture(
+        &mut self,
+        session: &str,
+        meeting: crate::NewMeeting,
+        ended_at_ms: i64,
+        transcript: Option<(&str, &str, &[crate::NewSegment])>,
+    ) -> Result<String> {
+        let tx = self
+            .conn_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_unlinked(&tx, session)?;
+        let id = finalize_in_transaction(&tx, session, meeting, ended_at_ms, transcript)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
     /// Atomically attach a session's notes to its saved meeting, preserving revisions.
     pub fn promote_session_note(
         &mut self,
@@ -371,6 +388,15 @@ pub(crate) fn deleted_capture_sessions(
         }
     }
     Ok(sessions)
+}
+
+pub(crate) fn ensure_unlinked(conn: &rusqlite::Connection, session: &str) -> Result<()> {
+    if read_link(conn, session)?.is_some() {
+        return Err(invalid(
+            "capture already has a saved meeting; session files retained",
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_capture_not_deleted(conn: &rusqlite::Connection, session: &str) -> Result<()> {

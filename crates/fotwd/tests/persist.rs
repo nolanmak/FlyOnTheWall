@@ -73,6 +73,7 @@ fn outcome(dir: &std::path::Path, segments: Vec<TranscriptSegment>) -> SessionOu
         dropped_samples: 0,
         segments,
         stt_errors: Vec::new(),
+        capture_lease: Default::default(),
     }
 }
 

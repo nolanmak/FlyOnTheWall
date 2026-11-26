@@ -959,12 +959,22 @@ fn persist_and_promote(root: &Path, outcome: &SessionOutcome, ready: &ReadyTap) 
         crate::persist::persist_session_linked(db, outcome, &title, link.as_ref())
     };
 
-    match crate::open_library(root) {
+    // The session's capture lease is held until here (see
+    // `session::CaptureLease`): start-up recovery cannot index this meeting
+    // while it is being saved. Released once the save has returned, because
+    // archiving takes the lease itself, and a failed save is left to recovery.
+    let library = crate::open_library(root);
+    let saved = library.map(|mut db| {
+        let saved = persist(&mut db);
+        (db, saved)
+    });
+    outcome.capture_lease.release();
+    match saved {
         Err(e) => {
             diag!("  ! could not open the library: {e}");
             None
         }
-        Ok(mut db) => match persist(&mut db) {
+        Ok((mut db, saved)) => match saved {
             Err(e) => {
                 diag!("  ! could not add to the library: {e}");
                 None

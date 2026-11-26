@@ -1011,3 +1011,30 @@ async fn shutdown_before_start_refuses_configuration_audit_and_capture() {
     assert_eq!(opened.load(Ordering::SeqCst), 0);
     assert!(!root.join("audit.jsonl").exists());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_leaves_a_session_alone_while_its_live_finisher_is_saving() {
+    use fotw_pipeline::capture_clock::CaptureOwner;
+    let root = tmpdir("lease-while-saving");
+    let sessions = root.join("sessions");
+    let gate = Arc::new(Gate::default());
+    let rec = gated_recorder(&sessions, gate.clone());
+    rec.start().unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    rec.stop().unwrap();
+    if !until(|| gate.reached()).await {
+        gate.open();
+        panic!("finisher did not reach the gate");
+    }
+    let dir = std::fs::read_dir(&sessions)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let during = CaptureOwner::recover(&dir);
+    gate.open();
+    assert_eq!(during.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    assert!(until(|| CaptureOwner::recover(&dir).is_ok()).await);
+    std::fs::remove_dir_all(root).unwrap();
+}
