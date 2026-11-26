@@ -463,13 +463,58 @@ fn applying_a_sweep_unlinks_the_audio_marks_the_rows_and_leaves_the_transcript_a
 }
 
 #[test]
+fn a_retention_preview_leaves_the_library_byte_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut db = db_at(root);
+    let id = seeded_meeting(
+        &mut db,
+        root,
+        "Checklist review",
+        NOW - MS_PER_DAY,
+        32,
+        true,
+    );
+    transcript_ready_at(&mut db, &id, NOW - MS_PER_DAY);
+    let stale = (NOW + MS_PER_DAY) as i64;
+    db.set_purge_after(&id, Some(stale)).unwrap();
+    let rows = db.audio_inventory().unwrap();
+    let paths: Vec<_> = rows[0]
+        .audio
+        .iter()
+        .map(|a| root.join(&a.rel_path))
+        .collect();
+    assert_eq!(paths.len(), 2);
+    let media_before: Vec<_> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+
+    // Keep the connection open so the snapshot covers only the sweep.
+    let database_bytes =
+        || ["db.sqlite3", "db.sqlite3-wal"].map(|name| std::fs::read(root.join(name)).unwrap());
+    let before = database_bytes();
+
+    let report = retention::sweep(&mut db, root, NOW, SweepMode::DryRun).unwrap();
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.files_removed, 0);
+    let after_deadline = db.audio_inventory().unwrap()[0].purge_after_ms;
+
+    let media_after: Vec<_> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    assert_eq!(media_before, media_after);
+    let unchanged = database_bytes() == before;
+    assert!(
+        unchanged && after_deadline == Some(stale),
+        "preview changed database bytes: {}; purge deadline before: {stale}, after: {after_deadline:?}",
+        !unchanged
+    );
+}
+
+#[test]
 fn a_sweep_refreshes_the_purge_deadline_so_the_library_can_say_when_audio_goes() {
     let root = tmpdir("deadline");
     let mut db = db_at(&root);
     let id = seeded_meeting(&mut db, &root, "young", NOW - MS_PER_DAY, MIB, true);
     transcript_ready_at(&mut db, &id, NOW - MS_PER_DAY);
 
-    retention::sweep(&mut db, &root, NOW, SweepMode::DryRun).unwrap();
+    retention::sweep(&mut db, &root, NOW, SweepMode::Apply).unwrap();
     let deadline = db.audio_inventory().unwrap()[0].purge_after_ms.unwrap();
     assert_eq!(deadline as u64, NOW - MS_PER_DAY + 30 * MS_PER_DAY);
 
@@ -477,7 +522,7 @@ fn a_sweep_refreshes_the_purge_deadline_so_the_library_can_say_when_audio_goes()
     // lie about the one setting the user chose specifically to be told the
     // truth about.
     db.set_retain_audio(&id, "forever", None).unwrap();
-    retention::sweep(&mut db, &root, NOW, SweepMode::DryRun).unwrap();
+    retention::sweep(&mut db, &root, NOW, SweepMode::Apply).unwrap();
     assert_eq!(db.audio_inventory().unwrap()[0].purge_after_ms, None);
 }
 
