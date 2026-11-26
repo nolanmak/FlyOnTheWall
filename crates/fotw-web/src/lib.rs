@@ -78,6 +78,7 @@ pub mod ingress;
 pub mod notes;
 pub mod query;
 pub mod recorder;
+pub mod release;
 pub mod secret;
 pub mod server;
 pub mod source;
