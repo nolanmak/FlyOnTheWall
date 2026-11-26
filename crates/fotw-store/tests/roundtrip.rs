@@ -1073,6 +1073,263 @@ fn a_resumed_export_only_rewrites_what_is_missing_or_stale() {
 }
 
 #[test]
+fn step3_archive_resume_repairs_missing_markdown_and_stale_summary_history() {
+    let (f, db) = fixture();
+    db.export_library(&f.archive, &ArchiveOptions::default(), &mut |_| {})
+        .unwrap();
+
+    let json = f.archive.join("meetings/mtg-1.json");
+    let markdown = f.archive.join("markdown/mtg-1.md");
+    let original_markdown = std::fs::read(&markdown).unwrap();
+    std::fs::remove_file(&markdown).unwrap();
+    let opts = ArchiveOptions {
+        resume: true,
+        ..ArchiveOptions::default()
+    };
+    let report = db.export_library(&f.archive, &opts, &mut |_| {}).unwrap();
+    assert_eq!(report.written, 1, "a missing Markdown file was skipped");
+    assert_eq!(report.skipped, 2);
+    assert_eq!(std::fs::read(&markdown).unwrap(), original_markdown);
+
+    // A change confined to old summary history invalidates the pair even
+    // though the Markdown projection is identical.
+    db.conn()
+        .execute(
+            "UPDATE summaries SET body_md = 'Revised history' WHERE id = 'sum-1'",
+            [],
+        )
+        .unwrap();
+    let report = db.export_library(&f.archive, &opts, &mut |_| {}).unwrap();
+    assert_eq!(report.written, 1, "stale summary history was skipped");
+    let doc = db.export_meeting("mtg-1").unwrap();
+    assert_eq!(
+        std::fs::read(json).unwrap(),
+        doc.to_json_pretty().as_bytes()
+    );
+    assert_eq!(std::fs::read(markdown).unwrap(), original_markdown);
+}
+
+#[test]
+fn step3_archive_retains_one_snapshot_during_a_concurrent_summary_edit() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+    let (f, reader) = fixture();
+    // The hook fires on the first summary query, so export mtg-1 first.
+    reader
+        .conn()
+        .execute(
+            "UPDATE meetings SET started_at_ms = -2208988800000 WHERE id = 'mtg-1'",
+            [],
+        )
+        .unwrap();
+    let before = reader.export_meeting("mtg-1").unwrap();
+    let writer = open_at(&f.root.join("db.sqlite3"));
+    let mut wrote = false;
+    // Preparing the summary query happens after reading the meeting row.
+    reader
+        .conn()
+        .authorizer(Some(move |context: AuthContext<'_>| {
+            if !wrote
+                && matches!(
+                    context.action,
+                    AuthAction::Read {
+                        table_name: "summaries",
+                        ..
+                    }
+                )
+            {
+                wrote = writer
+                    .conn()
+                    .execute_batch(
+                        "BEGIN IMMEDIATE;
+                     UPDATE meetings SET title = 'Edited mid-export' WHERE id = 'mtg-1';
+                     UPDATE summaries SET body_md = 'Committed mid-export' WHERE id = 'sum-3';
+                     COMMIT;",
+                    )
+                    .is_ok();
+            }
+            Authorization::Allow
+        }))
+        .unwrap();
+
+    reader
+        .export_library(&f.archive, &ArchiveOptions::default(), &mut |_| {})
+        .unwrap();
+    reader
+        .conn()
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .unwrap();
+    let after = reader.export_meeting("mtg-1").unwrap();
+    assert_eq!(after.meeting.title, "Edited mid-export");
+    assert_eq!(
+        after.summaries.last().unwrap().body_md,
+        "Committed mid-export"
+    );
+    let json = std::fs::read(f.archive.join("meetings/mtg-1.json")).unwrap();
+    let markdown = std::fs::read(f.archive.join("markdown/mtg-1.md")).unwrap();
+    assert!(
+        json == before.to_json_pretty().as_bytes(),
+        "JSON included the mid-export edit"
+    );
+    assert!(
+        markdown == before.to_markdown().as_bytes(),
+        "Markdown included the mid-export edit"
+    );
+}
+
+#[test]
+fn step3_archive_publishes_the_manifest_only_after_templates_copy() {
+    let (f, db) = fixture();
+    let templates = f.root.join("templates");
+    let template = templates.join("fixture.md");
+    std::fs::create_dir_all(&template).unwrap();
+    let mut opts = ArchiveOptions {
+        templates_dir: Some(templates),
+        ..Default::default()
+    };
+    let manifest = f.archive.join("library.json");
+
+    assert!(db.export_library(&f.archive, &opts, &mut |_| {}).is_err());
+    assert!(
+        !manifest.exists(),
+        "a failed first export published a manifest"
+    );
+
+    std::fs::remove_dir(&template).unwrap();
+    std::fs::write(&template, "fixture template").unwrap();
+    opts.resume = true;
+    let report = db.export_library(&f.archive, &opts, &mut |_| {}).unwrap();
+    assert_eq!(report.skipped, 3);
+    let original_manifest = std::fs::read(&manifest).unwrap();
+    assert_eq!(
+        std::fs::read(f.archive.join("templates/fixture.md")).unwrap(),
+        b"fixture template"
+    );
+
+    std::fs::remove_file(&template).unwrap();
+    std::fs::create_dir(&template).unwrap();
+    db.conn()
+        .execute(
+            "UPDATE settings SET value = 'false' WHERE key = 'theme'",
+            [],
+        )
+        .unwrap();
+    assert!(db.export_library(&f.archive, &opts, &mut |_| {}).is_err());
+    assert_eq!(std::fs::read(manifest).unwrap(), original_manifest);
+}
+
+#[test]
+fn step3_archive_resumes_an_interrupted_first_readme_write() {
+    let (f, db) = fixture();
+    let options = ArchiveOptions {
+        resume: true,
+        ..ArchiveOptions::default()
+    };
+    let warning = fotw_store::PLAINTEXT_WARNING.as_bytes();
+    for (index, bytes) in [&warning[..0], &warning[..24], warning]
+        .into_iter()
+        .enumerate()
+    {
+        let dest = f.archive.join(index.to_string());
+        std::fs::create_dir_all(&dest).unwrap();
+        let tmp = dest.join(".flyonthewall-archive-readme.tmp");
+        std::fs::write(&tmp, bytes).unwrap();
+
+        let report = db.export_library(&dest, &options, &mut |_| {}).unwrap();
+        assert_eq!(report.written, 3);
+        assert_eq!(std::fs::read(dest.join("README.txt")).unwrap(), warning);
+        assert!(dest.join("library.json").is_file());
+        assert!(!tmp.exists());
+    }
+}
+
+#[test]
+fn step3_archive_refuses_a_readme_temporary_file_in_an_unrelated_directory() {
+    let (f, db) = fixture();
+    std::fs::create_dir_all(&f.archive).unwrap();
+    let tmp = f.archive.join(".flyonthewall-archive-readme.tmp");
+    let unrelated = f.archive.join("unrelated.txt");
+    let options = ArchiveOptions {
+        resume: true,
+        ..ArchiveOptions::default()
+    };
+
+    std::fs::write(&tmp, "unrelated text").unwrap();
+    assert!(
+        db.export_library(&f.archive, &options, &mut |_| {})
+            .is_err()
+    );
+    std::fs::write(&tmp, fotw_store::PLAINTEXT_WARNING).unwrap();
+    std::fs::write(&unrelated, "keep me").unwrap();
+    assert!(
+        db.export_library(&f.archive, &options, &mut |_| {})
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&unrelated).unwrap(), b"keep me");
+    assert!(!f.archive.join("README.txt").exists());
+}
+
+#[test]
+fn step3_archive_rejects_a_non_directory_template_source_before_publication() {
+    let (f, db) = fixture();
+    let source = f.root.join("templates");
+    std::fs::write(&source, "a file in place of the template directory").unwrap();
+    let mut options = ArchiveOptions {
+        templates_dir: Some(source.clone()),
+        ..ArchiveOptions::default()
+    };
+    let manifest = f.archive.join("library.json");
+
+    assert!(
+        db.export_library(&f.archive, &options, &mut |_| {})
+            .is_err()
+    );
+    assert!(!manifest.exists());
+
+    // An uninstalled optional template directory still permits an export.
+    std::fs::remove_file(&source).unwrap();
+    options.resume = true;
+    db.export_library(&f.archive, &options, &mut |_| {})
+        .unwrap();
+    assert!(manifest.is_file());
+}
+
+#[test]
+fn step3_archive_round_trip_preserves_rendered_bytes() {
+    let (f, db) = fixture();
+    let opts = ArchiveOptions::default();
+    db.export_library(&f.archive, &opts, &mut |_| {}).unwrap();
+    let mut restored = open_at(&f.fresh.join("db.sqlite3"));
+    restored.import_library(&f.archive).unwrap();
+    let reexport = f.fresh.join("archive");
+    restored
+        .export_library(&reexport, &opts, &mut |_| {})
+        .unwrap();
+
+    let stable_manifest = |root: &Path| {
+        let manifest = std::fs::read_to_string(root.join("library.json")).unwrap();
+        manifest
+            .split_inclusive('\n')
+            .filter(|line| !line.starts_with("  \"exported_at_ms\": "))
+            .collect::<String>()
+    };
+    assert_eq!(stable_manifest(&f.archive), stable_manifest(&reexport));
+    assert_eq!(
+        std::fs::read(f.archive.join("README.txt")).unwrap(),
+        std::fs::read(reexport.join("README.txt")).unwrap()
+    );
+    for id in ["mtg-1", "mtg-2", "mtg-3"] {
+        for path in [format!("meetings/{id}.json"), format!("markdown/{id}.md")] {
+            assert_eq!(
+                std::fs::read(f.archive.join(&path)).unwrap(),
+                std::fs::read(reexport.join(&path)).unwrap(),
+                "{path}"
+            );
+        }
+    }
+}
+
+#[test]
 fn audio_is_opt_in_and_its_size_is_knowable_first() {
     let (f, db) = fixture();
     // The media file the `complete` recording points at.

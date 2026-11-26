@@ -69,7 +69,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{ErrorCode, Transaction};
+use rusqlite::{ErrorCode, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 use crate::db::Db;
@@ -89,6 +89,8 @@ const RELEASE_PREFIX: &str = "release_";
 
 /// The versioned document kind for a whole library.
 pub const LIBRARY_SCHEMA: &str = "flyonthewall/library@1";
+
+const README_TMP_FILE: &str = ".flyonthewall-archive-readme.tmp";
 
 /// What the archive root's README says. Written verbatim so the warning cannot
 /// drift away from the one the CLI prints.
@@ -133,8 +135,7 @@ pub struct ArchiveOptions {
     /// files outside the database, so an archive without them is not a
     /// complete backup.
     pub templates_dir: Option<PathBuf>,
-    /// Skip meeting files that are already present and readable, so an
-    /// interrupted export can be finished rather than restarted.
+    /// Skip a meeting when both files match its current rendering.
     pub resume: bool,
 }
 
@@ -303,6 +304,11 @@ impl Db {
     /// Streams: one meeting is loaded, rendered and written before the next is
     /// read, so peak memory is bounded by the largest single meeting rather
     /// than by the library.
+    /// Each meeting is read in one SQLite snapshot. The manifest is published
+    /// after the meeting files and ancillary copies are written. A failed
+    /// export can leave files from different runs together, even when an
+    /// earlier manifest is present. The archive is incomplete until export
+    /// succeeds.
     ///
     /// # Errors
     ///
@@ -315,7 +321,12 @@ impl Db {
         opts: &ArchiveOptions,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<ArchiveReport> {
-        prepare_destination(dest)?;
+        prepare_destination(dest, opts.resume)?;
+        write_atomic_with_tmp(
+            &dest.join("README.txt"),
+            &dest.join(README_TMP_FILE),
+            PLAINTEXT_WARNING.as_bytes(),
+        )?;
         let meetings_dir = dest.join("meetings");
         let markdown_dir = dest.join("markdown");
         create_dir(&meetings_dir)?;
@@ -334,16 +345,31 @@ impl Db {
         };
 
         for (i, id) in ids.iter().enumerate() {
+            let doc = {
+                let conn = self.conn();
+                // A caller's existing transaction already provides a snapshot.
+                let snapshot = conn
+                    .is_autocommit()
+                    .then(|| Transaction::new_unchecked(conn, TransactionBehavior::Deferred))
+                    .transpose()?;
+                let doc = self.export_meeting(id)?;
+                if let Some(snapshot) = snapshot {
+                    snapshot.commit()?;
+                }
+                doc
+            };
+            let json = doc.to_json_pretty();
+            let markdown = doc.to_markdown();
             let json_path = meetings_dir.join(format!("{id}.json"));
-            if opts.resume && is_intact_meeting_file(&json_path, id) {
+            let markdown_path = markdown_dir.join(format!("{id}.md"));
+            if opts.resume
+                && matches_rendering(&json_path, json.as_bytes())
+                && matches_rendering(&markdown_path, markdown.as_bytes())
+            {
                 report.skipped += 1;
             } else {
-                let doc = self.export_meeting(id)?;
-                write_atomic(&json_path, doc.to_json_pretty().as_bytes())?;
-                write_atomic(
-                    &markdown_dir.join(format!("{id}.md")),
-                    doc.to_markdown().as_bytes(),
-                )?;
+                write_atomic(&json_path, json.as_bytes())?;
+                write_atomic(&markdown_path, markdown.as_bytes())?;
                 report.written += 1;
             }
             progress(Progress {
@@ -377,16 +403,14 @@ impl Db {
         };
         let text = serde_json::to_string_pretty(&manifest)
             .map_err(|e| StoreError::InvalidArgument(format!("cannot serialize manifest: {e}")))?;
-        write_atomic(&dest.join("library.json"), text.as_bytes())?;
-        write_atomic(&dest.join("README.txt"), PLAINTEXT_WARNING.as_bytes())?;
-
         if let Some(src) = &opts.templates_dir {
-            copy_markdown_dir(src, &dest.join("templates"))?;
+            copy_markdown_dir(src, &dest.join("templates"), false)?;
         }
         if let Some(root) = &opts.data_root {
             self.copy_media_out(root, dest, opts.include_audio, &mut report)?;
         }
 
+        write_atomic(&dest.join("library.json"), text.as_bytes())?;
         Ok(report)
     }
 
@@ -530,7 +554,7 @@ impl Db {
         tx.commit()?;
 
         if let Some(dir) = templates_dir {
-            report.templates_restored = copy_markdown_dir(&src.join("templates"), dir)?;
+            report.templates_restored = copy_markdown_dir(&src.join("templates"), dir, true)?;
         }
         if let Some(root) = data_root {
             report.media_restored = copy_tree(&src.join("media"), &root.join("media"))?;
@@ -790,7 +814,7 @@ fn read_by_pk<T: TableRow>(tx: &Transaction<'_>, row: &T) -> Result<Option<T>> {
 // ---------------------------------------------------------------- filesystem
 
 /// Refuse a destination that holds something that is not one of our archives.
-fn prepare_destination(dest: &Path) -> Result<()> {
+fn prepare_destination(dest: &Path, resume: bool) -> Result<()> {
     if !dest.exists() {
         return create_dir(dest);
     }
@@ -801,13 +825,28 @@ fn prepare_destination(dest: &Path) -> Result<()> {
         )));
     }
     let mut entries = std::fs::read_dir(dest)
-        .map_err(|e| StoreError::io("reading the export destination", dest, e))?
-        .flatten()
-        .peekable();
-    if entries.peek().is_none() {
+        .map_err(|e| StoreError::io("reading the export destination", dest, e))?;
+    let Some(first) = entries.next() else {
+        return Ok(());
+    };
+    if dest.join("library.json").is_file() {
         return Ok(());
     }
-    if dest.join("library.json").is_file() {
+    // An interrupted first export has the archive README but no manifest yet.
+    let readme = dest.join("README.txt");
+    if resume && readme.is_file() && matches_rendering(&readme, PLAINTEXT_WARNING.as_bytes()) {
+        return Ok(());
+    }
+    // Before the first README rename, its temporary file is the only entry.
+    // An interrupted write can leave any prefix of the warning, including empty.
+    if resume
+        && let Ok(entry) = first
+        && entry.file_name() == README_TMP_FILE
+        && entries.next().is_none()
+        && entry.file_type().is_ok_and(|kind| kind.is_file())
+        && std::fs::read(entry.path())
+            .is_ok_and(|bytes| PLAINTEXT_WARNING.as_bytes().starts_with(&bytes))
+    {
         return Ok(());
     }
     Err(StoreError::InvalidArgument(format!(
@@ -817,16 +856,8 @@ fn prepare_destination(dest: &Path) -> Result<()> {
     )))
 }
 
-/// True when the file is a readable `meeting@1` document for `id`.
-///
-/// Checked by parsing rather than by existence: an export killed mid-write
-/// leaves a file that exists and is half a document, and "resume" that trusts
-/// the filename produces an archive that fails to import much later.
-fn is_intact_meeting_file(path: &Path, id: &str) -> bool {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    MeetingDoc::from_json(&text).is_ok_and(|d| d.meeting.id == id)
+fn matches_rendering(path: &Path, rendered: &[u8]) -> bool {
+    std::fs::read(path).is_ok_and(|bytes| bytes == rendered)
 }
 
 fn create_dir(path: &Path) -> Result<()> {
@@ -834,24 +865,31 @@ fn create_dir(path: &Path) -> Result<()> {
 }
 
 /// Write via a temporary file and a rename (EXP-04's "atomic writes").
-///
-/// A partially written meeting document that still carries yesterday's name is
-/// the worst possible artifact: it looks complete to `resume` and to a human
-/// listing the directory, and fails only at import.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).map_err(|e| StoreError::io("writing an archive file", &tmp, e))?;
-    std::fs::rename(&tmp, path).map_err(|e| StoreError::io("renaming an archive file", path, e))
+    write_atomic_with_tmp(path, &path.with_extension("tmp"), bytes)
+}
+
+fn write_atomic_with_tmp(path: &Path, tmp: &Path, bytes: &[u8]) -> Result<()> {
+    std::fs::write(tmp, bytes).map_err(|e| StoreError::io("writing an archive file", tmp, e))?;
+    std::fs::rename(tmp, path).map_err(|e| StoreError::io("renaming an archive file", path, e))
 }
 
 /// Copy every `*.md` from one directory to another, returning how many.
-fn copy_markdown_dir(src: &Path, dest: &Path) -> Result<usize> {
-    let Ok(entries) = std::fs::read_dir(src) else {
-        return Ok(0);
+/// Import preserves its historical best-effort directory discovery.
+fn copy_markdown_dir(src: &Path, dest: &Path, allow_read_errors: bool) -> Result<usize> {
+    let entries = match std::fs::read_dir(src) {
+        Ok(entries) => entries,
+        Err(e) if allow_read_errors || e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(StoreError::io("reading the template directory", src, e)),
     };
     create_dir(dest)?;
     let mut n = 0;
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) if allow_read_errors => continue,
+            Err(e) => return Err(StoreError::io("reading the template directory", src, e)),
+        };
         let path = entry.path();
         if path.extension().is_some_and(|e| e == "md") {
             let to = dest.join(path.file_name().unwrap_or_default());
