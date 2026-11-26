@@ -38,14 +38,19 @@ impl EnginePreparer {
 }
 
 /// Engine kind plus model name (D11): the unit the auto unlock counts in.
+///
+/// Only the API engine is told a model. The CLI engines run whatever model
+/// the CLI defaults to, which this process cannot see, so their id says
+/// `default` rather than naming a model that may not have run.
 fn engine_id_for(engine: &Engine) -> String {
-    let kind = match engine {
-        Engine::Anthropic { .. } => "anthropic-api",
-        Engine::ClaudeCli { .. } => "claude-cli",
-        Engine::Codex { .. } => "codex-cli",
-    };
-    let model = Preset::Balanced.prose_model().unwrap_or("default");
-    format!("{kind}:{model}")
+    match engine {
+        Engine::Anthropic { .. } => format!(
+            "anthropic-api:{}",
+            Preset::Balanced.prose_model().unwrap_or("default")
+        ),
+        Engine::ClaudeCli { .. } => "claude-cli:default".to_owned(),
+        Engine::Codex { .. } => "codex-cli:default".to_owned(),
+    }
 }
 
 impl Preparer for EnginePreparer {

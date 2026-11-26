@@ -52,12 +52,15 @@
     send_outcome_unknown: 'may already have been sent; check before resending',
     by_user: 'dropped by you',
   };
+  // What each worker pause stops (#326 D10): gws only sending, the engine
+  // only preparing, unreadable settings everything.
   const PAUSES = {
-    gws_unavailable: 'gws could not be started',
-    settings_unreadable: 'the saved release settings could not be read',
+    gws_unavailable: 'Sending is paused: gws could not be started or the sender is not verified.',
+    engine_unavailable: 'Preparing is paused: no summary engine is available under the current summary policy.',
+    settings_unreadable: 'Release is paused: the saved release settings could not be read. Save complete settings to resume.',
   };
   const reasonText = code => REASONS[code] || String(code);
-  const pauseText = code => 'Sending is paused: ' + (PAUSES[code] || String(code)) + '.';
+  const pauseText = code => PAUSES[code] || ('Release is paused: ' + String(code) + '.');
   const two = n => String(n).padStart(2, '0');
   const clock = ms => { const d = new Date(ms); return two(d.getHours()) + ':' + two(d.getMinutes()); };
   const stamp = ms => {
