@@ -526,6 +526,9 @@ async fn serve_until_stopped(
                 .map_or_else(|| "io".to_owned(), |n| format!("os_{n}"))
         );
     }
+    // The worker itself needs the release preparer (#329/#330); until that
+    // is wired in, release stays absent and nothing is started.
+    let _release = start_release(&root, None);
 
     // The GitHub export target (issue #63). Its own library connection, as
     // the sweeper has one, so a push never holds the UI's mutex through a
@@ -862,6 +865,79 @@ async fn serve_until_stopped(
     } else {
         server.serve().await.map_err(|e| format!("server: {e}"))
     }
+}
+
+/// Start attendee release (#326, #331) for the library at `root`: the
+/// prepare loop (every 60 s) and the send loop (every 15 s), on their own
+/// threads and their own library connection, and the control the web layer
+/// serves. Rows left in `sending` by a previous daemon go to review first.
+///
+/// Nothing starts without a `preparer` (cut, summary, render and review,
+/// #329/#330): release is then simply absent, and `None` is returned.
+/// Non-fatal like every other control here; codes only in the log (D15).
+#[must_use]
+pub fn start_release(
+    root: &Path,
+    preparer: Option<Arc<dyn crate::release::types::Preparer>>,
+) -> Option<Arc<dyn fotw_web::release::ReleaseControl>> {
+    use crate::release::worker::{
+        Clock, Deps, PREPARE_INTERVAL, ResolvedEnginePolicy, SEND_INTERVAL, Worker,
+    };
+    let preparer = preparer?;
+    let db = match crate::open_library(root) {
+        Ok(db) => Arc::new(std::sync::Mutex::new(db)),
+        Err(_) => {
+            diag!("  ! release: not started (library_unavailable)");
+            return None;
+        }
+    };
+    let clock: Clock = Arc::new(fotw_store::now_ms);
+    let runner: Arc<dyn crate::release::MailRunner> =
+        Arc::new(crate::release::SystemGws::default());
+    let policy: Arc<dyn crate::release::worker::PolicyCheck> = Arc::new(ResolvedEnginePolicy);
+    let calendar_root = root.to_owned();
+    let worker = Arc::new(Worker::new(Deps {
+        db: Arc::clone(&db),
+        library: root.parent().unwrap_or(root).to_owned(),
+        preparer: Arc::clone(&preparer),
+        runner: Arc::clone(&runner),
+        calendar: Arc::new(move || crate::calendar::for_library_root(&calendar_root)),
+        policy: Arc::clone(&policy),
+        clock: Arc::clone(&clock),
+    }));
+    worker.recover();
+    let control =
+        crate::release::control::Control::new(db, runner, policy, preparer, clock, worker.pauses());
+
+    let preparing = Arc::clone(&worker);
+    let prepare = std::thread::Builder::new()
+        .name("fotw-release-prepare".into())
+        .spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                diag!("  ! release: prepare loop not started (runtime_failed)");
+                return;
+            };
+            loop {
+                runtime.block_on(preparing.prepare_pass());
+                std::thread::sleep(PREPARE_INTERVAL);
+            }
+        });
+    let sending = Arc::clone(&worker);
+    let send = std::thread::Builder::new()
+        .name("fotw-release-send".into())
+        .spawn(move || {
+            loop {
+                sending.send_tick();
+                std::thread::sleep(SEND_INTERVAL);
+            }
+        });
+    if prepare.is_err() || send.is_err() {
+        diag!("  ! release: worker threads not started (spawn_failed)");
+    }
+    Some(Arc::new(control))
 }
 
 /// Start the auto-push worker on its own thread.
