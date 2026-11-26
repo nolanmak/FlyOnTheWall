@@ -244,3 +244,25 @@ test('fixing recent names shows how many meetings changed', async () => {
   assert.deepEqual(w.requests.at(-1).body, { action: 'fix_recent_names' });
   assert.equal(w.byId('calendar-status').textContent, 'Fixed names in 2 meetings.');
 });
+
+test('an unreadable invitee-name choice can be repaired by saving Off directly', async () => {
+  const w = rig();
+  w.respond(() => status({
+    invitee_names: false,
+    invitee_names_needs_repair: true,
+    error: 'Could not read the saved invitee-name setting.',
+  }));
+  w.mount();
+  await flush();
+  assert.equal(w.byId('calendar-invitee-names').checked, false);
+  const saveOff = w.byId('calendar-invitee-save-off');
+  assert.ok(saveOff && !saveOff.hidden, 'the repair action is available while Off');
+  w.respond(() => status({ invitee_names: false }));
+  await saveOff.click();
+  assert.deepEqual(w.requests.filter(r => r.body).map(r => r.body), [
+    { action: 'set_invitee_names', enabled: false },
+  ]);
+  assert.equal(w.byId('calendar-invitee-names').checked, false);
+  assert.equal(saveOff.hidden, true);
+  assert.equal(w.byId('calendar-status').textContent, '');
+});

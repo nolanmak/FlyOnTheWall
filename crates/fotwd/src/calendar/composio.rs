@@ -1060,6 +1060,7 @@ fn apple_access() -> String {
 impl CalendarControl for CalendarSettingsControl {
     fn read(&self) -> CalendarSettingsResponse {
         let settings = ComposioSettings::read(&self.lock());
+        let invitee_names = crate::invitees::enabled(&self.lock());
         CalendarSettingsResponse {
             apple_access: apple_access(),
             composio_key_saved: self
@@ -1068,10 +1069,11 @@ impl CalendarControl for CalendarSettingsControl {
                 .unwrap_or(false),
             composio_acknowledged: settings.acknowledged_egress,
             google_accounts: settings.accounts,
-            invitee_names: crate::invitees::enabled(&self.lock()),
+            invitee_names: matches!(invitee_names, Ok(None | Some(true))),
+            invitee_names_needs_repair: invitee_names.is_err(),
             notice: None,
             redirect_url: None,
-            error: None,
+            error: invitee_names.err(),
         }
     }
 

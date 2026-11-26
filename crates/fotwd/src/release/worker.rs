@@ -267,6 +267,10 @@ pub fn load_input(db: &mut Db, row: &ReleaseRow) -> Result<(PrepareInput, String
             started_at_ms: meeting.started_at_ms,
             segments,
             corrections,
+            include_summary_spellings: matches!(
+                crate::invitees::enabled(db),
+                Ok(None | Some(true))
+            ),
             recipients: row
                 .recipients
                 .iter()

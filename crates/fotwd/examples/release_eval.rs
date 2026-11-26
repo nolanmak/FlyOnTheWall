@@ -94,6 +94,7 @@ impl Meeting {
                 })
                 .collect(),
             corrections: vec![],
+            include_summary_spellings: true,
             recipients: self
                 .recipients
                 .iter()

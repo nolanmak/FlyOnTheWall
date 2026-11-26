@@ -51,6 +51,8 @@ pub struct PrepareInput {
     pub segments: Vec<SourceSegment>,
     /// Meeting-level name corrections.
     pub corrections: Vec<NameCorrection>,
+    /// Whether the summary request may include calendar spelling hints.
+    pub include_summary_spellings: bool,
     /// Frozen recipients (D4).
     pub recipients: Vec<ReleaseRecipient>,
 }

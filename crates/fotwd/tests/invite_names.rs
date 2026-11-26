@@ -191,14 +191,6 @@ fn invite_corrections_join_the_meetings_name_corrections() {
 }
 
 #[test]
-fn the_summary_setting_defaults_on_and_can_be_turned_off() {
-    let mut db = db();
-    assert!(invitees::enabled(&db));
-    invitees::set_enabled(&mut db, false).unwrap();
-    assert!(!invitees::enabled(&db));
-}
-
-#[test]
 fn no_invitees_means_nothing_changes() {
     let mut db = db();
     let id = meeting_saying(&mut db, &["Rafael is here."]);
@@ -286,4 +278,53 @@ fn a_different_short_name_of_the_same_length_is_left_alone() {
         &names(&["Kai", "Al"]),
     );
     assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn an_unreadable_opt_out_keeps_invitee_names_out_of_summary_inputs() {
+    let mut db = db();
+    let id = meeting_saying(&mut db, &["The checklist is ready."]);
+    let invitees = names(&["Rafiya Lindqvist"]);
+    let key = invitees::ENABLED_KEY;
+    invitees::store_names(&mut db, &id, &invitees).unwrap();
+
+    assert_eq!(invitees::for_summary(&db, &id), invitees);
+    invitees::set_enabled(&mut db, true).unwrap();
+    assert_eq!(invitees::for_summary(&db, &id), invitees);
+    invitees::set_enabled(&mut db, false).unwrap();
+    assert_eq!(db.get_setting(key).unwrap().as_deref(), Some("false"));
+    assert!(invitees::for_summary(&db, &id).is_empty());
+
+    db.conn()
+        .execute(
+            "UPDATE settings SET value = CAST(?2 AS TEXT) WHERE key = ?1",
+            (key, &b"false\xff"[..]),
+        )
+        .unwrap();
+    assert!(db.get_setting(key).is_err());
+    assert_eq!(invitees::read(&db, &id).names, invitees);
+    let actual = invitees::for_summary(&db, &id);
+    let stored: Vec<u8> = db
+        .conn()
+        .query_row(
+            "SELECT CAST(value AS BLOB) FROM settings WHERE key = ?1",
+            [key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, b"false\xff");
+    assert_eq!(
+        actual,
+        Vec::<String>::new(),
+        "an unreadable opt-out exposed an invitee spelling"
+    );
+}
+
+#[test]
+fn an_invalid_opt_out_keeps_invitee_names_out_of_summary_inputs() {
+    let mut db = db();
+    let id = meeting_saying(&mut db, &["Checklist review"]);
+    invitees::store_names(&mut db, &id, &names(&["Rafiya Lindqvist"])).unwrap();
+    db.put_setting(invitees::ENABLED_KEY, "invalid").unwrap();
+    assert!(invitees::for_summary(&db, &id).is_empty());
 }

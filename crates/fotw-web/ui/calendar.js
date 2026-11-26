@@ -61,7 +61,11 @@ globalThis.FOTWCalendar = {
     const inviteLabel = namesCard.appendChild(make('label', '', '', 'cal-ack'));
     const invite = inviteLabel.appendChild(make('input', '', 'calendar-invitee-names')); invite.type = 'checkbox';
     inviteLabel.appendChild(make('span', ' Also give invitee names to the summary engine as spellings. Names only, never email addresses.'));
-    const fixNames = namesCard.appendChild(make('div', '', '', 'cal-actions')).appendChild(button('Fix names in recent meetings', 'calendar-fix-names', 'cal-ghost'));
+    const nameActions = namesCard.appendChild(make('div', '', '', 'cal-actions'));
+    const saveOff = nameActions.appendChild(button('Save Off', 'calendar-invitee-save-off', 'cal-ghost'));
+    saveOff.setAttribute('aria-label', 'Save invitee-name sharing as Off');
+    saveOff.hidden = true;
+    const fixNames = nameActions.appendChild(button('Fix names in recent meetings', 'calendar-fix-names', 'cal-ghost'));
 
     const message = body.appendChild(make('p', '', 'calendar-status', 'cal-status')); message.setAttribute('role', 'status');
     const retry = body.appendChild(button('Try again', 'calendar-retry', 'cal-ghost')); retry.hidden = true;
@@ -111,6 +115,7 @@ globalThis.FOTWCalendar = {
       if (url) { signin.href = url; signin.hidden = false; }
       if (!list.some(a => a.status === 'pending')) signin.hidden = true;
       invite.checked = Boolean(doc.invitee_names);
+      saveOff.hidden = !doc.invitee_names_needs_repair;
       message.textContent = doc.error || doc.notice || (url ? 'Sign in on the Google page, then come back here.' : '');
       enable();
       schedule();
@@ -127,6 +132,7 @@ globalThis.FOTWCalendar = {
       keySave.disabled = busy;
       keyForget.disabled = busy;
       invite.disabled = busy;
+      saveOff.disabled = busy;
       fixNames.disabled = busy;
     }
 
@@ -160,6 +166,7 @@ globalThis.FOTWCalendar = {
     keyForget.addEventListener('click', () => act({ action: 'forget_key' }));
     ack.addEventListener('change', enable);
     invite.addEventListener('change', () => act({ action: 'set_invitee_names', enabled: Boolean(invite.checked) }));
+    saveOff.addEventListener('click', () => act({ action: 'set_invitee_names', enabled: false }));
     fixNames.addEventListener('click', () => { message.textContent = 'Looking up recent invites…'; return act({ action: 'fix_recent_names' }, true); });
     connect.addEventListener('click', () => { polls = 0; return act({ action: 'connect', acknowledge_egress: Boolean(ack.checked) }); });
 

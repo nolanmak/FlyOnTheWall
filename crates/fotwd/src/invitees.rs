@@ -29,8 +29,8 @@ use serde::{Deserialize, Serialize};
 /// Where each meeting's invitee names and corrections are kept.
 pub const SETTINGS_KEY: &str = "meeting_invitees";
 
-/// Whether invitee names are sent to the summary engine. On unless turned
-/// off in Settings › Calendars.
+/// Whether invitee names are sent to the summary engine. A missing setting
+/// defaults to on. An unreadable setting disables sharing.
 pub const ENABLED_KEY: &str = "invitee_names_in_summaries";
 
 /// Most invitees kept for one meeting.
@@ -324,20 +324,39 @@ pub fn refresh_corrections(db: &mut Db, meeting_id: &str) -> Result<Vec<NameCorr
 /// Invitee names to give the summary engine as spellings, when allowed.
 #[must_use]
 pub fn for_summary(db: &Db, meeting_id: &str) -> Vec<String> {
-    if enabled(db) {
-        read(db, meeting_id).names
-    } else {
-        Vec::new()
+    summary_inputs(db, meeting_id).0
+}
+
+pub(crate) fn summary_inputs(db: &Db, meeting_id: &str) -> (Vec<String>, Option<String>) {
+    match enabled(db) {
+        Ok(None | Some(true)) => (read(db, meeting_id).names, None),
+        Ok(Some(false)) => (Vec::new(), None),
+        Err(error) => {
+            crate::journal::record(&format!("summary: {error}"));
+            (Vec::new(), Some(error))
+        }
     }
 }
 
-/// Whether invitee names go to the summary engine.
-#[must_use]
-pub fn enabled(db: &Db) -> bool {
-    db.get_setting(ENABLED_KEY)
-        .ok()
-        .flatten()
-        .is_none_or(|v| v.trim() != "false")
+/// The saved choice about including invitee names in summary requests.
+///
+/// # Errors
+/// The saved choice could not be read or is invalid.
+pub fn enabled(db: &Db) -> Result<Option<bool>, String> {
+    let repair = "Invitee names are withheld. Save your choice again in Settings › Calendars. Use Save Off to keep names withheld.";
+    match db.get_setting(ENABLED_KEY) {
+        Ok(None) => Ok(None),
+        Ok(Some(value)) => match value.trim() {
+            "true" => Ok(Some(true)),
+            "false" => Ok(Some(false)),
+            _ => Err(format!(
+                "The saved invitee-name setting is invalid. {repair}"
+            )),
+        },
+        Err(_) => Err(format!(
+            "Could not read the saved invitee-name setting. {repair}"
+        )),
+    }
 }
 
 /// Turn sending invitee names to the summary engine on or off.

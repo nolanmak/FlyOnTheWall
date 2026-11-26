@@ -1,7 +1,7 @@
 //! The release summary call (D7).
 //!
 //! Its input is the retained excerpts with their `[#N]` labels, the
-//! recipients' display names (for spelling) and the meeting's name
+//! recipients' display names (for spelling, when enabled) and the meeting's name
 //! corrections. Nothing else: no notes, meeting title, meeting summary or
 //! omitted text, so content that was cut is structurally absent. Every bullet
 //! must cite at least one retained index and `Summary` must hold a bullet; an
@@ -65,12 +65,16 @@ pub(crate) async fn run_with(
     if retained.is_empty() {
         return Err(PrepareError::ModelFailed);
     }
-    let names: Vec<&str> = input
-        .recipients
-        .iter()
-        .filter_map(|r| r.display_name.as_deref())
-        .filter(|n| !n.trim().is_empty())
-        .collect();
+    let names: Vec<&str> = if input.include_summary_spellings {
+        input
+            .recipients
+            .iter()
+            .filter_map(|r| r.display_name.as_deref())
+            .filter(|n| !n.trim().is_empty())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let corrections: Vec<serde_json::Value> = input
         .corrections
         .iter()
