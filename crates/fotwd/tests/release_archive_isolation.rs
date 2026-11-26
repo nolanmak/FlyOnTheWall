@@ -117,7 +117,13 @@ fn github_export_is_byte_identical_with_release_on_and_off() {
     );
 
     gh.push_script(vec![ok(""), ok(PRIVATE_REPO), not_found(), ok(PUT_OK)]);
-    let first = exporter.push(&id).expect("push with release off");
+    let first = exporter.push(&id).expect("first push");
+
+    // The comparison is between two *updates* of the same file: the first
+    // push creates it ("Add"), every later one updates it ("Update"), so only
+    // a later push with release off is a fair baseline for one with it on.
+    gh.push_script(vec![ok(""), ok(PRIVATE_REPO), ok("abc123def"), ok(PUT_OK)]);
+    exporter.push(&id).expect("update with release off");
     let off = archived(&gh.last_put());
 
     side.conn()
