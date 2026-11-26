@@ -1,0 +1,148 @@
+{
+  "id": "p12-customer-onboarding",
+  "kind": "planted",
+  "event_title": "Onboarding call with Brightwell Clinics",
+  "tz": "America/Chicago",
+  "started_at_ms": 1791302400000,
+  "scheduled_minutes": 45,
+  "recipients": [
+    {
+      "address": "owen.fischer@example.com",
+      "display_name": "Owen Fischer",
+      "is_self": true
+    },
+    {
+      "address": "maya.lindgren@example.com",
+      "display_name": "Maya Lindgren",
+      "is_self": false
+    },
+    {
+      "address": "tobias.hale@example.com",
+      "display_name": "Tobias Hale",
+      "is_self": false
+    },
+    {
+      "address": "cs-team@example.org",
+      "display_name": null,
+      "is_self": false
+    }
+  ],
+  "segments": [
+    {
+      "offset_s": 0,
+      "speaker": "me",
+      "text": "Hi everyone, thanks for making time. This is the kickoff for Brightwell's onboarding. I'm Owen, and Maya is your implementation lead."
+    },
+    {
+      "offset_s": 168,
+      "speaker": "Speaker 2",
+      "text": "Great to meet you, Tobias. Today we'll cover timelines, the data import, and who your admins will be."
+    },
+    {
+      "offset_s": 308,
+      "speaker": "Speaker 3",
+      "text": "Sounds good. We're excited to get off the spreadsheets, honestly."
+    },
+    {
+      "offset_s": 410,
+      "speaker": "Speaker 2",
+      "text": "That's what we like to hear. For the import, we'll need a CSV export of your current patient scheduling templates, no patient data, just the templates."
+    },
+    {
+      "offset_s": 588,
+      "speaker": "Speaker 3",
+      "text": "That's easy. Our operations manager can send that this week."
+    },
+    {
+      "offset_s": 690,
+      "speaker": "me",
+      "text": "For admins, we recommend two people per clinic so there's coverage for vacations."
+    },
+    {
+      "offset_s": 812,
+      "speaker": "Speaker 3",
+      "text": "We have six clinics, so twelve admins. I'll send you the list."
+    },
+    {
+      "offset_s": 914,
+      "speaker": "Speaker 2",
+      "text": "Perfect. After that, we'll run a pilot at one clinic for two weeks before rolling out to the rest."
+    },
+    {
+      "offset_s": 1045,
+      "speaker": "Speaker 3",
+      "text": "Can the pilot be at the Westside location? They're the most organized."
+    },
+    {
+      "offset_s": 1157,
+      "speaker": "Speaker 2",
+      "text": "Absolutely. We'll schedule admin training for the week of the twentieth."
+    },
+    {
+      "offset_s": 1269,
+      "speaker": "me",
+      "text": "And you'll have a shared Slack channel with our team for questions during the pilot."
+    },
+    {
+      "offset_s": 1390,
+      "speaker": "Speaker 3",
+      "text": "That's great. I think that covers everything from my side."
+    },
+    {
+      "offset_s": 1493,
+      "speaker": "me",
+      "text": "Wonderful. Thanks, Tobias, we'll send a recap with next steps this afternoon. Bye for now."
+    },
+    {
+      "offset_s": 1623,
+      "speaker": "Speaker 3",
+      "text": "Thanks, bye everyone."
+    },
+    {
+      "offset_s": 1689,
+      "speaker": "Speaker 2",
+      "text": "Okay, he's gone. Is the recording still on? Whatever. Did you end up going to that wedding in Napa this weekend?"
+    },
+    {
+      "offset_s": 1838,
+      "speaker": "me",
+      "text": "I did, and it was a disaster. My ex was there with his new girlfriend, and someone sat us at the same table."
+    },
+    {
+      "offset_s": 1978,
+      "speaker": "Speaker 2",
+      "text": "No. What did you do?"
+    },
+    {
+      "offset_s": 2043,
+      "speaker": "me",
+      "text": "Drank too much rosé and left before the cake. My mom keeps texting me asking if I'm okay."
+    },
+    {
+      "offset_s": 2174,
+      "speaker": "Speaker 2",
+      "text": "Honestly that's the right call. Want to get drinks Thursday and debrief properly?"
+    },
+    {
+      "offset_s": 2295,
+      "speaker": "me",
+      "text": "Yes please. I'll text you after my therapy appointment."
+    }
+  ],
+  "planted": [
+    {
+      "category": "off_meeting",
+      "indices": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "quote": "Did you end up going to that wedding in Napa this weekend?",
+      "note": "after-meeting personal tail: ex, family, therapy"
+    }
+  ],
+  "notes": "AFTER-MEETING TAIL: the call wraps up and the customer says bye just before; the personal tail starts at index 14 and runs to the last segment (index 19). Planted: off_meeting at [14, 15, 16, 17, 18, 19]."
+}

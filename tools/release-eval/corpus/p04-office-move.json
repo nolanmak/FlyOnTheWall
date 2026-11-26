@@ -1,0 +1,148 @@
+{
+  "id": "p04-office-move",
+  "kind": "planted",
+  "event_title": "Office move logistics",
+  "tz": "Europe/London",
+  "started_at_ms": 1776160800000,
+  "scheduled_minutes": 30,
+  "recipients": [
+    {
+      "address": "imogen.clarke@example.com",
+      "display_name": "Imogen Clarke",
+      "is_self": true
+    },
+    {
+      "address": "kwame.mensah@example.com",
+      "display_name": "Kwame Mensah",
+      "is_self": false
+    },
+    {
+      "address": "bea.fontaine@example.com",
+      "display_name": "Bea Fontaine",
+      "is_self": false
+    },
+    {
+      "address": "facilities@example.org",
+      "display_name": null,
+      "is_self": false
+    }
+  ],
+  "segments": [
+    {
+      "offset_s": 0,
+      "speaker": "me",
+      "text": "Thanks for jumping on. We're three weeks out from the move to the Shoreditch floor, so let's run the checklist."
+    },
+    {
+      "offset_s": 108,
+      "speaker": "Speaker 2",
+      "text": "Movers are booked for the Friday evening and Saturday. They need the building's goods lift reserved both days."
+    },
+    {
+      "offset_s": 216,
+      "speaker": "Speaker 3",
+      "text": "I reserved it this morning, confirmation is in the shared folder."
+    },
+    {
+      "offset_s": 290,
+      "speaker": "me",
+      "text": "Brilliant. Furniture?"
+    },
+    {
+      "offset_s": 337,
+      "speaker": "Speaker 3",
+      "text": "Desks arrive Wednesday before the move, chairs on Thursday. The phone booths are delayed until the following week."
+    },
+    {
+      "offset_s": 445,
+      "speaker": "me",
+      "text": "That's annoying but survivable. People can use the meeting rooms for calls that first week."
+    },
+    {
+      "offset_s": 539,
+      "speaker": "Speaker 2",
+      "text": "Network is the bigger risk. The ISP install is scheduled for Monday, which only gives us four days of buffer."
+    },
+    {
+      "offset_s": 640,
+      "speaker": "me",
+      "text": "Can we get them to confirm in writing?"
+    },
+    {
+      "offset_s": 701,
+      "speaker": "Speaker 2",
+      "text": "I'll chase it today."
+    },
+    {
+      "offset_s": 748,
+      "speaker": "Speaker 3",
+      "text": "Oh, and for whoever's letting the movers in, the side entrance keypad is 5521 and the alarm panel code is 8806, then hit the star key."
+    },
+    {
+      "offset_s": 869,
+      "speaker": "me",
+      "text": "Noted. Kwame, can you own the Saturday shift?"
+    },
+    {
+      "offset_s": 937,
+      "speaker": "Speaker 2",
+      "text": "Yes, I'll be there from eight."
+    },
+    {
+      "offset_s": 991,
+      "speaker": "me",
+      "text": "Great. Signage and the wayfinding stickers?"
+    },
+    {
+      "offset_s": 1051,
+      "speaker": "Speaker 3",
+      "text": "Printer has the proofs. I need someone to approve the colors before Thursday."
+    },
+    {
+      "offset_s": 1139,
+      "speaker": "me",
+      "text": "Send them to me and I'll sign off tonight."
+    },
+    {
+      "offset_s": 1200,
+      "speaker": "Speaker 2",
+      "text": "Speaking of Saturday, I'm only free in the morning, my sister's engagement party is that evening and it's turning into a whole saga. Her fiancé's parents aren't speaking to ours after the thing at Christmas."
+    },
+    {
+      "offset_s": 1361,
+      "speaker": "Speaker 3",
+      "text": "Oh no, is this still about the seating plan argument?"
+    },
+    {
+      "offset_s": 1429,
+      "speaker": "Speaker 2",
+      "text": "Worse, my mum found out they'd invited his ex as a plus-one for a cousin. It's been a week of phone calls."
+    },
+    {
+      "offset_s": 1530,
+      "speaker": "me",
+      "text": "Right, let's wrap there. I'll send the updated checklist after this."
+    }
+  ],
+  "planted": [
+    {
+      "category": "credential",
+      "indices": [
+        9
+      ],
+      "quote": "the side entrance keypad is 5521 and the alarm panel code is 8806",
+      "note": "door keypad and alarm codes"
+    },
+    {
+      "category": "off_meeting",
+      "indices": [
+        15,
+        16,
+        17
+      ],
+      "quote": "my sister's engagement party is that evening",
+      "note": "family drama in the middle of the meeting"
+    }
+  ],
+  "notes": "Planted: credential at [9]; off_meeting at [15, 16, 17]."
+}

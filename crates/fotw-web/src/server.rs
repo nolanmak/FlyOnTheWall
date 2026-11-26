@@ -266,6 +266,18 @@ fn routes(state: AppState) -> Router {
             "/api/settings/summarize",
             get(api::summarize_settings).post(api::summarize_set_settings),
         )
+        // Attendee release (#326 5.1, 5.7), inside `routes()` so the ingress
+        // guard wraps them: they answer with recipients and stored mail.
+        .route(
+            "/api/settings/release",
+            get(api::release_settings).post(api::release_set_settings),
+        )
+        .route("/api/meetings/{id}/release", get(api::meeting_release))
+        .route("/api/release/outbox", get(api::release_outbox))
+        .route(
+            "/api/release/outbox/{id}",
+            get(api::release_outbox_detail).post(api::release_outbox_act),
+        )
         .route("/api/meetings/{id}/github-push", post(api::github_push))
         // A read, and the dashboard's replacement for the per-meeting push
         // button (#112): it asks this once for each meeting somebody opens.

@@ -2629,8 +2629,12 @@ async fn summarize_command(root: PathBuf, meeting_id: String, slug: Option<Strin
     };
     println!("  template   : {} ({})", template.name, template.slug);
 
-    match fotwd::summarize::summarize_meeting(&mut db, store, &meeting_id, &template).await {
-        Ok(out) => {
+    match fotwd::summarize::summarize_meeting_manually(&mut db, store, &meeting_id, &template).await
+    {
+        Ok(fotwd::summarize::ManualSummary {
+            outcome: out,
+            status_problem,
+        }) => {
             println!("  version    : v{}", out.version);
             println!("  grounding  : {:.0}%", out.coverage * 100.0);
             println!("  items kept : {}", out.kept_items);
@@ -2662,8 +2666,11 @@ async fn summarize_command(root: PathBuf, meeting_id: String, slug: Option<Strin
             // — losing the automatic retries, which is the opposite of what
             // someone reaching for this command wants. Only the daemon's own
             // pass (`enrich::enrich_meeting_with`) writes `failed`.
-            if let Err(e) = db.meetings().set_enrich_report(&meeting_id, "ok", None) {
-                eprintln!("  ! the summary was stored, but its status was not: {e}");
+            //
+            // The `ok` itself is written by `summarize_meeting_manually`, and
+            // only while this run is the newest pass on the meeting (#335).
+            if let Some(problem) = status_problem {
+                eprintln!("  ! {problem}");
             }
             println!();
             for line in out.markdown.lines() {

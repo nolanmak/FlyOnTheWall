@@ -525,7 +525,7 @@ pub fn dedupe_meeting(db: &mut Db, meeting_id: &str) -> StoreResult<DedupeReport
             new_transcript: None,
         });
     };
-    let mut segments = crate::summarize::load_segments(db, &old_transcript)?;
+    let mut segments = crate::summarize::load_segments(db, meeting_id, &old_transcript)?;
     crate::session::order_segments(&mut segments);
     let before = segments.len();
     let dropped = crate::session::dedupe_cross_leg(&mut segments);

@@ -17,7 +17,8 @@
 use std::os::unix::fs::PermissionsExt as _;
 
 use fotwd::journal::{
-    Journal, Pulse, meeting_problems, meeting_titled, serve_exit, serve_starting,
+    Journal, Pulse, meeting_problems, meeting_titled, ownership_repaired, serve_exit,
+    serve_starting,
 };
 
 fn tmpdir(name: &str) -> std::path::PathBuf {
@@ -198,6 +199,24 @@ fn the_line_written_when_enrichment_fails_never_quotes_the_problem() {
 fn a_meeting_with_no_problems_says_so_rather_than_saying_nothing() {
     let note = meeting_problems("2f8c1a4e-0000-4000-8000-000000000001", &[]);
     assert!(note.contains("no problems"), "{note}");
+}
+
+/// #343: what migration 0013 repaired is reported, counts per table, and a
+/// clean library says nothing.
+#[test]
+fn an_ownership_repair_is_journalled_per_table_with_its_counts() {
+    assert!(ownership_repaired(&[]).is_empty());
+    let lines = ownership_repaired(&[fotw_store::OwnershipRepair {
+        table: "segments".to_owned(),
+        found: 3,
+        rehomed: 1,
+        removed: 2,
+        cleared: 0,
+    }]);
+    assert_eq!(lines.len(), 1);
+    let line = &lines[0];
+    assert!(line.contains("3 segments"), "{line}");
+    assert!(line.contains("1 re-homed, 2 removed"), "{line}");
 }
 
 // ----------------------------------------- the daemon's own exit — issue #102

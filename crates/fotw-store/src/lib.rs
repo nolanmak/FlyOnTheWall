@@ -63,7 +63,7 @@ pub use crate::export::{Blob, Clipboard, MEETING_SCHEMA, MeetingDoc};
 pub use crate::ids::{new_id, now_ms};
 pub use crate::key::DbKey;
 pub use crate::media::{AudioFile, AudioRow, NewRecording};
-pub use crate::migrations::LATEST_SCHEMA_VERSION;
+pub use crate::migrations::{LATEST_SCHEMA_VERSION, OwnershipRepair};
 pub use crate::models::{
     Meeting, NewMeeting, NewSegment, NewSummary, NoteAnchor, StoredSegment, Summary,
 };
@@ -71,7 +71,7 @@ pub use crate::notes::{MAX_NOTE_BYTES, NoteDocument};
 pub use crate::post_pass::{
     CANCELLED as POST_PASS_CANCELLED, POST_PASS_WAIT_MS, PostPassJob, PostPassState,
 };
-pub use crate::repo::MeetingRepo;
+pub use crate::repo::{EnrichPass, MeetingRepo};
 pub use crate::search::{FTS_TABLES, SearchHit, SearchQuery, SearchSource, SearchWeights};
 
 pub use crate::session_notes::{SessionNoteDocument, SessionNoteDraftSummary};

@@ -840,7 +840,9 @@ fn switching_back_restores_only_the_original_transcript_to_search_pages() {
 /// segment filed under one meeting that points at another meeting's primary
 /// transcript. Such a segment is in neither meeting's primary transcript, so
 /// it is not a hit for either, whether or not a filter is set. Here the
-/// meeting it is filed under has no transcript at all.
+/// meeting it is filed under has no transcript at all. Since #343 the schema
+/// refuses the row, so it is written with enforcement off, standing in for a
+/// library from before migration 0013.
 #[test]
 fn a_segment_filed_under_another_meeting_than_its_transcript_is_not_found() {
     let mut db = db();
@@ -863,13 +865,15 @@ fn a_segment_filed_under_another_meeting_than_its_transcript_is_not_found() {
     let owned = segments_saying(&db, &owner_transcript, "quillfeather");
     db.conn()
         .execute_batch(&format!(
-            "INSERT INTO folders (id, name, created_at, updated_at, origin_device_id)
+            "PRAGMA foreign_keys = OFF;
+             INSERT INTO folders (id, name, created_at, updated_at, origin_device_id)
                   VALUES ('f-stray', 'Stray', 0, 0, 'dev-1');
              UPDATE meetings SET folder_id = 'f-stray' WHERE id = '{stray_meeting}';
              INSERT INTO segments
                     (id, transcript_id, meeting_id, idx, start_ms, end_ms, channel, text)
              VALUES ('sg-stray', '{owner_transcript}', '{stray_meeting}', 99, 0, 1000,
-                     'mic', 'the quillfeather budget slipped');"
+                     'mic', 'the quillfeather budget slipped');
+             PRAGMA foreign_keys = ON;"
         ))
         .unwrap();
     // Control: the stray row is indexed, so leaving it out is the search's doing.
