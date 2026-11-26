@@ -1385,6 +1385,11 @@ impl Worker {
                     }
                 }
                 if self.cloud.is_some() && self.shared.input_closed.load(Ordering::Acquire) {
+                    // `end` was read before this pass's provider work. Input
+                    // closes only after its last append, so read it again,
+                    // after the closed flag: an end loaded before the flag can
+                    // miss an append that landed just before Stop.
+                    let end = self.shared.end.load(Ordering::Acquire);
                     if self.journal.committed_through() == end {
                         return self.complete(end);
                     }
@@ -1416,7 +1421,18 @@ impl Worker {
                     }
                     moved = true;
                 }
-                if self.shared.input_closed.load(Ordering::Acquire) && self.local_cursor == end {
+                // `end` was read before this pass's inference, which can
+                // outlast the rest of the recording: audio written meanwhile,
+                // then Stop, must not be taken for the end of input. Input
+                // closes only after its last append, so the end read after
+                // seeing it closed is final. Keep that order (closed flag
+                // first, then the end): an end loaded before the flag can
+                // still miss an append that landed just before Stop, and the
+                // tests here cannot tell the two orders apart.
+                if self.shared.input_closed.load(Ordering::Acquire)
+                    && self.local_cursor == self.shared.end.load(Ordering::Acquire)
+                {
+                    let end = self.local_cursor;
                     if let Some(chunk) = self.local_endpoint.as_mut().unwrap().flush() {
                         self.infer(chunk)?;
                     }
@@ -1589,3 +1605,7 @@ impl Worker {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "stream_tests.rs"]
+mod tests;
