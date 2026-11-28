@@ -149,17 +149,12 @@ version; the meeting says a cleaned version is available.
 "Retry locally" and startup recovery (docs/DURABLE_SPEECH.md) finish the
 **live** transcript of canonical audio that was never transcribed, with each
 source's saved plan and the original sample clock, and append to the meeting's
-existing transcript. They still refuse Parakeet plans ("Parakeet recovery isn't
-supported yet; the audio is kept"), because recovery replays an exact saved
-per-source model plan through the durable journal, and that path runs only the
-in-process Whisper engine.
+existing transcript. Recovery loads the recorded model revision, including
+Parakeet on macOS, and keeps the original audio.
 
-The cleanup reads only finished, archived meetings and always writes a new
-version. It does not depend on the recording's speech plan, so a meeting whose
-live Parakeet transcript was cut short still gets a complete Parakeet
-transcript from its saved audio once it is in the library: that is how saved
-Parakeet audio is re-transcribed today. Extending recovery itself to Parakeet
-plans is tracked in [#274](https://github.com/nolanmak/FlyOnTheWall/issues/274).
+The cleanup reads finished, archived meetings and always writes a new
+version. It uses its own Parakeet model independently of the recording's
+speech plan.
 
 ## Tests
 

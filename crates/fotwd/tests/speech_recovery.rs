@@ -828,7 +828,7 @@ fn startup_skips_invalid_capture_and_missing_models_without_starving_later_work(
         Arc::new(move |plan, _| {
             assert_eq!(plan.language.as_deref(), Some("en"));
             if plan.engine.model == "missing-model" {
-                return Err("fixture model not installed".into());
+                return Err("Install the fixture model before retrying.".into());
             }
             assert_eq!(plan.engine.revision.as_deref(), Some("fixture-revision"));
             Ok(Arc::new(Factory(models.clone())))
@@ -843,6 +843,13 @@ fn startup_skips_invalid_capture_and_missing_models_without_starving_later_work(
     assert_eq!(c.read(&good).unwrap().phase, RecoveryPhase::Complete);
     assert!(c.read(&missing).unwrap().can_retry);
     assert!(c.read(&bad).is_err());
+    c.retry(&missing).unwrap();
+    let status = finished(&c, &missing);
+    assert_eq!(status.phase, RecoveryPhase::Failed);
+    assert_eq!(
+        status.message.as_deref(),
+        Some("Install the fixture model before retrying.")
+    );
 }
 
 #[test]

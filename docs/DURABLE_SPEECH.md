@@ -587,11 +587,13 @@ a durable coverage advance renews the 120-second progress-stall budget; healthy
 long recordings can run beyond that budget while making progress. Native calls cannot be forcibly interrupted. Timeout
 or Cancel revokes constructor/inference output while the job retains admission
 until the actual worker, model and cleanup return. Another retry cannot multiply
-a stuck owner. Model loading follows exclusive source/journal admission, and no
-library mutex spans model construction or inference. Missing/changed assets or
-invalid capture identity/clock retain audio and report failure. The installed
-candidate and managed copy are selected by saved identity and SHA-256, with
-checksum checks around native context creation.
+a stuck owner. No library mutex spans model preparation or inference.
+Whisper selects a configured or managed copy by saved identity and SHA-256,
+and checks the files around native context creation under source/journal
+admission. On macOS, Parakeet starts a helper on the recovery worker's runtime,
+checks the loaded revision against the saved plan, and uses the same Silero
+speech gate as live transcription. Missing models report how to install them,
+and failed preparation retains the original audio.
 
 Authenticated routes under `/api/meetings/{id}/speech-recovery` expose status,
 `retry` and `cancel`. Action bodies are empty objects; clients cannot choose a
