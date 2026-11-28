@@ -533,6 +533,8 @@ row_type!(
         id: String,
         meeting_id: String,
         version: i64,
+        /// The template identifier recorded when the summary was generated.
+        #[serde(default)]
         template_id: Option<String>,
         transcript_id: Option<String>,
         provider: String,

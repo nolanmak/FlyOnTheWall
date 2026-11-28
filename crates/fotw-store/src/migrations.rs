@@ -14,7 +14,7 @@ use crate::key::DbKey;
 ///
 /// Bump this in the same commit that appends to [`migration_set`]; the two
 /// drifting apart is what [`crate::Db::open`]'s refusal is guarding against.
-pub const LATEST_SCHEMA_VERSION: usize = 14;
+pub const LATEST_SCHEMA_VERSION: usize = 15;
 
 /// Every migration, oldest first. Append only — a released migration is
 /// immutable, because editing one changes the schema of databases that already
@@ -74,6 +74,11 @@ fn migration_set(new_library: bool) -> Migrations<'static> {
         .comment("a transcript's rows belong to the transcript's meeting"),
         M::up(include_str!("schema/0014_release_event_times.sql"))
             .comment("matched event times on release rows and the wrong_event decision"),
+        M::up_with_hook(
+            include_str!("schema/0015_summary_template_provenance.sql"),
+            |tx| check_references(tx, &["summaries", "action_items"]),
+        )
+        .comment("summary template provenance from file slugs"),
     ])
 }
 
@@ -213,7 +218,7 @@ pub(crate) fn migrate(
         backup_before_migration(conn, path, found, key)?;
     }
 
-    // Table-rebuild migrations (0013) drop and recreate tables that others
+    // Table-rebuild migrations drop and recreate tables that others
     // reference. With enforcement on, that DROP runs an implicit DELETE whose
     // ON DELETE CASCADE would empty every child table. SQLite's documented
     // procedure is to switch enforcement off for the rebuild, which has to
@@ -295,7 +300,7 @@ mod tests {
 
     use rusqlite::Connection;
 
-    use super::{LATEST_SCHEMA_VERSION, OWNERSHIP_REBUILT_TABLES, migration_set};
+    use super::{OWNERSHIP_REBUILT_TABLES, migration_set};
 
     /// Every trigger, index and column on the tables 0013 rebuilds.
     fn shape(conn: &Connection) -> BTreeSet<String> {
@@ -360,6 +365,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn summary_template_provenance_preserves_existing_summaries_and_search() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migration_set(true).to_version(&mut conn, 14).unwrap();
+        conn.execute_batch(
+            "INSERT INTO meetings (id, title, started_at_ms, tz, state, created_at, updated_at, origin_device_id)
+               VALUES ('m1', 'Planning', 0, 'UTC', 'ready', 0, 0, 'local');
+             INSERT INTO summaries (rowid, id, meeting_id, version, provider, model, prompt_hash,
+                                    body_md, created_at, origin_device_id)
+               VALUES (42, 's1', 'm1', 1, 'cli', 'model', 'hash', 'milestone', 0, 'local');
+             INSERT INTO action_items (id, meeting_id, summary_id, text, created_at, updated_at, origin_device_id)
+               VALUES ('a1', 'm1', 's1', 'Set a date', 0, 0, 'local');",
+        )
+        .unwrap();
+
+        super::migrate(&mut conn, None, None).unwrap();
+        let template_id: Option<String> = conn
+            .query_row(
+                "SELECT s.template_id FROM summaries_fts
+                 JOIN summaries s ON s.rowid = summaries_fts.rowid
+                 JOIN action_items a ON a.summary_id = s.id
+                 WHERE summaries_fts MATCH 'milestone' AND a.id = 'a1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(template_id, None);
+
+        conn.execute(
+            "UPDATE summaries SET template_id = 'custom-planning' WHERE id = 's1'",
+            [],
+        )
+        .unwrap();
+    }
+
     /// 0014: a release row created before it keeps its data and gains NULL
     /// event times; the decision log keeps every row, gains `wrong_event`,
     /// and is still append-only and still refuses an unknown decision.
@@ -388,8 +428,7 @@ mod tests {
             "v13 has no wrong_event decision"
         );
 
-        migrations.to_latest(&mut conn).unwrap();
-        assert_eq!(LATEST_SCHEMA_VERSION, 14);
+        migrations.to_version(&mut conn, 14).unwrap();
 
         let (title, start, end): (String, Option<i64>, Option<i64>) = conn
             .query_row(

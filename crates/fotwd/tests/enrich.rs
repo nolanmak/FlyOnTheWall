@@ -384,11 +384,8 @@ async fn a_working_engine_names_the_meeting_instead_of_quoting_it() {
 /// The two facts are pinned separately because they are two different kinds
 /// of claim. The shipped set is fixed, so "a standup is a standup and a
 /// placeholder is nothing" is asserted against the builtins. Which template
-/// the daemon *used* is read back off the stored summary's `prompt_hash` —
-/// the sha256 of the assembled system prompt, template body included — and
-/// compared against the same set the daemon loads. That is the only channel
-/// there is: the summary row has a `template_id` column and nothing writes
-/// it.
+/// the daemon used is read from the stored summary's template identifier and
+/// compared against the same set the daemon loads.
 #[tokio::test]
 async fn a_meeting_the_engine_named_selects_the_template_its_title_claims() {
     let mut db = db();
@@ -424,15 +421,14 @@ async fn a_meeting_the_engine_named_selects_the_template_its_title_claims() {
     // the claim is that the *title* decided it, not which file won.
     let set = TemplateSet::load_or_builtin(default_templates_dir()).unwrap();
     let chosen = set.for_event_title("Weekly Standup").unwrap();
-    let expected = fotw_summarize::prompt::assemble(&chosen.prompt_body());
     let summary = db
         .meetings()
         .current_summary(&meeting)
         .unwrap()
         .expect("a working engine writes a summary row");
     assert_eq!(
-        summary.prompt_hash,
-        expected.prompt_hash(),
+        summary.template_id.as_deref(),
+        Some(chosen.slug.as_str()),
         "the summary must be produced from the template the meeting's own \
          title selects, not from the one its placeholder fell back to"
     );

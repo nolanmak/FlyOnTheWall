@@ -481,6 +481,9 @@ function renderDetail(detail) {
     const summary = document.createElement("section");
     summary.className = "summary";
     summary.appendChild(text("h3", "Summary"));
+    if (detail.summary_template_id) {
+      summary.appendChild(text("p", `Template: ${detail.summary_template_id}`, "meta"));
+    }
     const body = document.createElement("div");
     body.className = "summary-body";
     renderMarkdown(detail.summary_md, body);

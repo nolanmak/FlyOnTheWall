@@ -117,6 +117,7 @@ async fn a_meeting_without_notes_returns_null_not_empty_string() {
             state: "ready".to_owned(),
         },
         summary_md: None,
+        summary_template_id: None,
         enrich_status: None,
         enrich_detail: None,
         note_md: None,
@@ -177,6 +178,7 @@ async fn a_summary_reaches_the_client_with_its_status() {
         body["summary_md"], "## Decisions\n- ship the guard",
         "the fixture's summary must survive the API"
     );
+    assert_eq!(body["summary_template_id"], "design-review");
     assert_eq!(body["enrich_status"], "ok");
     assert!(body["enrich_detail"].is_null());
 }
@@ -196,6 +198,7 @@ async fn a_meeting_with_no_summary_says_which_kind_of_no_summary_it_is() {
             state: "ready".to_owned(),
         },
         summary_md: None,
+        summary_template_id: None,
         enrich_status: Some("engine_unresolvable".to_owned()),
         enrich_detail: Some("claude".to_owned()),
         note_md: None,

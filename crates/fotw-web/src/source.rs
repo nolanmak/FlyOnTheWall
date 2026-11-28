@@ -142,6 +142,9 @@ pub struct MeetingDetail {
     pub meeting: MeetingRow,
     /// The current summary's markdown body, if one has been generated.
     pub summary_md: Option<String>,
+    /// The template identifier recorded on the current summary, if known.
+    #[serde(default)]
+    pub summary_template_id: Option<String>,
     /// Why there is no summary, when there is none: `no_engine`,
     /// `engine_unresolvable`, `failed` — or `ok` when there is one.
     ///
