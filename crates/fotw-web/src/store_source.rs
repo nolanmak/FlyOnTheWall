@@ -184,11 +184,12 @@ impl MeetingSource for StoreSource {
             Err(e) => return Err(map_err(e)),
         };
 
-        let summary_md = db
+        let (summary_md, summary_template_id) = db
             .meetings()
             .current_summary(id)
             .map_err(map_err)?
-            .map(|s| s.body_md);
+            .map(|summary| (Some(summary.body_md), summary.template_id))
+            .unwrap_or_default();
 
         // Propagates a real database failure instead of folding it into "no
         // transcript". `MeetingRepo::primary_transcript_id` distinguishes the
@@ -244,6 +245,7 @@ impl MeetingSource for StoreSource {
             enrich_detail: meeting.enrich_detail.clone(),
             meeting: row(meeting),
             summary_md,
+            summary_template_id,
             note_md,
             segments,
         }))

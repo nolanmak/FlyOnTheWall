@@ -398,7 +398,7 @@ where
                 (outcome.usage_a.output_tokens + outcome.usage_b.output_tokens) as i64,
             ),
             cost_micros: None,
-            template_id: None,
+            template_id: Some(template.slug.clone()),
             origin_device_id: "local".to_owned(),
         },
         stamp.version(),

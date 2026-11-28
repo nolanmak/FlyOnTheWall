@@ -327,7 +327,7 @@ VALUES
   -- silently destroys the history the append-only design exists to provide.
   ('sum-1', 'mtg-1', 1, 'tpl-1', 'tr-1', 'anthropic', 'claude-opus-5', 'aa00', '# v1', 0.7, 100, 200, 300, 0, 90, 'dev-1'),
   ('sum-2', 'mtg-1', 2, NULL, NULL, 'ollama', 'llama3', 'bb11', '# v2', NULL, NULL, NULL, NULL, 0, 91, 'dev-1'),
-  ('sum-3', 'mtg-1', 3, 'tpl-2', 'tr-2', 'anthropic', 'claude-sonnet-5', 'cc22', '# v3 café', 0.9999999999999999, 0, 0, 0, 1, 92, 'dev-2');
+  ('sum-3', 'mtg-1', 3, 'custom-planning', 'tr-2', 'anthropic', 'claude-sonnet-5', 'cc22', '# v3 café', 0.9999999999999999, 0, 0, 0, 1, 92, 'dev-2');
 
 INSERT INTO meeting_documents (id, meeting_id, version, document_json, created_at)
 VALUES ('doc-1', 'mtg-1', 1, '{"markdown":"draft café"}', 92),
@@ -745,6 +745,11 @@ fn the_meeting_document_carries_every_summary_version_and_every_anchor() {
     let doc = db.export_meeting("mtg-1").unwrap();
     assert_eq!(doc.schema, fotw_store::MEETING_SCHEMA);
     assert_eq!(doc.summaries.len(), 3, "summary history was truncated");
+    assert_eq!(
+        doc.current_summary().unwrap().template_id.as_deref(),
+        Some("custom-planning")
+    );
+    assert_eq!(doc.summaries[1].template_id, None);
     assert_eq!(doc.note_anchors.len(), 2, "note anchors were dropped");
     assert_eq!(doc.segments.len(), 6);
     assert_eq!(

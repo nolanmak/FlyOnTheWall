@@ -307,7 +307,7 @@ pub struct NewSummary {
     pub prompt_hash: String,
     /// The summary body.
     pub body_md: String,
-    /// Template used, if any.
+    /// The identifier of the template used, if known.
     pub template_id: Option<String>,
     /// Transcript it was generated from, if known.
     pub transcript_id: Option<String>,
@@ -369,7 +369,7 @@ pub struct Summary {
     pub meeting_id: String,
     /// 1-based, monotonically increasing per meeting.
     pub version: i64,
-    /// Template used, if any.
+    /// The identifier of the template used, if known.
     pub template_id: Option<String>,
     /// Transcript it was generated from, if known.
     pub transcript_id: Option<String>,

@@ -26,8 +26,8 @@ fn a_fresh_database_lands_on_the_latest_version() {
     let db = Db::open(&path, &test_key()).unwrap();
     assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
     assert_eq!(
-        LATEST_SCHEMA_VERSION, 14,
-        "0001 initial schema, 0002 fts5 search indexes, 0003 enrich report, 0004 sharing documents, 0005 session notes, 0006 note handoff aliases, 0007 durable speech receipts, 0008 capture clock state, 0009 summary destination defaults, 0010 summary input generations, 0011 post-meeting cleanup jobs, 0012 attendee release, 0013 segment-to-meeting ownership, 0014 release event times"
+        LATEST_SCHEMA_VERSION, 15,
+        "0001 initial schema, 0002 fts5 search indexes, 0003 enrich report, 0004 sharing documents, 0005 session notes, 0006 note handoff aliases, 0007 durable speech receipts, 0008 capture clock state, 0009 summary destination defaults, 0010 summary input generations, 0011 post-meeting cleanup jobs, 0012 attendee release, 0013 segment-to-meeting ownership, 0014 release event times, 0015 summary template provenance"
     );
 }
 
