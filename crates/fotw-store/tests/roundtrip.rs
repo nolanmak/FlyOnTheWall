@@ -954,9 +954,11 @@ fn the_markdown_transcript_does_not_collapse_into_one_paragraph() {
 fn the_plain_text_export_timestamps_every_line() {
     let (_f, db) = fixture();
     let txt = db.export_meeting("mtg-1").unwrap().to_plain_text();
-    // `[00:12:34] Alice: …` (issue #37).
-    assert!(txt.contains("[00:00:01] Speaker 0: Let's start."), "{txt}");
-    assert!(txt.contains("[00:00:00]"), "{txt}");
+    assert!(
+        txt.contains("[00:00:01 | 5:13:21 PM EST] Speaker 0: Let's start."),
+        "{txt}"
+    );
+    assert!(txt.contains("[00:00:00 | "), "{txt}");
     // A segment with no diarisation still gets a line rather than vanishing.
     assert!(txt.contains("Morning."), "{txt}");
 }
@@ -1382,8 +1384,8 @@ fn speech_relative_exports_preserve_recording_offsets() {
     doc.segments[1].start_ms = 17000;
     doc.segments[1].text = "first".into();
     let text = doc.to_plain_text();
-    assert!(text.contains("[00:00:00]"), "{text}");
-    assert!(text.contains("[00:00:19]"), "{text}");
+    assert!(text.contains("[00:00:00 | "), "{text}");
+    assert!(text.contains("[00:00:19 | "), "{text}");
     assert!(text.find("first").unwrap() < text.find("later").unwrap());
     assert!(doc.to_markdown().contains("speech_origin_ms: 17000"));
     let json: serde_json::Value = serde_json::from_str(&doc.to_json_pretty()).unwrap();
@@ -1401,6 +1403,7 @@ fn rust_and_ui_share_speech_relative_timestamp_fixtures() {
     let (_f, db) = fixture();
     for case in cases.as_array().unwrap() {
         let mut doc = db.export_meeting("mtg-1").unwrap();
+        doc.meeting.started_at_ms = case["capture_start_ms"].as_i64().unwrap();
         let primary = doc
             .transcripts
             .iter()

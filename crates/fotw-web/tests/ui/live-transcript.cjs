@@ -35,24 +35,36 @@ test('old meeting is immutable during live finals, partials, and row trimming; h
 });
 test('one speech origin, stable chronological copy, and original offsets survive late finals',()=>{
  const h=harness();start(h);h.ctx.appendDeltas([d(0,19000,'later'),d(1,17000,'first','mic'),d(2,36000,'last')]);
- const payload=h.ctx.livePayload();assert.match(payload.text,/\[00:00:00\] me: first/);assert.match(payload.text,/\[00:00:02\] them: later/);assert.match(payload.text,/\[00:00:19\] them: last/);assert.ok(payload.text.indexOf('first')<payload.text.indexOf('later'));
+ const payload=h.ctx.livePayload();assert.match(payload.text,/\[00:00:00 \| 7:00:18 PM EST\] me: first/);assert.match(payload.text,/\[00:00:02 \| 7:00:20 PM EST\] them: later/);assert.match(payload.text,/\[00:00:19 \| 7:00:37 PM EST\] them: last/);assert.ok(payload.text.indexOf('first')<payload.text.indexOf('later'));
  assert.deepEqual(JSON.parse(h.run('JSON.stringify(liveSegments.map(s=>s.start_ms))')),[17000,19000,36000]);
- assert.match(h.document.getElementById('segments').textContent,/0:00mefirst/);
+ assert.match(h.document.getElementById('segments').textContent,/00:00:00 \| 7:00:18 PM ESTmefirst/);
 });
 test('navigation does not reset the live buffer; stale sessions and repeated finals do not mix',()=>{
  const h=harness();start(h);h.ctx.appendDeltas([d(0,17000,'once'),d(0,17000,'once')]);h.old();h.ctx.appendDeltas([d(1,36000,'hidden')]);h.ctx.showLive();
  assert.equal((h.ctx.livePayload().text.match(/once/g)||[]).length,1);assert.match(h.ctx.livePayload().text,/hidden/);
- start(h,'C');h.ctx.appendDeltas([d(2,40000,'stale'),d(0,3000,'new','mic','C')]);assert.doesNotMatch(h.ctx.livePayload().text,/stale|hidden|once/);assert.match(h.ctx.livePayload().text,/\[00:00:00\] me: new/);
+ start(h,'C');h.ctx.appendDeltas([d(2,40000,'stale'),d(0,3000,'new','mic','C')]);assert.doesNotMatch(h.ctx.livePayload().text,/stale|hidden|once/);assert.match(h.ctx.livePayload().text,/\[00:00:00 \| 7:00:04 PM EST\] me: new/);
 });
 test('complete copy survives DOM cap and no mounted transcript; partials never establish zero',()=>{
  const h=harness();start(h);h.ctx.appendDeltas([{...d(-1,1000,'partial'),is_final:false}]);assert.doesNotMatch(h.ctx.livePayload().text,/partial/);
  h.ctx.clear(h.nodes.get('detail'));h.ctx.appendDeltas(Array.from({length:205},(_,i)=>d(i,17000+i*1000,'line'+i)));
- h.ctx.showLive();assert.equal(h.document.getElementById('segments').children.length,200);assert.match(h.ctx.livePayload().text,/\[00:00:00\] them: line0\n/);assert.match(h.ctx.livePayload().text,/line204/);
+ h.ctx.showLive();assert.equal(h.document.getElementById('segments').children.length,200);assert.match(h.ctx.livePayload().text,/\[00:00:00 \| 7:00:18 PM EST\] them: line0\n/);assert.match(h.ctx.livePayload().text,/line204/);
 });
 test('saved copy rebases both channels and leaves canonical input untouched',()=>{
  const h=harness(),segments=[d(0,36000,'later'),d(1,17000,'first','mic')];const before=JSON.stringify(segments);
  const payload=h.ctx.storedTranscriptPayload({meeting:{title:'Saved',started_at_ms:1000},segments});
- assert.match(payload.text,/\[00:00:00\] me: first/);assert.match(payload.text,/\[00:00:19\] them: later/);assert.equal(JSON.stringify(segments),before);
+ assert.match(payload.text,/\[00:00:00 \| 7:00:18 PM EST\] me: first/);assert.match(payload.text,/\[00:00:19 \| 7:00:37 PM EST\] them: later/);assert.equal(JSON.stringify(segments),before);
+});
+
+test('live rows and copy acquire the capture clock during finishing and retain it after idle',()=>{
+ const h=harness();h.ctx.refreshLibrary=()=>{};
+ h.ctx.renderRecording({state:'starting',session_id:'B'});
+ h.ctx.showLive();
+ h.ctx.appendDeltas([d(0,17000,'first')]);
+ assert.equal(h.document.getElementById('segments').children[0].children[0].textContent,'00:00:00');
+ h.ctx.renderRecording({state:'finishing',session_id:'B',started_at_ms:Date.parse('2026-07-14T14:05:12Z')});
+ h.ctx.renderRecording({state:'idle'});
+ assert.equal(h.document.getElementById('segments').children[0].children[0].textContent,'00:00:00 | 10:05:29 AM EDT');
+ assert.match(h.ctx.livePayload().text,/\[00:00:00 \| 10:05:29 AM EDT\] them: first/);
 });
 
 test('late saved-meeting responses cannot replace a newer selection or the live pane',async()=>{
@@ -72,7 +84,7 @@ test('snapshot merges newer socket finals, retains full origin, and ignores resp
  const h=harness();start(h);await Promise.resolve();let reply;h.ctx.api=()=>new Promise(resolve=>reply=resolve);
  const pending=h.ctx.recoverLiveHistory();h.ctx.appendDeltas([d(2,36000,'socket')]);
  reply({session_id:'B',deltas:[d(1,19000,'snapshot')],speech_origin_ms:17000,truncated:true});await pending;
- assert.match(h.ctx.livePayload().text,/\[00:00:02\] them: snapshot/);assert.match(h.ctx.livePayload().text,/\[00:00:19\] them: socket/);
+ assert.match(h.ctx.livePayload().text,/\[00:00:02 \| 7:00:20 PM EST\] them: snapshot/);assert.match(h.ctx.livePayload().text,/\[00:00:19 \| 7:00:37 PM EST\] them: socket/);
  assert.match(h.document.getElementById('live-history').textContent,/unavailable/);
  const stale=h.ctx.recoverLiveHistory();const oldReply=reply;start(h,'C');oldReply({session_id:'B',deltas:[d(0,0,'stale')],speech_origin_ms:0,truncated:false});await stale;
  assert.doesNotMatch(h.ctx.livePayload().text,/stale/);
@@ -102,12 +114,12 @@ test('saved handoff cannot steal a user navigation that is still loading',async(
  reply({meeting:{id:'chosen-old'}});await pending;assert.equal(h.nodes.get('detail').textContent,'chosen-old');
 });
 
-test('UI and Rust exports share the same zero, leading-silence and multi-hour contract',()=>{
+test('UI and Rust exports share elapsed and Eastern labels across date and DST transitions',()=>{
  const h=harness();
  for (const fixture of require('../fixtures/transcript-timing.json')) {
   const segments=fixture.offsets.map((ms,i)=>d(i,ms,'word'+i));
   assert.equal(h.ctx.speechOrigin(segments),fixture.origin);
-  const payload=h.ctx.storedTranscriptPayload({meeting:{title:'Shared fixture',started_at_ms:1000},segments});
+  const payload=h.ctx.storedTranscriptPayload({meeting:{title:'Shared fixture',started_at_ms:fixture.capture_start_ms},segments});
   fixture.labels.forEach(label=>{assert.ok(payload.text.includes('['+label+']'));assert.ok(payload.html.includes('['+label+']'));});
  }
 });

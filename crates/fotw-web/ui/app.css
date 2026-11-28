@@ -331,7 +331,7 @@ button, summary { min-height: 36px; }
    page instead of stepping in and out as the timestamps change width. */
 .segment {
   display: grid;
-  grid-template-columns: 3.5rem 2.5rem 1fr;
+  grid-template-columns: 12rem 2.5rem minmax(0, 1fr);
   gap: 0 8px;
   margin: 0 0 6px;
   align-items: baseline;

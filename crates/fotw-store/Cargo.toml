@@ -44,6 +44,7 @@ rusqlite_migration = "2.6"
 # being one, which is what keeps the door open for sync (§9.7 invariant 1).
 uuid = { version = "1", features = ["v7"] }
 base64 = "0.22"
+jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-zoneinfo", "tzdb-bundle-platform"] }
 
 [dev-dependencies]
 tempfile = "3"

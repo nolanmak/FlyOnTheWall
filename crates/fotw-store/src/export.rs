@@ -5,7 +5,7 @@
 //! * **Markdown with YAML frontmatter** — for a human, and specifically for
 //!   Obsidian, where the frontmatter is the only reason the file is a *note*
 //!   rather than a wall of text.
-//! * **Plain text** — the transcript as `[00:12:34] Alice: …`.
+//! * **Plain text** — the transcript as `[00:12:34 | 11:41:09 AM EDT] Alice: …`.
 //! * **JSON, `flyonthewall/meeting@1`** — everything. Every segment, every word
 //!   timing, every note anchor, every summary version, all provenance.
 //!
@@ -1197,7 +1197,7 @@ impl MeetingDoc {
         out
     }
 
-    /// The transcript as `[00:12:34] Alice: …` (issue #37).
+    /// The transcript as `[00:12:34 | 11:41:09 AM EDT] Alice: …` (issue #37).
     #[must_use]
     pub fn to_plain_text(&self) -> String {
         let m = &self.meeting;
@@ -1313,7 +1313,7 @@ impl MeetingDoc {
         out
     }
 
-    /// `[00:12:34] Alice: …`, one segment per line.
+    /// `[00:12:34 | 11:41:09 AM EDT] Alice: …`, one segment per line.
     ///
     /// `prefix` is `"- "` for Markdown and empty for plain text, and that is
     /// not cosmetic: CommonMark joins consecutive lines into one paragraph, so
@@ -1330,6 +1330,7 @@ impl MeetingDoc {
             return String::new();
         };
         let mut lines = String::from("Time since first speech\n\n");
+        let clock = TranscriptClock::new(self.meeting.started_at_ms);
         for s in rows {
             let who = s
                 .speaker_label
@@ -1342,7 +1343,7 @@ impl MeetingDoc {
             let text = s.text.replace(['\n', '\r'], " ");
             lines.push_str(&format!(
                 "{prefix}[{}] {who}: {text}\n",
-                hms(s.start_ms.saturating_sub(origin))
+                clock.label(s.start_ms.saturating_sub(origin), s.start_ms)
             ));
         }
         lines
@@ -1562,6 +1563,44 @@ pub fn parse_yaml_scalar(s: &str) -> String {
     serde_json::from_str::<String>(s.trim()).unwrap_or_else(|_| s.trim().to_owned())
 }
 
+/// Eastern wall-clock labels derived from one recording's capture start.
+pub struct TranscriptClock(Option<jiff::Zoned>);
+
+impl TranscriptClock {
+    /// Anchor clock labels to the original UTC capture timestamp.
+    #[must_use]
+    pub fn new(capture_start_ms: i64) -> Self {
+        let start = jiff::Timestamp::from_millisecond(capture_start_ms)
+            .and_then(|instant| instant.in_tz("America/New_York"))
+            .ok();
+        Self(start)
+    }
+
+    /// Combine the display-relative elapsed time and the original capture offset.
+    #[must_use]
+    pub fn label(&self, elapsed_ms: i64, source_offset_ms: i64) -> String {
+        let elapsed = hms(elapsed_ms);
+        let Some(start) = &self.0 else {
+            return elapsed;
+        };
+        let Some(at) = start
+            .timestamp()
+            .as_millisecond()
+            .checked_add(source_offset_ms)
+            .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
+        else {
+            return elapsed;
+        };
+        let at = at.to_zoned(start.time_zone().clone());
+        let format = if at.date() == start.date() {
+            "%-I:%M:%S %p %Z"
+        } else {
+            "%Y-%m-%d %-I:%M:%S %p %Z"
+        };
+        format!("{elapsed} | {}", at.strftime(format))
+    }
+}
+
 /// `HH:MM:SS` from milliseconds, saturating rather than panicking on a
 /// nonsense duration.
 fn hms(ms: i64) -> String {
@@ -1576,10 +1615,8 @@ fn hms(ms: i64) -> String {
 
 /// `YYYY-MM-DD` UTC from epoch milliseconds.
 ///
-/// Hand-rolled because the alternative is a date crate for one format string,
-/// and the civil-from-days algorithm is exact for the whole i64 range that
-/// matters here — including the pre-1970 timestamps a corrected meeting start
-/// can produce, which is where a naive `ms / 86_400_000` is off by a day.
+/// The civil-from-days algorithm supports the whole i64 millisecond range.
+/// Euclidean division keeps pre-1970 timestamps on the correct date.
 fn iso_date(ms: i64) -> String {
     let days = ms.div_euclid(86_400_000);
     let (y, m, d) = civil_from_days(days);

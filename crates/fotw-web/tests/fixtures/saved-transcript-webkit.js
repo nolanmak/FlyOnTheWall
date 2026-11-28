@@ -31,7 +31,7 @@ result.last_line_reachable=document.getElementById('segments').textContent.inclu
 result.final_clock=document.querySelector('#segments .at').textContent;
 result.copy_complete=storedTranscriptPayload(detail).text.includes('Synthetic line 0 —')&&storedTranscriptPayload(detail).text.includes('Synthetic line 12000 —');
 result.final_next_disabled=next.disabled;
-if(!result.focus_preserved||!result.last_line_reachable||!result.copy_complete||!result.final_next_disabled||result.final_clock!=='600:00')throw Error(JSON.stringify(result));
+if(!result.focus_preserved||!result.last_line_reachable||!result.copy_complete||!result.final_next_disabled||!result.final_clock.startsWith('10:00:00 | '))throw Error(JSON.stringify(result));
 field.value='60';field.dispatchEvent(new Event('change'));next.focus();next.click();
 result.last_boundary_focus=document.activeElement===field;
 field.value='2';field.dispatchEvent(new Event('change'));

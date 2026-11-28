@@ -423,7 +423,7 @@
         li.appendChild(make('span', ' ' + (f.reason || '')));
         for (const index of f.indices || []) {
           const seg = segments.find(s => s.index === index);
-          const label = seg ? offset(seg.offset_ms) + ' · ' + seg.speaker + ': ' + seg.text : 'Excerpt ' + index;
+          const label = seg ? seg.timestamp + ' · ' + seg.speaker + ': ' + seg.text : 'Excerpt ' + index;
           const link = li.appendChild(button(label, 'release-finding-' + i + '-excerpt-' + index, 'release-link'));
           link.addEventListener('click', () => {
             const target = segRows.get(index);
@@ -456,7 +456,7 @@
         const box = label.appendChild(input('release-cut-' + seg.index, 'checkbox'));
         box.checked = seg.retained === true;
         box.disabled = true;
-        label.appendChild(make('span', ' ' + offset(seg.offset_ms) + ' · ' + seg.speaker + ' — ' + seg.text));
+        label.appendChild(make('span', ' ' + seg.timestamp + ' · ' + seg.speaker + ' — ' + seg.text));
         segRows.set(seg.index, label);
         boxes.push([seg.index, box]);
       }

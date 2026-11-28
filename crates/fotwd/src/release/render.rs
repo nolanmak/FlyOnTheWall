@@ -6,7 +6,9 @@
 //! segment, or one from another meeting, cannot appear (D6, OT2). It is not the
 //! browser `sharingMarkdown` function and never includes the sharing brief.
 
-use super::cut::{hms, segment};
+use fotw_store::export::TranscriptClock;
+
+use super::cut::segment;
 use super::summary::plain;
 use super::types::{
     Bullet, IndexMap, Payload, PrepareError, PrepareInput, ReleaseSummary, Section,
@@ -169,6 +171,7 @@ fn attachment(
         zoned.strftime("%Y-%m-%d %H:%M %Z"),
         zoned.time_zone().iana_name().unwrap_or("UTC")
     ));
+    let clock = TranscriptClock::new(input.started_at_ms);
     let mut map = Vec::new();
     let mut next = 0;
     for index in kept {
@@ -179,7 +182,9 @@ fn attachment(
             continue;
         };
         let text = fotw_web::documents::corrected_names(&s.text, &corrections);
-        let (first, last) = doc.block(&format!("**{} · {}** {text}", hms(s.offset_ms), s.speaker));
+        let offset = i64::try_from(s.offset_ms).unwrap_or(i64::MAX);
+        let stamp = clock.label(offset, offset);
+        let (first, last) = doc.block(&format!("**{stamp} · {}** {text}", s.speaker));
         map.push((first, last, index));
         next = index + 1;
     }
@@ -241,14 +246,17 @@ mod tests {
         assert_eq!(lines[2], "Meeting: 2026-11-25 22:00 EST (America/New_York)");
         assert_eq!(
             lines[4],
-            "**00:00:00 · S1** Ship the onboarding checklist by Friday."
+            "**00:00:00 | 10:00:00 PM EST · S1** Ship the onboarding checklist by Friday."
         );
         assert_eq!(lines[6], "*[… 1 segments omitted …]*");
         assert_eq!(
             lines[8],
-            "**00:02:10 · S1** [John] will draft the release notes."
+            "**00:02:10 | 10:02:10 PM EST · S1** [John] will draft the release notes."
         );
-        assert_eq!(lines[10], "**00:03:15 · S2** Thanks all, talk next week.");
+        assert_eq!(
+            lines[10],
+            "**00:03:15 | 10:03:15 PM EST · S2** Thanks all, talk next week."
+        );
         assert_eq!(lines[12], "*[… remainder omitted …]*");
         assert_eq!(lines.len(), 13);
         assert_eq!(

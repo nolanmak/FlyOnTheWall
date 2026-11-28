@@ -82,7 +82,7 @@ test('page selection uses the full speech clock, validates input and retains con
  const field=h.all().find(n=>n['aria-label']==='Transcript page');
  assert.ok(field,'page number is keyboard accessible');
  field.value='3';field.listeners.change();
- assert.match(h.document.getElementById('segments').textContent,/6:40S0line 400/);
+ assert.match(h.document.getElementById('segments').textContent,/00:06:40 \| 7:06:58 PM ESTS0line 400/);
  assert.equal(h.all().find(n=>n['aria-label']==='Transcript page'),field);
  const count=h.rowsCreated;field.value='NaN';field.listeners.change();assert.equal(field.value,'3');assert.equal(h.rowsCreated,count);
  field.value='999';field.listeners.change();assert.equal(field.value,'4');assert.match(h.document.getElementById('segments').textContent,/line 600/);
@@ -92,6 +92,6 @@ test('page selection uses the full speech clock, validates input and retains con
 test('short and empty transcripts do not introduce paging and keep sorted speech-relative times',()=>{
  const h=harness();render(h,[{...segments(1)[0],start_ms:36000,text:'later'},{...segments(1)[0],text:'first'}]);
  assert.equal(h.button('Next transcript page'),undefined);
- assert.match(h.document.getElementById('segments').textContent,/0:00S0first0:19later/);
+ assert.match(h.document.getElementById('segments').textContent,/00:00:00 \| 7:00:18 PM ESTS0first00:00:19 \| 7:00:37 PM ESTlater/);
  render(h,[]);assert.equal(h.document.getElementById('segments').children.length,0);
 });
