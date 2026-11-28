@@ -299,7 +299,7 @@ function mountSharingDocument(detail, host) {
     selection.appendChild(selectionTitle);
     selection.appendChild(text("p", "Uncheck anything you don’t want in the file. The original meeting stays intact.", "meta"));
     for (const e of editor.document.excerpts) {
-      selection.appendChild(checkbox(sharingTranscriptOffset(editor.document, e.offset_ms) + " · " + e.text, !editor.excluded.has(e.index), keep => {
+      selection.appendChild(checkbox(sharingTranscriptOffset(editor.document, e.offset_ms) + " | " + sharingTime(e.at_ms) + " · " + e.text, !editor.excluded.has(e.index), keep => {
         if (keep) editor.excluded.delete(e.index); else editor.excluded.add(e.index);
         selectionTitle.textContent = "Selected transcript · " + sharingSelection(editor).length + " excerpts";
         markDirty();

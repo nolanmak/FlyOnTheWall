@@ -45,6 +45,7 @@ fn detail(state: &str, reasons: &[&str]) -> OutboxDetail {
         segments: vec![OutboxSegment {
             index: 3,
             offset_ms: 12_000,
+            timestamp: "00:00:12 | 10:00:12 AM EST".into(),
             speaker: "Ada".into(),
             text: "Hello".into(),
             retained: true,

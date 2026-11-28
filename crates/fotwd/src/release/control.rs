@@ -555,15 +555,20 @@ fn build_detail(db: &mut Db, row: &ReleaseRow) -> OutboxDetail {
                 .as_ref()
                 .map(|c| c.retained(input.segments.len()))
                 .unwrap_or_default();
+            let clock = fotw_store::export::TranscriptClock::new(input.started_at_ms);
             input
                 .segments
                 .into_iter()
-                .map(|s| OutboxSegment {
-                    retained: retained.binary_search(&s.index).is_ok(),
-                    index: s.index,
-                    offset_ms: s.offset_ms,
-                    speaker: s.speaker,
-                    text: s.text,
+                .map(|s| {
+                    let offset = i64::try_from(s.offset_ms).unwrap_or(i64::MAX);
+                    OutboxSegment {
+                        retained: retained.binary_search(&s.index).is_ok(),
+                        index: s.index,
+                        offset_ms: s.offset_ms,
+                        timestamp: clock.label(offset, offset),
+                        speaker: s.speaker,
+                        text: s.text,
+                    }
                 })
                 .collect()
         })

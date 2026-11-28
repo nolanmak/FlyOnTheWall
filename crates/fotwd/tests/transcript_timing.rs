@@ -227,7 +227,7 @@ async fn check_capture(speech_ms: u64, mic_delay: Duration) {
         old_before
     );
     let doc = db.export_meeting(&new).unwrap();
-    assert!(doc.to_plain_text().contains("[00:00:00]"));
+    assert!(doc.to_plain_text().contains("[00:00:00 | "));
     assert!(doc.segments.iter().all(|s| s.start_ms >= speech_ms as i64));
     sys_task.await.unwrap();
     mic_task.await.unwrap();

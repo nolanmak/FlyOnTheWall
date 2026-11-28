@@ -211,9 +211,9 @@ function detail(itemExtra = {}, extra = {}) {
       { category: 'confidential', indices: [], bullet: ['summary', 1], reason: 'Quotes a price' },
     ],
     segments: [
-      { index: 0, offset_ms: 0, speaker: 'Ada', text: 'Hello all', retained: true },
-      { index: 1, offset_ms: 65000, speaker: 'Lin', text: 'About my doctor visit', retained: true },
-      { index: 2, offset_ms: 130000, speaker: 'Ada', text: 'Off the record', retained: false },
+      { index: 0, offset_ms: 0, timestamp: '00:00:00 | 10:00:00 AM EST', speaker: 'Ada', text: 'Hello all', retained: true },
+      { index: 1, offset_ms: 65000, timestamp: '00:01:05 | 10:01:05 AM EST', speaker: 'Lin', text: 'About my doctor visit', retained: true },
+      { index: 2, offset_ms: 130000, timestamp: '00:02:10 | 10:02:10 AM EST', speaker: 'Ada', text: 'Off the record', retained: false },
     ],
     ...extra,
   };
@@ -278,7 +278,7 @@ test('the detail shows the stored copy, frozen recipients, every reason and link
   assert.match(reasons, /first release/i);
   // A finding with indices links to its excerpt.
   const excerpt = w.byId('release-finding-0-excerpt-1');
-  assert.match(excerpt.textContent, /00:01:05 · Lin/);
+  assert.match(excerpt.textContent, /00:01:05 \| 10:01:05 AM EST · Lin/);
   assert.match(excerpt.textContent, /doctor visit/);
   await excerpt.click();
   assert.equal(w.byId('release-seg-1').scrolled, true);

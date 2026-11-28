@@ -1,5 +1,9 @@
 [
-  {"offsets": [17000, 36000], "origin": 17000, "labels": ["00:00:00", "00:00:19"]},
-  {"offsets": [0, 19000], "origin": 0, "labels": ["00:00:00", "00:00:19"]},
-  {"offsets": [90000, 7389000], "origin": 90000, "labels": ["00:00:00", "02:01:39"]}
+  {"offsets": [17000, 36000], "origin": 17000, "labels": ["00:00:00 | 7:00:18 PM EST", "00:00:19 | 7:00:37 PM EST"], "capture_start_ms": 1000},
+  {"offsets": [0, 19000], "origin": 0, "labels": ["00:00:00 | 7:00:01 PM EST", "00:00:19 | 7:00:20 PM EST"], "capture_start_ms": 1000},
+  {"offsets": [90000, 7389000], "origin": 90000, "labels": ["00:00:00 | 7:01:31 PM EST", "02:01:39 | 9:03:10 PM EST"], "capture_start_ms": 1000},
+  {"capture_start_ms": 1784037912000, "offsets": [17000, 36000], "origin": 17000, "labels": ["00:00:00 | 10:05:29 AM EDT", "00:00:19 | 10:05:48 AM EDT"]},
+  {"capture_start_ms": 1784087990000, "offsets": [5000, 12000], "origin": 5000, "labels": ["00:00:00 | 11:59:55 PM EDT", "00:00:07 | 2026-07-15 12:00:02 AM EDT"]},
+  {"capture_start_ms": 1772953190000, "offsets": [5000, 12000], "origin": 5000, "labels": ["00:00:00 | 1:59:55 AM EST", "00:00:07 | 3:00:02 AM EDT"]},
+  {"capture_start_ms": 1793510990000, "offsets": [10000, 3610000], "origin": 10000, "labels": ["00:00:00 | 1:30:00 AM EDT", "01:00:00 | 1:30:00 AM EST"]}
 ]

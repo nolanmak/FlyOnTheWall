@@ -176,12 +176,26 @@ function duration(ms) {
   return mins < 60 ? mins + " min" : Math.floor(mins / 60) + " h " + (mins % 60) + " min";
 }
 
-// mm:ss from the start of the meeting, so a segment can be found in the audio.
-function offset(ms) {
-  const total = Math.floor((ms || 0) / 1000);
-  const mins = Math.floor(total / 60);
-  const secs = total % 60;
-  return mins + ":" + String(secs).padStart(2, "0");
+const easternClock = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York", hour: "numeric", minute: "2-digit", second: "2-digit",
+  hour12: true, timeZoneName: "short",
+});
+const easternDate = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit",
+});
+
+function transcriptTimestamp(elapsedMs, captureStart, sourceOffset) {
+  const elapsed = elapsedMs === null ? "…" : hms(elapsedMs);
+  if (!Number.isFinite(captureStart)) return elapsed;
+  const start = new Date(captureStart);
+  const instant = new Date(captureStart + sourceOffset);
+  if (!Number.isFinite(start.getTime()) || !Number.isFinite(instant.getTime())) return elapsed;
+  let clock = easternClock.format(instant);
+  if (easternDate.format(instant) !== easternDate.format(start)) {
+    const date = Object.fromEntries(easternDate.formatToParts(instant).map(p => [p.type, p.value]));
+    clock = date.year + "-" + date.month + "-" + date.day + " " + clock;
+  }
+  return elapsed + " | " + clock;
 }
 
 // A meeting still recording has no duration yet, and showing its state is more
@@ -510,7 +524,7 @@ function renderDetail(detail) {
   transcript.appendChild(text("p", "Time since first speech", "meta"));
   const body = document.createElement("div");
   body.id = "segments";
-  mountSavedTranscript(transcript, body, detail.segments);
+  mountSavedTranscript(transcript, body, detail.segments, detail.meeting.started_at_ms);
   transcript.appendChild(body);
   el.detail.appendChild(transcript);
   paintLiveNavigation();
@@ -602,12 +616,12 @@ function say(message) {
 // (#64) — capture keeps the legs on separate devices precisely so this is
 // free, and the styling in app.css is where it becomes visible. The words
 // live in a `.words` span because `.segment` is a three-column grid: a bare
-// text node lands in the 3.5rem time column, which is how the live view
+// text node lands in the time column, which is how the live view
 // shipped rendering two characters per line (#65).
-function segmentRow(channel, startMs, speaker, words, lastSpeaker) {
+function segmentRow(channel, stamp, speaker, words, lastSpeaker) {
   const line = document.createElement("p");
   line.className = "segment " + (channel || "");
-  line.appendChild(text("span", startMs === null ? "…" : offset(startMs), "at"));
+  line.appendChild(text("span", stamp, "at"));
   // Only when it changes. Repeating "S0" on ten consecutive lines is noise
   // that makes the actual turn-taking harder to see, not easier.
   if (speaker && speaker !== lastSpeaker) {
@@ -620,7 +634,7 @@ function segmentRow(channel, startMs, speaker, words, lastSpeaker) {
 // Page saved history rather than attaching a whole meeting to the layout tree.
 // The complete immutable detail still backs copy/export; each page uses the
 // same first-speech origin. Stable controls preserve keyboard focus on changes.
-function mountSavedTranscript(section, body, segments) {
+function mountSavedTranscript(section, body, segments, captureStart) {
   const ordered = orderedSegments(segments), origin = ordered[0]?.start_ms ?? 0;
   const pageSize = 200, pages = Math.ceil(ordered.length / pageSize);
   let page = 0, controls, field, previous, next, range;
@@ -630,7 +644,8 @@ function mountSavedTranscript(section, body, segments) {
     const start = page * pageSize, end = Math.min(start + pageSize, ordered.length);
     for (let index = start; index < end; index++) {
       const seg = ordered[index];
-      body.appendChild(segmentRow(seg.channel, seg.start_ms - origin, seg.speaker, seg.text, lastSpeaker));
+      const stamp = transcriptTimestamp(seg.start_ms - origin, captureStart, seg.start_ms);
+      body.appendChild(segmentRow(seg.channel, stamp, seg.speaker, seg.text, lastSpeaker));
       lastSpeaker = seg.speaker || lastSpeaker;
     }
     if (controls) {
@@ -642,7 +657,7 @@ function mountSavedTranscript(section, body, segments) {
       previous.disabled = page === 0;
       next.disabled = page === pages - 1;
       range.textContent = "Lines " + (start + 1) + "–" + end + " of " + ordered.length
-        + " · " + offset(ordered[start].start_ms - origin) + "–" + offset(ordered[end - 1].start_ms - origin);
+        + " · " + hms(ordered[start].start_ms - origin) + "–" + hms(ordered[end - 1].start_ms - origin);
     }
   };
   const select = requested => {
@@ -874,6 +889,7 @@ function speechOrigin(segments) {
   return orderedSegments(segments)[0]?.start_ms ?? null;
 }
 let liveSessionId = null;
+let liveCaptureStart = null;
 let liveFinals = new Map();
 let livePartials = new Map();
 // Per channel: the end of the latest final or clearing event. A live caption
@@ -885,6 +901,7 @@ let liveSavedMeetingId = null;
 function selectLiveSession(id) {
   if (!id || id === liveSessionId) return;
   liveSessionId = id;
+  liveCaptureStart = null;
   liveFinals = new Map();
   livePartials = new Map();
   liveCovered = new Map();
@@ -991,10 +1008,11 @@ function renderLiveTranscript(forceFollow = false) {
   for (const {key, d, partial} of visible) {
     const at = origin !== null && d.start_ms >= origin ? d.start_ms - origin : null;
     const speaker = partial && d.channel === "mic" ? "me" : d.speaker;
-    const signature = JSON.stringify([d.channel, at, speaker, d.text, partial]);
+    const signature = JSON.stringify([d.channel, at, liveCaptureStart, d.start_ms, speaker, d.text, partial]);
     let cached = previous.get(key);
     if (!cached || cached.signature !== signature) {
-      const row = segmentRow(d.channel, at, speaker, d.text, null);
+      const stamp = transcriptTimestamp(at, liveCaptureStart, d.start_ms);
+      const row = segmentRow(d.channel, stamp, speaker, d.text, null);
       if (partial) row.classList.add("pending");
       if (cached) cached.row.replaceWith(row);
       cached = {signature, row};
@@ -1157,7 +1175,13 @@ let autoOpenedSession = null;
 
 function renderRecording(body) {
   noteClock?.update(body);
-  if (body.session_id) selectLiveSession(body.session_id);
+  if (body.session_id) {
+    selectLiveSession(body.session_id);
+    if (Number.isFinite(body.started_at_ms) && liveCaptureStart !== body.started_at_ms) {
+      liveCaptureStart = body.started_at_ms;
+      renderLiveTranscript();
+    }
+  }
   const was = recState;
   // Anything the daemon does not name is treated as idle. An unrecognised
   // word must never be the one that leaves a clock running.
@@ -2068,10 +2092,6 @@ async function onSummarizeSave() {
 const COPY_REFUSED =
   "Could not copy — the browser refused the clipboard. Click this page, then press the button again.";
 
-// `[00:12:34]`, the shape `fotwd export --format txt` writes, rather than the
-// pane's `m:ss`. That column is for scanning a transcript beside its audio; a
-// line pasted into a document is read on its own, hours later, among other
-// people's text.
 function hms(ms) {
   const total = Math.max(0, Math.floor((ms || 0) / 1000));
   const pad = (n) => String(n).padStart(2, "0");
@@ -2145,12 +2165,12 @@ function serialize(root) {
 
 // Fills `root` with one paragraph per utterance and returns the matching plain
 // text, so both flavors come out of one loop and cannot drift apart.
-function transcriptBody(root, segments, origin = speechOrigin(segments)) {
+function transcriptBody(root, segments, captureStart, origin = speechOrigin(segments)) {
   root.appendChild(text("p", "Time since first speech"));
   let plain = "Time since first speech\n\n";
   for (const seg of orderedSegments(segments)) {
     const head =
-      "[" + hms(seg.start_ms - origin) + "] " + speakerFor(seg.speaker, seg.channel) + ":";
+      "[" + transcriptTimestamp(seg.start_ms - origin, captureStart, seg.start_ms) + "] " + speakerFor(seg.speaker, seg.channel) + ":";
     // One line in, one line out. Providers emit newlines inside a segment: in
     // the plain flavor a stray one hides the next timestamp, and in the rich one
     // it collapses to a space anyway. `transcript_lines` flattens for the same
@@ -2194,7 +2214,7 @@ function summaryPayload(detail) {
 function storedTranscriptPayload(detail) {
   const title = detail.meeting.title || "Untitled meeting";
   const root = copyDoc(title, detail.meeting.started_at_ms);
-  const plain = transcriptBody(root, detail.segments);
+  const plain = transcriptBody(root, detail.segments, detail.meeting.started_at_ms);
   return {
     text: plainHead(title, when(detail.meeting.started_at_ms)) + plain,
     html: serialize(root),
@@ -2211,7 +2231,7 @@ function storedTranscriptPayload(detail) {
 function livePayload() {
   const root = document.createElement("div");
   if (liveHistoryMissing) root.appendChild(text("p", "Some live history is unavailable; this copy may be incomplete."));
-  const plain = transcriptBody(root, liveSegments, liveOrigin());
+  const plain = transcriptBody(root, liveSegments, liveCaptureStart, liveOrigin());
   return {
     text: (liveHistoryMissing ? "Some live history is unavailable; this copy may be incomplete.\n\n" : "") + plain,
     html: serialize(root),

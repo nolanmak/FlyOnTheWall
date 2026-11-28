@@ -134,6 +134,8 @@ pub struct OutboxSegment {
     pub index: usize,
     /// Offset from capture start, ms.
     pub offset_ms: u64,
+    /// Capture-relative elapsed time and the Eastern clock time.
+    pub timestamp: String,
     /// Speaker label.
     pub speaker: String,
     /// Source text.
