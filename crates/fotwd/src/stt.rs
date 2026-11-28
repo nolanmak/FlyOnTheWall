@@ -180,7 +180,7 @@ pub(crate) fn fallback_transcription_with(
 ) -> Transcription {
     Transcription::PreparingFailover(Box::pin(async move {
         let (engine, revision) = if settings.uses_parakeet() {
-            parakeet_factory(data_root, detector, launch).await?
+            parakeet_factory(data_root, detector, launch, None).await?
         } else {
             tokio::task::spawn_blocking(move || pinned_local_model(&settings, &data_root))
                 .await
@@ -257,12 +257,39 @@ fn pinned_local_model(
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn saved_local_model(
+pub(crate) async fn saved_local_model(
     plan: &crate::failover::coverage::LocalPlan,
     candidate: &Path,
     data_root: &Path,
 ) -> Result<std::sync::Arc<dyn fotw_stt::RecognizerFactory>, String> {
-    saved_local_model_with(plan, candidate, data_root, &VAD_MODEL)
+    plan.validate().map_err(|e| e.to_string())?;
+    if plan.engine.provider == fotw_stt::speechd::PROVIDER {
+        if plan.engine.model != crate::speechd::ENGINE {
+            return Err("Saved speech helper model is unsupported; audio retained".into());
+        }
+        let revision = plan
+            .engine
+            .revision
+            .as_deref()
+            .ok_or("Saved Parakeet plan has no recorded revision; audio retained")?;
+        let (factory, _) = parakeet_factory(
+            data_root.to_owned(),
+            &VAD_MODEL,
+            crate::speechd::Launch::bundled,
+            Some(revision),
+        )
+        .await?;
+        return Ok(factory);
+    }
+
+    let plan = plan.clone();
+    let candidate = candidate.to_owned();
+    let data_root = data_root.to_owned();
+    tokio::task::spawn_blocking(move || {
+        saved_local_model_with(&plan, &candidate, &data_root, &VAD_MODEL)
+    })
+    .await
+    .map_err(|_| "saved model verification failed".to_owned())?
 }
 
 #[cfg(target_os = "macos")]
@@ -273,10 +300,6 @@ fn saved_local_model_with(
     detector: &'static KnownModel,
 ) -> Result<std::sync::Arc<dyn fotw_stt::RecognizerFactory>, String> {
     use fotw_stt::RecognizerFactory;
-    if plan.engine.provider == fotw_stt::speechd::PROVIDER {
-        return Err("Parakeet recovery isn't supported yet; the audio is kept.".into());
-    }
-    plan.validate().map_err(|e| e.to_string())?;
     let digest = plan
         .engine
         .revision
@@ -402,7 +425,7 @@ impl fotw_stt::RecognizerFactory for SavedFactory {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn saved_local_model(
+pub(crate) async fn saved_local_model(
     _plan: &crate::failover::coverage::LocalPlan,
     _candidate: &Path,
     _data_root: &Path,
@@ -749,7 +772,8 @@ pub(crate) fn local_transcription_with(
         // file, there is nothing to record an expected identity against, and
         // the fix (install it) is one command.
         if settings.uses_parakeet() {
-            let (engine, revision) = parakeet_factory(data_root, detector, move || launch).await?;
+            let (engine, revision) =
+                parakeet_factory(data_root, detector, move || launch, None).await?;
             let mut legs = crate::session::LocalLegs::for_session(
                 engine,
                 &session_id,
@@ -849,6 +873,7 @@ pub async fn prepare_parakeet(
         data_root.to_owned(),
         &VAD_MODEL,
         crate::speechd::Launch::bundled,
+        None,
     )
     .await
 }
@@ -873,6 +898,7 @@ async fn parakeet_factory(
     data_root: PathBuf,
     detector: &'static KnownModel,
     launch: impl FnOnce() -> Result<crate::speechd::Launch, String> + Send + 'static,
+    saved_revision: Option<&str>,
 ) -> Result<(std::sync::Arc<dyn fotw_stt::RecognizerFactory>, String), String> {
     let root = data_root.clone();
     // Without the gate, music and noise become text (#242).
@@ -880,7 +906,12 @@ async fn parakeet_factory(
         .await
         .map_err(|_| "speech detector check failed".to_owned())??;
     let launch = launch()?;
-    let (engine, revision) = crate::speechd::prepare(&launch, &data_root).await?;
+    let (engine, revision) = if let Some(revision) = saved_revision {
+        let engine = crate::speechd::prepare_recovery(&launch, &data_root, revision).await?;
+        (engine, revision.to_owned())
+    } else {
+        crate::speechd::prepare(&launch, &data_root).await?
+    };
     let gated = fotw_stt::GatedFactory::new(engine, move || {
         // Checked again per leg, as a Whisper leg checks its files.
         if !sha256_file(&vad).is_ok_and(|hash| hash == detector.sha256) {

@@ -26,7 +26,7 @@
 //! transcribed, with the saved per-source plan (docs/DURABLE_SPEECH.md). The
 //! cleanup reads only finished, archived meetings and always produces a new
 //! version. A recovered meeting is eligible for cleanup afterwards like any
-//! other, which is how saved Parakeet audio gets its Parakeet transcript.
+//! other.
 
 pub mod bleed;
 pub mod controller;

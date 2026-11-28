@@ -9,16 +9,24 @@ use fotw_stt::{RecognizerFactory, Source};
 use fotw_web::speech_recovery::{
     RecoveryError, RecoveryPhase, RecoverySource, RecoveryStatus, SpeechRecoveryControl,
 };
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU8, Ordering},
 };
 use std::time::{Duration, Instant};
 
-/// Installed factory resolver. Called on an owned worker without a database lock.
-pub type ModelResolver =
-    dyn Fn(&LocalPlan, &Path) -> Result<Arc<dyn RecognizerFactory>, String> + Send + Sync;
+type ResolvedModel = Result<Arc<dyn RecognizerFactory>, String>;
+
+/// Synchronous factory resolver for device-free fixtures.
+pub type ModelResolver = dyn Fn(&LocalPlan, &Path) -> ResolvedModel + Send + Sync;
+
+type ResolveFuture<'a> = Pin<Box<dyn Future<Output = ResolvedModel> + Send + 'a>>;
+/// Called on the owned recovery runtime without a database lock.
+type AsyncModelResolver =
+    dyn for<'a> Fn(&'a LocalPlan, &'a Path) -> ResolveFuture<'a> + Send + Sync;
 
 /// Lifetime of the bounded, local-only startup pass.
 pub struct StartupRecovery {
@@ -72,7 +80,7 @@ struct State {
 pub struct SavedSpeechRecovery {
     db: Arc<Mutex<Db>>,
     data_root: PathBuf,
-    resolver: Arc<ModelResolver>,
+    resolver: Arc<AsyncModelResolver>,
     prepare_timeout: Duration,
     progress_timeout: Duration,
     state: Arc<Mutex<State>>,
@@ -345,11 +353,14 @@ impl SavedSpeechRecovery {
     /// Production resolver checks the saved revision, never the current provider.
     pub fn new(db: Db, data_root: PathBuf) -> Self {
         let models = data_root.clone();
-        Self::with_parts(
+        Self::with_async_resolver(
             db,
             data_root,
             Arc::new(move |plan, candidate| {
-                crate::stt::saved_local_model(plan, candidate, &models)
+                let models = models.clone();
+                Box::pin(
+                    async move { crate::stt::saved_local_model(plan, candidate, &models).await },
+                )
             }),
             Duration::from_secs(30),
             Duration::from_secs(120),
@@ -360,6 +371,25 @@ impl SavedSpeechRecovery {
         db: Db,
         data_root: PathBuf,
         resolver: Arc<ModelResolver>,
+        prepare_timeout: Duration,
+        progress_timeout: Duration,
+    ) -> Self {
+        Self::with_async_resolver(
+            db,
+            data_root,
+            Arc::new(move |plan, candidate| {
+                let resolver = resolver.clone();
+                Box::pin(async move { resolver(plan, candidate) })
+            }),
+            prepare_timeout,
+            progress_timeout,
+        )
+    }
+
+    fn with_async_resolver(
+        db: Db,
+        data_root: PathBuf,
+        resolver: Arc<AsyncModelResolver>,
         prepare_timeout: Duration,
         progress_timeout: Duration,
     ) -> Self {
@@ -805,10 +835,22 @@ impl SavedSpeechRecovery {
                 RecoveryPhase::Partial => Some("Available saved speech recovered locally. The final recording time remains unknown and additional original audio is retained.".into()),
                 RecoveryPhase::Cancelled => Some("Local recovery cancelled. Audio retained for retry.".into()),
                 _ if job.stop.load(Ordering::Acquire) == 2 => Some("Local recovery made no timely preparation or durable transcription progress. Audio retained for retry.".into()),
-                _ => Some("Local recovery could not finish. Check that the original model revision is installed, then retry; audio retained.".into()),
+                _ => job.status.message.take().or_else(|| Some("Local recovery could not finish. Check that the original model revision is installed, then retry; audio retained.".into())),
             };
         }
     }
+    async fn watch_preparation<T>(&self, prepare: impl Future<Output = T>) -> T {
+        tokio::pin!(prepare);
+        let mut tick = tokio::time::interval(Duration::from_millis(20));
+        loop {
+            tokio::select! {
+                biased;
+                _ = tick.tick() => { self.check(); }
+                result = &mut prepare => return result,
+            }
+        }
+    }
+
     async fn recover(
         &self,
         meeting: &str,
@@ -829,8 +871,15 @@ impl SavedSpeechRecovery {
                 continue;
             }
             let plan = saved.plan.ok_or(RecoveryError::Invalid)?;
-            let factory =
-                (self.resolver)(&plan, &capture.model_path).map_err(|_| RecoveryError::Invalid)?;
+            let factory = self
+                .watch_preparation((self.resolver)(&plan, &capture.model_path))
+                .await
+                .map_err(|message| {
+                    if let Some(job) = self.state().job.as_mut() {
+                        job.status.message = Some(message);
+                    }
+                    RecoveryError::Invalid
+                })?;
             let stop = self.state().job.as_ref().unwrap().stop.clone();
             let factory = Arc::new(GuardedFactory {
                 inner: factory,
@@ -855,15 +904,10 @@ impl SavedSpeechRecovery {
                     FailoverStream::resume_local(&capture.dir, request).await
                 }
             };
-            tokio::pin!(prepare);
-            let mut tick = tokio::time::interval(Duration::from_millis(20));
-            let stream = loop {
-                tokio::select! {
-                    biased;
-                    _ = tick.tick() => { self.check(); }
-                    result = &mut prepare => break result.map_err(|_| RecoveryError::Invalid)?.0,
-                }
-            };
+            let (stream, _) = self
+                .watch_preparation(prepare)
+                .await
+                .map_err(|_| RecoveryError::Invalid)?;
             let reader = stream.status_reader();
             let complete = if self.check() {
                 false
@@ -875,6 +919,7 @@ impl SavedSpeechRecovery {
                 // resume_local freezes input before launch. Its worker drains
                 // and completes by itself; finish() would add an unrelated total
                 // drain timeout that incorrectly truncates healthy long jobs.
+                let mut tick = tokio::time::interval(Duration::from_millis(20));
                 loop {
                     self.progress(saved.source, &reader);
                     if self.check() {
@@ -1020,6 +1065,9 @@ impl RecognizerFactory for GuardedFactory {
     }
     fn language(&self) -> Option<&str> {
         self.inner.language()
+    }
+    fn provider(&self) -> &str {
+        self.inner.provider()
     }
     fn create(&self) -> Result<Box<dyn fotw_stt::Recognizer>, fotw_stt::SttError> {
         not_cancelled(&self.stop)?;

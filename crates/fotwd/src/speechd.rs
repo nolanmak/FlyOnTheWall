@@ -290,6 +290,23 @@ pub async fn prepare_private(
     load(start(launch, data_root).await?).await
 }
 
+/// Prepare a saved revision on recovery's private runtime. A shared client
+/// would keep its I/O tasks on whichever runtime started it.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) async fn prepare_recovery(
+    launch: &Launch,
+    data_root: &Path,
+    expected_revision: &str,
+) -> Result<Arc<SpeechdEngine>, String> {
+    let (engine, revision) = prepare_private(launch, data_root).await?;
+    if expected_revision != revision {
+        return Err(format!(
+            "Install the original Parakeet model revision ({expected_revision}) before retrying; installed revision is {revision}."
+        ));
+    }
+    Ok(engine)
+}
+
 async fn load(client: SpeechdClient) -> Result<(Arc<SpeechdEngine>, String), String> {
     let engine = SpeechdEngine::prepare(client, ENGINE)
         .await
@@ -820,30 +837,151 @@ mod fallback_tests {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod recovery_tests {
-    use super::*;
-    use crate::failover::coverage::{EngineDescriptor, LocalPlan};
+    use super::{testing::fake_launch, *};
+    use crate::failover::{
+        coverage::CoverageJournal,
+        stream::{FailoverStream, LocalResumeConfig, LocalSourceConfig},
+    };
+    use fotw_pipeline::replay::{ReplayReader, ReplaySource, ReplayWriter};
+    use fotw_stt::{LocalStreamConfig, Source};
 
-    #[test]
-    fn recovering_saved_parakeet_audio_is_refused_plainly_and_the_audio_kept() {
+    #[tokio::test]
+    async fn missing_saved_parakeet_model_has_an_install_hint() {
         let root = tempfile::tempdir().unwrap();
-        let plan = LocalPlan {
-            engine: EngineDescriptor {
-                provider: fotw_stt::speechd::PROVIDER.into(),
-                model: ENGINE.into(),
-                revision: Some(REVISION.into()),
-                capabilities: fotw_stt::SttCapabilities::deepgram(),
-            },
-            language: Some("en".into()),
-            endpoint: Default::default(),
-        };
-        let Err(refused) = crate::stt::saved_local_model(&plan, root.path(), root.path()) else {
-            panic!("Parakeet recovery is not supported yet");
-        };
-        assert_eq!(
-            refused,
-            "Parakeet recovery isn't supported yet; the audio is kept."
+        let refused = prepare_recovery(&fake_launch(), root.path(), REVISION)
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("fotwd stt models install parakeet-unified"),
+            "{refused}"
         );
+    }
+
+    #[tokio::test]
+    async fn interrupted_parakeet_replay_matches_live_speech_and_keeps_the_gap() {
+        let root = tempfile::tempdir().unwrap();
+        let baseline = tempfile::tempdir().unwrap();
+        let interrupted = tempfile::tempdir().unwrap();
+        let launch = fake_launch();
+        let model_root = root.path().to_owned();
+        let installer = launch.clone();
+        tokio::task::spawn_blocking(move || {
+            install(&installer, &model_root, None, &|| false, &mut |_| {})
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let (live, revision) = prepare_private(&launch, root.path()).await.unwrap();
+        let mut config = LocalSourceConfig::new(
+            LocalStreamConfig::new("fixture", Source::System).with_session_offset_ms(137),
+            live,
+        );
+        config.revision = Some(revision);
+        let (stream, _) = FailoverStream::open_local(baseline.path(), config)
+            .await
+            .unwrap();
+        let mut pcm = vec![0; 57_600];
+        pcm.extend((0..32_000).map(|n| if (n / 480) % 2 == 0 { 1_000 } else { 8_000 }));
+        pcm.extend(std::iter::repeat_n(0, 16_000));
+        stream.write(&pcm).unwrap();
+        assert!(stream.finish().await, "{:?}", stream.status());
+        let live = CoverageJournal::snapshot(baseline.path(), "fixture", Source::System).unwrap();
+        let plan = live.fallback.unwrap();
+
+        // Leave a synced replay and a gap receipt, with no Stop or coverage
+        // receipt for the remaining audio.
+        let start = 137 * 16;
+        // The saved gap ends on an endpoint frame boundary.
+        let gap_end = start + 19_200;
+        let mut audio =
+            ReplayWriter::create(interrupted.path(), "fixture", ReplaySource::System, start)
+                .unwrap();
+        audio.append(&pcm).unwrap();
+        audio.sync().unwrap();
+        let mut journal = CoverageJournal::create_with_fallback(
+            interrupted.path(),
+            "fixture",
+            Source::System,
+            plan.engine.clone(),
+            Some(plan.clone()),
+        )
+        .unwrap();
+        journal.skip(0, start, gap_end, "saved gap".into()).unwrap();
+        drop(journal);
+        drop(audio);
+
+        assert!(
+            prepare_recovery(&launch, root.path(), "wrong-revision")
+                .await
+                .is_err()
+        );
+        let engine = prepare_recovery(
+            &launch,
+            root.path(),
+            plan.engine.revision.as_deref().unwrap(),
+        )
+        .await
+        .unwrap();
+        let (resumed, _) = FailoverStream::resume_prefix(
+            interrupted.path(),
+            LocalResumeConfig {
+                session_id: "fixture".into(),
+                source: Source::System,
+                local: engine,
+                revision: plan.engine.revision,
+                stop_timeout: std::time::Duration::from_secs(5),
+            },
+            start + pcm.len() as u64,
+        )
+        .await
+        .unwrap();
+        assert!(!resumed.finish().await);
+        assert_eq!(
+            resumed.status().phase,
+            crate::failover::stream::Phase::PrefixRecovered
+        );
+
+        let saved =
+            CoverageJournal::snapshot(interrupted.path(), "fixture", Source::System).unwrap();
+        assert_eq!(saved.epochs.last().unwrap().engine, live.epochs[0].engine);
+        assert_eq!(saved.commits[0].gap.as_deref(), Some("saved gap"));
+        assert_eq!(
+            (
+                saved.commits[0].from_sample,
+                saved.commits[0].through_sample
+            ),
+            (start, gap_end)
+        );
+        let speech = |commits: &[crate::failover::coverage::CommittedAudio]| {
+            commits
+                .iter()
+                .flat_map(|c| &c.segments)
+                .map(|s| {
+                    (
+                        s.start_ms,
+                        s.end_ms,
+                        s.text.clone(),
+                        s.provider.clone(),
+                        s.model.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(speech(&live.commits).len(), 1);
+        assert_eq!(speech(&saved.commits), speech(&live.commits));
+        let mut retained =
+            ReplayReader::open(interrupted.path(), "fixture", ReplaySource::System).unwrap();
+        let mut actual = Vec::new();
+        while actual.len() < pcm.len() {
+            let chunk = retained
+                .read_from(start + actual.len() as u64, 16_000)
+                .unwrap();
+            assert!(!chunk.is_empty());
+            actual.extend(chunk);
+        }
+        assert_eq!(actual, pcm);
     }
 }
