@@ -81,6 +81,13 @@ Where CI still differs from a local `just ci`:
 The recipes build with 3 parallel cargo jobs so the machine stays usable; set
 `CARGO_BUILD_JOBS` to change that.
 
+While iterating on the `fotwd` CLI runner, run just the integration test target
+in `crates/fotwd/tests/cli_runner.rs` from the repository root.
+
+```sh
+cargo test -p fotwd --test cli_runner
+```
+
 ### Experimental echo cancellation
 
 Normal builds omit the live AEC coordinator and recording-pump adapter.
